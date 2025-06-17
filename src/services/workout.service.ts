@@ -3,7 +3,7 @@ import { WorkoutResponse } from '../types/workout';
 
 interface DailyExerciseWithRelations {
     id: string;
-    exercises: {
+    user_exercises: {
         id: string;
         name: string;
         exercise_type: string;
@@ -19,18 +19,16 @@ interface DailyExerciseWithRelations {
 }
 
 export const getWorkoutByDate = async (userId: string, date: string): Promise<WorkoutResponse> => {
-    const dailyWorkout = await prisma.workout_days.findUnique({
+    const dailyWorkout = await prisma.workout_days.findFirst({
         where: {
-            user_id_date: {
-                user_id: userId,
-                date: new Date(date),
-            },
+            user_id: userId,
+            date: new Date(date),
         },
         include: {
             daily_exercises: {
                 include: {
                     exercise_sets: true,
-                    exercises: true,
+                    user_exercises: true,
                 },
             },
         },
@@ -43,10 +41,10 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
         dailyExercises: dailyWorkout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
             dailyExerciseId: de.id,
             exercise: {
-                id: de.exercises.id,
-                name: de.exercises.name,
-                exerciseType: de.exercises.exercise_type,
-                exerciseBodyPart: de.exercises.exercise_body_part,
+                id: de.user_exercises.id,
+                name: de.user_exercises.name,
+                exerciseType: de.user_exercises.exercise_type,
+                exerciseBodyPart: de.user_exercises.exercise_body_part,
             },
             sets: de.exercise_sets.map((s) => ({
                 id: s.id,
@@ -67,7 +65,7 @@ export const getAllWorkoutsForUser = async (userId: string): Promise<WorkoutResp
             daily_exercises: {
                 include: {
                     exercise_sets: true,
-                    exercises: true,
+                    user_exercises: true,
                 },
             },
         },
@@ -81,10 +79,10 @@ export const getAllWorkoutsForUser = async (userId: string): Promise<WorkoutResp
         dailyExercises: workout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
             dailyExerciseId: de.id,
             exercise: {
-                id: de.exercises.id,
-                name: de.exercises.name,
-                exerciseType: de.exercises.exercise_type,
-                exerciseBodyPart: de.exercises.exercise_body_part,
+                id: de.user_exercises.id,
+                name: de.user_exercises.name,
+                exerciseType: de.user_exercises.exercise_type,
+                exerciseBodyPart: de.user_exercises.exercise_body_part,
             },
             sets: de.exercise_sets.map((s) => ({
                 id: s.id,
