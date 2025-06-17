@@ -15,10 +15,20 @@ export const getWorkout = async (req: Request, res: Response) => {
 
 export const getAllWorkouts = async (req: Request, res: Response) => {
     const userId = req.headers['x-user-id'] as string;
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
 
     try {
-        const workouts = await getAllWorkoutsForUser(userId);
-        return res.json(workouts);
+        const { workouts, total } = await getAllWorkoutsForUser(userId, page, limit);
+        return res.json({
+            workouts,
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit)
+            }
+        });
     } catch (err) {
         return res.status(500).json({ message: 'Failed to fetch workouts', error: err });
     }

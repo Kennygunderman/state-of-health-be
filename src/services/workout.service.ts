@@ -56,7 +56,18 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
     };
 };
 
-export const getAllWorkoutsForUser = async (userId: string): Promise<WorkoutResponse[]> => {
+export const getAllWorkoutsForUser = async (userId: string, page: number = 1, limit: number = 10): Promise<{ workouts: WorkoutResponse[], total: number }> => {
+    // Calculate skip value for pagination
+    const skip = (page - 1) * limit;
+
+    // Get total count of workouts for this user
+    const total = await prisma.workout_days.count({
+        where: {
+            user_id: userId,
+        }
+    });
+
+    // Get paginated workouts
     const workouts = await prisma.workout_days.findMany({
         where: {
             user_id: userId,
@@ -72,24 +83,29 @@ export const getAllWorkoutsForUser = async (userId: string): Promise<WorkoutResp
         orderBy: {
             date: 'desc',
         },
+        skip,
+        take: limit,
     });
 
-    return workouts.map(workout => ({
-        date: workout.date.toISOString(),
-        dailyExercises: workout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
-            dailyExerciseId: de.id,
-            exercise: {
-                id: de.user_exercises.id,
-                name: de.user_exercises.name,
-                exerciseType: de.user_exercises.exercise_type,
-                exerciseBodyPart: de.user_exercises.exercise_body_part,
-            },
-            sets: de.exercise_sets.map((s) => ({
-                id: s.id,
-                reps: s.reps,
-                weight: s.weight,
-                completed: s.completed ?? false,
+    return {
+        workouts: workouts.map(workout => ({
+            date: workout.date.toISOString(),
+            dailyExercises: workout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
+                dailyExerciseId: de.id,
+                exercise: {
+                    id: de.user_exercises.id,
+                    name: de.user_exercises.name,
+                    exerciseType: de.user_exercises.exercise_type,
+                    exerciseBodyPart: de.user_exercises.exercise_body_part,
+                },
+                sets: de.exercise_sets.map((s) => ({
+                    id: s.id,
+                    reps: s.reps,
+                    weight: s.weight,
+                    completed: s.completed ?? false,
+                })),
             })),
         })),
-    }));
+        total
+    };
 };
