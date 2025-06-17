@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { getWorkoutByDate, getAllExercisesForUser, getAllWorkoutsForUser } from '../services/workout.service';
+import { getWorkoutByDate, getAllWorkoutsForUser } from '../services/workout.service';
 
 export const getWorkout = async (req: Request, res: Response) => {
     const { date } = req.params;
@@ -10,17 +10,6 @@ export const getWorkout = async (req: Request, res: Response) => {
         return res.json(workout);
     } catch (err) {
         return res.status(500).json({ message: 'Failed to fetch workout', error: err });
-    }
-};
-
-export const getAllExercises = async (req: Request, res: Response) => {
-    const userId = req.headers['x-user-id'] as string;
-
-    try {
-        const exercises = await getAllExercisesForUser(userId);
-        return res.json(exercises);
-    } catch (err) {
-        return res.status(500).json({ message: 'Failed to fetch exercises', error: err });
     }
 };
 
