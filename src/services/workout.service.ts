@@ -37,6 +37,7 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
     if (!dailyWorkout) throw new Error('No workout found');
 
     return {
+        id: dailyWorkout.id,
         date: dailyWorkout.date.toISOString(),
         dailyExercises: dailyWorkout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
             dailyExerciseId: de.id,
@@ -48,8 +49,8 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
             },
             sets: de.exercise_sets.map((s) => ({
                 id: s.id,
-                reps: s.reps,
-                weight: s.weight,
+                reps: s.reps ?? 0,
+                weight: s.weight ?? 0,
                 completed: s.completed ?? false,
             })),
         })),
@@ -89,6 +90,7 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
 
     return {
         workouts: workouts.map(workout => ({
+            id: workout.id,
             date: workout.date.toISOString(),
             dailyExercises: workout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
                 dailyExerciseId: de.id,
@@ -100,8 +102,8 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
                 },
                 sets: de.exercise_sets.map((s) => ({
                     id: s.id,
-                    reps: s.reps,
-                    weight: s.weight,
+                    reps: s.reps ?? 0,
+                    weight: s.weight ?? 0,
                     completed: s.completed ?? false,
                 })),
             })),

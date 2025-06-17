@@ -1,4 +1,5 @@
 export interface WorkoutResponse {
+    id: string;
     date: string;
     dailyExercises: {
         dailyExerciseId: string;
