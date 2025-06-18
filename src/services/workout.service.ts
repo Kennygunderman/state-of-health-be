@@ -216,3 +216,78 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
         total
     };
 };
+
+export const createWorkout = async (userId: string, workoutData: {
+    id: string;
+    date: string;
+    dailyExercises: Array<{
+        id: string;
+        exercise: {
+            id: string;
+            name: string;
+            exerciseType: string;
+            exerciseBodyPart: string;
+        };
+        sets: Array<{
+            id: string;
+            reps?: number;
+            weight?: number;
+            setNumber?: number | null;
+            completedAt?: string | null;
+            completed: boolean;
+        }>;
+    }>;
+}): Promise<void> => {
+    await prisma.workout_days.upsert({
+        where: { id: workoutData.id },
+        update: {
+            date: new Date(workoutData.date),
+            daily_exercises: {
+                deleteMany: {}, // Delete existing daily exercises and their sets
+                create: workoutData.dailyExercises.map(de => ({
+                    id: de.id,
+                    user_exercises: {
+                        connect: {
+                            id: de.exercise.id
+                        }
+                    },
+                    exercise_sets: {
+                        create: de.sets.map(set => ({
+                            id: set.id,
+                            reps: set.reps ?? 0,
+                            weight: set.weight ?? 0,
+                            set_number: set.setNumber ?? null,
+                            completed_at: set.completedAt ? new Date(set.completedAt) : null,
+                            completed: set.completed
+                        }))
+                    }
+                }))
+            }
+        },
+        create: {
+            id: workoutData.id,
+            user_id: userId,
+            date: new Date(workoutData.date),
+            daily_exercises: {
+                create: workoutData.dailyExercises.map(de => ({
+                    id: de.id,
+                    user_exercises: {
+                        connect: {
+                            id: de.exercise.id
+                        }
+                    },
+                    exercise_sets: {
+                        create: de.sets.map(set => ({
+                            id: set.id,
+                            reps: set.reps ?? 0,
+                            weight: set.weight ?? 0,
+                            set_number: set.setNumber ?? null,
+                            completed_at: set.completedAt ? new Date(set.completedAt) : null,
+                            completed: set.completed
+                        }))
+                    }
+                }))
+            }
+        }
+    });
+};

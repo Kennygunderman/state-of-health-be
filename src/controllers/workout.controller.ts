@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { getWorkoutByDate, getAllWorkoutsForUser, getWorkoutSummary as getWorkoutSummaryService } from '../services/workout.service';
+import { getWorkoutByDate, getAllWorkoutsForUser, getWorkoutSummary as getWorkoutSummaryService, createWorkout as createWorkoutService } from '../services/workout.service';
 
 export const getWorkout = async (req: Request, res: Response) => {
     const { date } = req.params;
@@ -57,5 +57,20 @@ export const getWorkoutSummary = async (req: Request, res: Response) => {
     } catch (error) {
         console.error('Error getting workout summary:', error);
         res.status(500).json({ error: 'Failed to get workout summary' });
+    }
+};
+
+export const createWorkout = async (req: Request, res: Response) => {
+    try {
+        const userId = req.headers['x-user-id'] as string;
+        if (!userId) {
+            return res.status(401).json({ error: 'User ID is required' });
+        }
+
+        await createWorkoutService(userId, req.body);
+        return res.status(201).send();
+    } catch (error) {
+        console.error('Error creating workout:', error);
+        res.status(500).json({ error: 'Failed to create workout' });
     }
 };
