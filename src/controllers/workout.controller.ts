@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { getWorkoutByDate, getAllWorkoutsForUser, getWorkoutSummary as getWorkoutSummaryService, createWorkout as createWorkoutService } from '../services/workout.service';
+import { getWorkoutByDate, getAllWorkoutsForUser, getWorkoutSummary as getWorkoutSummaryService, createWorkout as createWorkoutService, getWeeklySummary } from '../services/workout.service';
 
 export const getWorkout = async (req: Request, res: Response) => {
     const { date } = req.params;
@@ -72,5 +72,20 @@ export const createWorkout = async (req: Request, res: Response) => {
     } catch (error) {
         console.error('Error creating workout:', error);
         res.status(500).json({ error: 'Failed to create workout' });
+    }
+};
+
+export const getWeeklySummaryController = async (req: Request, res: Response) => {
+    try {
+        const userId = req.headers['x-user-id'] as string;
+        if (!userId) {
+            return res.status(401).json({ error: 'User ID is required' });
+        }
+        const numOfWeeks = parseInt(req.params.numOfWeeks, 10) || 7;
+        const summary = await getWeeklySummary(userId, numOfWeeks);
+        return res.json(summary);
+    } catch (error) {
+        console.error('Error getting weekly summary:', error);
+        res.status(500).json({ error: 'Failed to get weekly summary' });
     }
 };

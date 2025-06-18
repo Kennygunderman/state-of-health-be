@@ -1,5 +1,6 @@
 import { prisma } from '../prisma/client';
 import { WorkoutResponse } from '../types/workout';
+import { startOfWeek, subWeeks, format, isWithinInterval, addDays } from 'date-fns';
 
 interface DailyExerciseWithRelations {
     id: string;
@@ -290,4 +291,71 @@ export const createWorkout = async (userId: string, workoutData: {
             }
         }
     });
+};
+
+export const getWeeklySummary = async (userId: string, numOfWeeks: number) => {
+    // Get today and the start of this week (Monday)
+    const today = new Date();
+    const weeks: { start: Date; end: Date }[] = [];
+    let currentStart = startOfWeek(today, { weekStartsOn: 1 });
+
+    // Build week ranges (from most recent to oldest)
+    for (let i = 0; i < numOfWeeks; i++) {
+        const start = subWeeks(currentStart, i);
+        const end = addDays(start, 6);
+        weeks.push({ start, end });
+    }
+
+    // Get all workout_days for the user in the last N weeks
+    const earliest = weeks[weeks.length - 1].start;
+    const workoutDays = await prisma.workout_days.findMany({
+        where: {
+            user_id: userId,
+            date: { gte: earliest }
+        },
+        include: {
+            daily_exercises: {
+                include: {
+                    exercise_sets: true
+                }
+            }
+        }
+    });
+
+    // For each week, count days with at least one completed set
+    const summary = weeks.map(({ start }, idx) => {
+        const end = addDays(start, 6);
+        
+        // Find all workout_days in this week
+        const daysInWeek = workoutDays.filter(wd => {
+            const workoutDate = wd.date;
+            // Use the date directly without timezone conversion
+            const workoutDateStr = workoutDate.toISOString().split('T')[0];
+            const weekStartStr = start.toISOString().split('T')[0];
+            const weekEndStr = end.toISOString().split('T')[0];
+            
+            const isInWeek = workoutDateStr >= weekStartStr && workoutDateStr <= weekEndStr;
+            return isInWeek;
+        });
+        
+        // For each day, check if any set is completed (matching client logic)
+        const completedDays = daysInWeek.filter(wd => {
+            // Calculate total weight for the day (matching client logic)
+            const totalWeightForDay = wd.daily_exercises.reduce((daySum, de) => {
+                return daySum + de.exercise_sets.reduce((setSum, set) => {
+                    return setSum + ((set.weight ?? 0) * (set.reps ?? 0));
+                }, 0);
+            }, 0);
+            
+            const hasCompletedWorkout = totalWeightForDay > 0;
+            return hasCompletedWorkout;
+        });
+        
+        return {
+            startOfWeek: format(start, 'M/d'),
+            completedWorkouts: completedDays.length
+        };
+    });
+
+    return summary;
 };
