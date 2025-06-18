@@ -7,6 +7,6 @@ router.get('/workouts/weekly-summary/:numOfWeeks', getWeeklySummaryController);
 router.get('/workouts/summary', getWorkoutSummary);
 router.get('/workouts/:date', getWorkout);
 router.get('/workouts', getAllWorkouts);
-router.post('/workouts', createWorkout);
+router.post('/workout', createWorkout);
 
 export default router;
