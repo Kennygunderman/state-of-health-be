@@ -111,3 +111,108 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
         total
     };
 };
+
+export const getWorkoutSummary = async (userId: string, page: number = 1, limit: number = 10): Promise<{ summaries: Array<{
+    workoutDayId: string;
+    day: string;
+    totalWeight: number;
+    exercises: Array<{
+        setsCompleted: number;
+        bestSet?: {
+            weight: number;
+            reps: number;
+        };
+        exercise: {
+            name: string;
+        };
+    }>;
+}>, total: number }> => {
+    // Calculate skip value for pagination
+    const skip = (page - 1) * limit;
+
+    // Get total count of workouts for this user
+    const total = await prisma.workout_days.count({
+        where: {
+            user_id: userId,
+        }
+    });
+
+    // Get paginated workouts with completed sets
+    const workouts = await prisma.workout_days.findMany({
+        where: {
+            user_id: userId,
+        },
+        include: {
+            daily_exercises: {
+                include: {
+                    exercise_sets: {
+                        where: {
+                            completed: true
+                        }
+                    },
+                    user_exercises: true
+                }
+            }
+        },
+        orderBy: {
+            date: 'desc'
+        },
+        skip,
+        take: limit
+    });
+
+    const summaries = workouts.map(workout => {
+        // Calculate total weight first
+        const totalWeight = workout.daily_exercises.reduce((sum, de) => {
+            const exerciseWeight = de.exercise_sets.reduce((setSum, set) => {
+                if (set.completed) {
+                    return setSum + (set.weight * set.reps);
+                }
+                return setSum;
+            }, 0);
+            return sum + exerciseWeight;
+        }, 0);
+
+        // Skip days with no weight lifted
+        if (totalWeight === 0) {
+            return null;
+        }
+
+        const exercises = workout.daily_exercises
+            .map(de => {
+                const completedSets = de.exercise_sets.filter(set => set.completed);
+                // Skip exercises with no completed sets
+                if (completedSets.length === 0) return null;
+
+                const bestSet = completedSets.reduce((best, current) => {
+                    const currentTotal = current.weight * current.reps;
+                    const bestTotal = best ? best.weight * best.reps : 0;
+                    return currentTotal > bestTotal ? current : best;
+                }, null as { weight: number; reps: number } | null);
+
+                return {
+                    setsCompleted: completedSets.length,
+                    bestSet: bestSet ? {
+                        weight: bestSet.weight,
+                        reps: bestSet.reps
+                    } : undefined,
+                    exercise: {
+                        name: de.user_exercises.name
+                    }
+                };
+            })
+            .filter((exercise): exercise is NonNullable<typeof exercise> => exercise !== null);
+
+        return {
+            workoutDayId: workout.id,
+            day: workout.date.toISOString(),
+            totalWeight,
+            exercises
+        };
+    }).filter((summary): summary is NonNullable<typeof summary> => summary !== null);
+
+    return {
+        summaries,
+        total
+    };
+};
