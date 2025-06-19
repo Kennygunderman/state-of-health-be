@@ -44,6 +44,7 @@ model users {
   first_name     String?
   last_name      String?
   email          String           @unique
+  templates      templates[]
   user_exercises user_exercises[]
 }
 
@@ -55,4 +56,16 @@ model workout_days {
   daily_exercises daily_exercises[]
 
   @@unique([user_id, date], map: "unique_user_date")
+}
+
+model templates {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id      String
+  name         String
+  tagline      String
+  exercise_ids String[]
+  users        users    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([user_id, name], map: "unique_user_template_name")
+  @@index([user_id], map: "idx_templates_user_id")
 }

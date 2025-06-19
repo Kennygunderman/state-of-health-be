@@ -1,4 +1,5 @@
 import { prisma } from '../prisma/client';
+import { v4 as uuidv4 } from 'uuid';
 
 interface ExerciseWithRelations {
     id: string;
@@ -111,6 +112,70 @@ export const deleteUserExercise = async (userId: string, exerciseId: string) => 
         },
         data: {
             deleted_at: new Date()
+        }
+    });
+};
+
+export const createTemplate = async (userId: string, templateData: {
+    name: string;
+    tagline: string;
+    exerciseIds: string[];
+}) => {
+    const templateId = uuidv4();
+    
+    const template = await prisma.templates.create({
+        data: {
+            id: templateId,
+            user_id: userId,
+            name: templateData.name,
+            tagline: templateData.tagline,
+            exercise_ids: templateData.exerciseIds
+        }
+    });
+
+    return {
+        id: template.id,
+        userId: template.user_id,
+        name: template.name,
+        tagline: template.tagline,
+        exerciseIds: template.exercise_ids
+    };
+};
+
+export const getTemplates = async (userId: string) => {
+    const templates = await prisma.templates.findMany({
+        where: {
+            user_id: userId
+        },
+        orderBy: {
+            name: 'asc'
+        }
+    });
+
+    return templates.map(template => ({
+        id: template.id,
+        userId: template.user_id,
+        name: template.name,
+        tagline: template.tagline,
+        exerciseIds: template.exercise_ids
+    }));
+};
+
+export const deleteTemplate = async (userId: string, templateId: string) => {
+    const template = await prisma.templates.findFirst({
+        where: {
+            id: templateId,
+            user_id: userId
+        }
+    });
+
+    if (!template) {
+        throw new Error('Template not found or does not belong to user');
+    }
+
+    return prisma.templates.delete({
+        where: {
+            id: templateId
         }
     });
 };

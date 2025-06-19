@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { getUserExercises, deleteUserExercise } from '../services/exercise.service';
+import { getUserExercises, deleteUserExercise, createTemplate, getTemplates, deleteTemplate } from '../services/exercise.service';
 
 export const getExercises = async (req: Request, res: Response) => {
     const userId = req.headers['x-user-id'] as string;
@@ -24,5 +24,55 @@ export const deleteExercise = async (req: Request, res: Response) => {
             return res.status(404).json({ message: err.message });
         }
         return res.status(500).json({ message: 'Failed to delete exercise', error: err });
+    }
+};
+
+export const createTemplateController = async (req: Request, res: Response) => {
+    try {
+        const userId = req.headers['x-user-id'] as string;
+        if (!userId) {
+            return res.status(401).json({ error: 'User ID is required' });
+        }
+
+        const template = await createTemplate(userId, req.body);
+        return res.status(201).json(template);
+    } catch (error) {
+        console.error('Error creating template:', error);
+        res.status(500).json({ error: 'Failed to create template' });
+    }
+};
+
+export const getTemplatesController = async (req: Request, res: Response) => {
+    try {
+        const userId = req.headers['x-user-id'] as string;
+        if (!userId) {
+            return res.status(401).json({ error: 'User ID is required' });
+        }
+
+        const templates = await getTemplates(userId);
+        return res.json({ templates });
+    } catch (error) {
+        console.error('Error getting templates:', error);
+        res.status(500).json({ error: 'Failed to get templates' });
+    }
+};
+
+export const deleteTemplateController = async (req: Request, res: Response) => {
+    try {
+        const userId = req.headers['x-user-id'] as string;
+        const { templateId } = req.params;
+
+        if (!userId) {
+            return res.status(401).json({ error: 'User ID is required' });
+        }
+
+        await deleteTemplate(userId, templateId);
+        return res.json({ message: 'Template deleted successfully' });
+    } catch (error) {
+        if (error instanceof Error && error.message === 'Template not found or does not belong to user') {
+            return res.status(404).json({ message: error.message });
+        }
+        console.error('Error deleting template:', error);
+        res.status(500).json({ error: 'Failed to delete template' });
     }
 };
