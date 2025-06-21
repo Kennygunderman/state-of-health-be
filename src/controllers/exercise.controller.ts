@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { getUserExercises, deleteUserExercise, createTemplate, getTemplates, deleteTemplate } from '../services/exercise.service';
+import { getUserExercises, deleteUserExercise, createTemplate, getTemplates, deleteTemplate, createExercise } from '../services/exercise.service';
 
 export const getExercises = async (req: Request, res: Response) => {
     const userId = req.headers['x-user-id'] as string;
@@ -18,7 +18,7 @@ export const deleteExercise = async (req: Request, res: Response) => {
 
     try {
         await deleteUserExercise(userId, exerciseId);
-        return res.json({ message: 'Exercise deleted successfully' });
+        return res.status(204).send();
     } catch (err) {
         if (err instanceof Error && err.message === 'Exercise not found or does not belong to user') {
             return res.status(404).json({ message: err.message });
@@ -67,12 +67,26 @@ export const deleteTemplateController = async (req: Request, res: Response) => {
         }
 
         await deleteTemplate(userId, templateId);
-        return res.json({ message: 'Template deleted successfully' });
+        return res.status(204).send();
     } catch (error) {
         if (error instanceof Error && error.message === 'Template not found or does not belong to user') {
             return res.status(404).json({ message: error.message });
         }
         console.error('Error deleting template:', error);
         res.status(500).json({ error: 'Failed to delete template' });
+    }
+};
+
+export const createExerciseController = async (req: Request, res: Response) => {
+    try {
+        const userId = req.headers['x-user-id'] as string;
+        if (!userId) {
+            return res.status(401).json({ error: 'User ID is required' });
+        }
+        const exercise = await createExercise(userId, req.body);
+        return res.status(201).json(exercise);
+    } catch (error) {
+        console.error('Error creating exercise:', error);
+        res.status(500).json({ error: 'Failed to create exercise' });
     }
 };

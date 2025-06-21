@@ -106,7 +106,7 @@ export const deleteUserExercise = async (userId: string, exerciseId: string) => 
     }
 
     // Soft delete by setting deleted_at timestamp
-    return prisma.user_exercises.update({
+    await prisma.user_exercises.update({
         where: {
             id: exerciseId
         },
@@ -114,6 +114,24 @@ export const deleteUserExercise = async (userId: string, exerciseId: string) => 
             deleted_at: new Date()
         }
     });
+
+    // Find all templates for this user that contain the exerciseId
+    const templates = await prisma.templates.findMany({
+        where: {
+            user_id: userId,
+            exercise_ids: { has: exerciseId }
+        }
+    });
+
+    // For each template, remove the exerciseId and update
+    for (const template of templates) {
+        await prisma.templates.update({
+            where: { id: template.id },
+            data: {
+                exercise_ids: template.exercise_ids.filter(id => id !== exerciseId)
+            }
+        });
+    }
 };
 
 export const createTemplate = async (userId: string, templateData: {
@@ -178,4 +196,26 @@ export const deleteTemplate = async (userId: string, templateId: string) => {
             id: templateId
         }
     });
+};
+
+export const createExercise = async (userId: string, payload: {
+    name: string;
+    exerciseType: string;
+    exerciseBodyPart: string;
+}) => {
+    const exercise = await prisma.user_exercises.create({
+        data: {
+            id: uuidv4(),
+            user_id: userId,
+            name: payload.name,
+            exercise_type: payload.exerciseType,
+            exercise_body_part: payload.exerciseBodyPart
+        }
+    });
+    return {
+        id: exercise.id,
+        name: exercise.name,
+        exerciseType: exercise.exercise_type,
+        exerciseBodyPart: exercise.exercise_body_part
+    };
 };
