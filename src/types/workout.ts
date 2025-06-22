@@ -3,6 +3,7 @@ export interface WorkoutResponse {
     date: string;
     dailyExercises: {
         dailyExerciseId: string;
+        order: number;
         exercise: {
             id: string;
             name: string;

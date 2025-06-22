@@ -4,6 +4,7 @@ import { startOfWeek, subWeeks, format, isWithinInterval, addDays } from 'date-f
 
 interface DailyExerciseWithRelations {
     id: string;
+    order: number | null;
     user_exercises: {
         id: string;
         name: string;
@@ -31,6 +32,9 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
                     exercise_sets: true,
                     user_exercises: true,
                 },
+                orderBy: {
+                    order: 'asc',
+                },
             },
         },
     });
@@ -42,6 +46,7 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
         date: dailyWorkout.date.toISOString(),
         dailyExercises: dailyWorkout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
             dailyExerciseId: de.id,
+            order: de.order ?? 0,
             exercise: {
                 id: de.user_exercises.id,
                 name: de.user_exercises.name,
@@ -80,6 +85,9 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
                     exercise_sets: true,
                     user_exercises: true,
                 },
+                orderBy: {
+                    order: 'asc',
+                },
             },
         },
         orderBy: {
@@ -95,6 +103,7 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
             date: workout.date.toISOString(),
             dailyExercises: workout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
                 dailyExerciseId: de.id,
+                order: de.order ?? 0,
                 exercise: {
                     id: de.user_exercises.id,
                     name: de.user_exercises.name,
@@ -131,12 +140,37 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
     // Calculate skip value for pagination
     const skip = (page - 1) * limit;
 
-    // Get total count of workouts for this user
-    const total = await prisma.workout_days.count({
+    // Get all workouts for this user to calculate the correct total
+    const allWorkouts = await prisma.workout_days.findMany({
         where: {
             user_id: userId,
+        },
+        include: {
+            daily_exercises: {
+                include: {
+                    exercise_sets: {
+                        where: {
+                            completed: true
+                        }
+                    }
+                }
+            }
         }
     });
+
+    // Calculate total count of workouts with completed sets
+    const total = allWorkouts.filter(workout => {
+        const totalWeight = workout.daily_exercises.reduce((sum, de) => {
+            const exerciseWeight = de.exercise_sets.reduce((setSum, set) => {
+                if (set.completed) {
+                    return setSum + (set.weight * set.reps);
+                }
+                return setSum;
+            }, 0);
+            return sum + exerciseWeight;
+        }, 0);
+        return totalWeight > 0;
+    }).length;
 
     // Get paginated workouts with completed sets
     const workouts = await prisma.workout_days.findMany({
@@ -152,6 +186,9 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
                         }
                     },
                     user_exercises: true
+                },
+                orderBy: {
+                    order: 'asc'
                 }
             }
         },
@@ -223,6 +260,7 @@ export const createWorkout = async (userId: string, workoutData: {
     date: string;
     dailyExercises: Array<{
         id: string;
+        order: number;
         exercise: {
             id: string;
             name: string;
@@ -247,6 +285,7 @@ export const createWorkout = async (userId: string, workoutData: {
                 deleteMany: {}, // Delete existing daily exercises and their sets
                 create: workoutData.dailyExercises.map(de => ({
                     id: de.id,
+                    order: de.order,
                     user_exercises: {
                         connect: {
                             id: de.exercise.id
@@ -272,6 +311,7 @@ export const createWorkout = async (userId: string, workoutData: {
             daily_exercises: {
                 create: workoutData.dailyExercises.map(de => ({
                     id: de.id,
+                    order: de.order,
                     user_exercises: {
                         connect: {
                             id: de.exercise.id
