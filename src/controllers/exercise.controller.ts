@@ -1,8 +1,9 @@
 import { Request, Response } from 'express';
 import { getUserExercises, deleteUserExercise, createTemplate, getTemplates, deleteTemplate, createExercise } from '../services/exercise.service';
+import { getUserId } from '../utils/getUserId';
 
 export const getExercises = async (req: Request, res: Response) => {
-    const userId = req.headers['x-user-id'] as string;
+    const userId = getUserId(req);
 
     try {
         const exercises = await getUserExercises(userId);
@@ -13,7 +14,7 @@ export const getExercises = async (req: Request, res: Response) => {
 };
 
 export const deleteExercise = async (req: Request, res: Response) => {
-    const userId = req.headers['x-user-id'] as string;
+    const userId = getUserId(req);
     const { exerciseId } = req.params;
 
     try {
@@ -29,11 +30,7 @@ export const deleteExercise = async (req: Request, res: Response) => {
 
 export const createTemplateController = async (req: Request, res: Response) => {
     try {
-        const userId = req.headers['x-user-id'] as string;
-        if (!userId) {
-            return res.status(401).json({ error: 'User ID is required' });
-        }
-
+        const userId = getUserId(req);
         const template = await createTemplate(userId, req.body);
         return res.status(201).json(template);
     } catch (error) {
@@ -44,11 +41,7 @@ export const createTemplateController = async (req: Request, res: Response) => {
 
 export const getTemplatesController = async (req: Request, res: Response) => {
     try {
-        const userId = req.headers['x-user-id'] as string;
-        if (!userId) {
-            return res.status(401).json({ error: 'User ID is required' });
-        }
-
+        const userId = getUserId(req);
         const templates = await getTemplates(userId);
         return res.json({ templates });
     } catch (error) {
@@ -59,13 +52,8 @@ export const getTemplatesController = async (req: Request, res: Response) => {
 
 export const deleteTemplateController = async (req: Request, res: Response) => {
     try {
-        const userId = req.headers['x-user-id'] as string;
+        const userId = getUserId(req);
         const { templateId } = req.params;
-
-        if (!userId) {
-            return res.status(401).json({ error: 'User ID is required' });
-        }
-
         await deleteTemplate(userId, templateId);
         return res.status(204).send();
     } catch (error) {
@@ -79,10 +67,7 @@ export const deleteTemplateController = async (req: Request, res: Response) => {
 
 export const createExerciseController = async (req: Request, res: Response) => {
     try {
-        const userId = req.headers['x-user-id'] as string;
-        if (!userId) {
-            return res.status(401).json({ error: 'User ID is required' });
-        }
+        const userId = getUserId(req);
         const exercise = await createExercise(userId, req.body);
         return res.status(201).json(exercise);
     } catch (error) {

@@ -1,9 +1,10 @@
 import { Request, Response } from 'express';
 import { getWorkoutByDate, getAllWorkoutsForUser, getWorkoutSummary as getWorkoutSummaryService, createWorkout as createWorkoutService, getWeeklySummary } from '../services/workout.service';
+import { getUserId } from '../utils/getUserId';
 
 export const getWorkout = async (req: Request, res: Response) => {
     const { date } = req.params;
-    const userId = req.headers['x-user-id'] as string; // or however you're passing user auth
+    const userId = getUserId(req);
 
     try {
         const workout = await getWorkoutByDate(userId, date);
@@ -14,7 +15,7 @@ export const getWorkout = async (req: Request, res: Response) => {
 };
 
 export const getAllWorkouts = async (req: Request, res: Response) => {
-    const userId = req.headers['x-user-id'] as string;
+    const userId = getUserId(req);
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 10;
 
@@ -36,14 +37,9 @@ export const getAllWorkouts = async (req: Request, res: Response) => {
 
 export const getWorkoutSummary = async (req: Request, res: Response) => {
     try {
-        const userId = req.headers['x-user-id'] as string;
-        if (!userId) {
-            return res.status(401).json({ error: 'User ID is required' });
-        }
-
+        const userId = getUserId(req);
         const page = parseInt(req.query.page as string) || 1;
         const limit = parseInt(req.query.limit as string) || 10;
-
         const { summaries, total } = await getWorkoutSummaryService(userId, page, limit);
         return res.json({
             summaries,
@@ -62,11 +58,7 @@ export const getWorkoutSummary = async (req: Request, res: Response) => {
 
 export const createWorkout = async (req: Request, res: Response) => {
     try {
-        const userId = req.headers['x-user-id'] as string;
-        if (!userId) {
-            return res.status(401).json({ error: 'User ID is required' });
-        }
-
+        const userId = getUserId(req);
         await createWorkoutService(userId, req.body);
         return res.status(201).send();
     } catch (error) {
@@ -77,10 +69,7 @@ export const createWorkout = async (req: Request, res: Response) => {
 
 export const getWeeklySummaryController = async (req: Request, res: Response) => {
     try {
-        const userId = req.headers['x-user-id'] as string;
-        if (!userId) {
-            return res.status(401).json({ error: 'User ID is required' });
-        }
+        const userId = getUserId(req);
         const numOfWeeks = parseInt(req.params.numOfWeeks, 10) || 7;
         const summary = await getWeeklySummary(userId, numOfWeeks);
         return res.json(summary);
