@@ -5,7 +5,7 @@ const router = Router();
 
 router.get('/workouts/weekly-summary/:numOfWeeks', getWeeklySummaryController);
 router.get('/workouts/summary', getWorkoutSummary);
-router.get('/workouts/:date', getWorkout);
+router.get('/workout/:date', getWorkout);
 router.get('/workouts', getAllWorkouts);
 router.post('/workout', createWorkout);
 
