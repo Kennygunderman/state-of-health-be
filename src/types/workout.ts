@@ -1,6 +1,8 @@
 export interface WorkoutResponse {
     id: string;
     date: string;
+    updatedAt: number;
+    userId: string;
     dailyExercises: {
         dailyExerciseId: string;
         order: number;

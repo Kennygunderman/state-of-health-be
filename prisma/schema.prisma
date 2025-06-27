@@ -54,6 +54,7 @@ model workout_days {
   user_id         String
   date            DateTime          @db.Date
   has_synced      Boolean?          @default(false)
+  updated_at      BigInt            @default(0)
   daily_exercises daily_exercises[]
 
   @@unique([user_id, date], map: "unique_user_date")

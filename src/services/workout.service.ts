@@ -1,6 +1,7 @@
 import { prisma } from '../prisma/client';
 import { WorkoutResponse } from '../types/workout';
 import { startOfWeek, subWeeks, format, addDays } from 'date-fns';
+import { v4 as uuidv4 } from 'uuid';
 
 interface DailyExerciseWithRelations {
     id: string;
@@ -20,7 +21,7 @@ interface DailyExerciseWithRelations {
     }>;
 }
 
-export const getWorkoutByDate = async (userId: string, date: string): Promise<WorkoutResponse> => {
+export const getWorkoutByDate = async (userId: string, date: string): Promise<WorkoutResponse | null> => {
     const dailyWorkout = await prisma.workout_days.findFirst({
         where: {
             user_id: userId,
@@ -39,11 +40,13 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
         },
     });
 
-    if (!dailyWorkout) throw new Error('No workout found');
+    if (!dailyWorkout) return null;
 
     return {
         id: dailyWorkout.id,
         date: dailyWorkout.date.toISOString(),
+        updatedAt: Number(dailyWorkout.updated_at),
+        userId: dailyWorkout.user_id,
         dailyExercises: dailyWorkout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
             dailyExerciseId: de.id,
             order: de.order ?? 0,
@@ -101,6 +104,8 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
         workouts: workouts.map(workout => ({
             id: workout.id,
             date: workout.date.toISOString(),
+            updatedAt: Number(workout.updated_at),
+            userId: workout.user_id,
             dailyExercises: workout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
                 dailyExerciseId: de.id,
                 order: de.order ?? 0,
@@ -256,8 +261,8 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
 };
 
 export const createWorkout = async (userId: string, workoutData: {
-    id: string;
     date: string;
+    updatedAt: number;
     dailyExercises: Array<{
         id: string;
         order: number;
@@ -277,37 +282,22 @@ export const createWorkout = async (userId: string, workoutData: {
         }>;
     }>;
 }): Promise<void> => {
-    await prisma.workout_days.upsert({
-        where: { id: workoutData.id },
-        update: {
-            date: new Date(workoutData.date),
-            daily_exercises: {
-                deleteMany: {}, // Delete existing daily exercises and their sets
-                create: workoutData.dailyExercises.map(de => ({
-                    id: de.id,
-                    order: de.order,
-                    user_exercises: {
-                        connect: {
-                            id: de.exercise.id
-                        }
-                    },
-                    exercise_sets: {
-                        create: de.sets.map(set => ({
-                            id: set.id,
-                            reps: set.reps ?? 0,
-                            weight: set.weight ?? 0,
-                            set_number: set.setNumber ?? null,
-                            completed_at: set.completedAt ? new Date(set.completedAt) : null,
-                            completed: set.completed
-                        }))
-                    }
-                }))
-            }
-        },
-        create: {
-            id: workoutData.id,
+    // Check if a workout day for this user/date already exists
+    const existing = await prisma.workout_days.findFirst({
+        where: { user_id: userId, date: new Date(workoutData.date) }
+    });
+    if (existing) {
+        throw new Error('Workout day already exists for this date. ' + workoutData.date);
+    }
+
+    const workoutDayId = uuidv4();
+
+    await prisma.workout_days.create({
+        data: {
+            id: workoutDayId,
             user_id: userId,
             date: new Date(workoutData.date),
+            updated_at: BigInt(workoutData.updatedAt),
             daily_exercises: {
                 create: workoutData.dailyExercises.map(de => ({
                     id: de.id,
@@ -398,4 +388,69 @@ export const getWeeklySummary = async (userId: string, numOfWeeks: number) => {
     });
 
     return summary;
+};
+
+export const updateWorkout = async (
+    userId: string,
+    workoutId: string,
+    workoutData: {
+        date: string;
+        updatedAt: number;
+        dailyExercises: Array<{
+            id: string;
+            order: number;
+            exercise: {
+                id: string;
+                name: string;
+                exerciseType: string;
+                exerciseBodyPart: string;
+            };
+            sets: Array<{
+                id: string;
+                reps?: number;
+                weight?: number;
+                setNumber?: number | null;
+                completedAt?: string | null;
+                completed: boolean;
+            }>;
+        }>;
+    }
+): Promise<{ date: Date } | null> => {
+    // Find the workout_day by id and userId
+    const existing = await prisma.workout_days.findFirst({
+        where: { id: workoutId, user_id: userId }
+    });
+    if (!existing) return null;
+
+    // Update the workout_day and replace all daily_exercises/sets
+    await prisma.workout_days.update({
+        where: { id: workoutId },
+        data: {
+            date: new Date(workoutData.date),
+            updated_at: BigInt(workoutData.updatedAt),
+            daily_exercises: {
+                deleteMany: {},
+                create: workoutData.dailyExercises.map(de => ({
+                    id: de.id,
+                    order: de.order,
+                    user_exercises: {
+                        connect: {
+                            id: de.exercise.id
+                        }
+                    },
+                    exercise_sets: {
+                        create: de.sets.map(set => ({
+                            id: set.id,
+                            reps: set.reps ?? 0,
+                            weight: set.weight ?? 0,
+                            set_number: set.setNumber ?? null,
+                            completed_at: set.completedAt ? new Date(set.completedAt) : null,
+                            completed: set.completed
+                        }))
+                    }
+                }))
+            }
+        }
+    });
+    return { date: new Date(workoutData.date) };
 };
