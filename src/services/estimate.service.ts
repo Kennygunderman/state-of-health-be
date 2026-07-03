@@ -52,6 +52,7 @@ Rules:
 - Preparation matters: fried vs boiled, cooked vs raw, with-milk vs black.
 - A composite item ("toast with peanut butter") should only match a candidate that covers the WHOLE item; component-only candidates are not a match.
 - A single plain food SHOULD match its generic database entry: "plain bagel" matches "Bagel" or "Bagels, plain, enriched...". Parenthetical variant lists like "(includes onion, poppy, sesame)" do not disqualify a match.
+- Reject candidates whose per-100g values are nutritionally implausible for that food (database entry errors exist).
 - Return -1 only when preparation clearly differs, the item is composite with no whole-item candidate, or every candidate is a different food.
 - Output "matches" as an array of integers aligned with the items, one per item.
 
@@ -268,9 +269,26 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
             Number.isInteger(matchIndex) && matchIndex >= 0 ? candidateLists[index][matchIndex] : undefined;
         if (!candidate || item.grams <= 0) return item;
         const scale = item.grams / 100;
+        const groundedCalories = toInt(candidate.caloriesPer100g * scale);
+
+        // Sanity guard: grounding should refine the LLM's number, not overturn
+        // it. USDA has data-entry errors and the judge can pick a plausible-
+        // sounding but wrong-density entry — if the grounded calories land
+        // outside 0.5–2x of the LLM's own estimate (beyond a small absolute
+        // tolerance), distrust the match and keep the estimate.
+        const delta = Math.abs(groundedCalories - item.calories);
+        const ratio = item.calories > 0 ? groundedCalories / item.calories : 1;
+        if (delta > 60 && (ratio < 0.5 || ratio > 2)) {
+            console.warn(
+                `Grounding rejected for "${item.name}": USDA "${candidate.description}" gives ` +
+                    `${groundedCalories} cal vs LLM estimate ${item.calories} cal`,
+            );
+            return item;
+        }
+
         return {
             ...item,
-            calories: toInt(candidate.caloriesPer100g * scale),
+            calories: groundedCalories,
             protein: toInt(candidate.proteinPer100g * scale),
             carbs: toInt(candidate.carbsPer100g * scale),
             fat: toInt(candidate.fatPer100g * scale),

@@ -27,7 +27,7 @@ const getApiKey = (): string => {
     return apiKey;
 };
 
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 4;
 const RETRY_DELAY_MS = 250;
 
 const usdaGet = async (path: string, params: Record<string, string>): Promise<any> => {
