@@ -27,17 +27,33 @@ const getApiKey = (): string => {
     return apiKey;
 };
 
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 250;
+
 const usdaGet = async (path: string, params: Record<string, string>): Promise<any> => {
     const baseUrl = process.env.USDA_BASE_URL || DEFAULT_BASE_URL;
     const query = new URLSearchParams({ ...params, api_key: getApiKey() });
-    const response = await fetch(`${baseUrl}${path}?${query.toString()}`);
-    if (response.status === 429) {
-        throw new UsdaError('USDA rate limit exceeded');
+    const url = `${baseUrl}${path}?${query.toString()}`;
+
+    let lastError: Error = new UsdaError('USDA request failed');
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+            const response = await fetch(url);
+            if (response.ok) {
+                return await response.json();
+            }
+            // USDA's API intermittently 400s on requests that succeed when
+            // retried verbatim (~1 in 5 observed) — so unlike a normal client
+            // error, 400 is retried here alongside 429/5xx.
+            lastError = new UsdaError(`USDA returned ${response.status}`);
+        } catch (error) {
+            lastError = new UsdaError(`USDA request failed: ${(error as Error).message}`);
+        }
+        if (attempt < MAX_ATTEMPTS) {
+            await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+        }
     }
-    if (!response.ok) {
-        throw new UsdaError(`USDA returned ${response.status}`);
-    }
-    return response.json();
+    throw lastError;
 };
 
 const titleCase = (value: string): string =>
