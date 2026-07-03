@@ -286,6 +286,10 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
             return item;
         }
 
+        console.log(
+            `Grounded "${item.name}" ⇐ USDA "${candidate.description}" ` +
+                `(LLM ${item.calories} → ${groundedCalories} cal @ ${item.grams}g)`,
+        );
         return {
             ...item,
             calories: groundedCalories,
