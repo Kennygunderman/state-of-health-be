@@ -53,6 +53,7 @@ Rules:
 - A composite item ("toast with peanut butter") should only match a candidate that covers the WHOLE item; component-only candidates are not a match.
 - A single plain food SHOULD match its generic database entry: "plain bagel" matches "Bagel" or "Bagels, plain, enriched...". Parenthetical variant lists like "(includes onion, poppy, sesame)" do not disqualify a match.
 - Reject candidates whose per-100g values are nutritionally implausible for that food (database entry errors exist).
+- Among plausible candidates, prefer the plain/typical/default variant of the food ("Rice, white, cooked" over "Rice, white, cooked, glutinous") unless the item text specifies the variant.
 - Return -1 only when preparation clearly differs, the item is composite with no whole-item candidate, or every candidate is a different food.
 - Output "matches" as an array of integers aligned with the items, one per item.
 
