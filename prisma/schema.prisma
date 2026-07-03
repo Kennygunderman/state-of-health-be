@@ -61,6 +61,7 @@ model users {
   personal_records      personal_records[]
   runs                  runs[]
   run_personal_records  run_personal_records[]
+  body_weight_entries   body_weight_entries[]
 }
 
 model workout_days {
@@ -133,6 +134,19 @@ model runs {
   run_personal_records run_personal_records[]
 
   @@index([user_id, started_at], map: "idx_runs_user_id_started_at")
+}
+
+// One row per weigh-in. logged_at is a full timestamp (not a date) so the app
+// can show time-of-day context ("morning") and allow multiple entries per day.
+model body_weight_entries {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id    String
+  weight     Float
+  logged_at  DateTime
+  created_at DateTime @default(now())
+  users      users    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id, logged_at], map: "idx_body_weight_entries_user_id_logged_at")
 }
 
 model run_splits {
