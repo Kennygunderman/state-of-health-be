@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { getUserExercises, deleteUserExercise, createTemplate, getTemplates, deleteTemplate, createExercise } from '../services/exercise.service';
+import { getUserExercises, deleteUserExercise, createTemplate, getTemplates, deleteTemplate, createExercise, getExerciseHistory } from '../services/exercise.service';
 import { getUserId } from '../utils/getUserId';
 
 export const getExercises = async (req: Request, res: Response) => {
@@ -73,5 +73,25 @@ export const createExerciseController = async (req: Request, res: Response) => {
     } catch (error) {
         console.error('Error creating exercise:', error);
         res.status(500).json({ error: 'Failed to create exercise' });
+    }
+};
+
+export const getExerciseHistoryController = async (req: Request, res: Response) => {
+    try {
+        const userId = getUserId(req);
+        const { exerciseId } = req.params;
+        const page = parseInt(req.query.page as string) || 1;
+        const limit = parseInt(req.query.limit as string) || 20;
+        const { history, total } = await getExerciseHistory(userId, exerciseId, page, limit);
+        return res.json({
+            history,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+        });
+    } catch (error) {
+        if (error instanceof Error && error.message === 'Exercise not found or does not belong to user') {
+            return res.status(404).json({ message: error.message });
+        }
+        console.error('Error getting exercise history:', error);
+        res.status(500).json({ error: 'Failed to get exercise history' });
     }
 };

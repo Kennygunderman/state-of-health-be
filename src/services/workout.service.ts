@@ -1,7 +1,9 @@
 import { prisma } from '../prisma/client';
 import { WorkoutResponse } from '../types/workout';
+import { PersonalRecordResponse } from '../types/personalRecord';
 import { startOfWeek, subWeeks, format, addDays } from 'date-fns';
 import { v4 as uuidv4 } from 'uuid';
+import { evaluateAndUpsertExerciseRecords } from './record.service';
 
 interface DailyExerciseWithRelations {
     id: string;
@@ -11,15 +13,45 @@ interface DailyExerciseWithRelations {
         name: string;
         exercise_type: string;
         exercise_body_part: string;
+        logging_type: string;
     };
     exercise_sets: Array<{
         id: string;
         daily_exercise_id: string;
-        reps: number;
-        weight: number;
+        reps: number | null;
+        weight: number | null;
+        added_weight: number | null;
+        duration_seconds: number | null;
+        distance_meters: number | null;
+        rpe: number | null;
+        is_warmup: boolean | null;
         completed: boolean | null;
     }>;
 }
+
+const mapDailyExercises = (dailyExercises: DailyExerciseWithRelations[]) =>
+    dailyExercises.map((de) => ({
+        dailyExerciseId: de.id,
+        order: de.order ?? 0,
+        exercise: {
+            id: de.user_exercises.id,
+            name: de.user_exercises.name,
+            exerciseType: de.user_exercises.exercise_type,
+            exerciseBodyPart: de.user_exercises.exercise_body_part,
+            loggingType: de.user_exercises.logging_type,
+        },
+        sets: de.exercise_sets.map((s) => ({
+            id: s.id,
+            reps: s.reps ?? 0,
+            weight: s.weight ?? 0,
+            completed: s.completed ?? false,
+            addedWeight: s.added_weight,
+            durationSeconds: s.duration_seconds,
+            distanceMeters: s.distance_meters,
+            rpe: s.rpe,
+            isWarmup: s.is_warmup ?? false,
+        })),
+    }));
 
 export const getWorkoutByDate = async (userId: string, date: string): Promise<WorkoutResponse | null> => {
     const dailyWorkout = await prisma.workout_days.findFirst({
@@ -47,22 +79,7 @@ export const getWorkoutByDate = async (userId: string, date: string): Promise<Wo
         date: dailyWorkout.date.toISOString(),
         updatedAt: Number(dailyWorkout.updated_at),
         userId: dailyWorkout.user_id,
-        dailyExercises: dailyWorkout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
-            dailyExerciseId: de.id,
-            order: de.order ?? 0,
-            exercise: {
-                id: de.user_exercises.id,
-                name: de.user_exercises.name,
-                exerciseType: de.user_exercises.exercise_type,
-                exerciseBodyPart: de.user_exercises.exercise_body_part,
-            },
-            sets: de.exercise_sets.map((s) => ({
-                id: s.id,
-                reps: s.reps ?? 0,
-                weight: s.weight ?? 0,
-                completed: s.completed ?? false,
-            })),
-        })),
+        dailyExercises: mapDailyExercises(dailyWorkout.daily_exercises as DailyExerciseWithRelations[]),
     };
 };
 
@@ -106,22 +123,7 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
             date: workout.date.toISOString(),
             updatedAt: Number(workout.updated_at),
             userId: workout.user_id,
-            dailyExercises: workout.daily_exercises.map((de: DailyExerciseWithRelations) => ({
-                dailyExerciseId: de.id,
-                order: de.order ?? 0,
-                exercise: {
-                    id: de.user_exercises.id,
-                    name: de.user_exercises.name,
-                    exerciseType: de.user_exercises.exercise_type,
-                    exerciseBodyPart: de.user_exercises.exercise_body_part,
-                },
-                sets: de.exercise_sets.map((s) => ({
-                    id: s.id,
-                    reps: s.reps ?? 0,
-                    weight: s.weight ?? 0,
-                    completed: s.completed ?? false,
-                })),
-            })),
+            dailyExercises: mapDailyExercises(workout.daily_exercises as DailyExerciseWithRelations[]),
         })),
         total
     };
@@ -168,7 +170,7 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
         const totalWeight = workout.daily_exercises.reduce((sum, de) => {
             const exerciseWeight = de.exercise_sets.reduce((setSum, set) => {
                 if (set.completed) {
-                    return setSum + (set.weight * set.reps);
+                    return setSum + ((set.weight ?? 0) * (set.reps ?? 0));
                 }
                 return setSum;
             }, 0);
@@ -209,7 +211,7 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
         const totalWeight = workout.daily_exercises.reduce((sum, de) => {
             const exerciseWeight = de.exercise_sets.reduce((setSum, set) => {
                 if (set.completed) {
-                    return setSum + (set.weight * set.reps);
+                    return setSum + ((set.weight ?? 0) * (set.reps ?? 0));
                 }
                 return setSum;
             }, 0);
@@ -228,17 +230,14 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
                 if (completedSets.length === 0) return null;
 
                 const bestSet = completedSets.reduce((best, current) => {
-                    const currentTotal = current.weight * current.reps;
+                    const currentTotal = (current.weight ?? 0) * (current.reps ?? 0);
                     const bestTotal = best ? best.weight * best.reps : 0;
-                    return currentTotal > bestTotal ? current : best;
+                    return currentTotal > bestTotal ? { weight: current.weight ?? 0, reps: current.reps ?? 0 } : best;
                 }, null as { weight: number; reps: number } | null);
 
                 return {
                     setsCompleted: completedSets.length,
-                    bestSet: bestSet ? {
-                        weight: bestSet.weight,
-                        reps: bestSet.reps
-                    } : undefined,
+                    bestSet: bestSet ?? undefined,
                     exercise: {
                         name: de.user_exercises.name
                     }
@@ -260,28 +259,67 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
     };
 };
 
+interface CreateOrUpdateSetPayload {
+    id: string;
+    reps?: number | null;
+    weight?: number | null;
+    addedWeight?: number | null;
+    durationSeconds?: number | null;
+    distanceMeters?: number | null;
+    rpe?: number | null;
+    isWarmup?: boolean;
+    setNumber?: number | null;
+    completedAt?: string | null;
+    completed: boolean;
+}
+
+interface CreateOrUpdateDailyExercisePayload {
+    id: string;
+    order: number;
+    exercise: {
+        id: string;
+        name: string;
+        exerciseType: string;
+        exerciseBodyPart: string;
+    };
+    sets: CreateOrUpdateSetPayload[];
+}
+
+// Diffs each exercise's completed sets against its current-best personal records
+// and upserts anything improved. Returns only the records that actually changed.
+const evaluateWorkoutRecords = async (
+    userId: string,
+    dailyExercises: CreateOrUpdateDailyExercisePayload[]
+): Promise<PersonalRecordResponse[]> => {
+    const newRecords: PersonalRecordResponse[] = [];
+
+    for (const de of dailyExercises) {
+        const completedSets = de.sets.filter((s) => s.completed);
+        if (completedSets.length === 0) continue;
+
+        const records = await evaluateAndUpsertExerciseRecords(
+            userId,
+            de.exercise.id,
+            completedSets.map((s) => ({
+                weight: s.weight ?? null,
+                addedWeight: s.addedWeight ?? null,
+                reps: s.reps ?? null,
+                durationSeconds: s.durationSeconds ?? null,
+                distanceMeters: s.distanceMeters ?? null,
+                completedAt: s.completedAt ? new Date(s.completedAt) : new Date(),
+            }))
+        );
+        newRecords.push(...records);
+    }
+
+    return newRecords;
+};
+
 export const createWorkout = async (userId: string, workoutData: {
     date: string;
     updatedAt: number;
-    dailyExercises: Array<{
-        id: string;
-        order: number;
-        exercise: {
-            id: string;
-            name: string;
-            exerciseType: string;
-            exerciseBodyPart: string;
-        };
-        sets: Array<{
-            id: string;
-            reps?: number;
-            weight?: number;
-            setNumber?: number | null;
-            completedAt?: string | null;
-            completed: boolean;
-        }>;
-    }>;
-}): Promise<void> => {
+    dailyExercises: CreateOrUpdateDailyExercisePayload[];
+}): Promise<{ newRecords: PersonalRecordResponse[] }> => {
     // Check if a workout day for this user/date already exists
     const existing = await prisma.workout_days.findFirst({
         where: { user_id: userId, date: new Date(workoutData.date) }
@@ -310,8 +348,13 @@ export const createWorkout = async (userId: string, workoutData: {
                     exercise_sets: {
                         create: de.sets.map(set => ({
                             id: set.id,
-                            reps: set.reps ?? 0,
-                            weight: set.weight ?? 0,
+                            reps: set.reps ?? null,
+                            weight: set.weight ?? null,
+                            added_weight: set.addedWeight ?? null,
+                            duration_seconds: set.durationSeconds ?? null,
+                            distance_meters: set.distanceMeters ?? null,
+                            rpe: set.rpe ?? null,
+                            is_warmup: set.isWarmup ?? false,
                             set_number: set.setNumber ?? null,
                             completed_at: set.completedAt ? new Date(set.completedAt) : null,
                             completed: set.completed
@@ -321,6 +364,9 @@ export const createWorkout = async (userId: string, workoutData: {
             }
         }
     });
+
+    const newRecords = await evaluateWorkoutRecords(userId, workoutData.dailyExercises);
+    return { newRecords };
 };
 
 export const getWeeklySummary = async (userId: string, numOfWeeks: number) => {
@@ -396,26 +442,9 @@ export const updateWorkout = async (
     workoutData: {
         date: string;
         updatedAt: number;
-        dailyExercises: Array<{
-            id: string;
-            order: number;
-            exercise: {
-                id: string;
-                name: string;
-                exerciseType: string;
-                exerciseBodyPart: string;
-            };
-            sets: Array<{
-                id: string;
-                reps?: number;
-                weight?: number;
-                setNumber?: number | null;
-                completedAt?: string | null;
-                completed: boolean;
-            }>;
-        }>;
+        dailyExercises: CreateOrUpdateDailyExercisePayload[];
     }
-): Promise<{ date: Date } | null> => {
+): Promise<{ date: Date; newRecords: PersonalRecordResponse[] } | null> => {
     // Find the workout_day by id and userId
     const existing = await prisma.workout_days.findFirst({
         where: { id: workoutId, user_id: userId }
@@ -441,8 +470,13 @@ export const updateWorkout = async (
                     exercise_sets: {
                         create: de.sets.map(set => ({
                             id: set.id,
-                            reps: set.reps ?? 0,
-                            weight: set.weight ?? 0,
+                            reps: set.reps ?? null,
+                            weight: set.weight ?? null,
+                            added_weight: set.addedWeight ?? null,
+                            duration_seconds: set.durationSeconds ?? null,
+                            distance_meters: set.distanceMeters ?? null,
+                            rpe: set.rpe ?? null,
+                            is_warmup: set.isWarmup ?? false,
                             set_number: set.setNumber ?? null,
                             completed_at: set.completedAt ? new Date(set.completedAt) : null,
                             completed: set.completed
@@ -452,5 +486,7 @@ export const updateWorkout = async (
             }
         }
     });
-    return { date: new Date(workoutData.date) };
+
+    const newRecords = await evaluateWorkoutRecords(userId, workoutData.dailyExercises);
+    return { date: new Date(workoutData.date), newRecords };
 };

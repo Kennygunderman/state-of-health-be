@@ -1,9 +1,10 @@
 import { Router } from 'express';
-import { getExercises, deleteExercise, createTemplateController, getTemplatesController, deleteTemplateController, createExerciseController } from '../controllers/exercise.controller';
+import { getExercises, deleteExercise, createTemplateController, getTemplatesController, deleteTemplateController, createExerciseController, getExerciseHistoryController } from '../controllers/exercise.controller';
 
 const router = Router();
 
 router.get('/exercises', getExercises);
+router.get('/exercises/:exerciseId/history', getExerciseHistoryController);
 router.post('/exercise', createExerciseController);
 router.delete('/exercise/:exerciseId', deleteExercise);
 

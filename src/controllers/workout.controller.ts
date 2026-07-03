@@ -59,10 +59,10 @@ export const getWorkoutSummary = async (req: Request, res: Response) => {
 export const createWorkout = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
-        await createWorkoutService(userId, req.body);
+        const { newRecords } = await createWorkoutService(userId, req.body);
         // Fetch the newly created workout by date
         const workout = await getWorkoutByDate(userId, req.body.date);
-        return res.status(201).json(workout);
+        return res.status(201).json(workout ? { ...workout, newRecords } : null);
     } catch (error) {
         console.error('Error creating workout:', error);
         res.status(500).json({ error: 'Failed to create workout' });
@@ -92,7 +92,7 @@ export const updateWorkout = async (req: Request, res: Response) => {
         }
         // Fetch the updated workout by date
         const workout = await getWorkoutByDate(userId, updated.date.toISOString());
-        return res.json(workout);
+        return res.json(workout ? { ...workout, newRecords: updated.newRecords } : null);
     } catch (error) {
         console.error('Error updating workout:', error);
         res.status(500).json({ error: 'Failed to update workout' });

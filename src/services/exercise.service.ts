@@ -1,11 +1,13 @@
 import { prisma } from '../prisma/client';
 import { v4 as uuidv4 } from 'uuid';
+import { getExerciseHistory as getExerciseHistoryRecords } from './record.service';
 
 interface ExerciseWithRelations {
     id: string;
     name: string;
     exercise_type: string;
     exercise_body_part: string;
+    logging_type: string;
     user_id: string | null;
     deleted_at: Date | null;
     daily_exercises: {
@@ -15,8 +17,12 @@ interface ExerciseWithRelations {
         exercise_sets: {
             id: string;
             daily_exercise_id: string;
-            reps: number;
-            weight: number;
+            reps: number | null;
+            weight: number | null;
+            added_weight: number | null;
+            duration_seconds: number | null;
+            distance_meters: number | null;
+            rpe: number | null;
             completed: boolean | null;
             set_number: number | null;
             completed_at: Date | null;
@@ -82,12 +88,17 @@ export const getUserExercises = async (userId: string) => {
             name: exercise.name,
             exerciseType: exercise.exercise_type,
             exerciseBodyPart: exercise.exercise_body_part,
+            loggingType: exercise.logging_type,
             latestCompletedSets: latestSets?.map(set => ({
                 id: set.id,
-                reps: set.reps,
-                weight: set.weight,
+                reps: set.reps ?? 0,
+                weight: set.weight ?? 0,
                 setNumber: set.set_number,
-                completedAt: set.completed_at?.toISOString()
+                completedAt: set.completed_at?.toISOString(),
+                addedWeight: set.added_weight,
+                durationSeconds: set.duration_seconds,
+                distanceMeters: set.distance_meters,
+                rpe: set.rpe
             })) ?? []
         };
     });
@@ -202,6 +213,7 @@ export const createExercise = async (userId: string, payload: {
     name: string;
     exerciseType: string;
     exerciseBodyPart: string;
+    loggingType?: string;
 }) => {
     const exercise = await prisma.user_exercises.create({
         data: {
@@ -209,13 +221,26 @@ export const createExercise = async (userId: string, payload: {
             user_id: userId,
             name: payload.name,
             exercise_type: payload.exerciseType,
-            exercise_body_part: payload.exerciseBodyPart
+            exercise_body_part: payload.exerciseBodyPart,
+            logging_type: payload.loggingType ?? 'WEIGHT_REPS'
         }
     });
     return {
         id: exercise.id,
         name: exercise.name,
         exerciseType: exercise.exercise_type,
-        exerciseBodyPart: exercise.exercise_body_part
+        exerciseBodyPart: exercise.exercise_body_part,
+        loggingType: exercise.logging_type
     };
+};
+
+export const getExerciseHistory = async (userId: string, exerciseId: string, page: number = 1, limit: number = 20) => {
+    const exercise = await prisma.user_exercises.findFirst({
+        where: { id: exerciseId, user_id: userId }
+    });
+    if (!exercise) {
+        throw new Error('Exercise not found or does not belong to user');
+    }
+
+    return getExerciseHistoryRecords(userId, exerciseId, page, limit);
 };

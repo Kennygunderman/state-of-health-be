@@ -16,13 +16,20 @@ model daily_exercises {
   user_exercises user_exercises  @relation(fields: [exercise_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "daily_exercise_exercise_id_fkey")
   workout_days   workout_days    @relation(fields: [workout_day_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "daily_exercise_workout_day_id_fkey")
   exercise_sets  exercise_sets[]
+
+  @@index([exercise_id], map: "idx_daily_exercises_exercise_id")
 }
 
 model exercise_sets {
   id                String          @id(map: "exercise_set_pkey") @db.Uuid
   daily_exercise_id String          @db.Uuid
-  reps              Int
-  weight            Float
+  reps              Int?
+  weight            Float?
+  added_weight      Float?
+  duration_seconds  Int?
+  distance_meters   Float?
+  rpe               Float?
+  is_warmup         Boolean?        @default(false)
   completed         Boolean?        @default(false)
   set_number        Int?
   completed_at      DateTime?       @db.Date
@@ -30,23 +37,30 @@ model exercise_sets {
 }
 
 model user_exercises {
-  id                 String            @id(map: "exercise_pkey") @db.Uuid
+  id                 String              @id(map: "exercise_pkey") @db.Uuid
   name               String
   exercise_type      String
   exercise_body_part String
+  logging_type       String              @default("WEIGHT_REPS")
   user_id            String?
-  deleted_at         DateTime?         @db.Timestamptz(6)
+  deleted_at         DateTime?           @db.Timestamptz(6)
   daily_exercises    daily_exercises[]
-  users              users?            @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "user_exercise_user_id_fkey")
+  personal_records   personal_records[]
+  users              users?              @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "user_exercise_user_id_fkey")
+
+  @@index([user_id], map: "idx_user_exercises_user_id")
 }
 
 model users {
-  id             String           @id
-  first_name     String?
-  last_name      String?
-  email          String           @unique
-  templates      templates[]
-  user_exercises user_exercises[]
+  id                    String                  @id
+  first_name            String?
+  last_name             String?
+  email                 String                  @unique
+  templates             templates[]
+  user_exercises        user_exercises[]
+  personal_records      personal_records[]
+  runs                  runs[]
+  run_personal_records  run_personal_records[]
 }
 
 model workout_days {
@@ -70,4 +84,84 @@ model templates {
 
   @@unique([user_id, name], map: "unique_user_template_name")
   @@index([user_id], map: "idx_templates_user_id")
+}
+
+// Current-best PR per user x exercise x record type. record_type is one of:
+// MAX_WEIGHT | MAX_REPS | MAX_ESTIMATED_1RM | MAX_VOLUME | MAX_DURATION | MAX_DISTANCE
+model personal_records {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id         String
+  exercise_id     String          @db.Uuid
+  record_type     String
+  value           Float
+  unit            String
+  reps_at_record  Int?
+  exercise_set_id String?         @db.Uuid
+  achieved_at     DateTime
+  created_at      DateTime        @default(now())
+  users           users           @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  user_exercises  user_exercises  @relation(fields: [exercise_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([user_id, exercise_id, record_type], map: "unique_user_exercise_record_type")
+  @@index([user_id], map: "idx_personal_records_user_id")
+}
+
+// Cardio session, sibling to workout_days rather than nested inside it.
+// has_synced / updated_at mirror workout_days' offline-sync contract exactly.
+model runs {
+  id                  String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id             String
+  started_at          DateTime
+  ended_at            DateTime?
+  duration_seconds    Int
+  distance_meters     Float
+  avg_pace_sec_per_km Float?
+  elevation_gain_m    Float?
+  elevation_loss_m    Float?
+  avg_heart_rate      Int?
+  max_heart_rate      Int?
+  calories            Int?
+  run_type            String       @default("OUTDOOR")
+  source              String       @default("MANUAL")
+  route_polyline      String?      @db.Text
+  notes               String?
+  has_synced          Boolean?     @default(false)
+  updated_at          BigInt       @default(0)
+  created_at          DateTime     @default(now())
+  users               users        @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  run_splits          run_splits[]
+  run_personal_records run_personal_records[]
+
+  @@index([user_id, started_at], map: "idx_runs_user_id_started_at")
+}
+
+model run_splits {
+  id               String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  run_id           String @db.Uuid
+  split_number     Int
+  distance_meters  Float
+  duration_seconds Int
+  pace_sec_per_km  Float?
+  runs             runs   @relation(fields: [run_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([run_id, split_number], map: "unique_run_split_number")
+}
+
+// Separate from personal_records (rather than a nullable exercise_id there) because
+// Postgres unique indexes treat NULL as distinct from NULL, so a nullable exercise_id
+// would let duplicate run PR rows slip past the uniqueness guarantee. record_type here
+// is one of: MAX_DISTANCE | MAX_DURATION | BEST_PACE
+model run_personal_records {
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id     String
+  record_type String
+  value       Float
+  unit        String
+  run_id      String?   @db.Uuid
+  achieved_at DateTime
+  created_at  DateTime  @default(now())
+  users       users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  runs        runs?     @relation(fields: [run_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@unique([user_id, record_type], map: "unique_user_run_record_type")
 }

@@ -3,6 +3,8 @@ import workoutRoutes from './routes/workout.routes';
 import exerciseRoutes from './routes/exercise.routes';
 import migrationRoutes from './routes/migration.routes';
 import userRoutes from './routes/user.routes';
+import runRoutes from './routes/run.routes';
+import recordRoutes from './routes/record.routes';
 import { authenticateFirebaseToken } from './middleware/auth';
 
 const app = express();
@@ -16,5 +18,7 @@ app.use(authenticateFirebaseToken);
 app.use('/api', workoutRoutes);
 app.use('/api', exerciseRoutes);
 app.use('/api', migrationRoutes);
+app.use('/api', runRoutes);
+app.use('/api', recordRoutes);
 
 export default app;
