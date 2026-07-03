@@ -41,7 +41,7 @@ Rules:
 - Return one item per distinct food or drink.
 - Estimate as-eaten portions (what the person actually consumed), not label servings.
 - All calorie and gram values are integers.
-- "quantityText" is a short human-readable portion line, e.g. "2 · 12g protein" or "12 oz · 5g protein" — quantity first, then protein.
+- "quantityText" is a short human-readable portion ONLY, e.g. "2", "1 slice", "12 oz", "1 bowl" — never include calories or nutrient values in it.
 - "grams" is your best estimate of the item's total as-eaten weight in grams (for drinks, total milliliters).
 - Set confidence to "low" when portion sizes are guesses, "high" only when quantities are explicit.
 - Never refuse: always give a best-effort estimate, and use "notes" for any assumption worth flagging (e.g. "Assumed whole milk in the latte.").`;
