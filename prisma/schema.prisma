@@ -56,12 +56,21 @@ model users {
   first_name            String?
   last_name             String?
   email                 String                  @unique
+  // Daily macro targets. Nullable = "not set"; the app falls back to its
+  // local default (1800 cal) until the user saves targets.
+  target_calories       Int?
+  target_protein_g      Int?
+  target_carbs_g        Int?
+  target_fat_g          Int?
   templates             templates[]
   user_exercises        user_exercises[]
   personal_records      personal_records[]
   runs                  runs[]
   run_personal_records  run_personal_records[]
   body_weight_entries   body_weight_entries[]
+  foods                 foods[]
+  meals                 meals[]
+  meal_entries          meal_entries[]
 }
 
 model workout_days {
@@ -178,4 +187,77 @@ model run_personal_records {
   runs        runs?     @relation(fields: [run_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
 
   @@unique([user_id, record_type], map: "unique_user_run_record_type")
+}
+
+// ---------------------------------------------------------------------------
+// Macros (nutrition) — see ../macros-refactor-plan/ in the workspace root.
+// ---------------------------------------------------------------------------
+
+// Personal food library ("Your foods"). One row per user-owned food with
+// per-serving values. Soft-deleted so meal_entries snapshots keep provenance.
+model foods {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id        String
+  name           String
+  serving_amount Float          @default(1)
+  serving_unit   String?
+  calories       Int
+  protein_g      Int
+  carbs_g        Int
+  fat_g          Int
+  brand          String?
+  source         String         @default("manual") // 'manual' | 'label_scan' | 'branded' | 'seed'
+  created_at     DateTime       @default(now())
+  updated_at     DateTime       @default(now()) @updatedAt
+  deleted_at     DateTime?      @db.Timestamptz(6)
+  users          users          @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  meal_entries   meal_entries[]
+
+  @@index([user_id, name], map: "idx_foods_user_id_name")
+}
+
+// One row per meal per user-day (Breakfast/Lunch/Dinner defaults are created
+// lazily on first read of a day; users can add/rename/delete custom meals).
+model meals {
+  id           String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id      String
+  date         DateTime       @db.Date
+  name         String
+  sort_order   Int            @default(0)
+  created_at   DateTime       @default(now())
+  deleted_at   DateTime?      @db.Timestamptz(6)
+  users        users          @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  meal_entries meal_entries[]
+
+  @@index([user_id, date], map: "idx_meals_user_id_date")
+}
+
+// One row per logged item inside a meal. Name/serving/macros are SNAPSHOTS
+// taken at log time (per-serving values); displayed totals multiply by
+// `servings` at read time. food_id is provenance only — renders never join
+// through it, so library edits/deletes can't rewrite history.
+model meal_entries {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  meal_id      String    @db.Uuid
+  user_id      String    // denormalized for cheap day/history aggregates
+  date         DateTime  @db.Date // denormalized day key, matches meals.date
+  food_id      String?   @db.Uuid
+  name         String
+  serving_text String?
+  servings     Float     @default(1)
+  calories     Int       // per serving (as-eaten for AI items, servings = 1)
+  protein_g    Int       // per serving
+  carbs_g      Int
+  fat_g        Int
+  input_method String    @default("library") // 'library' | 'search' | 'ai_text' | 'ai_photo'
+  raw_input    String?   @db.Text
+  logged_at    DateTime  @default(now())
+  updated_at   DateTime  @default(now()) @updatedAt
+  deleted_at   DateTime? @db.Timestamptz(6)
+  meals        meals     @relation(fields: [meal_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users        users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  foods        foods?    @relation(fields: [food_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@index([user_id, date], map: "idx_meal_entries_user_id_date")
+  @@index([meal_id], map: "idx_meal_entries_meal_id")
 }
