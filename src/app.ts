@@ -29,7 +29,10 @@ app.use('/api', migrationRoutes);
 app.use('/api', runRoutes);
 app.use('/api', recordRoutes);
 app.use('/api', weighInRoutes);
-app.use('/api', nutritionRoutes);
+// foodRoutes must mount BEFORE nutritionRoutes: it owns the literal
+// /macros/search-branded-foods and /macros/branded-food/:foodId paths, which
+// nutrition's /macros/:date would otherwise swallow (date = "search-branded-foods").
 app.use('/api', foodRoutes);
+app.use('/api', nutritionRoutes);
 
 export default app;
