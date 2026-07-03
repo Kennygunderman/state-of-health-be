@@ -83,12 +83,17 @@ export const getUserExercises = async (userId: string) => {
             .filter(set => set.completed && set.completed_at)
             .sort((a, b) => (a.set_number ?? 0) - (b.set_number ?? 0));
 
+        // exercise_sets is already filtered to completed sets by the query
+        const totalCompletedSets = exercise.daily_exercises
+            .reduce((sum, dailyExercise) => sum + dailyExercise.exercise_sets.length, 0);
+
         return {
             id: exercise.id,
             name: exercise.name,
             exerciseType: exercise.exercise_type,
             exerciseBodyPart: exercise.exercise_body_part,
             loggingType: exercise.logging_type,
+            totalCompletedSets,
             latestCompletedSets: latestSets?.map(set => ({
                 id: set.id,
                 reps: set.reps ?? 0,

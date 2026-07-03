@@ -42,6 +42,10 @@ const computeSetCandidates = (set: SetForRecords): RecordCandidate[] => {
         });
     } else if (set.reps !== null && set.reps > 0) {
         candidates.push({ recordType: 'MAX_REPS', value: set.reps, unit: 'reps' });
+    } else if (effectiveWeight !== null && effectiveWeight > 0 && set.durationSeconds !== null && set.durationSeconds > 0) {
+        // Weight-for-time sets (WEIGHT_TIME, e.g. farmers carries): the heaviest
+        // load carried is still a weight record; volume/1RM need reps to mean anything.
+        candidates.push({ recordType: 'MAX_WEIGHT', value: effectiveWeight, unit: 'lb' });
     }
 
     if (set.durationSeconds !== null && set.durationSeconds > 0) {

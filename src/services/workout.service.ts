@@ -129,15 +129,62 @@ export const getAllWorkoutsForUser = async (userId: string, page: number = 1, li
     };
 };
 
+interface BestSetFields {
+    weight: number | null;
+    added_weight: number | null;
+    reps: number | null;
+    duration_seconds: number | null;
+}
+
+// What makes a set the "best" of an exercise depends on how it's logged:
+// weight x reps for loaded lifts, most reps for bodyweight, longest hold for
+// timed work, heaviest carry (duration as tiebreak) for weighted-timed.
+// Returns [primary, tiebreak] so callers can compare lexicographically.
+const bestSetScore = (loggingType: string, set: BestSetFields): [number, number] => {
+    const weight = set.weight ?? 0;
+    const addedWeight = set.added_weight ?? 0;
+    const reps = set.reps ?? 0;
+    const duration = set.duration_seconds ?? 0;
+
+    switch (loggingType) {
+        case 'BODYWEIGHT_REPS':
+            return [reps, 0];
+        case 'WEIGHTED_BODYWEIGHT':
+            return [addedWeight * reps, reps];
+        case 'TIME_ONLY':
+            return [duration, 0];
+        case 'WEIGHT_TIME':
+            return [weight, duration];
+        case 'TIME_REPS':
+            return [duration * reps, duration];
+        default:
+            return [weight * reps, reps];
+    }
+};
+
+const isBetterSet = (loggingType: string, candidate: BestSetFields, current: BestSetFields): boolean => {
+    const [candidatePrimary, candidateTiebreak] = bestSetScore(loggingType, candidate);
+    const [currentPrimary, currentTiebreak] = bestSetScore(loggingType, current);
+
+    return candidatePrimary !== currentPrimary
+        ? candidatePrimary > currentPrimary
+        : candidateTiebreak > currentTiebreak;
+};
+
 export const getWorkoutSummary = async (userId: string, page: number = 1, limit: number = 10): Promise<{ summaries: Array<{
     workoutDayId: string;
     day: string;
     totalWeight: number;
+    totalDurationSeconds: number;
+    totalBodyweightReps: number;
     exercises: Array<{
         setsCompleted: number;
+        loggingType: string;
         bestSet?: {
-            weight: number;
-            reps: number;
+            weight: number | null;
+            addedWeight: number | null;
+            reps: number | null;
+            durationSeconds: number | null;
         };
         exercise: {
             name: string;
@@ -165,19 +212,11 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
         }
     });
 
-    // Calculate total count of workouts with completed sets
-    const total = allWorkouts.filter(workout => {
-        const totalWeight = workout.daily_exercises.reduce((sum, de) => {
-            const exerciseWeight = de.exercise_sets.reduce((setSum, set) => {
-                if (set.completed) {
-                    return setSum + ((set.weight ?? 0) * (set.reps ?? 0));
-                }
-                return setSum;
-            }, 0);
-            return sum + exerciseWeight;
-        }, 0);
-        return totalWeight > 0;
-    }).length;
+    // Calculate total count of workouts with completed sets (the query above
+    // already narrows exercise_sets to completed ones)
+    const total = allWorkouts.filter(workout =>
+        workout.daily_exercises.some(de => de.exercise_sets.length > 0)
+    ).length;
 
     // Get paginated workouts with completed sets
     const workouts = await prisma.workout_days.findMany({
@@ -207,37 +246,48 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
     });
 
     const summaries = workouts.map(workout => {
-        // Calculate total weight first
-        const totalWeight = workout.daily_exercises.reduce((sum, de) => {
-            const exerciseWeight = de.exercise_sets.reduce((setSum, set) => {
-                if (set.completed) {
-                    return setSum + ((set.weight ?? 0) * (set.reps ?? 0));
-                }
-                return setSum;
-            }, 0);
-            return sum + exerciseWeight;
-        }, 0);
+        const completedSetsOf = (sets: typeof workout.daily_exercises[number]['exercise_sets']) =>
+            sets.filter(set => set.completed);
 
-        // Skip days with no weight lifted
-        if (totalWeight === 0) {
-            return null;
-        }
+        const totalWeight = workout.daily_exercises.reduce((sum, de) =>
+            sum + completedSetsOf(de.exercise_sets).reduce((setSum, set) =>
+                setSum + ((set.weight ?? 0) * (set.reps ?? 0)), 0), 0);
+
+        const totalDurationSeconds = workout.daily_exercises.reduce((sum, de) =>
+            sum + completedSetsOf(de.exercise_sets).reduce((setSum, set) =>
+                setSum + (set.duration_seconds ?? 0), 0), 0);
+
+        // Reps done against bodyweight (with or without added load) — the
+        // volume chip can't represent these, so they get their own count
+        const totalBodyweightReps = workout.daily_exercises.reduce((sum, de) => {
+            const loggingType = de.user_exercises.logging_type;
+            if (loggingType !== 'BODYWEIGHT_REPS' && loggingType !== 'WEIGHTED_BODYWEIGHT') return sum;
+
+            return sum + completedSetsOf(de.exercise_sets).reduce((setSum, set) => setSum + (set.reps ?? 0), 0);
+        }, 0);
 
         const exercises = workout.daily_exercises
             .map(de => {
-                const completedSets = de.exercise_sets.filter(set => set.completed);
+                const completedSets = completedSetsOf(de.exercise_sets);
                 // Skip exercises with no completed sets
                 if (completedSets.length === 0) return null;
 
-                const bestSet = completedSets.reduce((best, current) => {
-                    const currentTotal = (current.weight ?? 0) * (current.reps ?? 0);
-                    const bestTotal = best ? best.weight * best.reps : 0;
-                    return currentTotal > bestTotal ? { weight: current.weight ?? 0, reps: current.reps ?? 0 } : best;
-                }, null as { weight: number; reps: number } | null);
+                const loggingType = de.user_exercises.logging_type;
+                const best = completedSets.reduce((currentBest, candidate) =>
+                    currentBest === null || isBetterSet(loggingType, candidate, currentBest) ? candidate : currentBest,
+                null as (typeof completedSets)[number] | null);
 
                 return {
                     setsCompleted: completedSets.length,
-                    bestSet: bestSet ?? undefined,
+                    loggingType,
+                    bestSet: best
+                        ? {
+                            weight: best.weight ?? null,
+                            addedWeight: best.added_weight ?? null,
+                            reps: best.reps ?? null,
+                            durationSeconds: best.duration_seconds ?? null
+                        }
+                        : undefined,
                     exercise: {
                         name: de.user_exercises.name
                     }
@@ -245,10 +295,18 @@ export const getWorkoutSummary = async (userId: string, page: number = 1, limit:
             })
             .filter((exercise): exercise is NonNullable<typeof exercise> => exercise !== null);
 
+        // Skip days where nothing was completed — any completed set counts,
+        // regardless of whether it moved external weight
+        if (exercises.length === 0) {
+            return null;
+        }
+
         return {
             workoutDayId: workout.id,
             day: workout.date.toISOString(),
             totalWeight,
+            totalDurationSeconds,
+            totalBodyweightReps,
             exercises
         };
     }).filter((summary): summary is NonNullable<typeof summary> => summary !== null);
@@ -414,18 +472,11 @@ export const getWeeklySummary = async (userId: string, numOfWeeks: number) => {
             return isInWeek;
         });
 
-        // For each day, check if any set is completed (matching client logic)
-        const completedDays = daysInWeek.filter(wd => {
-            // Calculate total weight for the day (matching client logic)
-            const totalWeightForDay = wd.daily_exercises.reduce((daySum, de) => {
-                return daySum + de.exercise_sets.reduce((setSum, set) => {
-                    return setSum + ((set.weight ?? 0) * (set.reps ?? 0));
-                }, 0);
-            }, 0);
-
-            const hasCompletedWorkout = totalWeightForDay > 0;
-            return hasCompletedWorkout;
-        });
+        // A day counts as a workout when any set was completed — bodyweight
+        // and timed sets count even though they move no external weight
+        const completedDays = daysInWeek.filter(wd =>
+            wd.daily_exercises.some(de => de.exercise_sets.some(set => set.completed === true))
+        );
 
         return {
             startOfWeek: format(start, 'M/d'),
