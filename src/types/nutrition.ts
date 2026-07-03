@@ -110,6 +110,10 @@ export interface EstimateItem {
     protein: number;
     carbs: number;
     fat: number;
+    // 'db_matched' = values grounded in a USDA generic-food entry scaled by the
+    // LLM's portion estimate; 'estimated' = pure LLM output.
+    source: 'estimated' | 'db_matched';
+    matchedTo: string | null; // USDA food description when db_matched
 }
 
 export interface EstimateResponse {

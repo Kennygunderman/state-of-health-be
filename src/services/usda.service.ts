@@ -49,6 +49,56 @@ const titleCase = (value: string): string =>
 
 const round = (value: number): number => Math.round(value);
 
+// Generic (non-branded) foods for grounding AI estimates: FNDDS "Survey"
+// foods are as-eaten descriptions ("Bagel, plain"), SR Legacy/Foundation are
+// reference foods. All carry per-100g nutrients in search results.
+export interface GenericFoodCandidate {
+    fdcId: string;
+    description: string;
+    dataType: string;
+    caloriesPer100g: number;
+    proteinPer100g: number;
+    carbsPer100g: number;
+    fatPer100g: number;
+}
+
+export const searchGenericFoods = async (query: string, limit: number = 6): Promise<GenericFoodCandidate[]> => {
+    const data = await usdaGet('/foods/search', {
+        query,
+        dataType: 'Survey (FNDDS),SR Legacy,Foundation',
+        pageSize: String(limit),
+        pageNumber: '1',
+    });
+    const foods = Array.isArray(data?.foods) ? data.foods : [];
+
+    return foods
+        .map((food: any): GenericFoodCandidate | null => {
+            if (!food?.fdcId || typeof food?.description !== 'string' || !Array.isArray(food?.foodNutrients)) {
+                return null;
+            }
+            const per100 = (nutrientNumber: string): number | null => {
+                const nutrient = food.foodNutrients.find((n: any) => String(n?.nutrientNumber) === nutrientNumber);
+                const value = Number(nutrient?.value);
+                return Number.isFinite(value) ? value : null;
+            };
+            const protein = per100(NUTRIENT_PROTEIN);
+            const fat = per100(NUTRIENT_FAT);
+            const carbs = per100(NUTRIENT_CARBS);
+            if (protein === null || fat === null || carbs === null) return null;
+            const calories = per100(NUTRIENT_CALORIES) ?? protein * 4 + carbs * 4 + fat * 9;
+            return {
+                fdcId: String(food.fdcId),
+                description: food.description,
+                dataType: String(food.dataType ?? ''),
+                caloriesPer100g: calories,
+                proteinPer100g: protein,
+                carbsPer100g: carbs,
+                fatPer100g: fat,
+            };
+        })
+        .filter((food: GenericFoodCandidate | null): food is GenericFoodCandidate => food !== null);
+};
+
 export const searchBrandedFoods = async (query: string): Promise<BrandedFoodResponse[]> => {
     const data = await usdaGet('/foods/search', {
         query,
