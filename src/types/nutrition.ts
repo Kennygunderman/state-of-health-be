@@ -42,11 +42,6 @@ export interface MacroTargetsResponse {
     fat: number | null;
 }
 
-export interface CreateMealPayload {
-    date: string; // 'yyyy-MM-dd'
-    name: string;
-}
-
 export interface LogMealEntryPayload {
     foodId?: string;
     name: string;

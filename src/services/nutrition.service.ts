@@ -1,6 +1,5 @@
 import { prisma } from '../prisma/client';
 import {
-    CreateMealPayload,
     DailyMacrosResponse,
     DailySummaryResponse,
     LogMealEntryPayload,
@@ -11,7 +10,7 @@ import {
     UpdateMealEntryPayload,
 } from '../types/nutrition';
 
-const DEFAULT_MEALS = ['Breakfast', 'Lunch', 'Dinner'];
+const DEFAULT_MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
 const INPUT_METHODS = ['library', 'search', 'ai_text', 'ai_photo'];
 
 interface MealEntryRow {
@@ -102,16 +101,17 @@ export const getDailyMacros = async (userId: string, dateKey: string): Promise<D
     const date = new Date(dateKey);
     let meals = await fetchMealsForDay(userId, date);
 
-    // Lazily create the default meals on first read of a day — the server-side
-    // version of the old MealsScreen mount effect, so every client sees the
-    // same day shape.
-    if (meals.length === 0) {
+    // Meals are a fixed set — lazily top up whichever defaults are missing on
+    // read, so new days materialize fully and days created before a default
+    // was added self-heal. sort_order comes from DEFAULT_MEALS position.
+    const missing = DEFAULT_MEALS.filter((name) => !meals.some((meal) => meal.name === name));
+    if (missing.length > 0) {
         await prisma.meals.createMany({
-            data: DEFAULT_MEALS.map((name, index) => ({
+            data: missing.map((name) => ({
                 user_id: userId,
                 date,
                 name,
-                sort_order: index,
+                sort_order: DEFAULT_MEALS.indexOf(name),
             })),
         });
         meals = await fetchMealsForDay(userId, date);
@@ -124,49 +124,6 @@ export const getDailyMacros = async (userId: string, dateKey: string): Promise<D
         totals: sumEntries(meals.flatMap((meal) => meal.meal_entries)),
         targets: await getTargetsForUser(userId),
     };
-};
-
-export const createMeal = async (userId: string, payload: CreateMealPayload): Promise<MealResponse> => {
-    const date = new Date(payload.date);
-    const maxSort = await prisma.meals.aggregate({
-        where: { user_id: userId, date, deleted_at: null },
-        _max: { sort_order: true },
-    });
-    const meal = await prisma.meals.create({
-        data: {
-            user_id: userId,
-            date,
-            name: payload.name.trim(),
-            sort_order: (maxSort._max.sort_order ?? -1) + 1,
-        },
-        include: { meal_entries: { where: { deleted_at: null } } },
-    });
-    return mapMeal(meal);
-};
-
-export const renameMeal = async (userId: string, mealId: string, name: string): Promise<MealResponse | null> => {
-    const existing = await prisma.meals.findFirst({ where: { id: mealId, user_id: userId, deleted_at: null } });
-    if (!existing) return null;
-    const meal = await prisma.meals.update({
-        where: { id: mealId },
-        data: { name: name.trim() },
-        include: { meal_entries: { where: { deleted_at: null }, orderBy: { logged_at: 'asc' } } },
-    });
-    return mapMeal(meal);
-};
-
-export const deleteMeal = async (userId: string, mealId: string): Promise<boolean> => {
-    const { count } = await prisma.meals.updateMany({
-        where: { id: mealId, user_id: userId, deleted_at: null },
-        data: { deleted_at: new Date() },
-    });
-    if (count > 0) {
-        await prisma.meal_entries.updateMany({
-            where: { meal_id: mealId, deleted_at: null },
-            data: { deleted_at: new Date() },
-        });
-    }
-    return count > 0;
 };
 
 export const logMealEntry = async (

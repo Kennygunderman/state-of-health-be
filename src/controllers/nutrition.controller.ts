@@ -1,12 +1,9 @@
 import { Request, Response } from 'express';
 import {
-    createMeal,
-    deleteMeal,
     deleteMealEntry,
     getDailyMacros,
     getHistory,
     logMealEntry,
-    renameMeal,
     updateMealEntry,
     updateTargets,
 } from '../services/nutrition.service';
@@ -32,53 +29,6 @@ export const getDailyMacrosController = async (req: Request, res: Response) => {
     } catch (error) {
         console.error('Error getting daily macros:', error);
         res.status(500).json({ error: 'Failed to get daily macros' });
-    }
-};
-
-export const createMealController = async (req: Request, res: Response) => {
-    try {
-        const userId = getUserId(req);
-        const { date, name } = req.body;
-        if (!DAY_KEY_REGEX.test(date ?? '') || typeof name !== 'string' || !name.trim()) {
-            return res.status(400).json({ error: 'date (yyyy-MM-dd) and name are required' });
-        }
-        const meal = await createMeal(userId, { date, name });
-        return res.status(201).json(meal);
-    } catch (error) {
-        console.error('Error creating meal:', error);
-        res.status(500).json({ error: 'Failed to create meal' });
-    }
-};
-
-export const renameMealController = async (req: Request, res: Response) => {
-    try {
-        const userId = getUserId(req);
-        const { name } = req.body;
-        if (typeof name !== 'string' || !name.trim()) {
-            return res.status(400).json({ error: 'name is required' });
-        }
-        const meal = await renameMeal(userId, req.params.id, name);
-        if (!meal) {
-            return res.status(404).json({ error: 'Meal not found' });
-        }
-        return res.json(meal);
-    } catch (error) {
-        console.error('Error renaming meal:', error);
-        res.status(500).json({ error: 'Failed to rename meal' });
-    }
-};
-
-export const deleteMealController = async (req: Request, res: Response) => {
-    try {
-        const userId = getUserId(req);
-        const deleted = await deleteMeal(userId, req.params.id);
-        if (!deleted) {
-            return res.status(404).json({ error: 'Meal not found' });
-        }
-        return res.json({ success: true });
-    } catch (error) {
-        console.error('Error deleting meal:', error);
-        res.status(500).json({ error: 'Failed to delete meal' });
     }
 };
 

@@ -1,14 +1,11 @@
 import { Router } from 'express';
 import {
-    createMealController,
-    deleteMealController,
     deleteMealEntryController,
     estimateController,
     getDailyMacrosController,
     getHistoryController,
     labelScanController,
     logMealEntryController,
-    renameMealController,
     updateMealEntryController,
     updateTargetsController,
 } from '../controllers/nutrition.controller';
@@ -19,10 +16,8 @@ const router = Router();
 router.get('/macros/history', getHistoryController);
 router.get('/macros/:date', getDailyMacrosController);
 
-router.post('/macros/meals', createMealController);
-router.put('/macros/meal/:id', renameMealController);
-router.delete('/macros/meal/:id', deleteMealController);
-
+// Meals are a fixed per-day set (see DEFAULT_MEALS in nutrition.service) —
+// there are intentionally no create/rename/delete meal routes.
 router.post('/macros/meal/:mealId/entries', logMealEntryController);
 router.put('/macros/entry/:id', updateMealEntryController);
 router.delete('/macros/entry/:id', deleteMealEntryController);
