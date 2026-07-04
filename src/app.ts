@@ -16,9 +16,12 @@ const app = express();
 // Must be registered BEFORE the global express.json() — the first JSON parser
 // to run wins, and the global one would reject large payloads first.
 app.use(['/api/macros/estimate', '/api/macros/label-scan'], express.json({ limit: '10mb' }));
+// Avatar uploads are ~20KB base64 but can exceed the 100KB default limit if a
+// client skips resizing; the controller enforces the real cap.
+app.use('/api/user/avatar', express.json({ limit: '1mb' }));
 app.use(express.json());
 
-// Unprotected user routes
+// User routes: signup is unprotected, avatar routes carry per-route auth
 app.use('/api', userRoutes);
 
 // Protected routes

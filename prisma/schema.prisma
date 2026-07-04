@@ -62,6 +62,9 @@ model users {
   target_protein_g      Int?
   target_carbs_g        Int?
   target_fat_g          Int?
+  // Base64 JPEG, client-resized to ~192px (~10-20KB) — small enough to live
+  // in the row instead of object storage.
+  avatar_base64         String?
   templates             templates[]
   user_exercises        user_exercises[]
   personal_records      personal_records[]

@@ -1,5 +1,5 @@
 import { prisma } from '../prisma/client';
-import { CreateUserRequest, UserResponse } from '../types/user';
+import { AvatarResponse, CreateUserRequest, UserResponse } from '../types/user';
 
 export const createUser = async (userData: CreateUserRequest): Promise<UserResponse> => {
     // Check if user already exists
@@ -40,4 +40,22 @@ export const createUser = async (userData: CreateUserRequest): Promise<UserRespo
         firstName: user.first_name || undefined,
         lastName: user.last_name || undefined,
     };
+};
+
+export const updateAvatar = async (userId: string, avatarBase64: string | null): Promise<AvatarResponse> => {
+    const user = await prisma.users.update({
+        where: { id: userId },
+        data: { avatar_base64: avatarBase64 },
+    });
+
+    return { avatarBase64: user.avatar_base64 };
+};
+
+export const getAvatar = async (userId: string): Promise<AvatarResponse> => {
+    const user = await prisma.users.findUnique({
+        where: { id: userId },
+        select: { avatar_base64: true },
+    });
+
+    return { avatarBase64: user?.avatar_base64 ?? null };
 }; 

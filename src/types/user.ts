@@ -10,4 +10,12 @@ export interface UserResponse {
     email: string;
     firstName?: string;
     lastName?: string;
+}
+
+export interface UpdateAvatarRequest {
+    avatarBase64: string | null;
+}
+
+export interface AvatarResponse {
+    avatarBase64: string | null;
 } 

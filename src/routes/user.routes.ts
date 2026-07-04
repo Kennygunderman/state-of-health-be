@@ -1,8 +1,15 @@
 import { Router } from 'express';
-import { createUserController } from '../controllers/user.controller';
+import { createUserController, getAvatarController, updateAvatarController } from '../controllers/user.controller';
+import { authenticateFirebaseToken } from '../middleware/auth';
 
 const router = Router();
 
+// Unprotected: called at signup, before the client has a verified session.
 router.post('/user', createUserController);
 
-export default router; 
+// This router mounts before the global auth middleware (see app.ts), so the
+// avatar routes carry their own auth.
+router.get('/user/avatar', authenticateFirebaseToken, getAvatarController);
+router.put('/user/avatar', authenticateFirebaseToken, updateAvatarController);
+
+export default router;
