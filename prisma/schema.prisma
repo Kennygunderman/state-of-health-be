@@ -264,3 +264,14 @@ model meal_entries {
   @@index([user_id, date], map: "idx_meal_entries_user_id_date")
   @@index([meal_id], map: "idx_meal_entries_meal_id")
 }
+
+// One row per user x UTC day, counting AI calls (estimate + label-scan share
+// the pool). Enforces the free daily quota — see entitlement.service.
+model ai_usage {
+  user_id    String
+  day        String // 'YYYY-MM-DD' (UTC)
+  count      Int      @default(0)
+  updated_at DateTime @default(now()) @updatedAt
+
+  @@id([user_id, day], map: "ai_usage_pkey")
+}

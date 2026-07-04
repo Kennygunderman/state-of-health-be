@@ -7,8 +7,14 @@ import {
     updateMealEntry,
     updateTargets,
 } from '../services/nutrition.service';
-import { estimateMeal, scanLabel, EstimateRateLimitError, EstimateFailedError } from '../services/estimate.service';
-import { getUserId } from '../utils/getUserId';
+import { estimateMeal, scanLabel, EstimateFailedError } from '../services/estimate.service';
+import {
+    assertAndConsumeAiCall,
+    getAiUsage,
+    DailyQuotaError,
+    FeatureDisabledError,
+} from '../services/entitlement.service';
+import { getUserId, getUserEmail } from '../utils/getUserId';
 
 const DAY_KEY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -124,8 +130,16 @@ export const updateTargetsController = async (req: Request, res: Response) => {
 };
 
 const handleEstimateError = (res: Response, error: unknown, fallback: string) => {
-    if (error instanceof EstimateRateLimitError) {
-        return res.status(429).json({ error: 'estimate_limit_reached' });
+    if (error instanceof FeatureDisabledError) {
+        return res.status(503).json({ error: 'feature_disabled' });
+    }
+    if (error instanceof DailyQuotaError) {
+        return res.status(429).json({
+            error: 'quota_exceeded',
+            used: error.used,
+            limit: error.limit,
+            resetsAt: error.resetsAt,
+        });
     }
     if (error instanceof EstimateFailedError) {
         console.error('Estimate failed:', error.message);
@@ -144,7 +158,8 @@ export const estimateController = async (req: Request, res: Response) => {
         if (!hasText && !hasImage) {
             return res.status(400).json({ error: 'text or imageBase64 is required' });
         }
-        const estimate = await estimateMeal(userId, hasText ? text.trim() : undefined, hasImage ? imageBase64 : undefined);
+        await assertAndConsumeAiCall(userId, getUserEmail(req));
+        const estimate = await estimateMeal(hasText ? text.trim() : undefined, hasImage ? imageBase64 : undefined);
         return res.json(estimate);
     } catch (error) {
         return handleEstimateError(res, error, 'Failed to estimate meal');
@@ -158,9 +173,22 @@ export const labelScanController = async (req: Request, res: Response) => {
         if (typeof imageBase64 !== 'string' || imageBase64.length === 0) {
             return res.status(400).json({ error: 'imageBase64 is required' });
         }
-        const scan = await scanLabel(userId, imageBase64);
+        await assertAndConsumeAiCall(userId, getUserEmail(req));
+        const scan = await scanLabel(imageBase64);
         return res.json(scan);
     } catch (error) {
         return handleEstimateError(res, error, 'Failed to scan label');
+    }
+};
+
+// Feeds the app's "X of 5 AI estimates left today" meter.
+export const aiUsageController = async (req: Request, res: Response) => {
+    try {
+        const userId = getUserId(req);
+        const usage = await getAiUsage(userId, getUserEmail(req));
+        return res.json(usage);
+    } catch (error) {
+        console.error('Error getting AI usage:', error);
+        res.status(500).json({ error: 'Failed to get AI usage' });
     }
 };

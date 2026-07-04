@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import {
+    aiUsageController,
     deleteMealEntryController,
     estimateController,
     getDailyMacrosController,
@@ -14,6 +15,7 @@ const router = Router();
 
 // Literal paths before parameterized ones (same rule as workout.routes.ts).
 router.get('/macros/history', getHistoryController);
+router.get('/macros/ai-usage', aiUsageController);
 router.get('/macros/:date', getDailyMacrosController);
 
 // Meals are a fixed per-day set (see DEFAULT_MEALS in nutrition.service) —

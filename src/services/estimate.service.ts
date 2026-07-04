@@ -4,17 +4,8 @@ import { GenericFoodCandidate, searchGenericFoods } from './usda.service';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const REQUEST_TIMEOUT_MS = 30_000;
 
-// Per-user daily cap across estimate + label-scan combined. This is abuse
-// protection for a leaked token, not cost management (calls are ~$0.001).
-const DAILY_CALL_CAP = 50;
-const callCounts = new Map<string, { day: string; count: number }>();
-
-export class EstimateRateLimitError extends Error {
-    constructor() {
-        super('Daily estimate limit reached');
-        this.name = 'EstimateRateLimitError';
-    }
-}
+// Access control (kill switch, daily quota) lives in entitlement.service —
+// controllers call assertAndConsumeAiCall before invoking this service.
 
 export class EstimateFailedError extends Error {
     constructor(message: string) {
@@ -22,19 +13,6 @@ export class EstimateFailedError extends Error {
         this.name = 'EstimateFailedError';
     }
 }
-
-const checkRateLimit = (userId: string): void => {
-    const today = new Date().toISOString().slice(0, 10);
-    const entry = callCounts.get(userId);
-    if (!entry || entry.day !== today) {
-        callCounts.set(userId, { day: today, count: 1 });
-        return;
-    }
-    if (entry.count >= DAILY_CALL_CAP) {
-        throw new EstimateRateLimitError();
-    }
-    entry.count += 1;
-};
 
 const ESTIMATE_SYSTEM_PROMPT = `You are a nutritionist estimating the calories and macros of a single eating occasion.
 Rules:
@@ -303,12 +281,7 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
     });
 };
 
-export const estimateMeal = async (
-    userId: string,
-    text?: string,
-    imageBase64?: string,
-): Promise<EstimateResponse> => {
-    checkRateLimit(userId);
+export const estimateMeal = async (text?: string, imageBase64?: string): Promise<EstimateResponse> => {
     const parsed = await callOpenRouter(
         ESTIMATE_SYSTEM_PROMPT,
         buildUserContent(text, imageBase64),
@@ -357,8 +330,7 @@ export const estimateMeal = async (
     };
 };
 
-export const scanLabel = async (userId: string, imageBase64: string): Promise<LabelScanResponse> => {
-    checkRateLimit(userId);
+export const scanLabel = async (imageBase64: string): Promise<LabelScanResponse> => {
     const parsed = await callOpenRouter(
         LABEL_SCAN_SYSTEM_PROMPT,
         buildUserContent(undefined, imageBase64),
