@@ -64,6 +64,16 @@ export interface UpdateMealEntryPayload {
     fat?: number;
 }
 
+export interface DaySummaryMealResponse {
+    id: string;
+    name: string;
+    sortOrder: number;
+    calories: number;
+    protein: number;
+    carbs: number;
+    fat: number;
+}
+
 export interface DailySummaryResponse {
     date: string;
     mealCount: number;
@@ -71,6 +81,7 @@ export interface DailySummaryResponse {
     protein: number;
     carbs: number;
     fat: number;
+    meals: DaySummaryMealResponse[];
 }
 
 export interface FoodResponse {

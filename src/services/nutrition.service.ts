@@ -1,7 +1,9 @@
+import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
 import {
     DailyMacrosResponse,
     DailySummaryResponse,
+    DaySummaryMealResponse,
     LogMealEntryPayload,
     MacroTargetsResponse,
     MacroTotals,
@@ -211,6 +213,60 @@ interface DailySummaryRow {
     fat: number | null;
 }
 
+interface DaySummaryMealRow {
+    date: Date;
+    meal_id: string;
+    name: string;
+    sort_order: number;
+    calories: number | null;
+    protein: number | null;
+    carbs: number | null;
+    fat: number | null;
+}
+
+// Per-meal totals for a set of days, keyed by day. Feeds the history screen's
+// line-by-line breakdown; only meals with logged entries appear.
+const getMealBreakdowns = async (
+    userId: string,
+    dates: Date[],
+): Promise<Map<string, DaySummaryMealResponse[]>> => {
+    if (dates.length === 0) return new Map();
+    const rows = await prisma.$queryRaw<DaySummaryMealRow[]>`
+        SELECT
+            e.date,
+            e.meal_id,
+            m.name,
+            m.sort_order,
+            SUM(ROUND(e.calories * e.servings))::int AS calories,
+            SUM(ROUND(e.protein_g * e.servings))::int AS protein,
+            SUM(ROUND(e.carbs_g * e.servings))::int AS carbs,
+            SUM(ROUND(e.fat_g * e.servings))::int AS fat
+        FROM meal_entries e
+        JOIN meals m ON m.id = e.meal_id
+        WHERE e.user_id = ${userId}
+            AND e.deleted_at IS NULL
+            AND e.date IN (${Prisma.join(dates)})
+        GROUP BY e.date, e.meal_id, m.name, m.sort_order
+        ORDER BY m.sort_order ASC, m.name ASC
+    `;
+    const byDay = new Map<string, DaySummaryMealResponse[]>();
+    for (const row of rows) {
+        const key = toDayKey(row.date);
+        const meals = byDay.get(key) ?? [];
+        meals.push({
+            id: row.meal_id,
+            name: row.name,
+            sortOrder: row.sort_order,
+            calories: row.calories ?? 0,
+            protein: row.protein ?? 0,
+            carbs: row.carbs ?? 0,
+            fat: row.fat ?? 0,
+        });
+        byDay.set(key, meals);
+    }
+    return byDay;
+};
+
 export const getHistory = async (
     userId: string,
     page: number,
@@ -242,6 +298,7 @@ export const getHistory = async (
             HAVING SUM(ROUND(calories * servings)) > 0
         ) days
     `;
+    const mealsByDay = await getMealBreakdowns(userId, rows.map((row) => row.date));
     return {
         days: rows.map((row) => ({
             date: toDayKey(row.date),
@@ -250,6 +307,7 @@ export const getHistory = async (
             protein: row.protein ?? 0,
             carbs: row.carbs ?? 0,
             fat: row.fat ?? 0,
+            meals: mealsByDay.get(toDayKey(row.date)) ?? [],
         })),
         total: Number(totalRows[0]?.count ?? 0),
     };
