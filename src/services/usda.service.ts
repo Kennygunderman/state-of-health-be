@@ -33,8 +33,12 @@ const RETRY_DELAY_MS = 250;
 
 const fetchFromUsda = async (path: string, params: Record<string, string>): Promise<any> => {
     const baseUrl = process.env.USDA_BASE_URL || DEFAULT_BASE_URL;
-    const query = new URLSearchParams({ ...params, api_key: getApiKey() });
-    const url = `${baseUrl}${path}?${query.toString()}`;
+    // Spaces must be %20, not URLSearchParams' "+" — USDA 400s on "+" inside
+    // dataType values (e.g. "Survey (FNDDS)").
+    const query = Object.entries({ ...params, api_key: getApiKey() })
+        .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+        .join('&');
+    const url = `${baseUrl}${path}?${query}`;
 
     let lastError: Error = new UsdaError('USDA request failed');
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
