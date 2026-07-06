@@ -1,4 +1,5 @@
 import { BrandedFoodResponse } from '../types/nutrition';
+import { prisma } from '../prisma/client';
 
 // USDA FoodData Central (public domain — no retention restrictions, so the
 // snapshot-at-log-time model is fully legal for this data source).
@@ -30,7 +31,7 @@ const getApiKey = (): string => {
 const MAX_ATTEMPTS = 4;
 const RETRY_DELAY_MS = 250;
 
-const usdaGet = async (path: string, params: Record<string, string>): Promise<any> => {
+const fetchFromUsda = async (path: string, params: Record<string, string>): Promise<any> => {
     const baseUrl = process.env.USDA_BASE_URL || DEFAULT_BASE_URL;
     const query = new URLSearchParams({ ...params, api_key: getApiKey() });
     const url = `${baseUrl}${path}?${query.toString()}`;
@@ -54,6 +55,72 @@ const usdaGet = async (path: string, params: Record<string, string>): Promise<an
         }
     }
     throw lastError;
+};
+
+// Detail lookups (/food/{id}) are near-immutable; search result lists get a
+// shorter TTL only so newly added USDA foods eventually show up.
+const SEARCH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const DETAIL_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+
+const ttlForPath = (path: string): number => (path.startsWith('/food/') ? DETAIL_TTL_MS : SEARCH_TTL_MS);
+
+const cacheKeyFor = (path: string, params: Record<string, string>): string => {
+    const normalized = Object.entries(params)
+        .map(([key, value]): [string, string] =>
+            key === 'query' ? [key, value.trim().toLowerCase().replace(/\s+/g, ' ')] : [key, value])
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, value]) => `${key}=${value}`)
+        .join('&');
+    return `${path}?${normalized}`;
+};
+
+const upsertCache = async (cacheKey: string, payload: any): Promise<void> => {
+    await prisma.usda_api_cache.upsert({
+        where: { cache_key: cacheKey },
+        create: { cache_key: cacheKey, payload },
+        update: { payload, fetched_at: new Date() },
+    });
+};
+
+const refreshing = new Set<string>();
+
+const refreshInBackground = (cacheKey: string, path: string, params: Record<string, string>): void => {
+    if (refreshing.has(cacheKey)) return;
+    refreshing.add(cacheKey);
+    fetchFromUsda(path, params)
+        .then((payload) => upsertCache(cacheKey, payload))
+        .catch(() => {
+            // Stale row keeps being served; the next request past TTL retries.
+        })
+        .finally(() => refreshing.delete(cacheKey));
+};
+
+// Stale-while-revalidate over fetchFromUsda: cached rows are served no matter
+// their age (a month-old food search is not meaningfully wrong), with rows
+// past TTL refreshed off the request path. Cache/DB errors fall through to a
+// live USDA call rather than failing the request.
+const usdaGet = async (path: string, params: Record<string, string>): Promise<any> => {
+    const cacheKey = cacheKeyFor(path, params);
+
+    let cached: { payload: any; fetched_at: Date } | null = null;
+    try {
+        cached = await prisma.usda_api_cache.findUnique({ where: { cache_key: cacheKey } });
+    } catch {
+        cached = null;
+    }
+
+    if (cached) {
+        if (Date.now() - cached.fetched_at.getTime() > ttlForPath(path)) {
+            refreshInBackground(cacheKey, path, params);
+        }
+        return cached.payload;
+    }
+
+    const payload = await fetchFromUsda(path, params);
+    upsertCache(cacheKey, payload).catch(() => {
+        // Caching is best-effort; the response is already in hand.
+    });
+    return payload;
 };
 
 const titleCase = (value: string): string =>

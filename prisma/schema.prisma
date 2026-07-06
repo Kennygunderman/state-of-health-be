@@ -265,6 +265,15 @@ model meal_entries {
   @@index([meal_id], map: "idx_meal_entries_meal_id")
 }
 
+// Raw USDA responses keyed by normalized request (path + params). USDA data
+// is public domain with no retention restrictions; stale rows are served
+// immediately and refreshed in the background — see usda.service.
+model usda_api_cache {
+  cache_key  String   @id(map: "usda_api_cache_pkey")
+  payload    Json
+  fetched_at DateTime @default(now()) @db.Timestamptz(6)
+}
+
 // One row per user x UTC day, counting AI calls (estimate + label-scan share
 // the pool). Enforces the free daily quota — see entitlement.service.
 model ai_usage {
