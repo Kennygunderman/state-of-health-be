@@ -11,7 +11,6 @@ yarn-error.log*
 
 # Prisma
 prisma/*.db
-prisma/migrations/
 src/generated/
 
 # Build output

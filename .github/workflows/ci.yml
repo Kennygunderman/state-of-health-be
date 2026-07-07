@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma validate
+        env:
+          # validate resolves the datasource env var but never connects
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: docker build -t soh-be-ci .

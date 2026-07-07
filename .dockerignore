@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.env
+.env.*
+serviceAccountKey.json
+coverage
+*.log
+.github
+prisma/manual-migrations
