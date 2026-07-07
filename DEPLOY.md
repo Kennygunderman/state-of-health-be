@@ -75,7 +75,9 @@ everything).
 - Env vars (Settings → Environment Variables, marked as build-time not
   needed — all runtime):
   - `DATABASE_URL` → the Coolify-managed prod Postgres (step 4)
-  - `USDA_API_KEY`, `OPENROUTER_API_KEY` → copy from current `/…/.env` on VPS
+  - `USDA_API_KEY`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`,
+    `AI_DAILY_QUOTA`, `AI_UNLIMITED_EMAILS` → copy from
+    `/home/kenny/state-of-health-be/.env` on the VPS
   - `FIREBASE_SERVICE_ACCOUNT` → `base64 -i serviceAccountKey.json | pbcopy`
 
 ### 4. Databases + backups
