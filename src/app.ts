@@ -8,9 +8,23 @@ import recordRoutes from './routes/record.routes';
 import weighInRoutes from './routes/weighIn.routes';
 import nutritionRoutes from './routes/nutrition.routes';
 import foodRoutes from './routes/food.routes';
+import coachRoutes from './routes/coach.routes';
 import { authenticateFirebaseToken } from './middleware/auth';
+import { trackLastActive } from './middleware/lastActive';
+import { prisma } from './prisma/client';
 
 const app = express();
+
+// Unauthenticated: used by Coolify health checks, uptime monitoring, and
+// post-deploy verification. GIT_SHA is injected at image build time.
+app.get('/health', async (_req, res) => {
+    try {
+        await prisma.$queryRaw`SELECT 1`;
+        res.json({ status: 'ok', version: process.env.GIT_SHA ?? 'unknown' });
+    } catch {
+        res.status(503).json({ status: 'db_unreachable' });
+    }
+});
 
 // The AI endpoints accept base64 photos, so they get a larger body limit.
 // Must be registered BEFORE the global express.json() — the first JSON parser
@@ -26,6 +40,10 @@ app.use('/api', userRoutes);
 
 // Protected routes
 app.use(authenticateFirebaseToken);
+// Coarse activity tracking for inactivity win-back pushes; throttled to one
+// DB write per user per hour, never blocks the request.
+app.use(trackLastActive);
+app.use('/api', coachRoutes);
 app.use('/api', workoutRoutes);
 app.use('/api', exerciseRoutes);
 app.use('/api', migrationRoutes);

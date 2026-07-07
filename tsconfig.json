@@ -109,5 +109,7 @@
     /* Completeness */
     // "skipDefaultLibCheck": true,                      /* Skip type checking .d.ts files that are included with TypeScript. */
     "skipLibCheck": true                                 /* Skip type checking all .d.ts files. */
-  }
+  },
+  /* Tests run via vitest, never through tsc — keep them out of dist. */
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"]
 }

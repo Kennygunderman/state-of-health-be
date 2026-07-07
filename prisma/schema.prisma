@@ -37,16 +37,16 @@ model exercise_sets {
 }
 
 model user_exercises {
-  id                 String              @id(map: "exercise_pkey") @db.Uuid
+  id                 String             @id(map: "exercise_pkey") @db.Uuid
   name               String
   exercise_type      String
   exercise_body_part String
-  logging_type       String              @default("WEIGHT_REPS")
+  logging_type       String             @default("WEIGHT_REPS")
   user_id            String?
-  deleted_at         DateTime?           @db.Timestamptz(6)
+  deleted_at         DateTime?          @db.Timestamptz(6)
   daily_exercises    daily_exercises[]
   personal_records   personal_records[]
-  users              users?              @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "user_exercise_user_id_fkey")
+  users              users?             @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "user_exercise_user_id_fkey")
 
   @@index([user_id], map: "idx_user_exercises_user_id")
 }
@@ -57,7 +57,8 @@ model users {
   last_name             String?
   email                 String                  @unique
   // Daily macro targets. Nullable = "not set"; the app falls back to its
-  // local default (1800 cal) until the user saves targets.
+  // local default (1800 cal) until the user saves targets. In coached mode
+  // (see coach_profiles) the weekly plan generator owns these columns.
   target_calories       Int?
   target_protein_g      Int?
   target_carbs_g        Int?
@@ -65,6 +66,16 @@ model users {
   // Base64 JPEG, client-resized to ~192px (~10-20KB) — small enough to live
   // in the row instead of object storage.
   avatar_base64         String?
+  // Profile fields for the Coach cold-start estimate (Mifflin-St Jeor) and
+  // scheduling. All nullable: manual mode never requires them.
+  sex                   String? // 'male' | 'female' | 'unspecified'
+  birth_date            DateTime?               @db.Date
+  height_cm             Float?
+  weight_unit           String? // 'lbs' | 'kg' — synced from the client setting
+  timezone              String? // IANA, e.g. 'America/Chicago'; refreshed on login
+  // Coarse activity signal for inactivity win-back pushes. Updated by
+  // middleware at most once per hour per user (see lastActive middleware).
+  last_active_at        DateTime?
   templates             templates[]
   user_exercises        user_exercises[]
   personal_records      personal_records[]
@@ -74,6 +85,9 @@ model users {
   foods                 foods[]
   meals                 meals[]
   meal_entries          meal_entries[]
+  coach_profiles        coach_profiles?
+  expenditure_snapshots expenditure_snapshots[]
+  coach_weekly_plans    coach_weekly_plans[]
 }
 
 model workout_days {
@@ -102,18 +116,18 @@ model templates {
 // Current-best PR per user x exercise x record type. record_type is one of:
 // MAX_WEIGHT | MAX_REPS | MAX_ESTIMATED_1RM | MAX_VOLUME | MAX_DURATION | MAX_DISTANCE
 model personal_records {
-  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id              String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   user_id         String
-  exercise_id     String          @db.Uuid
+  exercise_id     String         @db.Uuid
   record_type     String
   value           Float
   unit            String
   reps_at_record  Int?
-  exercise_set_id String?         @db.Uuid
+  exercise_set_id String?        @db.Uuid
   achieved_at     DateTime
-  created_at      DateTime        @default(now())
-  users           users           @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  user_exercises  user_exercises  @relation(fields: [exercise_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  created_at      DateTime       @default(now())
+  users           users          @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  user_exercises  user_exercises @relation(fields: [exercise_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, exercise_id, record_type], map: "unique_user_exercise_record_type")
   @@index([user_id], map: "idx_personal_records_user_id")
@@ -122,27 +136,27 @@ model personal_records {
 // Cardio session, sibling to workout_days rather than nested inside it.
 // has_synced / updated_at mirror workout_days' offline-sync contract exactly.
 model runs {
-  id                  String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id             String
-  started_at          DateTime
-  ended_at            DateTime?
-  duration_seconds    Int
-  distance_meters     Float
-  avg_pace_sec_per_km Float?
-  elevation_gain_m    Float?
-  elevation_loss_m    Float?
-  avg_heart_rate      Int?
-  max_heart_rate      Int?
-  calories            Int?
-  run_type            String       @default("OUTDOOR")
-  source              String       @default("MANUAL")
-  route_polyline      String?      @db.Text
-  notes               String?
-  has_synced          Boolean?     @default(false)
-  updated_at          BigInt       @default(0)
-  created_at          DateTime     @default(now())
-  users               users        @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  run_splits          run_splits[]
+  id                   String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id              String
+  started_at           DateTime
+  ended_at             DateTime?
+  duration_seconds     Int
+  distance_meters      Float
+  avg_pace_sec_per_km  Float?
+  elevation_gain_m     Float?
+  elevation_loss_m     Float?
+  avg_heart_rate       Int?
+  max_heart_rate       Int?
+  calories             Int?
+  run_type             String                 @default("OUTDOOR")
+  source               String                 @default("MANUAL")
+  route_polyline       String?                @db.Text
+  notes                String?
+  has_synced           Boolean?               @default(false)
+  updated_at           BigInt                 @default(0)
+  created_at           DateTime               @default(now())
+  users                users                  @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  run_splits           run_splits[]
   run_personal_records run_personal_records[]
 
   @@index([user_id, started_at], map: "idx_runs_user_id_started_at")
@@ -154,6 +168,10 @@ model body_weight_entries {
   id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   user_id    String
   weight     Float
+  // 'lbs' | 'kg'. Null on legacy rows until backfilled from the user's current
+  // weight_unit (decision: tdee-coach-plan.md §8.2); the Coach engine treats
+  // null as the user's current unit and converts everything to kg internally.
+  unit       String?
   logged_at  DateTime
   created_at DateTime @default(now())
   users      users    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
@@ -178,16 +196,16 @@ model run_splits {
 // would let duplicate run PR rows slip past the uniqueness guarantee. record_type here
 // is one of: MAX_DISTANCE | MAX_DURATION | BEST_PACE
 model run_personal_records {
-  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   user_id     String
   record_type String
   value       Float
   unit        String
-  run_id      String?   @db.Uuid
+  run_id      String?  @db.Uuid
   achieved_at DateTime
-  created_at  DateTime  @default(now())
-  users       users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  runs        runs?     @relation(fields: [run_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  created_at  DateTime @default(now())
+  users       users    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  runs        runs?    @relation(fields: [run_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
 
   @@unique([user_id, record_type], map: "unique_user_run_record_type")
 }
@@ -242,14 +260,14 @@ model meals {
 model meal_entries {
   id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   meal_id      String    @db.Uuid
-  user_id      String    // denormalized for cheap day/history aggregates
+  user_id      String // denormalized for cheap day/history aggregates
   date         DateTime  @db.Date // denormalized day key, matches meals.date
   food_id      String?   @db.Uuid
   name         String
   serving_text String?
   servings     Float     @default(1)
-  calories     Int       // per serving (as-eaten for AI items, servings = 1)
-  protein_g    Int       // per serving
+  calories     Int // per serving (as-eaten for AI items, servings = 1)
+  protein_g    Int // per serving
   carbs_g      Int
   fat_g        Int
   input_method String    @default("library") // 'library' | 'search' | 'ai_text' | 'ai_photo'
@@ -283,4 +301,59 @@ model ai_usage {
   updated_at DateTime @default(now()) @updatedAt
 
   @@id([user_id, day], map: "ai_usage_pkey")
+}
+
+// ---------------------------------------------------------------------------
+// Coach (adaptive TDEE) — see ../tdee-coach-plan.md in the workspace root.
+// ---------------------------------------------------------------------------
+
+// One row per user who has enrolled in coached mode. Absence of a row = manual
+// mode. mode 'paused' freezes weekly plan generation but the engine keeps
+// computing expenditure snapshots.
+model coach_profiles {
+  user_id      String   @id
+  mode         String // 'coached' | 'paused'
+  goal         String // 'lose' | 'maintain' | 'gain'
+  rate_pct_bw  Float // %BW per week, always positive; direction comes from goal
+  protein_pref Float? // g per kg override; null = engine default by goal
+  fat_bias     String? // 'low' | 'balanced' | 'high'; null = 'balanced'
+  started_at   DateTime @default(now())
+  updated_at   DateTime @default(now()) @updatedAt
+  users        users    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+// One row per user x local day: the engine's daily output. Recomputed
+// incrementally on read (GET /coach/state) and by the Phase-3 scheduler.
+// Idempotent by construction — same inputs always produce the same rows.
+model expenditure_snapshots {
+  user_id         String
+  day             DateTime @db.Date // user-local day
+  trend_weight_kg Float? // null until the first weigh-in exists
+  tdee_kcal       Int
+  confidence      String // 'calibrating' | 'low' | 'medium' | 'high'
+  users           users    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([user_id, day], map: "expenditure_snapshots_pkey")
+}
+
+// One row per user x local week (Monday start): the coached targets for that
+// week. The generator also writes users.target_* so the existing daily-macros
+// response keeps working unchanged. rationale is machine-readable "why" data
+// that powers the check-in copy (old/new TDEE, guardrails fired, data quality).
+model coach_weekly_plans {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id         String
+  week_start      DateTime  @db.Date // user-local Monday
+  calories        Int
+  protein_g       Int
+  carbs_g         Int
+  fat_g           Int
+  tdee_kcal       Int // expenditure estimate at generation time
+  rationale       Json
+  acknowledged_at DateTime?
+  created_at      DateTime  @default(now())
+  users           users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([user_id, week_start], map: "unique_user_week_start")
+  @@index([user_id], map: "idx_coach_weekly_plans_user_id")
 }

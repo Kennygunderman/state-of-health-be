@@ -20,6 +20,9 @@ export const createWeighIn = async (userId: string, payload: CreateWeighInPayloa
         data: {
             user_id: userId,
             weight: payload.weight,
+            // Unit provenance for the Coach engine; older clients omit it and
+            // the engine falls back to the user's current weight_unit.
+            unit: payload.unit ?? null,
             logged_at: new Date(payload.loggedAt),
         },
     });

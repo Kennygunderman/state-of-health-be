@@ -16,15 +16,18 @@ export const getWeighIns = async (req: Request, res: Response) => {
 export const createWeighInController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
-        const { weight, loggedAt } = req.body;
+        const { weight, loggedAt, unit } = req.body;
 
         const parsedWeight = Number(weight);
         const parsedLoggedAt = new Date(loggedAt);
         if (!Number.isFinite(parsedWeight) || parsedWeight <= 0 || isNaN(parsedLoggedAt.getTime())) {
             return res.status(400).json({ error: 'weight must be a positive number and loggedAt a valid date' });
         }
+        if (unit !== undefined && unit !== 'lbs' && unit !== 'kg' && unit !== 'st') {
+            return res.status(400).json({ error: "unit must be 'lbs', 'kg', or 'st'" });
+        }
 
-        const weighIn = await createWeighIn(userId, { weight: parsedWeight, loggedAt });
+        const weighIn = await createWeighIn(userId, { weight: parsedWeight, loggedAt, unit });
         return res.status(201).json(weighIn);
     } catch (error) {
         console.error('Error creating weigh-in:', error);
