@@ -45,9 +45,18 @@ export const getWeeklyRunSummaryController = async (req: Request, res: Response)
     }
 };
 
+const invalidRunPayload = (body: any): boolean =>
+    !body?.startedAt ||
+    typeof body.updatedAt !== 'number' ||
+    typeof body.durationSeconds !== 'number' ||
+    typeof body.distanceMeters !== 'number';
+
 export const createRunController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
+        if (invalidRunPayload(req.body)) {
+            return res.status(400).json({ error: 'startedAt, updatedAt, durationSeconds, and distanceMeters are required' });
+        }
         const { run, newRecords } = await createRun(userId, req.body);
         return res.status(201).json({ ...run, newRecords });
     } catch (error) {
@@ -60,6 +69,9 @@ export const updateRunController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
         const runId = req.params.id;
+        if (invalidRunPayload(req.body)) {
+            return res.status(400).json({ error: 'startedAt, updatedAt, durationSeconds, and distanceMeters are required' });
+        }
         const updated = await updateRun(userId, runId, req.body);
         if (!updated) {
             return res.status(404).json({ error: 'Run not found' });
