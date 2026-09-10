@@ -410,10 +410,10 @@ model catalog_foods {
   is_common_dislike          Boolean                     @default(false)
   cost_class                 Int                         @db.SmallInt
   search_text                String?
-  // The STORED generated expression and its GIN index are appended by hand in
-  // the migration SQL — Prisma can express neither, and the generated client
-  // omits Unsupported fields, so this stays optional to keep create() calls
-  // compiling.
+  // The STORED generated expression is appended by hand in the migration SQL
+  // because Prisma cannot express it, and the generated client omits Unsupported
+  // fields, so this stays optional to keep create() calls compiling. The GIN
+  // index over it is declarable and is declared below.
   search_vector              Unsupported("tsvector")?
   imported_at                DateTime?
   created_at                 DateTime                    @default(now())
@@ -432,6 +432,9 @@ model catalog_foods {
   @@unique([usda_fdc_id])
   @@index([publication_status, category])
   @@index([food_group])
+  // Mirrors the GIN index the migration creates by hand, so the schema-diff gate
+  // does not read it as drift. map: pins the migration's index name.
+  @@index([search_vector(ops: raw("tsvector_ops"))], map: "idx_catalog_foods_search_vector", type: Gin)
 }
 
 // Search aliases. The lower(alias) expression index is appended in the

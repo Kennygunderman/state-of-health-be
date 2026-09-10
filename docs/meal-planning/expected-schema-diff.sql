@@ -1,0 +1,43 @@
+-- Captured `prisma migrate diff --script` output, committed as schema-drift
+-- evidence. Nothing executes this file; the migration ledger under
+-- prisma/migrations is what runs.
+--
+-- Regenerate from backend/. SHADOW_DATABASE_URL must name a DISPOSABLE
+-- database — the command resets it:
+--
+--   npx prisma migrate diff \
+--     --from-migrations prisma/migrations \
+--     --to-schema-datamodel prisma/schema.prisma \
+--     --shadow-database-url "$SHADOW_DATABASE_URL" \
+--     --exit-code --script
+--
+-- Expected exit code 2 (differences found). 0 means this file is stale — the
+-- datamodel and the ledger now agree and there is nothing left to record. 1
+-- means the command failed, usually an unreachable or non-empty shadow database.
+--
+-- Permitted content: only the constructs prisma/schema.prisma cannot express.
+-- The statement below is the catalog_foods.search_vector STORED generated
+-- expression, which Prisma reads through the column-default slot and so
+-- reconciles back to a plain tsvector column. Any other statement means
+-- prisma/schema.prisma and
+-- prisma/migrations/20260908000000_meal_planning/migration.sql have diverged —
+-- fix those, never this file.
+--
+-- The migration's other hand-written constructs are absent by design, not by
+-- omission: the GIN index on search_vector is declared in the datamodel
+-- (@@index(..., type: Gin) with ops: raw("tsvector_ops")), and Prisma's schema
+-- describer models neither expression indexes (lower(alias) on
+-- catalog_food_aliases) nor partial indexes (catalog_foods,
+-- catalog_food_portions, recipe_versions, meal_plans, meal_entries), so it never
+-- reports them either way. All seven were confirmed present in pg_indexes after
+-- `prisma migrate deploy`, and search_vector confirmed attgenerated = 's'.
+--
+-- The gate strips `--` comments and blank lines from both sides before its
+-- byte-comparison, so this header is safe. Use line comments only: a block
+-- comment survives the strip and would be compared as content.
+--
+-- Captured against prisma and @prisma/client 6.9.0 on PostgreSQL 16, ledger
+-- prisma/migrations through 20260908000000_meal_planning.
+
+-- AlterTable
+ALTER TABLE "catalog_foods" ALTER COLUMN "search_vector" DROP DEFAULT;

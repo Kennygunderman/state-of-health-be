@@ -1,8 +1,6 @@
 import { EstimateItem, EstimateResponse, LabelScanResponse } from '../types/nutrition';
 import { GenericFoodCandidate, searchGenericFoods } from './usda.service';
-
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const REQUEST_TIMEOUT_MS = 30_000;
+import { MessageContent, OpenRouterError, callOpenRouter } from './openrouter.service';
 
 // Access control (kill switch, daily quota) lives in entitlement.service —
 // controllers call assertAndConsumeAiCall before invoking this service.
@@ -99,8 +97,6 @@ const LABEL_SCAN_JSON_SCHEMA = {
     },
 };
 
-type MessageContent = string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
-
 const buildUserContent = (text?: string, imageBase64?: string): MessageContent => {
     if (!imageBase64) return text ?? '';
     const parts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
@@ -109,72 +105,27 @@ const buildUserContent = (text?: string, imageBase64?: string): MessageContent =
     return parts;
 };
 
-// Not every routed model honors json_schema strictly — strip code fences and
-// parse the first {...} block as a fallback.
-const parseModelJson = (raw: string): any => {
-    try {
-        return JSON.parse(raw);
-    } catch {
-        const cleaned = raw.replace(/```(?:json)?/g, '');
-        const start = cleaned.indexOf('{');
-        const end = cleaned.lastIndexOf('}');
-        if (start === -1 || end <= start) {
-            throw new EstimateFailedError('Model returned unparseable output');
-        }
-        return JSON.parse(cleaned.slice(start, end + 1));
-    }
-};
-
-const callOpenRouter = async (
+// The OpenRouter transport lives in openrouter.service, which raises
+// OpenRouterError for every failure mode. The controller only maps
+// EstimateFailedError (→ 502), so every model call this service makes goes
+// through here: one translation point, not one per call site. The vendor error
+// already carries the exact message this endpoint has always returned —
+// including the HTTP status and the truncated response body — so it is passed
+// through verbatim rather than rebuilt per kind. Anything that is not a vendor
+// failure propagates untouched.
+const callModel = async (
     systemPrompt: string,
     userContent: MessageContent,
     jsonSchema: object,
     modelOverride?: string,
 ): Promise<any> => {
-    const apiKey = process.env.OPENROUTER_API_KEY;
-    if (!apiKey) {
-        throw new EstimateFailedError('OPENROUTER_API_KEY is not configured');
-    }
-    const model = modelOverride || process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash';
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-        const response = await fetch(OPENROUTER_URL, {
-            method: 'POST',
-            signal: controller.signal,
-            headers: {
-                Authorization: `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model,
-                temperature: 0,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userContent },
-                ],
-                response_format: { type: 'json_schema', json_schema: jsonSchema },
-            }),
-        });
-        if (!response.ok) {
-            const body = await response.text().catch(() => '');
-            throw new EstimateFailedError(`OpenRouter returned ${response.status}: ${body.slice(0, 300)}`);
-        }
-        const data = (await response.json()) as any;
-        const content = data?.choices?.[0]?.message?.content;
-        if (typeof content !== 'string' || !content.trim()) {
-            throw new EstimateFailedError('OpenRouter returned an empty completion');
-        }
-        return parseModelJson(content);
+        return await callOpenRouter(systemPrompt, userContent, jsonSchema, modelOverride);
     } catch (error) {
-        if (error instanceof EstimateFailedError) throw error;
-        if ((error as Error).name === 'AbortError') {
-            throw new EstimateFailedError('OpenRouter request timed out');
+        if (error instanceof OpenRouterError) {
+            throw new EstimateFailedError(error.message);
         }
-        throw new EstimateFailedError(`OpenRouter request failed: ${(error as Error).message}`);
-    } finally {
-        clearTimeout(timeout);
+        throw error;
     }
 };
 
@@ -230,7 +181,7 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
     // The judge is a classification task — it gets its own model tuned for
     // consistency (gemini-flash via OpenRouter routes across providers and
     // flip-flops on borderline matches even at temperature 0).
-    const judged = await callOpenRouter(
+    const judged = await callModel(
         JUDGE_SYSTEM_PROMPT,
         JSON.stringify(judgeInput, null, 2),
         JUDGE_JSON_SCHEMA,
@@ -282,7 +233,7 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
 };
 
 export const estimateMeal = async (text?: string, imageBase64?: string): Promise<EstimateResponse> => {
-    const parsed = await callOpenRouter(
+    const parsed = await callModel(
         ESTIMATE_SYSTEM_PROMPT,
         buildUserContent(text, imageBase64),
         ESTIMATE_JSON_SCHEMA,
@@ -331,7 +282,7 @@ export const estimateMeal = async (text?: string, imageBase64?: string): Promise
 };
 
 export const scanLabel = async (imageBase64: string): Promise<LabelScanResponse> => {
-    const parsed = await callOpenRouter(
+    const parsed = await callModel(
         LABEL_SCAN_SYSTEM_PROMPT,
         buildUserContent(undefined, imageBase64),
         LABEL_SCAN_JSON_SCHEMA,
