@@ -1,3 +1,10 @@
+// How a stored nutrition snapshot was arrived at. 'source_backed' = a USDA
+// record or scanned label supports the values; 'ingredient_derived' = computed
+// from a stored composition whose quantities are assumed, so still an estimate;
+// 'ai_estimated' = model output; 'user_entered' = client-supplied values the
+// server cannot verify.
+export type NutritionProvenance = 'source_backed' | 'ingredient_derived' | 'ai_estimated' | 'user_entered';
+
 export interface MacroTotals {
     calories: number;
     protein: number;
@@ -8,6 +15,10 @@ export interface MacroTotals {
 export interface MealEntryResponse {
     id: string;
     foodId: string | null;
+    // null unless the entry was logged from a planned meal (meal_plan_meals.id);
+    // its presence drives the "From meal plan" caption and the plan card's
+    // LOGGED state.
+    mealPlanMealId: string | null;
     name: string;
     servingText: string | null;
     servings: number;
@@ -17,6 +28,9 @@ export interface MealEntryResponse {
     carbs: number;
     fat: number;
     inputMethod: string;
+    // null on rows predating the column and on legacy client-supplied snapshots —
+    // both are classified unknown/user-entered and render no provenance label.
+    nutritionProvenance: NutritionProvenance | null;
     loggedAt: string;
 }
 
@@ -53,6 +67,18 @@ export interface LogMealEntryPayload {
     fat: number;
     inputMethod?: string; // 'library' | 'search' | 'ai_text' | 'ai_photo'
     rawInput?: string;
+}
+
+// The catalog counterpart of LogMealEntryPayload — the client names a published
+// catalog food and a portion, and the server derives the nutrition snapshot from
+// that catalog_foods row, ignoring any client-supplied macro values.
+export interface LogCatalogMealEntryPayload {
+    catalogFoodId: string;
+    servings: number;
+    // Accepted only when it matches one of that food's stored portion
+    // descriptions; omitted falls back to the default portion's description.
+    servingText?: string;
+    inputMethod: string; // 'search' — stamped server-side whatever the body says
 }
 
 export interface UpdateMealEntryPayload {

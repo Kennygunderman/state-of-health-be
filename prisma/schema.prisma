@@ -74,6 +74,12 @@ model users {
   foods                 foods[]
   meals                 meals[]
   meal_entries          meal_entries[]
+  meal_plan_preferences meal_plan_preferences?
+  meal_plans            meal_plans[]
+  meal_plan_days        meal_plan_days[]
+  meal_plan_meals       meal_plan_meals[]
+  grocery_items         grocery_items[]
+  meal_plan_actions     meal_plan_actions[]
 }
 
 model workout_days {
@@ -252,14 +258,25 @@ model meal_entries {
   protein_g    Int       // per serving
   carbs_g      Int
   fat_g        Int
-  input_method String    @default("library") // 'library' | 'search' | 'ai_text' | 'ai_photo'
+  input_method String    @default("library") // 'library' | 'search' | 'ai_text' | 'ai_photo' | 'meal_plan'
   raw_input    String?   @db.Text
   logged_at    DateTime  @default(now())
   updated_at   DateTime  @default(now()) @updatedAt
   deleted_at   DateTime? @db.Timestamptz(6)
+  // Meal-planning provenance, all nullable: rows predating the feature and
+  // hand-logged entries carry none, and a NULL nutrition_provenance reads as
+  // "unknown / user-entered" rather than as a verified source.
+  meal_plan_meal_id    String? @db.Uuid
+  catalog_food_id      String? @db.Uuid
+  recipe_version_id    String? @db.Uuid
+  nutrition_provenance String? // 'source_backed' | 'ingredient_derived' | 'ai_estimated' | 'user_entered'
   meals        meals     @relation(fields: [meal_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
   users        users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
   foods        foods?    @relation(fields: [food_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  meal_plan_meals  meal_plan_meals?  @relation(fields: [meal_plan_meal_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  catalog_foods    catalog_foods?    @relation(fields: [catalog_food_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  recipe_versions  recipe_versions?  @relation(fields: [recipe_version_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  meal_plan_actions meal_plan_actions[]
 
   @@index([user_id, date], map: "idx_meal_entries_user_id_date")
   @@index([meal_id], map: "idx_meal_entries_meal_id")
@@ -283,4 +300,494 @@ model ai_usage {
   updated_at DateTime @default(now()) @updatedAt
 
   @@id([user_id, day], map: "ai_usage_pkey")
+}
+
+// ---------------------------------------------------------------------------
+// Meal planning — internal food catalog, recipes, preferences, weekly plans,
+// grocery lists. Every closed value set below is a plain TEXT column validated
+// by the domain's pure *.logic.ts parser, which throws a typed error the
+// controller maps to 400: a database CHECK would surface as an untyped Prisma
+// error instead and would move the rule out of the pure layer. The permitted
+// values are therefore documented inline, as input_method and foods.source
+// already are.
+// ---------------------------------------------------------------------------
+
+// The catalog and recipe tables are the one deliberate exception to the
+// user-scoped query rule: they hold shared reference data, carry no user_id,
+// and are the only authenticated reads without a tenant predicate. Adding an
+// owner column here would be a mistake, not a fix.
+
+// One row per pipeline run. cursor is the resume checkpoint, so an interrupted
+// import continues where it stopped instead of restarting; the newest
+// succeeded 'release_load' run is what GET /catalog/status reports as the
+// active catalog release.
+model catalog_import_runs {
+  id                         String                       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  kind                       String // 'usda_import' | 'ai_generation' | 'validation' | 'release' | 'release_load'
+  manifest_version           String
+  started_at                 DateTime                     @default(now())
+  finished_at                DateTime?
+  status                     String // 'running' | 'succeeded' | 'failed'
+  cursor                     Json?
+  counts                     Json?
+  log                        Json?
+  catalog_generation_batches catalog_generation_batches[]
+
+  @@index([kind, started_at])
+}
+
+// One AI generation batch, keyed '<coveragePlanVersion>:<category>:<batchIndex>'
+// so a rerun addresses exactly the same batches. model_calls_reserved is
+// incremented BEFORE each paid model call and model_calls_used only after it
+// returns: a failed call still costs tokens, so the two counters must never be
+// collapsed into one or the budget stops being enforceable.
+model catalog_generation_batches {
+  id                   String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  run_id               String              @db.Uuid
+  batch_key            String
+  category             String
+  model                String
+  prompt_version       String
+  status               String // 'pending' | 'generated' | 'validated' | 'failed'
+  candidate_count      Int                 @default(0)
+  accepted_count       Int                 @default(0)
+  model_calls_reserved Int                 @default(0)
+  model_calls_used     Int                 @default(0)
+  tokens_used          Int                 @default(0)
+  catalog_import_runs  catalog_import_runs @relation(fields: [run_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  catalog_foods        catalog_foods[]
+
+  @@unique([batch_key])
+}
+
+// The internal food catalog. Identity (identity_source / identity_status),
+// nutrition provenance (nutrition_provenance) and publication
+// (publication_status) are three INDEPENDENT columns, never one mixed enum: a
+// USDA-sourced row can still be quarantined, and an AI-estimated row can be
+// published for search while never qualifying as recipe-eligible. Nutrition is
+// versioned separately from metadata so a nutrient change and a name/allergen
+// change each invalidate a recipe snapshot on their own. A NULL nutrient means
+// UNKNOWN and is never coerced to 0.
+model catalog_foods {
+  id                         String                      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // Deterministic and portable — 'usda:<fdcId>' or
+  // 'ai:<coverage_category>:<normalized canonical_name>:<food_state>'. This is
+  // the key every import, generation and release load upserts on, which is what
+  // makes a rerun a no-op and a release loadable into any database.
+  source_key                 String
+  canonical_name             String
+  display_name               String
+  category                   String // the 21-value coverage-plan list: produce_vegetable … other
+  food_state                 String // 'raw' | 'cooked' | 'prepared' | 'dry' | 'as_purchased'
+  identity_source            String // 'usda' | 'ai_generated'
+  identity_status            String // 'verified' | 'ambiguous' | 'unsourced'
+  nutrition_provenance       String // 'source_backed' | 'ingredient_derived' | 'ai_estimated'
+  nutrition_version          Int
+  metadata_version           Int
+  nutrition_basis            String // 'per_100g' | 'per_100ml' | 'per_serving'
+  basis_amount               Float
+  calories                   Float?
+  protein_g                  Float?
+  carbs_g                    Float?
+  fat_g                      Float?
+  fiber_g                    Float?
+  density_g_per_ml           Float?
+  usda_fdc_id                Int?
+  usda_data_type             String?
+  usda_description           String?
+  source_version             String?
+  source_cache_key           String?
+  generation_batch_id        String?                     @db.Uuid
+  // 'retired' is set only by catalog-load, for a previously published food that
+  // a newer release no longer contains: retired rows stay referenceable by
+  // recipe_ingredients and meal_entries, but are excluded from search,
+  // suggestions and new recipe eligibility.
+  publication_status         String // 'candidate' | 'published' | 'quarantined' | 'rejected' | 'retired'
+  allergen_tags              String[]
+  allergen_status            String // 'known' | 'unknown'
+  diet_tags                  String[]
+  food_group                 String // controlled taxonomy from the coverage plan; a dislike stores the food id and this group
+  is_common_dislike          Boolean                     @default(false)
+  cost_class                 Int                         @db.SmallInt
+  search_text                String?
+  // The STORED generated expression and its GIN index are appended by hand in
+  // the migration SQL — Prisma can express neither, and the generated client
+  // omits Unsupported fields, so this stays optional to keep create() calls
+  // compiling.
+  search_vector              Unsupported("tsvector")?
+  imported_at                DateTime?
+  created_at                 DateTime                    @default(now())
+  updated_at                 DateTime                    @default(now()) @updatedAt
+  catalog_generation_batches catalog_generation_batches? @relation(fields: [generation_batch_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  catalog_food_aliases       catalog_food_aliases[]
+  catalog_food_portions      catalog_food_portions[]
+  catalog_food_components    catalog_food_components[]   @relation("catalog_food_components_food")
+  component_usages           catalog_food_components[]   @relation("catalog_food_components_component")
+  catalog_validation_records catalog_validation_records?
+  recipe_ingredients         recipe_ingredients[]
+  grocery_items              grocery_items[]
+  meal_entries               meal_entries[]
+
+  @@unique([source_key])
+  @@unique([usda_fdc_id])
+  @@index([publication_status, category])
+  @@index([food_group])
+}
+
+// Search aliases. The lower(alias) expression index is appended in the
+// migration SQL; one alias hit must never produce a duplicate search row, which
+// is why search aggregates to one row per food rather than joining these out.
+model catalog_food_aliases {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  catalog_food_id String        @db.Uuid
+  alias           String
+  catalog_foods   catalog_foods @relation(fields: [catalog_food_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([catalog_food_id, alias])
+}
+
+// Portion -> gram conversions, the only way a recipe or grocery quantity leaves
+// the per-100g basis. gram_weight must be > 0 and exactly one portion per food
+// may be the default; catalog.logic.ts enforces both, and the default is also
+// backed by a partial unique index appended in the migration SQL.
+model catalog_food_portions {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  catalog_food_id String        @db.Uuid
+  description     String
+  amount          Float
+  unit            String
+  gram_weight     Float
+  is_default      Boolean       @default(false)
+  source          String
+  catalog_foods   catalog_foods @relation(fields: [catalog_food_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([catalog_food_id, description])
+}
+
+// The typed composition of an ingredient-derived food, so catalog.logic.ts can
+// recompute its nutrition deterministically instead of storing an opinion. The
+// component side is Restrict: a food that another food is built from gets
+// retired, never deleted.
+model catalog_food_components {
+  id                          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  catalog_food_id             String        @db.Uuid
+  component_catalog_food_id   String        @db.Uuid
+  quantity_grams              Float
+  yield_factor                Float // cooked/raw mass change applied to this component
+  component_nutrition_version Int
+  sort_order                  Int
+  catalog_foods               catalog_foods @relation("catalog_food_components_food", fields: [catalog_food_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  component_catalog_foods     catalog_foods @relation("catalog_food_components_component", fields: [component_catalog_food_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([catalog_food_id, component_catalog_food_id])
+}
+
+// The machine-readable validation record every published food must have — one
+// row per food, so the outcome is auditable per item rather than per run. checks
+// holds one entry per deterministic check (name, pass, observed, bound);
+// llm_review is advisory only and never promotes a value to published.
+model catalog_validation_records {
+  id                    String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  catalog_food_id       String        @unique @db.Uuid
+  canonical_identity    Json
+  aliases               String[]
+  category              String
+  food_state            String
+  identity_source       String
+  identity_status       String
+  nutrition_provenance  String
+  nutrition_method      String
+  nutrition_assumptions String?
+  portion_units         Json
+  identity_evidence     Json // retrieval records: url, final host, status, body hash, matched snippet, fetched_at
+  checks                Json
+  llm_review            Json?
+  outcome               String // 'accepted' | 'quarantined' | 'rejected'
+  reviewed_at           DateTime
+  publication_status    String
+  source_versions       Json
+  history               Json
+  catalog_foods         catalog_foods @relation(fields: [catalog_food_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+// A recipe identity. current_version_id names the single planning-current
+// version, which is why the two models reference each other: seeding publishes
+// a new recipe_versions row and moves this pointer in one transaction. The
+// matching partial unique on recipe_versions (recipe_id) WHERE status =
+// 'current' is appended in the migration SQL.
+model recipes {
+  id                 String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug               String
+  current_version_id String?           @db.Uuid
+  created_at         DateTime          @default(now())
+  current_version    recipe_versions?  @relation("recipes_current_version", fields: [current_version_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  recipe_versions    recipe_versions[] @relation("recipe_versions_recipe")
+
+  @@unique([slug])
+}
+
+// Immutable once published. A catalog refresh publishes a NEW version and
+// retires this one rather than editing it, so every historical plan, recipe
+// detail and diary entry keeps the numbers it was actually built from. Retired
+// versions stay readable for exactly that reason.
+model recipe_versions {
+  id                       String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  recipe_id                String               @db.Uuid
+  version                  Int
+  name                     String
+  description              String?
+  icon_key                 String // 'crosshair' | 'fork_knife' | 'bowl' | 'wrap' | 'dome' | 'salad' | 'bowl_dash' | 'pot' | 'cloche'
+  instructions             Json
+  yield_servings           Float
+  serving_description      String
+  prep_minutes             Int
+  cook_minutes             Int
+  total_minutes            Int // prep_minutes + cook_minutes — the value the user's cooking-time limit is applied to
+  meal_slots               String[] // 'breakfast' | 'lunch' | 'dinner' | 'snack'
+  diet_tags                String[]
+  allergen_tags            String[]
+  allergen_status          String // 'known' | 'unknown' — only 'known' is ever plannable
+  budget_tier              Int                  @db.SmallInt
+  badges                   String[] // 'high_protein' | 'gluten_free' | 'dairy_free' | 'vegan' | 'quick'
+  nutrition_provenance     String // 'source_backed' — planning admits nothing else
+  per_serving_calories     Float
+  per_serving_protein_g    Float
+  per_serving_carbs_g      Float
+  per_serving_fat_g        Float
+  sourced_calories_note    String?
+  status                   String // 'current' | 'retired'
+  published_at             DateTime?
+  retired_at               DateTime?
+  recipes                  recipes              @relation("recipe_versions_recipe", fields: [recipe_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  current_of_recipes       recipes[]            @relation("recipes_current_version")
+  recipe_ingredients       recipe_ingredients[]
+  meal_plan_meals          meal_plan_meals[]    @relation("meal_plan_meals_recipe_version")
+  previous_meal_plan_meals meal_plan_meals[]    @relation("meal_plan_meals_previous_recipe_version")
+  meal_entries             meal_entries[]
+
+  @@unique([recipe_id, version])
+}
+
+// Ingredient quantities plus a SNAPSHOT of the catalog row taken at
+// publication: identity, display name, provenance and the allergen/diet safety
+// metadata are frozen here, so plan, recipe-detail and diary responses read the
+// snapshot and never the live catalog row — a catalog refresh can therefore
+// never mutate an existing recipe version. Both version columns are recorded
+// because a metadata change (allergen, diet, name, food_group) must invalidate a
+// recipe version just as a nutrient change does. USDA FoodData Central is public
+// domain, which is what makes snapshot-at-publication storage legal here.
+model recipe_ingredients {
+  id                        String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  recipe_version_id         String          @db.Uuid
+  catalog_food_id           String          @db.Uuid
+  catalog_nutrition_version Int
+  catalog_metadata_version  Int
+  snapshot_per_100g         Json // calories, protein_g, carbs_g, fat_g, fiber_g as stored at version creation
+  snapshot_name             String
+  snapshot_provenance       String
+  snapshot_allergen_tags    String[]
+  snapshot_diet_tags        String[]
+  quantity                  Float
+  unit                      String
+  gram_weight               Float
+  display_text              String
+  sort_order                Int
+  is_optional               Boolean         @default(false)
+  recipe_versions           recipe_versions @relation(fields: [recipe_version_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  catalog_foods             catalog_foods   @relation(fields: [catalog_food_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@index([recipe_version_id])
+}
+
+// One row per user, created by the first setup step and the source of truth for
+// resuming an interrupted setup (setup_status + setup_step survive a restart, a
+// React context would not). confirmed_targets mirrors the four users.target_*
+// values as they stood at confirmation, which is how the canonical read tells a
+// confirmed target from one a legacy PUT /user/targets changed afterwards.
+model meal_plan_preferences {
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id                String    @unique
+  time_zone              String? // IANA name from the device, refreshed on every step save
+  setup_status           String // 'not_started' | 'in_progress' | 'ready_for_review' | 'completed'
+  setup_step             String? // 'goal' | 'body' | 'activity' | 'diet' | 'dislikes' | 'schedule' | 'cooking' | 'review' | 'targets_manual'
+  review_start_date      DateTime? @db.Date
+  target_route           String? // 'estimated' | 'manual'
+  goal                   String? // 'lose' | 'maintain' | 'gain'
+  goal_weight_kg         Float?
+  pace_lb_per_week       Float? // 0.5 | 1 | 1.5
+  age                    Int?
+  height_cm              Float?
+  weight_kg              Float?
+  weight_source          String?
+  sex_for_estimate       String? // 'female' | 'male' | 'prefer_not_to_say' — the last one takes the manual-target route
+  height_unit_pref       String? // 'ft_in' | 'cm'
+  weight_unit_pref       String? // 'lb' | 'kg'
+  activity_level         String? // 'not_very_active' | 'lightly_active' | 'active' | 'very_active'
+  diet                   String? // 'none' | 'vegetarian' | 'vegan' | 'pescatarian'
+  allergens              String[] // 'none' is mutually exclusive with the nine named allergens
+  // catalog_foods ids held as a plain uuid[]: Postgres cannot foreign-key an
+  // array, so membership is validated in preferences.logic.ts instead.
+  disliked_food_ids      String[]  @db.Uuid
+  disliked_food_groups   String[]
+  meal_schedule          String? // 'three' | 'three_plus_snack'
+  meal_times             Json? // one {slot, time} entry per slot of the chosen schedule, in wire order
+  cooking_time_limit_min Int? // 15 | 30 | 45 | 60, total prep + cook per meal
+  budget_amount          Int? // whole units of budget_currency
+  budget_currency        String? // 'USD' only in this version
+  no_budget_preference   Boolean   @default(false)
+  budget_tier            Int?      @db.SmallInt
+  target_source          String? // 'estimated' | 'manual'
+  targets_revision       Int       @default(0)
+  confirmed_targets      Json?
+  targets_input_revision Int? // the revision whose goal/body/activity/pace produced the confirmed estimate
+  estimated_targets      Json?
+  revision               Int       @default(0)
+  users                  users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+// One published week per user. status and revision drive the write-safety
+// model: every mutation takes the per-user advisory lock, requires status =
+// 'active', and compares the expected revision before writing. The partial
+// unique on (user_id, start_date) WHERE status = 'active' — the backstop that
+// makes two overlapping active plans impossible — is appended in the migration
+// SQL. targets_snapshot is what this plan was generated against, which is how a
+// later target change is reported as stale instead of silently regenerating.
+model meal_plans {
+  id                    String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id               String
+  start_date            DateTime            @db.Date
+  end_date              DateTime            @db.Date
+  status                String // 'active' | 'superseded'
+  revision              Int                 @default(1)
+  generation_attempt    Int
+  preferences_revision  Int
+  targets_revision      Int
+  targets_snapshot      Json
+  generation_seed       String
+  generation_key        String
+  replaced_plan_id      String?             @db.Uuid
+  incompatibility_flags Json?
+  published_at          DateTime            @default(now())
+  users                 users               @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  replaced_plan         meal_plans?         @relation("meal_plans_replaced_plan", fields: [replaced_plan_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  replaced_by_plans     meal_plans[]        @relation("meal_plans_replaced_plan")
+  meal_plan_days        meal_plan_days[]
+  meal_plan_meals       meal_plan_meals[]
+  grocery_items         grocery_items[]
+  meal_plan_actions     meal_plan_actions[]
+
+  @@unique([user_id, generation_key])
+  @@index([user_id, status, start_date])
+}
+
+model meal_plan_days {
+  id                String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  meal_plan_id      String            @db.Uuid
+  user_id           String // denormalized so every read and write predicate carries the owner without a join
+  date              DateTime          @db.Date
+  day_index         Int               @db.SmallInt
+  planned_calories  Float
+  planned_protein_g Float
+  planned_carbs_g   Float
+  planned_fat_g     Float
+  meal_plans        meal_plans        @relation(fields: [meal_plan_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users             users             @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  meal_plan_meals   meal_plan_meals[]
+
+  @@unique([meal_plan_id, date])
+}
+
+// One planned slot. meal_plan_id and user_id are denormalized so the composite
+// {id, user_id, meal_plan_id} write predicate needs no join and can never match
+// a meal whose plan has been superseded. previous_recipe_version_id is an audit
+// value only — the card's logged-then-swapped treatment is derived from the
+// linked meal_entries, so any number of successive swaps stays representable.
+model meal_plan_meals {
+  id                         String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  meal_plan_day_id           String              @db.Uuid
+  meal_plan_id               String              @db.Uuid
+  user_id                    String
+  slot                       String // 'breakfast' | 'lunch' | 'dinner' | 'snack'
+  slot_time                  String // 'HH:mm'
+  sort_order                 Int
+  recipe_version_id          String              @db.Uuid
+  portion_multiplier         Float
+  planned_calories           Float
+  planned_protein_g          Float
+  planned_carbs_g            Float
+  planned_fat_g              Float
+  revision                   Int                 @default(1)
+  // An ARRAY OF {code, detail} OBJECTS — the same shape the DTO's flags carry,
+  // so several details per code survive a round trip losslessly. A bare array of
+  // codes would lose them.
+  flags                      Json                @default("[]")
+  previous_recipe_version_id String?             @db.Uuid
+  swapped_at                 DateTime?
+  meal_plan_days             meal_plan_days      @relation(fields: [meal_plan_day_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  meal_plans                 meal_plans          @relation(fields: [meal_plan_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users                      users               @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  recipe_versions            recipe_versions     @relation("meal_plan_meals_recipe_version", fields: [recipe_version_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+  previous_recipe_versions   recipe_versions?    @relation("meal_plan_meals_previous_recipe_version", fields: [previous_recipe_version_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  meal_entries               meal_entries[]
+  meal_plan_actions          meal_plan_actions[]
+
+  @@unique([meal_plan_day_id, slot])
+}
+
+// The weekly list, aggregated from planned portions. The unique key includes
+// food_state so raw, dry and cooked quantities of one food never merge into a
+// nonsense total. previous_quantity_grams and flagged_at carry the "amount went
+// up" flag that keeps an already-checked item checked and visibly changed
+// instead of silently folding the increase in.
+model grocery_items {
+  id                      String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  meal_plan_id            String        @db.Uuid
+  user_id                 String
+  catalog_food_id         String        @db.Uuid
+  food_state              String // 'raw' | 'cooked' | 'prepared' | 'dry' | 'as_purchased'
+  category                String // 'produce' | 'protein' | 'dairy_alternatives' | 'grains_bread' | 'pantry_other'
+  name                    String
+  quantity_grams          Decimal       @db.Decimal(10, 2)
+  display_quantity        Float
+  display_unit            String
+  display_text            String
+  is_checked              Boolean       @default(false)
+  checked_at              DateTime?
+  previous_quantity_grams Decimal?      @db.Decimal(10, 2) // the last amount the user acknowledged, so "was Y" never drifts
+  flagged_at              DateTime?
+  sort_order              Int
+  meal_plans              meal_plans    @relation(fields: [meal_plan_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users                   users         @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  catalog_foods           catalog_foods @relation(fields: [catalog_food_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
+
+  @@unique([meal_plan_id, catalog_food_id, food_state])
+}
+
+// The idempotency ledger for every keyed write (generate, regenerate, swap,
+// log). A row is RESERVED first and completed by the same transaction, so
+// response_status, response_snapshot and plan_revision_after are nullable and
+// deliberately carry no defaults: NULL means "reserved but not yet completed",
+// and a replay returns the stored status and body verbatim so a client cannot
+// tell a replay from the original response. request_fingerprint is what
+// distinguishes a genuine retry from a reused key with a different body.
+model meal_plan_actions {
+  id                  String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id             String
+  idempotency_key     String
+  action_type         String // 'generate' | 'regenerate' | 'swap' | 'log'
+  request_fingerprint String // SHA-256 of method + action + resource ids + canonical JSON body
+  meal_plan_id        String?          @db.Uuid
+  meal_plan_meal_id   String?          @db.Uuid
+  meal_entry_id       String?          @db.Uuid
+  response_status     Int?             @db.SmallInt
+  response_snapshot   Json?
+  plan_revision_after Int?
+  created_at          DateTime         @default(now())
+  users               users            @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  meal_plans          meal_plans?      @relation(fields: [meal_plan_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  meal_plan_meals     meal_plan_meals? @relation(fields: [meal_plan_meal_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  meal_entries        meal_entries?    @relation(fields: [meal_entry_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@unique([user_id, idempotency_key])
+  @@index([meal_plan_id])
 }

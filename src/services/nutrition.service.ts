@@ -9,11 +9,19 @@ import {
     MacroTotals,
     MealEntryResponse,
     MealResponse,
+    NutritionProvenance,
     UpdateMealEntryPayload,
 } from '../types/nutrition';
 
 const DEFAULT_MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
 const INPUT_METHODS = ['library', 'search', 'ai_text', 'ai_photo'];
+
+const NUTRITION_PROVENANCES: NutritionProvenance[] = [
+    'source_backed',
+    'ingredient_derived',
+    'ai_estimated',
+    'user_entered',
+];
 
 interface MealEntryRow {
     id: string;
@@ -28,6 +36,11 @@ interface MealEntryRow {
     input_method: string;
     logged_at: Date;
     deleted_at: Date | null;
+    // Meal-planning provenance columns. Both are NULL on every row written
+    // before the feature and on hand-logged entries, so the mapper below emits
+    // an explicit null rather than omitting the field.
+    meal_plan_meal_id: string | null;
+    nutrition_provenance: string | null;
 }
 
 interface MealRow {
@@ -41,9 +54,18 @@ const toDayKey = (date: Date): string => date.toISOString().slice(0, 10);
 
 const asEaten = (perServing: number, servings: number): number => Math.round(perServing * servings);
 
+// A stored value outside the known set is reported as null — "unknown /
+// user-entered", the same class a NULL column carries — so an unrecognised
+// string can never be presented to a client as verified provenance.
+const toNutritionProvenance = (value: string | null): NutritionProvenance | null =>
+    value !== null && NUTRITION_PROVENANCES.includes(value as NutritionProvenance)
+        ? (value as NutritionProvenance)
+        : null;
+
 const mapEntry = (entry: MealEntryRow): MealEntryResponse => ({
     id: entry.id,
     foodId: entry.food_id,
+    mealPlanMealId: entry.meal_plan_meal_id ?? null,
     name: entry.name,
     servingText: entry.serving_text,
     servings: entry.servings,
@@ -52,6 +74,7 @@ const mapEntry = (entry: MealEntryRow): MealEntryResponse => ({
     carbs: entry.carbs_g,
     fat: entry.fat_g,
     inputMethod: entry.input_method,
+    nutritionProvenance: toNutritionProvenance(entry.nutrition_provenance),
     loggedAt: entry.logged_at.toISOString(),
 });
 
