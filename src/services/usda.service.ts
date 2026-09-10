@@ -31,7 +31,18 @@ const getApiKey = (): string => {
 const MAX_ATTEMPTS = 4;
 const RETRY_DELAY_MS = 250;
 
-const fetchFromUsda = async (path: string, params: Record<string, string>): Promise<any> => {
+// The batch endpoint is the only non-GET call this module makes; omitting the
+// options leaves the request byte-for-byte the GET it has always been.
+interface UsdaRequestOptions {
+    method?: 'GET' | 'POST';
+    body?: unknown;
+}
+
+const fetchFromUsda = async (
+    path: string,
+    params: Record<string, string>,
+    options?: UsdaRequestOptions,
+): Promise<any> => {
     const baseUrl = process.env.USDA_BASE_URL || DEFAULT_BASE_URL;
     // Spaces must be %20, not URLSearchParams' "+" — USDA 400s on "+" inside
     // dataType values (e.g. "Survey (FNDDS)").
@@ -40,10 +51,24 @@ const fetchFromUsda = async (path: string, params: Record<string, string>): Prom
         .join('&');
     const url = `${baseUrl}${path}?${query}`;
 
+    // api_key stays in the query string above whatever the method — USDA
+    // authenticates by query parameter, not by header.
+    const init: RequestInit | undefined =
+        options === undefined
+            ? undefined
+            : {
+                method: options.method ?? 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: options.body === undefined ? undefined : JSON.stringify(options.body),
+            };
+
     let lastError: Error = new UsdaError('USDA request failed');
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-            const response = await fetch(url);
+            // fetch is read from the global on every attempt because
+            // scripts/lib/rateLimiter.ts wraps globalThis.fetch to charge a
+            // token per physical attempt and must observe all four.
+            const response = init === undefined ? await fetch(url) : await fetch(url, init);
             if (response.ok) {
                 return await response.json();
             }
@@ -68,7 +93,11 @@ const DETAIL_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 const ttlForPath = (path: string): number => (path.startsWith('/food/') ? DETAIL_TTL_MS : SEARCH_TTL_MS);
 
-const cacheKeyFor = (path: string, params: Record<string, string>): string => {
+// This output is usda_api_cache.cache_key, a single-column primary key whose
+// rows are already deployed: changing the normalisation, the sort, the
+// separator or the prefix orphans every cached row and re-triggers live USDA
+// traffic against an hourly-capped key.
+export const cacheKeyFor = (path: string, params: Record<string, string>): string => {
     const normalized = Object.entries(params)
         .map(([key, value]): [string, string] =>
             key === 'query' ? [key, value.trim().toLowerCase().replace(/\s+/g, ' ')] : [key, value])
@@ -76,6 +105,72 @@ const cacheKeyFor = (path: string, params: Record<string, string>): string => {
         .map(([key, value]) => `${key}=${value}`)
         .join('&');
     return `${path}?${normalized}`;
+};
+
+// FDC ids are positive integers, so the same set in any order — or carrying a
+// duplicate — must address one cached row and send one request, while a
+// different set must never collide with it. Normalising to numbers also means a
+// rerun that passes 1 where the first run passed '1' reuses the cached row
+// instead of spending another request.
+export const normalizeFdcIds = (fdcIds: ReadonlyArray<string | number>): number[] => {
+    const unique = new Set<number>();
+    for (const fdcId of fdcIds) {
+        const parsed = Number(String(fdcId).trim());
+        if (!Number.isInteger(parsed) || parsed <= 0) {
+            throw new UsdaError(`Invalid USDA FDC id: ${String(fdcId)}`);
+        }
+        unique.add(parsed);
+    }
+    return Array.from(unique).sort((a, b) => a - b);
+};
+
+const isFdcIdListBody = (
+    body: unknown,
+): body is Record<string, unknown> & { fdcIds: Array<string | number> } =>
+    typeof body === 'object' && body !== null && Array.isArray((body as { fdcIds?: unknown }).fdcIds);
+
+// Object keys are emitted in sorted order so a key never depends on the order
+// the caller happened to build the body in.
+const canonicalJson = (value: unknown): string => {
+    if (value === undefined) {
+        return 'null';
+    }
+    if (value === null || typeof value !== 'object') {
+        return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+        return `[${value.map(canonicalJson).join(',')}]`;
+    }
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJson(nested)}`).join(',')}}`;
+};
+
+const canonicalBody = (body: unknown): string => {
+    if (Array.isArray(body)) {
+        return canonicalJson(normalizeFdcIds(body));
+    }
+    if (isFdcIdListBody(body)) {
+        return canonicalJson({ ...body, fdcIds: normalizeFdcIds(body.fdcIds) });
+    }
+    return canonicalJson(body);
+};
+
+// The method- and body-aware sibling of cacheKeyFor. A GET without a body
+// delegates to it, so GET keys stay byte-identical whichever builder a call
+// site uses; anything else carries a method and canonical-body discriminator,
+// which no GET key can collide with because no path begins "POST ".
+export const cacheKeyForRequest = (
+    method: string,
+    path: string,
+    params: Record<string, string>,
+    body?: unknown,
+): string => {
+    const normalizedMethod = method.trim().toUpperCase();
+    const baseKey = cacheKeyFor(path, params);
+    if (normalizedMethod === 'GET' && body === undefined) {
+        return baseKey;
+    }
+    return `${normalizedMethod} ${baseKey}#${canonicalBody(body)}`;
 };
 
 const upsertCache = async (cacheKey: string, payload: any): Promise<void> => {
@@ -121,6 +216,34 @@ const usdaGet = async (path: string, params: Record<string, string>): Promise<an
     }
 
     const payload = await fetchFromUsda(path, params);
+    upsertCache(cacheKey, payload).catch(() => {
+        // Caching is best-effort; the response is already in hand.
+    });
+    return payload;
+};
+
+// The batch POST cannot go through usdaGet — that path is GET-only and its key
+// is not body-aware — so it reads and writes the same cache table through
+// cacheKeyForRequest, with usdaGet's error posture: cache/DB failures fall
+// through to a live call. A cached batch is served whatever its age and is
+// never refreshed in the background: detail records are near-immutable, and a
+// background request would spend one of the hour's requests outside the
+// caller's rate accounting.
+const usdaPost = async (path: string, params: Record<string, string>, body: unknown): Promise<any> => {
+    const cacheKey = cacheKeyForRequest('POST', path, params, body);
+
+    let cached: { payload: any } | null = null;
+    try {
+        cached = await prisma.usda_api_cache.findUnique({ where: { cache_key: cacheKey } });
+    } catch {
+        cached = null;
+    }
+
+    if (cached) {
+        return cached.payload;
+    }
+
+    const payload = await fetchFromUsda(path, params, { method: 'POST', body });
     upsertCache(cacheKey, payload).catch(() => {
         // Caching is best-effort; the response is already in hand.
     });
@@ -284,4 +407,111 @@ export const getBrandedFood = async (foodId: string): Promise<BrandedFoodRespons
         carbs: round(carbs),
         fat: round(fat),
     };
+};
+
+// Everything below serves the offline catalog import (backend scripts/), never
+// a request path: once the catalog is seeded, plan generation, swaps, grocery
+// aggregation, recipe viewing and internal catalog search reach USDA never.
+//
+// These are raw, unvalidated vendor payloads — catalog-validate.ts is what
+// decides whether a record is publishable — so only fdcId is treated as
+// certain and the index signature keeps dataset-specific extras reachable.
+export interface UsdaFoodNutrient {
+    nutrientNumber?: string | number;
+    nutrientName?: string;
+    unitName?: string;
+    value?: number;
+    // Detail responses nest the descriptor and name the value `amount`, where
+    // search results flatten it to nutrientNumber/value.
+    amount?: number;
+    nutrient?: { number?: string | number; id?: number; name?: string; unitName?: string };
+    [key: string]: any;
+}
+
+// portionDescription is the FNDDS wording; SR Legacy carries modifier + amount.
+// gramWeight is what turns a household portion into a mass the planner can use.
+export interface UsdaFoodPortion {
+    amount?: number;
+    gramWeight?: number;
+    modifier?: string;
+    portionDescription?: string;
+    measureUnit?: { name?: string; abbreviation?: string };
+    [key: string]: any;
+}
+
+export interface UsdaFoodSummary {
+    fdcId: number;
+    description?: string;
+    dataType?: string;
+    publicationDate?: string;
+    foodNutrients?: UsdaFoodNutrient[];
+    [key: string]: any;
+}
+
+export interface UsdaFoodDetail extends UsdaFoodSummary {
+    foodPortions?: UsdaFoodPortion[];
+    foodCategory?: { id?: number; description?: string } | string;
+    servingSize?: number;
+    servingSizeUnit?: string;
+    householdServingFullText?: string;
+    brandName?: string;
+    brandOwner?: string;
+    ingredients?: string;
+    labelNutrients?: Record<string, { value?: number }>;
+}
+
+// USDA documents 20 FDC ids as the maximum for one POST /foods call.
+export const MAX_BATCH_FDC_IDS = 20;
+
+// USDA caps /foods/list at 200 records per page and rejects a larger pageSize.
+export const MAX_LIST_PAGE_SIZE = 200;
+
+export const clampListPageSize = (pageSize: number): number =>
+    Number.isFinite(pageSize) ? Math.min(Math.max(1, Math.trunc(pageSize)), MAX_LIST_PAGE_SIZE) : MAX_LIST_PAGE_SIZE;
+
+const clampPageNumber = (pageNumber: number): number =>
+    Number.isFinite(pageNumber) ? Math.max(1, Math.trunc(pageNumber)) : 1;
+
+// The full record rather than the BrandedFoodResponse projection: the catalog
+// import needs the foodNutrients and the foodPortions gram weights that DTO
+// discards. ttlForPath already gives every /food/ path the 90-day detail TTL,
+// so this inherits it with no TTL change.
+export const getFoodDetail = async (fdcId: string | number): Promise<UsdaFoodDetail> => {
+    // normalizeFdcIds guarantees a positive integer, so — unlike
+    // getBrandedFood's client-supplied id — the path needs no escaping.
+    const [id] = normalizeFdcIds([fdcId]);
+    return usdaGet(`/food/${id}`, { format: 'full' });
+};
+
+export const getFoodsBatch = async (fdcIds: ReadonlyArray<string | number>): Promise<UsdaFoodDetail[]> => {
+    if (fdcIds.length === 0) {
+        return [];
+    }
+    // Silently truncating to the cap would make the import under-count and its
+    // coverage report lie, so an over-length batch is rejected instead.
+    if (fdcIds.length > MAX_BATCH_FDC_IDS) {
+        throw new UsdaError(
+            `USDA accepts at most ${MAX_BATCH_FDC_IDS} FDC ids per batch request, received ${fdcIds.length}`,
+        );
+    }
+
+    const ids = normalizeFdcIds(fdcIds);
+    const data = await usdaPost('/foods', {}, { fdcIds: ids, format: 'full' });
+    return Array.isArray(data) ? (data as UsdaFoodDetail[]) : [];
+};
+
+// dataType takes the same values searchGenericFoods passes ('Foundation',
+// 'SR Legacy', 'Survey (FNDDS)', 'Branded'), which is why fetchFromUsda must
+// keep encoding spaces as %20.
+export const listFoods = async (
+    dataType: string,
+    pageSize: number = MAX_LIST_PAGE_SIZE,
+    pageNumber: number = 1,
+): Promise<UsdaFoodSummary[]> => {
+    const data = await usdaGet('/foods/list', {
+        dataType: dataType.trim(),
+        pageSize: String(clampListPageSize(pageSize)),
+        pageNumber: String(clampPageNumber(pageNumber)),
+    });
+    return Array.isArray(data) ? (data as UsdaFoodSummary[]) : [];
 };
