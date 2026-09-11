@@ -31,9 +31,16 @@
 // than per-row: scripts/lib/dbGuard.ts classifies DATABASE_URL and refuses an
 // unrecognised origin before Prisma is imported, so an unowned write can only
 // land in a database it recognises. Within that boundary the scoping key is
-// `run_id` (for every aggregate) or the globally unique `batch_key` (for every
-// single-row read and write), and no statement below touches a batch row
-// without one of them in its predicate.
+// `run_id`: every aggregate is scoped by it alone, and every single-row write
+// pairs it with `batch_key` (`where: { batch_key, run_id }`). `batch_key` on
+// its own is NOT a sufficient scope — it is globally unique but deliberately
+// stable across runs (see batchKeyFor), so it identifies a batch while saying
+// nothing about which run's ledger the row belongs to, and charging a
+// reservation to whatever run happens to own the row would corrupt that run's
+// totals while leaving the reserving run's aggregate at zero. No statement
+// below touches a batch row without `run_id` in its predicate, except the one
+// failure-path read that exists solely to tell "no such key" apart from "that
+// key belongs to another run".
 //
 // WHAT THIS MODULE DOES NOT DO (§1.1). It meters. It never calls OpenRouter,
 // never constructs a Prisma client or reaches for the `prisma` singleton, never
@@ -45,15 +52,21 @@
 // vendor or a fixed environment (§11 — Jest's `roots` is <rootDir>/src, so no
 // test file can live beside this one).
 //
-// TYPECHECKING NOTE: the type-only chain through ./checkpoint resolves to
-// Prisma's generated client, which .gitignore excludes and which CI and the
-// Docker build regenerate. `npx prisma generate` must therefore have run
-// against the current prisma/schema.prisma before this file typechecks.
+// TYPECHECKING NOTE: the type-only chain through ./checkpoint, and the one
+// type-only import below, resolve to Prisma's generated client, which
+// .gitignore excludes and which CI and the Docker build regenerate.
+// `npx prisma generate` must therefore have run against the current
+// prisma/schema.prisma before this file typechecks.
 
 import { recordCounts } from './checkpoint';
 import type { CatalogRunDb } from './checkpoint';
 import { describeMissingEnv } from './logger';
 import type { ScriptLogger } from './logger';
+// Type-only, and the only direct reference to the generated client anywhere in
+// this file: the reservation below needs to tell a full client apart from a
+// transaction client (see transactionRunnerOf). Nothing here is imported at
+// runtime, so this module still constructs no client and loads no engine.
+import type { PrismaClient } from '../../src/generated/prisma';
 
 // Matches `defaultBatchSize` in data/meal-planning/coverage-plan.v1.json. The
 // environment variable is the override and the plan file is the documented
@@ -77,7 +90,12 @@ const BATCH_INDEX_WIDTH = 4;
 // status afterwards.
 const INITIAL_BATCH_STATUS = 'pending';
 
-export type ModelBudgetCode = 'budget_misconfigured' | 'budget_insufficient' | 'budget_exhausted' | 'batch_not_found';
+export type ModelBudgetCode =
+    | 'budget_misconfigured'
+    | 'budget_insufficient'
+    | 'budget_exhausted'
+    | 'batch_not_found'
+    | 'batch_run_mismatch';
 
 // Follows the DailyQuotaError template in src/services/entitlement.service.ts
 // (§8): a named class carrying the numbers the caller needs rather than a
@@ -85,11 +103,18 @@ export type ModelBudgetCode = 'budget_misconfigured' | 'budget_insufficient' | '
 // from a plan that cannot fit from a run that has spent its budget, and report
 // each with its figures.
 //
+// `batch_not_found` and `batch_run_mismatch` are deliberately separate codes
+// because they are different operator mistakes: the first is "nothing was ever
+// reserved under this key", i.e. a caller spent without metering, while the
+// second is "the key exists but another run owns its ledger row", i.e. a new
+// run was started over a coverage plan whose batches an earlier run already
+// opened, and the fix is to resume that run rather than to charge it.
+//
 // `reserved` is strictly "reservations already recorded against this run", so
 // it is null for the two codes where nothing has been reserved yet
-// (budget_misconfigured, budget_insufficient) and for batch_not_found. Nothing
-// is lost: a caller hitting budget_insufficient already holds the BatchPlan it
-// passed in.
+// (budget_misconfigured, budget_insufficient) and for the two batch-identity
+// codes. Nothing is lost: a caller hitting budget_insufficient already holds
+// the BatchPlan it passed in.
 export class ModelBudgetError extends Error {
     constructor(
         public readonly code: ModelBudgetCode,
@@ -316,6 +341,15 @@ const padBatchIndex = (batchIndex: number): string => {
  * generation's — catalog-validate.ts's advisory review owns its own format, and
  * reserveModelCall deliberately accepts whatever key its caller passes rather
  * than building one, so this function never becomes a bottleneck on that.
+ *
+ * BECAUSE the key is both globally unique and stable across runs, it cannot be
+ * used on its own to address a run's ledger row: a key produced by a second run
+ * of the same coverage plan resolves to the row the FIRST run created. Every
+ * statement in the ledger below therefore pairs the key with `run_id`, and a
+ * key whose row belongs to another run is refused with `batch_run_mismatch`
+ * rather than silently charged to that run. Resuming the owning run
+ * (checkpoint.ts's openOrResumeRun) is what makes a rerun address these keys
+ * again; a genuinely new set of batches needs a new coveragePlanVersion.
  */
 export const batchKeyFor = (coveragePlanVersion: string, category: string, batchIndex: number): string => {
     const index = requireNonNegativeInteger(batchIndex, 'batchIndex');
@@ -360,7 +394,8 @@ export const assertModelCallBudget = (plan: BatchPlan, budgetLimit: number, logg
 
 // ---------------------------------------------------------------------------
 // The ledger itself (§1.2 — these orchestrate I/O; every decision they need is
-// above). Scoped by `run_id` or the unique `batch_key`, never by row id alone.
+// above). Every aggregate is scoped by `run_id` and every write by `run_id` and
+// `batch_key` together, never by the key alone and never by row id.
 // ---------------------------------------------------------------------------
 
 /**
@@ -401,15 +436,146 @@ export const getRemainingModelCalls = async (
     return Math.max(0, limit - reserved);
 };
 
-/**
- * Reserves one paid model call. Call this IMMEDIATELY BEFORE `callOpenRouter`,
- * never after — that ordering is the rule this module exists to enforce (§9).
- *
- * Throws `budget_exhausted` when the run has spent its cap, before any
- * increment and before the vendor call, so the caller's stop reason is a value
- * rather than a surprise bill.
- */
-export const reserveModelCall = async (
+// A Prisma transaction client is exactly the client with $transaction removed
+// (Prisma's ITXClientDenyList), so its absence is a reliable probe for "the
+// caller already owns a transaction" — the same probe checkpoint.ts uses for
+// recordCounts. Opening a transaction inside the caller's would nest, which
+// Prisma does not support.
+const transactionRunnerOf = (db: CatalogRunDb): PrismaClient | null => {
+    const candidate = db as PrismaClient;
+    return typeof candidate.$transaction === 'function' ? candidate : null;
+};
+
+// The per-run budget lock. One string parameter, passed as a bound parameter
+// rather than interpolated, and $executeRaw rather than $queryRaw because
+// pg_advisory_xact_lock returns `void`, which Prisma cannot deserialise into a
+// result row (P2010).
+//
+// This mirrors the per-user `pg_advisory_xact_lock(hashtext('meal-planning:' ||
+// userId))` idiom the Agent Action Plan specifies for every mutating
+// meal-planning transaction; the key is namespaced so the two lock spaces
+// cannot collide. Transaction-scoped, so it is released by the commit or the
+// rollback and cannot be leaked by a killed script.
+const lockRunBudget = async (db: CatalogRunDb, runId: string): Promise<void> => {
+    const lockKey = `catalog-budget:${runId}`;
+    await db.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
+};
+
+// One message for both ledger paths, so a reservation and a usage record cannot
+// describe the same operator mistake in two different ways. It names the key and
+// the run that was refused and states the remedy, because "that key is taken"
+// on its own would leave the operator guessing which run to look at.
+const batchRunMismatchError = (batchKey: string, runId: string): ModelBudgetError =>
+    new ModelBudgetError(
+        'batch_run_mismatch',
+        `Batch key ${batchKey} is already owned by a different run, so run ${runId} may not reserve or ` +
+            'record against it: batch keys are globally unique and stable across runs. Resume the run that ' +
+            'owns this batch instead of opening a new one, or publish a new coveragePlanVersion so this run ' +
+            'gets batch keys of its own.',
+    );
+
+// Records one reservation against the batch row THIS RUN owns, creating that
+// row when the run has not reserved under the key yet.
+//
+// Why this is not an upsert on `batch_key`: the key is stable across runs (see
+// batchKeyFor), so an upsert keyed on it alone takes its update branch on a row
+// a DIFFERENT run created — growing that run's `model_calls_reserved` while the
+// aggregate this module enforces the cap with, `SUM(model_calls_reserved) WHERE
+// run_id = <this run>`, stays at zero and the cap never binds. The predicate
+// therefore carries `run_id` as well, and the three outcomes are distinct:
+//
+//   1. updateMany matched -> the row is this run's and the atomic increment
+//      landed. `batch_key` is UNIQUE, so a match is always exactly one row.
+//   2. nothing matched -> either no row exists under the key, or one exists
+//      under another run. createMany with skipDuplicates tells the two apart
+//      without reading: inserting 1 row means we created this run's row
+//      (reserved = 1); inserting 0 means the key was taken.
+//   3. still nothing after one retry of the run-bound update -> the row belongs
+//      to another run, which is an operator mistake, not a race, so it throws.
+//
+// The retry between 2 and 3 exists because "the key was taken" can also mean a
+// writer for THIS run created the row in the window between our update and our
+// insert — possible for a caller that reserves under a transaction whose budget
+// lock is held elsewhere — and that case must reserve, not fail.
+//
+// skipDuplicates rather than catching a unique-violation on purpose: §9 forbids
+// pattern-matching a vendor's error shape, and matching Prisma's P2002 would
+// also force a runtime import of the generated client this module never makes.
+const bindReservationToRun = async (
+    db: CatalogRunDb,
+    input: { runId: string; batchKey: string; category: string; model: string; promptVersion: string },
+): Promise<void> => {
+    const claimed = await db.catalog_generation_batches.updateMany({
+        where: { batch_key: input.batchKey, run_id: input.runId },
+        data: { model_calls_reserved: { increment: 1 } },
+    });
+
+    if (claimed.count > 0) {
+        return;
+    }
+
+    const created = await db.catalog_generation_batches.createMany({
+        data: [
+            {
+                run_id: input.runId,
+                batch_key: input.batchKey,
+                category: input.category,
+                model: input.model,
+                prompt_version: input.promptVersion,
+                status: INITIAL_BATCH_STATUS,
+                model_calls_reserved: 1,
+                model_calls_used: 0,
+                tokens_used: 0,
+            },
+        ],
+        skipDuplicates: true,
+    });
+
+    if (created.count > 0) {
+        return;
+    }
+
+    const claimedAfterCreate = await db.catalog_generation_batches.updateMany({
+        where: { batch_key: input.batchKey, run_id: input.runId },
+        data: { model_calls_reserved: { increment: 1 } },
+    });
+
+    if (claimedAfterCreate.count > 0) {
+        return;
+    }
+
+    throw batchRunMismatchError(input.batchKey, input.runId);
+};
+
+// The whole of the reservation decision, in the order that makes the cap a cap.
+// Returns the reservation count the run held BEFORE this one, so the caller can
+// report `reserved`/`remaining` without a second aggregate.
+//
+// THE CAP CHECK AND THE INCREMENT ARE ONE ATOMIC STEP, AND THAT IS WHY THE LOCK
+// IS HERE. CATALOG_MODEL_CALL_BUDGET is a hard spending cap (Agent Action Plan
+// §0.4.3), so the aggregate that decides "one more call fits" and the increment
+// that consumes the allowance must not be separable: two callers reserving at
+// `limit - 1` would otherwise both read `limit - 1`, both pass the check and
+// both increment, and the run would spend past a cap an operator set in money.
+// A per-RUN advisory lock is what serialises them — per run and not per batch
+// key, because the cap spans every batch row the run owns, so two reservations
+// under two DIFFERENT keys racing at `limit - 1` must queue behind each other
+// too. (An earlier revision of this file argued the race could not occur
+// because one process owns a run end to end. That is an assumption about every
+// present and future caller, and it is not one a money cap should rest on.)
+//
+// ORDER IS LOAD-BEARING. The lock is taken BEFORE the aggregate: under
+// PostgreSQL's read-committed default every statement takes a fresh snapshot,
+// so the aggregate that runs once the lock is held sees the previous holder's
+// committed increment. Raising the isolation level would break exactly that and
+// must revisit this function. hashtext narrows the key to a 32-bit integer, so
+// two unrelated runs can collide and then merely wait for each other, which is
+// harmless.
+//
+// The locked section is three fast statements and contains NO vendor call — the
+// model call happens after reserveModelCall returns — so a multi-hour import
+// serialises on the ledger and on nothing else.
+const claimModelCallReservation = async (
     db: CatalogRunDb,
     input: {
         runId: string;
@@ -417,15 +583,18 @@ export const reserveModelCall = async (
         category: string;
         model: string;
         promptVersion: string;
-        budgetLimit: number;
         logger?: ScriptLogger;
     },
-): Promise<{ reserved: number; remaining: number }> => {
-    const limit = requirePositiveInteger(input.budgetLimit, 'budgetLimit');
+    limit: number,
+): Promise<number> => {
+    await lockRunBudget(db, input.runId);
+
     const reserved = await getReservedModelCalls(db, input.runId);
 
     // `>=`, unlike the `>` in assertModelCallBudget: there the question is
-    // whether N more calls fit, here it is whether one more does.
+    // whether N more calls fit, here it is whether one more does. Thrown before
+    // any increment and before the vendor call, so nothing has been spent and
+    // the rollback of this transaction leaves the ledger exactly as it was.
     if (reserved >= limit) {
         input.logger?.warn('model_budget_exhausted', {
             runId: input.runId,
@@ -442,42 +611,65 @@ export const reserveModelCall = async (
         );
     }
 
-    // CHECK-THEN-INCREMENT IS SAFE HERE, AND DELIBERATELY UNLOCKED. One script
-    // process owns a run from end to end and works through its batches
-    // sequentially — a run is resumed and continued, never shared — so this
-    // module has exactly one writer per run and there is no interleaving to
-    // lose. Do not "fix" this with an advisory lock or a locking read: the race
-    // it would guard against cannot occur, and the lock would serialise a
-    // multi-hour import against nothing. If a future stage ever reserves
-    // concurrently against one run, that needs a locking read, not a comment.
-    //
     // The increment itself is still Prisma's atomic `{increment: 1}` — the same
     // idiom entitlement.service.ts uses on ai_usage.count — so the counter is
-    // never computed in application code from a value that could be stale.
-    await db.catalog_generation_batches.upsert({
-        where: { batch_key: input.batchKey },
-        create: {
-            run_id: input.runId,
-            batch_key: input.batchKey,
-            category: input.category,
-            model: input.model,
-            prompt_version: input.promptVersion,
-            status: INITIAL_BATCH_STATUS,
-            model_calls_reserved: 1,
-            model_calls_used: 0,
-            tokens_used: 0,
-        },
-        update: { model_calls_reserved: { increment: 1 } },
-    });
+    // never computed in application code from a value that could be stale. The
+    // lock is what makes the CHECK above safe, not what makes the write atomic.
+    await bindReservationToRun(db, input);
+
+    return reserved;
+};
+
+/**
+ * Reserves one paid model call. Call this IMMEDIATELY BEFORE `callOpenRouter`,
+ * never after — that ordering is the rule this module exists to enforce (§9).
+ *
+ * Throws `budget_exhausted` when the run has spent its cap, before any
+ * increment and before the vendor call, so the caller's stop reason is a value
+ * rather than a surprise bill. Throws `batch_run_mismatch` when the batch key
+ * exists under another run, because charging that run's ledger would both
+ * corrupt its totals and leave this run's cap unenforced.
+ */
+export const reserveModelCall = async (
+    db: CatalogRunDb,
+    input: {
+        runId: string;
+        batchKey: string;
+        category: string;
+        model: string;
+        promptVersion: string;
+        budgetLimit: number;
+        logger?: ScriptLogger;
+    },
+): Promise<{ reserved: number; remaining: number }> => {
+    const limit = requirePositiveInteger(input.budgetLimit, 'budgetLimit');
+    const runner = transactionRunnerOf(db);
+
+    // When we own the connection the lock, the aggregate and the increment run
+    // inside one interactive transaction, so the lock is held for exactly as
+    // long as the decision it protects. When the caller passed its own
+    // transaction client we run IN PLACE — Prisma does not support nesting —
+    // and the caller's transaction supplies the boundary. Either way it is the
+    // LOCK that serialises, not the transaction; but a caller that brings its
+    // own transaction holds this run's budget lock until IT commits, so such a
+    // caller must not make the paid model call inside that transaction.
+    const reserved = runner
+        ? await runner.$transaction((tx) => claimModelCallReservation(tx, input, limit))
+        : await claimModelCallReservation(db, input, limit);
 
     // Mirrored for the reports only: catalog-generate-ai.ts reads these keys
     // back into the `modelSpend` block of
     // data/meal-planning/reports/latest/import-report.json, and catalog-report.ts
     // reads them again, so `modelCallsReserved`, `modelCallsUsed` and
     // `tokensUsed` are a contract with those two scripts and must keep their
-    // names. This runs AFTER the authoritative write, which is the order that
+    // names. This runs AFTER the authoritative write and — when we own the
+    // connection — OUTSIDE the reservation transaction, which is the order that
     // matters: if the mirror fails, the reservation still stands and the budget
-    // stays enforceable, because the aggregate above is what enforces it.
+    // stays enforceable, because the aggregate above is what enforces it. It is
+    // also why the mirror is not inside the locked section: a diagnostic JSONB
+    // merge must never be able to roll back a reservation that was already
+    // decided. (A caller that brought its own transaction necessarily gets both
+    // in that transaction — its boundary, its choice.)
     await recordCounts(db, input.runId, { modelCallsReserved: 1 });
 
     const reservedAfter = reserved + 1;
@@ -523,47 +715,67 @@ const normalizeTokensUsed = (tokensUsed?: number): number => {
  * before the call. `succeeded` therefore changes nothing in the arithmetic; it
  * records the caller's outcome in the log, where the two counters diverging is
  * the signal an operator reads.
+ *
+ * `runId` IS REQUIRED, and pairing it with the batch key is not ceremony: the
+ * key is stable across runs, so usage addressed by key alone lands on whichever
+ * run's row exists — the same defect the reservation path guards against, with
+ * the added twist that the run whose budget paid for the call would show no
+ * usage at all. The caller always knows its run id (it just reserved against
+ * it), so the pairing is explicit rather than derived from the row, and a key
+ * belonging to another run is refused instead of charged.
  */
 export const recordModelCallUsage = async (
     db: CatalogRunDb,
-    input: { batchKey: string; succeeded: boolean; tokensUsed?: number; logger?: ScriptLogger },
+    input: { runId: string; batchKey: string; succeeded: boolean; tokensUsed?: number; logger?: ScriptLogger },
 ): Promise<void> => {
     const tokensUsed = normalizeTokensUsed(input.tokensUsed);
 
-    // Read first for two reasons: the run id is needed for the mirror below,
-    // and a missing row has to be distinguishable. Racing this read is not a
-    // concern — a batch row is never deleted mid-run, and the increments below
-    // are atomic regardless.
-    const batch = await db.catalog_generation_batches.findUnique({
-        where: { batch_key: input.batchKey },
-        select: { run_id: true },
-    });
-
-    // Usage recorded against a batch that was never reserved means a caller
-    // spent without metering — the one bug this module exists to prevent — so
-    // it is surfaced loudly rather than swallowed (§8).
-    if (!batch) {
-        throw new ModelBudgetError(
-            'batch_not_found',
-            `No generation batch is reserved under batch key ${input.batchKey}: ` +
-                'reserveModelCall must run before recordModelCallUsage.',
-        );
-    }
-
-    await db.catalog_generation_batches.update({
-        where: { batch_key: input.batchKey },
+    // One run-bound statement, so the two increments cannot be applied to
+    // another run's row and need no lock of their own: Prisma's `{increment}`
+    // is computed by PostgreSQL, not in application code, and the `run_id`
+    // predicate is what makes the row this run's. No read precedes it — the
+    // run id comes from the caller now, so the only reason left to read is to
+    // explain a miss, which happens on the failure path below.
+    const recorded = await db.catalog_generation_batches.updateMany({
+        where: { batch_key: input.batchKey, run_id: input.runId },
         data: {
             model_calls_used: { increment: 1 },
             tokens_used: { increment: tokensUsed },
         },
     });
 
-    await recordCounts(db, batch.run_id, { modelCallsUsed: 1, tokensUsed });
+    // Usage recorded against a batch this run never reserved means a caller
+    // spent without metering — the one bug this module exists to prevent — so
+    // it is surfaced loudly rather than swallowed (§8). The extra read runs on
+    // the failure path only (checkpoint.ts's classifyUnwritableRun does the
+    // same) and exists because "no such key" and "that key is another run's"
+    // are different mistakes with different fixes.
+    if (recorded.count === 0) {
+        const existing = await db.catalog_generation_batches.findUnique({
+            where: { batch_key: input.batchKey },
+            select: { id: true },
+        });
+
+        if (!existing) {
+            throw new ModelBudgetError(
+                'batch_not_found',
+                `No generation batch is reserved under batch key ${input.batchKey}: ` +
+                    'reserveModelCall must run before recordModelCallUsage.',
+            );
+        }
+
+        throw batchRunMismatchError(input.batchKey, input.runId);
+    }
+
+    // The caller's run id, never the row's: mirroring into whatever run owned
+    // the row is exactly how a run's reported spend drifts from what it paid.
+    await recordCounts(db, input.runId, { modelCallsUsed: 1, tokensUsed });
 
     // Never the prompt, the completion, the API key or a caught error object —
     // logger.ts's safeError is the sanctioned way to reference a failure, and
     // the caller owns that reporting. This line carries counters only.
     input.logger?.info('model_call_recorded', {
+        runId: input.runId,
         batchKey: input.batchKey,
         succeeded: input.succeeded,
         tokensUsed,

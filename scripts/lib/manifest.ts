@@ -4,15 +4,19 @@
 // module (`seed-dev.ts` is the exception), and it makes them two promises.
 //
 // FIRST: paths resolve from the repository root, never from the process working
-// directory. A script launched from another directory — or through tooling that
-// changes the working directory under it — must still read the same files,
-// where `path.resolve('data/…')` would quietly read a different tree or nothing
-// at all. `.dockerignore` excludes both `scripts` and `data`, so these paths
-// exist only in the repository and in operator checkouts and never inside the
-// production image; the nine `npm run` entry points all execute TypeScript from
-// source under `ts-node`, so resolving relative to this module's own location
-// is correct in every environment the pipeline runs in, while anything derived
-// from a `dist/` layout would not be.
+// directory, and they stay inside `data/meal-planning`. A script launched from
+// another directory — or through tooling that changes the working directory
+// under it — must still read the same files, where `path.resolve('data/…')`
+// would quietly read a different tree or nothing at all. `.dockerignore`
+// excludes both `scripts` and `data`, so these paths exist only in the
+// repository and in operator checkouts and never inside the production image;
+// the nine `npm run` entry points all execute TypeScript from source under
+// `ts-node`, so resolving relative to this module's own location is correct in
+// every environment the pipeline runs in, while anything derived from a `dist/`
+// layout would not be. Containment is the other half of the same promise: a
+// segment reaching these helpers from an operator's flag or from a manifest on
+// disk is validated as one name inside the tree before it becomes a path, so
+// what a caller reads and writes is a meal-planning data file and nothing else.
 //
 // SECOND: a manifest whose declared version this build does not understand
 // fails loudly. These files carry policy — category targets, validation bounds,
@@ -22,10 +26,13 @@
 // §1.6/§9 puts that decision here, at the single boundary where the
 // configuration is read, behind accessors that throw rather than coerce (§8).
 //
-// Scope (§1.1, §7.1): this module resolves paths, reads and writes JSON, and
-// compares versions. Checksum verification belongs to `catalog-load.ts`, JSONL
-// streaming to the release and load scripts, shortfall arithmetic to
-// `catalog-report.ts`, and model-call budgeting to `budget.ts`. It imports two
+// Scope (§1.1, §7.1): this module resolves paths, reads and writes JSON,
+// compares versions, and verifies that the one policy document whose missing
+// fields would silently remove a security limit — the evidence allowlist —
+// carries the fields its declared shape promises. Checksum verification belongs
+// to `catalog-load.ts`, JSONL streaming to the release and load scripts,
+// shortfall arithmetic to `catalog-report.ts`, the evidence policy's meaning to
+// `src/services/evidence.logic.ts`, and model-call budgeting to `budget.ts`. It imports two
 // Node built-ins and its sibling logger, reads no environment variable, and
 // does nothing at import time — every read happens when a caller calls a
 // loader, and every argument a rule depends on is a parameter, so the pure
@@ -45,13 +52,28 @@ const logger = createLogger('manifest');
  * means an earlier pipeline step has not been run, `version_mismatch` means
  * this build predates the data it was handed, and `repo_root_not_found` means
  * the process is not running inside the checkout it expects.
+ *
+ * The last three are refusals rather than absences, and an operator acts on
+ * each of them differently. `invalid_path_segment` means a name this module was
+ * asked to build a path from — a `--release` id, a file name read out of a
+ * release manifest — is not a single name inside the data tree, so the argument
+ * is wrong. `path_outside_data_root` is the containment invariant itself
+ * failing: bad input is already refused by the segment rule, so this one means
+ * the module or the checkout layout moved, not that a caller passed something
+ * odd. `invalid_manifest_shape` means a policy document parsed and declared the
+ * version this build understands but does not carry the fields that version
+ * promises, so the document and this loader have to be reconciled before the
+ * run continues.
  */
 export type ManifestErrorCode =
     | 'repo_root_not_found'
     | 'file_not_found'
     | 'invalid_json'
     | 'missing_version_field'
-    | 'version_mismatch';
+    | 'version_mismatch'
+    | 'invalid_path_segment'
+    | 'path_outside_data_root'
+    | 'invalid_manifest_shape';
 
 export class ManifestError extends Error {
     constructor(
@@ -157,19 +179,155 @@ export const resolveRepoRoot = (fromDir: string = __dirname): string => {
     );
 };
 
-export const dataPath = (...segments: string[]): string =>
-    path.join(resolveRepoRoot(), 'data', 'meal-planning', ...segments);
+// ---------------------------------------------------------------------------
+// Path building, and why it is guarded.
+//
+// Not every segment these helpers receive is a literal written above them. A
+// release id arrives from an operator's `--release <id>` flag, and a release
+// file name arrives from the `files[].path` entries of a manifest read off
+// disk. `path.join` resolves `..` without complaint, so
+// `releaseFilePath('..', '../../../etc/passwd')` used to normalise to a path
+// outside the data tree — which the callers then read through `readJsonFile`
+// and write through `writeJsonFile`, and `writeJsonFile` creates missing
+// parents on the way. Root containment is one of this module's two promises
+// (see the header), so it is enforced here, at the single place every path is
+// built, rather than left to nine CLI scripts to remember.
+//
+// A segment is therefore one name — a single directory or file inside the data
+// tree — held to an allowlist rather than checked against a `..` denylist: a
+// denylist has to anticipate every spelling of "parent" a platform accepts,
+// while an allowlist admits only the shapes the committed tree actually uses
+// (`catalog`, `releases`, `v1`, `foods.jsonl`, `coverage-plan.v1.json`,
+// `chicken-burrito-bowl.json`). Callers that need a nested path pass several
+// segments, which is already the established style: `dataPath('catalog',
+// 'releases', version)`.
+// ---------------------------------------------------------------------------
 
-export const releaseDir = (releaseVersion: string): string => dataPath('catalog', 'releases', releaseVersion);
+const SAFE_PATH_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
+// Named so the refusal can say which of the two it was, instead of reporting a
+// character-class failure for the one input an operator is most likely to try.
+const RELATIVE_SEGMENTS = new Set(['.', '..']);
+
+// `v1`, `v2`, … — the release identifier form the catalog release tree is laid
+// out under (`data/meal-planning/catalog/releases/v<N>/`). Checked separately
+// from the generic segment rule so `--release ../../etc` is answered with the
+// expected form rather than with a character class.
+const RELEASE_VERSION_PATTERN = /^v[0-9]+$/;
+
+// A rejected name is diagnostic gold, and quoting it is how an operator sees
+// what their flag actually contained; the length cap is why it can be quoted at
+// all — a file name read out of a manifest is file content, and this module
+// never lets a document's bytes reach a log or a committed report unbounded.
+const MAX_DESCRIBED_SEGMENT_CHARS = 80;
+
+const describeSegment = (value: unknown): string => {
+    const rendered = typeof value === 'string' ? value : String(value);
+    const bounded =
+        rendered.length > MAX_DESCRIBED_SEGMENT_CHARS
+            ? `${rendered.slice(0, MAX_DESCRIBED_SEGMENT_CHARS)}…`
+            : rendered;
+    // Quoted rather than interpolated bare, so a name that is empty, or is all
+    // whitespace, or ends in a separator is visible as such in the message.
+    return JSON.stringify(bounded);
+};
+
+/**
+ * Accepts one path segment and returns it, or throws
+ * `ManifestError('invalid_path_segment')`. `role` names the argument in the
+ * message ("release id", "report file name") so the refusal reads as something
+ * about the caller's input rather than about this module's internals.
+ *
+ * Exported and argument-driven because it is the decision worth pinning from
+ * `src/__tests__/scripts/` (rule backend-architecture §11): its failure
+ * branches are the traversal guard.
+ */
+export const assertSafePathSegment = (segment: string, role: string): string => {
+    if (typeof segment !== 'string' || segment.length === 0) {
+        throw new ManifestError(
+            'invalid_path_segment',
+            `A meal-planning ${role} must be a non-empty name; received ${describeSegment(segment)}.`,
+        );
+    }
+
+    if (RELATIVE_SEGMENTS.has(segment)) {
+        throw new ManifestError(
+            'invalid_path_segment',
+            `A meal-planning ${role} may not be ${describeSegment(segment)}: it names a directory relative to its parent rather than something inside data/meal-planning.`,
+        );
+    }
+
+    if (!SAFE_PATH_SEGMENT.test(segment)) {
+        throw new ManifestError(
+            'invalid_path_segment',
+            `A meal-planning ${role} must be a single name of letters, digits, ".", "-" and "_" starting with a letter or digit; received ${describeSegment(segment)}. Path separators, "..", and absolute paths are refused so a name that reaches this module from a flag or a manifest cannot address a file outside data/meal-planning.`,
+        );
+    }
+
+    return segment;
+};
+
+/**
+ * The release id is the one segment an operator types by hand, so it carries
+ * its own rule on top of the segment rule.
+ */
+export const assertReleaseVersion = (releaseVersion: string): string => {
+    assertSafePathSegment(releaseVersion, 'release id');
+
+    if (!RELEASE_VERSION_PATTERN.test(releaseVersion)) {
+        throw new ManifestError(
+            'invalid_path_segment',
+            `A catalog release id must be "v" followed by digits, for example "v1"; received ${describeSegment(releaseVersion)}.`,
+        );
+    }
+
+    return releaseVersion;
+};
+
+/** The canonical directory every path this module returns must live in. */
+const mealPlanningDataRoot = (): string => path.resolve(resolveRepoRoot(), 'data', 'meal-planning');
+
+/**
+ * Validate, resolve canonically, then prove containment. The third step is
+ * unreachable while the segment rule holds, and it is kept deliberately: it is
+ * the invariant the other two steps exist to produce, it costs one `path.relative`
+ * per call, and it is what still fails loudly if this module later grows a
+ * caller that builds a segment some other way.
+ */
+const buildDataPath = (segments: readonly string[], role: string): string => {
+    const root = mealPlanningDataRoot();
+    const checked = segments.map((segment) => assertSafePathSegment(segment, role));
+    const resolved = path.resolve(root, ...checked);
+
+    const relative = path.relative(root, resolved);
+    const escapes = relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    if (escapes) {
+        throw new ManifestError(
+            'path_outside_data_root',
+            `data/meal-planning/${checked.join('/')} resolves outside the meal-planning data root. Every path this module returns must name the data root itself or something inside it.`,
+        );
+    }
+
+    return resolved;
+};
+
+export const dataPath = (...segments: string[]): string => buildDataPath(segments, 'path segment');
+
+export const releaseDir = (releaseVersion: string): string =>
+    buildDataPath(['catalog', 'releases', assertReleaseVersion(releaseVersion)], 'release id');
+
+// Built from the full segment list rather than by joining onto `releaseDir`'s
+// answer, so the file name passes the same gate as every other segment instead
+// of being appended to an already-validated path.
 export const releaseFilePath = (releaseVersion: string, fileName: string): string =>
-    path.join(releaseDir(releaseVersion), fileName);
+    buildDataPath(['catalog', 'releases', assertReleaseVersion(releaseVersion), fileName], 'release file name');
 
-export const reportPath = (fileName: string): string => dataPath('reports', 'latest', fileName);
+export const reportPath = (fileName: string): string =>
+    buildDataPath(['reports', 'latest', fileName], 'report file name');
 
-export const recipesDir = (): string => dataPath('recipes');
+export const recipesDir = (): string => buildDataPath(['recipes'], 'path segment');
 
-export const fixturePath = (fileName: string): string => dataPath('fixtures', fileName);
+export const fixturePath = (fileName: string): string => buildDataPath(['fixtures', fileName], 'fixture file name');
 
 /**
  * Error messages name the repository-relative path: it is the path an operator
@@ -222,11 +380,14 @@ export const readJsonFile = <T>(absolutePath: string): T => {
     }
 };
 
-// Four spaces matches the repository's TypeScript style and these artefacts are
-// reviewed as pull-request diffs. Should the hand-authored data files land
-// indented with two, change this one constant to match them — a report script
-// rewriting an artefact's whitespace on every run is review noise.
-const JSON_INDENT = 4;
+// Two spaces, because that is what the committed artefacts under
+// `data/meal-planning/` are indented with — `evidence-allowlist.v1.json` is the
+// one that exists as this is written, and it uses two. These files are reviewed
+// as pull-request diffs, so a report or release script that reindented an
+// artefact on every run would produce a whitespace-only diff over the whole
+// file and bury the change a reviewer is there to read. The repository's
+// four-space rule governs TypeScript source, which this constant is not about.
+const JSON_INDENT = 2;
 
 export const writeJsonFile = (absolutePath: string, value: unknown): void => {
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
@@ -277,11 +438,28 @@ export const assertManifestVersion = (args: {
 //
 // RECONCILIATION: the committed JSON is the authority for every field and key
 // name. The shapes below follow the data files' documented specification; where
-// a committed file diverges, this is the file that changes. The loaders cast
-// rather than validate structurally, so a divergence surfaces in the consuming
-// script — deliberate, because a hand-authored policy file is reviewed input,
-// not untrusted input, and re-validating every field here would duplicate the
-// checks `catalog-validate.ts` already owns.
+// a committed file diverges, this is the file that changes — and for the one
+// document that is committed today it did: `EvidenceHostClass` and
+// `EvidenceFetchLimits` are transcribed from `evidence-allowlist.v1.json` as it
+// actually stands, not from the intended field list (see the note above each).
+//
+// Four of the five loaders cast rather than validate structurally, so a
+// divergence surfaces in the consuming script — deliberate, because a
+// hand-authored policy file is reviewed input, not untrusted input, and
+// re-validating every field here would duplicate the checks
+// `catalog-validate.ts` already owns.
+//
+// `evidence-allowlist.v1.json` is the exception, and `loadEvidenceAllowlist`
+// validates it at runtime, because "surfaces in the consuming script" is not
+// true of this one document: it is the SSRF policy. A `fetchLimits` member that
+// is missing rather than wrong does not throw downstream, it removes a limit —
+// an absent `maxBodyBytes` is no size cap at all — and a `specialPurposeRanges`
+// row whose `cidr` is missing silently drops a range from the non-globally-
+// routable table, which turns every address inside it into an address the fetch
+// path accepts. Neither failure is visible in a run's output. So this loader
+// checks the fields the policy is made of and refuses the document otherwise
+// (`invalid_manifest_shape`); it does not re-derive the policy, which belongs
+// to `src/services/evidence.logic.ts`.
 //
 // `src/services/evidence.logic.ts` and `evidence.service.ts` load
 // `evidence-allowlist.v1.json` through their own types instead of importing
@@ -531,21 +709,54 @@ export interface SpecialPurposeRange {
     readonly globallyReachable: GloballyReachable;
 }
 
+/**
+ * One curated allowlist entry group, transcribed from the committed document:
+ * `hostClasses[]` entries carry `class`, `hosts` and `evidenceTypes`, and
+ * nothing else. They carry no `id` and no `description`, and an earlier version
+ * of this interface declared both as required `string`s — a script reading
+ * `hostClass.id` would have been handed `undefined` under a type promising a
+ * string, and `hostClass.class`, the identifier the document does write, was
+ * not visible to the type at all.
+ *
+ * `src/services/evidence.logic.ts` resolves the identifier through
+ * `evidenceHostClassId`, which prefers `class`; this shape is what that
+ * preference was written for.
+ */
 export interface EvidenceHostClass {
-    readonly id: string;
-    readonly description: string;
+    /** `usda_fdc`, `government_nutrition_reference`, … — the document's own key. */
+    readonly class: string;
     /** Exact hosts and `*.` wildcard entries, matched per label, never as substrings. */
     readonly hosts: readonly string[];
+    /** The evidence kinds this class may corroborate; every committed class states at least one. */
     readonly evidenceTypes: readonly string[];
 }
 
+/**
+ * The fetch policy as the committed document declares it. `schemes` and
+ * `allowedPorts` are the https-only and port-443-only halves of that policy and
+ * were absent from an earlier version of this interface, so a script could not
+ * see the two limits it is required to enforce.
+ *
+ * `maxSnippetChars` is optional because the committed v1 document does not
+ * state it: `src/services/evidence.logic.ts` applies the reviewed canonical cap
+ * when it is absent. Declaring it required here would have certified a value
+ * the file does not carry — and `slice(0, undefined)` returns the whole body,
+ * which is the snippet cap disappearing rather than failing.
+ *
+ * Enforcement itself belongs to `evidence.service.ts`, which owns the socket.
+ */
 export interface EvidenceFetchLimits {
+    /** `['https']` — a scheme list, because the policy is an allowlist, not a flag. */
+    readonly schemes: readonly string[];
+    /** `[443]` — the default https port only; a non-default port is refused. */
+    readonly allowedPorts: readonly number[];
+    readonly maxRedirects: number;
     readonly timeoutMs: number;
     /** Enforced on the decompressed body, so a compressed bomb cannot pass it. */
     readonly maxBodyBytes: number;
-    readonly maxRedirects: number;
     readonly allowedContentTypes: readonly string[];
-    readonly maxSnippetChars: number;
+    /** Absent from the committed v1 document — see the note above. */
+    readonly maxSnippetChars?: number;
 }
 
 export interface EvidenceAllowlist {
@@ -557,6 +768,170 @@ export interface EvidenceAllowlist {
     readonly specialPurposeRanges: readonly SpecialPurposeRange[];
     readonly fetchLimits: EvidenceFetchLimits;
 }
+
+// ---------------------------------------------------------------------------
+// Evidence-allowlist shape validation.
+//
+// Hand-written, because no schema validator is installed and none is being
+// added: validation in this repository is written out. Focused, because this is
+// not a second copy of the evidence policy — it answers one question, "does the
+// document carry the fields the declared type promises", so that what the type
+// says and what has been checked are the same set. Everything about what those
+// values MEAN — which schemes are permitted, how a CIDR is matched, which
+// address families nest — stays in `src/services/evidence.logic.ts`.
+//
+// Every check takes its data as an argument and the whole entry point is
+// exported, so `src/__tests__/scripts/` can drive each failure branch without a
+// database and without touching the committed document (rule
+// backend-architecture §11).
+// ---------------------------------------------------------------------------
+
+/**
+ * The third value the IANA registries state, beside `true` and `false`. Named
+ * because it appears in both the check and the message it produces, and a typo
+ * in either would be a check that accepts nothing or a message that misreports
+ * what the document may say.
+ */
+const GLOBALLY_REACHABLE_NA = 'n/a';
+
+const shapeError = (relativePath: string, detail: string): ManifestError =>
+    new ManifestError(
+        'invalid_manifest_shape',
+        `${relativePath} ${detail}. The document and the shape declared in scripts/lib/manifest.ts must be reconciled before this run can continue.`,
+    );
+
+const requireRecord = (value: unknown, relativePath: string, field: string): Record<string, unknown> => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        throw shapeError(relativePath, `declares ${field} as something other than a JSON object`);
+    }
+    return value as Record<string, unknown>;
+};
+
+const requireNonEmptyString = (value: unknown, relativePath: string, field: string): string => {
+    if (typeof value !== 'string' || value.length === 0) {
+        throw shapeError(relativePath, `declares no non-empty string ${field}`);
+    }
+    return value;
+};
+
+/**
+ * Integers only: every numeric field in this document is a count, a duration in
+ * milliseconds, a byte size or a port, and a fractional or non-finite value in
+ * any of them is a document error rather than a limit to round.
+ */
+const requireInteger = (value: unknown, relativePath: string, field: string, minimum: number): number => {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum) {
+        throw shapeError(relativePath, `declares ${field} as something other than an integer of at least ${minimum}`);
+    }
+    return value;
+};
+
+const requireNonEmptyArray = (value: unknown, relativePath: string, field: string): readonly unknown[] => {
+    if (!Array.isArray(value) || value.length === 0) {
+        throw shapeError(relativePath, `declares ${field} as something other than a non-empty array`);
+    }
+    return value;
+};
+
+const requireNonEmptyStringArray = (value: unknown, relativePath: string, field: string): readonly string[] =>
+    requireNonEmptyArray(value, relativePath, field).map((entry, index) =>
+        requireNonEmptyString(entry, relativePath, `${field}[${index}]`),
+    );
+
+/**
+ * `false` and `'n/a'` both reject a fetch and only `true` permits one, so the
+ * one thing this check must not do is accept a near-miss: the string `'false'`
+ * is truthy, and a row that carried it would read as globally routable to any
+ * consumer testing the value for truth rather than for `=== true`.
+ */
+const requireGloballyReachable = (value: unknown, relativePath: string, field: string): GloballyReachable => {
+    if (typeof value === 'boolean' || value === GLOBALLY_REACHABLE_NA) {
+        return value;
+    }
+    throw shapeError(
+        relativePath,
+        `declares ${field} as something other than true, false or "${GLOBALLY_REACHABLE_NA}", which is how the IANA registries state it`,
+    );
+};
+
+/**
+ * Refuses `evidence-allowlist.v1.json` unless it carries every field the
+ * declared `EvidenceAllowlist` shape promises, and returns it typed.
+ *
+ * The document is verified in place and returned as-is rather than rebuilt from
+ * the checked fields, so a reviewed addition to it still reaches the script that
+ * wants it instead of being quietly dropped by this function.
+ */
+export const assertEvidenceAllowlistShape = (value: unknown, relativePath: string): EvidenceAllowlist => {
+    const document = requireRecord(value, relativePath, 'its top level');
+
+    requireNonEmptyString(document.allowlistVersion, relativePath, 'allowlistVersion');
+    // The snapshot date is what makes an address-table refresh a reviewed data
+    // change rather than a silent one, so a table without one is refused even
+    // though nothing at runtime branches on the date.
+    requireNonEmptyString(document.registrySnapshot, relativePath, 'registrySnapshot');
+    const declaredRowCount = requireInteger(document.rowCount, relativePath, 'rowCount', 1);
+
+    const hostClasses = requireNonEmptyArray(document.hostClasses, relativePath, 'hostClasses');
+    hostClasses.forEach((entry, index) => {
+        const hostClass = requireRecord(entry, relativePath, `hostClasses[${index}]`);
+        requireNonEmptyString(hostClass.class, relativePath, `hostClasses[${index}].class`);
+        // An empty host list matches nothing and an empty evidence-type list
+        // corroborates nothing: either makes the class inert, which is a
+        // curation mistake worth failing on rather than a permissive default.
+        requireNonEmptyStringArray(hostClass.hosts, relativePath, `hostClasses[${index}].hosts`);
+        requireNonEmptyStringArray(hostClass.evidenceTypes, relativePath, `hostClasses[${index}].evidenceTypes`);
+    });
+
+    const ranges = requireNonEmptyArray(document.specialPurposeRanges, relativePath, 'specialPurposeRanges');
+    ranges.forEach((entry, index) => {
+        const range = requireRecord(entry, relativePath, `specialPurposeRanges[${index}]`);
+        // A row without a CIDR cannot classify an address, which does not fail
+        // — it removes the range from the table and makes every address inside
+        // it look globally routable.
+        requireNonEmptyString(range.cidr, relativePath, `specialPurposeRanges[${index}].cidr`);
+        requireNonEmptyString(range.name, relativePath, `specialPurposeRanges[${index}].name`);
+        requireNonEmptyString(range.registry, relativePath, `specialPurposeRanges[${index}].registry`);
+        requireGloballyReachable(
+            range.globallyReachable,
+            relativePath,
+            `specialPurposeRanges[${index}].globallyReachable`,
+        );
+    });
+
+    // `rowCount` is the document's own statement of how many registry rows it
+    // carries, and the pair is what a truncated or half-merged table shows up
+    // as. Comparing them here means the table cannot lose rows quietly; the
+    // sibling evidence test additionally pins both numbers against the values
+    // recorded in `docs/meal-planning/catalog-policy.md`.
+    if (ranges.length !== declaredRowCount) {
+        throw shapeError(
+            relativePath,
+            `declares rowCount ${declaredRowCount} but carries ${ranges.length} specialPurposeRanges rows`,
+        );
+    }
+
+    const fetchLimits = requireRecord(document.fetchLimits, relativePath, 'fetchLimits');
+    requireNonEmptyStringArray(fetchLimits.schemes, relativePath, 'fetchLimits.schemes');
+    requireNonEmptyArray(fetchLimits.allowedPorts, relativePath, 'fetchLimits.allowedPorts').forEach((port, index) => {
+        requireInteger(port, relativePath, `fetchLimits.allowedPorts[${index}]`, 1);
+    });
+    // Zero redirects is a valid policy (follow none); zero milliseconds, zero
+    // bytes or zero content types are not — each would be a limit that can
+    // never be satisfied rather than a strict one.
+    requireInteger(fetchLimits.maxRedirects, relativePath, 'fetchLimits.maxRedirects', 0);
+    requireInteger(fetchLimits.timeoutMs, relativePath, 'fetchLimits.timeoutMs', 1);
+    requireInteger(fetchLimits.maxBodyBytes, relativePath, 'fetchLimits.maxBodyBytes', 1);
+    requireNonEmptyStringArray(fetchLimits.allowedContentTypes, relativePath, 'fetchLimits.allowedContentTypes');
+    if (fetchLimits.maxSnippetChars !== undefined) {
+        requireInteger(fetchLimits.maxSnippetChars, relativePath, 'fetchLimits.maxSnippetChars', 1);
+    }
+
+    // Every member the declared type promises has now been checked against the
+    // document itself, which is what makes this a verified narrowing rather than
+    // the declarative cast the other four loaders make.
+    return value as EvidenceAllowlist;
+};
 
 /**
  * Declared for `catalog-load.ts` to read; nothing in this module computes or
@@ -649,14 +1024,32 @@ interface VersionCheck {
 const readVersionField = (value: unknown, field: string): unknown =>
     value !== null && typeof value === 'object' ? (value as Record<string, unknown>)[field] : undefined;
 
-const loadVersionedManifest = <T>(absolutePath: string, checks: readonly VersionCheck[]): T => {
+/**
+ * A loader's optional structural check. It runs after the version checks — a
+ * `v2` document is refused for its version, not for failing a `v1` shape — and
+ * before the result is cached, so a refused document is never memoised.
+ *
+ * Only `loadEvidenceAllowlist` passes one; the reason that document is the
+ * exception is written out above the shapes.
+ */
+type ManifestShapeCheck<T> = (value: unknown, relativePath: string) => T;
+
+const loadVersionedManifest = <T>(
+    absolutePath: string,
+    checks: readonly VersionCheck[],
+    validateShape?: ManifestShapeCheck<T>,
+): T => {
     const cached = manifestCache.get(absolutePath);
     if (cached !== undefined) {
         return cached as T;
     }
 
     const relativePath = describePath(absolutePath);
-    const parsed = readJsonFile<T>(absolutePath);
+    // Read as `unknown`: the parsed document only becomes a `T` once its
+    // version has been checked and — where a loader supplies one — its shape
+    // has been verified. The cast below is the declarative one described above
+    // the shapes, and it is confined to this line.
+    const parsed = readJsonFile<unknown>(absolutePath);
 
     let declaredVersion: string | null = null;
     for (const check of checks) {
@@ -670,14 +1063,16 @@ const loadVersionedManifest = <T>(absolutePath: string, checks: readonly Version
         }
     }
 
+    const value = validateShape === undefined ? (parsed as T) : validateShape(parsed, relativePath);
+
     // Cached only once every check has passed, so a refused manifest is never
     // memoised and the next call fails the same way instead of succeeding.
-    manifestCache.set(absolutePath, parsed);
+    manifestCache.set(absolutePath, value);
     // One line per real read: a cache hit is not a load, which also makes the
     // memoisation visible in a run's output.
     logger.info('manifest_loaded', { file: relativePath, version: declaredVersion });
 
-    return parsed;
+    return value;
 };
 
 export const loadCoveragePlan = (): CoveragePlan =>
@@ -696,9 +1091,14 @@ export const loadSearchBenchmark = (): SearchBenchmark =>
     ]);
 
 export const loadEvidenceAllowlist = (): EvidenceAllowlist =>
-    loadVersionedManifest<EvidenceAllowlist>(dataPath(EVIDENCE_ALLOWLIST_FILE), [
-        { field: EVIDENCE_ALLOWLIST_VERSION_FIELD, expected: EXPECTED_EVIDENCE_ALLOWLIST_VERSION },
-    ]);
+    loadVersionedManifest<EvidenceAllowlist>(
+        dataPath(EVIDENCE_ALLOWLIST_FILE),
+        [{ field: EVIDENCE_ALLOWLIST_VERSION_FIELD, expected: EXPECTED_EVIDENCE_ALLOWLIST_VERSION }],
+        // The one loader that verifies its document rather than declaring it:
+        // this file is the SSRF policy, and a field missing from it removes a
+        // limit instead of raising one.
+        assertEvidenceAllowlistShape,
+    );
 
 export const loadReleaseManifest = (releaseVersion: string): CatalogReleaseManifest =>
     loadVersionedManifest<CatalogReleaseManifest>(releaseFilePath(releaseVersion, RELEASE_MANIFEST_FILE), [

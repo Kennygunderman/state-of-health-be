@@ -10,11 +10,16 @@
 // OPENROUTER_API_KEY (an `Authorization: Bearer` header that OpenRouter's own
 // error bodies can reflect).
 //
-// The module imports nothing and reads no environment variable. It formats and
+// The module imports one Node builtin — `fs`, for the synchronous fatal write
+// path at the bottom of the file, which is the only way a refusal can be
+// guaranteed to reach fd 2 before `process.exit()` — and nothing else. It reads
+// no environment variable and has no import-time side effect. It formats and
 // redacts, and decides nothing about the pipeline (§1.1); the log level is an
 // injected option rather than a new env key (§1.6/§9); and `write`/`now` are
 // injected so the pure rules below are unit-testable from `src/__tests__`
 // (§11 — Jest's `roots` is `<rootDir>/src`, so no test file can live here).
+
+import fs from 'fs';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -173,6 +178,20 @@ const sanitizeFields = (fields?: LogFields): Record<string, unknown> => {
     return sanitized as Record<string, unknown>;
 };
 
+/**
+ * The recursive field sanitizer on its own, for a caller that has to make a
+ * structure safe somewhere other than a log line — persisting diagnostics into
+ * a JSONB column, for instance, where the same rules apply and the same
+ * scrubbing has to happen before the value is stored rather than printed.
+ *
+ * Identical behaviour to what every log line already goes through: every string
+ * value and every key scrubbed by SCRUB_RULES, Errors normalized through
+ * `safeError`, BigInt and Date rendered, functions/symbols and anything deeper
+ * than MAX_FIELD_DEPTH replaced with `[unserializable]`, cycles broken, and a
+ * throwing getter contained. A non-object argument yields `{}`.
+ */
+export const sanitizeLogFields = (fields?: LogFields): Record<string, unknown> => sanitizeFields(fields);
+
 const timestampOf = (clock: () => Date): string => {
     try {
         return clock().toISOString();
@@ -183,9 +202,67 @@ const timestampOf = (clock: () => Date): string => {
     }
 };
 
+// The four metadata keys of every line, written by one function so the reserved
+// list below cannot drift from what the serializer actually emits.
+const buildMetadata = (
+    level: LogLevel,
+    scope: string,
+    event: string,
+    clock: () => Date,
+): Record<string, unknown> => ({
+    ts: timestampOf(clock),
+    level,
+    scope: scrubSecrets(scope),
+    event: scrubSecrets(event),
+});
+
+/**
+ * The field names this module owns. They are metadata, never caller data: `ts`,
+ * `level`, `scope` and `event` are how a committed report, a CI log grep or an
+ * operator identifies a line, so a caller field must not be able to set them.
+ *
+ * Derived from `buildMetadata` rather than written out twice. The fixed clock is
+ * only a means of producing the shape at module load — nothing observes it.
+ */
+export const RESERVED_LOG_FIELDS: readonly string[] = Object.freeze(
+    Object.keys(buildMetadata('info', '', '', (): Date => new Date(0))),
+);
+
+const RENAMED_FIELD_PREFIX = 'field_';
+
+// A colliding caller field is renamed, not dropped: the value may be the one
+// diagnostic that explains the run, and losing it silently is its own bug. The
+// name is deterministic so a report consumer can find it again, and numbered
+// only when the plain form is itself taken — by another caller key, or by an
+// earlier rename.
+const renamedFieldName = (key: string, taken: ReadonlySet<string>): string => {
+    const base = `${RENAMED_FIELD_PREFIX}${key}`;
+    if (!taken.has(base)) {
+        return base;
+    }
+    // `taken` is finite, so at most `taken.size` of the numbered variants can be
+    // occupied and one of the first `taken.size` is free. The bound makes that
+    // termination argument explicit instead of relying on it.
+    for (let suffix = 2; suffix <= taken.size + 1; suffix += 1) {
+        const candidate = `${base}_${suffix}`;
+        if (!taken.has(candidate)) {
+            return candidate;
+        }
+    }
+    // Unreachable by the counting argument above, and still a real, distinct
+    // name rather than a thrown error on a logging path.
+    return `${base}_${taken.size + 2}`;
+};
+
 // One JSON object per line: human-scannable in a terminal and machine-parseable
-// for the committed reports. `ts`, `level`, `scope` and `event` are written
-// first and are therefore reserved field names — caller fields are spread last.
+// for the committed reports. Metadata is written first and caller fields follow,
+// so the field order is `ts`, `level`, `scope`, `event`, then the caller's — but
+// order is not what protects the metadata. A caller field whose sanitized name
+// collides with a RESERVED_LOG_FIELDS entry is renamed before it is copied, so
+// `logger.info('started', { level: 'debug' })` records the caller's value under
+// `field_level` and still reports `"level":"info"`. Without that, a field value
+// — which on this pipeline can come from a model response or a vendor error
+// body — could forge the identity of the line carrying it.
 const serializeEntry = (
     level: LogLevel,
     scope: string,
@@ -193,26 +270,34 @@ const serializeEntry = (
     fields: LogFields | undefined,
     clock: () => Date,
 ): string => {
-    const entry: Record<string, unknown> = {
-        ts: timestampOf(clock),
-        level,
-        scope: scrubSecrets(scope),
-        event: scrubSecrets(event),
-    };
+    const metadata = buildMetadata(level, scope, event, clock);
+    const entry: Record<string, unknown> = { ...metadata };
     const sanitized = sanitizeFields(fields);
-    for (const key of Object.keys(sanitized)) {
-        entry[key] = sanitized[key];
+    const callerKeys = Object.keys(sanitized);
+    // Seeded with both the reserved names and every caller key, so a rename can
+    // never land on a name another caller field is about to claim.
+    const taken = new Set<string>(RESERVED_LOG_FIELDS);
+    for (const key of callerKeys) {
+        taken.add(key);
     }
+
+    for (const key of callerKeys) {
+        if (!RESERVED_LOG_FIELDS.includes(key)) {
+            entry[key] = sanitized[key];
+            continue;
+        }
+        const renamed = renamedFieldName(key, taken);
+        taken.add(renamed);
+        entry[renamed] = sanitized[key];
+    }
+
     try {
         return JSON.stringify(entry);
     } catch {
-        return JSON.stringify({
-            ts: entry.ts,
-            level,
-            scope: entry.scope,
-            event: entry.event,
-            fields: UNSERIALIZABLE,
-        });
+        // The caller's fields are what failed to serialise, so they are dropped
+        // wholesale — but the line keeps the true metadata, because a line that
+        // cannot be attributed is worse than a line without its fields.
+        return JSON.stringify({ ...metadata, fields: UNSERIALIZABLE });
     }
 };
 
@@ -256,3 +341,103 @@ export const createLogger = (
         child: (childScope: string): ScriptLogger => createLogger(`${scope}:${childScope}`, { level, write, now }),
     };
 };
+
+// THE FATAL PATH.
+//
+// `defaultWrite` above goes through process.stderr, whose writes are buffered
+// when the stream is a pipe, and `process.exit()` discards whatever is still
+// buffered. Measured on this runtime: 200,001 bytes written with
+// `process.stderr.write` followed immediately by `process.exit(1)` deliver
+// 65,536 bytes — one pipe buffer — through a pipe, while the same bytes written
+// with `fs.writeSync(2, …)` deliver all 200,001. A guard that refuses to run
+// must not lose the reason it refused, so the refusal path writes to the file
+// descriptor synchronously and only then exits.
+const STDOUT_FD = 1;
+const STDERR_FD = 2;
+
+// A short bound on each side of the retry loop: a fatal path may stall a moment
+// for a slow reader, but it must not hang the process it is trying to end. The
+// worst case here is roughly one second of pausing before the line is dropped.
+const FATAL_WRITE_MAX_ATTEMPTS = 1024;
+const FATAL_WRITE_RETRY_PAUSE_MS = 1;
+
+// The only synchronous sleep available to a CommonJS script without adding a
+// dependency or an await point. `Atomics.wait` on a buffer no other thread can
+// see parks this thread for the timeout and returns 'timed-out'. It is
+// wrapped because a runtime that disables SharedArrayBuffer (or forbids
+// blocking on the main thread) throws here, and an immediate retry is a correct
+// — merely busier — fallback.
+const pauseSynchronously = (milliseconds: number): void => {
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+    } catch {
+        // Fall through to an immediate retry.
+    }
+};
+
+/**
+ * Writes one already-serialized line straight to a file descriptor, with the
+ * same `(line, level)` shape as `createLogger`'s injectable `write`, so it can
+ * be passed wherever that option is accepted.
+ *
+ * Problems go to fd 2 and progress to fd 1, matching `defaultWrite`. Partial
+ * writes are resumed from the byte offset the kernel accepted, `EAGAIN`/`EINTR`
+ * are retried after a brief synchronous pause, and every other failure —
+ * `EPIPE` from `… | head`, `EBADF` from a closed descriptor, anything
+ * unforeseen — is swallowed: this function runs while the process is already
+ * reporting a fatal condition, and throwing on top of that would replace the
+ * diagnosis with an unrelated stack trace.
+ */
+export const writeLineSync = (line: string, level: LogLevel): void => {
+    const fd = level === 'warn' || level === 'error' ? STDERR_FD : STDOUT_FD;
+
+    let buffer: Buffer;
+    try {
+        buffer = Buffer.from(`${line}\n`, 'utf8');
+    } catch {
+        // An unencodable line has nowhere to go and nothing left to report it.
+        return;
+    }
+
+    let written = 0;
+    let attempts = 0;
+    while (written < buffer.length && attempts < FATAL_WRITE_MAX_ATTEMPTS) {
+        attempts += 1;
+        try {
+            written += fs.writeSync(fd, buffer, written, buffer.length - written);
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === 'EAGAIN' || code === 'EINTR') {
+                // A full pipe with a slow reader, or a signal mid-write. Both
+                // are transient, so pause and resume from the same offset.
+                pauseSynchronously(FATAL_WRITE_RETRY_PAUSE_MS);
+                continue;
+            }
+            return;
+        }
+    }
+};
+
+/**
+ * A logger whose output is on the file descriptor before the call returns, for
+ * the paths that log and then terminate the process — today the module-load
+ * refusal in dbGuard.ts.
+ *
+ * Identical to `createLogger` in every other respect, including the field
+ * sanitization and reserved-key protection above, and it honours an injected
+ * `write`/`now`/`level` so a test can capture the line instead of the terminal.
+ * Ordinary logging keeps the buffered stream path: it is faster, and a
+ * long-running import writing thousands of progress lines synchronously would
+ * pay for durability it does not need.
+ */
+export const createFatalLogger = (
+    scope: string,
+    options?: { level?: LogLevel; write?: (line: string, level: LogLevel) => void; now?: () => Date },
+): ScriptLogger =>
+    createLogger(scope, {
+        // The same default level as createLogger, so the only difference between
+        // the two factories is where the bytes go.
+        level: options && options.level ? options.level : 'info',
+        write: options && options.write ? options.write : writeLineSync,
+        now: options && options.now ? options.now : (): Date => new Date(),
+    });

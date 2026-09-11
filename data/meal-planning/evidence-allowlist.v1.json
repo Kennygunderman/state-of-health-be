@@ -16,7 +16,8 @@
       "text/html",
       "application/json",
       "text/plain"
-    ]
+    ],
+    "maxSnippetChars": 500
   },
   "hostClasses": [
     {

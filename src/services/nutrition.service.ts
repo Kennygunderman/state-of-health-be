@@ -36,9 +36,12 @@ interface MealEntryRow {
     input_method: string;
     logged_at: Date;
     deleted_at: Date | null;
-    // Meal-planning provenance columns. Both are NULL on every row written
-    // before the feature and on hand-logged entries, so the mapper below emits
-    // an explicit null rather than omitting the field.
+    // Meal-planning columns with different null meanings: meal_plan_meal_id is
+    // NULL on every entry not logged from a planned meal, while
+    // nutrition_provenance is NULL only on rows written before the column
+    // existed — a client-supplied snapshot written through the legacy path
+    // carries 'user_entered'. Either way the mapper below emits an explicit
+    // null rather than omitting the field.
     meal_plan_meal_id: string | null;
     nutrition_provenance: string | null;
 }

@@ -107,6 +107,24 @@ export const cacheKeyFor = (path: string, params: Record<string, string>): strin
     return `${path}?${normalized}`;
 };
 
+// An FDC id names one specific USDA record, so only a canonical representation
+// of it is accepted: `Number()` coercion would read '0x10' as 16, '1e3' as
+// 1000 and '9007199254740993' as ...992, each of which fetches and caches a
+// different food than the manifest text names. A number must already be a safe
+// positive integer; a string must be decimal digits with no leading zero, sign,
+// exponent or fraction. Everything else — including a nested array whose
+// String() happens to look numeric — is rejected.
+const parseFdcId = (value: unknown): number | null => {
+    if (typeof value === 'number') {
+        return Number.isSafeInteger(value) && value > 0 ? value : null;
+    }
+    if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value.trim())) {
+        return null;
+    }
+    const parsed = Number(value.trim());
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
 // FDC ids are positive integers, so the same set in any order — or carrying a
 // duplicate — must address one cached row and send one request, while a
 // different set must never collide with it. Normalising to numbers also means a
@@ -115,8 +133,8 @@ export const cacheKeyFor = (path: string, params: Record<string, string>): strin
 export const normalizeFdcIds = (fdcIds: ReadonlyArray<string | number>): number[] => {
     const unique = new Set<number>();
     for (const fdcId of fdcIds) {
-        const parsed = Number(String(fdcId).trim());
-        if (!Number.isInteger(parsed) || parsed <= 0) {
+        const parsed = parseFdcId(fdcId);
+        if (parsed === null) {
             throw new UsdaError(`Invalid USDA FDC id: ${String(fdcId)}`);
         }
         unique.add(parsed);
@@ -229,10 +247,10 @@ const usdaGet = async (path: string, params: Record<string, string>): Promise<an
 // never refreshed in the background: detail records are near-immutable, and a
 // background request would spend one of the hour's requests outside the
 // caller's rate accounting.
-const usdaPost = async (path: string, params: Record<string, string>, body: unknown): Promise<any> => {
+const usdaPost = async (path: string, params: Record<string, string>, body: unknown): Promise<unknown> => {
     const cacheKey = cacheKeyForRequest('POST', path, params, body);
 
-    let cached: { payload: any } | null = null;
+    let cached: { payload: unknown } | null = null;
     try {
         cached = await prisma.usda_api_cache.findUnique({ where: { cache_key: cacheKey } });
     } catch {
@@ -413,9 +431,11 @@ export const getBrandedFood = async (foodId: string): Promise<BrandedFoodRespons
 // a request path: once the catalog is seeded, plan generation, swaps, grocery
 // aggregation, recipe viewing and internal catalog search reach USDA never.
 //
-// These are raw, unvalidated vendor payloads — catalog-validate.ts is what
-// decides whether a record is publishable — so only fdcId is treated as
-// certain and the index signature keeps dataset-specific extras reachable.
+// These describe raw vendor payloads — catalog-validate.ts is what decides
+// whether a record is publishable — so only fdcId is treated as certain, and
+// the index signature keeps dataset-specific extras reachable as `unknown`:
+// vendor-controlled fields a caller has not narrowed must not typecheck as
+// usable values.
 export interface UsdaFoodNutrient {
     nutrientNumber?: string | number;
     nutrientName?: string;
@@ -425,7 +445,7 @@ export interface UsdaFoodNutrient {
     // search results flatten it to nutrientNumber/value.
     amount?: number;
     nutrient?: { number?: string | number; id?: number; name?: string; unitName?: string };
-    [key: string]: any;
+    [key: string]: unknown;
 }
 
 // portionDescription is the FNDDS wording; SR Legacy carries modifier + amount.
@@ -436,7 +456,7 @@ export interface UsdaFoodPortion {
     modifier?: string;
     portionDescription?: string;
     measureUnit?: { name?: string; abbreviation?: string };
-    [key: string]: any;
+    [key: string]: unknown;
 }
 
 export interface UsdaFoodSummary {
@@ -445,7 +465,7 @@ export interface UsdaFoodSummary {
     dataType?: string;
     publicationDate?: string;
     foodNutrients?: UsdaFoodNutrient[];
-    [key: string]: any;
+    [key: string]: unknown;
 }
 
 export interface UsdaFoodDetail extends UsdaFoodSummary {
@@ -472,6 +492,35 @@ export const clampListPageSize = (pageSize: number): number =>
 const clampPageNumber = (pageNumber: number): number =>
     Number.isFinite(pageNumber) ? Math.max(1, Math.trunc(pageNumber)) : 1;
 
+// The catalog keys every imported row on `usda:<fdcId>`, so a record is only
+// usable once its id is proven: the payload is a vendor response, not a trusted
+// record, until it is a plain object carrying a canonical fdcId. The parsed id
+// is written back so the `fdcId: number` claim in UsdaFoodSummary holds even on
+// the datasets that stringify it.
+const toIdentifiedRecord = <T extends UsdaFoodSummary>(row: unknown, context: string): T => {
+    if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+        throw new UsdaError(`USDA ${context} returned a record that is not an object`);
+    }
+    const record = row as Record<string, unknown>;
+    const fdcId = parseFdcId(record.fdcId);
+    if (fdcId === null) {
+        throw new UsdaError(`USDA ${context} returned a record with an invalid fdcId: ${String(record.fdcId)}`);
+    }
+    return { ...record, fdcId } as T;
+};
+
+// A malformed batch/list payload fails loudly instead of degrading to an empty
+// array: the import's coverage report counts what came back, so a silent []
+// would be recorded as "USDA holds none of these foods" rather than "USDA's
+// answer was unusable", and the missing rows would never be retried. An empty
+// array from USDA is a real, valid answer and stays one.
+const toIdentifiedRecords = <T extends UsdaFoodSummary>(payload: unknown, context: string): T[] => {
+    if (!Array.isArray(payload)) {
+        throw new UsdaError(`USDA ${context} returned a payload that is not an array`);
+    }
+    return payload.map((row) => toIdentifiedRecord<T>(row, context));
+};
+
 // The full record rather than the BrandedFoodResponse projection: the catalog
 // import needs the foodNutrients and the foodPortions gram weights that DTO
 // discards. ttlForPath already gives every /food/ path the 90-day detail TTL,
@@ -480,7 +529,15 @@ export const getFoodDetail = async (fdcId: string | number): Promise<UsdaFoodDet
     // normalizeFdcIds guarantees a positive integer, so — unlike
     // getBrandedFood's client-supplied id — the path needs no escaping.
     const [id] = normalizeFdcIds([fdcId]);
-    return usdaGet(`/food/${id}`, { format: 'full' });
+    const payload: unknown = await usdaGet(`/food/${id}`, { format: 'full' });
+    const record = toIdentifiedRecord<UsdaFoodDetail>(payload, `detail for FDC id ${id}`);
+    // Identity, not just a well-formed id: the import files this payload under
+    // the id it asked for, so a response describing a different food would be
+    // published under the requested food's name instead of failing.
+    if (record.fdcId !== id) {
+        throw new UsdaError(`USDA detail for FDC id ${id} returned fdcId ${record.fdcId}`);
+    }
+    return record;
 };
 
 export const getFoodsBatch = async (fdcIds: ReadonlyArray<string | number>): Promise<UsdaFoodDetail[]> => {
@@ -496,8 +553,18 @@ export const getFoodsBatch = async (fdcIds: ReadonlyArray<string | number>): Pro
     }
 
     const ids = normalizeFdcIds(fdcIds);
-    const data = await usdaPost('/foods', {}, { fdcIds: ids, format: 'full' });
-    return Array.isArray(data) ? (data as UsdaFoodDetail[]) : [];
+    const payload: unknown = await usdaPost('/foods', {}, { fdcIds: ids, format: 'full' });
+    const requested = new Set(ids);
+    const records = toIdentifiedRecords<UsdaFoodDetail>(payload, 'batch');
+    for (const record of records) {
+        // Same identity rule as getFoodDetail, applied per row: the batch
+        // response is unordered, so membership in the requested set is the only
+        // thing tying a row back to the id the manifest named.
+        if (!requested.has(record.fdcId)) {
+            throw new UsdaError(`USDA batch returned an unrequested fdcId: ${record.fdcId}`);
+        }
+    }
+    return records;
 };
 
 // dataType takes the same values searchGenericFoods passes ('Foundation',
@@ -508,10 +575,10 @@ export const listFoods = async (
     pageSize: number = MAX_LIST_PAGE_SIZE,
     pageNumber: number = 1,
 ): Promise<UsdaFoodSummary[]> => {
-    const data = await usdaGet('/foods/list', {
+    const payload: unknown = await usdaGet('/foods/list', {
         dataType: dataType.trim(),
         pageSize: String(clampListPageSize(pageSize)),
         pageNumber: String(clampPageNumber(pageNumber)),
     });
-    return Array.isArray(data) ? (data as UsdaFoodSummary[]) : [];
+    return toIdentifiedRecords<UsdaFoodSummary>(payload, 'list');
 };

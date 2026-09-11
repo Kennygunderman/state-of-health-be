@@ -7,8 +7,27 @@ import { domainToASCII } from 'url';
  * corroborate a generated catalog food's identity, and then fetches them. A
  * model-proposed URL is attacker-influenced input, so every decision about
  * whether it may be fetched is made here, and the defences apply in this order:
- * an allowlist of *named* hosts, a fail-closed address classifier, DNS pinning
- * (the service resolves once and hands the answers here), and hard fetch limits.
+ * the policy document is validated against the reviewed attestation, the host
+ * must be allowlisted *for the claim being made*, the address classifier fails
+ * closed, DNS is pinned (the service resolves once and hands the answers here),
+ * and hard fetch limits bound the transfer.
+ *
+ * Two of those gates guard the policy data itself rather than the URL, because
+ * the document is loaded from disk by a CLI script and could be stale,
+ * truncated, hand-edited or swapped:
+ *
+ * - {@link validateEvidencePolicy} refuses a document that is not the reviewed
+ *   one. A table with a row deleted is the dangerous case: an address matching
+ *   no row is ordinary global unicast by design, so silently losing
+ *   `169.254.0.0/16` would turn the cloud metadata address into a permitted
+ *   fetch target. Completeness is therefore established by set equality against
+ *   the whole reviewed snapshot in {@link REVIEWED_RANGE_TABLE} — every reviewed
+ *   block present with its reviewed reachability, and no block the review never
+ *   saw — because a row count alone cannot tell a deletion from a substitution.
+ * - Authorization is per {@link EvidenceType}. A host class approved for
+ *   identity and preparation claims is not thereby a nutrition or allergen
+ *   source, so the requested claim is compared against the class's declared
+ *   `evidenceTypes` before any verdict allows a fetch.
  *
  * This module decides; `evidence.service.ts` acts. Nothing here performs I/O —
  * no `fetch`, no DNS lookup, no filesystem, no `process.env`, no clock — which
@@ -46,46 +65,86 @@ export interface SpecialPurposeRange {
 }
 
 /**
+ * The closed set of claims a retrieved page may be used to corroborate, and the
+ * vocabulary `evidence-allowlist.v1.json` writes in each host class's
+ * `evidenceTypes`.
+ *
+ * It is a closed set because authorization compares against it: a value outside
+ * this list is not "an unknown type, so probably fine" but a document or a
+ * caller asking for something nobody reviewed, and both are refused. The
+ * distinction the set exists to draw is that a named culinary reference may
+ * establish what a dish *is* and how it is prepared without being an authority
+ * on its nutrition or its allergens.
+ */
+export const EVIDENCE_TYPES = [
+    /** What the food is: its canonical name, its aliases, its identity. */
+    'canonical_identity',
+    /** How the food is prepared — the cooking method behind a prepared state. */
+    'preparation_method',
+    /** The nutrient values themselves. Reserved for source-backed references. */
+    'nutrition_reference',
+    /** A serving description and its gram weight. */
+    'portion_reference',
+    /** Which of the nine named allergens the food contains. */
+    'allergen_composition',
+    /** Which category and food group the food belongs to. */
+    'food_classification',
+] as const;
+
+export type EvidenceType = (typeof EVIDENCE_TYPES)[number];
+
+/** Whether a loaded or caller-supplied value names one of the reviewed claims. */
+export const isEvidenceType = (value: unknown): value is EvidenceType =>
+    typeof value === 'string' && (EVIDENCE_TYPES as readonly string[]).indexOf(value) !== -1;
+
+/**
  * One hand-curated allowlist entry group: USDA/FDC, government and university
  * nutrition references, and named culinary references. No manufacturer domains
  * appear in it by design — AI generation proposes only generic preparations,
  * and a model-proposed brand domain could never independently verify a
  * model-proposed product.
  *
- * Only `hosts` is required, because only `hosts` is read here. The identifier
- * is optional and accepted under either spelling (`class` in the committed
- * document, `id` in `scripts/lib/manifest.ts`) so that both the raw document
- * and the script loader's declared type satisfy this shape — see
- * {@link evidenceHostClassId}. Requiring a field this module does not use would
- * make one of the two callers fail to compile for no safety gain.
+ * `class`, `hosts` and `evidenceTypes` are all required, because all three are
+ * load-bearing: the identifier is what a validation record names as the source
+ * of a corroboration, the hosts are what may be reached, and the evidence types
+ * are what those hosts are trusted to attest. A group that omits its evidence
+ * types would authorize nothing in particular, which is how a culinary
+ * reference ends up standing in for a nutrition authority — so the document is
+ * refused rather than read permissively ({@link validateEvidencePolicy}).
+ *
+ * `description` is optional provenance for the human reviewing a refresh; it is
+ * never read as policy.
  */
 export interface EvidenceHostClass {
+    /** Stable identifier of the reviewed group, e.g. `usda_fdc`. */
+    readonly class: string;
     /** Exact hosts (`nal.usda.gov`) and `*.` wildcards (`*.nal.usda.gov`), matched per label. */
     readonly hosts: readonly string[];
-    readonly class?: string;
-    readonly id?: string;
+    /** The claims a host in this group may corroborate; any other claim is refused. */
+    readonly evidenceTypes: readonly EvidenceType[];
     readonly description?: string;
-    readonly evidenceTypes?: readonly string[];
 }
 
 /**
  * The fetch limits as the policy document declares them. Enforcement belongs to
- * `evidence.service.ts`, which owns the socket; this module only declares the
- * shape and resolves it against the canonical ceilings.
+ * `evidence.service.ts`, which owns the socket; this module declares the shape,
+ * validates it, and resolves it against the canonical ceilings.
  *
- * Every member is optional because the document and the script loader's
- * declared type disagree about which of them are written — a missing member
- * falls back to the reviewed canonical constant rather than to "no limit".
+ * Every member is required of a *valid document*: the reviewed transport policy
+ * is stated in data, so nothing silently relies on a code default that a
+ * reviewer cannot see. {@link resolveEvidenceFetchLimits} nonetheless accepts
+ * `unknown` and remains total, because it is also the path a partial or
+ * malformed document takes — the one place that tolerance belongs.
  */
 export interface EvidenceFetchLimits {
-    readonly schemes?: readonly string[];
-    readonly allowedPorts?: readonly number[];
-    readonly maxRedirects?: number;
-    readonly timeoutMs?: number;
+    readonly schemes: readonly string[];
+    readonly allowedPorts: readonly number[];
+    readonly maxRedirects: number;
+    readonly timeoutMs: number;
     /** Bytes of the *decompressed* body — a compressed-size cap is a zip-bomb hole. */
-    readonly maxBodyBytes?: number;
-    readonly allowedContentTypes?: readonly string[];
-    readonly maxSnippetChars?: number;
+    readonly maxBodyBytes: number;
+    readonly allowedContentTypes: readonly string[];
+    readonly maxSnippetChars: number;
 }
 
 /**
@@ -96,8 +155,14 @@ export interface EvidenceFetchLimits {
  * running API.
  *
  * `registrySnapshot` and `rowCount` are carried so a refresh of the address
- * table is a reviewed data change — the sibling test asserts both against the
- * values recorded in `docs/meal-planning/catalog-policy.md`.
+ * table is a reviewed data change: {@link validateEvidencePolicy} compares both
+ * against the reviewed attestation in this module, and the sibling test asserts
+ * them against the values recorded in `docs/meal-planning/catalog-policy.md`.
+ * A document that does not carry the reviewed pair is not read.
+ *
+ * Nothing accepts this type on trust. Every entry point validates the document
+ * first, reading each member as `unknown`, because a value that parsed as JSON
+ * has been shown to be JSON and nothing more.
  */
 export interface EvidencePolicy {
     readonly allowlistVersion: string;
@@ -145,8 +210,16 @@ export interface EvidenceRetrievalRecord {
  * bare host. It is not what a whole URL with such a host yields: the WHATWG
  * parser refuses to parse one at all, so {@link parseEvidenceUrl} answers
  * `unparseable_url` first. Both refuse; only the recorded cause differs.
+ *
+ * `policy_invalid` and `range_table_unclassifiable` are refusals of the policy
+ * *document* rather than of the URL, and they are deliberately distinct from
+ * every URL code: an operator reading them knows the candidate was never
+ * judged, because the rules it would have been judged by could not be trusted.
+ * `evidence_type_not_authorized` is likewise distinct from
+ * `host_not_allowlisted` — the host is allowlisted, for other claims.
  */
 export type EvidenceRejectionReason =
+    | 'policy_invalid'
     | 'unparseable_url'
     | 'scheme_not_allowed'
     | 'credentials_present'
@@ -155,6 +228,7 @@ export type EvidenceRejectionReason =
     | 'idna_conversion_failed'
     | 'malformed_host'
     | 'host_not_allowlisted'
+    | 'evidence_type_not_authorized'
     | 'unresolvable_host'
     | 'address_unparsable'
     | 'address_not_unicast'
@@ -242,6 +316,143 @@ export const EVIDENCE_MAX_SNIPPET_CHARS = 500;
  */
 export const EVIDENCE_HOST_PATTERN = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 
+// ---------------------------------------------------------------------------
+// The reviewed attestation of the policy document.
+//
+// Classification itself stays data-driven: no CIDR below is a classification
+// rule, and refreshing the IANA tables remains a data change to
+// `evidence-allowlist.v1.json`. What these constants add is the
+// *counter-signature* — the document must be the table that was reviewed, row
+// for row, and not merely a table that looks well formed.
+//
+// Why the whole table and not a chosen floor: an address matching no row is
+// ordinary global unicast, which is correct because the registries enumerate the
+// special-purpose blocks exhaustively. That makes an omission indistinguishable
+// from "nothing special here", so losing the `169.254.0.0/16` row would quietly
+// promote the cloud metadata address to a permitted fetch target. Neither a row
+// count nor a list of blocks somebody remembered to name catches that, because a
+// row can be *substituted* rather than dropped: delete one non-global block, add
+// any other canonical block in its place, and the count, the families and every
+// per-row integrity property still hold. Only equality with the complete
+// reviewed set refuses that document.
+//
+// Refreshing the registries is therefore three coordinated edits — the JSON, the
+// attestation below, and the values recorded in
+// `docs/meal-planning/catalog-policy.md` — and any one of them alone fails
+// closed and loudly rather than degrading silently.
+// ---------------------------------------------------------------------------
+
+/** The `allowlistVersion` this module was written against; matches the filename's `.v1`. */
+export const REVIEWED_ALLOWLIST_VERSION = 'v1';
+
+/** The date the committed IANA tables were transcribed. */
+export const REVIEWED_REGISTRY_SNAPSHOT = '2026-09-08';
+
+/**
+ * One reviewed registry row, reduced to the two facts the classifier acts on:
+ * the block, and the reachability the registry states for it. The row's name and
+ * registry label are provenance for the reviewer and live only in the document.
+ */
+export interface ReviewedRange {
+    readonly cidr: string;
+    readonly globallyReachable: GloballyReachable;
+}
+
+/**
+ * The **complete** IPv4 and IPv6 special-purpose registries as transcribed at
+ * {@link REVIEWED_REGISTRY_SNAPSHOT} — every row, in registry order, with the
+ * reachability each states.
+ *
+ * It is the whole table and not a selected floor on purpose. A subset attests
+ * only the rows someone thought to list, and a document can then drop an
+ * unlisted non-global row, add any other canonical row in its place, and keep
+ * both the row count and every integrity property intact — after which
+ * `192.88.99.0/24`, `100:0:0:1::/64` or `5f00::/16` matches nothing and is
+ * classified as ordinary global unicast. Set equality is what closes that:
+ * {@link validateEvidenceRangeTable} refuses a table with a row missing, a row
+ * added, or a reachability changed, so no same-count substitution survives.
+ *
+ * This is an attestation, not a classification rule. Classification still reads
+ * the document's rows — which is where the registry names, the family labels and
+ * the review history live — and this list only establishes that those rows are
+ * the ones that were reviewed. A registry refresh is therefore still a data
+ * change, counter-signed here and recorded in
+ * `docs/meal-planning/catalog-policy.md`: three coordinated edits, any one of
+ * which alone fails closed and loudly.
+ *
+ * Included by construction, and worth naming because the classifier depends on
+ * them: the nested globally reachable exceptions (`192.0.0.9/32`,
+ * `192.0.0.10/32`, `192.31.196.0/24`, `192.52.193.0/24`, `192.175.48.0/24`,
+ * `2001:1::1/128`, `2001:1::2/128`, `2001:1::3/128`, `2001:3::/32`,
+ * `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`, `2620:4f:8000::/48`,
+ * `64:ff9b::/96`), which longest-prefix matching needs in order to admit
+ * legitimate anycast inside a non-global parent; and the embedded-IPv4 prefixes
+ * (`::/96`, `::ffff:0:0/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, `2001::/32`,
+ * `2002::/16`) that {@link unwrapEmbeddedIpv4} unwraps.
+ */
+export const REVIEWED_RANGE_TABLE: readonly ReviewedRange[] = [
+    // IPv4 Special-Purpose Address Registry
+    { cidr: '0.0.0.0/8', globallyReachable: false }, // This network
+    { cidr: '0.0.0.0/32', globallyReachable: false }, // This host on this network
+    { cidr: '10.0.0.0/8', globallyReachable: false }, // Private-Use
+    { cidr: '100.64.0.0/10', globallyReachable: false }, // Shared Address Space
+    { cidr: '127.0.0.0/8', globallyReachable: false }, // Loopback
+    { cidr: '169.254.0.0/16', globallyReachable: false }, // Link Local
+    { cidr: '172.16.0.0/12', globallyReachable: false }, // Private-Use
+    { cidr: '192.0.0.0/24', globallyReachable: false }, // IETF Protocol Assignments
+    { cidr: '192.0.0.0/29', globallyReachable: false }, // IPv4 Service Continuity Prefix
+    { cidr: '192.0.0.8/32', globallyReachable: false }, // IPv4 dummy address
+    { cidr: '192.0.0.9/32', globallyReachable: true }, // Port Control Protocol Anycast
+    { cidr: '192.0.0.10/32', globallyReachable: true }, // Traversal Using Relays around NAT Anycast
+    { cidr: '192.0.0.170/32', globallyReachable: false }, // NAT64/DNS64 Discovery
+    { cidr: '192.0.0.171/32', globallyReachable: false }, // NAT64/DNS64 Discovery
+    { cidr: '192.0.2.0/24', globallyReachable: false }, // Documentation (TEST-NET-1)
+    { cidr: '192.31.196.0/24', globallyReachable: true }, // AS112-v4
+    { cidr: '192.52.193.0/24', globallyReachable: true }, // AMT
+    { cidr: '192.88.99.0/24', globallyReachable: 'n/a' }, // Deprecated (6to4 Relay Anycast)
+    { cidr: '192.88.99.2/32', globallyReachable: false }, // 6a44-relay anycast address
+    { cidr: '192.168.0.0/16', globallyReachable: false }, // Private-Use
+    { cidr: '192.175.48.0/24', globallyReachable: true }, // Direct Delegation AS112 Service
+    { cidr: '198.18.0.0/15', globallyReachable: false }, // Benchmarking
+    { cidr: '198.51.100.0/24', globallyReachable: false }, // Documentation (TEST-NET-2)
+    { cidr: '203.0.113.0/24', globallyReachable: false }, // Documentation (TEST-NET-3)
+    { cidr: '240.0.0.0/4', globallyReachable: false }, // Reserved
+    { cidr: '255.255.255.255/32', globallyReachable: false }, // Limited Broadcast
+    // IPv6 Special-Purpose Address Registry
+    { cidr: '::1/128', globallyReachable: false }, // Loopback Address
+    { cidr: '::/128', globallyReachable: false }, // Unspecified Address
+    // `::/96` is RFC 4291's deprecated IPv4-Compatible block rather than a row
+    // of the current registry. It is carried because `unwrapEmbeddedIpv4`
+    // unwraps it, and because `::a9fe:a9fe` must not outflank `169.254.0.0/16`.
+    { cidr: '::/96', globallyReachable: false }, // IPv4-Compatible Address (deprecated)
+    { cidr: '::ffff:0:0/96', globallyReachable: false }, // IPv4-mapped Address
+    { cidr: '64:ff9b::/96', globallyReachable: true }, // IPv4-IPv6 Translat.
+    { cidr: '64:ff9b:1::/48', globallyReachable: false }, // IPv4-IPv6 Translat.
+    { cidr: '100::/64', globallyReachable: false }, // Discard-Only Address Block
+    { cidr: '100:0:0:1::/64', globallyReachable: false }, // Dummy IPv6 Prefix
+    { cidr: '2001::/23', globallyReachable: false }, // IETF Protocol Assignments
+    { cidr: '2001::/32', globallyReachable: 'n/a' }, // TEREDO
+    { cidr: '2001:1::1/128', globallyReachable: true }, // Port Control Protocol Anycast
+    { cidr: '2001:1::2/128', globallyReachable: true }, // Traversal Using Relays around NAT Anycast
+    { cidr: '2001:1::3/128', globallyReachable: true }, // DNS-SD Service Registration Protocol Anycast
+    { cidr: '2001:2::/48', globallyReachable: false }, // Benchmarking
+    { cidr: '2001:3::/32', globallyReachable: true }, // AMT
+    { cidr: '2001:4:112::/48', globallyReachable: true }, // AS112-v6
+    { cidr: '2001:10::/28', globallyReachable: 'n/a' }, // Deprecated (previously ORCHID)
+    { cidr: '2001:20::/28', globallyReachable: true }, // ORCHIDv2
+    { cidr: '2001:30::/28', globallyReachable: true }, // Drone Remote ID Protocol Entity Tags (DETs) Prefix
+    { cidr: '2001:db8::/32', globallyReachable: false }, // Documentation
+    { cidr: '2002::/16', globallyReachable: 'n/a' }, // 6to4
+    { cidr: '2620:4f:8000::/48', globallyReachable: true }, // Direct Delegation AS112 Service
+    { cidr: '3fff::/20', globallyReachable: false }, // Documentation
+    { cidr: '5f00::/16', globallyReachable: false }, // Segment Routing (SRv6) SIDs
+    { cidr: 'fc00::/7', globallyReachable: false }, // Unique-Local
+    { cidr: 'fe80::/10', globallyReachable: false }, // Link-Local Unicast
+];
+
+/** The number of registry rows reviewed at that snapshot: 26 IPv4 and 26 IPv6. */
+export const REVIEWED_RANGE_ROW_COUNT = REVIEWED_RANGE_TABLE.length;
+
 const WILDCARD_PREFIX = '*.';
 const IPV4_BYTES = 4;
 const IPV6_BYTES = 16;
@@ -253,7 +464,7 @@ const MAX_IPV6_PREFIX = 128;
 
 const IPV4_OCTET_PATTERN = /^\d{1,3}$/;
 const IPV6_GROUP_PATTERN = /^[0-9a-f]{1,4}$/i;
-const PREFIX_LENGTH_PATTERN = /^\d{1,3}$/;
+const PREFIX_LENGTH_PATTERN = /^(0|[1-9]\d{0,2})$/;
 
 /**
  * The declared limits after resolution: fully populated, and with the cross-host
@@ -274,10 +485,19 @@ export interface ResolvedEvidenceFetchLimits {
 /** Anything that is not a real array is treated as absent, never as trusted. */
 const asList = (value: unknown): readonly unknown[] => (Array.isArray(value) ? (value as readonly unknown[]) : []);
 
+/** An object with string keys, which is the only shape a loaded member may be read through. */
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** No scheme, no port and no content type is permitted — the fail-closed list. */
+const NOTHING_PERMITTED: readonly never[] = [];
+
 // A declared cap is honoured only when it is stricter than the reviewed one; an
 // absent or nonsensical cap falls back to the reviewed value rather than to
 // zero, because a zero timeout or a zero-byte body would disable evidence
-// retrieval entirely instead of securing it.
+// retrieval entirely instead of securing it. A cap grants no access on its own,
+// which is why falling back here is safe while falling back on a *list* would
+// not be.
 const narrowCap = (declared: unknown, ceiling: number, allowZero: boolean): number => {
     if (typeof declared !== 'number' || !isFinite(declared)) {
         return ceiling;
@@ -288,33 +508,91 @@ const narrowCap = (declared: unknown, ceiling: number, allowZero: boolean): numb
     return Math.min(declared, ceiling);
 };
 
-const narrowStrings = (declared: readonly string[] | undefined, ceiling: readonly string[]): readonly string[] => {
-    if (declared === undefined) {
+// Every member arrives as `unknown`, because the document is loaded JSON: a
+// member the document's own type calls an array of strings can be a number, an
+// object or a string at runtime. Three outcomes, and no fourth:
+//
+//   absent (`undefined` or JSON `null`) -> the reviewed ceiling: the document
+//                              said nothing, and the ceiling is what the code
+//                              itself sanctions, so this grants nothing extra
+//   an array                -> the intersection with the ceiling, non-strings skipped
+//   present but not an array -> nothing permitted (the document is malformed)
+//
+// The third case is the one that used to throw on `.map`, and it is also the one
+// where a fallback to the ceiling would be wrong: a malformed declaration is not
+// an absent declaration, and resolving it to the full reviewed list would hand a
+// corrupt document the widest policy this module allows.
+const narrowStrings = (declared: unknown, ceiling: readonly string[]): readonly string[] => {
+    if (declared === undefined || declared === null) {
         return ceiling;
     }
-    const normalized = declared.map((value) => String(value).trim().toLowerCase());
+    if (!Array.isArray(declared)) {
+        return NOTHING_PERMITTED;
+    }
+    const normalized: string[] = [];
+    for (const value of declared) {
+        if (typeof value === 'string') {
+            normalized.push(value.trim().toLowerCase());
+        }
+    }
     return ceiling.filter((value) => normalized.indexOf(value) !== -1);
 };
 
-const narrowNumbers = (declared: readonly number[] | undefined, ceiling: readonly number[]): readonly number[] => {
-    if (declared === undefined) {
+const narrowNumbers = (declared: unknown, ceiling: readonly number[]): readonly number[] => {
+    if (declared === undefined || declared === null) {
         return ceiling;
     }
-    return ceiling.filter((value) => declared.indexOf(value) !== -1);
+    if (!Array.isArray(declared)) {
+        return NOTHING_PERMITTED;
+    }
+    const normalized: number[] = [];
+    for (const value of declared) {
+        if (typeof value === 'number' && isFinite(value)) {
+            normalized.push(value);
+        }
+    }
+    return ceiling.filter((value) => normalized.indexOf(value) !== -1);
 };
 
 /**
- * Resolves the document's declared limits against the canonical ceilings.
+ * Resolves a document's declared limits against the canonical ceilings.
  *
- * One rule governs it: **the document may narrow the policy and can never widen
- * it.** Lists are intersected with the ceiling, numeric caps take the smaller of
- * the two, and anything missing or malformed falls back to the canonical
- * constant. A document that declares no `https` scheme therefore yields an empty
- * scheme list and refuses every URL — narrowing to nothing is a legitimate,
- * fail-closed outcome.
+ * Two rules govern it, and they are what make this function **total**: it
+ * accepts `unknown` and it never throws, however corrupt the input, because the
+ * only caller that can reach it with a malformed value is a policy document read
+ * off disk and a security predicate that raises instead of answering has no
+ * verdict to record.
+ *
+ * 1. **The document may narrow the policy and can never widen it.** Lists are
+ *    intersected with the ceiling and numeric caps take the smaller of the two,
+ *    so no document can unlock a scheme, a port, a content type, a longer
+ *    timeout or a bigger body than the code sanctions.
+ * 2. **Malformed is not absent.** A missing member falls back to the reviewed
+ *    ceiling; a member that is present but not a list — or a container that is
+ *    not an object at all — resolves to *nothing permitted*, which refuses every
+ *    URL and every body. Narrowing to nothing is a legitimate, fail-closed
+ *    outcome, and it is the outcome a corrupt document gets.
+ *
+ * A malformed document is additionally refused outright by
+ * {@link validateEvidencePolicy}, which is where an operator sees *why*. This
+ * function is the last line under it, for the paths that resolve limits without
+ * a whole document in hand.
  */
-export const resolveEvidenceFetchLimits = (limits?: EvidenceFetchLimits): ResolvedEvidenceFetchLimits => {
-    const declared: EvidenceFetchLimits = limits ?? {};
+export const resolveEvidenceFetchLimits = (limits?: unknown): ResolvedEvidenceFetchLimits => {
+    if (limits !== undefined && limits !== null && !isRecord(limits)) {
+        return {
+            schemes: NOTHING_PERMITTED,
+            allowedPorts: NOTHING_PERMITTED,
+            maxRedirects: EVIDENCE_MAX_REDIRECTS,
+            timeoutMs: EVIDENCE_FETCH_TIMEOUT_MS,
+            maxBodyBytes: EVIDENCE_MAX_BODY_BYTES,
+            allowedContentTypes: NOTHING_PERMITTED,
+            maxSnippetChars: EVIDENCE_MAX_SNIPPET_CHARS,
+            allowCrossHostRedirect: false,
+        };
+    }
+
+    const declared: Record<string, unknown> = isRecord(limits) ? limits : {};
 
     return {
         schemes: narrowStrings(declared.schemes, [EVIDENCE_ALLOWED_SCHEME]),
@@ -462,19 +740,64 @@ export const hostMatchesEntry = (host: string, entry: string): boolean => {
 };
 
 /**
- * The allowlist entry group a host belongs to, or `null` when no entry admits
- * it. The group is returned rather than a boolean so the caller can record
- * which class of reference corroborated a candidate.
+ * Whether an allowlist entry is written in one of the two forms the matcher
+ * understands, strictly enough that an entry admitting more than its author
+ * intended cannot be written by accident.
+ *
+ * An entry must already be in normal form — lower-case, no trailing dot, no
+ * surrounding whitespace — rather than be normalised on the reviewer's behalf,
+ * because an entry that needs repair is an entry nobody read carefully. A URL,
+ * a port, userinfo, an IP literal and a bare label all fail, the last because
+ * the host pattern requires at least two labels, which is also what stops a
+ * wildcard from being written against a bare TLD (`*.gov` is refused).
+ *
+ * How broad a legitimate multi-label suffix is — `*.co.uk` and its kind —
+ * remains a judgement for the human curating the document; this predicate
+ * rejects the mechanically wrong entry, not the unwisely wide one.
  */
-export const matchEvidenceHostClass = (
+export const isValidEvidenceHostEntry = (entry: unknown): boolean => {
+    if (typeof entry !== 'string' || entry === '' || entry !== entry.trim()) {
+        return false;
+    }
+
+    const isWildcard = entry.slice(0, WILDCARD_PREFIX.length) === WILDCARD_PREFIX;
+    const base = isWildcard ? entry.slice(WILDCARD_PREFIX.length) : entry;
+
+    if (isIpLiteralHost(base)) {
+        return false;
+    }
+
+    return normalizeEvidenceHost(base) === base;
+};
+
+// The one place a loaded host class is viewed through its declared type. The
+// conversion is deliberately narrow: every member is still read through a guard
+// (`asList` for the lists, `isEvidenceType` for the claims,
+// `evidenceHostClassId` for the identifier), so the view is a convenience for
+// the caller's types and never an assertion that the document is well-formed —
+// establishing that is `validateEvidencePolicy`'s job.
+const asHostClassView = (value: unknown): EvidenceHostClass | null =>
+    isRecord(value) ? (value as unknown as EvidenceHostClass) : null;
+
+/**
+ * The allowlist entry group whose hosts admit this host, **ignoring what the
+ * host is trusted to attest**.
+ *
+ * It exists for diagnosis, not for authorization: it is what lets a refusal say
+ * "allowlisted, but not for this claim" instead of "not allowlisted", and those
+ * are different operator actions. Authorization is
+ * {@link matchEvidenceHostClass}, which no caller can invoke without naming a
+ * claim.
+ */
+export const findEvidenceHostClassForHost = (
     host: string,
     hostClasses: readonly EvidenceHostClass[],
 ): EvidenceHostClass | null => {
     for (const rawClass of asList(hostClasses)) {
-        if (rawClass === null || typeof rawClass !== 'object') {
+        const hostClass = asHostClassView(rawClass);
+        if (hostClass === null) {
             continue;
         }
-        const hostClass = rawClass as EvidenceHostClass;
         for (const rawEntry of asList(hostClass.hosts)) {
             if (typeof rawEntry === 'string' && hostMatchesEntry(host, rawEntry)) {
                 return hostClass;
@@ -484,26 +807,84 @@ export const matchEvidenceHostClass = (
     return null;
 };
 
-export const isHostAllowed = (host: string, hostClasses: readonly EvidenceHostClass[]): boolean =>
-    matchEvidenceHostClass(host, hostClasses) !== null;
+/**
+ * Whether a group is trusted to attest this particular claim.
+ *
+ * A group whose `evidenceTypes` is absent, empty or not a list authorizes
+ * **nothing**: an unstated scope is not an unlimited one, and treating it as one
+ * is how a culinary reference comes to stand in for a nutrition authority. A
+ * type the reviewed vocabulary does not contain is refused as well, so a
+ * document cannot invent a claim class.
+ */
+export const hostClassAuthorizesEvidenceType = (
+    hostClass: EvidenceHostClass | null,
+    evidenceType: EvidenceType,
+): boolean => {
+    if (hostClass === null || !isRecord(hostClass) || !isEvidenceType(evidenceType)) {
+        return false;
+    }
+
+    for (const declared of asList(hostClass.evidenceTypes)) {
+        if (isEvidenceType(declared) && declared === evidenceType) {
+            return true;
+        }
+    }
+    return false;
+};
 
 /**
- * Reconciles the two spellings of a host class's identifier: the committed
- * allowlist writes `class`, while `scripts/lib/manifest.ts` declares `id`. This
- * is the single place that difference is resolved, so neither the document nor
- * the loader has to change for the other to work.
+ * The allowlist entry group that admits this host **for this claim**, or `null`
+ * when none does. The group is returned rather than a boolean so the caller can
+ * record which class of reference corroborated a candidate.
+ *
+ * `evidenceType` is required rather than optional, which is the point: an
+ * optional scope is a scope that gets omitted, and an omitted scope authorizes
+ * everything. Where a host appears in two groups the first group that admits it
+ * *and* authorizes the claim wins, so overlapping entries grant the union of
+ * their claims and never more than that.
  */
-export const evidenceHostClassId = (hostClass: EvidenceHostClass | null): string | null => {
-    if (hostClass === null || typeof hostClass !== 'object') {
+export const matchEvidenceHostClass = (
+    host: string,
+    hostClasses: readonly EvidenceHostClass[],
+    evidenceType: EvidenceType,
+): EvidenceHostClass | null => {
+    if (!isEvidenceType(evidenceType)) {
         return null;
     }
-    if (typeof hostClass.class === 'string' && hostClass.class !== '') {
-        return hostClass.class;
-    }
-    if (typeof hostClass.id === 'string' && hostClass.id !== '') {
-        return hostClass.id;
+
+    for (const rawClass of asList(hostClasses)) {
+        const hostClass = asHostClassView(rawClass);
+        if (hostClass === null || !hostClassAuthorizesEvidenceType(hostClass, evidenceType)) {
+            continue;
+        }
+        for (const rawEntry of asList(hostClass.hosts)) {
+            if (typeof rawEntry === 'string' && hostMatchesEntry(host, rawEntry)) {
+                return hostClass;
+            }
+        }
     }
     return null;
+};
+
+export const isHostAllowed = (
+    host: string,
+    hostClasses: readonly EvidenceHostClass[],
+    evidenceType: EvidenceType,
+): boolean => matchEvidenceHostClass(host, hostClasses, evidenceType) !== null;
+
+/**
+ * A group's `class` identifier, or `null` when the value is missing or empty.
+ *
+ * A validated document always carries one ({@link validateEvidencePolicy}
+ * refuses a group without it), so the `null` case exists for the paths that
+ * match against a raw document — a verdict must still be able to say it does
+ * not know which group corroborated a candidate rather than invent a name.
+ */
+export const evidenceHostClassId = (hostClass: EvidenceHostClass | null): string | null => {
+    if (hostClass === null || !isRecord(hostClass)) {
+        return null;
+    }
+    return typeof hostClass.class === 'string' && hostClass.class !== '' ? hostClass.class : null;
 };
 
 // ---------------------------------------------------------------------------
@@ -547,8 +928,13 @@ const buildNormalizedUrl = (parsed: URL, host: string): string => {
  *
  * `hostClass` is `null` on success here because this function does not consult
  * the allowlist; {@link evaluateEvidenceUrl} fills it in.
+ *
+ * `limits` is `unknown` for the reason given on {@link resolveEvidenceFetchLimits}:
+ * it may be a member of a document read off disk, so it is guarded rather than
+ * trusted, and a malformed value narrows the policy to nothing instead of
+ * raising.
  */
-export const parseEvidenceUrl = (rawUrl: string, limits?: EvidenceFetchLimits): EvidenceUrlVerdict => {
+export const parseEvidenceUrl = (rawUrl: string, limits?: unknown): EvidenceUrlVerdict => {
     const resolved = resolveEvidenceFetchLimits(limits);
 
     if (typeof rawUrl !== 'string' || rawUrl.trim() === '') {
@@ -593,25 +979,6 @@ export const parseEvidenceUrl = (rawUrl: string, limits?: EvidenceFetchLimits): 
     const host = hostVerdict.host;
 
     return { allowed: true, url: buildNormalizedUrl(parsed, host), host, hostClass: null };
-};
-
-/**
- * The entry point for a candidate URL: the full URL policy plus the allowlist.
- * `evidence.service.ts` calls this before resolving anything, and fetches only
- * the `url` it returns.
- */
-export const evaluateEvidenceUrl = (rawUrl: string, policy: EvidencePolicy): EvidenceUrlVerdict => {
-    const verdict = parseEvidenceUrl(rawUrl, policy.fetchLimits);
-    if (!verdict.allowed) {
-        return verdict;
-    }
-
-    const hostClass = matchEvidenceHostClass(verdict.host, policy.hostClasses);
-    if (hostClass === null) {
-        return rejectUrl('host_not_allowlisted', `host "${verdict.host}" is not on the evidence allowlist`);
-    }
-
-    return { allowed: true, url: verdict.url, host: verdict.host, hostClass: evidenceHostClassId(hostClass) };
 };
 
 // ---------------------------------------------------------------------------
@@ -811,6 +1178,12 @@ const maskByte = (prefixLength: number, byteIndex: number): number => {
  * the prefix, so a row written with host bits set still classifies correctly.
  * Returns `null` for a malformed CIDR, which the classifier treats as a table it
  * cannot trust rather than a row it can skip.
+ *
+ * The prefix length must be plain decimal: `/8` parses and `/008` does not, for
+ * the same reason {@link parseIpAddress} refuses a zero-padded octet — padded
+ * numerals are read differently by different tools, and a validator and a
+ * connector disagreeing about what a string means is the bypass class this
+ * module refuses throughout.
  */
 export const parseCidr = (cidr: string): ParsedCidr | null => {
     if (typeof cidr !== 'string') {
@@ -910,6 +1283,15 @@ export const addressBefore = (address: ParsedIpAddress): ParsedIpAddress | null 
  *
  * Two rows of equal prefix length are resolved in favour of the more
  * restrictive one, so the verdict never depends on the table's row order.
+ *
+ * This is a lookup, not a permission decision: it answers "which row covers
+ * this address", and `null` means "no row in the rows you handed me", never
+ * "safe to fetch". It therefore validates nothing, and the rows it is given are
+ * always the validated rows {@link validateEvidenceRangeTable} returned —
+ * {@link classifyIpAddress} is the only caller in this module and passes
+ * `table.rows`. It is exported because the registry-derived test walks the
+ * committed table row by row, and that test wants the lookup on its own,
+ * separately from the verdict built on top of it.
  */
 export const findMostSpecificRange = (
     address: ParsedIpAddress,
@@ -1065,43 +1447,274 @@ const rejectAddress = (
     address: string | null,
 ): EvidenceAddressVerdict => ({ allowed: false, reason, detail, address });
 
-type RangeTableVerdict = { readonly ok: true } | { readonly ok: false; readonly detail: string };
+/**
+ * The verdict on the address table. On success it carries the **normalized
+ * rows**, so an address is only ever compared against rows that passed every
+ * check — the caller cannot accidentally classify against the raw input it
+ * handed in.
+ */
+export type EvidenceRangeTableVerdict =
+    | { readonly ok: true; readonly rows: readonly SpecialPurposeRange[] }
+    | { readonly ok: false; readonly detail: string };
+
+/** A value rendered for an operator-facing detail string, without ever throwing. */
+const describeValue = (value: unknown): string => {
+    if (typeof value === 'string') {
+        return `"${value}"`;
+    }
+    if (value === null || value === undefined || typeof value === 'number' || typeof value === 'boolean') {
+        return String(value);
+    }
+    return Array.isArray(value) ? 'a list' : typeof value;
+};
+
+/** A block's identity, independent of how its text was written. */
+const cidrKey = (cidr: ParsedCidr): string => `${cidr.version}|${cidr.bytes.join('.')}|${cidr.prefixLength}`;
+
+const bytesEqual = (left: readonly number[], right: readonly number[]): boolean => {
+    if (left.length !== right.length) {
+        return false;
+    }
+    for (let index = 0; index < left.length; index++) {
+        if (left[index] !== right[index]) {
+            return false;
+        }
+    }
+    return true;
+};
+
+type CheckedRow =
+    | { readonly ok: true; readonly row: SpecialPurposeRange; readonly cidr: ParsedCidr }
+    | { readonly ok: false; readonly detail: string };
 
 /**
- * The table itself must be trustworthy before any address is judged against it.
+ * One row, checked the way a reviewer checks it against the registry page.
  *
- * An empty table rejects: a table that did not load is not a clean bill of
- * health. A row whose CIDR does not parse, or whose `globallyReachable` is not
- * one of the three permitted values, also rejects — every row, not merely the
- * ones covering this address, because a table that has drifted from the
- * registries cannot be relied on for the row that happens to match either.
+ * The CIDR must parse **and be written in canonical registry text**: in lower
+ * case, without surrounding whitespace, on its own network address with no host
+ * bits set, and with a plain decimal prefix length — `/8`, never `/008`, which
+ * {@link parseCidr} refuses outright. None of these is a classification hole on
+ * its own: `10.0.0.1/8` is masked to the same block, and a padded prefix does
+ * not parse at all. Each is instead evidence that the row was edited by hand
+ * rather than transcribed from the registry, and the whole point of an
+ * attestation is to notice that while it can still be fixed — a table nobody can
+ * diff against the registry page is a table nobody can review.
+ *
+ * `registry` must name the family its CIDR actually belongs to. The classifier
+ * takes the family from the CIDR, so a mislabelled row could never smuggle an
+ * IPv4 rule onto an IPv6 address — but a row whose own two fields disagree is a
+ * transcription error, and a transcription error in this table is exactly the
+ * failure this validation exists to catch.
  */
-const validateRangeTable = (ranges: readonly SpecialPurposeRange[]): RangeTableVerdict => {
-    const rows = asList(ranges);
-    if (rows.length === 0) {
+const checkRangeRow = (rawRow: unknown, index: number): CheckedRow => {
+    if (!isRecord(rawRow)) {
+        return { ok: false, detail: `special-purpose row ${index} is ${describeValue(rawRow)}, not an object` };
+    }
+
+    const cidrText = rawRow.cidr;
+    if (typeof cidrText !== 'string' || cidrText.trim() === '') {
+        return { ok: false, detail: `special-purpose row ${index} declares no CIDR` };
+    }
+    if (cidrText !== cidrText.trim() || cidrText !== cidrText.toLowerCase()) {
+        return {
+            ok: false,
+            detail: `special-purpose row "${cidrText}" is not written in canonical lower-case registry text`,
+        };
+    }
+
+    const cidr = parseCidr(cidrText);
+    if (cidr === null) {
+        return { ok: false, detail: `special-purpose row "${cidrText}" is not a valid CIDR` };
+    }
+
+    const slashIndex = cidrText.indexOf('/');
+    const written = parseIpAddress(cidrText.slice(0, slashIndex));
+    if (written === null || !bytesEqual(written.bytes, cidr.bytes)) {
+        return {
+            ok: false,
+            detail: `special-purpose row "${cidrText}" is not written on its own network address`,
+        };
+    }
+
+    const name = rawRow.name;
+    if (typeof name !== 'string' || name.trim() === '') {
+        return { ok: false, detail: `special-purpose row "${cidrText}" carries no registry name` };
+    }
+
+    const registry = rawRow.registry;
+    const family = cidr.version === 4 ? 'ipv4' : 'ipv6';
+    if (registry !== 'ipv4' && registry !== 'ipv6') {
+        return {
+            ok: false,
+            detail: `special-purpose row "${cidrText}" declares the registry ${describeValue(registry)}`,
+        };
+    }
+    if (registry !== family) {
+        return {
+            ok: false,
+            detail:
+                `special-purpose row "${cidrText}" is filed under the ${registry} registry ` +
+                `but is an ${family} block`,
+        };
+    }
+
+    const reachable = rawRow.globallyReachable;
+    if (reachable !== true && reachable !== false && reachable !== 'n/a') {
+        return {
+            ok: false,
+            detail:
+                `special-purpose row "${cidrText}" declares the unrecognised ` +
+                `globallyReachable value ${describeValue(reachable)}`,
+        };
+    }
+
+    return { ok: true, row: { cidr: cidrText, name, registry, globallyReachable: reachable }, cidr };
+};
+
+/** One reviewed row resolved to the block identity the comparison keys on. */
+interface AttestedRange {
+    readonly key: string;
+    readonly cidr: string;
+    readonly globallyReachable: GloballyReachable;
+}
+
+/** The reviewed table resolved to block identities, plus any defect found in it. */
+interface ReviewedAttestation {
+    readonly rows: readonly AttestedRange[];
+    readonly keys: ReadonlySet<string>;
+    readonly defects: readonly string[];
+}
+
+/**
+ * The reviewed table, resolved to block identities once at module load.
+ *
+ * Resolving it per classified address would repeat 52 CIDR parses on every
+ * candidate URL for a value that cannot change at runtime. A defect in the
+ * attestation — an entry that does not parse, or one block written twice, which
+ * would make it cover fewer blocks than its row count claims — is recorded
+ * rather than thrown: it would be a typing mistake in this file, and the honest
+ * response is for every table to stop validating, loudly and through the
+ * ordinary verdict, rather than for the attestation to silently attest less
+ * than it appears to.
+ */
+const REVIEWED_ATTESTATION: ReviewedAttestation = (() => {
+    const rows: AttestedRange[] = [];
+    const keys = new Set<string>();
+    const defects: string[] = [];
+
+    for (const reviewed of REVIEWED_RANGE_TABLE) {
+        const cidr = parseCidr(reviewed.cidr);
+        if (cidr === null) {
+            defects.push(`the reviewed entry "${reviewed.cidr}" is not a valid CIDR`);
+            continue;
+        }
+
+        const key = cidrKey(cidr);
+        if (keys.has(key)) {
+            defects.push(`the reviewed entry "${reviewed.cidr}" names a block already attested`);
+            continue;
+        }
+
+        rows.push({ key, cidr: reviewed.cidr, globallyReachable: reviewed.globallyReachable });
+        keys.add(key);
+    }
+
+    return { rows, keys, defects };
+})();
+
+/**
+ * The table itself must be trustworthy **and complete** before any address is
+ * judged against it.
+ *
+ * Integrity comes first, over every row rather than only the rows covering the
+ * address in hand: a table that has drifted from the registries cannot be
+ * relied on for the row that happens to match either. So an empty table, a
+ * non-object row, an unparsable or non-canonical CIDR, a row filed under the
+ * wrong family, a row without its registry name, a `globallyReachable` outside
+ * the three permitted values and a block declared twice all reject.
+ *
+ * Completeness comes second, and it is the check whose absence is invisible.
+ * "Matches no row" means global unicast, which is right because the registries
+ * enumerate the special-purpose blocks — and it is also why a *missing* row
+ * cannot be noticed by classification: deleting `169.254.0.0/16` makes
+ * `169.254.169.254` match nothing and pass. So the table is compared with
+ * {@link REVIEWED_RANGE_TABLE} as a **set**, in both directions: every reviewed
+ * block must be present with exactly the reachability the registries state, and
+ * no block outside the reviewed snapshot may appear. A row deleted, a row
+ * substituted for another at the same count, or a reachability flipped all
+ * refuse, and a table that is not the reviewed snapshot classifies nothing at
+ * all rather than classifying part of it wrongly.
+ *
+ * This is also what ties classification to the attestation. Every
+ * address-classification entry point runs through here, so no caller can
+ * classify against a hand-assembled subset of the table, whatever else about it
+ * is well-formed.
+ */
+export const validateEvidenceRangeTable = (ranges: unknown): EvidenceRangeTableVerdict => {
+    if (!Array.isArray(ranges)) {
+        return { ok: false, detail: `the special-purpose address table is ${describeValue(ranges)}, not a list` };
+    }
+    if (ranges.length === 0) {
         return { ok: false, detail: 'the special-purpose address table is empty' };
     }
 
-    for (const rawRange of rows) {
-        if (rawRange === null || typeof rawRange !== 'object') {
-            return { ok: false, detail: 'a special-purpose address row is not an object' };
+    const rows: SpecialPurposeRange[] = [];
+    const declaredKeys: { key: string; cidr: string }[] = [];
+    const declaredByBlock = new Map<string, GloballyReachable>();
+
+    for (let index = 0; index < ranges.length; index++) {
+        const checked = checkRangeRow(ranges[index], index);
+        if (!checked.ok) {
+            return { ok: false, detail: checked.detail };
         }
 
-        const range = rawRange as SpecialPurposeRange;
-        if (parseCidr(range.cidr) === null) {
-            return { ok: false, detail: `special-purpose row "${String(range.cidr)}" is not a valid CIDR` };
+        const key = cidrKey(checked.cidr);
+        if (declaredByBlock.has(key)) {
+            return { ok: false, detail: `the special-purpose block "${checked.row.cidr}" is declared twice` };
         }
 
-        const reachable: unknown = range.globallyReachable;
-        if (reachable !== true && reachable !== false && reachable !== 'n/a') {
+        declaredByBlock.set(key, checked.row.globallyReachable);
+        declaredKeys.push({ key, cidr: checked.row.cidr });
+        rows.push(checked.row);
+    }
+
+    if (REVIEWED_ATTESTATION.defects.length > 0) {
+        return {
+            ok: false,
+            detail: `the reviewed attestation is unusable: ${REVIEWED_ATTESTATION.defects[0]}`,
+        };
+    }
+
+    for (const reviewed of REVIEWED_ATTESTATION.rows) {
+        const declared = declaredByBlock.get(reviewed.key);
+        if (declared === undefined) {
             return {
                 ok: false,
-                detail: `special-purpose row "${range.cidr}" declares an unrecognised globallyReachable value`,
+                detail: `the address table omits the reviewed block ${reviewed.cidr}`,
+            };
+        }
+        if (declared !== reviewed.globallyReachable) {
+            return {
+                ok: false,
+                detail:
+                    `the address table marks the reviewed block ${reviewed.cidr} ${String(declared)}, ` +
+                    `but the ${REVIEWED_REGISTRY_SNAPSHOT} snapshot states ${String(reviewed.globallyReachable)}`,
             };
         }
     }
 
-    return { ok: true };
+    for (const declared of declaredKeys) {
+        if (!REVIEWED_ATTESTATION.keys.has(declared.key)) {
+            return {
+                ok: false,
+                detail:
+                    `the address table carries "${declared.cidr}", which is not part of the ` +
+                    `${REVIEWED_REGISTRY_SNAPSHOT} reviewed snapshot`,
+            };
+        }
+    }
+
+    return { ok: true, rows };
 };
 
 // Guards against a hand-built address object: a wrong byte count or an
@@ -1167,23 +1780,26 @@ const classifySpecialAddress = (address: ParsedIpAddress): EvidenceAddressVerdic
  * Judges one resolved address against the committed registry table, and reports
  * why it was refused.
  *
- * An address is routable only if all of these hold: the table is trustworthy,
- * the address parses, it is unicast and not one of the explicitly refused
- * special addresses, every IPv4 address it carries passes the same IPv4 rules,
- * and the **most specific** row covering it is either absent or marked
- * `globallyReachable: true`.
+ * An address is routable only if all of these hold: the table is trustworthy
+ * **and complete**, the address parses, it is unicast and not one of the
+ * explicitly refused special addresses, every IPv4 address it carries passes the
+ * same IPv4 rules, and the **most specific** row covering it is either absent or
+ * marked `globallyReachable: true`.
  *
- * It **fails closed without exception**. An empty or malformed table, an
- * unparsable address, a mis-sized address object, a non-unicast address, a row
- * marked `false` or `'n/a'`, or a bad embedded address all reject. No branch
- * returns "routable" because a check could not be performed.
+ * It **fails closed without exception**. An empty, malformed or incomplete
+ * table, an unparsable address, a mis-sized address object, a non-unicast
+ * address, a row marked `false` or `'n/a'`, or a bad embedded address all
+ * reject. No branch returns "routable" because a check could not be performed.
  *
  * Matching no row *is* a positive answer rather than a skipped check: the
  * registries enumerate the special-purpose blocks, so an address outside all of
  * them is ordinary global unicast. The blocks they omit — the two multicast
- * ranges — are refused above, which is why that omission is not a hole. No
- * range is hard-coded here beyond those explicit checks, so refreshing the
- * table stays a reviewed data change rather than a code edit.
+ * ranges — are refused above, which is why that omission is not a hole. That
+ * reading is only safe against a table known to still contain the blocks it
+ * should, which is what {@link validateEvidenceRangeTable} establishes first and
+ * why classification runs against the rows it returns rather than against the
+ * argument. No range is hard-coded as a classification rule, so refreshing the
+ * table stays a reviewed data change.
  */
 export const classifyIpAddress = (
     ip: ParsedIpAddress | string,
@@ -1191,11 +1807,12 @@ export const classifyIpAddress = (
 ): EvidenceAddressVerdict => {
     const asText = typeof ip === 'string' ? ip : null;
 
-    const table = validateRangeTable(ranges);
+    const table = validateEvidenceRangeTable(ranges);
     if (!table.ok) {
         return rejectAddress('range_table_unclassifiable', table.detail, asText);
     }
 
+    const rows = table.rows;
     const address = typeof ip === 'string' ? parseIpAddress(ip) : ip;
     if (address === null || !isWellFormedAddress(address)) {
         return rejectAddress('address_unparsable', 'the address could not be parsed', asText);
@@ -1220,7 +1837,7 @@ export const classifyIpAddress = (
             );
         }
 
-        const carriedRow = findMostSpecificRange(carried, ranges);
+        const carriedRow = findMostSpecificRange(carried, rows);
         if (carriedRow !== null && carriedRow.globallyReachable !== true) {
             return rejectAddress(
                 'embedded_address_not_globally_routable',
@@ -1230,7 +1847,7 @@ export const classifyIpAddress = (
         }
     }
 
-    const row = findMostSpecificRange(address, ranges);
+    const row = findMostSpecificRange(address, rows);
     if (row !== null && row.globallyReachable !== true) {
         return rejectAddress(
             'address_not_globally_routable',
@@ -1282,6 +1899,389 @@ export const areAllAddressesRoutable = (
 ): boolean => classifyAddressSet(addresses, ranges).allowed;
 
 // ---------------------------------------------------------------------------
+// Policy document validation.
+//
+// The document is hand-curated and reviewed, and it is still read as untrusted
+// input here: it arrives from disk through a CLI script, so it can be stale,
+// truncated, partially edited or swapped, and none of those states announce
+// themselves. Every member is read as `unknown`, every check answers with a
+// verdict instead of throwing, and the verdict carries the *validated* document
+// so a caller cannot use the unvalidated one by accident.
+// ---------------------------------------------------------------------------
+
+/**
+ * The verdict on a whole policy document. On success it carries a rebuilt
+ * {@link EvidencePolicy} containing only validated members — assembled field by
+ * field rather than cast, so nothing downstream is typed as something it was
+ * merely asserted to be.
+ */
+export type EvidencePolicyVerdict =
+    | { readonly ok: true; readonly policy: EvidencePolicy }
+    | {
+          readonly ok: false;
+          readonly reason: 'policy_invalid' | 'range_table_unclassifiable';
+          readonly detail: string;
+      };
+
+type Checked<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly detail: string };
+
+const invalidPolicy = (detail: string): EvidencePolicyVerdict => ({ ok: false, reason: 'policy_invalid', detail });
+
+const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+const isPositiveInteger = (value: unknown): value is number =>
+    typeof value === 'number' && isFinite(value) && Math.floor(value) === value && value > 0;
+
+/**
+ * One host class, checked and rebuilt.
+ *
+ * All three load-bearing members are required: a group without an identifier
+ * cannot be named in a validation record, a group without hosts admits nothing,
+ * and a group without evidence types authorizes nothing in particular — which
+ * is the state {@link hostClassAuthorizesEvidenceType} refuses at match time and
+ * this refuses at load time, so a document can never quietly widen a class by
+ * leaving its scope unstated.
+ */
+const checkHostClass = (rawClass: unknown, index: number): Checked<EvidenceHostClass> => {
+    if (!isRecord(rawClass)) {
+        return { ok: false, detail: `host class ${index} is ${describeValue(rawClass)}, not an object` };
+    }
+
+    const className = rawClass.class;
+    if (typeof className !== 'string' || className.trim() === '') {
+        return { ok: false, detail: `host class ${index} declares no class identifier` };
+    }
+
+    const rawHosts = rawClass.hosts;
+    if (!Array.isArray(rawHosts) || rawHosts.length === 0) {
+        return { ok: false, detail: `host class "${className}" declares no hosts` };
+    }
+
+    const hosts: string[] = [];
+    for (const entry of rawHosts) {
+        if (!isValidEvidenceHostEntry(entry)) {
+            return {
+                ok: false,
+                detail: `host class "${className}" declares the unusable host entry ${describeValue(entry)}`,
+            };
+        }
+        const host = entry as string;
+        if (hosts.indexOf(host) !== -1) {
+            return { ok: false, detail: `host class "${className}" declares "${host}" twice` };
+        }
+        hosts.push(host);
+    }
+
+    const rawTypes = rawClass.evidenceTypes;
+    if (!Array.isArray(rawTypes) || rawTypes.length === 0) {
+        return { ok: false, detail: `host class "${className}" authorizes no evidence type` };
+    }
+
+    const evidenceTypes: EvidenceType[] = [];
+    for (const declared of rawTypes) {
+        if (!isEvidenceType(declared)) {
+            return {
+                ok: false,
+                detail: `host class "${className}" declares the unknown evidence type ${describeValue(declared)}`,
+            };
+        }
+        if (evidenceTypes.indexOf(declared) !== -1) {
+            return { ok: false, detail: `host class "${className}" declares "${declared}" twice` };
+        }
+        evidenceTypes.push(declared);
+    }
+
+    const description = rawClass.description;
+    if (description !== undefined && (typeof description !== 'string' || description.trim() === '')) {
+        return { ok: false, detail: `host class "${className}" declares an empty description` };
+    }
+
+    return {
+        ok: true,
+        value:
+            description === undefined
+                ? { class: className, hosts, evidenceTypes }
+                : { class: className, hosts, evidenceTypes, description },
+    };
+};
+
+// A declared list must be non-empty and every member must sit inside the
+// reviewed ceiling. Narrowing is welcome — a document may permit only
+// `text/html` — but a member outside the ceiling is an attempt to widen the
+// policy, and the right answer to that is to refuse the document rather than to
+// silently drop the member and carry on with the rest of it.
+const checkStringList = (value: unknown, ceiling: readonly string[], member: string): Checked<readonly string[]> => {
+    if (!Array.isArray(value) || value.length === 0) {
+        return { ok: false, detail: `fetchLimits.${member} is ${describeValue(value)}, not a non-empty list` };
+    }
+
+    const values: string[] = [];
+    for (const entry of value) {
+        if (typeof entry !== 'string') {
+            return { ok: false, detail: `fetchLimits.${member} contains ${describeValue(entry)}, not a string` };
+        }
+        const normalized = entry.trim().toLowerCase();
+        if (ceiling.indexOf(normalized) === -1) {
+            return {
+                ok: false,
+                detail: `fetchLimits.${member} declares "${entry}", which the reviewed policy does not permit`,
+            };
+        }
+        if (values.indexOf(normalized) !== -1) {
+            return { ok: false, detail: `fetchLimits.${member} declares "${normalized}" twice` };
+        }
+        values.push(normalized);
+    }
+
+    return { ok: true, value: values };
+};
+
+const checkNumberList = (value: unknown, ceiling: readonly number[], member: string): Checked<readonly number[]> => {
+    if (!Array.isArray(value) || value.length === 0) {
+        return { ok: false, detail: `fetchLimits.${member} is ${describeValue(value)}, not a non-empty list` };
+    }
+
+    const values: number[] = [];
+    for (const entry of value) {
+        if (typeof entry !== 'number' || !isFinite(entry)) {
+            return { ok: false, detail: `fetchLimits.${member} contains ${describeValue(entry)}, not a number` };
+        }
+        if (ceiling.indexOf(entry) === -1) {
+            return {
+                ok: false,
+                detail: `fetchLimits.${member} declares ${entry}, which the reviewed policy does not permit`,
+            };
+        }
+        if (values.indexOf(entry) !== -1) {
+            return { ok: false, detail: `fetchLimits.${member} declares ${entry} twice` };
+        }
+        values.push(entry);
+    }
+
+    return { ok: true, value: values };
+};
+
+const checkCap = (value: unknown, ceiling: number, member: string, allowZero: boolean): Checked<number> => {
+    const isInteger = typeof value === 'number' && isFinite(value) && Math.floor(value) === value;
+    if (!isInteger || (allowZero ? (value as number) < 0 : (value as number) <= 0)) {
+        return {
+            ok: false,
+            detail:
+                `fetchLimits.${member} is ${describeValue(value)}, not ` +
+                `${allowZero ? 'a non-negative' : 'a positive'} integer`,
+        };
+    }
+    if ((value as number) > ceiling) {
+        return {
+            ok: false,
+            detail: `fetchLimits.${member} declares ${value}, above the reviewed ceiling of ${ceiling}`,
+        };
+    }
+    return { ok: true, value: value as number };
+};
+
+/**
+ * The transport policy, checked and rebuilt.
+ *
+ * The document must state the whole of it, so that what a fetch is permitted to
+ * do is visible to the reviewer reading the JSON rather than resolved against a
+ * code default they would have to go and find. The one exception is
+ * `maxSnippetChars`, which bounds what is *stored* rather than what is reached
+ * and may be left to the reviewed ceiling.
+ */
+const checkDeclaredFetchLimits = (raw: unknown): Checked<EvidenceFetchLimits> => {
+    if (!isRecord(raw)) {
+        return { ok: false, detail: `fetchLimits is ${describeValue(raw)}, not an object` };
+    }
+
+    const schemes = checkStringList(raw.schemes, [EVIDENCE_ALLOWED_SCHEME], 'schemes');
+    if (!schemes.ok) {
+        return schemes;
+    }
+
+    const allowedPorts = checkNumberList(raw.allowedPorts, [EVIDENCE_ALLOWED_PORT], 'allowedPorts');
+    if (!allowedPorts.ok) {
+        return allowedPorts;
+    }
+
+    const allowedContentTypes = checkStringList(
+        raw.allowedContentTypes,
+        EVIDENCE_ALLOWED_CONTENT_TYPES,
+        'allowedContentTypes',
+    );
+    if (!allowedContentTypes.ok) {
+        return allowedContentTypes;
+    }
+
+    const maxRedirects = checkCap(raw.maxRedirects, EVIDENCE_MAX_REDIRECTS, 'maxRedirects', true);
+    if (!maxRedirects.ok) {
+        return maxRedirects;
+    }
+
+    const timeoutMs = checkCap(raw.timeoutMs, EVIDENCE_FETCH_TIMEOUT_MS, 'timeoutMs', false);
+    if (!timeoutMs.ok) {
+        return timeoutMs;
+    }
+
+    const maxBodyBytes = checkCap(raw.maxBodyBytes, EVIDENCE_MAX_BODY_BYTES, 'maxBodyBytes', false);
+    if (!maxBodyBytes.ok) {
+        return maxBodyBytes;
+    }
+
+    let maxSnippetChars = EVIDENCE_MAX_SNIPPET_CHARS;
+    if (raw.maxSnippetChars !== undefined) {
+        const checked = checkCap(raw.maxSnippetChars, EVIDENCE_MAX_SNIPPET_CHARS, 'maxSnippetChars', false);
+        if (!checked.ok) {
+            return checked;
+        }
+        maxSnippetChars = checked.value;
+    }
+
+    return {
+        ok: true,
+        value: {
+            schemes: schemes.value,
+            allowedPorts: allowedPorts.value,
+            maxRedirects: maxRedirects.value,
+            timeoutMs: timeoutMs.value,
+            maxBodyBytes: maxBodyBytes.value,
+            allowedContentTypes: allowedContentTypes.value,
+            maxSnippetChars,
+        },
+    };
+};
+
+/**
+ * Validates a loaded policy document and returns it rebuilt, or says why it
+ * cannot be used. **Nothing is judged against an unvalidated document**: both
+ * policy-level entry points call this first, and a failure is reported as a
+ * refusal of the policy rather than of the candidate.
+ *
+ * What is checked, and why each one earns its place:
+ *
+ * - **The reviewed attestation.** `allowlistVersion` and `registrySnapshot`
+ *   must be the ones this module was written against, and `rowCount` must equal
+ *   both the number of rows carried and the reviewed count. A stale or swapped
+ *   document is then a refusal rather than a quiet change of policy, and a
+ *   truncation that also rewrote `rowCount` is caught by the reviewed count that
+ *   the document cannot edit.
+ * - **The address table**, through {@link validateEvidenceRangeTable}: per-row
+ *   integrity plus set equality with the complete reviewed snapshot, which is
+ *   what makes "matches no row" a safe reading. Set equality is the check that
+ *   matters here: a subset floor would accept a document that dropped a
+ *   non-global block and replaced it with an unrelated one, keeping `rowCount`
+ *   intact while promoting the dropped block to global unicast.
+ * - **The host classes.** Each needs an identifier, at least one usable host
+ *   entry and at least one reviewed evidence type. Identifiers must be unique,
+ *   and no host entry may appear in two classes — overlapping entries would make
+ *   the authorization of that host depend on the order the classes happen to be
+ *   written in, and a security answer that depends on document order is a
+ *   security answer nobody can review.
+ * - **The transport policy**, complete and never wider than the ceilings.
+ */
+export const validateEvidencePolicy = (policy: unknown): EvidencePolicyVerdict => {
+    if (!isRecord(policy)) {
+        return invalidPolicy(`the evidence policy document is ${describeValue(policy)}, not an object`);
+    }
+
+    const allowlistVersion = policy.allowlistVersion;
+    if (typeof allowlistVersion !== 'string' || allowlistVersion !== REVIEWED_ALLOWLIST_VERSION) {
+        return invalidPolicy(
+            `the policy document declares version ${describeValue(allowlistVersion)}, ` +
+                `not the reviewed "${REVIEWED_ALLOWLIST_VERSION}"`,
+        );
+    }
+
+    const registrySnapshot = policy.registrySnapshot;
+    if (typeof registrySnapshot !== 'string' || !ISO_DATE_PATTERN.test(registrySnapshot)) {
+        return invalidPolicy(
+            `the policy document declares the registry snapshot ${describeValue(registrySnapshot)}, ` +
+                'which is not a YYYY-MM-DD date',
+        );
+    }
+    if (registrySnapshot !== REVIEWED_REGISTRY_SNAPSHOT) {
+        return invalidPolicy(
+            `the address table is dated ${registrySnapshot}, not the reviewed ${REVIEWED_REGISTRY_SNAPSHOT}`,
+        );
+    }
+
+    const ranges = policy.specialPurposeRanges;
+    if (!Array.isArray(ranges)) {
+        return invalidPolicy(`specialPurposeRanges is ${describeValue(ranges)}, not a list`);
+    }
+
+    const rowCount = policy.rowCount;
+    if (!isPositiveInteger(rowCount)) {
+        return invalidPolicy(`the policy document declares the row count ${describeValue(rowCount)}`);
+    }
+    if (rowCount !== ranges.length) {
+        return invalidPolicy(
+            `the policy document declares ${rowCount} address rows and carries ${ranges.length}`,
+        );
+    }
+    if (ranges.length !== REVIEWED_RANGE_ROW_COUNT) {
+        return invalidPolicy(
+            `the address table carries ${ranges.length} rows, not the ` +
+                `${REVIEWED_RANGE_ROW_COUNT} reviewed at ${REVIEWED_REGISTRY_SNAPSHOT}`,
+        );
+    }
+
+    const table = validateEvidenceRangeTable(ranges);
+    if (!table.ok) {
+        return { ok: false, reason: 'range_table_unclassifiable', detail: table.detail };
+    }
+
+    const rawClasses = policy.hostClasses;
+    if (!Array.isArray(rawClasses) || rawClasses.length === 0) {
+        return invalidPolicy('the policy document declares no host classes');
+    }
+
+    const hostClasses: EvidenceHostClass[] = [];
+    const seenClassIds: string[] = [];
+    const seenHostEntries: string[] = [];
+
+    for (let index = 0; index < rawClasses.length; index++) {
+        const checked = checkHostClass(rawClasses[index], index);
+        if (!checked.ok) {
+            return invalidPolicy(checked.detail);
+        }
+
+        if (seenClassIds.indexOf(checked.value.class) !== -1) {
+            return invalidPolicy(`host class "${checked.value.class}" is declared twice`);
+        }
+        seenClassIds.push(checked.value.class);
+
+        for (const entry of checked.value.hosts) {
+            if (seenHostEntries.indexOf(entry) !== -1) {
+                return invalidPolicy(
+                    `host entry "${entry}" appears in more than one class, so what it may attest is ambiguous`,
+                );
+            }
+            seenHostEntries.push(entry);
+        }
+
+        hostClasses.push(checked.value);
+    }
+
+    const fetchLimits = checkDeclaredFetchLimits(policy.fetchLimits);
+    if (!fetchLimits.ok) {
+        return invalidPolicy(fetchLimits.detail);
+    }
+
+    return {
+        ok: true,
+        policy: {
+            allowlistVersion,
+            registrySnapshot,
+            rowCount,
+            hostClasses,
+            specialPurposeRanges: table.rows,
+            fetchLimits: fetchLimits.value,
+        },
+    };
+};
+
+// ---------------------------------------------------------------------------
 // Limits this module declares and `evidence.service.ts` enforces.
 //
 // The service owns the socket, so it applies these; they live here as pure
@@ -1295,7 +2295,7 @@ export const areAllAddressesRoutable = (
  * missing or non-string header is refused: an unlabelled body is not a
  * permitted one.
  */
-export const isAllowedContentType = (headerValue: string | null | undefined, limits?: EvidenceFetchLimits): boolean => {
+export const isAllowedContentType = (headerValue: string | null | undefined, limits?: unknown): boolean => {
     if (typeof headerValue !== 'string') {
         return false;
     }
@@ -1314,11 +2314,88 @@ export const isAllowedContentType = (headerValue: string | null | undefined, lim
  * inclusive: exactly {@link EVIDENCE_MAX_BODY_BYTES} bytes is within it, one
  * more is not.
  */
-export const isWithinBodyCap = (decompressedBytes: number, limits?: EvidenceFetchLimits): boolean => {
+export const isWithinBodyCap = (decompressedBytes: number, limits?: unknown): boolean => {
     if (typeof decompressedBytes !== 'number' || !isFinite(decompressedBytes) || decompressedBytes < 0) {
         return false;
     }
     return decompressedBytes <= resolveEvidenceFetchLimits(limits).maxBodyBytes;
+};
+
+// ---------------------------------------------------------------------------
+// Policy-level entry points.
+//
+// These are what `evidence.service.ts` calls, and they sit last because they
+// compose everything above: the document validation, the URL policy, the
+// allowlist and the evidence-type authorization. Both require a claim, so there
+// is no way to ask "may I fetch this?" without saying what the fetch would be
+// used to establish.
+// ---------------------------------------------------------------------------
+
+// The host half of the URL policy, applied to an already-validated document so
+// that the redirect path does not revalidate the same document on every hop.
+const evaluateValidatedEvidenceUrl = (
+    rawUrl: string,
+    policy: EvidencePolicy,
+    evidenceType: EvidenceType,
+): EvidenceUrlVerdict => {
+    const verdict = parseEvidenceUrl(rawUrl, policy.fetchLimits);
+    if (!verdict.allowed) {
+        return verdict;
+    }
+
+    const authorized = matchEvidenceHostClass(verdict.host, policy.hostClasses, evidenceType);
+    if (authorized === null) {
+        // Allowlisted for other claims, or not allowlisted at all: two different
+        // defects, and the operator's next move differs, so the causes stay apart.
+        const admittedBy = findEvidenceHostClassForHost(verdict.host, policy.hostClasses);
+        if (admittedBy === null) {
+            return rejectUrl('host_not_allowlisted', `host "${verdict.host}" is not on the evidence allowlist`);
+        }
+        return rejectUrl(
+            'evidence_type_not_authorized',
+            `host "${verdict.host}" is allowlisted as ${String(evidenceHostClassId(admittedBy))} ` +
+                `but is not a source of ${evidenceType} evidence`,
+        );
+    }
+
+    return { allowed: true, url: verdict.url, host: verdict.host, hostClass: evidenceHostClassId(authorized) };
+};
+
+/**
+ * The entry point for a candidate URL: the policy document, the full URL policy,
+ * the allowlist and the requested claim. `evidence.service.ts` calls this before
+ * resolving anything, and fetches only the `url` it returns.
+ *
+ * `evidenceType` names what the page would be used to corroborate, and it is
+ * required: a host class states which claims it may support, and a check that
+ * can be skipped by omitting an argument is not a check. A host on the allowlist
+ * for identity and preparation claims is therefore refused as a source of
+ * nutrition or allergen evidence, with `evidence_type_not_authorized` rather
+ * than `host_not_allowlisted` so the cause is not mistaken for a missing entry.
+ *
+ * The document is validated first. A stale, truncated or tampered policy yields
+ * `policy_invalid` or `range_table_unclassifiable` — the candidate is refused
+ * because the rules could not be trusted, which is a different fact about the
+ * world than the candidate being disallowed, and is recorded as one.
+ */
+export const evaluateEvidenceUrl = (
+    rawUrl: string,
+    policy: EvidencePolicy,
+    evidenceType: EvidenceType,
+): EvidenceUrlVerdict => {
+    const validated = validateEvidencePolicy(policy);
+    if (!validated.ok) {
+        return rejectUrl(validated.reason, validated.detail);
+    }
+
+    if (!isEvidenceType(evidenceType)) {
+        return rejectUrl(
+            'evidence_type_not_authorized',
+            `${describeValue(evidenceType)} is not one of the reviewed evidence types`,
+        );
+    }
+
+    return evaluateValidatedEvidenceUrl(rawUrl, validated.policy, evidenceType);
 };
 
 /**
@@ -1328,18 +2405,32 @@ export const isWithinBodyCap = (decompressedBytes: number, limits?: EvidenceFetc
  * `>=` against the cap and at most {@link EVIDENCE_MAX_REDIRECTS} hops happen.
  * A `Location` header may be relative, so it is resolved against the URL that
  * produced it and then **re-validated from the URL step onward** — scheme, port,
- * userinfo, IP literal, host shape and allowlist all apply again, which is what
- * stops a redirect to `http://`, to another port, or to a host nobody
- * allowlisted. Finally, any change of host ends the fetch: the pinned address
- * belongs to the original host, so following the hop would abandon the pin.
+ * userinfo, IP literal, host shape, allowlist and evidence-type authorization
+ * all apply again, which is what stops a redirect to `http://`, to another port,
+ * to a host nobody allowlisted, or to a host allowlisted for some other claim.
+ * Finally, any change of host ends the fetch: the pinned address belongs to the
+ * original host, so following the hop would abandon the pin.
  */
 export const evaluateEvidenceRedirect = (
     currentUrl: string,
     location: string,
     redirectCount: number,
     policy: EvidencePolicy,
+    evidenceType: EvidenceType,
 ): EvidenceUrlVerdict => {
-    const resolved = resolveEvidenceFetchLimits(policy.fetchLimits);
+    const validated = validateEvidencePolicy(policy);
+    if (!validated.ok) {
+        return rejectUrl(validated.reason, validated.detail);
+    }
+
+    if (!isEvidenceType(evidenceType)) {
+        return rejectUrl(
+            'evidence_type_not_authorized',
+            `${describeValue(evidenceType)} is not one of the reviewed evidence types`,
+        );
+    }
+
+    const resolved = resolveEvidenceFetchLimits(validated.policy.fetchLimits);
 
     if (typeof redirectCount !== 'number' || !isFinite(redirectCount) || redirectCount < 0) {
         return rejectUrl('redirect_limit_exceeded', 'the redirect count is not a usable number');
@@ -1348,7 +2439,7 @@ export const evaluateEvidenceRedirect = (
         return rejectUrl('redirect_limit_exceeded', `more than ${resolved.maxRedirects} redirects were required`);
     }
 
-    const current = parseEvidenceUrl(currentUrl, policy.fetchLimits);
+    const current = parseEvidenceUrl(currentUrl, validated.policy.fetchLimits);
     if (!current.allowed) {
         return current;
     }
@@ -1364,7 +2455,7 @@ export const evaluateEvidenceRedirect = (
         return rejectUrl('unparseable_url', 'the redirect target could not be parsed');
     }
 
-    const target = evaluateEvidenceUrl(absolute, policy);
+    const target = evaluateValidatedEvidenceUrl(absolute, validated.policy, evidenceType);
     if (!target.allowed) {
         return target;
     }

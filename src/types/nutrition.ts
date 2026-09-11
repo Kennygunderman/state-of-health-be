@@ -28,8 +28,10 @@ export interface MealEntryResponse {
     carbs: number;
     fat: number;
     inputMethod: string;
-    // null on rows predating the column and on legacy client-supplied snapshots —
-    // both are classified unknown/user-entered and render no provenance label.
+    // null is the historical class alone: rows written before this column existed,
+    // which the client reads as unknown. A client-supplied snapshot logged through
+    // the legacy entries path carries 'user_entered' instead, because the server
+    // cannot verify numbers it did not derive; neither class earns a source label.
     nutritionProvenance: NutritionProvenance | null;
     loggedAt: string;
 }

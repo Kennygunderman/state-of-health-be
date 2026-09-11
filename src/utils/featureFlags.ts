@@ -75,8 +75,13 @@ const resolveFault = (
 // boots these routes answering 503 and turns planning on only once the catalog
 // and recipes have been loaded and verified.
 const mealPlanningEnabled = process.env.MEAL_PLANNING_ENABLED === 'true';
-const isProduction = process.env.NODE_ENV === 'production';
-const isTest = process.env.NODE_ENV === 'test';
+// One snapshot of NODE_ENV, and both environment booleans derive from it: two
+// reads of a mutable global could disagree, and a value that is somehow both
+// production and test would put the fault resolver and the abort predicate on
+// different footings.
+const nodeEnv = process.env.NODE_ENV;
+const isProduction = nodeEnv === 'production';
+const isTest = nodeEnv === 'test';
 const resolvedFault = resolveFault(process.env.MEAL_PLANNING_FAULT, isProduction);
 
 export function isMealPlanningEnabled(): boolean {

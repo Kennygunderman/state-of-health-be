@@ -20,16 +20,21 @@
 // catches or reshapes a USDA response (§9). The one error this module owns is
 // a configuration error.
 //
+// Two gates enforce that cap, because a token bucket on its own cannot: it
+// shapes the burst and paces smoothly, while an exact rolling-hour ledger of
+// admitted attempts is what holds the run to `requestsPerHour` in ANY hour
+// (see the derivation above `createUsdaRateLimiter`'s bounds check).
+//
 // The rate is a constructor argument, never an environment read inside the
 // flow (§1.6/§5): `getUsdaImportRateLimitPerHour` is the single accessor that
 // reads `USDA_IMPORT_RATE_LIMIT_PER_HOUR`, and it fails loudly (§9). The rules
-// worth getting wrong — the refill arithmetic, the wait computation, the host
-// match and the burst invariant — are pure and exported so they can be unit
-// tested with no clock and no network (§1.2/§7.1); `await sleep` and the
-// `globalThis.fetch` patch are the only impure parts. Jest's `roots` is
-// `<rootDir>/src`, so no test file can live in this folder (§11); `now`,
-// `sleep` and `logger` are injected so a test can drive an hour of pacing
-// instantly.
+// worth getting wrong — the refill arithmetic, the wait computation, the
+// rolling-hour ledger, the host match and the burst invariant — are pure and
+// exported so they can be unit tested with no clock and no network
+// (§1.2/§7.1); `await sleep` and the `globalThis.fetch` patch are the only
+// impure parts. Jest's `roots` is `<rootDir>/src`, so no test file can live in
+// this folder (§11); `now`, `sleep` and `logger` are injected so a test can
+// drive an hour of pacing instantly.
 
 import { hostOf, type ScriptLogger } from './logger';
 
@@ -46,6 +51,14 @@ export const DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR = 900;
 export const DEFAULT_BURST_CAPACITY = 20;
 
 const MS_PER_HOUR = 3_600_000;
+
+/**
+ * The window the hourly ceiling is measured over. USDA's limit is stated per
+ * hour and it is a ROLLING hour, not a wall-clock one: there is no top of the
+ * hour at which the vendor forgives what the importer already spent, so the
+ * ledger measures the last `MS_PER_HOUR` from every attempt.
+ */
+export const RATE_WINDOW_MS = MS_PER_HOUR;
 
 const RATE_LIMIT_ENV_VAR = 'USDA_IMPORT_RATE_LIMIT_PER_HOUR';
 
@@ -99,7 +112,11 @@ export interface UsdaRequestStats {
 }
 
 export interface UsdaRateLimiter {
-    /** Consumes one request's allowance, waiting if none is available. */
+    /**
+     * Consumes one request's allowance — one burst token AND one slot in the
+     * rolling-hour ceiling — waiting for however long the later of the two
+     * takes. It waits; it never throws and never drops a request.
+     */
     acquire(): Promise<void>;
     /**
      * Gates USDA traffic by wrapping `globalThis.fetch`, and returns the
@@ -110,6 +127,14 @@ export interface UsdaRateLimiter {
      * leaves the wrapper installed for the rest of the process. Calling
      * `install` twice is the same installation, and the restore is safe to
      * call more than once.
+     *
+     * Restoring is ownership-safe: it puts the original back only while
+     * `globalThis.fetch` is still this limiter's wrapper. If something else
+     * wrapped `fetch` after `install()`, that owner is left alone and this
+     * limiter's wrapper stays in the chain beneath it — harmless, because it
+     * paces nothing but USDA traffic, and strictly better than silently
+     * disabling a wrapper this module knows nothing about. A later restore
+     * still succeeds once that owner steps down.
      */
     install(): () => void;
     stats(): UsdaRequestStats;
@@ -212,6 +237,105 @@ export const waitMsForToken = (
     }
 
     return Math.ceil((1 - refilled.tokens) / tokensPerMs);
+};
+
+/**
+ * Drops the attempt stamps that have aged out of the window ending at `nowMs`.
+ *
+ * The far boundary is INCLUSIVE — a stamp exactly at `nowMs - windowMs` still
+ * counts — which costs one millisecond of allowance and buys an unconditional
+ * guarantee. Read the hour as `(nowMs - windowMs, nowMs]` and an exclusive
+ * boundary is correct, but read it as the closed `[nowMs - windowMs, nowMs]`
+ * and an exclusive boundary admits `limit + 1`: the stamp that just aged out
+ * plus a full window. USDA does not publish which way it counts, and the whole
+ * point of this ledger is a ceiling that holds either way, so the boundary
+ * instant is charged rather than forgiven. `windowWaitMs` floors the resulting
+ * zero wait at 1ms, which is exactly how long that slot is withheld.
+ *
+ * A stamp that is not a finite number is dropped outright — it could never age
+ * out and would freeze the ledger for the rest of the run.
+ */
+export const pruneAttemptWindow = (
+    stamps: readonly number[],
+    nowMs: number,
+    windowMs: number,
+): number[] => {
+    const cutoffMs = nowMs - windowMs;
+
+    if (!Number.isFinite(cutoffMs)) {
+        // A reading that cannot produce a cutoff says nothing about what has
+        // aged out, and pruning on it would hand back an hour of allowance the
+        // vendor never granted. Keep every usable stamp instead.
+        return stamps.filter((stamp) => Number.isFinite(stamp));
+    }
+
+    return stamps.filter((stamp) => Number.isFinite(stamp) && stamp >= cutoffMs);
+};
+
+/**
+ * How long to wait, from `nowMs`, before the rolling window has room for one
+ * more attempt. Zero while it holds fewer than `limit`.
+ *
+ * The wait is measured from the OLDEST stamp still inside the window, which is
+ * the head: `recordAttemptWindow` keeps the sequence monotonically
+ * nondecreasing. Reading the head rather than scanning for the minimum is also
+ * the safe direction if a caller hands over an unordered array — the head is
+ * then never older than the true minimum, so the wait can only come out longer
+ * than needed, never shorter.
+ */
+export const windowWaitMs = (
+    stamps: readonly number[],
+    nowMs: number,
+    limit: number,
+    windowMs: number,
+): number => {
+    const inWindow = pruneAttemptWindow(stamps, nowMs, windowMs);
+
+    if (inWindow.length < limit) {
+        return 0;
+    }
+
+    const oldestMs = inWindow[0];
+    if (oldestMs === undefined) {
+        return 0;
+    }
+
+    // The floor is load-bearing in two cases. A stamp sitting exactly on the
+    // inclusive far boundary computes a zero wait, and that slot is withheld
+    // for the one millisecond it takes to leave the closed window. An unusable
+    // clock (a non-finite reading prunes nothing and can compute a non-finite
+    // difference) would otherwise either let `acquire` spin or park the import
+    // forever on an infinite wait.
+    const waitMs = Math.ceil(oldestMs + windowMs - nowMs);
+    return Number.isFinite(waitMs) && waitMs > 0 ? waitMs : 1;
+};
+
+/**
+ * Records one admitted attempt and drops whatever aged out with it.
+ *
+ * The appended stamp is clamped to `Math.max(nowMs, lastStamp)`, mirroring
+ * `refillBucket`'s monotonic-safety posture: `Date.now()` can step backwards
+ * (NTP correction, a VM resuming), and a stamp written behind the previous one
+ * would age out early and grant allowance the vendor did not. The clamp keeps
+ * the sequence nondecreasing, which is what makes the head the oldest entry.
+ *
+ * A non-finite reading is stamped at the most recent known one rather than
+ * dropped — an admitted attempt that leaves no trace is exactly the allowance
+ * leak this ledger exists to close.
+ */
+export const recordAttemptWindow = (
+    stamps: readonly number[],
+    nowMs: number,
+    windowMs: number,
+): number[] => {
+    const lastMs = stamps.length > 0 ? stamps[stamps.length - 1] : undefined;
+    const previousMs = lastMs !== undefined && Number.isFinite(lastMs) ? lastMs : 0;
+    const stampedMs = Number.isFinite(nowMs) ? Math.max(nowMs, previousMs) : previousMs;
+
+    // Pruned against the clamped stamp, not the raw reading: the monotonic
+    // maximum is the ledger's notion of now, so the two operations cannot
+    // disagree about which entries are still inside the hour.
+    return pruneAttemptWindow([...stamps, stampedMs], stampedMs, windowMs);
 };
 
 // `hostOf` reduces a URL to its hostname but answers 'invalid-url' for a bare
@@ -323,19 +447,45 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
     // that hangs instead of running.
     requirePositiveInteger('burstCapacity', capacity);
 
+    // WHY THERE ARE TWO GATES, AND WHY NEITHER IS REDUNDANT.
+    //
     // A token bucket with capacity C refilling at rate R admits up to
-    // C + R*T requests in any window of length T. The burst allowance is
-    // therefore not free: it is a bill the vendor pays on top of the rate.
-    // C = 900 with R = 900/hour would admit 1,800 in a rolling hour and blow
-    // straight through USDA's 1,000/hour cap — which is why the burst stays
-    // small (one detail batch) and why it is the SUM, not the rate alone, that
-    // has to fit under the vendor's ceiling. Do not "simplify" the capacity to
-    // requestsPerHour.
-    if (capacity + requestsPerHour > vendorCapPerHour) {
+    // C + R*T requests in any window of length T. So the bucket ALONE cannot
+    // hold the importer to `requestsPerHour`: after any idle stretch it stands
+    // full, and the hour that follows admits C + R*1h — 20 + 900 = 920 at the
+    // defaults, which leaves the live API 80 of USDA's 1,000 instead of the
+    // 100 this rate exists to reserve (AAP 0.7.1). The burst allowance is not
+    // free; it is a bill the vendor pays on top of the rate.
+    //
+    // The exact rolling-hour ledger (`attemptWindow` in `acquire`) is
+    // therefore the BINDING gate: it admits at most `requestsPerHour` attempts
+    // in any hour, idle stretch or not, so 900 is the importer's total and the
+    // headroom is real. The bucket's remaining job is shaping — one detail
+    // batch back-to-back, then a smooth one-every-four-seconds pace, instead
+    // of 900 requests fired at the vendor in the first second of the hour and
+    // then 59 minutes of silence. Delete either one and the module is wrong in
+    // a different way: without the ledger the 920 is back, without the bucket
+    // the pacing is gone.
+    //
+    // What the configuration must satisfy is consequently narrower than the
+    // old `C + R <= vendorCap`: the ceiling itself has to fit under the
+    // vendor's cap, and the burst has to be spendable within the ceiling.
+    if (requestsPerHour > vendorCapPerHour) {
         reject(
-            `burstCapacity ${capacity} + requestsPerHour ${requestsPerHour} exceeds ` +
-                `vendorCapPerHour ${vendorCapPerHour}: a token bucket admits capacity + rate * window ` +
-                `requests, so the burst and the rate must fit under the vendor's hourly cap together`,
+            `requestsPerHour ${requestsPerHour} exceeds vendorCapPerHour ${vendorCapPerHour}: ` +
+                `the importer's rolling-hour ceiling is the total it may spend, so it has to fit ` +
+                `under the vendor's hourly cap with headroom left for the running API`,
+        );
+    }
+    // A burst wider than the hourly ceiling can never be spent in full — the
+    // ledger stops it at `requestsPerHour` — so configuring one asks for
+    // allowance that does not exist, and the extra capacity would only delay
+    // the pacing the bucket is there to provide.
+    if (capacity > requestsPerHour) {
+        reject(
+            `burstCapacity ${capacity} exceeds requestsPerHour ${requestsPerHour}: the rolling-hour ` +
+                `ledger admits at most requestsPerHour attempts per hour, so a wider burst can never ` +
+                `be spent in full`,
         );
     }
 
@@ -361,6 +511,13 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
     // The bucket starts full so the first detail batch is not made to wait for
     // allowance the importer has not yet spent.
     let state: BucketState = { tokens: capacity, lastRefillMs: readClock() };
+
+    // The rolling-hour ledger: one stamp per ADMITTED attempt, pruned to the
+    // last hour on every pass, so it is bounded by `requestsPerHour` entries.
+    // It starts empty because a fresh limiter has spent nothing — the run's
+    // history before this process is not knowable here, and assuming a full
+    // ledger would idle the first hour of every import.
+    let attemptWindow: number[] = [];
 
     const counters = {
         attempts: 0,
@@ -389,23 +546,42 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
     };
 
     const acquire = async (): Promise<void> => {
-        // An empty bucket answers "later", never "no": the import pauses
+        // An exhausted gate answers "later", never "no": the import pauses
         // rather than failing, because aborting a multi-hour run over
         // allowance it will have again in seconds is strictly worse than
         // waiting for it. Looping rather than sleeping once is deliberate — a
-        // coarse timer can wake early — and it cannot spin hot, because
-        // `tokens < 1` makes `waitMsForToken` round up to at least 1ms.
+        // coarse timer can wake early, and a wait satisfying one gate can
+        // leave the other short — and it cannot spin hot, because both
+        // `waitMsForToken` and `windowWaitMs` round a non-zero wait up to at
+        // least 1ms.
         for (;;) {
             const nowMs = readClock();
             state = refillBucket(state, nowMs, tokensPerMs, capacity);
+            attemptWindow = pruneAttemptWindow(attemptWindow, nowMs, RATE_WINDOW_MS);
 
-            if (state.tokens >= 1) {
+            const bucketWaitMs = waitMsForToken(state, nowMs, tokensPerMs, capacity);
+            const ceilingWaitMs = windowWaitMs(attemptWindow, nowMs, requestsPerHour, RATE_WINDOW_MS);
+
+            // Both gates have to be open, and an admitted attempt is charged to
+            // both: one token spent and one stamp recorded. Charging only the
+            // bucket is what let an idle-then-burst run reach C + R*T.
+            if (bucketWaitMs === 0 && ceilingWaitMs === 0) {
                 state = { tokens: state.tokens - 1, lastRefillMs: state.lastRefillMs };
+                attemptWindow = recordAttemptWindow(attemptWindow, nowMs, RATE_WINDOW_MS);
                 recordAttempt(nowMs);
                 return;
             }
 
-            const waitMs = waitMsForToken(state, nowMs, tokensPerMs, capacity);
+            // The longer wait, because satisfying the nearer gate would only
+            // wake into the other one.
+            const waitMs = Math.max(bucketWaitMs, ceilingWaitMs);
+            // Which gate held is the one thing an operator needs from this
+            // line: 'burst' is the pacer doing its job between batches, while
+            // 'hourly_ceiling' means the run has spent its whole hourly
+            // allowance and is waiting for the oldest attempt to age out.
+            const reason: 'burst' | 'hourly_ceiling' =
+                ceilingWaitMs >= bucketWaitMs ? 'hourly_ceiling' : 'burst';
+
             recordPause(waitMs);
             // One line per pause, never per request: at 900 requests an hour a
             // per-request line is ~900 lines that bury the pauses, which are
@@ -413,6 +589,7 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
             // wait so a live run shows the pause while it is happening.
             logger?.info('usda_rate_limit_pause', {
                 waitMs,
+                reason,
                 attempts: counters.attempts,
                 configuredPerHour: requestsPerHour,
             });
@@ -454,12 +631,32 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
         };
 
         const restore = (): void => {
-            // Safe to call twice, and deliberately narrow: after restoring it
-            // must not overwrite whatever is installed by then, which may be
-            // someone else's wrapper rather than ours.
+            // Safe to call twice: once it has handed the global back, what is
+            // installed by then is somebody else's business.
             if (!active) {
                 return;
             }
+
+            // Deliberately narrow, and this identity check is the whole of it:
+            // the original goes back only while the global is still OUR
+            // wrapper. Anything installed on top of it — a sibling limiter, a
+            // test transport, an instrumentation hook — owns `globalThis.fetch`
+            // now, and assigning `original` over that would silently disable a
+            // wrapper this module knows nothing about. `Object.assign` returns
+            // its target, so the value installed below is `paced` itself.
+            if (globalThis.fetch !== paced) {
+                // `active` and `restoreInstalled` stay set on purpose, which
+                // keeps both halves of the contract: `install` still refuses to
+                // wrap twice, and a later `restore` succeeds once the newer
+                // owner steps down and our wrapper is the global again. Host
+                // only, never a URL — a USDA URL carries `api_key`.
+                logger?.debug('usda_rate_limit_restore_skipped', {
+                    host,
+                    reason: 'foreign_fetch_owner',
+                });
+                return;
+            }
+
             active = false;
             restoreInstalled = null;
             globalThis.fetch = original;

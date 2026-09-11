@@ -7,6 +7,35 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+
+    # A throwaway PostgreSQL for the checks that need a real database: applying
+    # the migration ledger, the meal-planning schema-drift gate, and the API
+    # test suite. Nothing here can reach data that matters.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        # Published, because the job runs on the runner VM and DATABASE_URL
+        # below resolves localhost:5432.
+        ports:
+          - 5432:5432
+        # No step runs before the server accepts connections.
+        options: >-
+          --health-cmd "pg_isready -U ci -d ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      NODE_ENV: test
+      # The test setup refuses to truncate without it, and refuses regardless
+      # unless the database name says test or ci.
+      ALLOW_DB_TRUNCATE: 'true'
+
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -16,9 +45,100 @@ jobs:
       - run: npm ci
       - run: npx prisma generate
       - run: npx prisma validate
-        env:
-          # validate resolves the datasource env var but never connects
-          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      - name: Apply the migration ledger
+        run: npx prisma migrate deploy
       - run: npm run typecheck
+      - run: npm run typecheck:test
+      - run: npm run typecheck:scripts
+
+      # docs/meal-planning/expected-schema-diff.sql is the committed record of
+      # every construct in the migration that prisma/schema.prisma cannot
+      # express. This step re-derives both of its sections from the database the
+      # ledger was just applied to and fails on any difference, in either
+      # direction. The file's header documents the same two commands for local
+      # use; this runs them without needing a psql binary on the runner.
+      - name: Schema-drift evidence gate
+        run: |
+          # Actions runs this under `bash -e`; set it here too so the script
+          # behaves the same when it is run by hand. errexit is lifted only
+          # around the two commands whose non-zero exit is expected.
+          set -euo pipefail
+
+          EVIDENCE=docs/meal-planning/expected-schema-diff.sql
+          WORK="${RUNNER_TEMP:-/tmp}/schema-evidence"
+          mkdir -p "$WORK"
+
+          BASE="${DATABASE_URL%%\?*}"
+          ADMIN_URL="${BASE%/*}/postgres"
+          SHADOW_URL="${BASE}_schema_evidence"
+
+          cat > "$WORK/run-sql.js" <<'JS'
+          // Resolved from the checkout, not from this script's directory: the
+          // script lives in the runner's temp directory, which has no
+          // node_modules above it.
+          const { Client } = require(require('path').join(process.cwd(), 'node_modules', 'pg'));
+
+          const sql = require('fs').readFileSync(0, 'utf8');
+          const client = new Client({ connectionString: process.env.PGURL });
+
+          client
+            .connect()
+            .then(() => client.query(sql))
+            .then((result) => {
+              const rows = result.rows || [];
+              console.log(rows.map((row) => Object.values(row)[0]).join('\n'));
+            })
+            .then(() => client.end())
+            .catch((error) => {
+              console.error(error.message || error);
+              process.exit(1);
+            });
+          JS
+
+          # `migrate diff --from-migrations` resets the database it is given, so
+          # it gets its own, never the one holding the applied ledger.
+          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "DROP DATABASE IF EXISTS ${SHADOW_URL##*/}" > /dev/null || exit 1
+          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "CREATE DATABASE ${SHADOW_URL##*/}" > /dev/null || exit 1
+
+          # --exit-code makes 2 the success case here: it means the datamodel
+          # and the ledger differ, which is exactly what section A records.
+          set +e
+          npx prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url "$SHADOW_URL" \
+            --exit-code --script > "$WORK/actual-a.sql"
+          diff_exit=$?
+          set -e
+          if [ "$diff_exit" -ne 2 ]; then
+            echo "prisma migrate diff exited $diff_exit; the gate expects 2 (differences found)."
+            echo "0 means the evidence file is stale; 1 means the command itself failed."
+            cat "$WORK/actual-a.sql"
+            exit 1
+          fi
+
+          sed -n 's/^-- @@Q //p' "$EVIDENCE" > "$WORK/evidence-query.sql"
+          PGURL="$DATABASE_URL" node "$WORK/run-sql.js" < "$WORK/evidence-query.sql" > "$WORK/actual-b.sql" || exit 1
+
+          norm() { grep -vE '^[[:space:]]*--|^[[:space:]]*$' || true; }
+          section() {
+            awk -v marker="-- @@SECTION $1" '$0 == marker { inside = 1; next } /^-- @@SECTION /{ inside = 0 } inside' "$EVIDENCE"
+          }
+
+          status=0
+          section A | norm > "$WORK/expected-a.sql"
+          norm < "$WORK/actual-a.sql" > "$WORK/normalised-a.sql"
+          diff -u "$WORK/expected-a.sql" "$WORK/normalised-a.sql" || status=1
+          section B | norm > "$WORK/expected-b.sql"
+          norm < "$WORK/actual-b.sql" > "$WORK/normalised-b.sql"
+          diff -u "$WORK/expected-b.sql" "$WORK/normalised-b.sql" || status=1
+
+          if [ "$status" -ne 0 ]; then
+            echo "$EVIDENCE no longer matches the schema."
+            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the evidence if the change was intended."
+            exit 1
+          fi
+          echo "schema-drift evidence gate: PASS ($(wc -l < "$WORK/expected-a.sql") statement(s) in section A, $(wc -l < "$WORK/expected-b.sql") in section B)"
+
       - run: npm test
       - run: docker build -t soh-be-ci .

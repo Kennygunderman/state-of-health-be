@@ -1,7 +1,8 @@
 import { NutritionProvenance } from './nutrition';
 
 // The offset-pagination envelope, shared with GET /api/foods so both list
-// endpoints page identically.
+// endpoints page identically. Declared here once, as the wire shape it is;
+// `src/utils/pagination.ts` imports it to build the block.
 export interface PaginationBlock {
     page: number;
     limit: number;
@@ -127,9 +128,11 @@ export interface CatalogValidationCheck {
     // observed value nor a bound.
     observed: number | string | null;
     bound: number | string | null;
-    // Present on a failing check, whose tier decides the resulting
-    // publication status; absent on a passing check, which needs no disposition.
-    tier?: CatalogCheckTier;
+    // Recorded on every check, passing or failing: the tier that governs this
+    // candidate's disposition — the one applied on a failure, the one the
+    // failure would have carried on a pass — so the record is auditable and
+    // replayable without consulting the validator's code.
+    tier: CatalogCheckTier;
 }
 
 // The audit trail for a generated food's identity: one record per URL actually

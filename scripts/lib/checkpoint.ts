@@ -18,13 +18,47 @@
 // async functions below are I/O recipes and every decision they need lives in
 // the exported pure functions above them.
 //
+// THE CONCURRENCY MODEL. Nothing prevents an operator from launching a stage
+// twice, and budget.ts writes this row while a stage writes it too, so every
+// write here is written for more than one writer:
+//   * Claiming a run is serialised on a per-(kind, manifest_version) ADVISORY
+//     LOCK (acquireRunClaimLock), so exactly one caller creates the run and the
+//     rest converge on it rather than opening a competing second run. Read THE
+//     CLAIM for what that does and does not promise — it bounds the damage of a
+//     double launch, it does not make one impossible, and the difference is
+//     stated there rather than glossed here.
+//   * EVERY write to a run row — cursor, counts, log and the close — first reads
+//     that row with SELECT … FOR UPDATE (lockRunForUpdate) inside a transaction.
+//     There is no unlocked write and no exception. `counts` and `log` need it
+//     because they are JSONB maps that can only be accumulated by
+//     read-modify-write and a transaction alone would NOT prevent a lost update;
+//     the cursor takes it so the invariant holds uniformly rather than resting
+//     on an assumption about how many writers exist.
+//   * Closing a run is a one-way transition, taken under that row lock and
+//     written with a status-guarded predicate, so a duplicate teardown can never
+//     rewrite a settled outcome (see THE TERMINAL-TRANSITION RULE).
+// Every lock lives for the surrounding transaction, which is this module's own
+// when the caller passed the client, and the CALLER'S when it passed a `tx`.
+//
+// The run log is persisted state that operators read and the committed reports
+// under data/meal-planning/reports/ copy, so every entry is written through
+// sanitizeRunLogEntry — the storage-safe counterpart of logger.ts's terminal-
+// safe formatting.
+//
 // TYPECHECKING NOTE: the type-only import below resolves to Prisma's generated
 // client, which .gitignore excludes and which CI and the Docker build
 // regenerate. `npx prisma generate` must therefore have run against the current
 // prisma/schema.prisma before this file typechecks — a fresh checkout has no
 // src/generated/prisma directory at all.
 
-import { safeError, ScriptLogger } from './logger';
+// hostOf, safeError and scrubSecrets are logger.ts's exported redaction
+// primitives. They are IMPORTED rather than re-implemented so the pipeline has
+// exactly one definition of "what is a secret": adding a credential-bearing
+// variable to .env.example means adding a rule there, and this module then
+// enforces it on persisted state too. logger.ts's own recursive sanitizer is
+// private and shapes a terminal line, so the recursion for a stored JSONB entry
+// lives here (see sanitizeRunLogEntry) and is built on those three exports.
+import { hostOf, safeError, scrubSecrets, ScriptLogger } from './logger';
 
 // Types only. Rule §12 forbids editing or reviewing src/generated/prisma, not
 // importing from it — this is the same module src/prisma/client.ts imports. The
@@ -88,24 +122,51 @@ export const RUN_LOG_MAX_ENTRIES = 200;
 // the two constants above are a contract shared with src/ and the runbook.
 const RUN_STATUS_RUNNING: CatalogRunStatus = 'running';
 
-export type CheckpointErrorCode = 'run_not_found' | 'run_not_open';
+export type CheckpointErrorCode = 'run_not_found' | 'run_not_open' | 'run_already_finished';
+
+// Kept as a function rather than inline in the constructor so a third code
+// could be added without disturbing the two messages that already exist: both
+// are byte-identical to what this module has always thrown, because they reach
+// operator terminals and the committed reports.
+const checkpointErrorMessage = (
+    code: CheckpointErrorCode,
+    runId: string,
+    storedStatus?: CatalogRunStatus,
+): string => {
+    if (code === 'run_not_found') {
+        return `Catalog run ${runId} does not exist`;
+    }
+    if (code === 'run_already_finished') {
+        // The stored status is named in the message because it is the whole
+        // diagnosis: "already succeeded" while closing as failed is a very
+        // different incident from the reverse (see finishRun).
+        return storedStatus
+            ? `Catalog run ${runId} is already ${storedStatus}`
+            : `Catalog run ${runId} is already finished`;
+    }
+    return `Catalog run ${runId} is no longer open`;
+};
 
 // Follows the DailyQuotaError template in src/services/entitlement.service.ts:
 // a named class carrying the data the caller needs rather than a string (§8).
-// The two codes are worth distinguishing because they mean different operator
-// mistakes — a run id that no longer exists (wrong database, wrong environment)
-// versus a checkpoint written into a run that was already closed (a script that
-// lost track of its own run, which would otherwise corrupt a finished record).
+// The three codes are worth distinguishing because they mean different operator
+// mistakes — a run id that no longer exists (wrong database, wrong environment),
+// a checkpoint written into a run that was already closed (a script that lost
+// track of its own run, which would otherwise corrupt a finished record), and a
+// second teardown trying to close an already-terminal run as the OTHER status
+// (`run_already_finished`, which finishRun refuses because it would rewrite a
+// settled outcome — see the transition rule there).
+//
+// `storedStatus` is optional so every existing two-argument construction in this
+// module and its callers keeps compiling and keeps producing the same message;
+// only the conflicting-transition path passes it.
 export class CheckpointError extends Error {
     constructor(
         public readonly code: CheckpointErrorCode,
         public readonly runId: string,
+        public readonly storedStatus?: CatalogRunStatus,
     ) {
-        super(
-            code === 'run_not_found'
-                ? `Catalog run ${runId} does not exist`
-                : `Catalog run ${runId} is no longer open`,
-        );
+        super(checkpointErrorMessage(code, runId, storedStatus));
         this.name = 'CheckpointError';
     }
 }
@@ -224,6 +285,294 @@ export const appendCappedLog = (
     return entries.slice(-limit);
 };
 
+// THE STORAGE SECURITY CONTRACT OF THE RUN LOG.
+//
+// `log` is not a terminal line that scrolls away: it is persisted state that
+// operators read with psql, that catalog-report.ts copies into the committed
+// reports under data/meal-planning/reports/, and that survives the run by
+// design. Callers pass arbitrary diagnostics into appendRunLog — a failed USDA
+// request URL (api_key lives in its query string), an OpenRouter error body (it
+// can reflect the Authorization header), a Prisma failure (it echoes
+// DATABASE_URL, whose userinfo carries the password), a thrown Error with its
+// stack, a model-proposed evidence URL, a whole vendor response. Writing any of
+// those verbatim commits a credential to the database and then to a file in git.
+//
+// So every entry is reduced to a storage-safe value first. The rules, and why
+// each one exists:
+//   * Every string value and every object KEY goes through logger.ts's
+//     scrubSecrets — the single definition of a secret pattern in this pipeline.
+//   * A value whose KEY NAMES a credential is replaced outright. scrubSecrets
+//     recognises `password=hunter2` inside a string but cannot know that a bare
+//     `hunter2` stored under a key called `password` is the same secret, so for
+//     those names the key is the only signal there is (RUN_LOG_SECRET_WORDS).
+//   * An Error becomes safeError's {name, message}: never the object, never the
+//     stack, never a `cause` (§8).
+//   * Anything URL-shaped is reduced to its HOST. Evidence URLs are
+//     model-proposed and therefore attacker-influenced input that the Agent
+//     Action Plan (§0.3.2) records at host level only, and a path or query
+//     segment can carry a credential that no pattern list reliably catches. Two
+//     independent triggers, because either alone leaks: a key in
+//     RUN_LOG_URL_KEYS (the documented closed set below), and any value that
+//     looks like an absolute `scheme://` URL whatever its key is called.
+//   * Strings are capped. The AAP caps a stored evidence snippet at 500
+//     characters (§0.3.2) and that is the precedent followed here, so a vendor
+//     body or a stack pasted into a field cannot become row content.
+//   * Depth is capped at 8, the same bound logger.ts uses for log fields
+//     (MAX_FIELD_DEPTH), with a cycle guard, an array cap and explicit handling
+//     for the values JSON cannot represent — a JSONB column cannot hold NaN,
+//     Infinity, a bigint, a function or a symbol, and JSON.stringify turns the
+//     first two into `null` silently.
+//   * `__proto__` is dropped, for the reason UNSAFE_COUNT_KEY documents.
+//   * `at` and `event` are AUTHORITATIVE. They are written from the injected
+//     clock and the typed parameter, and a caller field of the same name is
+//     dropped rather than allowed to win. The previous code spread caller fields
+//     last and invited overriding `at`, which is log-record forgery in persisted
+//     state: an entry could claim any time, or masquerade as another event, in
+//     the record an operator uses to reconstruct what a run did. A caller that
+//     legitimately means to record an earlier moment passes its own field name
+//     (`observedAt`, `fetchedAt`), which is preserved untouched.
+const RUN_LOG_MAX_FIELD_DEPTH = 8;
+const RUN_LOG_MAX_STRING_CHARS = 500;
+
+// A log entry is a diagnostic, not a payload. The longest array a caller here
+// legitimately records is one generation batch of candidate keys
+// (CATALOG_BATCH_SIZE = 25), so this leaves headroom while still bounding the
+// row that every checkpoint write reads.
+const RUN_LOG_MAX_ARRAY_ENTRIES = 50;
+
+// Mirrors logger.ts's markers so a reader meets one vocabulary across the
+// terminal output and the stored log (its REDACTED and UNSERIALIZABLE constants
+// are private, so the values — not the constants — are what is shared).
+const RUN_LOG_UNSERIALIZABLE = '[unserializable]';
+const RUN_LOG_REDACTED = '***';
+const RUN_LOG_TRUNCATED = '[truncated]';
+const RUN_LOG_INVALID_TIMESTAMP = 'invalid-timestamp';
+const RUN_LOG_UNKNOWN_EVENT = 'unknown_event';
+
+const RUN_LOG_AT_KEY = 'at';
+const RUN_LOG_EVENT_KEY = 'event';
+
+// The closed set of field names whose value is treated as a URL regardless of
+// its shape, matched case-insensitively. Closed rather than heuristic so the
+// policy is reviewable: these are the names this pipeline's diagnostics use for
+// a location (`evidenceUrl`, `finalUrl` and `sourceUrl` come from the evidence
+// retrieval record, `requestUrl` from the USDA and OpenRouter call sites,
+// `location` from a redirect header). A value under one of these keys that does
+// not parse as a URL becomes hostOf's 'invalid-url' — deliberately, because a
+// URL-bearing key is attacker-influenced and what is left of an unparseable
+// value is exactly the part that could hide a credential.
+const RUN_LOG_URL_KEYS = new Set([
+    'url',
+    'uri',
+    'href',
+    'link',
+    'endpoint',
+    'location',
+    'requesturl',
+    'evidenceurl',
+    'finalurl',
+    'sourceurl',
+]);
+
+// Deliberately loose: it matches the RFC 3986 scheme grammar followed by `//`,
+// so `postgresql://`, `https://` and any vendor scheme all trip it. Matching too
+// eagerly costs a diagnostic its path; matching too narrowly stores a secret.
+const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+// Field names whose VALUE is a credential, not a string that might contain one.
+// The vocabulary starts from logger.ts's own SCRUB_RULES parameter list and
+// differs from it in three deliberate ways. Words a field name uses but a query
+// parameter does not are added (`passwd`, `credential`, `credentials`,
+// `authorization`, `bearer`). The bare word `key` is EXCLUDED, because this
+// pipeline's diagnostics legitimately record `batchKey`, `sourceKey` and
+// `manifestKey`, and redacting a resume key would cost an operator the one field
+// that explains where a run stopped. And multi-word names that only read as a
+// credential when joined (`apiKey`, `x-api-key`, `accessToken`) are matched as
+// PHRASES against the key with its separators removed, since splitting them into
+// words would produce the excluded `key` again.
+const RUN_LOG_SECRET_WORDS = new Set([
+    'password',
+    'passwd',
+    'secret',
+    'token',
+    'credential',
+    'credentials',
+    'signature',
+    'authorization',
+    'auth',
+    'bearer',
+]);
+
+const RUN_LOG_SECRET_PHRASES = ['apikey', 'accesstoken', 'refreshtoken', 'idtoken', 'privatekey', 'clientsecret'];
+
+// camelCase and snake_case both split into words, so `dbPassword`, `db_password`
+// and `DB-PASSWORD` are one case rather than three. Word matching — not
+// substring matching — is what keeps `author` and `authored_by` out of the
+// credential set while still catching `authHeader`.
+const runLogKeyWords = (key: string): string[] =>
+    key
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .split(/[^A-Za-z0-9]+/)
+        .filter((word) => word.length > 0)
+        .map((word) => word.toLowerCase());
+
+const isSecretBearingKey = (key: string): boolean => {
+    const collapsed = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (RUN_LOG_SECRET_PHRASES.some((phrase) => collapsed.includes(phrase))) {
+        return true;
+    }
+    return runLogKeyWords(key).some((word) => RUN_LOG_SECRET_WORDS.has(word));
+};
+
+const truncateForStorage = (value: string): string =>
+    value.length > RUN_LOG_MAX_STRING_CHARS
+        ? `${value.slice(0, RUN_LOG_MAX_STRING_CHARS)}${RUN_LOG_TRUNCATED}`
+        : value;
+
+const isUrlBearingKey = (key: string): boolean => RUN_LOG_URL_KEYS.has(key.toLowerCase());
+
+const sanitizeRunLogString = (value: string, urlBearing: boolean): string =>
+    urlBearing || ABSOLUTE_URL_PATTERN.test(value.trim())
+        ? hostOf(value.trim())
+        : truncateForStorage(scrubSecrets(value));
+
+const sanitizeRunLogValue = (value: unknown, urlBearing: boolean, depth: number, seen: Set<object>): unknown => {
+    if (value === null || value === undefined) {
+        // JSON has no undefined, and a key that silently disappears reads as a
+        // field the caller never passed.
+        return null;
+    }
+    if (typeof value === 'string') {
+        return sanitizeRunLogString(value, urlBearing);
+    }
+    if (typeof value === 'number') {
+        // NaN and ±Infinity have no JSON representation; JSON.stringify would
+        // store `null` and lose the fact that the caller passed a broken number.
+        return Number.isFinite(value) ? value : RUN_LOG_UNSERIALIZABLE;
+    }
+    if (typeof value === 'boolean') {
+        return value;
+    }
+    if (typeof value === 'bigint') {
+        // Prisma returns a bigint for some columns and JSON.stringify throws on
+        // one, which would abort the checkpoint write rather than log it.
+        return String(value);
+    }
+    if (typeof value === 'function' || typeof value === 'symbol') {
+        return RUN_LOG_UNSERIALIZABLE;
+    }
+    if (value instanceof Error) {
+        const normalized = safeError(value);
+        return {
+            name: truncateForStorage(normalized.name),
+            message: truncateForStorage(normalized.message),
+        };
+    }
+    if (value instanceof Date) {
+        // Recursed as a plain object a Date has no own keys and would serialise
+        // to `{}`, silently losing the timestamp.
+        const time = value.getTime();
+        return Number.isFinite(time) ? value.toISOString() : RUN_LOG_UNSERIALIZABLE;
+    }
+    if (depth >= RUN_LOG_MAX_FIELD_DEPTH) {
+        return RUN_LOG_UNSERIALIZABLE;
+    }
+
+    const container = value as object;
+    // `seen` tracks the current path only — it is cleared on the way out — so a
+    // node shared by two branches survives while a true cycle is caught before
+    // it can recurse forever.
+    if (seen.has(container)) {
+        return RUN_LOG_UNSERIALIZABLE;
+    }
+    seen.add(container);
+    try {
+        if (Array.isArray(value)) {
+            const kept = value
+                .slice(0, RUN_LOG_MAX_ARRAY_ENTRIES)
+                .map((member): unknown => sanitizeRunLogValue(member, urlBearing, depth + 1, seen));
+            // The marker carries the dropped count (a number this module
+            // computed, never caller content) so the log says it was truncated
+            // instead of quietly reading as a shorter array.
+            return value.length > RUN_LOG_MAX_ARRAY_ENTRIES
+                ? [...kept, `${RUN_LOG_TRUNCATED} ${value.length - RUN_LOG_MAX_ARRAY_ENTRIES} more`]
+                : kept;
+        }
+
+        const record = container as Record<string, unknown>;
+        const output: Record<string, unknown> = {};
+        for (const key of Object.keys(record)) {
+            if (key === UNSAFE_COUNT_KEY) {
+                continue;
+            }
+            // Redaction by key name comes FIRST and replaces the value whatever
+            // its type: a credential nested under `credentials: {...}` must not
+            // be recursed into and partially preserved.
+            output[truncateForStorage(scrubSecrets(key))] = isSecretBearingKey(key)
+                ? RUN_LOG_REDACTED
+                : sanitizeRunLogValue(record[key], urlBearing || isUrlBearingKey(key), depth + 1, seen);
+        }
+        return output;
+    } catch {
+        // A throwing getter or an exotic host object is a caller problem, never
+        // a reason to abandon the checkpoint write.
+        return RUN_LOG_UNSERIALIZABLE;
+    } finally {
+        seen.delete(container);
+    }
+};
+
+const runLogTimestamp = (at: Date): string => {
+    if (!(at instanceof Date)) {
+        return RUN_LOG_INVALID_TIMESTAMP;
+    }
+    const time = at.getTime();
+    return Number.isFinite(time) ? at.toISOString() : RUN_LOG_INVALID_TIMESTAMP;
+};
+
+// Exported for the same reason mergeCounts, appendCappedLog and toCatalogRun are
+// (§1.2): it is a pure decision the unit suite under src/__tests__ can pin with
+// no database, and every rule in the contract above is a rule someone could get
+// wrong. It is the only way an entry reaches the `log` column — appendRunLog and
+// finishRun both go through it.
+export const sanitizeRunLogEntry = (
+    entry: { event: string } & Record<string, unknown>,
+    at: Date,
+): Record<string, unknown> => {
+    // Written first so they also come first in the stored object (the order
+    // operators read), and re-asserted by skipping any caller key that collides.
+    const sanitized: Record<string, unknown> = {
+        [RUN_LOG_AT_KEY]: runLogTimestamp(at),
+        [RUN_LOG_EVENT_KEY]:
+            typeof entry?.event === 'string' && entry.event.length > 0
+                ? truncateForStorage(scrubSecrets(entry.event))
+                : // Mirrors safeError's 'UnknownError' fallback: the declared
+                  // type does not bind a JavaScript caller, and an entry with no
+                  // event is still worth storing.
+                  RUN_LOG_UNKNOWN_EVENT,
+    };
+
+    if (!isPlainRecord(entry)) {
+        return sanitized;
+    }
+
+    // Seeded with the entry itself so a self-referencing field is caught at the
+    // first hop rather than one level in.
+    const seen = new Set<object>([entry as object]);
+
+    for (const key of Object.keys(entry)) {
+        const safeKey = truncateForStorage(scrubSecrets(key));
+        if (safeKey === RUN_LOG_AT_KEY || safeKey === RUN_LOG_EVENT_KEY || key === UNSAFE_COUNT_KEY) {
+            continue;
+        }
+        sanitized[safeKey] = isSecretBearingKey(key)
+            ? RUN_LOG_REDACTED
+            : sanitizeRunLogValue(entry[key], isUrlBearingKey(key), 1, seen);
+    }
+
+    return sanitized;
+};
+
 // The single row -> domain mapper (§6): snake_case to camelCase, with real
 // defaults instead of optionals the caller has to guess about. No other function
 // in this module hand-assembles a CatalogRun.
@@ -284,12 +633,100 @@ export const toCatalogRun = <TCursor>(row: unknown): CatalogRun<TCursor> => {
 
 // A Prisma transaction client is exactly the client with $transaction removed
 // (Prisma's ITXClientDenyList), so its absence is a reliable probe for "the
-// caller already owns a transaction". Used by recordCounts to wrap its
-// read-modify-write when — and only when — we own the connection; opening a
+// caller already owns a transaction". Used by every locking write below to wrap
+// its read-modify-write when — and only when — we own the connection; opening a
 // transaction inside the caller's would nest, which Prisma does not support.
 const transactionRunnerOf = (db: CatalogRunDb): PrismaClient | null => {
     const candidate = db as PrismaClient;
     return typeof candidate.$transaction === 'function' ? candidate : null;
+};
+
+// The one place that decides "new transaction or the caller's". Every locking
+// write goes through it, so the two client shapes never diverge in behaviour:
+// with the singleton we open one interactive transaction and the locks are
+// released at its commit; with an injected `tx` we run in place and the locks
+// are held until the CALLER commits — which is exactly what catalog-load.ts
+// wants, since its release verification and this checkpoint write must succeed
+// or fail together.
+const inRunTransaction = async <T>(db: CatalogRunDb, work: (tx: CatalogRunDb) => Promise<T>): Promise<T> => {
+    const runner = transactionRunnerOf(db);
+    return runner ? runner.$transaction((tx) => work(tx)) : work(db);
+};
+
+// A syntactically valid uuid, checked before any $queryRaw below binds `id`.
+// The raw statements cast the parameter with `::uuid` (the column is @db.Uuid
+// and a template parameter binds as text), and Postgres answers a malformed
+// value with a 22P02 invalid-input error that Prisma surfaces as its own error
+// class — a vendor error shape this module must neither leak nor pattern-match
+// (§8/§9). Prisma's own findUnique rejects a malformed id too, so turning that
+// case into this module's typed `run_not_found` is a single shared improvement
+// rather than a behaviour regression: an id that cannot identify a row is
+// exactly "no such run".
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const assertWellFormedRunId = (runId: string): void => {
+    if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)) {
+        throw new CheckpointError('run_not_found', runId);
+    }
+};
+
+// The row lock every JSONB read-modify-write and every close takes first.
+//
+// Prisma cannot express FOR UPDATE, so this is raw SQL by necessity — it is also
+// the only lock that works: `counts` and `log` are JSONB maps that have to be
+// read, merged in application code and written back (see mergeCounts), and two
+// unlocked writers of that pair silently lose one side's update. The lock is
+// held for the life of the surrounding transaction (see inRunTransaction), so
+// concurrent checkpoint writers queue on the row instead of overwriting each
+// other, and a reader that arrives after the close sees the settled status.
+//
+// JSONB columns come back already parsed; `mergeCounts` and `appendCappedLog`
+// tolerate any shape, so no assertion about their contents is needed here. An
+// empty array means the id is well formed but no such run exists.
+interface LockedRunState {
+    status: string;
+    counts: unknown;
+    log: unknown;
+}
+
+const lockRunForUpdate = async (db: CatalogRunDb, runId: string): Promise<LockedRunState | null> => {
+    const rows = await db.$queryRaw<LockedRunState[]>`
+        SELECT status, counts, log FROM catalog_import_runs WHERE id = ${runId}::uuid FOR UPDATE
+    `;
+
+    return rows.length > 0 ? rows[0] : null;
+};
+
+// The claim lock for openOrResumeRun, and the reason a run can be claimed at all
+// without a new unique constraint.
+//
+// There is no row to lock before the claim — that is the whole problem: two
+// invocations for the same (kind, manifest_version) both find no resumable run
+// and both create one, after which two processes own the same work, duplicate
+// every USDA and OpenRouter call it costs, and race each other's cursor. A
+// transaction alone does not prevent it (neither insert conflicts with the
+// other), so the serialisation point has to be a lock on the IDENTITY rather
+// than on a row.
+//
+// This mirrors the Agent Action Plan's own idiom for the request path
+// (`SELECT pg_advisory_xact_lock(hashtext('meal-planning:' || userId))`, §0.5.1
+// "Lock first"), applied to the pipeline's identity instead of a user's. The key
+// is composed as one string parameter so the whole value is bound rather than
+// interpolated. hashtext narrows to 32 bits, so two unrelated keys can collide:
+// the only consequence is that one claim waits for the other's transaction, which
+// is a few milliseconds once per stage.
+//
+// $executeRaw, not $queryRaw: pg_advisory_xact_lock returns void, and Prisma's
+// query path fails to deserialise a void column (P2010). The lock is released
+// when the surrounding transaction ends — the one we open, or the caller's when
+// it injected a `tx` (see inRunTransaction).
+const acquireRunClaimLock = async (
+    db: CatalogRunDb,
+    kind: CatalogRunKind,
+    manifestVersion: string,
+): Promise<void> => {
+    const key = `catalog-run:${kind}:${manifestVersion}`;
+    await db.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
 };
 
 // Runs on the failure path only, so the happy path never pays for this read. It
@@ -369,38 +806,130 @@ export const findResumableRun = async <TCursor>(
     return row ? toCatalogRun<TCursor>(row) : null;
 };
 
+// THE CLAIM. This is the only entry point the four scripts use, and it is an
+// atomic claim rather than a find-then-create: the advisory lock is taken FIRST,
+// so the find and the create are one indivisible step for a given
+// (kind, manifest_version). Exactly one concurrent caller creates the run; every
+// other caller blocks on the lock, then finds the row the winner committed and
+// resumes it. Without the lock both callers see "nothing resumable" and both
+// create.
+//
+// WHAT THIS GUARANTEES, PRECISELY, AND WHAT IT DOES NOT.
+//
+// It guarantees exactly one run row per (kind, manifest_version), and therefore
+// that every concurrent invocation converges on the SAME run. That convergence
+// is load-bearing well beyond tidiness: budget.ts's spend cap is enforced as
+// SUM(model_calls_reserved) over one run's batch rows, so two competing run rows
+// would give an operator's single CATALOG_MODEL_CALL_BUDGET two independent
+// allowances and double the money it caps. Converged on one run, the cap binds
+// across every invocation, `counts` and `log` accumulate under the row lock
+// without loss, and the terminal transition (see THE TERMINAL-TRANSITION RULE)
+// settles the outcome once.
+//
+// It does NOT grant exclusive processing for the run's lifetime. The advisory
+// lock is transaction-scoped, so it is released when this short claim commits;
+// after that, two processes launched against the same stage both hold a handle
+// to the same run and can both work through it. The residual cost of that is
+// bounded rather than corrupting — the cap still holds, no count or log entry is
+// lost, the outcome cannot be rewritten, and the pipeline's own writes are
+// idempotent (upsert on source_key for catalog foods, slug for recipes), so the
+// waste is repeated work rather than wrong data — but it is real, and this
+// module cannot close it:
+//   * A durable claim (an owner id plus a lease expiry on the run row, taken by
+//     compare-and-set and reasserted as work proceeds) needs columns
+//     catalog_import_runs does not have, i.e. a schema change, and a periodic
+//     reassertion, i.e. the background timer the Agent Action Plan (§0.8.2)
+//     excludes from this feature.
+//   * A session-scoped lock (pg_advisory_lock, held from claim to teardown)
+//     needs one pinned connection for the run's whole lifetime. This module is
+//     handed a POOLED client it must neither construct nor pin (see the
+//     type-only import above), and Prisma routes each statement to whichever
+//     pooled connection is free, so a session lock taken here would be held by
+//     an arbitrary connection and could never be released deterministically.
+// That lock belongs to the CLI entry point, which owns its own process and can
+// hold it for exactly as long as it works, and it is the entry points — not
+// this module — that decide whether a second concurrent launch should wait or
+// refuse. Until one of them does, treat "two launches of the same stage" as
+// wasteful and not as unsafe, and do not re-add a justification here claiming
+// this claim makes a second writer impossible: it makes a second run row
+// impossible, which is a different and smaller promise.
 export const openOrResumeRun = async <TCursor>(
     db: CatalogRunDb,
     input: { kind: CatalogRunKind; manifestVersion: string; initialCursor?: TCursor; logger?: ScriptLogger },
 ): Promise<{ run: CatalogRun<TCursor>; resumed: boolean }> => {
-    const resumable = await findResumableRun<TCursor>(db, {
-        kind: input.kind,
-        manifestVersion: input.manifestVersion,
+    const claimed = await inRunTransaction(db, async (tx) => {
+        await acquireRunClaimLock(tx, input.kind, input.manifestVersion);
+
+        const resumable = await findResumableRun<TCursor>(tx, {
+            kind: input.kind,
+            manifestVersion: input.manifestVersion,
+        });
+
+        if (resumable) {
+            return { run: resumable, resumed: true };
+        }
+
+        // The logger is deliberately NOT passed down: openRun would print
+        // 'run_opened' before this transaction commits, and a claim that rolled
+        // back afterwards would leave a line claiming a run exists. The
+        // equivalent line is emitted below, after the commit, with the same
+        // event and fields.
+        const run = await openRun<TCursor>(tx, {
+            kind: input.kind,
+            manifestVersion: input.manifestVersion,
+            cursor: input.initialCursor,
+        });
+
+        return { run, resumed: false };
     });
 
-    if (resumable) {
+    if (claimed.resumed) {
         // The cursor is logged, not just the id: on a resumed run this line is
         // the operator's only visible answer to "where does it pick up?".
-        input.logger?.info('run_resumed', { runId: resumable.id, cursor: resumable.cursor });
-        return { run: resumable, resumed: true };
+        input.logger?.info('run_resumed', { runId: claimed.run.id, cursor: claimed.run.cursor });
+    } else {
+        input.logger?.info('run_opened', {
+            runId: claimed.run.id,
+            kind: claimed.run.kind,
+            manifestVersion: claimed.run.manifestVersion,
+        });
     }
 
-    const run = await openRun<TCursor>(db, {
-        kind: input.kind,
-        manifestVersion: input.manifestVersion,
-        cursor: input.initialCursor,
-        logger: input.logger,
-    });
-
-    return { run, resumed: false };
+    return claimed;
 };
 
-export const saveCursor = async <TCursor>(db: CatalogRunDb, runId: string, cursor: TCursor): Promise<void> => {
-    // Called after every manifest batch, generation batch and verified release
-    // file, so it stays one statement: no read, no merge, last write wins. The
-    // cursor is the caller's own latest position, so there is nothing to
-    // reconcile against what is stored.
+const writeCursorToRun = async <TCursor>(db: CatalogRunDb, runId: string, cursor: TCursor): Promise<void> => {
+    // The same LOCKING read the two JSONB merges and the close take, so that
+    // EVERY write to a run row goes through the row lock without exception.
     //
+    // The cursor is not a read-modify-write — it replaces the column with a
+    // value the caller computed — so the lock is not protecting an earlier read
+    // here. It is protecting the invariant: the previous revision of this file
+    // left this one statement unlocked and justified it by claiming
+    // openOrResumeRun's claim "guarantees a single owner per run". That claim
+    // guarantees a single run ROW (see THE CLAIM), which is not the same thing
+    // as a single live writer, so the justification was wrong and the exception
+    // it licensed is gone. With the lock, two writers of one run serialise into
+    // a defined order instead of racing, and the status is read under the lock
+    // that the write is then guarded on.
+    //
+    // What the lock still cannot decide is WHICH cursor is newer: ordering that
+    // would mean interpreting the caller's opaque resume key, which this module
+    // never does by design. Two live writers therefore remain last-write-wins,
+    // whose worst case is a cursor moved backwards and work repeated — and the
+    // pipeline's writes are idempotent by design (upsert on source_key for the
+    // catalog, slug for recipes), so repeated work costs time rather than
+    // correctness. Preventing two live writers at all is a lifetime-ownership
+    // question that belongs above this module (see THE CLAIM).
+    const locked = await lockRunForUpdate(db, runId);
+
+    if (!locked) {
+        throw new CheckpointError('run_not_found', runId);
+    }
+    if (locked.status !== RUN_STATUS_RUNNING) {
+        throw new CheckpointError('run_not_open', runId);
+    }
+
     // updateMany rather than update because it reports a count instead of
     // throwing Prisma's P2025 when the guarded where matches nothing. Reacting to
     // P2025 would mean pattern-matching a vendor error shape (§9) and would
@@ -411,9 +940,20 @@ export const saveCursor = async <TCursor>(db: CatalogRunDb, runId: string, curso
         data: { cursor: cursor as Prisma.InputJsonValue },
     });
 
+    // Unreachable while the row lock is held; kept as the guarantee itself
+    // rather than as a comment (see closeRunOnce).
     if (result.count === 0) {
-        throw new CheckpointError(await classifyUnwritableRun(db, runId), runId);
+        throw new CheckpointError('run_not_open', runId);
     }
+};
+
+export const saveCursor = async <TCursor>(db: CatalogRunDb, runId: string, cursor: TCursor): Promise<void> => {
+    assertWellFormedRunId(runId);
+
+    // Called after every manifest batch, generation batch and verified release
+    // file — the hottest write in the module — which is why the locked section
+    // is one read and one write and nothing else.
+    await inRunTransaction(db, (tx) => writeCursorToRun(tx, runId, cursor));
 };
 
 const mergeCountsIntoRun = async (
@@ -421,26 +961,26 @@ const mergeCountsIntoRun = async (
     runId: string,
     delta: Record<string, number>,
 ): Promise<Readonly<Record<string, number>>> => {
-    const row = await db.catalog_import_runs.findUnique({
-        where: { id: runId },
-        select: { status: true, counts: true },
-    });
+    // The LOCKING read. Everything this function then does depends on the value
+    // it just read, so the row must not change underneath it.
+    const locked = await lockRunForUpdate(db, runId);
 
-    if (!row) {
+    if (!locked) {
         throw new CheckpointError('run_not_found', runId);
     }
-    if (row.status !== RUN_STATUS_RUNNING) {
+    if (locked.status !== RUN_STATUS_RUNNING) {
         throw new CheckpointError('run_not_open', runId);
     }
 
-    const counts = mergeCounts(row.counts, delta);
+    const counts = mergeCounts(locked.counts, delta);
 
     const result = await db.catalog_import_runs.updateMany({
         where: { id: runId, status: RUN_STATUS_RUNNING },
         data: { counts },
     });
 
-    // Reachable only if the run was closed between the read and the write.
+    // Unreachable while the row lock is held; kept as the guarantee itself
+    // rather than as a comment (see closeRunOnce).
     if (result.count === 0) {
         throw new CheckpointError('run_not_open', runId);
     }
@@ -453,24 +993,59 @@ export const recordCounts = async (
     runId: string,
     delta: Record<string, number>,
 ): Promise<Readonly<Record<string, number>>> => {
-    const runner = transactionRunnerOf(db);
+    assertWellFormedRunId(runId);
 
     // Accumulating into a JSONB map is unavoidably a read-modify-write (see
-    // mergeCounts). When we own the connection the pair runs inside one
-    // interactive transaction, so a crash between the read and the write cannot
-    // leave a half-merged map on the row. When the caller passed its own
-    // transaction client we run in place — nesting is not supported, and the
-    // caller's transaction already provides the same atomicity.
+    // mergeCounts: Prisma cannot increment a key inside a JSONB column, so the
+    // addition happens in application code).
     //
-    // Worth being precise about what this does NOT buy: a transaction alone does
-    // not serialise two concurrent read-modify-writes, so it is not lost-update
-    // protection. It does not need to be — one script process owns a run at a
-    // time (a run is found again and continued, never shared), so the only
-    // writer of a given run row is the process that opened it. If that ever
-    // changes, this needs a locking read, not a comment.
-    return runner
-        ? runner.$transaction((tx) => mergeCountsIntoRun(tx, runId, delta))
-        : mergeCountsIntoRun(db, runId, delta);
+    // WHY THE ROW LOCK IS NOT OPTIONAL. A transaction alone does not serialise
+    // two read-modify-writes: both can read `counts` at the same value, both add
+    // their own delta to it, and the second write erases the first — a lost
+    // update, in the column an operator reads to decide whether a release is
+    // complete. `SELECT … FOR UPDATE` inside the transaction is what makes the
+    // pair atomic, so concurrent writers queue on the row and every delta lands.
+    // Concurrency here is real rather than hypothetical: budget.ts mirrors its
+    // model-call totals through this same function while a stage records its own
+    // progress, and an operator can run two stages against one run's row.
+    return inRunTransaction(db, (tx) => mergeCountsIntoRun(tx, runId, delta));
+};
+
+const appendLogToRun = async (
+    db: CatalogRunDb,
+    runId: string,
+    entry: { event: string } & Record<string, unknown>,
+    at: Date,
+): Promise<void> => {
+    // The same LOCKING read as mergeCountsIntoRun, for the same reason:
+    // appending to a JSONB array is a read-modify-write, and two unlocked
+    // appenders each write an array missing the other's entry. Losing a log
+    // entry is quieter than losing a count and costs an operator the one record
+    // of what a stage did.
+    const locked = await lockRunForUpdate(db, runId);
+
+    if (!locked) {
+        throw new CheckpointError('run_not_found', runId);
+    }
+    if (locked.status !== RUN_STATUS_RUNNING) {
+        throw new CheckpointError('run_not_open', runId);
+    }
+
+    // Sanitized BEFORE it is appended, never after: what reaches the column is
+    // the storage-safe entry, and `at`/`event` are this module's values rather
+    // than the caller's (see THE STORAGE SECURITY CONTRACT OF THE RUN LOG).
+    const log = appendCappedLog(locked.log, sanitizeRunLogEntry(entry, at), RUN_LOG_MAX_ENTRIES);
+
+    const result = await db.catalog_import_runs.updateMany({
+        where: { id: runId, status: RUN_STATUS_RUNNING },
+        data: { log: log as Prisma.InputJsonValue },
+    });
+
+    // Unreachable while the row lock is held; kept as the guarantee itself
+    // rather than as a comment (see closeRunOnce).
+    if (result.count === 0) {
+        throw new CheckpointError('run_not_open', runId);
+    }
 };
 
 export const appendRunLog = async (
@@ -479,58 +1054,80 @@ export const appendRunLog = async (
     entry: { event: string } & Record<string, unknown>,
     now: () => Date = () => new Date(),
 ): Promise<void> => {
-    const row = await db.catalog_import_runs.findUnique({
-        where: { id: runId },
-        select: { status: true, log: true },
-    });
+    assertWellFormedRunId(runId);
 
+    // `now` is injected (and defaulted) so the retention behaviour is testable
+    // without freezing the system clock. It is read inside the transaction, so
+    // the recorded moment is the moment the entry is written rather than the
+    // moment the caller queued behind the row lock.
+    await inRunTransaction(db, (tx) => appendLogToRun(tx, runId, entry, now()));
+};
+
+// Reads the closed row back for the mapper while the row lock is still held, so
+// what the caller receives is the committed state rather than a value this
+// module assembled from its own inputs (§6 — toCatalogRun is the only mapper).
+const readRunForMapping = async (db: CatalogRunDb, runId: string): Promise<CatalogRun> => {
+    const row = await db.catalog_import_runs.findUnique({ where: { id: runId } });
+
+    // Unreachable while the transaction holds the row lock, and this pipeline
+    // never deletes run rows (they are small, retained indefinitely, and cascade
+    // only with the release batches). Kept because the alternative to a typed
+    // error here is a non-null assertion that would lie if either fact changed.
     if (!row) {
         throw new CheckpointError('run_not_found', runId);
     }
-    if (row.status !== RUN_STATUS_RUNNING) {
-        throw new CheckpointError('run_not_open', runId);
-    }
 
-    // `now` is injected (and defaulted) so the retention behaviour is testable
-    // without freezing the system clock. Caller fields are spread last, so an
-    // entry may override `at` if it is recording something that happened
-    // earlier than the write.
-    const log = appendCappedLog(row.log, { at: now().toISOString(), ...entry }, RUN_LOG_MAX_ENTRIES);
-
-    const result = await db.catalog_import_runs.updateMany({
-        where: { id: runId, status: RUN_STATUS_RUNNING },
-        data: { log: log as Prisma.InputJsonValue },
-    });
-
-    if (result.count === 0) {
-        throw new CheckpointError('run_not_open', runId);
-    }
+    return toCatalogRun(row);
 };
 
-export const finishRun = async (
+// THE TERMINAL-TRANSITION RULE.
+//
+// A run is closed exactly once. Only a run whose STORED status is 'running' may
+// be written, the status is read under a row lock and the write itself is
+// guarded on that status, so a duplicate teardown cannot rewrite a settled
+// outcome. Two things make that non-negotiable rather than tidy:
+//
+//   * The active catalog release is defined as the newest 'release_load' run
+//     with status 'succeeded' (see the note on RELEASE_LOAD_RUN_KIND). Flipping
+//     a failed load to 'succeeded' would publish a release whose checksums or
+//     row counts never verified; flipping a succeeded one to 'failed' would
+//     silently deactivate a good release. Both are release-safety incidents, not
+//     bookkeeping errors.
+//   * `input.counts` are MERGED BY ADDITION (see mergeCounts), so re-running the
+//     close would add the caller's final totals to the row a second time.
+//
+// What the previous tolerance was right about is kept: a teardown path that runs
+// twice (an error handler plus a `finally`) must not raise a second error that
+// masks the first. So an IDENTICAL replay — the stored status already equals the
+// requested one — returns the stored row unchanged, with no write and no second
+// merge of `input.counts`. A CONFLICTING replay is rejected with a typed
+// `run_already_finished` carrying the stored status, because there is no
+// interpretation of it that is safe to guess at.
+const closeRunOnce = async (
     db: CatalogRunDb,
     runId: string,
     status: 'succeeded' | 'failed',
-    input?: { counts?: Record<string, number>; error?: unknown; logger?: ScriptLogger },
+    input?: { counts?: Record<string, number>; error?: unknown },
 ): Promise<CatalogRun> => {
-    const existing = await db.catalog_import_runs.findUnique({
-        where: { id: runId },
-        select: { counts: true, log: true },
-    });
+    const locked = await lockRunForUpdate(db, runId);
 
-    if (!existing) {
+    if (!locked) {
         throw new CheckpointError('run_not_found', runId);
     }
 
-    // Closing is deliberately tolerant of a run that is already closed — unlike
-    // the three in-flight writers above, which demand status = 'running'. A
-    // teardown path that runs twice (an error handler plus a finally) must not
-    // raise a second error that masks the first, and re-closing a run changes
-    // nothing an operator relies on. Only a run that does not exist is worth
-    // raising, because that means the caller is pointed at the wrong database.
-    const counts = mergeCounts(existing.counts, input?.counts ?? {});
+    if (locked.status !== RUN_STATUS_RUNNING) {
+        if (locked.status === status) {
+            return readRunForMapping(db, runId);
+        }
+        // Cast, not coercion: toCatalogRun preserves an unfamiliar status rather
+        // than rewriting it, and an error reporting the value it actually found
+        // is worth more to an operator than one that normalised it away.
+        throw new CheckpointError('run_already_finished', runId, locked.status as CatalogRunStatus);
+    }
 
-    const data: Prisma.catalog_import_runsUpdateInput = {
+    const counts = mergeCounts(locked.counts, input?.counts ?? {});
+
+    const data: Prisma.catalog_import_runsUpdateManyMutationInput = {
         status,
         finished_at: new Date(),
         counts,
@@ -547,21 +1144,53 @@ export const finishRun = async (
         // appendRunLog, for two reasons: the failure record and the closure must
         // not be separable, and appendRunLog requires an open run — which this
         // write is in the act of ending.
-        const failureEntry = {
-            at: new Date().toISOString(),
-            event: 'run_failed',
-            error: safeError(input?.error),
-        };
-        data.log = appendCappedLog(existing.log, failureEntry, RUN_LOG_MAX_ENTRIES) as Prisma.InputJsonValue;
+        //
+        // safeError FIRST, then the sanitizer: safeError is what discards a
+        // non-Error thrown value wholesale (a thrown string carrying a
+        // connection URL becomes 'Unknown error'), and the sanitizer then caps
+        // and re-scrubs what is left, so both log writers in this module store
+        // entries under exactly the same rules.
+        const failureEntry = sanitizeRunLogEntry(
+            { event: 'run_failed', error: safeError(input?.error) },
+            new Date(),
+        );
+        data.log = appendCappedLog(locked.log, failureEntry, RUN_LOG_MAX_ENTRIES) as Prisma.InputJsonValue;
     }
 
-    // Existence was just established and this pipeline never deletes run rows
-    // (they are small, retained indefinitely, and cascade only with the release
-    // batches), so the unique update is safe here and returns the closed row for
-    // the mapper.
-    const row = await db.catalog_import_runs.update({ where: { id: runId }, data });
-    const run = toCatalogRun(row);
+    // The status predicate is defence in depth: while this transaction holds the
+    // row lock no other writer can close the run, so a zero count is
+    // unreachable. It stays because it is the guarantee itself — if the lock were
+    // ever lost, this predicate, not a comment, is what keeps a second close from
+    // landing. updateMany rather than update so the miss is a count instead of
+    // Prisma's P2025, which this module must not pattern-match (§9).
+    const result = await db.catalog_import_runs.updateMany({
+        where: { id: runId, status: RUN_STATUS_RUNNING },
+        data,
+    });
 
+    if (result.count === 0) {
+        throw new CheckpointError(await classifyUnwritableRun(db, runId), runId);
+    }
+
+    return readRunForMapping(db, runId);
+};
+
+export const finishRun = async (
+    db: CatalogRunDb,
+    runId: string,
+    status: 'succeeded' | 'failed',
+    input?: { counts?: Record<string, number>; error?: unknown; logger?: ScriptLogger },
+): Promise<CatalogRun> => {
+    assertWellFormedRunId(runId);
+
+    // Lock, decide and write in one transaction. Two concurrent teardowns of the
+    // same run therefore serialise: the first closes it, the second sees the
+    // settled status and either replays it or is rejected.
+    const run = await inRunTransaction(db, (tx) => closeRunOnce(tx, runId, status, input));
+
+    // Logged after the transaction returns, so a line claiming a run was closed
+    // is only ever printed for a close that actually committed.
+    //
     // For catalog-load.ts this call IS the active-release mechanism: marking a
     // run 'failed' is precisely what leaves the previous release active, because
     // getActiveReleaseLoad only ever considers 'succeeded' rows. A load that
@@ -605,4 +1234,3 @@ export const getActiveReleaseLoad = async (
         runId: run.id,
     };
 };
-

@@ -113,12 +113,16 @@ const buildUserContent = (text?: string, imageBase64?: string): MessageContent =
 // including the HTTP status and the truncated response body — so it is passed
 // through verbatim rather than rebuilt per kind. Anything that is not a vendor
 // failure propagates untouched.
+//
+// The model output is returned as `unknown`: the vendor boundary validates the
+// transport and the JSON syntax, never the shape, so each call site below
+// narrows the fields it reads instead of trusting model-controlled data.
 const callModel = async (
     systemPrompt: string,
     userContent: MessageContent,
     jsonSchema: object,
     modelOverride?: string,
-): Promise<any> => {
+): Promise<unknown> => {
     try {
         return await callOpenRouter(systemPrompt, userContent, jsonSchema, modelOverride);
     } catch (error) {
@@ -133,6 +137,26 @@ const toInt = (value: unknown): number => {
     const parsed = Math.round(Number(value));
     return Number.isFinite(parsed) ? Math.max(parsed, 0) : 0;
 };
+
+// Readers for model-controlled values. They reproduce exactly what the previous
+// optional-chained reads did: a non-record (including an array or null) has no
+// readable fields, a blank or non-string text field is absent, and an
+// unrecognised confidence falls back to 'medium' — a model is free to return
+// any of these and the endpoint's response must not change shape because of it.
+const asRecord = (value: unknown): Record<string, unknown> | undefined =>
+    typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+
+const readNonBlankString = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.trim() ? value.trim() : undefined;
+
+const CONFIDENCE_LEVELS: readonly EstimateResponse['confidence'][] = ['low', 'medium', 'high'];
+
+const readConfidence = (value: unknown): EstimateResponse['confidence'] =>
+    typeof value === 'string' && (CONFIDENCE_LEVELS as readonly string[]).includes(value)
+        ? (value as EstimateResponse['confidence'])
+        : 'medium';
 
 const JUDGE_JSON_SCHEMA = {
     name: 'food_matches',
@@ -187,7 +211,8 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
         JUDGE_JSON_SCHEMA,
         process.env.ESTIMATE_JUDGE_MODEL || 'openai/gpt-4o-mini',
     );
-    const matches: unknown[] = Array.isArray(judged?.matches) ? judged.matches : [];
+    const judgedMatches = asRecord(judged)?.matches;
+    const matches: unknown[] = Array.isArray(judgedMatches) ? judgedMatches : [];
     if (matches.length !== items.length) {
         console.warn(`Grounding judge returned ${matches.length} matches for ${items.length} items; skipping`);
         return items;
@@ -232,26 +257,38 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
     });
 };
 
+// A model item is only usable when it is a record carrying a non-blank name;
+// anything else (null, a number, a string, an array, a nameless object) is
+// dropped, exactly as the previous name filter did. `quantityText` is passed
+// through untrimmed — only a string survives, everything else becomes ''.
+const toEstimateItem = (value: unknown): EstimateItemWithGrams | null => {
+    const item = asRecord(value);
+    if (!item) return null;
+    const name = readNonBlankString(item.name);
+    if (name === undefined) return null;
+    return {
+        name,
+        quantityText: typeof item.quantityText === 'string' ? item.quantityText : '',
+        grams: toInt(item.grams),
+        calories: toInt(item.calories),
+        protein: toInt(item.protein),
+        carbs: toInt(item.carbs),
+        fat: toInt(item.fat),
+        source: 'estimated' as const,
+        matchedTo: null,
+    };
+};
+
 export const estimateMeal = async (text?: string, imageBase64?: string): Promise<EstimateResponse> => {
-    const parsed = await callModel(
-        ESTIMATE_SYSTEM_PROMPT,
-        buildUserContent(text, imageBase64),
-        ESTIMATE_JSON_SCHEMA,
+    const parsed = asRecord(
+        await callModel(ESTIMATE_SYSTEM_PROMPT, buildUserContent(text, imageBase64), ESTIMATE_JSON_SCHEMA),
     );
 
-    let items: EstimateItem[] = (Array.isArray(parsed?.items) ? parsed.items : [])
-        .filter((item: any) => item && typeof item.name === 'string' && item.name.trim())
-        .map((item: any) => ({
-            name: item.name.trim(),
-            quantityText: typeof item.quantityText === 'string' ? item.quantityText : '',
-            grams: toInt(item.grams),
-            calories: toInt(item.calories),
-            protein: toInt(item.protein),
-            carbs: toInt(item.carbs),
-            fat: toInt(item.fat),
-            source: 'estimated' as const,
-            matchedTo: null,
-        }));
+    const parsedItems = parsed?.items;
+    const modelItems: unknown[] = Array.isArray(parsedItems) ? parsedItems : [];
+    let items: EstimateItem[] = modelItems
+        .map(toEstimateItem)
+        .filter((item): item is EstimateItemWithGrams => item !== null);
     if (items.length === 0) {
         throw new EstimateFailedError('Model returned no food items');
     }
@@ -276,28 +313,25 @@ export const estimateMeal = async (text?: string, imageBase64?: string): Promise
             }),
             { calories: 0, protein: 0, carbs: 0, fat: 0 },
         ),
-        confidence: ['low', 'medium', 'high'].includes(parsed?.confidence) ? parsed.confidence : 'medium',
-        notes: typeof parsed?.notes === 'string' && parsed.notes.trim() ? parsed.notes.trim() : null,
+        confidence: readConfidence(parsed?.confidence),
+        notes: readNonBlankString(parsed?.notes) ?? null,
     };
 };
 
 export const scanLabel = async (imageBase64: string): Promise<LabelScanResponse> => {
-    const parsed = await callModel(
-        LABEL_SCAN_SYSTEM_PROMPT,
-        buildUserContent(undefined, imageBase64),
-        LABEL_SCAN_JSON_SCHEMA,
+    const parsed = asRecord(
+        await callModel(LABEL_SCAN_SYSTEM_PROMPT, buildUserContent(undefined, imageBase64), LABEL_SCAN_JSON_SCHEMA),
     );
 
     const servingAmount = Number(parsed?.servingAmount);
     return {
-        name: typeof parsed?.name === 'string' && parsed.name.trim() ? parsed.name.trim() : null,
+        name: readNonBlankString(parsed?.name) ?? null,
         servingAmount: Number.isFinite(servingAmount) && servingAmount > 0 ? servingAmount : null,
-        servingUnit:
-            typeof parsed?.servingUnit === 'string' && parsed.servingUnit.trim() ? parsed.servingUnit.trim() : null,
+        servingUnit: readNonBlankString(parsed?.servingUnit) ?? null,
         calories: toInt(parsed?.calories),
         protein: toInt(parsed?.protein),
         carbs: toInt(parsed?.carbs),
         fat: toInt(parsed?.fat),
-        confidence: ['low', 'medium', 'high'].includes(parsed?.confidence) ? parsed.confidence : 'medium',
+        confidence: readConfidence(parsed?.confidence),
     };
 };

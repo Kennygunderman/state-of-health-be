@@ -7,10 +7,12 @@
 --
 -- Running it by hand is normally unnecessary, because the Prisma migration is
 -- applied automatically: the container's final command is
--- `npx prisma migrate deploy && node dist/server.js` (see Dockerfile), and CI runs
--- the same `npx prisma migrate deploy` against its own throwaway database before
--- the test suite. `prisma/manual-migrations` is listed in .dockerignore, so the
--- runtime image does not even contain this file.
+-- `npx prisma migrate deploy && node dist/server.js` (see Dockerfile), and CI
+-- applies the same ledger with `npx prisma migrate deploy` against its own
+-- throwaway PostgreSQL service before the schema gate and the test suite (see
+-- the "Apply the migration ledger" step in .github/workflows/ci.yml).
+-- `prisma/manual-migrations` is listed in .dockerignore, so the runtime image
+-- does not even contain this file.
 --
 -- IF YOU DO APPLY THIS FILE BY HAND, immediately follow it with
 --   npx prisma migrate resolve --applied 20260908000000_meal_planning
@@ -20,11 +22,20 @@
 -- a `DO $$` block per foreign key, since `ADD CONSTRAINT` has no `IF NOT EXISTS`
 -- form. This is the first file under prisma/ to need those constructs. Re-running
 -- it is therefore a no-op, but it is NOT a repair tool for a partially applied
--- schema: `CREATE TABLE IF NOT EXISTS` will not add a missing column to a table
--- that already exists.
+-- schema: `CREATE TABLE IF NOT EXISTS` will not add a missing column - or a
+-- missing NOT NULL - to a table that already exists.
 --
--- The release and recovery procedure lives in README.md in this folder and in
--- docs/meal-planning/release-and-recovery.md; it is deliberately not repeated here.
+-- Three things here are deliberate and are not Prisma's output, so do not
+-- "correct" them against prisma/schema.prisma: the STORED generated expression
+-- on catalog_foods.search_vector, the block of expression and partial indexes
+-- before the foreign keys, and NOT NULL on the twelve required TEXT[]/UUID[]
+-- columns. Prisma cannot express any of them; all three are recorded in
+-- docs/meal-planning/expected-schema-diff.sql and checked by CI.
+--
+-- README.md in this folder explains when an operator would run this file and how
+-- to prove it still matches the authoritative ledger;
+-- docs/meal-planning/release-and-recovery.md carries the release and rollback
+-- procedure. Neither is repeated here.
 
 -- AlterTable
 ALTER TABLE "meal_entries" ADD COLUMN IF NOT EXISTS "catalog_food_id" UUID,
@@ -93,9 +104,9 @@ CREATE TABLE IF NOT EXISTS "catalog_foods" (
     "source_cache_key" TEXT,
     "generation_batch_id" UUID,
     "publication_status" TEXT NOT NULL,
-    "allergen_tags" TEXT[],
+    "allergen_tags" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     "allergen_status" TEXT NOT NULL,
-    "diet_tags" TEXT[],
+    "diet_tags" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     "food_group" TEXT NOT NULL,
     "is_common_dislike" BOOLEAN NOT NULL DEFAULT false,
     "cost_class" SMALLINT NOT NULL,
@@ -149,7 +160,7 @@ CREATE TABLE IF NOT EXISTS "catalog_validation_records" (
     "id" UUID NOT NULL DEFAULT gen_random_uuid(),
     "catalog_food_id" UUID NOT NULL,
     "canonical_identity" JSONB NOT NULL,
-    "aliases" TEXT[],
+    "aliases" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     "category" TEXT NOT NULL,
     "food_state" TEXT NOT NULL,
     "identity_source" TEXT NOT NULL,
@@ -194,12 +205,12 @@ CREATE TABLE IF NOT EXISTS "recipe_versions" (
     "prep_minutes" INTEGER NOT NULL,
     "cook_minutes" INTEGER NOT NULL,
     "total_minutes" INTEGER NOT NULL,
-    "meal_slots" TEXT[],
-    "diet_tags" TEXT[],
-    "allergen_tags" TEXT[],
+    "meal_slots" TEXT[] NOT NULL,
+    "diet_tags" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    "allergen_tags" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     "allergen_status" TEXT NOT NULL,
     "budget_tier" SMALLINT NOT NULL,
-    "badges" TEXT[],
+    "badges" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     "nutrition_provenance" TEXT NOT NULL,
     "per_serving_calories" DOUBLE PRECISION NOT NULL,
     "per_serving_protein_g" DOUBLE PRECISION NOT NULL,
@@ -223,8 +234,8 @@ CREATE TABLE IF NOT EXISTS "recipe_ingredients" (
     "snapshot_per_100g" JSONB NOT NULL,
     "snapshot_name" TEXT NOT NULL,
     "snapshot_provenance" TEXT NOT NULL,
-    "snapshot_allergen_tags" TEXT[],
-    "snapshot_diet_tags" TEXT[],
+    "snapshot_allergen_tags" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    "snapshot_diet_tags" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     "quantity" DOUBLE PRECISION NOT NULL,
     "unit" TEXT NOT NULL,
     "gram_weight" DOUBLE PRECISION NOT NULL,
@@ -256,9 +267,9 @@ CREATE TABLE IF NOT EXISTS "meal_plan_preferences" (
     "weight_unit_pref" TEXT,
     "activity_level" TEXT,
     "diet" TEXT,
-    "allergens" TEXT[],
-    "disliked_food_ids" UUID[],
-    "disliked_food_groups" TEXT[],
+    "allergens" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    "disliked_food_ids" UUID[] NOT NULL DEFAULT ARRAY[]::UUID[],
+    "disliked_food_groups" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     "meal_schedule" TEXT,
     "meal_times" JSONB,
     "cooking_time_limit_min" INTEGER,
@@ -388,6 +399,9 @@ CREATE INDEX IF NOT EXISTS "catalog_foods_publication_status_category_idx" ON "c
 CREATE INDEX IF NOT EXISTS "catalog_foods_food_group_idx" ON "catalog_foods"("food_group");
 
 -- CreateIndex
+CREATE INDEX IF NOT EXISTS "catalog_foods_is_common_dislike_publication_status_idx" ON "catalog_foods"("is_common_dislike", "publication_status");
+
+-- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "catalog_foods_source_key_key" ON "catalog_foods"("source_key");
 
 -- CreateIndex
@@ -424,10 +438,37 @@ CREATE INDEX IF NOT EXISTS "meal_plans_user_id_status_start_date_idx" ON "meal_p
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plans_user_id_generation_key_key" ON "meal_plans"("user_id", "generation_key");
 
 -- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "meal_plans_id_user_id_key" ON "meal_plans"("id", "user_id");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "meal_plan_days_user_id_idx" ON "meal_plan_days"("user_id");
+
+-- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_days_meal_plan_id_date_key" ON "meal_plan_days"("meal_plan_id", "date");
 
 -- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_days_id_user_id_key" ON "meal_plan_days"("id", "user_id");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "meal_plan_meals_meal_plan_id_user_id_idx" ON "meal_plan_meals"("meal_plan_id", "user_id");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "meal_plan_meals_user_id_idx" ON "meal_plan_meals"("user_id");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "meal_plan_meals_recipe_version_id_idx" ON "meal_plan_meals"("recipe_version_id");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "meal_plan_meals_previous_recipe_version_id_idx" ON "meal_plan_meals"("previous_recipe_version_id");
+
+-- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_meals_meal_plan_day_id_slot_key" ON "meal_plan_meals"("meal_plan_day_id", "slot");
+
+-- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_meals_id_user_id_key" ON "meal_plan_meals"("id", "user_id");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "grocery_items_user_id_idx" ON "grocery_items"("user_id");
 
 -- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "grocery_items_meal_plan_id_catalog_food_id_food_state_key" ON "grocery_items"("meal_plan_id", "catalog_food_id", "food_state");
@@ -436,9 +477,25 @@ CREATE UNIQUE INDEX IF NOT EXISTS "grocery_items_meal_plan_id_catalog_food_id_fo
 CREATE INDEX IF NOT EXISTS "meal_plan_actions_meal_plan_id_idx" ON "meal_plan_actions"("meal_plan_id");
 
 -- CreateIndex
+CREATE INDEX IF NOT EXISTS "meal_plan_actions_meal_plan_meal_id_idx" ON "meal_plan_actions"("meal_plan_meal_id");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "meal_plan_actions_meal_entry_id_idx" ON "meal_plan_actions"("meal_entry_id");
+
+-- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_actions_user_id_idempotency_key_key" ON "meal_plan_actions"("user_id", "idempotency_key");
 
 -- CreateIndex
+CREATE INDEX IF NOT EXISTS "idx_meal_entries_recipe_version_id" ON "meal_entries"("recipe_version_id");
+
+-- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "meal_entries_id_user_id_key" ON "meal_entries"("id", "user_id");
+
+-- CreateIndex
+-- Hand-written from here to the foreign keys: constructs the Prisma datamodel
+-- cannot express. `prisma migrate diff` is blind to expression and partial
+-- indexes, so docs/meal-planning/expected-schema-diff.sql reads them back out of
+-- the database instead and the CI schema-evidence gate compares them.
 CREATE INDEX IF NOT EXISTS "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("search_vector");
 
 -- CreateIndex
@@ -492,6 +549,18 @@ BEGIN
           AND conrelid = '"meal_entries"'::regclass
     ) THEN
         ALTER TABLE "meal_entries" ADD CONSTRAINT "meal_entries_recipe_version_id_fkey" FOREIGN KEY ("recipe_version_id") REFERENCES "recipe_versions"("id") ON DELETE SET NULL ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+-- AddForeignKey
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'meal_entries_meal_plan_meal_id_user_id_fkey'
+          AND conrelid = '"meal_entries"'::regclass
+    ) THEN
+        ALTER TABLE "meal_entries" ADD CONSTRAINT "meal_entries_meal_plan_meal_id_user_id_fkey" FOREIGN KEY ("meal_plan_meal_id", "user_id") REFERENCES "meal_plan_meals"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
     END IF;
 END $$;
 
@@ -668,10 +737,22 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conname = 'meal_plan_days_meal_plan_id_fkey'
+        WHERE conname = 'meal_plans_replaced_plan_id_user_id_fkey'
+          AND conrelid = '"meal_plans"'::regclass
+    ) THEN
+        ALTER TABLE "meal_plans" ADD CONSTRAINT "meal_plans_replaced_plan_id_user_id_fkey" FOREIGN KEY ("replaced_plan_id", "user_id") REFERENCES "meal_plans"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+-- AddForeignKey
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'meal_plan_days_meal_plan_id_user_id_fkey'
           AND conrelid = '"meal_plan_days"'::regclass
     ) THEN
-        ALTER TABLE "meal_plan_days" ADD CONSTRAINT "meal_plan_days_meal_plan_id_fkey" FOREIGN KEY ("meal_plan_id") REFERENCES "meal_plans"("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+        ALTER TABLE "meal_plan_days" ADD CONSTRAINT "meal_plan_days_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_id", "user_id") REFERENCES "meal_plans"("id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
     END IF;
 END $$;
 
@@ -692,10 +773,10 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conname = 'meal_plan_meals_meal_plan_day_id_fkey'
+        WHERE conname = 'meal_plan_meals_meal_plan_day_id_user_id_fkey'
           AND conrelid = '"meal_plan_meals"'::regclass
     ) THEN
-        ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_day_id_fkey" FOREIGN KEY ("meal_plan_day_id") REFERENCES "meal_plan_days"("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+        ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_day_id_user_id_fkey" FOREIGN KEY ("meal_plan_day_id", "user_id") REFERENCES "meal_plan_days"("id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
     END IF;
 END $$;
 
@@ -704,10 +785,10 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conname = 'meal_plan_meals_meal_plan_id_fkey'
+        WHERE conname = 'meal_plan_meals_meal_plan_id_user_id_fkey'
           AND conrelid = '"meal_plan_meals"'::regclass
     ) THEN
-        ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_id_fkey" FOREIGN KEY ("meal_plan_id") REFERENCES "meal_plans"("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+        ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_id", "user_id") REFERENCES "meal_plans"("id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
     END IF;
 END $$;
 
@@ -752,10 +833,10 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conname = 'grocery_items_meal_plan_id_fkey'
+        WHERE conname = 'grocery_items_meal_plan_id_user_id_fkey'
           AND conrelid = '"grocery_items"'::regclass
     ) THEN
-        ALTER TABLE "grocery_items" ADD CONSTRAINT "grocery_items_meal_plan_id_fkey" FOREIGN KEY ("meal_plan_id") REFERENCES "meal_plans"("id") ON DELETE CASCADE ON UPDATE NO ACTION;
+        ALTER TABLE "grocery_items" ADD CONSTRAINT "grocery_items_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_id", "user_id") REFERENCES "meal_plans"("id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
     END IF;
 END $$;
 
@@ -828,6 +909,42 @@ BEGIN
           AND conrelid = '"meal_plan_actions"'::regclass
     ) THEN
         ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_entry_id_fkey" FOREIGN KEY ("meal_entry_id") REFERENCES "meal_entries"("id") ON DELETE SET NULL ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+-- AddForeignKey
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'meal_plan_actions_meal_plan_id_user_id_fkey'
+          AND conrelid = '"meal_plan_actions"'::regclass
+    ) THEN
+        ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_id", "user_id") REFERENCES "meal_plans"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+-- AddForeignKey
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'meal_plan_actions_meal_plan_meal_id_user_id_fkey'
+          AND conrelid = '"meal_plan_actions"'::regclass
+    ) THEN
+        ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_plan_meal_id_user_id_fkey" FOREIGN KEY ("meal_plan_meal_id", "user_id") REFERENCES "meal_plan_meals"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+-- AddForeignKey
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'meal_plan_actions_meal_entry_id_user_id_fkey'
+          AND conrelid = '"meal_plan_actions"'::regclass
+    ) THEN
+        ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_entry_id_user_id_fkey" FOREIGN KEY ("meal_entry_id", "user_id") REFERENCES "meal_entries"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
     END IF;
 END $$;
 
