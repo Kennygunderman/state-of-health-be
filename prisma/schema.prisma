@@ -355,6 +355,20 @@ model catalog_import_runs {
 // incremented BEFORE each paid model call and model_calls_used only after it
 // returns: a failed call still costs tokens, so the two counters must never be
 // collapsed into one or the budget stops being enforceable.
+//
+// batch_key is unique ACROSS THE TABLE, not per run, and that constraint is
+// load-bearing rather than incidental: the spend cap is enforced as
+// SUM(model_calls_reserved) over one run's rows, so a batch's paid calls can only
+// ever be metered for the single run that owns its row. What makes that coherent
+// is the run lifecycle in scripts/lib/checkpoint.ts, and the two must be read
+// together — openOrResumeRun never opens a competing run over work an earlier run
+// already owns: a stage interrupted mid-flight resumes its own running row, a
+// stage that was closed as 'failed' is retried by continuing that same row (its
+// spent budget is not forgiven and its batch keys stay addressable), and a stage
+// already closed as 'succeeded' is reported complete without a write. Genuinely
+// new generation work therefore means a new coveragePlanVersion, which yields
+// batch keys of its own. Catalog data idempotency is separate again and lives in
+// the pipeline's own upserts (source_key for foods, slug for recipes).
 model catalog_generation_batches {
   id                   String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   run_id               String              @db.Uuid

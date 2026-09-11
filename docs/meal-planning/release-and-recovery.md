@@ -58,6 +58,17 @@ Backend first, app second, feature flags last.
    development machine, reviewed as `data/meal-planning/catalog/releases/v<N+1>/`
    in a pull request, and loaded the same way. Both writers refuse a database
    they cannot classify as development unless `--confirm-target` names it.
+
+   Repeating a catalog stage on that development machine is safe, and what it
+   does depends on how the previous attempt ended. An interrupted stage resumes
+   its own run from its stored cursor and spends what is left of that run's
+   model-call budget. A stage that failed is retried on that same run, so its
+   generation batches stay addressable and the calls the failed attempt already
+   paid for are not handed back as fresh budget. A stage that already succeeded
+   reports that it is complete and writes nothing at all — producing new
+   candidates is not a rerun, it is a new `coveragePlanVersion`, which brings
+   batch keys and a budget of its own. The catalog data itself stays idempotent
+   throughout, because foods upsert on `source_key` and recipes on `slug`.
 5. **Verify before switching on.** `GET /api/catalog/status` must report the
    expected release with at least 10,000 published foods and at least 40
    recipes; the benchmark report must meet its thresholds; per-table row counts

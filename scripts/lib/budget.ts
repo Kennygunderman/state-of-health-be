@@ -32,15 +32,22 @@
 // unrecognised origin before Prisma is imported, so an unowned write can only
 // land in a database it recognises. Within that boundary the scoping key is
 // `run_id`: every aggregate is scoped by it alone, and every single-row write
-// pairs it with `batch_key` (`where: { batch_key, run_id }`). `batch_key` on
-// its own is NOT a sufficient scope — it is globally unique but deliberately
-// stable across runs (see batchKeyFor), so it identifies a batch while saying
-// nothing about which run's ledger the row belongs to, and charging a
-// reservation to whatever run happens to own the row would corrupt that run's
-// totals while leaving the reserving run's aggregate at zero. No statement
-// below touches a batch row without `run_id` in its predicate, except the one
-// failure-path read that exists solely to tell "no such key" apart from "that
-// key belongs to another run".
+// pairs it with `batch_key` (`where: { batch_key, run_id }`). `batch_key` on its
+// own is UNIQUE (prisma/schema.prisma) but is NOT a sufficient scope: it is
+// deliberately stable across runs (see batchKeyFor), so it identifies a batch
+// while saying nothing about whose ledger the row is, and charging a reservation
+// to whatever run happens to own it would corrupt that run's totals while
+// leaving the reserving run's aggregate — the very sum that enforces the cap —
+// at zero. No statement below touches a batch row without `run_id` in its
+// predicate, except the two failure-path reads that address the key alone in
+// order to name the run that does own it.
+//
+// The row this module inserts belongs to a run it does not own, so before any
+// insert it asks checkpoint.ts's requireOpenRun to prove, under a row lock, that
+// the run exists and is still open. That check is what keeps a bad run id a
+// typed CheckpointError instead of PostgreSQL's foreign-key violation surfacing
+// as a raw Prisma error nobody may pattern-match (§9), and what stops a
+// reservation being appended to a settled run's finished ledger.
 //
 // WHAT THIS MODULE DOES NOT DO (§1.1). It meters. It never calls OpenRouter,
 // never constructs a Prisma client or reaches for the `prisma` singleton, never
@@ -58,7 +65,7 @@
 // `npx prisma generate` must therefore have run against the current
 // prisma/schema.prisma before this file typechecks.
 
-import { recordCounts } from './checkpoint';
+import { recordCounts, requireOpenRun } from './checkpoint';
 import type { CatalogRunDb } from './checkpoint';
 import { describeMissingEnv } from './logger';
 import type { ScriptLogger } from './logger';
@@ -104,11 +111,22 @@ export type ModelBudgetCode =
 // each with its figures.
 //
 // `batch_not_found` and `batch_run_mismatch` are deliberately separate codes
-// because they are different operator mistakes: the first is "nothing was ever
-// reserved under this key", i.e. a caller spent without metering, while the
-// second is "the key exists but another run owns its ledger row", i.e. a new
-// run was started over a coverage plan whose batches an earlier run already
-// opened, and the fix is to resume that run rather than to charge it.
+// because they are different caller mistakes with different fixes. The first is
+// "nothing was ever reserved under this key", i.e. a caller spent without
+// metering. The second is "the key exists, but the row belongs to another run",
+// which happens either because a stage was launched over a coverage plan an
+// earlier run already worked, or because reserveModelCall and
+// recordModelCallUsage were called with different `runId`s for one model call;
+// both messages name the owning run, and the remedy is to continue that run
+// rather than to charge this one. Continuing it is a real option rather than
+// advice: checkpoint.ts's openOrResumeRun resumes an interrupted run, retries a
+// failed one on the same row, and reports a succeeded one as already complete,
+// so the run that owns a batch key is always reachable.
+//
+// Neither code covers a run id that does not exist or is already closed. That is
+// checkpoint.ts's domain and it answers with its own typed CheckpointError
+// ('run_not_found' / 'run_not_open') before this module inserts anything — see
+// the header and claimModelCallReservation.
 //
 // `reserved` is strictly "reservations already recorded against this run", so
 // it is null for the two codes where nothing has been reserved yet
@@ -333,23 +351,28 @@ const padBatchIndex = (batchIndex: number): string => {
 /**
  * Builds the generation batch key documented by coverage-plan.v1.json:
  * `<coveragePlanVersion>:<category>:<zero-padded batchIndex>`. Addressing the
- * same batch by the same key is what makes a rerun a no-op and a resume
- * possible.
+ * same batch by the same key is what lets an interrupted or retried run pick the
+ * batch up exactly where it stopped; catalog data stays idempotent through the
+ * pipeline's own upserts (`source_key` for foods, `slug` for recipes), never
+ * through this ledger.
  *
- * `batch_key` is GLOBALLY unique (prisma/schema.prisma), not unique per run, so
+ * `batch_key` is UNIQUE ACROSS THE TABLE (prisma/schema.prisma), not per run, so
  * any other stage sharing this ledger must supply keys that cannot collide with
  * generation's — catalog-validate.ts's advisory review owns its own format, and
  * reserveModelCall deliberately accepts whatever key its caller passes rather
  * than building one, so this function never becomes a bottleneck on that.
  *
- * BECAUSE the key is both globally unique and stable across runs, it cannot be
- * used on its own to address a run's ledger row: a key produced by a second run
- * of the same coverage plan resolves to the row the FIRST run created. Every
- * statement in the ledger below therefore pairs the key with `run_id`, and a
- * key whose row belongs to another run is refused with `batch_run_mismatch`
- * rather than silently charged to that run. Resuming the owning run
- * (checkpoint.ts's openOrResumeRun) is what makes a rerun address these keys
- * again; a genuinely new set of batches needs a new coveragePlanVersion.
+ * BECAUSE the key is both unique and stable across runs, it cannot be used on
+ * its own to address a run's ledger row: a key produced while working the same
+ * coverage plan again resolves to the row the FIRST run created. Every statement
+ * in the ledger below therefore pairs the key with `run_id`, and a key whose row
+ * belongs to another run is refused with `batch_run_mismatch` rather than
+ * silently charged to that run. What makes that refusal actionable is the run
+ * lifecycle: checkpoint.ts's openOrResumeRun resumes an interrupted run, retries
+ * a failed one on the same row (so its batch keys stay addressable and its spent
+ * budget is not forgiven) and reports a succeeded one as already complete
+ * without writing to it. A genuinely new set of batches needs a new
+ * coveragePlanVersion, which yields keys of its own.
  */
 export const batchKeyFor = (coveragePlanVersion: string, category: string, batchIndex: number): string => {
     const index = requireNonNegativeInteger(batchIndex, 'batchIndex');
@@ -462,16 +485,21 @@ const lockRunBudget = async (db: CatalogRunDb, runId: string): Promise<void> => 
 };
 
 // One message for both ledger paths, so a reservation and a usage record cannot
-// describe the same operator mistake in two different ways. It names the key and
-// the run that was refused and states the remedy, because "that key is taken"
-// on its own would leave the operator guessing which run to look at.
-const batchRunMismatchError = (batchKey: string, runId: string): ModelBudgetError =>
+// describe the same operator mistake in two different ways. It names BOTH runs —
+// the one that owns the row and the one that was refused — because "that key is
+// taken" on its own would leave the operator guessing which run to look at, and
+// it states the remedy, which the run lifecycle makes reachable: continuing the
+// owning run is what addresses these keys again (checkpoint.ts's
+// openOrResumeRun resumes a running one, retries a failed one on the same row,
+// and reports a succeeded one as complete), and a genuinely new set of batches
+// needs a new coveragePlanVersion.
+const batchRunMismatchError = (batchKey: string, ownerRunId: string, runId: string): ModelBudgetError =>
     new ModelBudgetError(
         'batch_run_mismatch',
-        `Batch key ${batchKey} is already owned by a different run, so run ${runId} may not reserve or ` +
-            'record against it: batch keys are globally unique and stable across runs. Resume the run that ' +
-            'owns this batch instead of opening a new one, or publish a new coveragePlanVersion so this run ' +
-            'gets batch keys of its own.',
+        `Batch key ${batchKey} belongs to run ${ownerRunId}, so run ${runId} may not reserve or record ` +
+            'against it: batch keys are unique across the ledger and stable across runs. Continue run ' +
+            `${ownerRunId} instead of working this coverage plan under a second run, or publish a new ` +
+            'coveragePlanVersion so this run gets batch keys of its own.',
     );
 
 // Records one reservation against the batch row THIS RUN owns, creating that
@@ -489,9 +517,14 @@ const batchRunMismatchError = (batchKey: string, runId: string): ModelBudgetErro
 //   2. nothing matched -> either no row exists under the key, or one exists
 //      under another run. createMany with skipDuplicates tells the two apart
 //      without reading: inserting 1 row means we created this run's row
-//      (reserved = 1); inserting 0 means the key was taken.
+//      (reserved = 1); inserting 0 means the key was taken. The insert cannot
+//      fail for a missing parent run, because requireOpenRun has already proved
+//      under a row lock that the run exists and is open.
 //   3. still nothing after one retry of the run-bound update -> the row belongs
-//      to another run, which is an operator mistake, not a race, so it throws.
+//      to another run, which is an operator mistake, not a race, so it throws
+//      `batch_run_mismatch` naming the run that owns it. The owner is read on
+//      this failure path only, and `batch_key` being unique means that read
+//      returns the one true owner rather than an arbitrary candidate.
 //
 // The retry between 2 and 3 exists because "the key was taken" can also mean a
 // writer for THIS run created the row in the window between our update and our
@@ -544,7 +577,27 @@ const bindReservationToRun = async (
         return;
     }
 
-    throw batchRunMismatchError(input.batchKey, input.runId);
+    // The key is taken and the row is not ours. Reading the owner here, on the
+    // failure path only, is what turns "that key is taken" into a message an
+    // operator can act on; it is exact rather than a guess, because the key is
+    // unique. A row that has vanished between the skipped insert and this read
+    // means someone deleted the batch or its run mid-flight — nothing has been
+    // reserved and nothing spent, so it is reported as the missing row it is.
+    const owner = await db.catalog_generation_batches.findUnique({
+        where: { batch_key: input.batchKey },
+        select: { run_id: true },
+    });
+
+    if (!owner) {
+        throw new ModelBudgetError(
+            'batch_not_found',
+            `No generation batch row could be found or created for batch key ${input.batchKey}: it was ` +
+                'claimed by another writer and then removed. Nothing was reserved, so the call must not ' +
+                'be made; re-run the stage to reserve again.',
+        );
+    }
+
+    throw batchRunMismatchError(input.batchKey, owner.run_id, input.runId);
 };
 
 // The whole of the reservation decision, in the order that makes the cap a cap.
@@ -572,7 +625,7 @@ const bindReservationToRun = async (
 // two unrelated runs can collide and then merely wait for each other, which is
 // harmless.
 //
-// The locked section is three fast statements and contains NO vendor call — the
+// The locked section is four fast statements and contains NO vendor call — the
 // model call happens after reserveModelCall returns — so a multi-hour import
 // serialises on the ledger and on nothing else.
 const claimModelCallReservation = async (
@@ -588,6 +641,15 @@ const claimModelCallReservation = async (
     limit: number,
 ): Promise<number> => {
     await lockRunBudget(db, input.runId);
+
+    // Before the aggregate, because a cap computed over a run that does not
+    // exist or has already been settled is meaningless, and before the insert,
+    // because the batch row's NOT NULL `run_id` foreign key would otherwise
+    // refuse it as a raw Prisma error instead of the typed CheckpointError an
+    // operator can read (see this module's header and checkpoint.requireOpenRun).
+    // The row lock it takes is held for this transaction, so the run cannot be
+    // deleted or closed between the check and the write.
+    await requireOpenRun(db, input.runId);
 
     const reserved = await getReservedModelCalls(db, input.runId);
 
@@ -627,8 +689,11 @@ const claimModelCallReservation = async (
  * Throws `budget_exhausted` when the run has spent its cap, before any
  * increment and before the vendor call, so the caller's stop reason is a value
  * rather than a surprise bill. Throws `batch_run_mismatch` when the batch key
- * exists under another run, because charging that run's ledger would both
- * corrupt its totals and leave this run's cap unenforced.
+ * belongs to another run, because charging that run's ledger would both corrupt
+ * its totals and leave this run's cap unenforced. Throws checkpoint.ts's
+ * `CheckpointError('run_not_found' | 'run_not_open')` — not a ModelBudgetError —
+ * when the run id does not exist or has already been settled, since run identity
+ * is that module's contract and this one asks it before writing anything.
  */
 export const reserveModelCall = async (
     db: CatalogRunDb,
@@ -748,12 +813,19 @@ export const recordModelCallUsage = async (
     // spent without metering — the one bug this module exists to prevent — so
     // it is surfaced loudly rather than swallowed (§8). The extra read runs on
     // the failure path only (checkpoint.ts's classifyUnwritableRun does the
-    // same) and exists because "no such key" and "that key is another run's"
-    // are different mistakes with different fixes.
+    // same) and exists because "no such key" and "that key is another run's" are
+    // different mistakes with different fixes.
+    //
+    // findUnique on the key alone is exact here rather than approximate:
+    // `batch_key` is UNIQUE across the table, so at most one row can carry it and
+    // the `run_id` this read returns is the one run that reserved the call — the
+    // run the mismatch message tells the operator to record against. A key-only
+    // read would be unsafe to write through, which is why it selects and never
+    // mutates.
     if (recorded.count === 0) {
         const existing = await db.catalog_generation_batches.findUnique({
             where: { batch_key: input.batchKey },
-            select: { id: true },
+            select: { id: true, run_id: true },
         });
 
         if (!existing) {
@@ -764,7 +836,7 @@ export const recordModelCallUsage = async (
             );
         }
 
-        throw batchRunMismatchError(input.batchKey, input.runId);
+        throw batchRunMismatchError(input.batchKey, existing.run_id, input.runId);
     }
 
     // The caller's run id, never the row's: mirroring into whatever run owned

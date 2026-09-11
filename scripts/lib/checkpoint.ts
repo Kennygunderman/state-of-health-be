@@ -118,9 +118,11 @@ export const RUN_STATUS_SUCCEEDED: CatalogRunStatus = 'succeeded';
 // a full audit trail belongs.
 export const RUN_LOG_MAX_ENTRIES = 200;
 
-// Not exported: 'running' is this module's internal lifecycle detail, whereas
-// the two constants above are a contract shared with src/ and the runbook.
+// Not exported: the open and failed statuses are this module's internal
+// lifecycle detail, whereas the two constants above are a contract shared with
+// src/ and the runbook.
 const RUN_STATUS_RUNNING: CatalogRunStatus = 'running';
+const RUN_STATUS_FAILED: CatalogRunStatus = 'failed';
 
 export type CheckpointErrorCode = 'run_not_found' | 'run_not_open' | 'run_already_finished';
 
@@ -180,6 +182,19 @@ export interface CatalogRun<TCursor = unknown> {
     finishedAt: Date | null;
     cursor: TCursor | null;
     counts: Readonly<Record<string, number>>;
+}
+
+// What openOrResumeRun answers. Three booleans' worth of outcome in two flags,
+// because they are not independent: `resumed` covers a run this claim continued
+// (an interrupted one picked up from its cursor, or a failed one retried on the
+// same row), and `alreadyCompleted` is the one outcome in which the caller must
+// NOT work — the stage is settled and nothing was written. Both false means a
+// fresh run. See THE CLAIM for why a completed stage is an outcome at all rather
+// than simply another new run.
+export interface CatalogRunClaim<TCursor = unknown> {
+    run: CatalogRun<TCursor>;
+    resumed: boolean;
+    alreadyCompleted: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +799,13 @@ export const openRun = async <TCursor>(
     return run;
 };
 
+// Only a 'running' row is RESUMABLE, and that is a narrower question than "is
+// there a run for this stage": a row closed as 'failed' or 'succeeded' is not
+// resumable but still OWNS the batch keys it opened, because
+// catalog_generation_batches.batch_key is unique across the table (see the model
+// comment in prisma/schema.prisma). openOrResumeRun therefore consults this
+// function first and the terminal history second — never this function alone —
+// and the reason is spelled out in THE CLAIM below.
 export const findResumableRun = async <TCursor>(
     db: CatalogRunDb,
     input: { kind: CatalogRunKind; manifestVersion: string },
@@ -806,6 +828,94 @@ export const findResumableRun = async <TCursor>(
     return row ? toCatalogRun<TCursor>(row) : null;
 };
 
+// The newest run for this identity WHATEVER its status, which is how the claim
+// sees the terminal history a resumable-only read is blind to. Ordered the same
+// way as findResumableRun, so "newest" means the same thing in both and the
+// newest attempt is what decides.
+const findLatestRun = async <TCursor>(
+    db: CatalogRunDb,
+    input: { kind: CatalogRunKind; manifestVersion: string },
+): Promise<CatalogRun<TCursor> | null> => {
+    const row = await db.catalog_import_runs.findFirst({
+        where: { kind: input.kind, manifest_version: input.manifestVersion },
+        orderBy: { started_at: 'desc' },
+    });
+
+    return row ? toCatalogRun<TCursor>(row) : null;
+};
+
+// Continues a run that was closed as 'failed', instead of opening a second run
+// beside it.
+//
+// WHY A RETRY CONTINUES THE SAME ROW. A failed stage's batch rows survive its
+// closure, and `batch_key` is unique across catalog_generation_batches, so a new
+// run could never reserve a model call under a key the failed run opened —
+// budget.ts would refuse it, correctly, because charging another run's row would
+// leave this run's cap unenforced. Continuing the row is therefore not a
+// convenience: it is the only transition under which a retry can address its own
+// batches at all. It also carries the right budget semantics, which a fresh run
+// would get wrong in the expensive direction: `counts`, `cursor` and the batch
+// ledger are preserved, so the retry picks up at the recorded checkpoint and
+// spends against what is LEFT of CATALOG_MODEL_CALL_BUDGET rather than receiving
+// a second full allowance for money the failed attempt already spent.
+//
+// This is the one transition out of a terminal status, and it is deliberately
+// not part of finishRun: THE TERMINAL-TRANSITION RULE forbids a teardown
+// REWRITING a settled outcome (succeeded becoming failed or the reverse), and
+// nothing here rewrites an outcome — the run is explicitly reopened for a new
+// attempt, under the same row lock, with the previous attempt's failure entry
+// still in `log` and a `run_retried` entry appended beside it. The status
+// predicate on the write is what keeps the two apart: only a stored 'failed' can
+// be reopened, so a concurrent close or a second retry cannot slip through.
+const retryFailedRun = async <TCursor>(
+    db: CatalogRunDb,
+    runId: string,
+    at: Date,
+): Promise<CatalogRun<TCursor>> => {
+    const locked = await lockRunForUpdate(db, runId);
+
+    if (!locked) {
+        throw new CheckpointError('run_not_found', runId);
+    }
+    if (locked.status !== RUN_STATUS_FAILED) {
+        // Cast for the same reason closeRunOnce casts: an unfamiliar stored
+        // status is reported as found rather than normalised away.
+        throw new CheckpointError('run_already_finished', runId, locked.status as CatalogRunStatus);
+    }
+
+    // finished_at goes back to null because the run is open again and that column
+    // is what every reader uses to tell an open run from a settled one —
+    // getActiveReleaseLoad falls back to started_at, and a row that claimed both
+    // 'running' and a finish time would be a contradiction an operator has to
+    // resolve by hand. The log entry is written in the SAME statement as the
+    // status change, exactly as closeRunOnce writes its failure entry, so the
+    // reopening and its record cannot be separated.
+    const log = appendCappedLog(locked.log, sanitizeRunLogEntry({ event: 'run_retried' }, at), RUN_LOG_MAX_ENTRIES);
+
+    const result = await db.catalog_import_runs.updateMany({
+        where: { id: runId, status: RUN_STATUS_FAILED },
+        data: {
+            status: RUN_STATUS_RUNNING,
+            finished_at: null,
+            log: log as Prisma.InputJsonValue,
+        },
+    });
+
+    // Unreachable while this transaction holds the row lock; kept as the
+    // guarantee itself rather than as a comment (see closeRunOnce).
+    if (result.count === 0) {
+        throw new CheckpointError(await classifyUnwritableRun(db, runId), runId);
+    }
+
+    const row = await db.catalog_import_runs.findUnique({ where: { id: runId } });
+
+    if (!row) {
+        throw new CheckpointError('run_not_found', runId);
+    }
+
+    return toCatalogRun<TCursor>(row);
+};
+
 // THE CLAIM. This is the only entry point the four scripts use, and it is an
 // atomic claim rather than a find-then-create: the advisory lock is taken FIRST,
 // so the find and the create are one indivisible step for a given
@@ -813,6 +923,26 @@ export const findResumableRun = async <TCursor>(
 // other caller blocks on the lock, then finds the row the winner committed and
 // resumes it. Without the lock both callers see "nothing resumable" and both
 // create.
+//
+// FOUR OUTCOMES, NOT TWO, AND THE BATCH LEDGER IS WHY. `batch_key` is unique
+// across catalog_generation_batches, so the batches a stage opens belong to that
+// run for good and no later run can reserve a model call under them. A claim
+// that answered "nothing running, so open a fresh row" would therefore hand the
+// operator a run that cannot reserve anything the previous attempt had already
+// opened, and the visible symptom would be a budget error in place of a rerun.
+// The claim consequently looks at the terminal history too:
+//   * a 'running' row            -> resumed, from its own cursor and remaining budget;
+//   * a 'failed' row             -> RETRIED, by continuing that same row (retryFailedRun);
+//   * a 'succeeded' row          -> returned as `alreadyCompleted`, with NO write
+//                                   of any kind, because the work it records is done
+//                                   and its ledger is settled;
+//   * nothing at all             -> a fresh run.
+// `alreadyCompleted` is the caller's signal to stop rather than to work: a stage
+// that ignores it and reserves anyway is refused by budget.ts, which requires an
+// open run (requireOpenRun), so the failure is typed and nothing is spent — but
+// the intended shape is `if (claim.alreadyCompleted) { report and exit 0 }`.
+// Re-running a completed stage is not how new candidates are produced; a new
+// coveragePlanVersion is, and it brings batch keys of its own.
 //
 // WHAT THIS GUARANTEES, PRECISELY, AND WHAT IT DOES NOT.
 //
@@ -855,9 +985,20 @@ export const findResumableRun = async <TCursor>(
 // impossible, which is a different and smaller promise.
 export const openOrResumeRun = async <TCursor>(
     db: CatalogRunDb,
-    input: { kind: CatalogRunKind; manifestVersion: string; initialCursor?: TCursor; logger?: ScriptLogger },
-): Promise<{ run: CatalogRun<TCursor>; resumed: boolean }> => {
-    const claimed = await inRunTransaction(db, async (tx) => {
+    input: {
+        kind: CatalogRunKind;
+        manifestVersion: string;
+        initialCursor?: TCursor;
+        logger?: ScriptLogger;
+        now?: () => Date;
+    },
+): Promise<CatalogRunClaim<TCursor>> => {
+    // Injected and defaulted like appendRunLog's, so the retry entry's timestamp
+    // is testable without freezing the system clock, and read inside the
+    // transaction so it is the moment the reopening is written.
+    const now = input.now ?? ((): Date => new Date());
+
+    const claimed = await inRunTransaction(db, async (tx): Promise<CatalogRunClaim<TCursor>> => {
         await acquireRunClaimLock(tx, input.kind, input.manifestVersion);
 
         const resumable = await findResumableRun<TCursor>(tx, {
@@ -866,7 +1007,25 @@ export const openOrResumeRun = async <TCursor>(
         });
 
         if (resumable) {
-            return { run: resumable, resumed: true };
+            return { run: resumable, resumed: true, alreadyCompleted: false };
+        }
+
+        // Nothing is running, so the terminal history decides — see THE CLAIM.
+        const latest = await findLatestRun<TCursor>(tx, {
+            kind: input.kind,
+            manifestVersion: input.manifestVersion,
+        });
+
+        if (latest?.status === RUN_STATUS_SUCCEEDED) {
+            return { run: latest, resumed: false, alreadyCompleted: true };
+        }
+
+        if (latest) {
+            // Any terminal status other than 'succeeded' is a failed attempt, and
+            // retryFailedRun refuses anything it does not recognise rather than
+            // reopening it blindly.
+            const retried = await retryFailedRun<TCursor>(tx, latest.id, now());
+            return { run: retried, resumed: true, alreadyCompleted: false };
         }
 
         // The logger is deliberately NOT passed down: openRun would print
@@ -880,12 +1039,21 @@ export const openOrResumeRun = async <TCursor>(
             cursor: input.initialCursor,
         });
 
-        return { run, resumed: false };
+        return { run, resumed: false, alreadyCompleted: false };
     });
 
-    if (claimed.resumed) {
-        // The cursor is logged, not just the id: on a resumed run this line is
-        // the operator's only visible answer to "where does it pick up?".
+    // One line per outcome, all after the commit, so nothing printed here can
+    // describe a claim that rolled back.
+    if (claimed.alreadyCompleted) {
+        input.logger?.info('run_already_completed', {
+            runId: claimed.run.id,
+            kind: claimed.run.kind,
+            manifestVersion: claimed.run.manifestVersion,
+            finishedAt: claimed.run.finishedAt,
+        });
+    } else if (claimed.resumed) {
+        // The cursor is logged, not just the id: on a resumed or retried run this
+        // line is the operator's only visible answer to "where does it pick up?".
         input.logger?.info('run_resumed', { runId: claimed.run.id, cursor: claimed.run.cursor });
     } else {
         input.logger?.info('run_opened', {
@@ -896,6 +1064,38 @@ export const openOrResumeRun = async <TCursor>(
     }
 
     return claimed;
+};
+
+// The guard budget.ts takes before it inserts a batch row, and the reason a
+// reservation against a run that does not exist is a typed error rather than a
+// raw Prisma failure.
+//
+// catalog_generation_batches.run_id is a NOT NULL foreign key, so inserting a
+// batch for an unknown run id is refused by PostgreSQL and surfaces as Prisma's
+// P2003 — a vendor error shape neither module may pattern-match (§9) and one no
+// caller can act on. Reading the row first turns that into CheckpointError,
+// which names the run and says whether it is missing or closed; `FOR UPDATE` is
+// what makes the answer durable rather than advisory, because a concurrent
+// DELETE of the parent run must then wait for the caller's transaction and
+// cannot invalidate the check between here and the insert.
+//
+// Requiring the run to be OPEN, not merely to exist, is the other half: a
+// settled run's ledger is finished evidence, and adding a reservation to it
+// would corrupt the record of what that run spent.
+//
+// Callers must be inside a transaction for the lock to mean anything — budget.ts
+// calls this inside the transaction that holds its per-run budget lock.
+export const requireOpenRun = async (db: CatalogRunDb, runId: string): Promise<void> => {
+    assertWellFormedRunId(runId);
+
+    const locked = await lockRunForUpdate(db, runId);
+
+    if (!locked) {
+        throw new CheckpointError('run_not_found', runId);
+    }
+    if (locked.status !== RUN_STATUS_RUNNING) {
+        throw new CheckpointError('run_not_open', runId);
+    }
 };
 
 const writeCursorToRun = async <TCursor>(db: CatalogRunDb, runId: string, cursor: TCursor): Promise<void> => {

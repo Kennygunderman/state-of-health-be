@@ -80,8 +80,11 @@ const CONFIRM_TARGET_FLAG = '--confirm-target';
 // Hosts that can only be this machine or the container network beside it.
 // Exported because src/__tests__/setup/testDb.ts::assertTestDatabase builds its
 // own check on these same rules; duplicating them there would let the two drift.
-// The rules themselves are `isLocalDatabaseHost`, `isTestDatabaseOrigin` and
-// `isShadowDatabaseOrigin` below, which is what that guard should import.
+// The rules themselves are `isLocalDatabaseHost`, `isTestDatabaseName`,
+// `isShadowDatabaseName`, `isTestDatabaseOrigin` and `isShadowDatabaseOrigin`
+// below, which is what that guard should import: the two `…Name` predicates own
+// the database-name half of the rule (including the clone-index form), the two
+// `…Origin` predicates apply the host half on top of them.
 export const LOCAL_HOSTS: readonly string[] = ['localhost', '127.0.0.1', 'postgres'];
 
 // Narrower than LOCAL_HOSTS on purpose. `postgres` is a container-network
@@ -96,6 +99,70 @@ export const TEST_DATABASE_SUFFIX = '_test';
 export const SHADOW_DATABASE_SUFFIX = '_shadow';
 export const DEVELOPMENT_DATABASE_SUFFIX = '_dev';
 export const CI_DATABASE_NAME = 'ci';
+
+// The clone-index tail, and the reason the name rules are patterns rather than
+// `endsWith` calls. An agent clone is provisioned with one database triple of
+// its own — `soh_dev_<index>`, `soh_test_<index>`, `soh_shadow_<index>`, all on
+// the same local host — so on such a machine the mandated test and shadow names
+// carry a numeric index AFTER the suffix and `endsWith(TEST_DATABASE_SUFFIX)` is
+// false for both. Left unrecognised they fell through to the host rule at the
+// end of classifyDatabaseOrigin and classified `development`, the weakest
+// class: `catalog-load`/`recipes-seed` stopped demanding `--confirm-target`
+// before writing catalog data into the clone's TEST database, `seed-dev` became
+// willing to write user-scoped rows there, and the shared test-origin rule that
+// src/__tests__/setup/testDb.ts is specified to import did not recognise the
+// name the operator was told to use.
+//
+// The index is OPTIONAL, which is what makes this additive: every bare Agent
+// Action Plan §0.4.4 name (`soh_test`, `soh_shadow`) still matches, and matches
+// through the same rule and the same reason as before.
+//
+// Both patterns are BUILT FROM the exported suffix constants instead of being
+// re-typed as regex literals, so renaming a constant can never leave the rule
+// and the constant it is named after disagreeing. Interpolating them is safe:
+// each is an underscore followed by lower-case letters, with no
+// regular-expression metacharacter, so each contributes only literal
+// characters to the pattern.
+//
+// Digits only, and a zero-padded index (`soh_test_038`) is accepted too,
+// because the clone identifier is published in both a plain and a zero-padded
+// form; rejecting the padded spelling would reinstate exactly the `development`
+// fall-through these rules close.
+//
+// Neither pattern carries the `g` or `y` flag. They are module-level constants
+// shared by every call, and those flags make `RegExp.prototype.test` advance
+// `lastIndex`, which would let one input classify differently on alternate
+// calls — a guard that is right every other time is not a guard.
+//
+// CLONE_INDEX_TAIL_SOURCE is the tail ALONE, with no `$` folded into it, and the
+// anchor is written where each pattern is built. It is exported for the same
+// reason the suffixes are, so a caller composing its own rule gets the one
+// definition of "a clone index" rather than a second guess at it — and a tail
+// that carried a hidden anchor could only be used at the end of a pattern,
+// which is not what its name promises.
+export const CLONE_INDEX_TAIL_SOURCE = '(?:_[0-9]+)?';
+export const TEST_DATABASE_NAME_PATTERN = new RegExp(`${TEST_DATABASE_SUFFIX}${CLONE_INDEX_TAIL_SOURCE}$`);
+export const SHADOW_DATABASE_NAME_PATTERN = new RegExp(`${SHADOW_DATABASE_SUFFIX}${CLONE_INDEX_TAIL_SOURCE}$`);
+
+// The database-name half of the test rule, with no host in it: a `_test`
+// suffix with or without a clone index, or CI's plainly named database.
+//
+// Exported as part of the same shared surface as the host and suffix constants
+// (see LOCAL_HOSTS above): src/__tests__/setup/testDb.ts::assertTestDatabase
+// accepts exactly the `test` class of this module, so it imports this rather
+// than re-deriving `_test`/`ci` from the constants — and the name half is what
+// that guard checks against its own `DATABASE_URL`.
+//
+// CI_DATABASE_NAME stays an EXACT match on purpose: CI provisions exactly one
+// database, named `ci`, and there is no indexed form of it to accept. Widening
+// it would only add names nothing provisions.
+export const isTestDatabaseName = (database: string): boolean =>
+    TEST_DATABASE_NAME_PATTERN.test(database) || database === CI_DATABASE_NAME;
+
+// The database-name half of the shadow rule. Kept separate from the test one
+// because the two classes are not interchangeable: Prisma resets the shadow
+// database (see isShadowDatabaseOrigin below).
+export const isShadowDatabaseName = (database: string): boolean => SHADOW_DATABASE_NAME_PATTERN.test(database);
 
 // Connection parameters that move the connection somewhere other than the
 // authority and path the URL displays. libpq reads `host`, `hostname`, `port`,
@@ -153,9 +220,13 @@ const REASON_NO_HOST = `${DATABASE_URL_ENV} names no host`;
 // cannot vouch for either.
 const REASON_ENCODED_NAME = `${DATABASE_URL_ENV} database name is percent-encoded`;
 
-const REASON_TEST_SUFFIX = `database name ends in ${TEST_DATABASE_SUFFIX} on a local host`;
+// "with or without a clone index" is in the phrase because the rule accepts
+// both spellings: a reason that claimed the name "ends in _test" would be
+// literally false for `soh_test_38`, and this string is the only account of the
+// decision an operator or a log reader gets.
+const REASON_TEST_SUFFIX = `database name ends in ${TEST_DATABASE_SUFFIX}, with or without a clone index, on a local host`;
 const REASON_CI_NAME = `database name is ${CI_DATABASE_NAME} on a local host`;
-const REASON_SHADOW_SUFFIX = `database name ends in ${SHADOW_DATABASE_SUFFIX} on a local host`;
+const REASON_SHADOW_SUFFIX = `database name ends in ${SHADOW_DATABASE_SUFFIX}, with or without a clone index, on a local host`;
 const REASON_DEVELOPMENT_SUFFIX = `database name ends in ${DEVELOPMENT_DATABASE_SUFFIX}`;
 const REASON_DEVELOPMENT_HOST = 'host is a development host';
 const REASON_NO_RULE_MATCHED =
@@ -305,8 +376,10 @@ export interface DatabaseTarget {
 // module. src/__tests__/setup/testDb.ts::assertTestDatabase is specified
 // (Agent Action Plan §0.7.1) to accept exactly the same origins as the `test`
 // class here, and the comment on LOCAL_HOSTS above already promises that
-// sharing: it imports these instead of re-deriving `_test`/`ci` from the
-// constants, because a second derivation is a second place to get wrong.
+// sharing: it imports these — and `isTestDatabaseName`/`isShadowDatabaseName`,
+// the name half they are composed from — instead of re-deriving
+// `_test`/`_test_<index>`/`ci` from the constants, because a second derivation
+// is a second place to get wrong.
 //
 // Host comparison is on the normalised host parseDatabaseUrl produces;
 // database-name comparison is case-sensitive on purpose — PostgreSQL database
@@ -318,17 +391,19 @@ export const isLocalDatabaseHost = (host: string): boolean => LOCAL_HOSTS.includ
 // convention, not a property of the server, so `…@prod.example.com/app_test`
 // is a production database wearing a test name. Gating both halves of this
 // rule on LOCAL_HOSTS keeps such an origin `unknown`, which every policy —
-// including `any_recognised` — refuses.
+// including `any_recognised` — refuses. The clone-indexed spelling is a naming
+// convention in exactly the same way, so it is gated identically:
+// `…@prod.example.com/app_test_38` stays `unknown` too.
 export const isTestDatabaseOrigin = (target: DatabaseTarget): boolean =>
-    isLocalDatabaseHost(target.host) &&
-    (target.database.endsWith(TEST_DATABASE_SUFFIX) || target.database === CI_DATABASE_NAME);
+    isLocalDatabaseHost(target.host) && isTestDatabaseName(target.database);
 
 // Local-host-gated for the same reason, and more urgently: Prisma's
 // `migrate diff`/`migrate dev --create-only` RESET the shadow database, so a
-// remote database named `…_shadow` classifying as `shadow` would be a remote
-// database this pipeline is willing to have dropped and recreated.
+// remote database named `…_shadow` (or `…_shadow_38`) classifying as `shadow`
+// would be a remote database this pipeline is willing to have dropped and
+// recreated.
 export const isShadowDatabaseOrigin = (target: DatabaseTarget): boolean =>
-    isLocalDatabaseHost(target.host) && target.database.endsWith(SHADOW_DATABASE_SUFFIX);
+    isLocalDatabaseHost(target.host) && isShadowDatabaseName(target.database);
 
 export const classifyDatabaseOrigin = (databaseUrl: string | undefined): DatabaseOrigin => {
     if (!databaseUrl || databaseUrl.trim().length === 0) {
@@ -405,12 +480,26 @@ export const classifyDatabaseOrigin = (databaseUrl: string | undefined): Databas
     if (isTestDatabaseOrigin({ host, database })) {
         // CI's database is named plainly (`ci`), so the two halves of the test
         // rule are distinguished here only to name the matched rule in `reason`.
-        const reason = database.endsWith(TEST_DATABASE_SUFFIX) ? REASON_TEST_SUFFIX : REASON_CI_NAME;
+        // The same pattern the rule matched on is re-applied here rather than an
+        // `endsWith` shortcut: with the clone-index form accepted, `endsWith`
+        // would report `soh_test_38` under REASON_CI_NAME — "database name is ci
+        // on a local host" — which is simply untrue of it, and a reason is the
+        // only account of the decision that reaches a log.
+        const reason = TEST_DATABASE_NAME_PATTERN.test(database) ? REASON_TEST_SUFFIX : REASON_CI_NAME;
         return { originClass: 'test', host, database, reason };
     }
     if (isShadowDatabaseOrigin({ host, database })) {
         return { originClass: 'shadow', host, database, reason: REASON_SHADOW_SUFFIX };
     }
+    // Deliberately NOT widened to `_dev_<index>`, and the asymmetry with the two
+    // rules above is load-bearing rather than an oversight to tidy up: this is
+    // the one name rule that is not gated on a local host, so accepting an
+    // indexed form here would newly certify a REMOTE `…_dev_7` database as
+    // `development` — the class `seed-dev` writes user-scoped rows into with no
+    // confirmation door. That is a weakening, and nothing needs it: a clone's
+    // `soh_dev_<index>` is provisioned on 127.0.0.1, so it already reaches
+    // `development` through the host rule below, which is the other half of the
+    // §0.7.1 disjunction.
     if (database.endsWith(DEVELOPMENT_DATABASE_SUFFIX)) {
         return { originClass: 'development', host, database, reason: REASON_DEVELOPMENT_SUFFIX };
     }

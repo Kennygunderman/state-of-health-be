@@ -71,8 +71,9 @@ const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}
 
 // logCatalogMealEntry stamps the input method server-side whatever the body
 // says, so the parser normalizes to it rather than carrying forward a client
-// value that will not be honoured.
-const CATALOG_INPUT_METHOD = 'search';
+// value that will not be honoured. Typed from the payload so the DTO stays the
+// one place the accepted value is declared.
+const CATALOG_INPUT_METHOD: LogCatalogMealEntryPayload['inputMethod'] = 'search';
 
 const CATALOG_FIELD_MESSAGES: Record<string, string> = {
     catalogFoodId: 'catalogFoodId must be a v4 UUID',

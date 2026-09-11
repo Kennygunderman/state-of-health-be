@@ -80,7 +80,10 @@ export interface LogCatalogMealEntryPayload {
     // Accepted only when it matches one of that food's stored portion
     // descriptions; omitted falls back to the default portion's description.
     servingText?: string;
-    inputMethod: string; // 'search' — stamped server-side whatever the body says
+    // The only accepted and stored method, and what reaches
+    // meal_entries.input_method. A divergent or absent body value is not
+    // rejected: parseLogEntryBody discards it and stamps 'search'.
+    inputMethod: 'search';
 }
 
 export interface UpdateMealEntryPayload {
