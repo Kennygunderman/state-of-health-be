@@ -57,14 +57,40 @@ const UNSERIALIZABLE = '[unserializable]';
 // widening the pattern.
 const SCRUB_RULES: Array<{ pattern: RegExp; replacement: string }> = [
     { pattern: /-----BEGIN[\s\S]*?-----END[^-\n]*-----/g, replacement: REDACTED },
-    { pattern: /([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, replacement: `$1${REDACTED}@` },
+    // The scheme body is BOUNDED, and that bound is a security property rather
+    // than a tidiness choice. Written `*`, this pattern rescans to the end of
+    // the string from every offset inside a long run of scheme-legal characters
+    // looking for a `://` that never arrives: measured here, a 200,000-character
+    // run of `A-KEY-` took 19,758 ms and one of `A-KEY` 23,420 ms, so a vendor
+    // error body — caller-supplied input this module is expected to survive —
+    // could stall the pipeline inside its own logger. The longest registered URI
+    // scheme is about 20 characters, so 40 leaves room for an unregistered one
+    // and still measures 34 ms on the same input with `postgresql://user:pass@`
+    // and a 300-character URL password both still redacted. Do not unbound it.
+    { pattern: /([a-z][a-z0-9+.-]{0,40}:\/\/)[^/\s@]+@/gi, replacement: `$1${REDACTED}@` },
     { pattern: /bearer\s+[^\s"',;)\]}]+/gi, replacement: `Bearer ${REDACTED}` },
     // The parameter name is kept (it is useful in a log) and only its value is
     // lost. Longest alternatives come first so `access_token` is not split by
     // `token`, and the `\b` branch keeps `pageSize=20` and `monkey=1` intact.
+    //
+    // `_` and `-` are lead-in characters beside `?&;` because `_` is itself a
+    // word character: with `\b` alone there is no boundary between `USDA_` and
+    // `API_KEY`, so the env-file shape every credential-bearing name in
+    // .env.example has — `USDA_API_KEY=`, `OPENROUTER_API_KEY=`,
+    // `FIREBASE_SERVICE_ACCOUNT=` — never tripped this rule and was printed, and
+    // persisted by checkpoint.ts into `catalog_import_runs.log`, verbatim.
+    //
+    // Both quantifiers around the name are bounded for the same reason the URL
+    // rule above is. A lead-in written as the prefix loop `(?:[A-Za-z0-9]+[_-])*`
+    // measured 20,541 ms on `'api_key_'.repeat(25000)`, and relaxing the
+    // trailing-segment loop to `{0,32}` measured 19,900 ms; the forms below stay
+    // in single-digit milliseconds on those inputs. The trailing loop is what
+    // recognises a suffixed name (`API_KEY_ID`, `SERVICE_ACCOUNT_JSON`), and four
+    // segments is more than any name this pipeline configures.
     {
-        pattern: /([?&;]|\b)(access_token|api_key|apikey|password|signature|secret|token|auth|key)=[^&\s#"']*/gi,
-        replacement: `$1$2=${REDACTED}`,
+        pattern:
+            /([?&;_-]|\b)((?:access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|private[_-]?key|client[_-]?secret|service[_-]?account|authorization|credentials?|password|passwd|signature|secret|token|auth|bearer|key)(?:[_-][A-Za-z0-9]{1,32}){0,4}[_-]?)(\s*=\s*)[^&\s#"']*/gi,
+        replacement: `$1$2$3${REDACTED}`,
     },
     { pattern: /[A-Za-z0-9+/]{40,}={0,2}/g, replacement: REDACTED },
 ];
@@ -76,6 +102,95 @@ export const scrubSecrets = (value: string): string => {
         return '';
     }
     return SCRUB_RULES.reduce((scrubbed, rule) => scrubbed.replace(rule.pattern, rule.replacement), value);
+};
+
+// THE KEY-NAME HALF OF THE SECURITY CONTRACT.
+//
+// SCRUB_RULES can only see the string it is handed. It recognises
+// `password=hunter2` inside a value, but a bare `hunter2` stored under a field
+// called `password` carries no pattern at all, and the name is the only signal
+// there is. This vocabulary is that signal, and it lives here — beside the
+// patterns — so the pipeline keeps exactly ONE definition of "what is a
+// secret": checkpoint.ts imports it for the persisted run log, which means an
+// operator's terminal and the `catalog_import_runs.log` column can no longer
+// disagree about the same payload. They did disagree while the list lived only
+// in checkpoint.ts, and the terminal was the permissive side of the two.
+//
+// Matched as whole WORDS after a camelCase/snake_case split, never as
+// substrings: that is what keeps `author` and `authored_by` out of the
+// credential set while still catching `authHeader`, and what makes
+// `dbPassword`, `db_password` and `DB-PASSWORD` one case rather than three.
+const SECRET_BEARING_KEY_WORDS: ReadonlySet<string> = new Set([
+    'password',
+    'passwd',
+    'secret',
+    'token',
+    'credential',
+    'credentials',
+    'signature',
+    'authorization',
+    'auth',
+    'bearer',
+]);
+
+// The bare word `key` is DELIBERATELY ABSENT above, and that exclusion is worth
+// defending against a future edit that "completes" the list: this pipeline's
+// diagnostics legitimately record `batchKey`, `sourceKey` and `manifestKey`, and
+// a resume key is the one field that explains where an interrupted run stopped
+// — redacting it would cost an operator the reason to read the log at all.
+// `tokensUsed` survives for the related reason that word matching gives
+// `['tokens', 'used']`, and `tokens` is not `token`.
+//
+// Names that only read as a credential once their words are joined are
+// therefore matched as PHRASES against the key with its separators removed,
+// since splitting `apiKey` or `x-api-key` into words would produce the excluded
+// `key` again. `serviceaccount` is in the list for FIREBASE_SERVICE_ACCOUNT.
+const SECRET_BEARING_KEY_PHRASES: readonly string[] = [
+    'apikey',
+    'accesstoken',
+    'refreshtoken',
+    'idtoken',
+    'privatekey',
+    'clientsecret',
+    'serviceaccount',
+];
+
+// One split shared by the word check and, in its collapsed form, the phrase
+// check, so the two halves cannot drift apart.
+const secretKeyWordsOf = (key: string): string[] =>
+    key
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .split(/[^A-Za-z0-9]+/)
+        .filter((word) => word.length > 0)
+        .map((word) => word.toLowerCase());
+
+/**
+ * Whether a field NAME declares its value to be a credential — as opposed to a
+ * string that might happen to contain one, which is SCRUB_RULES' job.
+ *
+ * Exported because both redaction paths in this pipeline have to answer the
+ * question identically: `sanitizeLogFields` below asks it of every object key on
+ * its way to a terminal line, and checkpoint.ts's `sanitizeRunLogEntry` asks it
+ * of every key on its way into the `log` JSONB column. A caller that stores or
+ * prints caller-supplied structures elsewhere asks it too, rather than
+ * reinventing the vocabulary.
+ *
+ * `isSecretBearingKey('dbPassword')` and `isSecretBearingKey('x-api-key')` are
+ * both true; `isSecretBearingKey('batchKey')`, `'sourceKey'`, `'tokensUsed'` and
+ * `'authored_by'` are all false, deliberately (see the two lists above).
+ */
+export const isSecretBearingKey = (key: string): boolean => {
+    // Guarded rather than trusted, like scrubSecrets above: this runs on keys
+    // taken from decoded vendor JSON, where a runtime value can disagree with
+    // its declared type, and a non-string here must not throw on a log path.
+    if (typeof key !== 'string') {
+        return false;
+    }
+    const collapsed = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (SECRET_BEARING_KEY_PHRASES.some((phrase) => collapsed.includes(phrase))) {
+        return true;
+    }
+    return secretKeyWordsOf(key).some((word) => SECRET_BEARING_KEY_WORDS.has(word));
 };
 
 // The sanctioned way to render a thrown value (§8). `name` survives so the
@@ -155,7 +270,16 @@ const sanitizeValue = (value: unknown, depth: number, seen: Set<object>): unknow
         const record = container as Record<string, unknown>;
         const output: Record<string, unknown> = {};
         for (const key of Object.keys(record)) {
-            output[scrubSecrets(key)] = sanitizeValue(record[key], depth + 1, seen);
+            // Redaction by key name is decided on the RAW key and happens BEFORE
+            // any recursion, for two reasons. A credential nested under
+            // `credentials: {...}` must not be recursed into and partially
+            // preserved — the whole subtree is the secret. And the key is tested
+            // before scrubbing precisely because scrubbing can rewrite it: check
+            // raw, write scrubbed, which is the ordering checkpoint.ts's
+            // persisted path already used and the reason the two agree now.
+            output[scrubSecrets(key)] = isSecretBearingKey(key)
+                ? REDACTED
+                : sanitizeValue(record[key], depth + 1, seen);
         }
         return output;
     } catch {
@@ -185,10 +309,12 @@ const sanitizeFields = (fields?: LogFields): Record<string, unknown> => {
  * scrubbing has to happen before the value is stored rather than printed.
  *
  * Identical behaviour to what every log line already goes through: every string
- * value and every key scrubbed by SCRUB_RULES, Errors normalized through
- * `safeError`, BigInt and Date rendered, functions/symbols and anything deeper
- * than MAX_FIELD_DEPTH replaced with `[unserializable]`, cycles broken, and a
- * throwing getter contained. A non-object argument yields `{}`.
+ * value and every key scrubbed by SCRUB_RULES, every value whose key
+ * `isSecretBearingKey` recognises replaced outright without being recursed into,
+ * Errors normalized through `safeError`, BigInt and Date rendered,
+ * functions/symbols and anything deeper than MAX_FIELD_DEPTH replaced with
+ * `[unserializable]`, cycles broken, and a throwing getter contained. A
+ * non-object argument yields `{}`.
  */
 export const sanitizeLogFields = (fields?: LogFields): Record<string, unknown> => sanitizeFields(fields);
 

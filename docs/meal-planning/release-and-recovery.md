@@ -119,10 +119,24 @@ partial load is repaired by re-running it.
 
 Removing the schema is not part of rollback and should not be done to recover
 from an application fault — the tables are inert while both gates are closed.
-If a database must genuinely be returned to the pre-feature schema, take a fresh
-backup first and drop the sixteen tables and the four `meal_entries` columns in
-dependency order in a reviewed maintenance window; `prisma migrate resolve
---rolled-back 20260908000000_meal_planning` then clears the ledger entry.
+If a database must genuinely be returned to the pre-feature schema, that is a
+reviewed maintenance window of its own: take a fresh backup, confirm it restores,
+then run the reference removal script
+`prisma/manual-migrations/meal-planning/001_meal_planning.down.sql`, which drops
+the sixteen tables, the four `meal_entries` columns and the three indexes on that
+table in dependency order. Diary history is kept — the columns are nullable
+links, so planned and catalog-logged entries are detached rather than deleted —
+while everything the dropped tables held is destroyed.
+
+Afterwards, `_prisma_migrations` still records `20260908000000_meal_planning` as
+applied, so `migrate deploy` would report nothing pending and leave the database
+without the schema. Delete that single ledger row
+(`DELETE FROM _prisma_migrations WHERE migration_name =
+'20260908000000_meal_planning';`) and `npx prisma migrate deploy` re-applies the
+migration whenever the feature is wanted back. `prisma migrate resolve
+--rolled-back` is not the step here: Prisma 6 accepts it only for a migration in
+a failed state and returns `P3012` for one that applied cleanly. That folder's
+README carries the full procedure.
 
 ## Schema drift
 

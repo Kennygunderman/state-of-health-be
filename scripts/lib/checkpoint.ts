@@ -51,14 +51,20 @@
 // prisma/schema.prisma before this file typechecks — a fresh checkout has no
 // src/generated/prisma directory at all.
 
-// hostOf, safeError and scrubSecrets are logger.ts's exported redaction
-// primitives. They are IMPORTED rather than re-implemented so the pipeline has
-// exactly one definition of "what is a secret": adding a credential-bearing
-// variable to .env.example means adding a rule there, and this module then
-// enforces it on persisted state too. logger.ts's own recursive sanitizer is
-// private and shapes a terminal line, so the recursion for a stored JSONB entry
-// lives here (see sanitizeRunLogEntry) and is built on those three exports.
-import { hostOf, safeError, scrubSecrets, ScriptLogger } from './logger';
+// hostOf, isSecretBearingKey, safeError and scrubSecrets are logger.ts's
+// exported redaction primitives. They are IMPORTED rather than re-implemented so
+// the pipeline has exactly one definition of "what is a secret": adding a
+// credential-bearing variable to .env.example means adding a rule (or a key
+// name) there, and this module then enforces it on persisted state too.
+// isSecretBearingKey in particular used to live only here, which is how the
+// terminal and this column came to enforce two different contracts for one
+// payload: a bare secret under `password` was replaced on its way into this
+// column and printed verbatim on its way to an operator's screen, so the
+// terminal showed what the database deliberately never stored. It is defined
+// once now. logger.ts's own recursive sanitizer is private and shapes a terminal
+// line, so the recursion for a stored JSONB entry lives here (see
+// sanitizeRunLogEntry) and is built on those four exports.
+import { hostOf, isSecretBearingKey, safeError, scrubSecrets, ScriptLogger } from './logger';
 
 // Types only. Rule §12 forbids editing or reviewing src/generated/prisma, not
 // importing from it — this is the same module src/prisma/client.ts imports. The
@@ -276,13 +282,38 @@ export const mergeCounts = (existing: unknown, delta: Record<string, number>): R
 
 // Appends one entry and keeps the MOST RECENT `maxEntries` (see
 // RUN_LOG_MAX_ENTRIES for why a cap exists at all).
+//
+// The cap arrives from a caller, so each of the four shapes it can have is given
+// an explicit meaning instead of collapsing into one. The reading of each, and
+// why it is that:
+//   * A FINITE POSITIVE cap keeps the newest `floor(cap)` entries INCLUDING the
+//     one just appended, which is the production case — `1` therefore yields the
+//     new entry alone.
+//   * A NON-FINITE POSITIVE cap (`Infinity`) means UNBOUNDED: every retained
+//     entry plus the new one. It used to return `[]`, because
+//     `Number.isFinite(Infinity)` is false and the fallback collapsed the limit
+//     to 0 — so asking for "no limit" destroyed the entire run log and the entry
+//     being written, the exact opposite of what was asked for.
+//   * ZERO OR NEGATIVE, `-Infinity` included, keeps the documented total
+//     discard. A caller asking for room for nothing gets nothing, and that is a
+//     coherent request rather than a mistake to second-guess.
+//   * NOT A NUMBER AT ALL, `NaN` included, has no defensible reading, so it
+//     falls back to RUN_LOG_MAX_ENTRIES rather than losing the log over it. The
+//     declared type does not bind a JavaScript caller, and this function runs
+//     inside the statement that records a run's progress — the stored log is the
+//     only account of what the run did, so the safe failure is to keep it capped
+//     at the module's own default, never to empty it.
 export const appendCappedLog = (
     existing: unknown,
     entry: Record<string, unknown>,
     maxEntries: number,
 ): Record<string, unknown>[] => {
-    const limit = Number.isFinite(maxEntries) ? Math.floor(maxEntries) : 0;
-    if (limit < 1) {
+    // Resolved first so every branch below reasons about a cap already known to
+    // be a number; `Number.isNaN` rather than a comparison because NaN fails
+    // both `< 1` and `>= 1` and would otherwise fall through to the slice.
+    const requested = typeof maxEntries === 'number' && !Number.isNaN(maxEntries) ? maxEntries : RUN_LOG_MAX_ENTRIES;
+
+    if (requested < 1) {
         // Array.prototype.slice(-0) returns the WHOLE array rather than none of
         // it, so a zero or negative cap has to short-circuit here instead of
         // falling through to the slice below.
@@ -295,9 +326,16 @@ export const appendCappedLog = (
     const entries = previous.filter(isPlainRecord);
     entries.push(isPlainRecord(entry) ? entry : {});
 
+    if (!Number.isFinite(requested)) {
+        // Unbounded, and returned before the slice because `slice(-Infinity)` is
+        // a `NaN` offset that silently yields the whole array for the wrong
+        // reason — this branch says what it means.
+        return entries;
+    }
+
     // Negative slice keeps the tail, which is the newest end — entries are always
     // appended.
-    return entries.slice(-limit);
+    return entries.slice(-Math.floor(requested));
 };
 
 // THE STORAGE SECURITY CONTRACT OF THE RUN LOG.
@@ -319,7 +357,10 @@ export const appendCappedLog = (
 //   * A value whose KEY NAMES a credential is replaced outright. scrubSecrets
 //     recognises `password=hunter2` inside a string but cannot know that a bare
 //     `hunter2` stored under a key called `password` is the same secret, so for
-//     those names the key is the only signal there is (RUN_LOG_SECRET_WORDS).
+//     those names the key is the only signal there is. That vocabulary is
+//     logger.ts's isSecretBearingKey — one definition shared with the terminal
+//     path, not a second list maintained here (see the note above
+//     truncateForStorage for the two exclusions it turns on).
 //   * An Error becomes safeError's {name, message}: never the object, never the
 //     stack, never a `cause` (§8).
 //   * Anything URL-shaped is reduced to its HOST. Evidence URLs are
@@ -394,51 +435,18 @@ const RUN_LOG_URL_KEYS = new Set([
 // eagerly costs a diagnostic its path; matching too narrowly stores a secret.
 const ABSOLUTE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
 
-// Field names whose VALUE is a credential, not a string that might contain one.
-// The vocabulary starts from logger.ts's own SCRUB_RULES parameter list and
-// differs from it in three deliberate ways. Words a field name uses but a query
-// parameter does not are added (`passwd`, `credential`, `credentials`,
-// `authorization`, `bearer`). The bare word `key` is EXCLUDED, because this
-// pipeline's diagnostics legitimately record `batchKey`, `sourceKey` and
-// `manifestKey`, and redacting a resume key would cost an operator the one field
-// that explains where a run stopped. And multi-word names that only read as a
-// credential when joined (`apiKey`, `x-api-key`, `accessToken`) are matched as
-// PHRASES against the key with its separators removed, since splitting them into
-// words would produce the excluded `key` again.
-const RUN_LOG_SECRET_WORDS = new Set([
-    'password',
-    'passwd',
-    'secret',
-    'token',
-    'credential',
-    'credentials',
-    'signature',
-    'authorization',
-    'auth',
-    'bearer',
-]);
-
-const RUN_LOG_SECRET_PHRASES = ['apikey', 'accesstoken', 'refreshtoken', 'idtoken', 'privatekey', 'clientsecret'];
-
-// camelCase and snake_case both split into words, so `dbPassword`, `db_password`
-// and `DB-PASSWORD` are one case rather than three. Word matching — not
-// substring matching — is what keeps `author` and `authored_by` out of the
-// credential set while still catching `authHeader`.
-const runLogKeyWords = (key: string): string[] =>
-    key
-        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-        .split(/[^A-Za-z0-9]+/)
-        .filter((word) => word.length > 0)
-        .map((word) => word.toLowerCase());
-
-const isSecretBearingKey = (key: string): boolean => {
-    const collapsed = key.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (RUN_LOG_SECRET_PHRASES.some((phrase) => collapsed.includes(phrase))) {
-        return true;
-    }
-    return runLogKeyWords(key).some((word) => RUN_LOG_SECRET_WORDS.has(word));
-};
-
+// Field names whose VALUE is a credential, not a string that might contain one,
+// are recognised by logger.ts's `isSecretBearingKey` — IMPORTED for the same
+// reason scrubSecrets is, so the terminal and this column cannot disagree about
+// the same payload. Two properties of that vocabulary are load-bearing HERE and
+// are recorded here so a future edit to it meets the reason before the list. The
+// bare word `key` is EXCLUDED, because this pipeline's diagnostics legitimately
+// record `batchKey`, `sourceKey` and `manifestKey`, and redacting a resume key
+// would cost an operator the one field that explains where a run stopped. And
+// multi-word names that only read as a credential when joined (`apiKey`,
+// `x-api-key`, `accessToken`) are matched as PHRASES against the key with its
+// separators removed, since splitting them into words would produce the excluded
+// `key` again.
 const truncateForStorage = (value: string): string =>
     value.length > RUN_LOG_MAX_STRING_CHARS
         ? `${value.slice(0, RUN_LOG_MAX_STRING_CHARS)}${RUN_LOG_TRUNCATED}`

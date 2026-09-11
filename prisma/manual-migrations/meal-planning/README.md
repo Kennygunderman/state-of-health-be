@@ -7,6 +7,7 @@ points at it, and Prisma only ever looks at `prisma/migrations`.
 | File | What it is |
 | --- | --- |
 | `001_meal_planning.sql` | The idempotent copy of `prisma/migrations/20260908000000_meal_planning/migration.sql` — the same DDL, statement for statement, with `IF NOT EXISTS` on tables, columns and indexes and one table-scoped `DO $$` guard per foreign key. |
+| `001_meal_planning.down.sql` | The inverse of that file, for the one case below where removal is genuinely required. Reference only: it is part of no deploy and no rollback. |
 
 ## Which ledger actually runs
 
@@ -41,6 +42,47 @@ Re-running the file on a database that already has the schema is a no-op. It is
 **not** a repair tool for a half-applied schema: `CREATE TABLE IF NOT EXISTS`
 will not add a missing column, and it will not add a missing `NOT NULL` to a
 column that already exists. Restore from a backup instead.
+
+## Removing the schema — `001_meal_planning.down.sql`
+
+**Rolling the backend back does not need this file.** Everything the migration
+adds is additive and inert once the two feature gates are closed, so redeploying
+an earlier commit leaves it in place; that is the documented rollback
+(`docs/meal-planning/release-and-recovery.md`). The down file exists for the
+separate case where a database must genuinely be returned to the pre-feature
+schema, so that removal is a reviewed procedure rather than DDL improvised
+under pressure. Take a backup you have confirmed restores, stop the API or close
+both gates, then:
+
+```bash
+pg_dump --format=custom "$DATABASE_URL" > pre-removal.dump
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
+```
+
+It drops the sixteen tables, the four columns the feature added to
+`meal_entries` and the three indexes it added to that table, in an order that
+needs no `CASCADE`. Diary history survives: those columns are nullable links, so
+planned and catalog-logged entries are **detached, not deleted** — each keeps its
+name, servings and macro snapshot and simply loses its provenance caption. Every
+statement is guarded, so re-running it is a no-op. Everything held in the tables
+themselves — plans, grocery state, preferences, recipes and the whole catalog —
+is gone with them, which is what the backup is for.
+
+Then reconcile the ledger. `_prisma_migrations` still records the migration as
+applied, so `prisma migrate deploy` would report nothing pending and leave the
+database without the schema. Remove that one row and re-apply normally:
+
+```bash
+psql "$DATABASE_URL" -c "DELETE FROM _prisma_migrations WHERE migration_name = '20260908000000_meal_planning';"
+npx prisma migrate deploy   # re-applies the migration when you want the feature back
+```
+
+`npx prisma migrate resolve --rolled-back 20260908000000_meal_planning` does
+**not** work here and is not the step to use: Prisma 6 accepts `--rolled-back`
+only for a migration in a *failed* state and answers `P3012 … cannot be rolled
+back because it is not in a failed state` for one that applied cleanly
+(reproduced against Prisma 6.9.0). Deleting the row is the reconciliation, and
+`migrate deploy` is the way back.
 
 ## Three constructs that are not Prisma's output
 

@@ -152,6 +152,71 @@ export interface UsdaRateLimiterOptions {
 }
 
 /**
+ * What an environment value turned out to be when read as a decimal integer.
+ * On `not_decimal`, `reads` is whatever `Number()` made of it — `NaN` or an
+ * infinity when it could not be coerced at all.
+ */
+type DecimalIntegerRead =
+    | { kind: 'ok'; value: number }
+    | { kind: 'not_decimal'; reads: number }
+    | { kind: 'not_exact'; digits: number };
+
+/**
+ * Reads an environment value as a decimal integer, or reports why it is not
+ * one. Bounds are the caller's business; this decides only whether a number was
+ * written at all, and whether the one written is the one that would be enforced.
+ *
+ * `Number()` implements the JavaScript numeric-literal grammar, not a decimal
+ * reader, so on its own it accepts forms no operator means by a count: `0x10`
+ * becomes 16, `1e3` becomes 1000, `+7` becomes 7, `8.` becomes 8, and because
+ * `String.prototype.trim` removes U+00A0 a non-breaking space pasted before a
+ * digit disappears silently. Each of those would be enforced as a rate nobody
+ * asked for — `1e3` in particular lands on the vendor's full 1,000/hour, wiping
+ * out the headroom this module exists to protect. `Number()` also rounds:
+ * `Number('9007199254740993')` is 9007199254740992, which passes
+ * `Number.isInteger` and every range check while no longer being the value that
+ * was typed. So the digits are checked before the number is believed, and a
+ * magnitude that cannot be represented exactly is refused rather than rounded.
+ *
+ * `budget.ts` reads `CATALOG_MODEL_CALL_BUDGET` and `CATALOG_BATCH_SIZE` under
+ * this same rule. The rule is stated once per module rather than shared from a
+ * third file because each module maps the outcome onto its own error class, and
+ * neither may import the other: this one touches no database, and that one
+ * never calls a vendor.
+ */
+const readDecimalInteger = (raw: string): DecimalIntegerRead => {
+    // Only ASCII whitespace is stripped, deliberately NOT `String.trim()`:
+    // trim also removes U+00A0, U+FEFF and the other Unicode space
+    // separators, so a non-breaking space or a byte-order mark pasted in front
+    // of a digit would vanish here and the value would be accepted as though it
+    // had been typed cleanly. An invisible character in a .env line is exactly
+    // what to fail loudly on — it survives later edits, defeats a grep for the
+    // value, and any other reader of the same file (a shell `export`, a
+    // compose file, a secrets manager) may well disagree about it.
+    const trimmed = raw.replace(/^[ \t\n\r\v\f]+/, '').replace(/[ \t\n\r\v\f]+$/, '');
+
+    if (!/^[0-9]+$/.test(trimmed)) {
+        // What `Number()` would have made of it is the useful half of the
+        // report — it is the rate the run would otherwise have enforced —
+        // whereas the raw string is never echoed: a misplaced paste can put a
+        // credential on a line that reaches terminals, CI logs and committed
+        // reports.
+        return { kind: 'not_decimal', reads: Number(trimmed) };
+    }
+
+    const value = Number(trimmed);
+    if (!Number.isSafeInteger(value)) {
+        // Digits only by now, so the only way here is a magnitude past
+        // 2^53-1, where the nearest representable double is a different
+        // number. The digit count says how far out of range it is without
+        // echoing either the raw text or the misleading rounded value.
+        return { kind: 'not_exact', digits: trimmed.replace(/^0+(?=[0-9])/, '').length };
+    }
+
+    return { kind: 'ok', value };
+};
+
+/**
  * Resolves the importer's hourly rate — the only place
  * `USDA_IMPORT_RATE_LIMIT_PER_HOUR` is read.
  *
@@ -168,21 +233,42 @@ export const getUsdaImportRateLimitPerHour = (env: NodeJS.ProcessEnv = process.e
         return DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR;
     }
 
-    const parsed = Number(raw.trim());
-    if (!Number.isInteger(parsed) || parsed <= 0 || parsed > USDA_VENDOR_CAP_PER_HOUR) {
-        // The parsed number is safe to echo; the raw string is not. A
-        // misplaced paste can put a credential on this line, and this message
-        // reaches terminals, CI logs and committed reports.
-        const observed = Number.isFinite(parsed) ? `${parsed}` : 'not a number';
+    const read = readDecimalInteger(raw);
+
+    if (read.kind === 'not_decimal') {
+        // The number `Number()` would have produced is safe to echo; the raw
+        // string is not, for the reason given on `readDecimalInteger`.
+        const observed = Number.isFinite(read.reads) ? `${read.reads}` : 'not a number';
         throw new RateLimitConfigError(
-            `${RATE_LIMIT_ENV_VAR} must be an integer between 1 and ${USDA_VENDOR_CAP_PER_HOUR} (got ${observed})`,
-            Number.isFinite(parsed) ? parsed : null,
+            `${RATE_LIMIT_ENV_VAR} must be decimal digits only, with no sign, decimal point, exponent or hex prefix (got ${observed})`,
+            Number.isFinite(read.reads) ? read.reads : null,
             null,
             USDA_VENDOR_CAP_PER_HOUR,
         );
     }
 
-    return parsed;
+    if (read.kind === 'not_exact') {
+        // No `requestsPerHour` travels on this one: every candidate value is
+        // either the raw text or the rounded number, and reporting the rounded
+        // number is the specific dishonesty this rejection exists to prevent.
+        throw new RateLimitConfigError(
+            `${RATE_LIMIT_ENV_VAR} is too large to be read exactly: ${read.digits} digits exceeds the largest safe integer ${Number.MAX_SAFE_INTEGER}`,
+            null,
+            null,
+            USDA_VENDOR_CAP_PER_HOUR,
+        );
+    }
+
+    if (read.value <= 0 || read.value > USDA_VENDOR_CAP_PER_HOUR) {
+        throw new RateLimitConfigError(
+            `${RATE_LIMIT_ENV_VAR} must be an integer between 1 and ${USDA_VENDOR_CAP_PER_HOUR} (got ${read.value})`,
+            read.value,
+            null,
+            USDA_VENDOR_CAP_PER_HOUR,
+        );
+    }
+
+    return read.value;
 };
 
 /**
@@ -338,17 +424,40 @@ export const recordAttemptWindow = (
     return pruneAttemptWindow([...stamps, stampedMs], stampedMs, windowMs);
 };
 
+/**
+ * Reduces a hostname to the one form host comparisons are made in: lower case,
+ * with the DNS root's trailing dot removed.
+ *
+ * `api.nal.usda.gov.` is the fully qualified spelling of `api.nal.usda.gov` —
+ * it resolves to the same addresses and reaches the same vendor — but WHATWG
+ * `URL` keeps the dot in `hostname`, and `hostOf` only lower-cases. Comparing
+ * the raw hostname therefore reads the FQDN form as a different host, and an
+ * unrecognised host is not paced: the request would go to USDA spending none of
+ * this limiter's allowance, against a key whose 1,000/hour the running API
+ * shares. Exactly one dot is stripped, because `api.nal.usda.gov..` is not a
+ * resolvable name and must keep failing the match rather than be repaired into
+ * one.
+ *
+ * This is the same rule `dbGuard.ts` applies to `DATABASE_URL`
+ * (`hostname.toLowerCase().replace(/\.$/, '')`), and the two must agree: a host
+ * that one module treats as USDA and the other as unrecognised is the gap this
+ * closes.
+ */
+const canonicalHostname = (hostname: string): string => hostname.toLowerCase().replace(/\.$/, '');
+
 // `hostOf` reduces a URL to its hostname but answers 'invalid-url' for a bare
 // hostname, so which form arrived has to be decided first. Both are accepted
 // because `usda.service.ts` reads `USDA_BASE_URL`, and a caller wiring the
 // limiter to a mock server would naturally pass that base URL straight through.
+// Both branches canonicalise, so a configured host, a configured base URL and
+// an outgoing request URL are all compared in the same form.
 const normalizeHost = (host: string): string => {
     const trimmed = host.trim();
     if (!trimmed.includes('://')) {
-        return trimmed.toLowerCase();
+        return canonicalHostname(trimmed);
     }
     const parsed = hostOf(trimmed);
-    return parsed === 'invalid-url' ? '' : parsed;
+    return parsed === 'invalid-url' ? '' : canonicalHostname(parsed);
 };
 
 // `fetch` accepts a string, a URL or a Request. The `url`/`href` duck-typing
@@ -388,7 +497,7 @@ export const isUsdaRequestUrl = (input: unknown, host: string = USDA_HOST): bool
     }
 
     try {
-        return new URL(href).hostname.toLowerCase() === expected;
+        return canonicalHostname(new URL(href).hostname) === expected;
     } catch {
         return false;
     }

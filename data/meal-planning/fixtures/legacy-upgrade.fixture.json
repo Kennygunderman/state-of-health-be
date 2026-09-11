@@ -1,0 +1,1057 @@
+{
+  "fixture_version": "v1",
+  "description": "Representative pre-meal-planning dataset for the Agent Action Plan 0.9.1 dual-ledger equivalence and preservation gate. Every row is synthetic: the user ids are uid-shaped but belong to no Firebase project, the addresses are @example.com, and the one avatar is the base64 of the ASCII text 'fake-avatar-pixels'. The rows cover only tables that exist BEFORE the 20260908000000_meal_planning migration, and they deliberately carry none of that migration's additive columns (meal_entries.meal_plan_meal_id, catalog_food_id, recipe_version_id, nutrition_provenance) and none of its sixteen new tables, so the gate can load this dataset into a database that has only 20260706000000_init applied, migrate it by either ledger, and prove that every legacy row survives byte-for-byte and that no additive column was silently backfilled. Loaded only into the disposable databases the gate creates and drops; never into a development, shadow or production database.",
+  "insert_order": [
+    "users",
+    "foods",
+    "meals",
+    "user_exercises",
+    "templates",
+    "workout_days",
+    "runs",
+    "body_weight_entries",
+    "ai_usage",
+    "usda_api_cache",
+    "daily_exercises",
+    "exercise_sets",
+    "meal_entries",
+    "personal_records",
+    "run_splits",
+    "run_personal_records"
+  ],
+  "type_notes": {
+    "annotation_field": "Every row may carry a 'note' field. It is documentation, not a column: the loader strips it and rejects any OTHER key that is not a real column of the target table, so a fixture that drifts from the schema fails loudly instead of silently dropping data.",
+    "uuid_scheme": "Uuid primary keys are deterministic and encode their table in the first group so foreign keys read at a glance: 00000001=foods, 00000002=meals, 00000003=meal_entries, 00000004=user_exercises, 00000005=templates, 00000006=workout_days, 00000007=daily_exercises, 00000008=exercise_sets, 00000009=personal_records, 0000000a=runs, 0000000b=run_splits, 0000000c=run_personal_records, 0000000d=body_weight_entries. The last group is a per-table counter.",
+    "user_ids": "users.id is TEXT (a Firebase uid in production), so the three fixture users are 28-character alphanumeric strings that are obviously synthetic.",
+    "bigint_columns": "workout_days.updated_at and runs.updated_at are BigInt. They are written here as JSON numbers of epoch milliseconds, all below 2^53 so no precision is lost by a JSON parser. A raw pg loader may pass them straight through (node-postgres sends parameters as text and PostgreSQL casts to int8); a Prisma-based loader must wrap them in BigInt(...).",
+    "date_columns": "Columns typed @db.Date (meals.date, meal_entries.date, workout_days.date, exercise_sets.completed_at) are bare 'YYYY-MM-DD' strings. Every other temporal column is a full ISO-8601 instant with an explicit Z.",
+    "explicit_timestamps": "Every created_at, updated_at, logged_at, fetched_at and achieved_at value is written explicitly even though the schema defaults them to now(). That is what makes the gate's cross-ledger row hashes comparable: a defaulted now() would differ between the two disposable databases and would fail the comparison for a reason that has nothing to do with the migration.",
+    "macro_units": "foods and meal_entries macros are integers (Int columns). meal_entries calories/protein_g/carbs_g/fat_g are PER SERVING; as-eaten values are round(perServing * servings), which is how src/services/nutrition.service.ts reads them.",
+    "soft_deletes": "deleted_at is @db.Timestamptz(6) on foods, meals, meal_entries and user_exercises. Rows with a non-null deleted_at are soft-deleted and must stay in the table through the migration.",
+    "no_weight_unit": "body_weight_entries has no unit column in this schema and none is invented here. The stored number is unit-less by design, which is exactly the ambiguity the plan's weigh-in prefill policy has to live with."
+  },
+  "users": [
+    {
+      "id": "fixtureUserOneTargetsFull001",
+      "first_name": "Ada",
+      "last_name": "Fixture",
+      "email": "ada.full@example.com",
+      "target_calories": 2100,
+      "target_protein_g": 158,
+      "target_carbs_g": 210,
+      "target_fat_g": 70,
+      "avatar_base64": "ZmFrZS1hdmF0YXItcGl4ZWxz",
+      "note": "All four targets set, plus an avatar. The 'complete targets' profile: the only profile the planner may generate for, and the one whose targets Account, the Diary and the planner must all report identically."
+    },
+    {
+      "id": "fixtureUserTwoTargetsCals002",
+      "first_name": "Grace",
+      "last_name": "Fixture",
+      "email": "grace.calories-only@example.com",
+      "target_calories": 1800,
+      "target_protein_g": null,
+      "target_carbs_g": null,
+      "target_fat_g": null,
+      "avatar_base64": null,
+      "note": "Calories only, the three macro targets null. The 'partial targets' profile: a legacy account that set a calorie goal years ago, which must read back as partially set rather than as complete or as absent."
+    },
+    {
+      "id": "fixtureUserThreeNoTargets003",
+      "first_name": "Alan",
+      "last_name": "Fixture",
+      "email": "alan.no-targets@example.com",
+      "target_calories": null,
+      "target_protein_g": null,
+      "target_carbs_g": null,
+      "target_fat_g": null,
+      "avatar_base64": null,
+      "note": "All four targets null. The 'no targets' profile: the user who never opted in, whose local fallback must keep working and whose columns must stay null after the migration."
+    }
+  ],
+  "foods": [
+    {
+      "id": "00000001-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "name": "Greek yogurt, plain",
+      "serving_amount": 170,
+      "serving_unit": "g",
+      "calories": 100,
+      "protein_g": 17,
+      "carbs_g": 6,
+      "fat_g": 0,
+      "brand": null,
+      "source": "manual",
+      "created_at": "2026-01-04T09:12:00.000Z",
+      "updated_at": "2026-01-04T09:12:00.000Z",
+      "deleted_at": null,
+      "note": "source 'manual'. Its name is duplicated by a different owner's food below, so any query that forgets its user_id predicate returns two rows instead of one."
+    },
+    {
+      "id": "00000001-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "name": "Sourdough toast",
+      "serving_amount": 1,
+      "serving_unit": "slice",
+      "calories": 120,
+      "protein_g": 4,
+      "carbs_g": 22,
+      "fat_g": 1,
+      "brand": null,
+      "source": "label_scan",
+      "created_at": "2026-01-09T18:40:00.000Z",
+      "updated_at": "2026-01-11T07:55:00.000Z",
+      "deleted_at": null,
+      "note": "source 'label_scan', and the one food whose updated_at differs from its created_at."
+    },
+    {
+      "id": "00000001-0000-4000-8000-000000000003",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "name": "Chobani Greek Yogurt, plain nonfat",
+      "serving_amount": 1,
+      "serving_unit": "cup",
+      "calories": 140,
+      "protein_g": 20,
+      "carbs_g": 9,
+      "fat_g": 2,
+      "brand": "Chobani",
+      "source": "branded",
+      "created_at": "2026-01-15T06:30:00.000Z",
+      "updated_at": "2026-01-15T06:30:00.000Z",
+      "deleted_at": null,
+      "note": "source 'branded', the only food carrying a brand. A branded row is client-supplied nutrition, so after the release it must still earn no source-backed provenance label."
+    },
+    {
+      "id": "00000001-0000-4000-8000-000000000004",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "name": "Greek yogurt, plain",
+      "serving_amount": 170,
+      "serving_unit": "g",
+      "calories": 100,
+      "protein_g": 17,
+      "carbs_g": 6,
+      "fat_g": 0,
+      "brand": null,
+      "source": "seed",
+      "created_at": "2026-01-05T11:00:00.000Z",
+      "updated_at": "2026-01-05T11:00:00.000Z",
+      "deleted_at": null,
+      "note": "source 'seed', and the contested half of the duplicated name: same name and macros as user one's food, different owner and different id."
+    },
+    {
+      "id": "00000001-0000-4000-8000-000000000005",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "name": "Sheet-pan salmon",
+      "serving_amount": 1,
+      "serving_unit": "fillet",
+      "calories": 420,
+      "protein_g": 38,
+      "carbs_g": 8,
+      "fat_g": 26,
+      "brand": null,
+      "source": "manual",
+      "created_at": "2026-01-20T19:05:00.000Z",
+      "updated_at": "2026-01-20T19:05:00.000Z",
+      "deleted_at": "2026-02-10T21:15:00.000Z",
+      "note": "Soft-deleted food that a LIVE diary entry still points at. Deleting a personal food must not erase the diary history that referenced it, so both this row and that entry's food_id have to survive the migration."
+    },
+    {
+      "id": "00000001-0000-4000-8000-000000000006",
+      "user_id": "fixtureUserThreeNoTargets003",
+      "name": "Overnight oats",
+      "serving_amount": 1,
+      "serving_unit": "jar",
+      "calories": 330,
+      "protein_g": 12,
+      "carbs_g": 52,
+      "fat_g": 9,
+      "brand": null,
+      "source": "manual",
+      "created_at": "2026-02-01T08:00:00.000Z",
+      "updated_at": "2026-02-01T08:00:00.000Z",
+      "deleted_at": null,
+      "note": "Orphan food: owned by the no-targets user and referenced by no diary entry. It proves the migration touches foods that nothing joins to."
+    }
+  ],
+  "meals": [
+    {
+      "id": "00000002-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "name": "Breakfast",
+      "sort_order": 0,
+      "created_at": "2026-02-14T06:00:00.000Z",
+      "deleted_at": null,
+      "note": "Start of the complete four-bucket day. sort_order follows DEFAULT_MEALS in src/services/nutrition.service.ts: Breakfast 0, Lunch 1, Dinner 2, Snack 3."
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "name": "Lunch",
+      "sort_order": 1,
+      "created_at": "2026-02-14T06:00:01.000Z",
+      "deleted_at": null
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000003",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "name": "Dinner",
+      "sort_order": 2,
+      "created_at": "2026-02-14T06:00:02.000Z",
+      "deleted_at": null
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000004",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "name": "Snack",
+      "sort_order": 3,
+      "created_at": "2026-02-14T06:00:03.000Z",
+      "deleted_at": null,
+      "note": "The Snack bucket exists on this day, which is what a planned snack needs in order to be logged into an existing meal."
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000005",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-13",
+      "name": "Breakfast",
+      "sort_order": 0,
+      "created_at": "2026-02-13T06:30:00.000Z",
+      "deleted_at": null,
+      "note": "Start of the deliberately Snack-LESS day: only Breakfast, Lunch and Dinner exist, so reading this day exercises the lazy backfill in nutrition.service.ts that creates the missing default bucket on demand."
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000006",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-13",
+      "name": "Lunch",
+      "sort_order": 1,
+      "created_at": "2026-02-13T06:30:01.000Z",
+      "deleted_at": null
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000007",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-13",
+      "name": "Dinner",
+      "sort_order": 2,
+      "created_at": "2026-02-13T06:30:02.000Z",
+      "deleted_at": null
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000008",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-12",
+      "name": "Breakfast",
+      "sort_order": 0,
+      "created_at": "2026-02-12T07:10:00.000Z",
+      "deleted_at": null,
+      "note": "The only bucket of the zero-calorie day. Its live entries sum to 0 kcal, so the history aggregate (which filters HAVING SUM(...) > 0) must skip 2026-02-12 entirely while the rows stay in the table."
+    },
+    {
+      "id": "00000002-0000-4000-8000-000000000009",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-11",
+      "name": "Pre-workout",
+      "sort_order": 4,
+      "created_at": "2026-02-11T05:45:00.000Z",
+      "deleted_at": "2026-02-11T12:00:00.000Z",
+      "note": "Soft-deleted CUSTOM meal (a name outside DEFAULT_MEALS, sort_order past the defaults) that still contains a live entry. Both rows must survive: the parent is deleted, the child is not, and no cascade or cleanup may run during the migration."
+    },
+    {
+      "id": "00000002-0000-4000-8000-00000000000a",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "date": "2026-02-14",
+      "name": "Breakfast",
+      "sort_order": 0,
+      "created_at": "2026-02-14T06:05:00.000Z",
+      "deleted_at": null,
+      "note": "Second owner, same date and same bucket name as user one's meal above. Any day query missing its user_id predicate returns both users' meals."
+    },
+    {
+      "id": "00000002-0000-4000-8000-00000000000b",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "date": "2026-02-14",
+      "name": "Lunch",
+      "sort_order": 1,
+      "created_at": "2026-02-14T06:05:01.000Z",
+      "deleted_at": null
+    }
+  ],
+  "user_exercises": [
+    {
+      "id": "00000004-0000-4000-8000-000000000001",
+      "name": "Barbell Bench Press",
+      "exercise_type": "Barbell",
+      "exercise_body_part": "Chest",
+      "logging_type": "WEIGHT_REPS",
+      "user_id": null,
+      "deleted_at": null,
+      "note": "Global exercise: user_id is NULL, which the schema allows and which makes this the one row in the whole fixture that belongs to no user. It is referenced by a user-owned daily_exercise and by user-owned records, so a migration that tightened this column would break both."
+    },
+    {
+      "id": "00000004-0000-4000-8000-000000000002",
+      "name": "Pull-Up",
+      "exercise_type": "Bodyweight",
+      "exercise_body_part": "Back",
+      "logging_type": "BODYWEIGHT_REPS",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "deleted_at": null
+    },
+    {
+      "id": "00000004-0000-4000-8000-000000000003",
+      "name": "Weighted Dip",
+      "exercise_type": "Weighted",
+      "exercise_body_part": "Triceps",
+      "logging_type": "WEIGHTED_BODYWEIGHT",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "deleted_at": null
+    },
+    {
+      "id": "00000004-0000-4000-8000-000000000004",
+      "name": "Plank",
+      "exercise_type": "Timed",
+      "exercise_body_part": "Core",
+      "logging_type": "TIME_ONLY",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "deleted_at": null
+    },
+    {
+      "id": "00000004-0000-4000-8000-000000000005",
+      "name": "Farmer Carry",
+      "exercise_type": "Weighted",
+      "exercise_body_part": "Full Body",
+      "logging_type": "WEIGHT_TIME",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "deleted_at": null
+    },
+    {
+      "id": "00000004-0000-4000-8000-000000000006",
+      "name": "Rowing Machine",
+      "exercise_type": "Machine",
+      "exercise_body_part": "Cardio",
+      "logging_type": "DISTANCE_TIME",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "deleted_at": "2026-02-09T17:20:00.000Z",
+      "note": "Soft-deleted exercise that a personal record still points at, so strength history survives hiding the exercise. The six logging_type values across this collection are the vocabulary src/services/exercise.service.ts accepts."
+    }
+  ],
+  "templates": [
+    {
+      "id": "00000005-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "name": "Push Day",
+      "tagline": "Chest, shoulders and triceps",
+      "exercise_ids": [
+        "00000004-0000-4000-8000-000000000001",
+        "00000004-0000-4000-8000-000000000003"
+      ],
+      "note": "exercise_ids is a plain String[] rather than a foreign key, so the array contents are data the migration must preserve verbatim. tagline is NOT NULL in this schema."
+    },
+    {
+      "id": "00000005-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "name": "Push Day",
+      "tagline": "Bench and carries",
+      "exercise_ids": [
+        "00000004-0000-4000-8000-000000000001",
+        "00000004-0000-4000-8000-000000000005"
+      ],
+      "note": "Same template name as user one's. The unique key is (user_id, name), so this row only loads if ownership is part of the constraint."
+    }
+  ],
+  "workout_days": [
+    {
+      "id": "00000006-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "has_synced": true,
+      "updated_at": 1771027200000,
+      "note": "Synced day with a real epoch-millisecond BigInt updated_at."
+    },
+    {
+      "id": "00000006-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-13",
+      "has_synced": false,
+      "updated_at": 0,
+      "note": "Unsynced day at the column default 0, the value every pre-sync row carries."
+    },
+    {
+      "id": "00000006-0000-4000-8000-000000000003",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "date": "2026-02-14",
+      "has_synced": null,
+      "updated_at": 1771027260000,
+      "note": "Second owner on the same date as the first row: the unique key is (user_id, date). has_synced is explicitly NULL, which the nullable Boolean allows and which is distinct from false."
+    }
+  ],
+  "runs": [
+    {
+      "id": "0000000a-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "started_at": "2026-02-14T13:02:00.000Z",
+      "ended_at": "2026-02-14T13:32:00.000Z",
+      "duration_seconds": 1800,
+      "distance_meters": 5000,
+      "avg_pace_sec_per_km": 360,
+      "elevation_gain_m": 42.5,
+      "elevation_loss_m": 38.1,
+      "avg_heart_rate": 152,
+      "max_heart_rate": 171,
+      "calories": 412,
+      "run_type": "OUTDOOR",
+      "source": "GPS",
+      "route_polyline": "_p~iF~ps|U_ulLnnqC_mqNvxq`@",
+      "notes": null,
+      "has_synced": true,
+      "updated_at": 1771030800000,
+      "created_at": "2026-02-14T13:33:00.000Z",
+      "note": "Fully populated GPS run with splits and an encoded polyline. run_type stays 'OUTDOOR' and source is 'GPS' because those are the only values the shipped code produces; no third value is invented here."
+    },
+    {
+      "id": "0000000a-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "started_at": "2026-02-12T18:15:00.000Z",
+      "ended_at": null,
+      "duration_seconds": 2400,
+      "distance_meters": 6000,
+      "avg_pace_sec_per_km": null,
+      "elevation_gain_m": null,
+      "elevation_loss_m": null,
+      "avg_heart_rate": null,
+      "max_heart_rate": null,
+      "calories": null,
+      "run_type": "OUTDOOR",
+      "source": "MANUAL",
+      "route_polyline": null,
+      "notes": "Entered by hand after the watch failed, so there is no trace.",
+      "has_synced": false,
+      "updated_at": 0,
+      "created_at": "2026-02-12T19:00:00.000Z",
+      "note": "The sparse counterpart: a hand-entered run with every optional metric null, no splits, and free-text notes. Together the two rows cover both source values and both ends of the nullability of this table."
+    }
+  ],
+  "body_weight_entries": [
+    {
+      "id": "0000000d-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "weight": 82.6,
+      "logged_at": "2026-02-14T07:05:00.000Z",
+      "created_at": "2026-02-14T07:05:10.000Z",
+      "note": "logged_at is a full instant rather than a day key, so two weigh-ins can share a date. There is no unit column in this schema and none is added here."
+    },
+    {
+      "id": "0000000d-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "weight": 82.1,
+      "logged_at": "2026-02-14T20:40:00.000Z",
+      "created_at": "2026-02-14T20:40:05.000Z",
+      "note": "Second weigh-in on the same date as the first: the latest weigh-in is the one a prefill would read, and picking it requires ordering by logged_at, not by date."
+    },
+    {
+      "id": "0000000d-0000-4000-8000-000000000003",
+      "user_id": "fixtureUserThreeNoTargets003",
+      "weight": 64.4,
+      "logged_at": "2026-02-10T06:30:00.000Z",
+      "created_at": "2026-02-10T06:30:08.000Z",
+      "note": "The no-targets user's only row in the whole fixture: an account that weighs in but has never logged food or set a target."
+    }
+  ],
+  "ai_usage": [
+    {
+      "user_id": "fixtureUserOneTargetsFull001",
+      "day": "2026-02-14",
+      "count": 3,
+      "updated_at": "2026-02-14T21:00:00.000Z",
+      "note": "Composite primary key (user_id, day) with day as a 'YYYY-MM-DD' UTC string rather than a date column. Meal planning issues no request-time model calls, so this ledger must be untouched by the migration."
+    },
+    {
+      "user_id": "fixtureUserOneTargetsFull001",
+      "day": "2026-02-13",
+      "count": 1,
+      "updated_at": "2026-02-13T19:30:00.000Z"
+    },
+    {
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "day": "2026-02-14",
+      "count": 1,
+      "updated_at": "2026-02-14T12:05:00.000Z",
+      "note": "Same day as the first row for a different user, which is the half of the composite key that is easy to lose."
+    }
+  ],
+  "usda_api_cache": [
+    {
+      "cache_key": "fixture:search:greek%20yogurt:1:25",
+      "payload": {
+        "totalHits": 2,
+        "foods": [
+          {
+            "fdcId": 170894,
+            "description": "Yogurt, Greek, plain, nonfat",
+            "dataType": "SR Legacy"
+          }
+        ]
+      },
+      "fetched_at": "2026-02-10T10:00:00.000Z",
+      "note": "Raw vendor response cache keyed by request. payload is a JSON object (never a bare array: a raw pg loader would send a top-level array as a PostgreSQL array literal rather than as JSON). This table pre-dates the catalog tables and must not be migrated into them."
+    },
+    {
+      "cache_key": "fixture:detail:170894:full",
+      "payload": {
+        "fdcId": 170894,
+        "foodNutrients": [
+          {
+            "nutrientNumber": "208",
+            "value": 59
+          },
+          {
+            "nutrientNumber": "203",
+            "value": 10.19
+          }
+        ]
+      },
+      "fetched_at": "2026-02-10T10:00:05.000Z"
+    }
+  ],
+  "daily_exercises": [
+    {
+      "id": "00000007-0000-4000-8000-000000000001",
+      "workout_day_id": "00000006-0000-4000-8000-000000000001",
+      "exercise_id": "00000004-0000-4000-8000-000000000001",
+      "order": 0,
+      "note": "'order' is a reserved SQL word, so any loader or migration touching this table has to quote the identifier."
+    },
+    {
+      "id": "00000007-0000-4000-8000-000000000002",
+      "workout_day_id": "00000006-0000-4000-8000-000000000001",
+      "exercise_id": "00000004-0000-4000-8000-000000000002",
+      "order": 1
+    },
+    {
+      "id": "00000007-0000-4000-8000-000000000003",
+      "workout_day_id": "00000006-0000-4000-8000-000000000003",
+      "exercise_id": "00000004-0000-4000-8000-000000000005",
+      "order": null,
+      "note": "order is explicitly NULL, which the nullable column allows and which is not the same stored value as the default 0."
+    }
+  ],
+  "exercise_sets": [
+    {
+      "id": "00000008-0000-4000-8000-000000000001",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000001",
+      "reps": 10,
+      "weight": 45,
+      "added_weight": null,
+      "duration_seconds": null,
+      "distance_meters": null,
+      "rpe": null,
+      "is_warmup": true,
+      "completed": true,
+      "set_number": 1,
+      "completed_at": "2026-02-14",
+      "note": "Warm-up set. completed_at is @db.Date, a day key rather than an instant."
+    },
+    {
+      "id": "00000008-0000-4000-8000-000000000002",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000001",
+      "reps": 5,
+      "weight": 185,
+      "added_weight": null,
+      "duration_seconds": null,
+      "distance_meters": null,
+      "rpe": 8.5,
+      "is_warmup": false,
+      "completed": true,
+      "set_number": 2,
+      "completed_at": "2026-02-14",
+      "note": "Working set with a fractional RPE; it is the set three of the personal records below were achieved on."
+    },
+    {
+      "id": "00000008-0000-4000-8000-000000000003",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000002",
+      "reps": 12,
+      "weight": null,
+      "added_weight": null,
+      "duration_seconds": null,
+      "distance_meters": null,
+      "rpe": null,
+      "is_warmup": false,
+      "completed": true,
+      "set_number": 1,
+      "completed_at": "2026-02-14",
+      "note": "Bodyweight-reps set: no weight and no added weight, which is what distinguishes a max-reps record from a max-weight one."
+    },
+    {
+      "id": "00000008-0000-4000-8000-000000000004",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000002",
+      "reps": null,
+      "weight": null,
+      "added_weight": null,
+      "duration_seconds": 90,
+      "distance_meters": null,
+      "rpe": null,
+      "is_warmup": false,
+      "completed": true,
+      "set_number": 2,
+      "completed_at": null,
+      "note": "Duration-only set with completed_at NULL: a set can be marked completed without ever being stamped with a day."
+    },
+    {
+      "id": "00000008-0000-4000-8000-000000000005",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000003",
+      "reps": null,
+      "weight": 70,
+      "added_weight": null,
+      "duration_seconds": 300,
+      "distance_meters": 1000,
+      "rpe": null,
+      "is_warmup": false,
+      "completed": true,
+      "set_number": 1,
+      "completed_at": "2026-02-14",
+      "note": "The second owner's set, carrying weight, duration and distance at once so every numeric column in this table is populated somewhere in the fixture."
+    }
+  ],
+  "meal_entries": [
+    {
+      "id": "00000003-0000-4000-8000-000000000001",
+      "meal_id": "00000002-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "food_id": "00000001-0000-4000-8000-000000000001",
+      "name": "Greek yogurt, plain",
+      "serving_text": "170 g",
+      "servings": 1.5,
+      "calories": 100,
+      "protein_g": 17,
+      "carbs_g": 6,
+      "fat_g": 0,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-14T07:20:00.000Z",
+      "updated_at": "2026-02-14T07:20:00.000Z",
+      "deleted_at": null,
+      "note": "input_method 'library' with a fractional servings of 1.5, so as-eaten calories are round(100 * 1.5) = 150 and a migration that rounded the stored per-serving value instead would change the day total."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000002",
+      "meal_id": "00000002-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "food_id": "00000001-0000-4000-8000-000000000003",
+      "name": "Chobani Greek Yogurt, plain nonfat",
+      "serving_text": "1 cup",
+      "servings": 1,
+      "calories": 140,
+      "protein_g": 20,
+      "carbs_g": 9,
+      "fat_g": 2,
+      "input_method": "search",
+      "raw_input": null,
+      "logged_at": "2026-02-14T07:22:00.000Z",
+      "updated_at": "2026-02-14T07:22:00.000Z",
+      "deleted_at": null,
+      "note": "input_method 'search' against a branded food: client-supplied nutrition that must never read back as source-backed."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000003",
+      "meal_id": "00000002-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "food_id": null,
+      "name": "Chicken burrito bowl",
+      "serving_text": "1 bowl",
+      "servings": 1,
+      "calories": 610,
+      "protein_g": 45,
+      "carbs_g": 58,
+      "fat_g": 21,
+      "input_method": "ai_text",
+      "raw_input": "chicken burrito bowl with brown rice, black beans and avocado",
+      "logged_at": "2026-02-14T12:40:00.000Z",
+      "updated_at": "2026-02-14T12:40:00.000Z",
+      "deleted_at": null,
+      "note": "input_method 'ai_text' with food_id NULL and the original prompt in raw_input. An AI-logged entry is an estimate, so after the release it must render an 'Estimated' caption from input_method alone, with no provenance column set."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000004",
+      "meal_id": "00000002-0000-4000-8000-000000000003",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "food_id": "00000001-0000-4000-8000-000000000005",
+      "name": "Sheet-pan salmon",
+      "serving_text": "1 fillet",
+      "servings": 1,
+      "calories": 420,
+      "protein_g": 38,
+      "carbs_g": 8,
+      "fat_g": 26,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-14T19:05:00.000Z",
+      "updated_at": "2026-02-14T19:05:00.000Z",
+      "deleted_at": null,
+      "note": "Live entry pointing at the SOFT-DELETED food. The food_id must still be there after the migration: the relation is SetNull, so anything that actually deleted the food would silently blank this column."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000005",
+      "meal_id": "00000002-0000-4000-8000-000000000004",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "food_id": null,
+      "name": "Trail mix",
+      "serving_text": "1 handful",
+      "servings": 0.5,
+      "calories": 320,
+      "protein_g": 9,
+      "carbs_g": 30,
+      "fat_g": 20,
+      "input_method": "ai_photo",
+      "raw_input": "photo of a handful of trail mix",
+      "logged_at": "2026-02-14T15:35:00.000Z",
+      "updated_at": "2026-02-14T15:35:00.000Z",
+      "deleted_at": null,
+      "note": "input_method 'ai_photo' in the Snack bucket with a half serving, completing the four legacy input methods this fixture covers."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000006",
+      "meal_id": "00000002-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-14",
+      "food_id": "00000001-0000-4000-8000-000000000002",
+      "name": "Sourdough toast",
+      "serving_text": "2 slices",
+      "servings": 2,
+      "calories": 120,
+      "protein_g": 4,
+      "carbs_g": 22,
+      "fat_g": 1,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-14T12:41:00.000Z",
+      "updated_at": "2026-02-14T13:10:00.000Z",
+      "deleted_at": "2026-02-14T13:10:00.000Z",
+      "note": "Soft-deleted entry inside an otherwise populated meal, with updated_at moved to the deletion instant. It must stay in the table and stay out of every total."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000007",
+      "meal_id": "00000002-0000-4000-8000-000000000005",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-13",
+      "food_id": "00000001-0000-4000-8000-000000000001",
+      "name": "Greek yogurt, plain",
+      "serving_text": "170 g",
+      "servings": 1,
+      "calories": 100,
+      "protein_g": 17,
+      "carbs_g": 6,
+      "fat_g": 0,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-13T06:55:00.000Z",
+      "updated_at": "2026-02-13T06:55:00.000Z",
+      "deleted_at": null,
+      "note": "On the Snack-less day, so this day has history and still needs its missing bucket backfilled when read."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000008",
+      "meal_id": "00000002-0000-4000-8000-000000000007",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-13",
+      "food_id": null,
+      "name": "Lentil soup",
+      "serving_text": "1 bowl",
+      "servings": 0.33,
+      "calories": 230,
+      "protein_g": 14,
+      "carbs_g": 34,
+      "fat_g": 4,
+      "input_method": "search",
+      "raw_input": null,
+      "logged_at": "2026-02-13T19:20:00.000Z",
+      "updated_at": "2026-02-13T19:20:00.000Z",
+      "deleted_at": null,
+      "note": "servings 0.33 is the stored two-decimal representation of a one-third fraction chip, which is what the shipped serving helpers produce; it must survive as 0.33 and not be normalised."
+    },
+    {
+      "id": "00000003-0000-4000-8000-000000000009",
+      "meal_id": "00000002-0000-4000-8000-000000000008",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-12",
+      "food_id": null,
+      "name": "Black coffee",
+      "serving_text": "12 fl oz",
+      "servings": 1,
+      "calories": 0,
+      "protein_g": 0,
+      "carbs_g": 0,
+      "fat_g": 0,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-12T07:15:00.000Z",
+      "updated_at": "2026-02-12T07:15:00.000Z",
+      "deleted_at": null,
+      "note": "The live half of the zero-calorie day: a real entry worth 0 kcal. Its day must be readable but must NOT appear in history, whose aggregate keeps only days summing above zero."
+    },
+    {
+      "id": "00000003-0000-4000-8000-00000000000a",
+      "meal_id": "00000002-0000-4000-8000-000000000008",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-12",
+      "food_id": "00000001-0000-4000-8000-000000000002",
+      "name": "Sourdough toast",
+      "serving_text": "1 slice",
+      "servings": 1,
+      "calories": 120,
+      "protein_g": 4,
+      "carbs_g": 22,
+      "fat_g": 1,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-12T07:16:00.000Z",
+      "updated_at": "2026-02-12T07:45:00.000Z",
+      "deleted_at": "2026-02-12T07:45:00.000Z",
+      "note": "The deleted half of the zero-calorie day. It carries calories, so a history query that forgot the deleted_at filter would wrongly surface 2026-02-12."
+    },
+    {
+      "id": "00000003-0000-4000-8000-00000000000b",
+      "meal_id": "00000002-0000-4000-8000-000000000009",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "date": "2026-02-11",
+      "food_id": null,
+      "name": "Banana",
+      "serving_text": "1 medium",
+      "servings": 1,
+      "calories": 105,
+      "protein_g": 1,
+      "carbs_g": 27,
+      "fat_g": 0,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-11T05:50:00.000Z",
+      "updated_at": "2026-02-11T05:50:00.000Z",
+      "deleted_at": null,
+      "note": "Live entry whose PARENT MEAL is soft-deleted: the orphaned-by-soft-delete case. Both rows must survive the migration unchanged."
+    },
+    {
+      "id": "00000003-0000-4000-8000-00000000000c",
+      "meal_id": "00000002-0000-4000-8000-00000000000a",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "date": "2026-02-14",
+      "food_id": "00000001-0000-4000-8000-000000000004",
+      "name": "Greek yogurt, plain",
+      "serving_text": "170 g",
+      "servings": 1,
+      "calories": 100,
+      "protein_g": 17,
+      "carbs_g": 6,
+      "fat_g": 0,
+      "input_method": "library",
+      "raw_input": null,
+      "logged_at": "2026-02-14T07:30:00.000Z",
+      "updated_at": "2026-02-14T07:30:00.000Z",
+      "deleted_at": null,
+      "note": "The second owner's entry: same name, same date and the same bucket name as user one's first entry, pointing at that owner's own food. It is the row a query missing its user_id predicate would leak."
+    },
+    {
+      "id": "00000003-0000-4000-8000-00000000000d",
+      "meal_id": "00000002-0000-4000-8000-00000000000b",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "date": "2026-02-14",
+      "food_id": null,
+      "name": "Turkey and hummus wrap",
+      "serving_text": "1 wrap",
+      "servings": 1,
+      "calories": 540,
+      "protein_g": 38,
+      "carbs_g": 49,
+      "fat_g": 19,
+      "input_method": "ai_text",
+      "raw_input": "turkey and hummus wrap",
+      "logged_at": "2026-02-14T12:55:00.000Z",
+      "updated_at": "2026-02-14T12:55:00.000Z",
+      "deleted_at": null
+    }
+  ],
+  "personal_records": [
+    {
+      "id": "00000009-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "exercise_id": "00000004-0000-4000-8000-000000000001",
+      "record_type": "MAX_WEIGHT",
+      "value": 185,
+      "unit": "lb",
+      "reps_at_record": 5,
+      "exercise_set_id": "00000008-0000-4000-8000-000000000002",
+      "achieved_at": "2026-02-14T08:12:00.000Z",
+      "created_at": "2026-02-14T08:12:05.000Z",
+      "note": "One of the three records the same working set produced. The unique key is (user_id, exercise_id, record_type), so all three coexist."
+    },
+    {
+      "id": "00000009-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "exercise_id": "00000004-0000-4000-8000-000000000001",
+      "record_type": "MAX_VOLUME",
+      "value": 925,
+      "unit": "lb",
+      "reps_at_record": 5,
+      "exercise_set_id": "00000008-0000-4000-8000-000000000002",
+      "achieved_at": "2026-02-14T08:12:00.000Z",
+      "created_at": "2026-02-14T08:12:06.000Z"
+    },
+    {
+      "id": "00000009-0000-4000-8000-000000000003",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "exercise_id": "00000004-0000-4000-8000-000000000001",
+      "record_type": "MAX_ESTIMATED_1RM",
+      "value": 215.83,
+      "unit": "lb",
+      "reps_at_record": 5,
+      "exercise_set_id": "00000008-0000-4000-8000-000000000002",
+      "achieved_at": "2026-02-14T08:12:00.000Z",
+      "created_at": "2026-02-14T08:12:07.000Z",
+      "note": "A derived, non-integer value (185 * (1 + 5/30)), which is why value is a Float and must not be rounded by the migration."
+    },
+    {
+      "id": "00000009-0000-4000-8000-000000000004",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "exercise_id": "00000004-0000-4000-8000-000000000002",
+      "record_type": "MAX_REPS",
+      "value": 12,
+      "unit": "reps",
+      "reps_at_record": 12,
+      "exercise_set_id": "00000008-0000-4000-8000-000000000003",
+      "achieved_at": "2026-02-14T08:20:00.000Z",
+      "created_at": "2026-02-14T08:20:04.000Z"
+    },
+    {
+      "id": "00000009-0000-4000-8000-000000000005",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "exercise_id": "00000004-0000-4000-8000-000000000004",
+      "record_type": "MAX_DURATION",
+      "value": 90,
+      "unit": "sec",
+      "reps_at_record": null,
+      "exercise_set_id": "00000008-0000-4000-8000-000000000004",
+      "achieved_at": "2026-02-14T08:26:00.000Z",
+      "created_at": "2026-02-14T08:26:03.000Z",
+      "note": "reps_at_record is NULL for a timed record."
+    },
+    {
+      "id": "00000009-0000-4000-8000-000000000006",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "exercise_id": "00000004-0000-4000-8000-000000000006",
+      "record_type": "MAX_DISTANCE",
+      "value": 2000,
+      "unit": "m",
+      "reps_at_record": null,
+      "exercise_set_id": null,
+      "achieved_at": "2026-02-08T17:00:00.000Z",
+      "created_at": "2026-02-08T17:00:09.000Z",
+      "note": "Two edges at once: the exercise is soft-deleted and exercise_set_id is NULL (the originating set was deleted). Strength history outlives both, and the sixth and last record_type is covered here."
+    },
+    {
+      "id": "00000009-0000-4000-8000-000000000007",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "exercise_id": "00000004-0000-4000-8000-000000000005",
+      "record_type": "MAX_WEIGHT",
+      "value": 70,
+      "unit": "lb",
+      "reps_at_record": null,
+      "exercise_set_id": "00000008-0000-4000-8000-000000000005",
+      "achieved_at": "2026-02-14T09:10:00.000Z",
+      "created_at": "2026-02-14T09:10:02.000Z",
+      "note": "The second owner's MAX_WEIGHT: the same record_type as user one's first row, which only coexists because ownership is part of the unique key."
+    }
+  ],
+  "run_splits": [
+    {
+      "id": "0000000b-0000-4000-8000-000000000001",
+      "run_id": "0000000a-0000-4000-8000-000000000001",
+      "split_number": 1,
+      "distance_meters": 1000,
+      "duration_seconds": 355,
+      "pace_sec_per_km": 355
+    },
+    {
+      "id": "0000000b-0000-4000-8000-000000000002",
+      "run_id": "0000000a-0000-4000-8000-000000000001",
+      "split_number": 2,
+      "distance_meters": 1000,
+      "duration_seconds": 358,
+      "pace_sec_per_km": 358
+    },
+    {
+      "id": "0000000b-0000-4000-8000-000000000003",
+      "run_id": "0000000a-0000-4000-8000-000000000001",
+      "split_number": 3,
+      "distance_meters": 1000,
+      "duration_seconds": 362,
+      "pace_sec_per_km": 362
+    },
+    {
+      "id": "0000000b-0000-4000-8000-000000000004",
+      "run_id": "0000000a-0000-4000-8000-000000000001",
+      "split_number": 4,
+      "distance_meters": 1000,
+      "duration_seconds": 365,
+      "pace_sec_per_km": 365
+    },
+    {
+      "id": "0000000b-0000-4000-8000-000000000005",
+      "run_id": "0000000a-0000-4000-8000-000000000001",
+      "split_number": 5,
+      "distance_meters": 1000,
+      "duration_seconds": 360,
+      "pace_sec_per_km": null,
+      "note": "Five splits under one run, unique by (run_id, split_number). The last split leaves pace_sec_per_km NULL so the nullable column is exercised."
+    }
+  ],
+  "run_personal_records": [
+    {
+      "id": "0000000c-0000-4000-8000-000000000001",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "record_type": "MAX_DISTANCE",
+      "value": 5000,
+      "unit": "m",
+      "run_id": "0000000a-0000-4000-8000-000000000001",
+      "achieved_at": "2026-02-14T13:32:00.000Z",
+      "created_at": "2026-02-14T13:33:01.000Z"
+    },
+    {
+      "id": "0000000c-0000-4000-8000-000000000002",
+      "user_id": "fixtureUserOneTargetsFull001",
+      "record_type": "BEST_PACE",
+      "value": 355,
+      "unit": "sec_per_km",
+      "run_id": "0000000a-0000-4000-8000-000000000001",
+      "achieved_at": "2026-02-14T13:32:00.000Z",
+      "created_at": "2026-02-14T13:33:02.000Z",
+      "note": "The one record type where a lower value is better, so a migration that re-derived records from runs could plausibly get its direction wrong."
+    },
+    {
+      "id": "0000000c-0000-4000-8000-000000000003",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "record_type": "MAX_DISTANCE",
+      "value": 6000,
+      "unit": "m",
+      "run_id": "0000000a-0000-4000-8000-000000000002",
+      "achieved_at": "2026-02-12T18:55:00.000Z",
+      "created_at": "2026-02-12T19:00:02.000Z",
+      "note": "The second owner's MAX_DISTANCE: same record_type as user one's, distinct because the unique key is (user_id, record_type)."
+    },
+    {
+      "id": "0000000c-0000-4000-8000-000000000004",
+      "user_id": "fixtureUserTwoTargetsCals002",
+      "record_type": "MAX_DURATION",
+      "value": 2400,
+      "unit": "sec",
+      "run_id": null,
+      "achieved_at": "2026-02-12T18:55:00.000Z",
+      "created_at": "2026-02-12T19:00:03.000Z",
+      "note": "run_id is NULL: the relation is SetNull, so a record can outlive the run that set it. All three run record types are covered across this collection."
+    }
+  ]
+}

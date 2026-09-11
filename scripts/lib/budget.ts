@@ -159,6 +159,74 @@ export class ModelBudgetError extends Error {
 
 const describeNumber = (value: number): string => (Number.isFinite(value) ? `${value}` : 'not a number');
 
+/**
+ * What an environment value turned out to be when read as a decimal integer.
+ * On `not_decimal`, `reads` is whatever `Number()` made of it — `NaN` or an
+ * infinity when it could not be coerced at all.
+ */
+type DecimalIntegerRead =
+    | { kind: 'ok'; value: number }
+    | { kind: 'not_decimal'; reads: number }
+    | { kind: 'not_exact'; digits: number };
+
+/**
+ * Reads an environment value as a decimal integer, or reports why it is not
+ * one. Ranges are the caller's business; this decides only whether a number was
+ * written at all, and whether the one written is the one that would be spent
+ * against.
+ *
+ * `Number()` implements the JavaScript numeric-literal grammar, not a decimal
+ * reader, so on its own it accepts forms no operator means by a count of paid
+ * calls: `0x10` becomes 16, `1e3` becomes 1000, `+7` becomes 7, `8.` becomes 8,
+ * and because `String.prototype.trim` removes U+00A0 a non-breaking space
+ * pasted before a digit disappears silently. Each of those would become the
+ * hard spend cap for an unattended run — a cap nobody chose, which is exactly
+ * the decision this module is not entitled to make on an operator's behalf.
+ * `Number()` also rounds: `Number('9007199254740993')` is 9007199254740992,
+ * which passes `Number.isInteger` and every range check while no longer being
+ * the value that was typed. So the digits are checked before the number is
+ * believed, and a magnitude that cannot be represented exactly is refused
+ * rather than rounded — the reservation ledger counts single calls, and a cap
+ * it cannot represent exactly is a cap it cannot enforce exactly.
+ *
+ * `rateLimiter.ts` reads `USDA_IMPORT_RATE_LIMIT_PER_HOUR` under this same
+ * rule. The rule is stated once per module rather than shared from a third file
+ * because each module maps the outcome onto its own error class, and neither
+ * may import the other: this one never calls a vendor, and that one touches no
+ * database.
+ */
+const readDecimalInteger = (raw: string): DecimalIntegerRead => {
+    // Only ASCII whitespace is stripped, deliberately NOT `String.trim()`:
+    // trim also removes U+00A0, U+FEFF and the other Unicode space
+    // separators, so a non-breaking space or a byte-order mark pasted in front
+    // of a digit would vanish here and the value would be accepted as though it
+    // had been typed cleanly. An invisible character in a .env line is exactly
+    // what to fail loudly on — it survives later edits, defeats a grep for the
+    // value, and any other reader of the same file (a shell `export`, a
+    // compose file, a secrets manager) may well disagree about it.
+    const trimmed = raw.replace(/^[ \t\n\r\v\f]+/, '').replace(/[ \t\n\r\v\f]+$/, '');
+
+    if (!/^[0-9]+$/.test(trimmed)) {
+        // What `Number()` would have made of it is the useful half of the
+        // report — it is the cap the run would otherwise have enforced —
+        // whereas the raw string is never echoed: a misplaced paste can put a
+        // credential on a line that reaches terminals, CI logs and committed
+        // reports.
+        return { kind: 'not_decimal', reads: Number(trimmed) };
+    }
+
+    const value = Number(trimmed);
+    if (!Number.isSafeInteger(value)) {
+        // Digits only by now, so the only way here is a magnitude past 2^53-1,
+        // where the nearest representable double is a different number. The
+        // digit count says how far out of range it is without echoing either
+        // the raw text or the misleading rounded value.
+        return { kind: 'not_exact', digits: trimmed.replace(/^0+(?=[0-9])/, '').length };
+    }
+
+    return { kind: 'ok', value };
+};
+
 const requirePositiveInteger = (value: number, label: string): number => {
     if (!Number.isInteger(value) || value <= 0) {
         throw new ModelBudgetError(
@@ -177,6 +245,38 @@ const requireNonNegativeInteger = (value: number, label: string): number => {
         );
     }
     return value;
+};
+
+/**
+ * Reads one environment variable that must be a positive integer, phrasing
+ * every rejection as a `budget_misconfigured` startup failure. Whether absence
+ * is allowed is the caller's decision — one of these variables is required and
+ * the other has a reviewed default — so this is only reached with a value
+ * present.
+ */
+const requirePositiveIntegerEnv = (raw: string, label: string): number => {
+    const read = readDecimalInteger(raw);
+
+    if (read.kind === 'not_decimal') {
+        throw new ModelBudgetError(
+            'budget_misconfigured',
+            `${label} must be decimal digits only, with no sign, decimal point, exponent or hex prefix ` +
+                `(got ${describeNumber(read.reads)})`,
+        );
+    }
+
+    if (read.kind === 'not_exact') {
+        throw new ModelBudgetError(
+            'budget_misconfigured',
+            `${label} is too large to be read exactly: ${read.digits} digits exceeds the largest safe ` +
+                `integer ${Number.MAX_SAFE_INTEGER}`,
+        );
+    }
+
+    // Digits only by now, so 0 is the only value left that can fail, and it
+    // fails with the range message this variable has always used: a cap of zero
+    // is a range error, not a notation one.
+    return requirePositiveInteger(read.value, label);
 };
 
 // ---------------------------------------------------------------------------
@@ -215,15 +315,7 @@ export const getCatalogModelCallBudget = (env: NodeJS.ProcessEnv = process.env):
         );
     }
 
-    const parsed = Number(raw.trim());
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-        throw new ModelBudgetError(
-            'budget_misconfigured',
-            `${MODEL_CALL_BUDGET_ENV_VAR} must be a positive integer (got ${describeNumber(parsed)})`,
-        );
-    }
-
-    return parsed;
+    return requirePositiveIntegerEnv(raw, MODEL_CALL_BUDGET_ENV_VAR);
 };
 
 /**
@@ -244,15 +336,7 @@ export const getCatalogBatchSize = (env: NodeJS.ProcessEnv = process.env): numbe
         return DEFAULT_CATALOG_BATCH_SIZE;
     }
 
-    const parsed = Number(raw.trim());
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-        throw new ModelBudgetError(
-            'budget_misconfigured',
-            `${BATCH_SIZE_ENV_VAR} must be a positive integer (got ${describeNumber(parsed)})`,
-        );
-    }
-
-    return parsed;
+    return requirePositiveIntegerEnv(raw, BATCH_SIZE_ENV_VAR);
 };
 
 // ---------------------------------------------------------------------------
@@ -303,7 +387,17 @@ export const planBatches = (input: BatchPlanInput): BatchPlan => {
     const modelCallsPerBatch = requirePositiveInteger(input.modelCallsPerBatch, 'modelCallsPerBatch');
 
     const candidates = input.aiCandidatesByCategory;
-    const batchesByCategory: Record<string, number> = {};
+
+    // Prototype-free on purpose — do not "simplify" this back to `{}`. The
+    // coverage plan is JSON parsed from disk, and JSON.parse creates a literal
+    // `__proto__` key as an ordinary own property. `Object.keys` enumerates it
+    // and `candidates['__proto__']` reads its own value correctly, so the loop
+    // below counts it into `totalBatches`; but assigning it on a plain object
+    // reaches Object.prototype's setter, which takes an object or null and
+    // silently drops a number. The category would then be counted in the
+    // estimate and missing from the per-category plan, leaving the two halves
+    // of the same return value disagreeing about how much a run will cost.
+    const batchesByCategory: Record<string, number> = Object.create(null) as Record<string, number>;
     let totalBatches = 0;
 
     // Guarded rather than trusted, like logger.ts's and checkpoint.ts's own

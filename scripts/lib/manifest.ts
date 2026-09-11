@@ -123,6 +123,25 @@ const MAX_ASCENT_LEVELS = 6;
 // real root.
 const repoRootCache = new Map<string, string>();
 
+// A byte-order mark is the one invisible reason a reviewed JSON file refuses to
+// parse, and reading as `utf8` hands it straight through: Node decodes the three
+// UTF-8 bytes to U+FEFF and leaves it at the head of the string, where
+// `JSON.parse` rejects it as an unexpected token. RFC 8259 §8.1 lets a parser
+// ignore it, every editor renders the document as ordinary JSON, and it arrives
+// by accident rather than by intent — an editor or an export saving "UTF-8 with
+// BOM" over a file authored here. So one leading mark is dropped before parsing,
+// at both of this module's parse sites, and the reader names it (below) instead
+// of a run dying over a byte nobody can see.
+//
+// One, and only at the head. A second mark, or one between values, is document
+// content rather than an encoding artefact, and a file carrying it stays
+// invalid — tolerating those would start repairing documents, which is not this
+// module's job.
+const UTF8_BOM = '\uFEFF';
+
+const stripUtf8Bom = (text: string): string =>
+    text.startsWith(UTF8_BOM) ? text.slice(UTF8_BOM.length) : text;
+
 const hasRepoPackageJson = (candidate: string): boolean => {
     let raw: string;
     try {
@@ -132,7 +151,12 @@ const hasRepoPackageJson = (candidate: string): boolean => {
     }
 
     try {
-        const parsed: unknown = JSON.parse(raw);
+        // Stripped here too, and silently: a mark on the repository's own
+        // `package.json` would otherwise make this candidate unparseable, the
+        // walk run out of ancestors, and the failure report `repo_root_not_found`
+        // — sending an operator to look for a wrong checkout over one byte in a
+        // file that is not even the one being loaded.
+        const parsed: unknown = JSON.parse(stripUtf8Bom(raw));
         return (
             parsed !== null &&
             typeof parsed === 'object' &&
@@ -370,13 +394,36 @@ export const readJsonFile = <T>(absolutePath: string): T => {
         throw error;
     }
 
+    const hadBom = raw.startsWith(UTF8_BOM);
+    if (hadBom) {
+        // Named rather than swallowed. The document parses once the mark is
+        // ignored, so the run continues — but the mark is invisible in every
+        // editor, it survives into a reviewed diff, and the bytes of a file are
+        // what `catalog-load.ts` checksums a release against, so an operator who
+        // is never told keeps a file that reads as correct and hashes as
+        // something else. A mark is a fact about the file's encoding rather than
+        // any of its content, so saying so leaves the rule below intact.
+        logger.warn('manifest_bom_stripped', {
+            file: describePath(absolutePath),
+            remedy: 'Re-save the file as UTF-8 without a byte-order mark.',
+        });
+    }
+
     try {
-        return JSON.parse(raw) as T;
+        return JSON.parse(stripUtf8Bom(raw)) as T;
     } catch {
         // The parser's own message is deliberately dropped rather than
         // forwarded: since Node 20 it quotes the offending part of the document,
-        // and file contents must never reach a log or a committed report.
-        throw new ManifestError('invalid_json', `${describePath(absolutePath)} is not valid JSON.`);
+        // and file contents must never reach a log or a committed report. What
+        // takes its place is the one cause an operator cannot see in the file
+        // itself, so a document that still fails after its mark was ignored says
+        // that much rather than leaving the encoding as an open question.
+        throw new ManifestError(
+            'invalid_json',
+            hadBom
+                ? `${describePath(absolutePath)} is not valid JSON, even with its leading byte-order mark ignored. Re-save it as UTF-8 without a byte-order mark, then check the document parses.`
+                : `${describePath(absolutePath)} is not valid JSON.`,
+        );
     }
 };
 

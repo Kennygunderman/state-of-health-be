@@ -80,19 +80,25 @@ const CONFIRM_TARGET_FLAG = '--confirm-target';
 // Hosts that can only be this machine or the container network beside it.
 // Exported because src/__tests__/setup/testDb.ts::assertTestDatabase builds its
 // own check on these same rules; duplicating them there would let the two drift.
-// The rules themselves are `isLocalDatabaseHost`, `isTestDatabaseName`,
-// `isShadowDatabaseName`, `isTestDatabaseOrigin` and `isShadowDatabaseOrigin`
-// below, which is what that guard should import: the two `…Name` predicates own
-// the database-name half of the rule (including the clone-index form), the two
-// `…Origin` predicates apply the host half on top of them.
+// The rules themselves are `isLocalDatabaseHost`, the three `…Name` predicates
+// (`isTestDatabaseName`, `isShadowDatabaseName`, `isDevelopmentDatabaseName`)
+// and the three `…Origin` predicates built from them (`isTestDatabaseOrigin`,
+// `isShadowDatabaseOrigin`, `isDevelopmentDatabaseOrigin`) below, which is what
+// that guard should import: each `…Name` predicate owns the database-name half
+// of its rule (including the clone-index form where the name carries one), and
+// each `…Origin` predicate applies this host half on top of it. Every class is
+// host-gated, so no database name on its own reaches one.
 export const LOCAL_HOSTS: readonly string[] = ['localhost', '127.0.0.1', 'postgres'];
 
-// Narrower than LOCAL_HOSTS on purpose. `postgres` is a container-network
-// service name, which in CI or a compose stack can resolve to a database that is
-// nobody's development box. It earns membership in the test and `ci` rules,
-// where the database *name* is what identifies the origin, but it must not make
-// an unrecognised name pass as development: `…@postgres/state_of_health` is
-// therefore `unknown` and refused, while `…@postgres/soh_test` is `test`.
+// Narrower than LOCAL_HOSTS on purpose, and the line it draws is between the two
+// arms of the development rule rather than between classes. `postgres` is a
+// container-network service name, which in CI or a compose stack can resolve to a
+// database that is nobody's development box. It earns membership in every NAME
+// rule — `_test`, `ci`, `_shadow` and `_dev`, where the database name is what
+// identifies the origin — but not in the HOST arm below, so it must not make an
+// unrecognised name pass as development: `…@postgres/state_of_health` is
+// therefore `unknown` and refused, while `…@postgres/soh_test` is `test` and
+// `…@postgres/soh_dev` is `development`.
 export const DEVELOPMENT_HOSTS: readonly string[] = ['localhost', '127.0.0.1'];
 
 export const TEST_DATABASE_SUFFIX = '_test';
@@ -164,6 +170,22 @@ export const isTestDatabaseName = (database: string): boolean =>
 // database (see isShadowDatabaseOrigin below).
 export const isShadowDatabaseName = (database: string): boolean => SHADOW_DATABASE_NAME_PATTERN.test(database);
 
+// The database-name half of the development rule, named and exported for the
+// same reason as the two above: one definition, so a caller composing its own
+// check cannot derive a second one that disagrees.
+//
+// A plain suffix, deliberately NOT the clone-index pattern the test and shadow
+// names accept, and the asymmetry is a decision rather than an omission.
+// `development` is the one class with a second arm — the DEVELOPMENT_HOSTS host
+// rule at the end of classifyDatabaseOrigin — and a clone's `soh_dev_<index>`
+// is provisioned on 127.0.0.1, so it already classifies through that arm;
+// `test` and `shadow` have no host-only arm, which is why for them the indexed
+// pattern is the only path to their class. Widening this one would only ADD
+// acceptances that nothing provisions (`…@postgres/app_dev_7`), which is the
+// wrong direction for a guard.
+export const isDevelopmentDatabaseName = (database: string): boolean =>
+    database.endsWith(DEVELOPMENT_DATABASE_SUFFIX);
+
 // Connection parameters that move the connection somewhere other than the
 // authority and path the URL displays. libpq reads `host`, `hostname`, `port`,
 // `dbname` and the `service`/`servicefile` indirection from the query string,
@@ -204,14 +226,17 @@ const REASON_CONNECTION_PARAMS_PREFIX = `${DATABASE_URL_ENV} query string sets c
 const describeConnectionRedirectingParams = (params: readonly string[]): string =>
     `${REASON_CONNECTION_PARAMS_PREFIX}${params.join(', ')}`;
 
-// The other way a URL can fail to name its own target, and the reason it is a
-// refusal rather than a classification: `postgresql:///soh_dev` parses, and
-// names a database, but carries no authority — verified with
-// pg-connection-string, which returns `host: ''` for it. Both `pg` and libpq
-// then fall back to PGHOST/PGSERVICE or the default unix socket, so the server
-// is chosen outside the URL and can be anywhere, while the `_dev` name rule
-// below would otherwise certify the origin as `development`. A host the guard
-// cannot see is a host it cannot vouch for.
+// The other way a URL can fail to name its own target, and the reason it gets a
+// refusal of its own rather than falling through to the generic one:
+// `postgresql:///soh_dev` parses, and names a database, but carries no
+// authority — verified with pg-connection-string, which returns `host: ''` for
+// it. Both `pg` and libpq then fall back to PGHOST/PGSERVICE or the default unix
+// socket, so the server is chosen outside the URL and can be anywhere. Every
+// name rule is host-gated, so such a URL could not reach a recognised class in
+// any case; naming this reason explicitly is what turns the answer from "no rule
+// matched" into the one thing the operator can act on — the URL, not the
+// database, is what has to change. A host the guard cannot see is a host it
+// cannot vouch for.
 const REASON_NO_HOST = `${DATABASE_URL_ENV} names no host`;
 
 // The third, and the one that is not a matter of degree: with Prisma opening the
@@ -227,18 +252,39 @@ const REASON_ENCODED_NAME = `${DATABASE_URL_ENV} database name is percent-encode
 const REASON_TEST_SUFFIX = `database name ends in ${TEST_DATABASE_SUFFIX}, with or without a clone index, on a local host`;
 const REASON_CI_NAME = `database name is ${CI_DATABASE_NAME} on a local host`;
 const REASON_SHADOW_SUFFIX = `database name ends in ${SHADOW_DATABASE_SUFFIX}, with or without a clone index, on a local host`;
-const REASON_DEVELOPMENT_SUFFIX = `database name ends in ${DEVELOPMENT_DATABASE_SUFFIX}`;
+// "on a local host" for the same reason the two above carry it: the rule is
+// host-gated (isDevelopmentDatabaseOrigin), and a reason that named the suffix
+// alone would read as a licence the rule does not grant.
+const REASON_DEVELOPMENT_SUFFIX = `database name ends in ${DEVELOPMENT_DATABASE_SUFFIX}, on a local host`;
 const REASON_DEVELOPMENT_HOST = 'host is a development host';
 const REASON_NO_RULE_MATCHED =
     'the database name matches no recognised rule on this host and the host is not a development host';
+
+// The development rule in one phrase, defined once because two operator-facing
+// refusals quote it and a rule described two ways is a rule an operator has to
+// guess at. Both arms carry their host requirement, so neither reading suggests
+// that a `_dev` name travels.
+const DEVELOPMENT_ORIGIN_DESCRIPTION =
+    `host ${DEVELOPMENT_HOSTS.join(' or ')}, or a name ending ${DEVELOPMENT_DATABASE_SUFFIX} ` +
+    `on host ${LOCAL_HOSTS.join(', ')}`;
+
+// The sentence an operator needs when a remote database wearing a recognised
+// name is refused. Without it the `unrecognised_origin` message names the three
+// classes and leaves someone who deliberately called their database `app_dev`
+// with no way to tell that the host, not the name, is what disqualified it.
+const LOCAL_ORIGIN_REQUIREMENT =
+    `Every recognised origin is on host ${LOCAL_HOSTS.join(', ')}: a ${DEVELOPMENT_DATABASE_SUFFIX}, ` +
+    `${TEST_DATABASE_SUFFIX} or ${SHADOW_DATABASE_SUFFIX} name does not make a remote database one.`;
 
 export const SCRIPT_DATABASE_POLICIES: Readonly<Record<string, ScriptDatabasePolicy>> = {
     // The loader is the only sanctioned way to populate a shared environment
     // with catalog data, so it keeps a door — guarded by an explicit flag.
     'catalog-load': 'development_or_confirmed',
     'recipes-seed': 'development_or_confirmed',
-    // Writes user-scoped rows (a development user, its preferences, its diary
-    // buckets), so there is no door to open.
+    // Writes user-scoped rows, so there is no door to open. The wording the
+    // refusal quotes is not repeated here: it lives once in
+    // DEVELOPMENT_ONLY_RATIONALES below, so the reason an operator reads and the
+    // reason recorded beside the policy cannot drift apart.
     'seed-dev': 'development_only',
     // Development-machine pipeline stages. They still must never address an
     // origin this module cannot classify.
@@ -251,8 +297,50 @@ export const SCRIPT_DATABASE_POLICIES: Readonly<Record<string, ScriptDatabasePol
 };
 
 // A script name absent from the table is a caller mistake, and a mistake must
-// not make the guard weaker than its strictest setting.
+// not make the guard weaker than its strictest setting. The strictest setting
+// happens to be `seed-dev`'s, which is exactly why the refusal has to name
+// which of the two reasons applied — see describeDevelopmentOnlyPolicy.
 const FALLBACK_POLICY: ScriptDatabasePolicy = 'development_only';
+
+// Why a particular script is development-only. A `development_only` refusal is
+// the only account of that decision an operator gets, so it states the reason
+// that applies to the caller in front of it rather than one script's reason for
+// all of them: told that their module "writes user-scoped rows", someone
+// debugging an unlisted entry point goes looking for a write path that does not
+// exist, and never learns that the policy table is what they are missing.
+//
+// A map rather than a conditional so that adding a second development-only
+// script is a one-line data change that cannot silently inherit seed-dev's
+// rationale.
+const DEVELOPMENT_ONLY_RATIONALES: Readonly<Record<string, string>> = {
+    'seed-dev': 'writes user-scoped rows (a development user, its preferences, its diary buckets)',
+};
+
+const DEVELOPMENT_ONLY_CLAUSE = 'runs against a development database only';
+
+/**
+ * The opening clause of a `development_only` refusal: the script, why the policy
+ * applies to it, and the policy itself.
+ *
+ * Three cases, each true of its input — a script the table lists with a
+ * recorded rationale, a script absent from the table (FALLBACK_POLICY, and the
+ * absence IS the reason), and a listed script with no rationale yet, which
+ * states the policy without inventing a motive for it. Both lookups go through
+ * hasOwnProperty for the reason entryScriptName does: a caller named
+ * `constructor` or `toString` would otherwise resolve through Object's
+ * prototype and produce a rationale out of a function body.
+ */
+const describeDevelopmentOnlyPolicy = (script: string): string => {
+    if (Object.prototype.hasOwnProperty.call(DEVELOPMENT_ONLY_RATIONALES, script)) {
+        return `${script} ${DEVELOPMENT_ONLY_RATIONALES[script]}, so it ${DEVELOPMENT_ONLY_CLAUSE}`;
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(SCRIPT_DATABASE_POLICIES, script)) {
+        return `${script} is not a known pipeline script, so it falls back to the strictest policy and ${DEVELOPMENT_ONLY_CLAUSE}`;
+    }
+
+    return `${script} ${DEVELOPMENT_ONLY_CLAUSE}`;
+};
 
 export const parseDatabaseUrl = (databaseUrl: string): { host: string; database: string; port: string } | null => {
     let parsed: URL;
@@ -346,11 +434,12 @@ export const findConnectionRedirectingParams = (databaseUrl: string): string[] =
  * escapes differently (Prisma opens the literal name, `pg` decodes it; both
  * measured, see parseDatabaseUrl). Whichever spelling the guard classified, the
  * other connector would open a different database, which is the whole failure
- * mode: `…@prod.example.com/prod%5Fdev` classified on the decoded name is a
- * REMOTE database certified `development` by the host-independent `_dev` rule,
- * while `…@127.0.0.1/soh%5Ftest` classified on the literal name skips the
- * `_test` rule and loses `catalog-load`'s `--confirm-target`. Refusing the
- * encoded form is the only answer that is wrong in neither direction.
+ * mode, and it is reachable in both directions: `…@127.0.0.1/soh%5Ftest`
+ * classified on the literal name skips the `_test` rule, falls through to the
+ * host rule as `development`, and loses `catalog-load`'s `--confirm-target`,
+ * while `…@postgres/soh%5Fdev` is `unknown` on the literal name and
+ * `development` on the decoded one. Refusing the encoded form is the only answer
+ * that is wrong in neither direction.
  *
  * The cost is that a database whose real name contains a `%` cannot be reached
  * through these scripts at all. That is accepted: no environment this pipeline
@@ -405,6 +494,34 @@ export const isTestDatabaseOrigin = (target: DatabaseTarget): boolean =>
 export const isShadowDatabaseOrigin = (target: DatabaseTarget): boolean =>
     isLocalDatabaseHost(target.host) && isShadowDatabaseName(target.database);
 
+// Local-host-gated like the two above, and this is the rule whose gate matters
+// most, because `development` is the most privileged class this module hands
+// out: it is the only one `catalog-load` and `recipes-seed` write to without
+// `--confirm-target`, and the only one `seed-dev` accepts at all. Ungated — the
+// literal reading of the Agent Action Plan §0.7.1 disjunction, "host in
+// {localhost, 127.0.0.1} OR name ending _dev" — a remote database called
+// `app_dev` reached that class on the strength of its name, so all three of
+// those writes proceeded against it silently, while `…@prod.example.com/app_test`
+// was refused. The asymmetry ran the wrong way: the two *less* privileged
+// classes were pinned to a local host and the most privileged one was not.
+//
+// §0.4.4 is the sentence that settles it — "every script and test refuses a
+// DATABASE_URL whose host is not localhost/127.0.0.1/postgres" — and that host
+// set is LOCAL_HOSTS. Gating here is the only reading under which both
+// requirements hold at once, and it makes §0.7.1's own stated goal true rather
+// than aspirational: no load or seed can run against a non-development database
+// without a human typing its name.
+//
+// The gate is LOCAL_HOSTS, not the narrower DEVELOPMENT_HOSTS, so that a
+// container-network `…@postgres/soh_dev` keeps the class it has always had;
+// narrowing further would refuse a compose-stack database that no finding is
+// about. The change is therefore purely acceptance-REMOVING: a remote `_dev`
+// name now matches no rule, falls through to `unknown`, and is refused by every
+// policy including `any_recognised` — `--confirm-target` cannot reach it either,
+// because an unclassifiable origin is refused before any policy is consulted.
+export const isDevelopmentDatabaseOrigin = (target: DatabaseTarget): boolean =>
+    isLocalDatabaseHost(target.host) && isDevelopmentDatabaseName(target.database);
+
 export const classifyDatabaseOrigin = (databaseUrl: string | undefined): DatabaseOrigin => {
     if (!databaseUrl || databaseUrl.trim().length === 0) {
         return { originClass: 'unknown', host: '', database: '', reason: REASON_MISSING_DATABASE_URL };
@@ -447,10 +564,13 @@ export const classifyDatabaseOrigin = (databaseUrl: string | undefined): Databas
 
     // Same fail-closed reasoning as the query-parameter check above, for the
     // other half of "the URL does not determine its own target": with no
-    // authority there is no host to apply a host rule to, and no host rule is
-    // what makes the name rules the whole decision — `postgresql:///soh_dev`
-    // would be `development` on a server chosen by PGHOST. The database name is
-    // still reported, because it is the one part of the target the URL does fix.
+    // authority there is no host to vouch for, and the server comes from PGHOST
+    // or a default socket rather than from the URL. The host-gated name rules
+    // below would already refuse it — an empty host is in no host list — so this
+    // branch exists for the diagnosis: `ambiguous_database_url` names the URL as
+    // the thing to fix, where `unrecognised_origin` would point at the database.
+    // The database name is still reported, because it is the one part of the
+    // target the URL does fix.
     if (host.length === 0) {
         return { originClass: 'unknown', host: '', database, reason: REASON_NO_HOST };
     }
@@ -468,15 +588,14 @@ export const classifyDatabaseOrigin = (databaseUrl: string | undefined): Databas
     // `shadow` is its own class rather than a flavour of development because
     // Prisma's `migrate diff` resets that database.
     //
-    // The name rules are local-host-gated (isTestDatabaseOrigin /
-    // isShadowDatabaseOrigin); the `_dev` rule below is not. That asymmetry is
-    // the Agent Action Plan §0.7.1 definition, not an inconsistency: `test` and
-    // `shadow` are "the assertTestDatabase rules", which require a host in
-    // LOCAL_HOSTS, while `development` is defined there as the disjunction
-    // "host in {localhost, 127.0.0.1} OR name ending _dev". A `_dev` name on a
-    // remote host therefore still classifies `development` by specification —
-    // and it is the weakest class to land in only for `seed-dev`, which writes
-    // user-scoped rows it created itself.
+    // All three name rules are local-host-gated — isTestDatabaseOrigin,
+    // isShadowDatabaseOrigin and isDevelopmentDatabaseOrigin — so every
+    // recognised class requires a host in LOCAL_HOSTS and a database name alone
+    // never certifies an origin. That makes the `_dev` arm of the Agent Action
+    // Plan §0.7.1 disjunction narrower than its literal wording, which the
+    // predicate documents in full; §0.4.4's "every script and test refuses a
+    // DATABASE_URL whose host is not localhost/127.0.0.1/postgres" is the
+    // requirement that decides it.
     if (isTestDatabaseOrigin({ host, database })) {
         // CI's database is named plainly (`ci`), so the two halves of the test
         // rule are distinguished here only to name the matched rule in `reason`.
@@ -491,16 +610,12 @@ export const classifyDatabaseOrigin = (databaseUrl: string | undefined): Databas
     if (isShadowDatabaseOrigin({ host, database })) {
         return { originClass: 'shadow', host, database, reason: REASON_SHADOW_SUFFIX };
     }
-    // Deliberately NOT widened to `_dev_<index>`, and the asymmetry with the two
-    // rules above is load-bearing rather than an oversight to tidy up: this is
-    // the one name rule that is not gated on a local host, so accepting an
-    // indexed form here would newly certify a REMOTE `…_dev_7` database as
-    // `development` — the class `seed-dev` writes user-scoped rows into with no
-    // confirmation door. That is a weakening, and nothing needs it: a clone's
-    // `soh_dev_<index>` is provisioned on 127.0.0.1, so it already reaches
-    // `development` through the host rule below, which is the other half of the
-    // §0.7.1 disjunction.
-    if (database.endsWith(DEVELOPMENT_DATABASE_SUFFIX)) {
+    // Still a plain `_dev` suffix rather than the clone-index pattern its two
+    // siblings use, because nothing needs the indexed form here: a clone's
+    // `soh_dev_<index>` is provisioned on 127.0.0.1 and reaches `development`
+    // through the host rule below, the other arm of the §0.7.1 disjunction. See
+    // isDevelopmentDatabaseName.
+    if (isDevelopmentDatabaseOrigin({ host, database })) {
         return { originClass: 'development', host, database, reason: REASON_DEVELOPMENT_SUFFIX };
     }
     if (DEVELOPMENT_HOSTS.includes(host)) {
@@ -623,7 +738,9 @@ export const evaluateScriptDatabase = (input: {
         return {
             allowed: false,
             code: 'unrecognised_origin',
-            message: `${script} refuses to run against ${target}: it is not a recognised ${RECOGNISED_ORIGIN_CLASSES} origin.`,
+            message:
+                `${script} refuses to run against ${target}: it is not a recognised ` +
+                `${RECOGNISED_ORIGIN_CLASSES} origin. ${LOCAL_ORIGIN_REQUIREMENT}`,
         };
     }
 
@@ -632,8 +749,7 @@ export const evaluateScriptDatabase = (input: {
             allowed: false,
             code: 'development_only',
             message:
-                `${script} writes user-scoped rows, so it runs against a development database only ` +
-                `(host ${DEVELOPMENT_HOSTS.join(' or ')}, or a name ending ${DEVELOPMENT_DATABASE_SUFFIX}); ` +
+                `${describeDevelopmentOnlyPolicy(script)} (${DEVELOPMENT_ORIGIN_DESCRIPTION}); ` +
                 `${target} is ${origin.originClass}. There is no confirmation flag for this script.`,
         };
     }
