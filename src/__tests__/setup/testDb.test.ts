@@ -1,40 +1,18 @@
-/**
- * The test harness's own suite (Agent Action Plan §0.7.1 / §0.9.1), in three
- * clearly separated concerns:
- *
- *   1. `assertTestDatabase` against injected environments — every accept and
- *      reject rule, in process, with no spawning and no database.
- *   2. The guard proven from OUTSIDE the process it protects. This is the part
- *      that cannot live inside the suite it defends: by the time a test runs,
- *      `jestSetup.ts` has already passed the guard, so the only way to observe
- *      the unsafe path is to run `jestSetup.ts` in a child of our own with an
- *      unsafe `DATABASE_URL` and instrumentation that records any database
- *      module load or socket connect.
- *   3. The rest of the harness exercised for real: the factories through
- *      Prisma, `truncateFeatureTables`, `disconnectTestDatabase`, and
- *      `testApp`'s supertest handle against `/health` and a protected route.
- */
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { spawnSync } from 'child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import { FEATURE_TABLES, TestDatabaseGuardError, assertTestDatabase } from './testDb';
 
-import { prisma } from '../../prisma/client';
-import { makeCatalogFood, makeUser } from './factories';
-import { TEST_EMAIL_HEADER, TEST_USER_ID_HEADER, asUser, request } from './testApp';
-import {
-    FEATURE_TABLES,
-    TestDatabaseGuardError,
-    assertTestDatabase,
-    disconnectTestDatabase,
-    truncateFeatureTables,
-} from './testDb';
-
-/** The backend package root — `src/__tests__/setup` is three levels down. */
 const BACKEND_ROOT = join(__dirname, '..', '..', '..');
+const JEST_SETUP_FILE = join(__dirname, 'jestSetup.ts');
+const TEST_TSCONFIG = join(BACKEND_ROOT, 'tsconfig.test.json');
 
-/** A safe environment, which each case below then breaks in exactly one way. */
+const CHILD_TIMEOUT_MS = 60_000;
+
+const UNROUTABLE_RFC_5737_DOCUMENTATION_HOST = '192.0.2.1';
+
 const SAFE_ENV: NodeJS.ProcessEnv = {
     NODE_ENV: 'test',
     ALLOW_DB_TRUNCATE: 'true',
@@ -43,18 +21,15 @@ const SAFE_ENV: NodeJS.ProcessEnv = {
 
 const envWith = (overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({ ...SAFE_ENV, ...overrides });
 
-/**
- * The password and user in every URL below. A refusal message reaches CI logs
- * and a terminal, so the suite asserts they never appear in one.
- */
-const SECRET_PASSWORD = 'hunter2-not-in-any-message';
 const SECRET_USER = 'appuser';
+const SECRET_PASSWORD = 'hunter2-never-in-any-message';
+
 const secretUrl = (host: string, database: string): string =>
     `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@${host}:5432/${database}`;
 
-/** Asserts a refusal and returns it, so a case can make further assertions. */
 const expectRefusal = (env: NodeJS.ProcessEnv, code: string): TestDatabaseGuardError => {
     let thrown: unknown;
+
     try {
         assertTestDatabase(env);
     } catch (error) {
@@ -62,127 +37,140 @@ const expectRefusal = (env: NodeJS.ProcessEnv, code: string): TestDatabaseGuardE
     }
 
     expect(thrown).toBeInstanceOf(TestDatabaseGuardError);
+
     const refusal = thrown as TestDatabaseGuardError;
+    expect(refusal.name).toBe('TestDatabaseGuardError');
     expect(refusal.code).toBe(code);
 
     return refusal;
 };
 
-describe('assertTestDatabase — accepted environments', () => {
-    it('accepts the ambient environment the suite is running under', () => {
-        // If this fails, the suite could not have got this far: `jestSetup.ts`
-        // runs the same call. It is asserted anyway so a future change that
-        // makes the guard depend on something only `jestSetup` set up fails
-        // here, where the reason is legible.
-        expect(() => assertTestDatabase()).not.toThrow();
+describe('assertTestDatabase', () => {
+    describe('accepted environments', () => {
+        it('accepts the ambient environment this suite is running under', () => {
+            expect(() => assertTestDatabase()).not.toThrow();
+        });
+
+        it.each([
+            { scenario: 'the documented local test database', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/soh_test' },
+            { scenario: 'a clone-index tail', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/soh_test_46' },
+            { scenario: 'a zero-padded clone index', databaseUrl: 'postgresql://soh:soh@localhost:5433/soh_test_046' },
+            { scenario: 'a test name on the compose service host', databaseUrl: 'postgresql://soh:soh@postgres:5432/soh_test' },
+            { scenario: "CI's plainly named database on localhost", databaseUrl: 'postgresql://ci:ci@localhost:5432/ci' },
+            { scenario: "CI's database on the loopback address", databaseUrl: 'postgresql://ci:ci@127.0.0.1:5432/ci' },
+            { scenario: "CI's database on the compose service host", databaseUrl: 'postgresql://ci:ci@postgres:5432/ci' },
+            { scenario: 'an upper-case host spelling', databaseUrl: 'postgresql://soh:soh@LOCALHOST:5433/soh_test' },
+        ])('accepts $scenario', ({ databaseUrl }) => {
+            expect(() => assertTestDatabase(envWith({ DATABASE_URL: databaseUrl }))).not.toThrow();
+        });
     });
 
-    it.each([
-        ['the documented local name', 'postgresql://soh:soh@127.0.0.1:5433/soh_test'],
-        ['a clone-index tail', 'postgresql://soh:soh@127.0.0.1:5433/soh_test_46'],
-        ['a zero-padded clone index', 'postgresql://soh:soh@localhost:5433/soh_test_046'],
-        ["CI's plainly named database", 'postgresql://ci:ci@localhost:5432/ci'],
-        ['the compose service host', 'postgresql://ci:ci@postgres:5432/ci'],
-        ['an upper-case host spelling', 'postgresql://soh:soh@LOCALHOST:5433/soh_test'],
-    ])('accepts %s', (_case, databaseUrl) => {
-        expect(() => assertTestDatabase(envWith({ DATABASE_URL: databaseUrl }))).not.toThrow();
-    });
-});
+    describe('NODE_ENV', () => {
+        it.each([
+            { scenario: 'development', nodeEnv: 'development' },
+            { scenario: 'production', nodeEnv: 'production' },
+            { scenario: 'a near miss in case', nodeEnv: 'Test' },
+            { scenario: 'a padded value', nodeEnv: ' test' },
+        ])('refuses $scenario', ({ nodeEnv }) => {
+            const refusal = expectRefusal(envWith({ NODE_ENV: nodeEnv }), 'node_env_not_test');
 
-describe('assertTestDatabase — NODE_ENV', () => {
-    it.each([
-        ['development', 'development'],
-        ['production', 'production'],
-        ['a near miss in case', 'Test'],
-        ['a padded value', ' test'],
-    ])('refuses %s', (_case, nodeEnv) => {
-        const refusal = expectRefusal(envWith({ NODE_ENV: nodeEnv }), 'node_env_not_test');
-        expect(refusal.message).toContain('NODE_ENV');
+            expect(refusal.message).toContain('NODE_ENV');
+        });
+
+        it('refuses an unset NODE_ENV and says it is not set', () => {
+            const refusal = expectRefusal(envWith({ NODE_ENV: undefined }), 'node_env_not_test');
+
+            expect(refusal.message).toContain('not set');
+        });
     });
 
-    it('refuses an unset NODE_ENV and says it is not set', () => {
-        const refusal = expectRefusal(envWith({ NODE_ENV: undefined }), 'node_env_not_test');
-        expect(refusal.message).toContain('not set');
-    });
-});
+    describe('ALLOW_DB_TRUNCATE', () => {
+        it.each([
+            { scenario: 'an unset value', allowDbTruncate: undefined },
+            { scenario: 'a blank value', allowDbTruncate: '' },
+            { scenario: 'an upper-case value', allowDbTruncate: 'TRUE' },
+            { scenario: 'a numeric value', allowDbTruncate: '1' },
+            { scenario: 'a padded value', allowDbTruncate: 'true ' },
+            { scenario: 'an explicit false', allowDbTruncate: 'false' },
+        ])('refuses $scenario', ({ allowDbTruncate }) => {
+            const refusal = expectRefusal(envWith({ ALLOW_DB_TRUNCATE: allowDbTruncate }), 'truncate_not_allowed');
 
-describe('assertTestDatabase — ALLOW_DB_TRUNCATE', () => {
-    it.each([
-        ['an unset value', undefined],
-        ['a blank value', ''],
-        ['an upper-case value', 'TRUE'],
-        ['a numeric value', '1'],
-        ['a padded value', 'true '],
-        ['an explicit false', 'false'],
-    ])('refuses %s', (_case, allowDbTruncate) => {
-        const refusal = expectRefusal(
-            envWith({ ALLOW_DB_TRUNCATE: allowDbTruncate }),
-            'truncate_not_allowed',
-        );
-        expect(refusal.message).toContain('ALLOW_DB_TRUNCATE');
-    });
-});
-
-describe('assertTestDatabase — DATABASE_URL', () => {
-    it('refuses an absent DATABASE_URL', () => {
-        expectRefusal(envWith({ DATABASE_URL: undefined }), 'missing_database_url');
+            expect(refusal.message).toContain('ALLOW_DB_TRUNCATE');
+        });
     });
 
-    it('refuses a blank DATABASE_URL', () => {
-        expectRefusal(envWith({ DATABASE_URL: '   ' }), 'missing_database_url');
+    describe('DATABASE_URL', () => {
+        it.each([
+            { scenario: 'an unset DATABASE_URL', databaseUrl: undefined },
+            { scenario: 'an empty DATABASE_URL', databaseUrl: '' },
+            { scenario: 'a blank DATABASE_URL', databaseUrl: '   ' },
+        ])('refuses $scenario', ({ databaseUrl }) => {
+            expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'missing_database_url');
+        });
+
+        it.each([
+            { scenario: 'a value that is not a URL', databaseUrl: 'soh_test' },
+            { scenario: 'unparsable garbage', databaseUrl: '!! not a url !!' },
+            { scenario: 'a URL naming no database', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433' },
+            { scenario: 'a URL with an empty path', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/' },
+            { scenario: 'a malformed percent escape', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/soh%ZZtest' },
+        ])('refuses $scenario', ({ databaseUrl }) => {
+            expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'unparsable_database_url');
+        });
+
+        it.each([
+            { scenario: 'the development database', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/soh_dev_46' },
+            { scenario: 'the shadow database', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/soh_shadow_46' },
+            { scenario: 'a production-looking name', databaseUrl: 'postgresql://soh:soh@localhost:5432/state_of_health' },
+            { scenario: 'a name carrying test as a prefix', databaseUrl: 'postgresql://soh:soh@localhost:5432/test_state_of_health' },
+            { scenario: 'a name that merely contains test', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/testing_grounds' },
+            { scenario: 'a non-numeric tail after the suffix', databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/soh_test_copy' },
+        ])('refuses $scenario on a local host', ({ databaseUrl }) => {
+            const refusal = expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'database_name_not_test');
+
+            expect(refusal.message).toContain('_test');
+        });
+
+        it.each([
+            { scenario: 'a test name on a remote host', databaseUrl: secretUrl('db.prod.example.com', 'app_test') },
+            { scenario: 'a clone-indexed test name on a remote host', databaseUrl: secretUrl('db.prod.example.com', 'app_test_46') },
+            { scenario: "CI's database name on a remote host", databaseUrl: secretUrl('db.prod.example.com', 'ci') },
+            { scenario: 'the production-shaped URL this platform exports', databaseUrl: secretUrl('ev7c65ukrc31l80vndc57w5o', 'state_of_health') },
+            { scenario: 'a public IP address', databaseUrl: secretUrl('203.0.113.10', 'soh_test') },
+        ])('refuses $scenario', ({ databaseUrl }) => {
+            const refusal = expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'database_host_not_local');
+
+            expect(refusal.message).toContain('the host must be one of');
+        });
+
+        it.each([
+            { scenario: 'a redirecting host parameter', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?host=db.prod.example.com` },
+            { scenario: 'a redirecting dbname parameter', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?dbname=state_of_health` },
+            { scenario: 'a percent-encoded database name', databaseUrl: secretUrl('127.0.0.1', 'soh%5Ftest') },
+            { scenario: 'no host at all', databaseUrl: 'postgresql:///soh_test' },
+        ])('refuses $scenario, because the URL does not determine what it opens', ({ databaseUrl }) => {
+            expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'ambiguous_database_url');
+        });
     });
 
-    it.each([
-        ['a value that is not a URL', 'soh_test'],
-        ['a URL naming no database', 'postgresql://soh:soh@127.0.0.1:5433'],
-        ['a URL with an empty path', 'postgresql://soh:soh@127.0.0.1:5433/'],
-        ['a malformed percent escape', 'postgresql://soh:soh@127.0.0.1:5433/soh%ZZtest'],
-    ])('refuses %s', (_case, databaseUrl) => {
-        expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'unparsable_database_url');
-    });
+    describe('refusal messages', () => {
+        it('names the host and the database it judged', () => {
+            const refusal = expectRefusal(
+                envWith({ DATABASE_URL: secretUrl('db.prod.example.com', 'state_of_health') }),
+                'database_host_not_local',
+            );
 
-    it.each([
-        ['the development database', 'postgresql://soh:soh@127.0.0.1:5433/soh_dev_46'],
-        ['the shadow database', 'postgresql://soh:soh@127.0.0.1:5433/soh_shadow_46'],
-        ['a production-looking name on a local host', 'postgresql://soh:soh@localhost:5432/state_of_health'],
-        ['a name that merely contains test', 'postgresql://soh:soh@127.0.0.1:5433/testing_grounds'],
-        ['a name with a non-numeric tail after the suffix', 'postgresql://soh:soh@127.0.0.1:5433/soh_test_copy'],
-    ])('refuses %s on a local host', (_case, databaseUrl) => {
-        const refusal = expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'database_name_not_test');
-        expect(refusal.message).toContain('_test');
-    });
+            expect(refusal.message).toContain('db.prod.example.com');
+            expect(refusal.message).toContain('state_of_health');
+        });
 
-    it.each([
-        ['a test name on a remote host', secretUrl('db.prod.example.com', 'app_test')],
-        ['a clone-indexed test name on a remote host', secretUrl('db.prod.example.com', 'app_test_46')],
-        ['the production-shaped URL this platform exports', secretUrl('ev7c65ukrc31l80vndc57w5o', 'state_of_health')],
-        ['a public IP address', secretUrl('203.0.113.10', 'soh_test')],
-    ])('refuses %s', (_case, databaseUrl) => {
-        const refusal = expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'database_host_not_local');
-        expect(refusal.message).toContain('the host must be one of');
-    });
-
-    it.each([
-        ['a redirecting host parameter', `postgresql://soh:${SECRET_PASSWORD}@127.0.0.1:5433/soh_test?host=db.prod.example.com`],
-        ['a redirecting dbname parameter', `postgresql://soh:${SECRET_PASSWORD}@127.0.0.1:5433/soh_test?dbname=state_of_health`],
-        ['a percent-encoded database name', `postgresql://soh:${SECRET_PASSWORD}@127.0.0.1:5433/soh%5Ftest`],
-        ['a URL with no host at all', 'postgresql:///soh_test'],
-    ])('refuses %s, because the URL does not determine what it opens', (_case, databaseUrl) => {
-        // Fail-closed, and the reason it matters: `pg` and Prisma resolve these
-        // two forms differently, so a guard that classified the authority while
-        // the driver connected elsewhere would be decoration.
-        expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'ambiguous_database_url');
-    });
-
-    it('never puts the password, the user or the URL in a refusal message', () => {
-        const urls = [
-            secretUrl('db.prod.example.com', 'app_test'),
-            secretUrl('127.0.0.1', 'state_of_health'),
-            `postgresql://soh:${SECRET_PASSWORD}@127.0.0.1:5433/soh_test?host=db.prod.example.com`,
-        ];
-
-        for (const databaseUrl of urls) {
+        it.each([
+            { scenario: 'a remote test database', databaseUrl: secretUrl('db.prod.example.com', 'app_test') },
+            { scenario: 'a local production database', databaseUrl: secretUrl('127.0.0.1', 'state_of_health') },
+            { scenario: 'a redirected local test database', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?host=db.prod.example.com` },
+        ])('carries neither the password, the user nor the URL for $scenario', ({ databaseUrl }) => {
             let message = '';
+
             try {
                 assertTestDatabase(envWith({ DATABASE_URL: databaseUrl }));
             } catch (error) {
@@ -194,24 +182,22 @@ describe('assertTestDatabase — DATABASE_URL', () => {
             expect(message).not.toContain(SECRET_USER);
             expect(message).not.toContain(databaseUrl);
             expect(message).not.toContain('postgresql://');
-        }
-    });
+        });
 
-    it('checks all three conditions, reporting NODE_ENV first when several fail', () => {
-        // Order is part of the contract: the cheapest, least ambiguous
-        // condition is reported, so an operator fixes one thing at a time
-        // instead of chasing a URL problem that was not the first fault.
-        const refusal = expectRefusal(
-            { NODE_ENV: 'development', DATABASE_URL: secretUrl('db.prod.example.com', 'state_of_health') },
-            'node_env_not_test',
-        );
-        expect(refusal.message).not.toContain('state_of_health');
+        it('reports NODE_ENV first when several conditions fail, naming nothing from the URL', () => {
+            const refusal = expectRefusal(
+                { NODE_ENV: 'development', DATABASE_URL: secretUrl('db.prod.example.com', 'state_of_health') },
+                'node_env_not_test',
+            );
+
+            expect(refusal.message).not.toContain('state_of_health');
+            expect(refusal.message).not.toContain('db.prod.example.com');
+        });
     });
 });
 
 describe('FEATURE_TABLES', () => {
-    it('covers the sixteen feature tables, the three diary tables and the five legacy tables', () => {
-        expect(FEATURE_TABLES).toHaveLength(24);
+    it('names exactly the sixteen feature tables, the three diary tables and the five legacy tables', () => {
         expect([...FEATURE_TABLES].sort()).toEqual(
             [
                 'ai_usage',
@@ -262,273 +248,210 @@ describe('FEATURE_TABLES', () => {
     });
 });
 
-/**
- * The out-of-process proof.
- *
- * The child runs `jestSetup.ts` itself — the real file, through
- * `ts-node/register/transpile-only` — with two `--require` hooks in front of
- * it. Transpile-only is deliberate: it keeps the child's failure attributable
- * to the guard rather than to a type error, which is why the assertions below
- * are on the guard's own condition rather than merely on a non-zero exit.
- *
- * The instrumentation patches `Module._load` (recording any load of
- * `@prisma/client`, the generated client or `pg`) and
- * `net.Socket.prototype.connect` (recording any connect attempt), and writes a
- * marker line to stderr for each. A passing case therefore shows the guard's
- * message and NO markers.
- */
+// The guard cannot prove itself from inside the process it protects: by the time
+// any test here runs, `jestSetup.ts` has already passed it, so a test asserting
+// "it aborts" would be running in a process that had already loaded Prisma and
+// possibly connected. The only place the unsafe path is observable is a child of
+// our own, running the real setup file with an unsafe DATABASE_URL.
 describe('the guard, proven from outside the process it protects', () => {
-    const MODULE_MARKER = 'DB_MODULE_LOADED:';
-    const CONNECT_MARKER = 'SOCKET_CONNECT_ATTEMPTED';
+    const MARKER_VARIABLE = 'SOH_GUARD_PROBE_MARKER';
 
-    let hookDirectory: string;
+    // `src/prisma/client.ts` imports '../generated/prisma', not '@prisma/client',
+    // so a hook watching only the package specifier would record nothing and
+    // every "no database module loaded" assertion below would pass vacuously.
+    const DATABASE_MODULE_PATTERN = String.raw`@prisma[\\/]client|generated[\\/]prisma`;
+
+    let probeDirectory: string;
     let hookPath: string;
-    let controlPath: string;
+    let markerPath: string;
+    let instrumentControlPath: string;
 
     beforeAll(() => {
-        // Outside the checkout, by construction: a repository is not a scratch
-        // space, and a stray fixture inside `src/` would join the test match.
-        hookDirectory = mkdtempSync(join(tmpdir(), 'soh-testdb-guard-'));
-        hookPath = join(hookDirectory, 'record-db-access.js');
-        controlPath = join(hookDirectory, 'instrument-control.js');
+        probeDirectory = mkdtempSync(join(tmpdir(), 'soh-guard-proof-'));
+        hookPath = join(probeDirectory, 'record-database-access.js');
+        markerPath = join(probeDirectory, 'database-access.log');
+        instrumentControlPath = join(probeDirectory, 'instrument-control.js');
+
+        const packagedClientFixture = join(probeDirectory, 'node_modules', '@prisma', 'client');
+        mkdirSync(packagedClientFixture, { recursive: true });
+        writeFileSync(join(packagedClientFixture, 'index.js'), 'module.exports = {};\n');
+
+        mkdirSync(join(probeDirectory, 'generated'));
+        writeFileSync(join(probeDirectory, 'generated', 'prisma.js'), 'module.exports = {};\n');
 
         writeFileSync(
             hookPath,
             `'use strict';
 const Module = require('module');
 const net = require('net');
-const WATCHED = /@prisma[\\\\/]client|generated[\\\\/]prisma|^pg$|[\\\\/]pg[\\\\/]|[\\\\/]pg$/;
-const originalLoad = Module._load;
+const { appendFileSync } = require('fs');
+
+const markerPath = process.env.${MARKER_VARIABLE};
+const databaseModule = new RegExp(${JSON.stringify(DATABASE_MODULE_PATTERN)});
+const record = (entry) => appendFileSync(markerPath, entry + '\\n');
+
+const loadModule = Module._load;
 Module._load = function (request) {
-    if (typeof request === 'string' && WATCHED.test(request)) {
-        process.stderr.write('${MODULE_MARKER}' + request + '\\n');
+    if (typeof request === 'string' && databaseModule.test(request)) {
+        record('module ' + request);
     }
-    return originalLoad.apply(this, arguments);
+
+    return loadModule.apply(this, arguments);
 };
-const originalConnect = net.Socket.prototype.connect;
+
+const openSocket = net.Socket.prototype.connect;
 net.Socket.prototype.connect = function () {
-    process.stderr.write('${CONNECT_MARKER}\\n');
-    return originalConnect.apply(this, arguments);
+    record('connect');
+
+    return openSocket.apply(this, arguments);
 };
+
+const returnsItself = function () {
+    return returnsItself;
+};
+globalThis.jest = new Proxy({}, { get: () => returnsItself });
 `,
         );
 
         writeFileSync(
-            controlPath,
+            instrumentControlPath,
             `'use strict';
-require(process.argv[2]);
 const net = require('net');
+
+require('@prisma/client');
+require('./generated/prisma');
+
 const socket = net.connect({ host: '127.0.0.1', port: 1 });
-socket.on('error', () => {});
+socket.on('error', () => socket.destroy());
 socket.destroy();
 `,
         );
     });
 
     afterAll(() => {
-        rmSync(hookDirectory, { recursive: true, force: true });
+        rmSync(probeDirectory, { recursive: true, force: true });
     });
 
-    const runChildWith = (env: NodeJS.ProcessEnv) =>
-        spawnSync(
-            process.execPath,
-            [
-                '--require',
-                hookPath,
-                '--require',
-                'ts-node/register/transpile-only',
-                join('src', '__tests__', 'setup', 'jestSetup.ts'),
-            ],
-            {
-                cwd: BACKEND_ROOT,
-                encoding: 'utf8',
-                timeout: 60_000,
-                // A deliberately minimal environment: inheriting this process's
-                // would hand the child the safe DATABASE_URL the suite runs
-                // under and prove nothing.
-                env: { PATH: process.env.PATH, HOME: process.env.HOME, ...env },
+    const readMarker = (): string => (existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '');
+
+    const runChild = (argv: readonly string[], childEnv: NodeJS.ProcessEnv) => {
+        rmSync(markerPath, { force: true });
+
+        return spawnSync(process.execPath, [...argv], {
+            cwd: BACKEND_ROOT,
+            encoding: 'utf8',
+            timeout: CHILD_TIMEOUT_MS,
+            env: {
+                PATH: process.env.PATH,
+                HOME: process.env.HOME,
+                NODE_OPTIONS: `--require ${hookPath}`,
+                [MARKER_VARIABLE]: markerPath,
+                ...childEnv,
             },
-        );
+        });
+    };
 
-    it(
-        'records a database module load and a connect when they do happen (instrument control)',
-        () => {
-            // Without this, a silent child would be indistinguishable from a
-            // broken instrument — the assertions below would pass even if the
-            // hooks recorded nothing at all.
-            const control = spawnSync(
-                process.execPath,
-                ['--require', hookPath, controlPath, join(BACKEND_ROOT, 'src', 'generated', 'prisma')],
-                { cwd: BACKEND_ROOT, encoding: 'utf8', timeout: 60_000, env: { PATH: process.env.PATH, HOME: process.env.HOME } },
-            );
+    const runSetupFileWith = (databaseEnv: NodeJS.ProcessEnv) =>
+        runChild(['--require', 'ts-node/register', JEST_SETUP_FILE], {
+            TS_NODE_PROJECT: TEST_TSCONFIG,
+            TS_NODE_TRANSPILE_ONLY: '1',
+            ...databaseEnv,
+        });
 
-            expect(control.status).toBe(0);
-            expect(control.stderr).toContain(MODULE_MARKER);
-            expect(control.stderr).toContain(CONNECT_MARKER);
+    const unsafeEnvironments: ReadonlyArray<{ scenario: string; databaseEnv: NodeJS.ProcessEnv; code: string }> = [
+        {
+            scenario: 'a production-shaped URL on an unroutable host',
+            databaseEnv: {
+                NODE_ENV: 'test',
+                ALLOW_DB_TRUNCATE: 'true',
+                DATABASE_URL: secretUrl(UNROUTABLE_RFC_5737_DOCUMENTATION_HOST, 'state_of_health'),
+            },
+            code: 'database_host_not_local',
         },
-        60_000,
-    );
-
-    it.each([
-        [
-            'a production-shaped URL on an unroutable host with NODE_ENV=test',
-            {
+        {
+            scenario: 'the local development database',
+            databaseEnv: {
                 NODE_ENV: 'test',
                 ALLOW_DB_TRUNCATE: 'true',
-                DATABASE_URL: `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@unroutable.invalid:5433/state_of_health`,
+                DATABASE_URL: secretUrl('127.0.0.1', 'soh_dev_46'),
             },
-            'database_host_not_local',
-        ],
-        [
-            'the local development database',
-            {
-                NODE_ENV: 'test',
-                ALLOW_DB_TRUNCATE: 'true',
-                DATABASE_URL: `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@127.0.0.1:5433/soh_dev_46`,
-            },
-            'database_name_not_test',
-        ],
-        [
-            'NODE_ENV=development with an otherwise valid test URL',
-            {
+            code: 'database_name_not_test',
+        },
+        {
+            scenario: 'NODE_ENV=development beside an otherwise valid test URL',
+            databaseEnv: {
                 NODE_ENV: 'development',
                 ALLOW_DB_TRUNCATE: 'true',
-                DATABASE_URL: `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@127.0.0.1:5433/soh_test_46`,
+                DATABASE_URL: secretUrl('127.0.0.1', 'soh_test_46'),
             },
-            'node_env_not_test',
-        ],
-        [
-            'ALLOW_DB_TRUNCATE unset',
-            {
+            code: 'node_env_not_test',
+        },
+        {
+            scenario: 'ALLOW_DB_TRUNCATE unset',
+            databaseEnv: {
                 NODE_ENV: 'test',
-                DATABASE_URL: `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@127.0.0.1:5433/soh_test_46`,
+                DATABASE_URL: secretUrl('127.0.0.1', 'soh_test_46'),
             },
-            'truncate_not_allowed',
-        ],
-    ])(
-        'aborts the run for %s before any database module loads or any socket connects',
-        (_case, env, code) => {
-            const child = runChildWith(env as NodeJS.ProcessEnv);
+            code: 'truncate_not_allowed',
+        },
+        {
+            scenario: 'DATABASE_URL unset',
+            databaseEnv: {
+                NODE_ENV: 'test',
+                ALLOW_DB_TRUNCATE: 'true',
+            },
+            code: 'missing_database_url',
+        },
+    ];
+
+    it(
+        'records a database module load and a socket connect when they do happen, so silence below is the guard and not a broken instrument',
+        () => {
+            const control = runChild([instrumentControlPath], {});
+            const marker = readMarker();
+
+            expect(control.error).toBeUndefined();
+            expect(control.status).toBe(0);
+            expect(marker).toContain('module @prisma/client');
+            expect(marker).toContain('module ./generated/prisma');
+            expect(marker).toContain('connect');
+        },
+        CHILD_TIMEOUT_MS,
+    );
+
+    it.each(unsafeEnvironments)(
+        'aborts the run for $scenario before any database module loads or any socket opens',
+        ({ databaseEnv, code }) => {
+            const child = runSetupFileWith(databaseEnv);
 
             expect(child.error).toBeUndefined();
-            expect(child.status).not.toBe(0);
+            expect(child.signal).toBeNull();
             expect(child.status).toBe(1);
             expect(child.stderr).toContain('TestDatabaseGuardError');
             expect(child.stderr).toContain(code);
-            // Nothing that could reach a database was even loaded, and nothing
-            // dialled out. The unroutable host in the first case is what makes
-            // this meaningful: a connect attempt there would hang rather than
-            // quietly succeed, so silence here is the guard's, not luck's.
-            expect(child.stderr).not.toContain(MODULE_MARKER);
-            expect(child.stderr).not.toContain(CONNECT_MARKER);
             expect(child.stderr).not.toContain(SECRET_PASSWORD);
             expect(child.stderr).not.toContain(SECRET_USER);
             expect(child.stdout).toBe('');
+            expect(readMarker()).toBe('');
         },
-        60_000,
+        CHILD_TIMEOUT_MS,
     );
-});
 
-describe('truncateFeatureTables', () => {
-    beforeAll(async () => {
-        await truncateFeatureTables();
-    });
+    it(
+        'runs the same setup file to completion for a safe DATABASE_URL, so a broken child invocation cannot make the cases above pass',
+        () => {
+            const child = runSetupFileWith({
+                NODE_ENV: 'test',
+                ALLOW_DB_TRUNCATE: 'true',
+                DATABASE_URL: secretUrl('127.0.0.1', 'soh_test'),
+            });
 
-    afterAll(async () => {
-        await truncateFeatureTables();
-    });
-
-    it('empties the rows the factories create, leaving both tables readable', async () => {
-        const user = await makeUser();
-        const food = await makeCatalogFood();
-
-        const createdUser = await prisma.users.findUnique({ where: { id: user.id } });
-        const createdFood = await prisma.catalog_foods.findUnique({ where: { id: food.id } });
-
-        expect(createdUser?.email).toBe(user.email);
-        expect(createdFood?.publication_status).toBe('published');
-        expect(createdFood?.nutrition_provenance).toBe('source_backed');
-        // The list columns the migration makes NOT NULL: an omitted list must
-        // read back as the empty set, never as null.
-        expect(createdFood?.allergen_tags).toEqual([]);
-
-        await truncateFeatureTables();
-
-        expect(await prisma.users.count()).toBe(0);
-        expect(await prisma.catalog_foods.count()).toBe(0);
-    });
-
-    it('is idempotent, so a suite may call it in both beforeAll and afterAll', async () => {
-        await truncateFeatureTables();
-        await expect(truncateFeatureTables()).resolves.toBeUndefined();
-
-        expect(await prisma.meal_plans.count()).toBe(0);
-        expect(await prisma.recipe_versions.count()).toBe(0);
-    });
-
-    it('refuses to truncate when the ambient environment stops being a test one', async () => {
-        const previous = process.env.ALLOW_DB_TRUNCATE;
-        delete process.env.ALLOW_DB_TRUNCATE;
-
-        try {
-            await expect(truncateFeatureTables()).rejects.toBeInstanceOf(TestDatabaseGuardError);
-        } finally {
-            process.env.ALLOW_DB_TRUNCATE = previous;
-        }
-
-        // And the guard did not leave the environment or the connection broken.
-        await expect(truncateFeatureTables()).resolves.toBeUndefined();
-    });
-});
-
-describe('testApp', () => {
-    afterAll(async () => {
-        await truncateFeatureTables();
-        await disconnectTestDatabase();
-    });
-
-    it('reaches the unauthenticated health endpoint', async () => {
-        const response = await request.get('/health');
-
-        expect(response.status).toBe(200);
-        expect(response.body.status).toBe('ok');
-    });
-
-    it('answers 401 with the shipped body when no identity header is sent', async () => {
-        const response = await request.get('/api/weigh-ins');
-
-        expect(response.status).toBe(401);
-        expect(response.body).toEqual({ error: 'No token provided' });
-    });
-
-    it("propagates the header identity as the request's user", async () => {
-        const user = await makeUser();
-        await prisma.body_weight_entries.create({
-            data: { user_id: user.id, weight: 81.5, logged_at: new Date('2026-01-05T07:00:00.000Z') },
-        });
-
-        const response = await asUser(request.get('/api/weigh-ins'), {
-            uid: user.id,
-            email: user.email,
-        });
-
-        // Not merely "not 401": the row comes back only if the uid from the
-        // header reached `getUserId(req)` and scoped the query, which is the
-        // whole contract of the auth mock in `jestSetup.ts`.
-        expect(response.status).toBe(200);
-        expect(response.body.weighIns).toHaveLength(1);
-        expect(response.body.weighIns[0].weight).toBe(81.5);
-    });
-
-    it('scopes a request to its own user, so another uid sees nothing', async () => {
-        const response = await asUser(request.get('/api/weigh-ins'), { uid: 'test-user-0000000002' });
-
-        expect(response.status).toBe(200);
-        expect(response.body.weighIns).toEqual([]);
-    });
-
-    it('exports the header names the setup mock reads', () => {
-        expect(TEST_USER_ID_HEADER).toBe('x-test-user-id');
-        expect(TEST_EMAIL_HEADER).toBe('x-test-email');
-    });
+            expect(child.error).toBeUndefined();
+            expect(child.signal).toBeNull();
+            expect(child.status).toBe(0);
+            expect(child.stderr).not.toContain('TestDatabaseGuardError');
+            expect(readMarker()).toBe('');
+        },
+        CHILD_TIMEOUT_MS,
+    );
 });

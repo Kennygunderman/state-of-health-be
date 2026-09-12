@@ -1,118 +1,230 @@
-/**
- * The coverage gate's own test (Agent Action Plan §0.7.1 / §0.9.1).
- *
- * The gate in `jest.config.ts` is derived from disk so that a new
- * `src/services/*.logic.ts` cannot ship uncovered. This suite is what makes
- * that promise enforceable: it reads the same directory INDEPENDENTLY — with
- * its own `readdirSync`, not by calling the helper it is checking — and
- * asserts the emitted inventory, the `collectCoverageFrom` list and the
- * per-path thresholds all agree with it. A `*.logic.ts` added without a
- * covering suite therefore turns the run red here (and again in the coverage
- * summary), instead of slipping through a hand-maintained list.
- */
-
-import { existsSync, readdirSync } from 'fs';
-import { mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import config, {
     BRANCH_COVERAGE_THRESHOLD,
     COVERED_UTIL_MODULES,
     coverageThresholdFor,
+    coverageThresholdPaths,
     coveredSourcePaths,
 } from '../../../jest.config';
 
-/** The backend package root — `src/__tests__/setup` is three levels down. */
 const BACKEND_ROOT = join(__dirname, '..', '..', '..');
 
-/**
- * The expected inventory, derived here from scratch. Deliberately duplicated
- * logic: a test that called `coveredSourcePaths()` to compute its own
- * expectation could only ever agree with itself.
- */
-const expectedInventory = (): string[] => {
-    const logicModules = readdirSync(join(BACKEND_ROOT, 'src', 'services'))
-        .filter((fileName) => fileName.endsWith('.logic.ts'))
-        .sort()
-        .map((fileName) => `src/services/${fileName}`);
+const SERVICES_DIRECTORY = join(BACKEND_ROOT, 'src', 'services');
 
-    return [...logicModules, ...COVERED_UTIL_MODULES];
+const LOGIC_MODULE_SUFFIX = '.logic.ts';
+
+const TEST_DIRECTORY_NAME = '__tests__';
+
+// The four utility modules and the two exclusions are spelled out HERE rather
+// than imported from the config, and the services directory is read with this
+// file's own `readdirSync` rather than by calling `coveredSourcePaths`. A test
+// that built its expectation from the derivation it is checking would agree
+// with itself no matter what the derivation said — it would stay green while a
+// module silently fell out of the gate, which is the one thing this suite
+// exists to prevent.
+const COVERED_UTILS: readonly string[] = [
+    'src/utils/units.ts',
+    'src/utils/seededRandom.ts',
+    'src/utils/pagination.ts',
+    'src/utils/featureFlags.ts',
+];
+
+const EXCLUDED_UTILS: readonly string[] = ['src/utils/firebase.ts', 'src/utils/getUserId.ts'];
+
+const INTEGRATION_COVERED_SUFFIXES: readonly string[] = ['.service.ts', '.mapper.ts', '.errors.ts'];
+
+const toRepoRelativePosix = (candidate: string): string => {
+    const posixCandidate = candidate.replace(/\\/g, '/').replace(/^<rootDir>\/?/, '');
+    const rootPrefix = `${BACKEND_ROOT.replace(/\\/g, '/')}/`;
+
+    return posixCandidate.startsWith(rootPrefix) ? posixCandidate.slice(rootPrefix.length) : posixCandidate;
 };
 
-describe('coveredSourcePaths', () => {
-    it('lists every src/services/*.logic.ts on disk plus the four pure utils', () => {
-        expect(coveredSourcePaths()).toEqual(expectedInventory());
-    });
+const normalised = (paths: readonly string[]): string[] => paths.map(toRepoRelativePosix).sort();
 
-    it('names files that exist, so a renamed module cannot leave a stale entry behind', () => {
-        for (const relativePath of coveredSourcePaths()) {
-            expect(existsSync(join(BACKEND_ROOT, relativePath))).toBe(true);
-        }
-    });
+const servicesDirectoryEntries = (): string[] =>
+    readdirSync(SERVICES_DIRECTORY, { withFileTypes: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => entry.name);
 
-    it('includes no test file, snapshot or directory from src/services', () => {
-        for (const relativePath of coveredSourcePaths()) {
-            expect(relativePath).toMatch(/\.ts$/);
-            expect(relativePath).not.toContain('__tests__');
-            expect(relativePath).not.toMatch(/\.test\.ts$/);
-        }
-    });
+const expectedInventory = (): string[] => {
+    const logicModules = servicesDirectoryEntries()
+        .filter((fileName) => fileName.endsWith(LOGIC_MODULE_SUFFIX))
+        .map((fileName) => `src/services/${fileName}`);
 
-    it('refuses to derive an empty gate when the services directory cannot be read', () => {
-        // A missing directory must fail loudly: an empty inventory would mean
-        // an empty coverageThreshold, which passes every module unconditionally
-        // — the one way this gate could stop protecting anything while still
-        // reporting success. The fixture root lives in the OS temp directory,
-        // so nothing is written inside the checkout.
-        const emptyRoot = mkdtempSync(join(tmpdir(), 'soh-coverage-inventory-'));
+    return normalised([...logicModules, ...COVERED_UTILS]);
+};
 
-        try {
-            expect(() => coveredSourcePaths(emptyRoot)).toThrow(/could not be read/);
-            expect(() => coveredSourcePaths(emptyRoot)).toThrow(/empty coverage inventory/);
-        } finally {
-            rmSync(emptyRoot, { recursive: true, force: true });
-        }
-    });
-});
+const gatedPaths = (): string[] => normalised(coverageThresholdPaths);
 
-describe('the emitted Jest configuration', () => {
-    it('collects coverage from exactly the derived inventory', () => {
-        expect(config.collectCoverageFrom).toEqual(expectedInventory());
-    });
+const colocatedTestPathFor = (relativePath: string): string => {
+    const lastSeparator = relativePath.lastIndexOf('/');
+    const directory = relativePath.slice(0, lastSeparator);
+    const fileName = relativePath.slice(lastSeparator + 1);
 
-    it('holds every covered file to the §0.9.1 branch threshold on its own', () => {
-        const threshold = config.coverageThreshold as Record<string, { branches: number }>;
+    return `${directory}/${TEST_DIRECTORY_NAME}/${fileName.replace(/\.ts$/, '.test.ts')}`;
+};
 
-        expect(Object.keys(threshold).sort()).toEqual([...expectedInventory()].sort());
-        for (const entry of Object.values(threshold)) {
-            expect(entry).toEqual({ branches: BRANCH_COVERAGE_THRESHOLD });
-        }
-        expect(BRANCH_COVERAGE_THRESHOLD).toBe(80);
-    });
+const thresholdEntries = (): Record<string, { branches: number }> =>
+    (config.coverageThreshold ?? {}) as Record<string, { branches: number }>;
 
-    it('declares no global average, so no module can hide behind one', () => {
-        const threshold = config.coverageThreshold as Record<string, unknown>;
+const absentFrom = (candidates: readonly string[], present: readonly string[]): string[] =>
+    candidates.filter((candidate) => !present.includes(candidate));
 
-        expect(Object.prototype.hasOwnProperty.call(threshold, 'global')).toBe(false);
-    });
+describe('coverage inventory', () => {
+    describe('the emitted threshold key set', () => {
+        it('gates every src/services/*.logic.ts that is on disk', () => {
+            const forgottenModules = absentFrom(expectedInventory(), gatedPaths());
 
-    it('runs the database guard from setupFiles, before any application module loads', () => {
-        expect(config.setupFiles).toEqual(['<rootDir>/src/__tests__/setup/jestSetup.ts']);
-        expect(config.setupFilesAfterEnv).toBeUndefined();
-    });
-});
+            expect(forgottenModules).toEqual([]);
+        });
 
-describe('coverageThresholdFor', () => {
-    it('emits one branch-only entry per path and nothing else', () => {
-        expect(coverageThresholdFor(['src/a.ts', 'src/b.ts'])).toEqual({
-            'src/a.ts': { branches: BRANCH_COVERAGE_THRESHOLD },
-            'src/b.ts': { branches: BRANCH_COVERAGE_THRESHOLD },
+        it('gates no path that has since been renamed or deleted', () => {
+            const orphanedEntries = absentFrom(gatedPaths(), expectedInventory());
+
+            expect(orphanedEntries).toEqual([]);
+            for (const relativePath of gatedPaths()) {
+                expect(existsSync(join(BACKEND_ROOT, relativePath))).toBe(true);
+            }
+        });
+
+        it('matches the on-disk inventory exactly', () => {
+            expect(gatedPaths()).toEqual(expectedInventory());
+        });
+
+        it('is non-empty, so an empty gate cannot pass by matching an empty disk read', () => {
+            expect(expectedInventory().length).toBeGreaterThan(0);
+            expect(gatedPaths().length).toBeGreaterThan(0);
+        });
+
+        it('is the key set Jest is actually handed', () => {
+            expect(normalised(Object.keys(thresholdEntries()))).toEqual(gatedPaths());
         });
     });
 
-    it('never synthesises a global entry, whatever it is given', () => {
-        expect(Object.keys(coverageThresholdFor([]))).toEqual([]);
-        expect(Object.keys(coverageThresholdFor(['src/a.ts']))).toEqual(['src/a.ts']);
+    describe('the covering test each gated module must have', () => {
+        it('gates no module that has no colocated unit test to cover it', () => {
+            const modulesWithoutATest = gatedPaths().filter(
+                (relativePath) => !existsSync(join(BACKEND_ROOT, colocatedTestPathFor(relativePath))),
+            );
+
+            expect(modulesWithoutATest).toEqual([]);
+        });
+
+        it('expects the test beside the module it covers', () => {
+            expect(colocatedTestPathFor('src/services/targets.logic.ts')).toBe(
+                'src/services/__tests__/targets.logic.test.ts',
+            );
+            expect(colocatedTestPathFor('src/utils/units.ts')).toBe('src/utils/__tests__/units.test.ts');
+        });
+    });
+
+    describe('the derivation behind it', () => {
+        it('lists the same inventory this suite reads from disk', () => {
+            expect(normalised(coveredSourcePaths())).toEqual(expectedInventory());
+        });
+
+        it('refuses to derive an empty gate when the services directory cannot be read', () => {
+            const emptyRoot = mkdtempSync(join(tmpdir(), 'soh-coverage-inventory-'));
+
+            try {
+                expect(() => coveredSourcePaths(emptyRoot)).toThrow(/could not be read/);
+                expect(() => coveredSourcePaths(emptyRoot)).toThrow(/empty coverage inventory/);
+            } finally {
+                rmSync(emptyRoot, { recursive: true, force: true });
+            }
+        });
+    });
+
+    describe('the four pure utility modules', () => {
+        it('gates the four the plan names, and exactly those', () => {
+            expect(normalised(COVERED_UTIL_MODULES)).toEqual(normalised(COVERED_UTILS));
+        });
+
+        it('gates each of them by name, and each is present on disk', () => {
+            for (const relativePath of COVERED_UTILS) {
+                expect(existsSync(join(BACKEND_ROOT, relativePath))).toBe(true);
+                expect(gatedPaths()).toContain(relativePath);
+            }
+        });
+    });
+
+    describe('the modules it deliberately leaves to integration coverage', () => {
+        it('gates no orchestration, mapper or error module from src/services', () => {
+            const servicesEntries = servicesDirectoryEntries();
+
+            for (const suffix of INTEGRATION_COVERED_SUFFIXES) {
+                expect(servicesEntries.some((fileName) => fileName.endsWith(suffix))).toBe(true);
+                expect(gatedPaths().filter((relativePath) => relativePath.endsWith(suffix))).toEqual([]);
+            }
+        });
+
+        it('gates neither src/utils I/O boundary', () => {
+            for (const relativePath of EXCLUDED_UTILS) {
+                expect(existsSync(join(BACKEND_ROOT, relativePath))).toBe(true);
+                expect(gatedPaths()).not.toContain(relativePath);
+            }
+        });
+
+        it('gates no test file or __tests__ directory', () => {
+            const testPaths = gatedPaths().filter(
+                (relativePath) => relativePath.includes('__tests__') || relativePath.endsWith('.test.ts'),
+            );
+
+            expect(testPaths).toEqual([]);
+        });
+    });
+
+    describe('the bar each entry enforces', () => {
+        it('holds every covered module to the branch threshold on its own', () => {
+            const belowTheBar = Object.entries(thresholdEntries())
+                .filter(([, entry]) => entry.branches !== BRANCH_COVERAGE_THRESHOLD)
+                .map(([relativePath]) => relativePath);
+
+            expect(BRANCH_COVERAGE_THRESHOLD).toBe(80);
+            expect(belowTheBar).toEqual([]);
+        });
+
+        it('constrains branches and nothing else', () => {
+            const withOtherMetrics = Object.entries(thresholdEntries())
+                .filter(([, entry]) => Object.keys(entry).length !== 1)
+                .map(([relativePath]) => relativePath);
+
+            expect(withOtherMetrics).toEqual([]);
+        });
+
+        it('declares no global average for a module to hide behind', () => {
+            expect(Object.prototype.hasOwnProperty.call(thresholdEntries(), 'global')).toBe(false);
+        });
+    });
+
+    describe('collectCoverageFrom', () => {
+        it('collects exactly the files the thresholds gate, so every entry is evaluated', () => {
+            expect(normalised(config.collectCoverageFrom ?? [])).toEqual(expectedInventory());
+        });
+    });
+
+    describe('coverageThresholdFor', () => {
+        it('emits one branch-only entry per path', () => {
+            expect(coverageThresholdFor(['src/a.ts', 'src/b.ts'])).toEqual({
+                'src/a.ts': { branches: BRANCH_COVERAGE_THRESHOLD },
+                'src/b.ts': { branches: BRANCH_COVERAGE_THRESHOLD },
+            });
+        });
+
+        it('never synthesises a global entry, whatever it is given', () => {
+            expect(Object.keys(coverageThresholdFor([]))).toEqual([]);
+            expect(Object.keys(coverageThresholdFor(['src/a.ts']))).toEqual(['src/a.ts']);
+        });
+    });
+
+    describe('the harness the gate runs under', () => {
+        it('runs the database guard from setupFiles, before any application module loads', () => {
+            expect(config.setupFiles).toEqual(['<rootDir>/src/__tests__/setup/jestSetup.ts']);
+            expect(config.setupFilesAfterEnv).toBeUndefined();
+        });
     });
 });

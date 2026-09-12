@@ -1,0 +1,424 @@
+{"food_source_key":"usda:167555","alias":"hard pretzels"}
+{"food_source_key":"usda:167555","alias":"pretzel"}
+{"food_source_key":"usda:167746","alias":"fresh lemon"}
+{"food_source_key":"usda:167746","alias":"lemon juice fruit"}
+{"food_source_key":"usda:167746","alias":"lemons"}
+{"food_source_key":"usda:167762","alias":"fresh strawberries"}
+{"food_source_key":"usda:167762","alias":"strawberry"}
+{"food_source_key":"usda:167762","alias":"strawberrys"}
+{"food_source_key":"usda:167959","alias":"air popped popcorn"}
+{"food_source_key":"usda:167959","alias":"popcorn"}
+{"food_source_key":"usda:167989","alias":"gum drops"}
+{"food_source_key":"usda:167989","alias":"gummy candy"}
+{"food_source_key":"usda:167989","alias":"jelly candy"}
+{"food_source_key":"usda:168155","alias":"fresh lime"}
+{"food_source_key":"usda:168155","alias":"key lime"}
+{"food_source_key":"usda:168155","alias":"limes"}
+{"food_source_key":"usda:168165","alias":"dried grapes"}
+{"food_source_key":"usda:168165","alias":"raisin"}
+{"food_source_key":"usda:168165","alias":"sultanas"}
+{"food_source_key":"usda:168202","alias":"apples"}
+{"food_source_key":"usda:168202","alias":"fresh apple"}
+{"food_source_key":"usda:168202","alias":"gala apple"}
+{"food_source_key":"usda:168202","alias":"red apple"}
+{"food_source_key":"usda:168249","alias":"pork fillet"}
+{"food_source_key":"usda:168249","alias":"pork loin"}
+{"food_source_key":"usda:168249","alias":"tenderloin"}
+{"food_source_key":"usda:168277","alias":"bacon strips"}
+{"food_source_key":"usda:168277","alias":"raw bacon"}
+{"food_source_key":"usda:168277","alias":"streaky bacon"}
+{"food_source_key":"usda:168409","alias":"cucumbers"}
+{"food_source_key":"usda:168409","alias":"cukes"}
+{"food_source_key":"usda:168409","alias":"english cucumber"}
+{"food_source_key":"usda:168462","alias":"baby spinach"}
+{"food_source_key":"usda:168462","alias":"fresh spinach"}
+{"food_source_key":"usda:168462","alias":"spinach leaves"}
+{"food_source_key":"usda:168462","alias":"spinich"}
+{"food_source_key":"usda:168482","alias":"kumara"}
+{"food_source_key":"usda:168482","alias":"sweet potatoes"}
+{"food_source_key":"usda:168482","alias":"sweetpotato"}
+{"food_source_key":"usda:168482","alias":"yam"}
+{"food_source_key":"usda:168874","alias":"keenwa"}
+{"food_source_key":"usda:168874","alias":"quinoa"}
+{"food_source_key":"usda:168874","alias":"uncooked quinoa"}
+{"food_source_key":"usda:168894","alias":"flour"}
+{"food_source_key":"usda:168894","alias":"plain flour"}
+{"food_source_key":"usda:168894","alias":"wheat flour"}
+{"food_source_key":"usda:168894","alias":"white flour"}
+{"food_source_key":"usda:168917","alias":"cooked quinoa"}
+{"food_source_key":"usda:169094","alias":"black olives"}
+{"food_source_key":"usda:169094","alias":"canned olives"}
+{"food_source_key":"usda:169094","alias":"olives"}
+{"food_source_key":"usda:169094","alias":"ripe olives"}
+{"food_source_key":"usda:169098","alias":"fresh orange juice"}
+{"food_source_key":"usda:169098","alias":"oj"}
+{"food_source_key":"usda:169098","alias":"orange juce"}
+{"food_source_key":"usda:169228","alias":"aubergine"}
+{"food_source_key":"usda:169228","alias":"brinjal"}
+{"food_source_key":"usda:169228","alias":"egg plant"}
+{"food_source_key":"usda:169230","alias":"fresh garlic"}
+{"food_source_key":"usda:169230","alias":"garlic bulb"}
+{"food_source_key":"usda:169230","alias":"garlic cloves"}
+{"food_source_key":"usda:169251","alias":"button mushrooms"}
+{"food_source_key":"usda:169251","alias":"champignon"}
+{"food_source_key":"usda:169251","alias":"mushroom"}
+{"food_source_key":"usda:169251","alias":"mushrooms"}
+{"food_source_key":"usda:169251","alias":"white mushrooms"}
+{"food_source_key":"usda:169282","alias":"edaname"}
+{"food_source_key":"usda:169282","alias":"green soybeans"}
+{"food_source_key":"usda:169282","alias":"soy beans"}
+{"food_source_key":"usda:169291","alias":"courgette"}
+{"food_source_key":"usda:169291","alias":"summer squash"}
+{"food_source_key":"usda:169291","alias":"zuchini"}
+{"food_source_key":"usda:169451","alias":"calf liver"}
+{"food_source_key":"usda:169451","alias":"liver"}
+{"food_source_key":"usda:169451","alias":"ox liver"}
+{"food_source_key":"usda:169640","alias":"raw honey"}
+{"food_source_key":"usda:169640","alias":"runny honey"}
+{"food_source_key":"usda:169655","alias":"caster sugar"}
+{"food_source_key":"usda:169655","alias":"sugar"}
+{"food_source_key":"usda:169655","alias":"table sugar"}
+{"food_source_key":"usda:169655","alias":"white sugar"}
+{"food_source_key":"usda:169661","alias":"maple sirup"}
+{"food_source_key":"usda:169661","alias":"pure maple syrup"}
+{"food_source_key":"usda:169677","alias":"chips"}
+{"food_source_key":"usda:169677","alias":"crisps"}
+{"food_source_key":"usda:169677","alias":"potato crisps"}
+{"food_source_key":"usda:169698","alias":"corn starch"}
+{"food_source_key":"usda:169698","alias":"cornflour"}
+{"food_source_key":"usda:169703","alias":"brown rice"}
+{"food_source_key":"usda:169703","alias":"uncooked brown rice"}
+{"food_source_key":"usda:169703","alias":"wholegrain rice"}
+{"food_source_key":"usda:169704","alias":"cooked brown rice"}
+{"food_source_key":"usda:169704","alias":"steamed brown rice"}
+{"food_source_key":"usda:169736","alias":"dry pasta"}
+{"food_source_key":"usda:169736","alias":"macaroni"}
+{"food_source_key":"usda:169736","alias":"penne"}
+{"food_source_key":"usda:169736","alias":"uncooked pasta"}
+{"food_source_key":"usda:169737","alias":"boiled pasta"}
+{"food_source_key":"usda:169737","alias":"cooked pasta"}
+{"food_source_key":"usda:169737","alias":"cooked spaghetti"}
+{"food_source_key":"usda:169756","alias":"long grain rice"}
+{"food_source_key":"usda:169756","alias":"raw rice"}
+{"food_source_key":"usda:169756","alias":"uncooked white rice"}
+{"food_source_key":"usda:169756","alias":"white rice"}
+{"food_source_key":"usda:169757","alias":"boiled rice"}
+{"food_source_key":"usda:169757","alias":"cooked white rice"}
+{"food_source_key":"usda:169757","alias":"steamed rice"}
+{"food_source_key":"usda:169910","alias":"fresh mango"}
+{"food_source_key":"usda:169910","alias":"mangoes"}
+{"food_source_key":"usda:169910","alias":"mangos"}
+{"food_source_key":"usda:169928","alias":"fresh peach"}
+{"food_source_key":"usda:169928","alias":"peaches"}
+{"food_source_key":"usda:169975","alias":"green cabbage"}
+{"food_source_key":"usda:169975","alias":"shredded cabbage"}
+{"food_source_key":"usda:169975","alias":"white cabbage"}
+{"food_source_key":"usda:169986","alias":"califlower"}
+{"food_source_key":"usda:169986","alias":"cauliflour"}
+{"food_source_key":"usda:169986","alias":"cauliflower florets"}
+{"food_source_key":"usda:169988","alias":"celery stalks"}
+{"food_source_key":"usda:169988","alias":"celery sticks"}
+{"food_source_key":"usda:169997","alias":"chinese parsley"}
+{"food_source_key":"usda:169997","alias":"coriander"}
+{"food_source_key":"usda:169997","alias":"corriander"}
+{"food_source_key":"usda:169997","alias":"fresh coriander"}
+{"food_source_key":"usda:170000","alias":"brown onion"}
+{"food_source_key":"usda:170000","alias":"cooking onion"}
+{"food_source_key":"usda:170000","alias":"onions"}
+{"food_source_key":"usda:170000","alias":"white onion"}
+{"food_source_key":"usda:170000","alias":"yellow onion"}
+{"food_source_key":"usda:170027","alias":"baking potato"}
+{"food_source_key":"usda:170027","alias":"potatoes"}
+{"food_source_key":"usda:170027","alias":"russet potato"}
+{"food_source_key":"usda:170027","alias":"white potato"}
+{"food_source_key":"usda:170108","alias":"bell peppers"}
+{"food_source_key":"usda:170108","alias":"capsicum"}
+{"food_source_key":"usda:170108","alias":"red pepper"}
+{"food_source_key":"usda:170108","alias":"sweet pepper"}
+{"food_source_key":"usda:170162","alias":"cashew"}
+{"food_source_key":"usda:170162","alias":"cashew nuts"}
+{"food_source_key":"usda:170162","alias":"kaju"}
+{"food_source_key":"usda:170170","alias":"coconut flakes"}
+{"food_source_key":"usda:170170","alias":"desiccated coconut"}
+{"food_source_key":"usda:170170","alias":"dried coconut"}
+{"food_source_key":"usda:170170","alias":"shredded coconut"}
+{"food_source_key":"usda:170173","alias":"coconut milk"}
+{"food_source_key":"usda:170173","alias":"tinned coconut milk"}
+{"food_source_key":"usda:170184","alias":"pistachio"}
+{"food_source_key":"usda:170184","alias":"pistachio nuts"}
+{"food_source_key":"usda:170187","alias":"english walnuts"}
+{"food_source_key":"usda:170187","alias":"walnut"}
+{"food_source_key":"usda:170189","alias":"sesame paste"}
+{"food_source_key":"usda:170189","alias":"tahina"}
+{"food_source_key":"usda:170189","alias":"tahini paste"}
+{"food_source_key":"usda:170284","alias":"barley"}
+{"food_source_key":"usda:170284","alias":"pearled barley"}
+{"food_source_key":"usda:170379","alias":"broccoli crowns"}
+{"food_source_key":"usda:170379","alias":"broccoli florets"}
+{"food_source_key":"usda:170379","alias":"brocoli"}
+{"food_source_key":"usda:170379","alias":"brocolli"}
+{"food_source_key":"usda:170393","alias":"baby carrots"}
+{"food_source_key":"usda:170393","alias":"carrots"}
+{"food_source_key":"usda:170393","alias":"shredded carrot"}
+{"food_source_key":"usda:170457","alias":"fresh tomato"}
+{"food_source_key":"usda:170457","alias":"tomatoes"}
+{"food_source_key":"usda:170457","alias":"tomatos"}
+{"food_source_key":"usda:170457","alias":"vine tomato"}
+{"food_source_key":"usda:170497","alias":"chilli pepper"}
+{"food_source_key":"usda:170497","alias":"green chili"}
+{"food_source_key":"usda:170497","alias":"green chilli"}
+{"food_source_key":"usda:170497","alias":"hot pepper"}
+{"food_source_key":"usda:170562","alias":"sunflower kernels"}
+{"food_source_key":"usda:170562","alias":"sunflower seed"}
+{"food_source_key":"usda:170567","alias":"almond"}
+{"food_source_key":"usda:170567","alias":"raw almonds"}
+{"food_source_key":"usda:170567","alias":"whole almonds"}
+{"food_source_key":"usda:170688","alias":"bulgar"}
+{"food_source_key":"usda:170688","alias":"bulghur"}
+{"food_source_key":"usda:170688","alias":"cracked wheat"}
+{"food_source_key":"usda:170859","alias":"double cream"}
+{"food_source_key":"usda:170859","alias":"heavy whipping cream"}
+{"food_source_key":"usda:170859","alias":"whipping cream"}
+{"food_source_key":"usda:170923","alias":"cumin"}
+{"food_source_key":"usda:170923","alias":"cumin seed"}
+{"food_source_key":"usda:170923","alias":"jeera"}
+{"food_source_key":"usda:170931","alias":"ground black pepper"}
+{"food_source_key":"usda:170931","alias":"pepper"}
+{"food_source_key":"usda:170931","alias":"peppercorn"}
+{"food_source_key":"usda:171009","alias":"mayo"}
+{"food_source_key":"usda:171009","alias":"mayonaise"}
+{"food_source_key":"usda:171009","alias":"real mayonnaise"}
+{"food_source_key":"usda:171077","alias":"boneless skinless chicken breast"}
+{"food_source_key":"usda:171077","alias":"chicken breasts"}
+{"food_source_key":"usda:171077","alias":"chicken fillet"}
+{"food_source_key":"usda:171077","alias":"chiken breast"}
+{"food_source_key":"usda:171098","alias":"raw turkey breast"}
+{"food_source_key":"usda:171098","alias":"turkey"}
+{"food_source_key":"usda:171098","alias":"turkey fillet"}
+{"food_source_key":"usda:171186","alias":"chili sauce"}
+{"food_source_key":"usda:171186","alias":"chilli sauce"}
+{"food_source_key":"usda:171186","alias":"hot sauce"}
+{"food_source_key":"usda:171186","alias":"sriracha"}
+{"food_source_key":"usda:171267","alias":"2% milk"}
+{"food_source_key":"usda:171267","alias":"milk"}
+{"food_source_key":"usda:171267","alias":"reduced fat milk"}
+{"food_source_key":"usda:171267","alias":"semi skimmed milk"}
+{"food_source_key":"usda:171287","alias":"chicken egg"}
+{"food_source_key":"usda:171287","alias":"eggs"}
+{"food_source_key":"usda:171287","alias":"large egg"}
+{"food_source_key":"usda:171287","alias":"whole egg"}
+{"food_source_key":"usda:171319","alias":"chile powder"}
+{"food_source_key":"usda:171319","alias":"chilli powder"}
+{"food_source_key":"usda:171412","alias":"copra oil"}
+{"food_source_key":"usda:171412","alias":"virgin coconut oil"}
+{"food_source_key":"usda:171413","alias":"evoo"}
+{"food_source_key":"usda:171413","alias":"extra virgin olive oil"}
+{"food_source_key":"usda:171413","alias":"virgin olive oil"}
+{"food_source_key":"usda:171477","alias":"cooked chicken breast"}
+{"food_source_key":"usda:171477","alias":"grilled chicken breast"}
+{"food_source_key":"usda:171477","alias":"roasted chicken breast"}
+{"food_source_key":"usda:171705","alias":"avacado"}
+{"food_source_key":"usda:171705","alias":"avocadoes"}
+{"food_source_key":"usda:171705","alias":"avocados"}
+{"food_source_key":"usda:171705","alias":"hass avocado"}
+{"food_source_key":"usda:171890","alias":"black coffee"}
+{"food_source_key":"usda:171890","alias":"brewed coffee"}
+{"food_source_key":"usda:171890","alias":"coffee"}
+{"food_source_key":"usda:171955","alias":"cod"}
+{"food_source_key":"usda:171955","alias":"cod filet"}
+{"food_source_key":"usda:171955","alias":"codfish"}
+{"food_source_key":"usda:171955","alias":"white fish"}
+{"food_source_key":"usda:171986","alias":"canned tuna"}
+{"food_source_key":"usda:171986","alias":"tinned tuna"}
+{"food_source_key":"usda:171986","alias":"tuna"}
+{"food_source_key":"usda:171986","alias":"tuna fish"}
+{"food_source_key":"usda:172175","alias":"bleu cheese"}
+{"food_source_key":"usda:172175","alias":"blue vein cheese"}
+{"food_source_key":"usda:172175","alias":"gorgonzola style cheese"}
+{"food_source_key":"usda:172183","alias":"albumen"}
+{"food_source_key":"usda:172183","alias":"egg whites"}
+{"food_source_key":"usda:172184","alias":"egg yolks"}
+{"food_source_key":"usda:172184","alias":"yolk"}
+{"food_source_key":"usda:172232","alias":"basil leaves"}
+{"food_source_key":"usda:172232","alias":"fresh basil"}
+{"food_source_key":"usda:172232","alias":"sweet basil"}
+{"food_source_key":"usda:172233","alias":"dill weed"}
+{"food_source_key":"usda:172233","alias":"fresh dill"}
+{"food_source_key":"usda:172234","alias":"american mustard"}
+{"food_source_key":"usda:172234","alias":"mustard"}
+{"food_source_key":"usda:172234","alias":"prepared mustard"}
+{"food_source_key":"usda:172241","alias":"balsamic"}
+{"food_source_key":"usda:172241","alias":"vinegar"}
+{"food_source_key":"usda:172336","alias":"canola"}
+{"food_source_key":"usda:172336","alias":"rapeseed oil"}
+{"food_source_key":"usda:172336","alias":"vegetable oil"}
+{"food_source_key":"usda:172410","alias":"duck"}
+{"food_source_key":"usda:172410","alias":"duck breast"}
+{"food_source_key":"usda:172410","alias":"duckling"}
+{"food_source_key":"usda:172420","alias":"dry lentils"}
+{"food_source_key":"usda:172420","alias":"green lentils"}
+{"food_source_key":"usda:172420","alias":"lentil"}
+{"food_source_key":"usda:172420","alias":"red lentils"}
+{"food_source_key":"usda:172421","alias":"boiled lentils"}
+{"food_source_key":"usda:172421","alias":"cooked lentils"}
+{"food_source_key":"usda:172448","alias":"bean curd"}
+{"food_source_key":"usda:172448","alias":"firm tofu"}
+{"food_source_key":"usda:172448","alias":"soy curd"}
+{"food_source_key":"usda:172448","alias":"tofu"}
+{"food_source_key":"usda:172470","alias":"creamy peanut butter"}
+{"food_source_key":"usda:172470","alias":"peanutbutter"}
+{"food_source_key":"usda:172470","alias":"smooth peanut butter"}
+{"food_source_key":"usda:172688","alias":"brown bread"}
+{"food_source_key":"usda:172688","alias":"whole grain bread"}
+{"food_source_key":"usda:172688","alias":"wholemeal bread"}
+{"food_source_key":"usda:172688","alias":"wholewheat bread"}
+{"food_source_key":"usda:172749","alias":"crackers"}
+{"food_source_key":"usda:172749","alias":"crispbread"}
+{"food_source_key":"usda:172749","alias":"wheat crackers"}
+{"food_source_key":"usda:172909","alias":"chicken soup"}
+{"food_source_key":"usda:172909","alias":"noodle soup"}
+{"food_source_key":"usda:172941","alias":"deli turkey"}
+{"food_source_key":"usda:172941","alias":"sliced turkey"}
+{"food_source_key":"usda:172941","alias":"turkey deli meat"}
+{"food_source_key":"usda:172941","alias":"turkey slices"}
+{"food_source_key":"usda:173110","alias":"ground beef"}
+{"food_source_key":"usda:173110","alias":"hamburger meat"}
+{"food_source_key":"usda:173110","alias":"lean ground beef"}
+{"food_source_key":"usda:173110","alias":"minced beef"}
+{"food_source_key":"usda:173227","alias":"black tea"}
+{"food_source_key":"usda:173227","alias":"brewed tea"}
+{"food_source_key":"usda:173227","alias":"tea"}
+{"food_source_key":"usda:173410","alias":"salted butter"}
+{"food_source_key":"usda:173410","alias":"stick butter"}
+{"food_source_key":"usda:173420","alias":"feta"}
+{"food_source_key":"usda:173420","alias":"fetta"}
+{"food_source_key":"usda:173420","alias":"greek cheese"}
+{"food_source_key":"usda:173462","alias":"egg replacer"}
+{"food_source_key":"usda:173462","alias":"egg substitute"}
+{"food_source_key":"usda:173462","alias":"liquid eggs"}
+{"food_source_key":"usda:173468","alias":"kosher salt"}
+{"food_source_key":"usda:173468","alias":"sea salt"}
+{"food_source_key":"usda:173468","alias":"table salt"}
+{"food_source_key":"usda:173475","alias":"fresh mint"}
+{"food_source_key":"usda:173475","alias":"mint leaves"}
+{"food_source_key":"usda:173475","alias":"spearmint"}
+{"food_source_key":"usda:173592","alias":"ranch"}
+{"food_source_key":"usda:173592","alias":"ranch salad dressing"}
+{"food_source_key":"usda:173647","alias":"drinking water"}
+{"food_source_key":"usda:173647","alias":"plain water"}
+{"food_source_key":"usda:173647","alias":"tap water"}
+{"food_source_key":"usda:173734","alias":"dry black beans"}
+{"food_source_key":"usda:173734","alias":"turtle beans"}
+{"food_source_key":"usda:173756","alias":"chick peas"}
+{"food_source_key":"usda:173756","alias":"dry chickpeas"}
+{"food_source_key":"usda:173756","alias":"dry garbanzo beans"}
+{"food_source_key":"usda:173800","alias":"canned chickpeas"}
+{"food_source_key":"usda:173800","alias":"garbanzo beans"}
+{"food_source_key":"usda:173800","alias":"tinned chickpeas"}
+{"food_source_key":"usda:173806","alias":"groundnuts"}
+{"food_source_key":"usda:173806","alias":"peanuts"}
+{"food_source_key":"usda:173806","alias":"roasted peanuts"}
+{"food_source_key":"usda:173904","alias":"oatmeal"}
+{"food_source_key":"usda:173904","alias":"oats"}
+{"food_source_key":"usda:173904","alias":"old fashioned oats"}
+{"food_source_key":"usda:173904","alias":"porridge oats"}
+{"food_source_key":"usda:173944","alias":"bananas"}
+{"food_source_key":"usda:173944","alias":"bannana"}
+{"food_source_key":"usda:173944","alias":"ripe banana"}
+{"food_source_key":"usda:174183","alias":"anchovie"}
+{"food_source_key":"usda:174183","alias":"anchovies"}
+{"food_source_key":"usda:174183","alias":"anchovy"}
+{"food_source_key":"usda:174183","alias":"tinned anchovies"}
+{"food_source_key":"usda:174210","alias":"prawn"}
+{"food_source_key":"usda:174210","alias":"prawns"}
+{"food_source_key":"usda:174210","alias":"raw shrimp"}
+{"food_source_key":"usda:174210","alias":"shrimps"}
+{"food_source_key":"usda:174216","alias":"blue mussels"}
+{"food_source_key":"usda:174216","alias":"mussel"}
+{"food_source_key":"usda:174272","alias":"fermented soybean cake"}
+{"food_source_key":"usda:174272","alias":"tempe"}
+{"food_source_key":"usda:174277","alias":"light soy sauce"}
+{"food_source_key":"usda:174277","alias":"shoyu"}
+{"food_source_key":"usda:174277","alias":"soya sauce"}
+{"food_source_key":"usda:174285","alias":"canned kidney beans"}
+{"food_source_key":"usda:174285","alias":"rajma"}
+{"food_source_key":"usda:174285","alias":"red kidney beans"}
+{"food_source_key":"usda:174289","alias":"chickpea dip"}
+{"food_source_key":"usda:174289","alias":"hommus"}
+{"food_source_key":"usda:174289","alias":"houmous"}
+{"food_source_key":"usda:174289","alias":"humus"}
+{"food_source_key":"usda:174370","alias":"lamb ground"}
+{"food_source_key":"usda:174370","alias":"lamb mince"}
+{"food_source_key":"usda:174370","alias":"minced lamb"}
+{"food_source_key":"usda:174421","alias":"bison"}
+{"food_source_key":"usda:174421","alias":"bison mince"}
+{"food_source_key":"usda:174421","alias":"buffalo meat"}
+{"food_source_key":"usda:174524","alias":"pico de gallo"}
+{"food_source_key":"usda:174524","alias":"salza"}
+{"food_source_key":"usda:174524","alias":"tomato salsa"}
+{"food_source_key":"usda:174683","alias":"grape"}
+{"food_source_key":"usda:174683","alias":"green grapes"}
+{"food_source_key":"usda:174683","alias":"red grapes"}
+{"food_source_key":"usda:174683","alias":"seedless grapes"}
+{"food_source_key":"usda:174832","alias":"almond beverage"}
+{"food_source_key":"usda:174832","alias":"almondmilk"}
+{"food_source_key":"usda:174832","alias":"unsweetened almond milk"}
+{"food_source_key":"usda:174916","alias":"flatbread"}
+{"food_source_key":"usda:174916","alias":"pita"}
+{"food_source_key":"usda:174916","alias":"pitta bread"}
+{"food_source_key":"usda:174916","alias":"whole wheat pita"}
+{"food_source_key":"usda:174987","alias":"butter croissant"}
+{"food_source_key":"usda:174987","alias":"croissants"}
+{"food_source_key":"usda:174987","alias":"crossaint"}
+{"food_source_key":"usda:175167","alias":"atlantic salmon"}
+{"food_source_key":"usda:175167","alias":"fresh salmon"}
+{"food_source_key":"usda:175167","alias":"salmon"}
+{"food_source_key":"usda:175167","alias":"salmon filet"}
+{"food_source_key":"usda:175176","alias":"tilapa"}
+{"food_source_key":"usda:175176","alias":"tilapia fillet"}
+{"food_source_key":"usda:175215","alias":"soya milk"}
+{"food_source_key":"usda:175215","alias":"soymilk"}
+{"food_source_key":"usda:175215","alias":"unsweetened soy milk"}
+{"food_source_key":"usda:175238","alias":"black beans"}
+{"food_source_key":"usda:175238","alias":"canned black beans"}
+{"food_source_key":"usda:175238","alias":"tinned black beans"}
+{"food_source_key":"usda:2705412","alias":"oat beverage"}
+{"food_source_key":"usda:2705412","alias":"oat drink"}
+{"food_source_key":"usda:2705412","alias":"oatmilk"}
+{"food_source_key":"usda:2705424","alias":"greek yoghurt"}
+{"food_source_key":"usda:2705424","alias":"greek yogurt"}
+{"food_source_key":"usda:2705424","alias":"nonfat greek yogurt"}
+{"food_source_key":"usda:2705424","alias":"plain yogurt"}
+{"food_source_key":"usda:2705424","alias":"yoghurt"}
+{"food_source_key":"usda:2706135","alias":"turkey rashers"}
+{"food_source_key":"usda:2706135","alias":"turkey strips"}
+{"food_source_key":"usda:2706967","alias":"cheese and ham sandwich"}
+{"food_source_key":"usda:2706967","alias":"ham sandwich"}
+{"food_source_key":"usda:2707825","alias":"soft tortilla"}
+{"food_source_key":"usda:2707825","alias":"tortillas"}
+{"food_source_key":"usda:2707825","alias":"wheat wrap"}
+{"food_source_key":"usda:2707825","alias":"whole wheat tortilla"}
+{"food_source_key":"usda:2708549","alias":"bean burrito"}
+{"food_source_key":"usda:2708549","alias":"burrito"}
+{"food_source_key":"usda:2708549","alias":"rice and bean wrap"}
+{"food_source_key":"usda:2708618","alias":"cheese pizza slice"}
+{"food_source_key":"usda:2708618","alias":"margherita pizza"}
+{"food_source_key":"usda:2708618","alias":"pizza"}
+{"food_source_key":"usda:2708811","alias":"mac and cheese"}
+{"food_source_key":"usda:2708811","alias":"macaroni cheese"}
+{"food_source_key":"usda:2708831","alias":"spagetti with tomato sauce"}
+{"food_source_key":"usda:2708831","alias":"spaghetti marinara"}
+{"food_source_key":"usda:2708831","alias":"spaghetti with tomato sauce"}
+{"food_source_key":"usda:2709163","alias":"wheat gluten"}
+{"food_source_key":"usda:2709163","alias":"wheat meat"}
+{"food_source_key":"usda:2709823","alias":"green salad"}
+{"food_source_key":"usda:2709823","alias":"mixed salad"}
+{"food_source_key":"usda:2709823","alias":"side salad"}
+{"food_source_key":"usda:2710725","alias":"meal shake"}
+{"food_source_key":"usda:2710725","alias":"nutrition shake"}
+{"food_source_key":"usda:2710742","alias":"protein powder"}
+{"food_source_key":"usda:2710742","alias":"protein supplement"}
+{"food_source_key":"usda:2710742","alias":"whey protein"}
+{"food_source_key":"usda:328637","alias":"cheddar"}
+{"food_source_key":"usda:328637","alias":"cheeder cheese"}
+{"food_source_key":"usda:328637","alias":"sharp cheddar"}

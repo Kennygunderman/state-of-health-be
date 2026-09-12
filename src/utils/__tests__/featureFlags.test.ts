@@ -1,20 +1,7 @@
-/**
- * `src/utils/featureFlags.ts` reads the environment ONCE, at import — that is
- * the module's stated contract, so the only honest way to test it is to
- * re-import it per case. Every test therefore goes through `loadFlags`, which
- * resets the module registry, writes the environment, and requires the module
- * fresh.
- *
- * The environment is saved and restored around each case because
- * `src/__tests__/setup/jestSetup.ts` sets `MEAL_PLANNING_ENABLED` and
- * `MEAL_PLANNING_FAULT` for the whole run, and `NODE_ENV=test` is what the
- * database guard requires: a case that left any of the three rewritten would
- * change the meaning of every later suite in the file.
- */
-
 type FeatureFlagsModule = typeof import('../featureFlags');
 
-/** Only the variables this module reads. */
+type MealPlanningActionType = Parameters<FeatureFlagsModule['postCommitAbort']>[0];
+
 interface FlagEnv {
     MEAL_PLANNING_ENABLED?: string;
     MEAL_PLANNING_FAULT?: string;
@@ -23,9 +10,22 @@ interface FlagEnv {
 
 const MANAGED_KEYS: (keyof FlagEnv)[] = ['MEAL_PLANNING_ENABLED', 'MEAL_PLANNING_FAULT', 'NODE_ENV'];
 
+const ACTION_TYPES: MealPlanningActionType[] = ['generate', 'regenerate', 'swap', 'log'];
+
+const INVALID_FAULT_MESSAGE = 'MEAL_PLANNING_FAULT must be one of off | generation | swap | log; received';
+
+// Every case below rewrites the environment this module reads at import, and
+// Jest hands a test file its own copy of `process.env` but never restores it
+// between cases — so an abandoned value would change the meaning of every later
+// case in this file, including the `NODE_ENV` the abort predicate branches on.
+// The environment is therefore captured once here and put back after each case,
+// and `afterAll` re-checks the baseline rather than trusting that it held.
+const ORIGINAL_ENV: NodeJS.ProcessEnv = { ...process.env };
+
 const applyEnv = (env: FlagEnv): void => {
     for (const key of MANAGED_KEYS) {
         const value = env[key];
+
         if (value === undefined) {
             delete process.env[key];
         } else {
@@ -34,40 +34,46 @@ const applyEnv = (env: FlagEnv): void => {
     }
 };
 
-/**
- * Re-imports the module under the given environment. `NODE_ENV` defaults to
- * `test`, the value the suite actually runs under, so a case only states the
- * environment it is about.
- */
-const loadFlags = (env: FlagEnv): FeatureFlagsModule => {
-    jest.resetModules();
-    applyEnv({ NODE_ENV: 'test', ...env });
+const restoreEnv = (): void => {
+    for (const key of Object.keys(process.env)) {
+        if (!(key in ORIGINAL_ENV)) {
+            delete process.env[key];
+        }
+    }
 
-    // eslint-disable-next-line @typescript-eslint/no-var-requires -- the module reads env at import; that is what is under test
+    for (const key of Object.keys(ORIGINAL_ENV)) {
+        const value = ORIGINAL_ENV[key];
+
+        if (value === undefined) {
+            delete process.env[key];
+        } else {
+            process.env[key] = value;
+        }
+    }
+};
+
+// A module-registry reset, not a dependency mock: featureFlags.ts resolves its
+// two variables and NODE_ENV once at import, which is the contract it exists to
+// satisfy, so a scenario's environment can only be observed by re-evaluating the
+// module. All three governed variables are cleared before the overrides land and
+// NODE_ENV defaults to the value the suite really runs under, leaving every case
+// independent of the ambient environment `setup/jestSetup.ts` establishes.
+const loadFlags = (env: FlagEnv): FeatureFlagsModule => {
+    applyEnv({ NODE_ENV: 'test', ...env });
+    jest.resetModules();
+
     return require('../featureFlags') as FeatureFlagsModule;
 };
 
-/** Requires the module and returns whatever it threw, for the failure cases. */
-const loadFlagsExpectingThrow = (env: FlagEnv): unknown => {
-    try {
-        loadFlags(env);
-    } catch (error) {
-        return error;
-    }
-    return undefined;
-};
-
-const savedEnv: FlagEnv = {};
-
-beforeAll(() => {
-    for (const key of MANAGED_KEYS) {
-        savedEnv[key] = process.env[key];
-    }
+afterEach(() => {
+    restoreEnv();
+    jest.resetModules();
 });
 
-afterEach(() => {
-    applyEnv(savedEnv);
-    jest.resetModules();
+afterAll(() => {
+    restoreEnv();
+
+    expect(process.env.NODE_ENV).toBe('test');
 });
 
 describe('isMealPlanningEnabled', () => {
@@ -81,27 +87,37 @@ describe('isMealPlanningEnabled', () => {
         ['an explicit false', 'false'],
         ['upper case', 'TRUE'],
         ['mixed case', 'True'],
-        ['padded', ' true'],
         ['numeric', '1'],
         ['yes', 'yes'],
-    ])('is false when %s', (_case, value) => {
-        // The polarity is deliberate and the inverse of AI_FEATURES_ENABLED: a
-        // release boots with planning OFF and turns it on only once the catalog
-        // has been loaded, so anything other than the exact opt-in means off.
+        ['the name of a fault', 'off'],
+    ])('is false when %s, because the opt-in is matched exactly', (_case, value) => {
         expect(loadFlags({ MEAL_PLANNING_ENABLED: value }).isMealPlanningEnabled()).toBe(false);
     });
+
+    it('is false for "true" wrapped in whitespace, because the comparison does not trim', () => {
+        expect(loadFlags({ MEAL_PLANNING_ENABLED: ' true ' }).isMealPlanningEnabled()).toBe(false);
+    });
+
+    it.each(['production', 'development'])(
+        'is true for the exact opt-in under NODE_ENV=%s, because only the fault switch is production-gated',
+        (nodeEnv) => {
+            const flags = loadFlags({ MEAL_PLANNING_ENABLED: 'true', NODE_ENV: nodeEnv });
+
+            expect(flags.isMealPlanningEnabled()).toBe(true);
+        },
+    );
 });
 
 describe('mealPlanningFault', () => {
+    it.each(['off', 'generation', 'swap', 'log'])('accepts %s', (value) => {
+        expect(loadFlags({ MEAL_PLANNING_FAULT: value }).mealPlanningFault()).toBe(value);
+    });
+
     it.each([
         ['unset', undefined],
         ['blank', ''],
     ])('resolves to off when %s', (_case, value) => {
         expect(loadFlags({ MEAL_PLANNING_FAULT: value }).mealPlanningFault()).toBe('off');
-    });
-
-    it.each(['off', 'generation', 'swap', 'log'])('accepts %s', (value) => {
-        expect(loadFlags({ MEAL_PLANNING_FAULT: value }).mealPlanningFault()).toBe(value);
     });
 
     it.each([
@@ -110,51 +126,62 @@ describe('mealPlanningFault', () => {
         ['a trailing space', 'log '],
         ['a leading space', ' swap'],
         ['a list', 'off,log'],
-    ])('throws FeatureFlagError at import for %s', (_case, value) => {
-        const error = loadFlagsExpectingThrow({ MEAL_PLANNING_FAULT: value });
+    ])('rejects %s at import rather than coercing it to a working default', (_case, value) => {
+        expect(() => loadFlags({ MEAL_PLANNING_FAULT: value })).toThrow(
+            `${INVALID_FAULT_MESSAGE} "${value}"`,
+        );
+    });
 
-        // At import, not at first use: a misspelled switch must fail the run it
-        // was set for, not the first request that happens to read it.
-        expect(error).toBeInstanceOf(Error);
-        expect((error as Error).name).toBe('FeatureFlagError');
-        expect((error as Error).message).toContain('off | generation | swap | log');
-        expect((error as Error).message).toContain(`received "${value}"`);
+    it('rejects an unrecognised value with an error named FeatureFlagError', () => {
+        let caught: unknown;
+
+        try {
+            loadFlags({ MEAL_PLANNING_FAULT: 'bogus' });
+        } catch (error) {
+            caught = error;
+        }
+
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).name).toBe('FeatureFlagError');
+    });
+
+    it.each(['development', 'test'])('still rejects an unrecognised value under NODE_ENV=%s', (nodeEnv) => {
+        expect(() => loadFlags({ MEAL_PLANNING_FAULT: 'bogus', NODE_ENV: nodeEnv })).toThrow(
+            INVALID_FAULT_MESSAGE,
+        );
+    });
+
+    it('still rejects an unrecognised value when NODE_ENV is unset', () => {
+        expect(() => loadFlags({ MEAL_PLANNING_FAULT: 'bogus', NODE_ENV: undefined })).toThrow(
+            INVALID_FAULT_MESSAGE,
+        );
     });
 
     it.each([
-        ['a bogus value', 'bogus'],
+        ['a value it rejects everywhere else', 'bogus'],
         ['a real fault', 'log'],
         ['a blank value', ''],
-    ])('is forced to an inert off in production, without throwing, for %s', (_case, value) => {
-        // Failing startup over a development-only switch would take the service
-        // down, so production ignores the variable entirely. This check runs
-        // BEFORE validation in the module, which is why "bogus" does not throw.
-        const flags = loadFlags({ MEAL_PLANNING_FAULT: value, NODE_ENV: 'production' });
+    ])(
+        'is inert in production for %s: forced to off, and never thrown over',
+        (_case, value) => {
+            expect(() => loadFlags({ MEAL_PLANNING_FAULT: value, NODE_ENV: 'production' })).not.toThrow();
 
-        expect(flags.mealPlanningFault()).toBe('off');
-    });
+            const flags = loadFlags({ MEAL_PLANNING_FAULT: value, NODE_ENV: 'production' });
 
-    it('still validates the value in development', () => {
-        const error = loadFlagsExpectingThrow({ MEAL_PLANNING_FAULT: 'bogus', NODE_ENV: 'development' });
-
-        expect((error as Error).name).toBe('FeatureFlagError');
-    });
-
-    it('still validates the value when NODE_ENV is unset', () => {
-        const error = loadFlagsExpectingThrow({ MEAL_PLANNING_FAULT: 'bogus', NODE_ENV: undefined });
-
-        expect((error as Error).name).toBe('FeatureFlagError');
-    });
+            expect(flags.mealPlanningFault()).toBe('off');
+        },
+    );
 });
 
 describe('postCommitAbort — the log fault', () => {
-    it.each(['test', 'development'])('aborts a log write whenever the fault is log (NODE_ENV=%s)', (nodeEnv) => {
-        const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: nodeEnv });
+    it.each(['test', 'development'])(
+        'aborts a log write whenever the fault is log, including under NODE_ENV=%s',
+        (nodeEnv) => {
+            const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: nodeEnv });
 
-        // The device path: a developer drives this from a phone against a dev
-        // backend, so it is not gated on NODE_ENV.
-        expect(flags.postCommitAbort('log', undefined)).toBe(true);
-    });
+            expect(flags.postCommitAbort('log', undefined)).toBe(true);
+        },
+    );
 
     it('is inert in production even when the fault says log', () => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: 'production' });
@@ -162,7 +189,7 @@ describe('postCommitAbort — the log fault', () => {
         expect(flags.postCommitAbort('log', undefined)).toBe(false);
     });
 
-    it.each<['generate' | 'regenerate' | 'swap']>([['generate'], ['regenerate'], ['swap']])(
+    it.each<[MealPlanningActionType]>([['generate'], ['regenerate'], ['swap']])(
         'leaves the %s action alone under the log fault',
         (actionType) => {
             const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: 'test' });
@@ -179,68 +206,72 @@ describe('postCommitAbort — the log fault', () => {
 });
 
 describe('postCommitAbort — the request header', () => {
-    it('exports the header name so the controller and the suite share one spelling', () => {
-        expect(loadFlags({}).POST_COMMIT_ABORT_HEADER).toBe('x-test-abort-after-commit');
-    });
-
-    it.each([
-        ['the action name', 'log', 'log'],
-        ['a swap', 'swap', 'swap'],
-        ['a padded value', 'log', '  log  '],
-    ])('honours %s under NODE_ENV=test', (_case, actionType, headerValue) => {
+    it.each(ACTION_TYPES)('honours a header naming the %s action under NODE_ENV=test', (actionType) => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
 
-        expect(flags.postCommitAbort(actionType as 'log' | 'swap', headerValue)).toBe(true);
+        expect(flags.postCommitAbort(actionType, actionType)).toBe(true);
     });
 
-    it.each([
-        ['names a different action', 'log', 'swap'],
+    it('trims the header before comparing it, unlike the MEAL_PLANNING_ENABLED opt-in', () => {
+        const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
+
+        expect(flags.postCommitAbort('log', ' log ')).toBe(true);
+    });
+
+    it.each<[string, MealPlanningActionType, string]>([
+        ['names a different action', 'swap', 'log'],
         ['is in the wrong case', 'log', 'LOG'],
         ['is blank', 'log', ''],
         ['is whitespace only', 'log', '   '],
     ])('refuses a header that %s, even under NODE_ENV=test', (_case, actionType, headerValue) => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
 
-        expect(flags.postCommitAbort(actionType as 'log' | 'swap', headerValue)).toBe(false);
+        expect(flags.postCommitAbort(actionType, headerValue)).toBe(false);
     });
 
     it.each([
         ['a repeated header, which Express yields as an array', ['log', 'log']],
         ['a missing header', undefined],
         ['a null value', null],
-        ['a number', 1],
-        ['an object', { value: 'log' }],
-    ])('ignores %s', (_case, headerValue) => {
+        ['a number', 42],
+        ['a boolean', true],
+        ['an object carrying the action', { value: 'log' }],
+    ])('ignores %s, so only a string can trip the seam', (_case, headerValue) => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
 
-        // `unknown` is the parameter type precisely so these cannot reach the
-        // comparison: a repeated `x-test-abort-after-commit` must not abort.
         expect(flags.postCommitAbort('log', headerValue)).toBe(false);
     });
 
-    it.each(['development', 'production'])('ignores the header entirely under NODE_ENV=%s', (nodeEnv) => {
-        const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: nodeEnv });
+    it.each(['development', 'production'])(
+        'never reads the header under NODE_ENV=%s, so a client cannot reach the seam',
+        (nodeEnv) => {
+            const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: nodeEnv });
 
-        expect(flags.postCommitAbort('log', 'log')).toBe(false);
-        expect(flags.postCommitAbort('swap', 'swap')).toBe(false);
-    });
+            expect(flags.postCommitAbort('log', 'log')).toBe(false);
+            expect(flags.postCommitAbort('swap', 'swap')).toBe(false);
+        },
+    );
 
-    it('ignores the header when NODE_ENV is unset', () => {
+    it('never reads the header when NODE_ENV is unset', () => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: undefined });
 
         expect(flags.postCommitAbort('log', 'log')).toBe(false);
     });
 });
 
+describe('POST_COMMIT_ABORT_HEADER', () => {
+    it('is the exact header name the controller and the fault suite both spell', () => {
+        expect(loadFlags({}).POST_COMMIT_ABORT_HEADER).toBe('x-test-abort-after-commit');
+    });
+});
+
 describe('the environment snapshot', () => {
-    it('does not re-read the environment after import', () => {
+    it('does not re-read the environment after import, so a flag cannot flip mid-request', () => {
         const flags = loadFlags({ MEAL_PLANNING_ENABLED: 'true', MEAL_PLANNING_FAULT: 'log' });
 
         process.env.MEAL_PLANNING_ENABLED = 'false';
         process.env.MEAL_PLANNING_FAULT = 'off';
 
-        // A mid-flight environment change must not flip a flag under a running
-        // request; the whole point of reading once is that the answer is stable.
         expect(flags.isMealPlanningEnabled()).toBe(true);
         expect(flags.mealPlanningFault()).toBe('log');
     });

@@ -45,8 +45,7 @@ jobs:
       - run: npm ci
       - run: npx prisma generate
       - run: npx prisma validate
-      - name: Apply the migration ledger
-        run: npx prisma migrate deploy
+      - run: npx prisma migrate deploy
       - run: npm run typecheck
       - run: npm run typecheck:test
       - run: npm run typecheck:scripts

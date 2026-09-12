@@ -1,0 +1,3570 @@
+{
+  "benchmarkVersion": "v1",
+  "catalogRelease": "v1",
+  "description": "Fixed query set and measurement contract for internal catalog search (Agent Action Plan sections 0.7.3 and 0.9.3). scripts/search-benchmark.ts runs it against a loaded catalog release and writes benchmark-report.json; that report is the acceptance evidence for search quality. Running it against a second, independently loaded database must reproduce identical ranks and page sequences, with only latencies free to differ.",
+  "acceptanceRunner": "scripts/search-benchmark.ts",
+  "acceptanceReport": "data/meal-planning/reports/latest/benchmark-report.json",
+  "nonAcceptanceSuite": {
+    "path": "src/__tests__/api/benchmark.test.ts",
+    "fixture": "data/meal-planning/fixtures/benchmark-synthetic-10k.json",
+    "coversAcceptanceThresholds": false,
+    "reason": "That suite exercises the benchmark mechanics against a synthetic fixture, so it can pass while real search quality is unmeasured. The thresholds below are asserted only by acceptanceRunner against the loaded release named in catalogRelease; a green Jest run is never acceptance evidence."
+  },
+  "thresholds": {
+    "topThreeHitRate": 0.9,
+    "topTenHitRate": 0.97,
+    "maxZeroResultRate": 0.03,
+    "p95LatencyMs": 150,
+    "latencyLimit": 25
+  },
+  "thresholdPolicy": "Fail closed: the runner exits non-zero when any threshold is missed, and writes no report on any path where nothing was measured, so neither an absent nor a stale report can read as a pass. These five values are the plan's and are not tuning knobs — lowering one turns a failing benchmark green, which is why they are reviewed here rather than written as literals in the runner.",
+  "ordering": [
+    "ts_rank DESC",
+    "display_name ASC",
+    "source_key ASC"
+  ],
+  "orderingRationale": "The service's ORDER BY, most significant first. source_key is the final key because it is portable: the same release loaded into a second database yields the same order, which a database-generated id could not, and that identity of ranks and page sequences is how release determinism is evidenced.",
+  "protocol": {
+    "warmupPasses": 1,
+    "timedPasses": 3,
+    "sequential": true,
+    "connections": 1,
+    "timing": "in_process",
+    "measuredUnit": "catalog.service.searchPublishedFoods",
+    "warmupRationale": "The first pass is untimed: it settles the shared buffers and the GIN index into cache, so the three timed passes measure the steady state the report claims rather than a cold read.",
+    "measuredUnitRationale": "The stopwatch sits on the service function rather than an HTTP round trip, so the latency figures exclude network, Express and JSON-serialisation time and stay comparable across machines. One connection and no concurrency, so a percentile describes the query and not queueing behind other queries."
+  },
+  "reportedConditions": [
+    "catalogReleaseChecksum",
+    "postgresVersion",
+    "hostCpu",
+    "hostMemory",
+    "sharedBuffers",
+    "warmCacheCondition"
+  ],
+  "reportedConditionsRule": "Field names the run must fill into the report, not values. No environment fact — host, database origin, credential or installed version — belongs in this file: it is loaded identically in every environment, and a value recorded here would be wrong in all but one of them.",
+  "expectationResolution": "sourceKey",
+  "expectationResolutionRule": "Every expectation names a food by the stable catalog_foods.source_key the release carries, which the runner resolves to the local catalog_foods.id after the release is loaded. A key that does not resolve is a hard failure of the whole run: it is never skipped and never scored as a miss, because an unresolvable expectation means this file and the loaded release disagree about what is published, and no hit rate can describe that.",
+  "expectedSemantics": "Acceptable answers, best-placed member counting for the rank metrics. One entry per canonical food and never one per alias: search aggregates MAX(ts_rank) over a food's name and all of its aliases into a single row, so an alias hit produces no second row. Several entries mean the term is genuinely ambiguous across published foods — two states of one food, or a category word — not that the answer is uncertain. No entry expects zero results: maxZeroResultRate is a measured outcome over this set, not a declared one.",
+  "kinds": [
+    {
+      "kind": "exact",
+      "definition": "The food's own name as a user would type it."
+    },
+    {
+      "kind": "plural",
+      "definition": "A singular/plural alternation of the stored name, which the English stemmer has to fold."
+    },
+    {
+      "kind": "misspelling",
+      "definition": "A real misspelling or variant transliteration, curated into the food's aliases so it is retrievable at all."
+    },
+    {
+      "kind": "alias",
+      "definition": "A different name for the same food: regional, colloquial or shortened."
+    },
+    {
+      "kind": "multi_word",
+      "definition": "A multi-token phrase, every token of which the tsquery ANDs."
+    },
+    {
+      "kind": "partial",
+      "definition": "A prefix, which resolves through the ILIKE prefix fallback rather than the tsquery."
+    }
+  ],
+  "authoringBasis": "Every expectation is a source_key read from catalog/releases/v1/foods.jsonl, the authoritative set of published foods; none is invented from an FDC id or reconstructed from an identity pattern. Only published foods are searchable, so no retired food appears here. Each query's non-stopword words appear literally in each expected food's search_text — for kind partial, the query is instead a prefix of the canonical name or of a curated alias — so a match never depends on reproducing the English stemmer exactly. Release v1 publishes 139 foods, so a query set of this size means several query forms per food rather than several foods per form: each entry is a different string a user would plausibly type and exercises a different retrieval path, and no string appears twice.",
+  "omittedFoods": {
+    "reason": "Common searches deliberately left out because release v1 does not publish the food. A speculative source_key would fail the run by design, and a query with no expected food cannot be scored, so the honest action is omission. Add the queries when a later release publishes these.",
+    "names": [
+      "Veggie burger patty",
+      "Lard",
+      "Granola bar",
+      "Dark chocolate, 70-85%",
+      "Baking powder",
+      "Vanilla extract"
+    ]
+  },
+  "paginationCheck": {
+    "queryIds": [
+      "q008",
+      "q020",
+      "q050",
+      "q099",
+      "q123",
+      "q131",
+      "q188",
+      "q245",
+      "q254",
+      "q260",
+      "q369",
+      "q377",
+      "q378",
+      "q379",
+      "q380",
+      "q381",
+      "q382",
+      "q383",
+      "q384",
+      "q386"
+    ],
+    "limit": 25,
+    "pages": 3,
+    "singlePageLimit": 75,
+    "referenceMode": "in_process",
+    "invariant": "For each id in queryIds, pages 1, 2 and 3 fetched at limit (offsets 0, 25 and 50) concatenated must equal the first min(singlePageLimit, total) food ids of one singlePageLimit fetch of the same query, in the same order, with no id repeated and none missing.",
+    "referenceModeReason": "GET /catalog/foods validates limit as 1 to 50, so a singlePageLimit fetch over HTTP answers 400 invalid_request. The reference is therefore read in process through catalog.service.searchPublishedFoods, the same unit the protocol times. Do not lower singlePageLimit to 50 to make it routable, and do not put this fetch through the endpoint: the first weakens the invariant, the second cannot express it.",
+    "queryIdSelection": "The twenty queries with the widest measured result sets against release v1, one per distinct result set, so twenty different sets are paged rather than one set twenty times.",
+    "breadthLimitation": "Measured at authoring time, the widest query in this set matches 8 published foods, because release v1 publishes far fewer foods than the coverage plan's published target. No query here fills even the first page, so today the check proves ordering stability and that paging repeats and drops nothing, rather than multi-page traversal. The ids are chosen by measured breadth precisely so the same twenty exercise all three pages unchanged once the catalog reaches its target; do not compensate by lowering limit."
+  },
+  "queries": [
+    {
+      "id": "q001",
+      "q": "coffee",
+      "kind": "exact",
+      "expected": [
+        "usda:171890"
+      ]
+    },
+    {
+      "id": "q002",
+      "q": "black coffee",
+      "kind": "multi_word",
+      "expected": [
+        "usda:171890"
+      ]
+    },
+    {
+      "id": "q003",
+      "q": "orange juice",
+      "kind": "exact",
+      "expected": [
+        "usda:169098"
+      ]
+    },
+    {
+      "id": "q004",
+      "q": "orange juce",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169098"
+      ]
+    },
+    {
+      "id": "q005",
+      "q": "oj",
+      "kind": "alias",
+      "expected": [
+        "usda:169098"
+      ]
+    },
+    {
+      "id": "q006",
+      "q": "tea",
+      "kind": "exact",
+      "expected": [
+        "usda:173227"
+      ]
+    },
+    {
+      "id": "q007",
+      "q": "black tea",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173227"
+      ]
+    },
+    {
+      "id": "q008",
+      "q": "water",
+      "kind": "exact",
+      "expected": [
+        "usda:173647"
+      ]
+    },
+    {
+      "id": "q009",
+      "q": "tap water",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173647"
+      ]
+    },
+    {
+      "id": "q010",
+      "q": "drinking water",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173647"
+      ]
+    },
+    {
+      "id": "q011",
+      "q": "croissant",
+      "kind": "exact",
+      "expected": [
+        "usda:174987"
+      ]
+    },
+    {
+      "id": "q012",
+      "q": "crossaint",
+      "kind": "misspelling",
+      "expected": [
+        "usda:174987"
+      ]
+    },
+    {
+      "id": "q013",
+      "q": "croissants",
+      "kind": "plural",
+      "expected": [
+        "usda:174987"
+      ]
+    },
+    {
+      "id": "q014",
+      "q": "pita bread",
+      "kind": "exact",
+      "expected": [
+        "usda:174916"
+      ]
+    },
+    {
+      "id": "q015",
+      "q": "pitta bread",
+      "kind": "misspelling",
+      "expected": [
+        "usda:174916"
+      ]
+    },
+    {
+      "id": "q016",
+      "q": "flatbread",
+      "kind": "alias",
+      "expected": [
+        "usda:174916"
+      ]
+    },
+    {
+      "id": "q017",
+      "q": "tortilla",
+      "kind": "exact",
+      "expected": [
+        "usda:2707825"
+      ]
+    },
+    {
+      "id": "q018",
+      "q": "tortillas",
+      "kind": "plural",
+      "expected": [
+        "usda:2707825"
+      ]
+    },
+    {
+      "id": "q019",
+      "q": "whole wheat tortilla",
+      "kind": "multi_word",
+      "expected": [
+        "usda:2707825"
+      ]
+    },
+    {
+      "id": "q020",
+      "q": "whole wheat bread",
+      "kind": "exact",
+      "expected": [
+        "usda:172688"
+      ]
+    },
+    {
+      "id": "q021",
+      "q": "wholewheat bread",
+      "kind": "misspelling",
+      "expected": [
+        "usda:172688"
+      ]
+    },
+    {
+      "id": "q022",
+      "q": "wholemeal bread",
+      "kind": "alias",
+      "expected": [
+        "usda:172688"
+      ]
+    },
+    {
+      "id": "q023",
+      "q": "crackers",
+      "kind": "exact",
+      "expected": [
+        "usda:172749"
+      ]
+    },
+    {
+      "id": "q024",
+      "q": "wheat crackers",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172749"
+      ]
+    },
+    {
+      "id": "q025",
+      "q": "balsamic vinegar",
+      "kind": "exact",
+      "expected": [
+        "usda:172241"
+      ]
+    },
+    {
+      "id": "q026",
+      "q": "vinegar",
+      "kind": "alias",
+      "expected": [
+        "usda:172241"
+      ]
+    },
+    {
+      "id": "q027",
+      "q": "balsamic",
+      "kind": "alias",
+      "expected": [
+        "usda:172241"
+      ]
+    },
+    {
+      "id": "q028",
+      "q": "hummus",
+      "kind": "exact",
+      "expected": [
+        "usda:174289"
+      ]
+    },
+    {
+      "id": "q029",
+      "q": "humus",
+      "kind": "misspelling",
+      "expected": [
+        "usda:174289"
+      ]
+    },
+    {
+      "id": "q030",
+      "q": "houmous",
+      "kind": "alias",
+      "expected": [
+        "usda:174289"
+      ]
+    },
+    {
+      "id": "q031",
+      "q": "mayonnaise",
+      "kind": "exact",
+      "expected": [
+        "usda:171009"
+      ]
+    },
+    {
+      "id": "q032",
+      "q": "mayonaise",
+      "kind": "misspelling",
+      "expected": [
+        "usda:171009"
+      ]
+    },
+    {
+      "id": "q033",
+      "q": "mayo",
+      "kind": "alias",
+      "expected": [
+        "usda:171009"
+      ]
+    },
+    {
+      "id": "q034",
+      "q": "ranch dressing",
+      "kind": "exact",
+      "expected": [
+        "usda:173592"
+      ]
+    },
+    {
+      "id": "q035",
+      "q": "ranch",
+      "kind": "alias",
+      "expected": [
+        "usda:173592"
+      ]
+    },
+    {
+      "id": "q036",
+      "q": "salsa",
+      "kind": "exact",
+      "expected": [
+        "usda:174524"
+      ]
+    },
+    {
+      "id": "q037",
+      "q": "salza",
+      "kind": "misspelling",
+      "expected": [
+        "usda:174524"
+      ]
+    },
+    {
+      "id": "q038",
+      "q": "pico de gallo",
+      "kind": "alias",
+      "expected": [
+        "usda:174524"
+      ]
+    },
+    {
+      "id": "q039",
+      "q": "soy sauce",
+      "kind": "exact",
+      "expected": [
+        "usda:174277"
+      ]
+    },
+    {
+      "id": "q040",
+      "q": "shoyu",
+      "kind": "alias",
+      "expected": [
+        "usda:174277"
+      ]
+    },
+    {
+      "id": "q041",
+      "q": "soya sauce",
+      "kind": "alias",
+      "expected": [
+        "usda:174277"
+      ]
+    },
+    {
+      "id": "q042",
+      "q": "sriracha",
+      "kind": "exact",
+      "expected": [
+        "usda:171186"
+      ]
+    },
+    {
+      "id": "q043",
+      "q": "hot sauce",
+      "kind": "alias",
+      "expected": [
+        "usda:171186"
+      ]
+    },
+    {
+      "id": "q044",
+      "q": "chili sauce",
+      "kind": "alias",
+      "expected": [
+        "usda:171186"
+      ]
+    },
+    {
+      "id": "q045",
+      "q": "mustard",
+      "kind": "exact",
+      "expected": [
+        "usda:172234"
+      ]
+    },
+    {
+      "id": "q046",
+      "q": "yellow mustard",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172234"
+      ]
+    },
+    {
+      "id": "q047",
+      "q": "american mustard",
+      "kind": "alias",
+      "expected": [
+        "usda:172234"
+      ]
+    },
+    {
+      "id": "q048",
+      "q": "blue cheese",
+      "kind": "exact",
+      "expected": [
+        "usda:172175"
+      ]
+    },
+    {
+      "id": "q049",
+      "q": "bleu cheese",
+      "kind": "misspelling",
+      "expected": [
+        "usda:172175"
+      ]
+    },
+    {
+      "id": "q050",
+      "q": "butter",
+      "kind": "exact",
+      "expected": [
+        "usda:173410"
+      ]
+    },
+    {
+      "id": "q051",
+      "q": "salted butter",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173410"
+      ]
+    },
+    {
+      "id": "q052",
+      "q": "cheddar cheese",
+      "kind": "exact",
+      "expected": [
+        "usda:328637"
+      ]
+    },
+    {
+      "id": "q053",
+      "q": "cheeder cheese",
+      "kind": "misspelling",
+      "expected": [
+        "usda:328637"
+      ]
+    },
+    {
+      "id": "q054",
+      "q": "cheddar",
+      "kind": "alias",
+      "expected": [
+        "usda:328637"
+      ]
+    },
+    {
+      "id": "q055",
+      "q": "feta cheese",
+      "kind": "exact",
+      "expected": [
+        "usda:173420"
+      ]
+    },
+    {
+      "id": "q056",
+      "q": "fetta",
+      "kind": "misspelling",
+      "expected": [
+        "usda:173420"
+      ]
+    },
+    {
+      "id": "q057",
+      "q": "feta",
+      "kind": "alias",
+      "expected": [
+        "usda:173420"
+      ]
+    },
+    {
+      "id": "q058",
+      "q": "greek yogurt",
+      "kind": "exact",
+      "expected": [
+        "usda:2705424"
+      ]
+    },
+    {
+      "id": "q059",
+      "q": "greek yoghurt",
+      "kind": "alias",
+      "expected": [
+        "usda:2705424"
+      ]
+    },
+    {
+      "id": "q060",
+      "q": "yoghurt",
+      "kind": "alias",
+      "expected": [
+        "usda:2705424"
+      ]
+    },
+    {
+      "id": "q061",
+      "q": "heavy cream",
+      "kind": "exact",
+      "expected": [
+        "usda:170859"
+      ]
+    },
+    {
+      "id": "q062",
+      "q": "heavy whipping cream",
+      "kind": "multi_word",
+      "expected": [
+        "usda:170859"
+      ]
+    },
+    {
+      "id": "q063",
+      "q": "double cream",
+      "kind": "alias",
+      "expected": [
+        "usda:170859"
+      ]
+    },
+    {
+      "id": "q064",
+      "q": "reduced fat milk",
+      "kind": "exact",
+      "expected": [
+        "usda:171267"
+      ]
+    },
+    {
+      "id": "q065",
+      "q": "semi skimmed milk",
+      "kind": "alias",
+      "expected": [
+        "usda:171267"
+      ]
+    },
+    {
+      "id": "q066",
+      "q": "almond milk",
+      "kind": "exact",
+      "expected": [
+        "usda:174832"
+      ]
+    },
+    {
+      "id": "q067",
+      "q": "almondmilk",
+      "kind": "misspelling",
+      "expected": [
+        "usda:174832"
+      ]
+    },
+    {
+      "id": "q068",
+      "q": "unsweetened almond milk",
+      "kind": "multi_word",
+      "expected": [
+        "usda:174832"
+      ]
+    },
+    {
+      "id": "q069",
+      "q": "coconut milk",
+      "kind": "exact",
+      "expected": [
+        "usda:170173"
+      ]
+    },
+    {
+      "id": "q070",
+      "q": "tinned coconut milk",
+      "kind": "alias",
+      "expected": [
+        "usda:170173"
+      ]
+    },
+    {
+      "id": "q071",
+      "q": "oat milk",
+      "kind": "exact",
+      "expected": [
+        "usda:2705412"
+      ]
+    },
+    {
+      "id": "q072",
+      "q": "oatmilk",
+      "kind": "misspelling",
+      "expected": [
+        "usda:2705412"
+      ]
+    },
+    {
+      "id": "q073",
+      "q": "oat drink",
+      "kind": "alias",
+      "expected": [
+        "usda:2705412"
+      ]
+    },
+    {
+      "id": "q074",
+      "q": "soy milk",
+      "kind": "exact",
+      "expected": [
+        "usda:175215"
+      ]
+    },
+    {
+      "id": "q075",
+      "q": "soymilk",
+      "kind": "misspelling",
+      "expected": [
+        "usda:175215"
+      ]
+    },
+    {
+      "id": "q076",
+      "q": "soya milk",
+      "kind": "alias",
+      "expected": [
+        "usda:175215"
+      ]
+    },
+    {
+      "id": "q077",
+      "q": "all purpose flour",
+      "kind": "exact",
+      "expected": [
+        "usda:168894"
+      ]
+    },
+    {
+      "id": "q078",
+      "q": "wheat flour",
+      "kind": "multi_word",
+      "expected": [
+        "usda:168894"
+      ]
+    },
+    {
+      "id": "q079",
+      "q": "plain flour",
+      "kind": "alias",
+      "expected": [
+        "usda:168894"
+      ]
+    },
+    {
+      "id": "q080",
+      "q": "cooked brown rice",
+      "kind": "exact",
+      "expected": [
+        "usda:169704"
+      ]
+    },
+    {
+      "id": "q081",
+      "q": "steamed brown rice",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169704"
+      ]
+    },
+    {
+      "id": "q082",
+      "q": "uncooked brown rice",
+      "kind": "exact",
+      "expected": [
+        "usda:169703"
+      ]
+    },
+    {
+      "id": "q083",
+      "q": "wholegrain rice",
+      "kind": "alias",
+      "expected": [
+        "usda:169703"
+      ]
+    },
+    {
+      "id": "q084",
+      "q": "bulgur",
+      "kind": "exact",
+      "expected": [
+        "usda:170688"
+      ]
+    },
+    {
+      "id": "q085",
+      "q": "bulghur",
+      "kind": "misspelling",
+      "expected": [
+        "usda:170688"
+      ]
+    },
+    {
+      "id": "q086",
+      "q": "bulgar",
+      "kind": "misspelling",
+      "expected": [
+        "usda:170688"
+      ]
+    },
+    {
+      "id": "q087",
+      "q": "cooked pasta",
+      "kind": "exact",
+      "expected": [
+        "usda:169737"
+      ]
+    },
+    {
+      "id": "q088",
+      "q": "boiled pasta",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169737"
+      ]
+    },
+    {
+      "id": "q089",
+      "q": "cooked spaghetti",
+      "kind": "alias",
+      "expected": [
+        "usda:169737"
+      ]
+    },
+    {
+      "id": "q090",
+      "q": "dry pasta",
+      "kind": "exact",
+      "expected": [
+        "usda:169736"
+      ]
+    },
+    {
+      "id": "q091",
+      "q": "uncooked pasta",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169736"
+      ]
+    },
+    {
+      "id": "q092",
+      "q": "penne",
+      "kind": "alias",
+      "expected": [
+        "usda:169736"
+      ]
+    },
+    {
+      "id": "q093",
+      "q": "pearl barley",
+      "kind": "exact",
+      "expected": [
+        "usda:170284"
+      ]
+    },
+    {
+      "id": "q094",
+      "q": "barley",
+      "kind": "alias",
+      "expected": [
+        "usda:170284"
+      ]
+    },
+    {
+      "id": "q095",
+      "q": "cooked quinoa",
+      "kind": "exact",
+      "expected": [
+        "usda:168917"
+      ]
+    },
+    {
+      "id": "q096",
+      "q": "uncooked quinoa",
+      "kind": "exact",
+      "expected": [
+        "usda:168874"
+      ]
+    },
+    {
+      "id": "q097",
+      "q": "keenwa",
+      "kind": "misspelling",
+      "expected": [
+        "usda:168874"
+      ]
+    },
+    {
+      "id": "q098",
+      "q": "rolled oats",
+      "kind": "exact",
+      "expected": [
+        "usda:173904"
+      ]
+    },
+    {
+      "id": "q099",
+      "q": "oats",
+      "kind": "alias",
+      "expected": [
+        "usda:173904"
+      ]
+    },
+    {
+      "id": "q100",
+      "q": "oatmeal",
+      "kind": "alias",
+      "expected": [
+        "usda:173904"
+      ]
+    },
+    {
+      "id": "q101",
+      "q": "cooked white rice",
+      "kind": "exact",
+      "expected": [
+        "usda:169757"
+      ]
+    },
+    {
+      "id": "q102",
+      "q": "boiled rice",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169757"
+      ]
+    },
+    {
+      "id": "q103",
+      "q": "long grain rice",
+      "kind": "exact",
+      "expected": [
+        "usda:169756"
+      ]
+    },
+    {
+      "id": "q104",
+      "q": "raw rice",
+      "kind": "alias",
+      "expected": [
+        "usda:169756"
+      ]
+    },
+    {
+      "id": "q105",
+      "q": "canned black beans",
+      "kind": "exact",
+      "expected": [
+        "usda:175238"
+      ]
+    },
+    {
+      "id": "q106",
+      "q": "tinned black beans",
+      "kind": "alias",
+      "expected": [
+        "usda:175238"
+      ]
+    },
+    {
+      "id": "q107",
+      "q": "dry black beans",
+      "kind": "exact",
+      "expected": [
+        "usda:173734"
+      ]
+    },
+    {
+      "id": "q108",
+      "q": "turtle beans",
+      "kind": "alias",
+      "expected": [
+        "usda:173734"
+      ]
+    },
+    {
+      "id": "q109",
+      "q": "canned chickpeas",
+      "kind": "exact",
+      "expected": [
+        "usda:173800"
+      ]
+    },
+    {
+      "id": "q110",
+      "q": "tinned chickpeas",
+      "kind": "alias",
+      "expected": [
+        "usda:173800"
+      ]
+    },
+    {
+      "id": "q111",
+      "q": "dry chickpeas",
+      "kind": "exact",
+      "expected": [
+        "usda:173756"
+      ]
+    },
+    {
+      "id": "q112",
+      "q": "chick peas",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173756"
+      ]
+    },
+    {
+      "id": "q113",
+      "q": "edamame",
+      "kind": "exact",
+      "expected": [
+        "usda:169282"
+      ]
+    },
+    {
+      "id": "q114",
+      "q": "edaname",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169282"
+      ]
+    },
+    {
+      "id": "q115",
+      "q": "green soybeans",
+      "kind": "alias",
+      "expected": [
+        "usda:169282"
+      ]
+    },
+    {
+      "id": "q116",
+      "q": "kidney beans",
+      "kind": "exact",
+      "expected": [
+        "usda:174285"
+      ]
+    },
+    {
+      "id": "q117",
+      "q": "red kidney beans",
+      "kind": "multi_word",
+      "expected": [
+        "usda:174285"
+      ]
+    },
+    {
+      "id": "q118",
+      "q": "rajma",
+      "kind": "alias",
+      "expected": [
+        "usda:174285"
+      ]
+    },
+    {
+      "id": "q119",
+      "q": "cooked lentils",
+      "kind": "exact",
+      "expected": [
+        "usda:172421"
+      ]
+    },
+    {
+      "id": "q120",
+      "q": "boiled lentils",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172421"
+      ]
+    },
+    {
+      "id": "q121",
+      "q": "dry lentils",
+      "kind": "exact",
+      "expected": [
+        "usda:172420"
+      ]
+    },
+    {
+      "id": "q122",
+      "q": "red lentils",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172420"
+      ]
+    },
+    {
+      "id": "q123",
+      "q": "almonds",
+      "kind": "exact",
+      "expected": [
+        "usda:170567"
+      ]
+    },
+    {
+      "id": "q124",
+      "q": "almond",
+      "kind": "plural",
+      "expected": [
+        "usda:170567"
+      ]
+    },
+    {
+      "id": "q125",
+      "q": "cashews",
+      "kind": "exact",
+      "expected": [
+        "usda:170162"
+      ]
+    },
+    {
+      "id": "q126",
+      "q": "cashew",
+      "kind": "plural",
+      "expected": [
+        "usda:170162"
+      ]
+    },
+    {
+      "id": "q127",
+      "q": "kaju",
+      "kind": "alias",
+      "expected": [
+        "usda:170162"
+      ]
+    },
+    {
+      "id": "q128",
+      "q": "peanut butter",
+      "kind": "exact",
+      "expected": [
+        "usda:172470"
+      ]
+    },
+    {
+      "id": "q129",
+      "q": "peanutbutter",
+      "kind": "misspelling",
+      "expected": [
+        "usda:172470"
+      ]
+    },
+    {
+      "id": "q130",
+      "q": "creamy peanut butter",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172470"
+      ]
+    },
+    {
+      "id": "q131",
+      "q": "peanuts",
+      "kind": "exact",
+      "expected": [
+        "usda:173806"
+      ]
+    },
+    {
+      "id": "q132",
+      "q": "roasted peanuts",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173806"
+      ]
+    },
+    {
+      "id": "q133",
+      "q": "groundnuts",
+      "kind": "alias",
+      "expected": [
+        "usda:173806"
+      ]
+    },
+    {
+      "id": "q134",
+      "q": "pistachios",
+      "kind": "exact",
+      "expected": [
+        "usda:170184"
+      ]
+    },
+    {
+      "id": "q135",
+      "q": "pistachio",
+      "kind": "plural",
+      "expected": [
+        "usda:170184"
+      ]
+    },
+    {
+      "id": "q136",
+      "q": "shredded coconut",
+      "kind": "exact",
+      "expected": [
+        "usda:170170"
+      ]
+    },
+    {
+      "id": "q137",
+      "q": "coconut flakes",
+      "kind": "multi_word",
+      "expected": [
+        "usda:170170"
+      ]
+    },
+    {
+      "id": "q138",
+      "q": "desiccated coconut",
+      "kind": "alias",
+      "expected": [
+        "usda:170170"
+      ]
+    },
+    {
+      "id": "q139",
+      "q": "sunflower seeds",
+      "kind": "exact",
+      "expected": [
+        "usda:170562"
+      ]
+    },
+    {
+      "id": "q140",
+      "q": "sunflower kernels",
+      "kind": "alias",
+      "expected": [
+        "usda:170562"
+      ]
+    },
+    {
+      "id": "q141",
+      "q": "tahini",
+      "kind": "exact",
+      "expected": [
+        "usda:170189"
+      ]
+    },
+    {
+      "id": "q142",
+      "q": "tahina",
+      "kind": "misspelling",
+      "expected": [
+        "usda:170189"
+      ]
+    },
+    {
+      "id": "q143",
+      "q": "sesame paste",
+      "kind": "alias",
+      "expected": [
+        "usda:170189"
+      ]
+    },
+    {
+      "id": "q144",
+      "q": "walnuts",
+      "kind": "exact",
+      "expected": [
+        "usda:170187"
+      ]
+    },
+    {
+      "id": "q145",
+      "q": "walnut",
+      "kind": "plural",
+      "expected": [
+        "usda:170187"
+      ]
+    },
+    {
+      "id": "q146",
+      "q": "english walnuts",
+      "kind": "multi_word",
+      "expected": [
+        "usda:170187"
+      ]
+    },
+    {
+      "id": "q147",
+      "q": "canola oil",
+      "kind": "exact",
+      "expected": [
+        "usda:172336"
+      ]
+    },
+    {
+      "id": "q148",
+      "q": "vegetable oil",
+      "kind": "alias",
+      "expected": [
+        "usda:172336"
+      ]
+    },
+    {
+      "id": "q149",
+      "q": "coconut oil",
+      "kind": "exact",
+      "expected": [
+        "usda:171412"
+      ]
+    },
+    {
+      "id": "q150",
+      "q": "virgin coconut oil",
+      "kind": "multi_word",
+      "expected": [
+        "usda:171412"
+      ]
+    },
+    {
+      "id": "q151",
+      "q": "olive oil",
+      "kind": "exact",
+      "expected": [
+        "usda:171413"
+      ]
+    },
+    {
+      "id": "q152",
+      "q": "extra virgin olive oil",
+      "kind": "multi_word",
+      "expected": [
+        "usda:171413"
+      ]
+    },
+    {
+      "id": "q153",
+      "q": "evoo",
+      "kind": "alias",
+      "expected": [
+        "usda:171413"
+      ]
+    },
+    {
+      "id": "q154",
+      "q": "cornstarch",
+      "kind": "exact",
+      "expected": [
+        "usda:169698"
+      ]
+    },
+    {
+      "id": "q155",
+      "q": "corn starch",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169698"
+      ]
+    },
+    {
+      "id": "q156",
+      "q": "cornflour",
+      "kind": "alias",
+      "expected": [
+        "usda:169698"
+      ]
+    },
+    {
+      "id": "q157",
+      "q": "meal replacement shake",
+      "kind": "exact",
+      "expected": [
+        "usda:2710725"
+      ]
+    },
+    {
+      "id": "q158",
+      "q": "nutrition shake",
+      "kind": "alias",
+      "expected": [
+        "usda:2710725"
+      ]
+    },
+    {
+      "id": "q159",
+      "q": "whey protein",
+      "kind": "exact",
+      "expected": [
+        "usda:2710742"
+      ]
+    },
+    {
+      "id": "q160",
+      "q": "protein powder",
+      "kind": "alias",
+      "expected": [
+        "usda:2710742"
+      ]
+    },
+    {
+      "id": "q161",
+      "q": "burrito",
+      "kind": "exact",
+      "expected": [
+        "usda:2708549"
+      ]
+    },
+    {
+      "id": "q162",
+      "q": "bean burrito",
+      "kind": "multi_word",
+      "expected": [
+        "usda:2708549"
+      ]
+    },
+    {
+      "id": "q163",
+      "q": "pizza",
+      "kind": "exact",
+      "expected": [
+        "usda:2708618"
+      ]
+    },
+    {
+      "id": "q164",
+      "q": "cheese pizza",
+      "kind": "multi_word",
+      "expected": [
+        "usda:2708618"
+      ]
+    },
+    {
+      "id": "q165",
+      "q": "margherita pizza",
+      "kind": "alias",
+      "expected": [
+        "usda:2708618"
+      ]
+    },
+    {
+      "id": "q166",
+      "q": "chicken noodle soup",
+      "kind": "exact",
+      "expected": [
+        "usda:172909"
+      ]
+    },
+    {
+      "id": "q167",
+      "q": "noodle soup",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172909"
+      ]
+    },
+    {
+      "id": "q168",
+      "q": "chicken soup",
+      "kind": "alias",
+      "expected": [
+        "usda:172909"
+      ]
+    },
+    {
+      "id": "q169",
+      "q": "ham and cheese sandwich",
+      "kind": "exact",
+      "expected": [
+        "usda:2706967"
+      ]
+    },
+    {
+      "id": "q170",
+      "q": "ham sandwich",
+      "kind": "multi_word",
+      "expected": [
+        "usda:2706967"
+      ]
+    },
+    {
+      "id": "q171",
+      "q": "green salad",
+      "kind": "exact",
+      "expected": [
+        "usda:2709823"
+      ]
+    },
+    {
+      "id": "q172",
+      "q": "side salad",
+      "kind": "alias",
+      "expected": [
+        "usda:2709823"
+      ]
+    },
+    {
+      "id": "q173",
+      "q": "mixed salad",
+      "kind": "alias",
+      "expected": [
+        "usda:2709823"
+      ]
+    },
+    {
+      "id": "q174",
+      "q": "macaroni and cheese",
+      "kind": "exact",
+      "expected": [
+        "usda:2708811"
+      ]
+    },
+    {
+      "id": "q175",
+      "q": "mac and cheese",
+      "kind": "alias",
+      "expected": [
+        "usda:2708811"
+      ]
+    },
+    {
+      "id": "q176",
+      "q": "spaghetti marinara",
+      "kind": "exact",
+      "expected": [
+        "usda:2708831"
+      ]
+    },
+    {
+      "id": "q177",
+      "q": "spagetti with tomato sauce",
+      "kind": "misspelling",
+      "expected": [
+        "usda:2708831"
+      ]
+    },
+    {
+      "id": "q178",
+      "q": "pasta with tomato sauce",
+      "kind": "multi_word",
+      "expected": [
+        "usda:2708831"
+      ]
+    },
+    {
+      "id": "q179",
+      "q": "apple",
+      "kind": "exact",
+      "expected": [
+        "usda:168202"
+      ]
+    },
+    {
+      "id": "q180",
+      "q": "apples",
+      "kind": "plural",
+      "expected": [
+        "usda:168202"
+      ]
+    },
+    {
+      "id": "q181",
+      "q": "gala apple",
+      "kind": "multi_word",
+      "expected": [
+        "usda:168202"
+      ]
+    },
+    {
+      "id": "q182",
+      "q": "avocado",
+      "kind": "exact",
+      "expected": [
+        "usda:171705"
+      ]
+    },
+    {
+      "id": "q183",
+      "q": "avacado",
+      "kind": "misspelling",
+      "expected": [
+        "usda:171705"
+      ]
+    },
+    {
+      "id": "q184",
+      "q": "avocadoes",
+      "kind": "misspelling",
+      "expected": [
+        "usda:171705"
+      ]
+    },
+    {
+      "id": "q185",
+      "q": "banana",
+      "kind": "exact",
+      "expected": [
+        "usda:173944"
+      ]
+    },
+    {
+      "id": "q186",
+      "q": "bannana",
+      "kind": "misspelling",
+      "expected": [
+        "usda:173944"
+      ]
+    },
+    {
+      "id": "q187",
+      "q": "bananas",
+      "kind": "plural",
+      "expected": [
+        "usda:173944"
+      ]
+    },
+    {
+      "id": "q188",
+      "q": "grapes",
+      "kind": "exact",
+      "expected": [
+        "usda:174683"
+      ]
+    },
+    {
+      "id": "q189",
+      "q": "grape",
+      "kind": "plural",
+      "expected": [
+        "usda:174683"
+      ]
+    },
+    {
+      "id": "q190",
+      "q": "seedless grapes",
+      "kind": "multi_word",
+      "expected": [
+        "usda:174683"
+      ]
+    },
+    {
+      "id": "q191",
+      "q": "lemon",
+      "kind": "exact",
+      "expected": [
+        "usda:167746"
+      ]
+    },
+    {
+      "id": "q192",
+      "q": "lemons",
+      "kind": "plural",
+      "expected": [
+        "usda:167746"
+      ]
+    },
+    {
+      "id": "q193",
+      "q": "fresh lemon",
+      "kind": "multi_word",
+      "expected": [
+        "usda:167746"
+      ]
+    },
+    {
+      "id": "q194",
+      "q": "lime",
+      "kind": "exact",
+      "expected": [
+        "usda:168155"
+      ]
+    },
+    {
+      "id": "q195",
+      "q": "limes",
+      "kind": "plural",
+      "expected": [
+        "usda:168155"
+      ]
+    },
+    {
+      "id": "q196",
+      "q": "key lime",
+      "kind": "multi_word",
+      "expected": [
+        "usda:168155"
+      ]
+    },
+    {
+      "id": "q197",
+      "q": "mango",
+      "kind": "exact",
+      "expected": [
+        "usda:169910"
+      ]
+    },
+    {
+      "id": "q198",
+      "q": "mangos",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169910"
+      ]
+    },
+    {
+      "id": "q199",
+      "q": "mangoes",
+      "kind": "plural",
+      "expected": [
+        "usda:169910"
+      ]
+    },
+    {
+      "id": "q200",
+      "q": "peach",
+      "kind": "exact",
+      "expected": [
+        "usda:169928"
+      ]
+    },
+    {
+      "id": "q201",
+      "q": "peaches",
+      "kind": "plural",
+      "expected": [
+        "usda:169928"
+      ]
+    },
+    {
+      "id": "q202",
+      "q": "raisins",
+      "kind": "exact",
+      "expected": [
+        "usda:168165"
+      ]
+    },
+    {
+      "id": "q203",
+      "q": "raisin",
+      "kind": "plural",
+      "expected": [
+        "usda:168165"
+      ]
+    },
+    {
+      "id": "q204",
+      "q": "dried grapes",
+      "kind": "multi_word",
+      "expected": [
+        "usda:168165"
+      ]
+    },
+    {
+      "id": "q205",
+      "q": "strawberries",
+      "kind": "exact",
+      "expected": [
+        "usda:167762"
+      ]
+    },
+    {
+      "id": "q206",
+      "q": "strawberrys",
+      "kind": "misspelling",
+      "expected": [
+        "usda:167762"
+      ]
+    },
+    {
+      "id": "q207",
+      "q": "strawberry",
+      "kind": "plural",
+      "expected": [
+        "usda:167762"
+      ]
+    },
+    {
+      "id": "q208",
+      "q": "bell pepper",
+      "kind": "exact",
+      "expected": [
+        "usda:170108"
+      ]
+    },
+    {
+      "id": "q209",
+      "q": "bell peppers",
+      "kind": "plural",
+      "expected": [
+        "usda:170108"
+      ]
+    },
+    {
+      "id": "q210",
+      "q": "capsicum",
+      "kind": "alias",
+      "expected": [
+        "usda:170108"
+      ]
+    },
+    {
+      "id": "q211",
+      "q": "broccoli",
+      "kind": "exact",
+      "expected": [
+        "usda:170379"
+      ]
+    },
+    {
+      "id": "q212",
+      "q": "brocoli",
+      "kind": "misspelling",
+      "expected": [
+        "usda:170379"
+      ]
+    },
+    {
+      "id": "q213",
+      "q": "brocolli",
+      "kind": "misspelling",
+      "expected": [
+        "usda:170379"
+      ]
+    },
+    {
+      "id": "q214",
+      "q": "cabbage",
+      "kind": "exact",
+      "expected": [
+        "usda:169975"
+      ]
+    },
+    {
+      "id": "q215",
+      "q": "shredded cabbage",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169975"
+      ]
+    },
+    {
+      "id": "q216",
+      "q": "green cabbage",
+      "kind": "alias",
+      "expected": [
+        "usda:169975"
+      ]
+    },
+    {
+      "id": "q217",
+      "q": "carrot",
+      "kind": "exact",
+      "expected": [
+        "usda:170393"
+      ]
+    },
+    {
+      "id": "q218",
+      "q": "carrots",
+      "kind": "plural",
+      "expected": [
+        "usda:170393"
+      ]
+    },
+    {
+      "id": "q219",
+      "q": "baby carrots",
+      "kind": "multi_word",
+      "expected": [
+        "usda:170393"
+      ]
+    },
+    {
+      "id": "q220",
+      "q": "cauliflower",
+      "kind": "exact",
+      "expected": [
+        "usda:169986"
+      ]
+    },
+    {
+      "id": "q221",
+      "q": "cauliflour",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169986"
+      ]
+    },
+    {
+      "id": "q222",
+      "q": "califlower",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169986"
+      ]
+    },
+    {
+      "id": "q223",
+      "q": "celery",
+      "kind": "exact",
+      "expected": [
+        "usda:169988"
+      ]
+    },
+    {
+      "id": "q224",
+      "q": "celery stalks",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169988"
+      ]
+    },
+    {
+      "id": "q225",
+      "q": "green chili",
+      "kind": "exact",
+      "expected": [
+        "usda:170497"
+      ]
+    },
+    {
+      "id": "q226",
+      "q": "chilli pepper",
+      "kind": "alias",
+      "expected": [
+        "usda:170497"
+      ]
+    },
+    {
+      "id": "q227",
+      "q": "hot pepper",
+      "kind": "alias",
+      "expected": [
+        "usda:170497"
+      ]
+    },
+    {
+      "id": "q228",
+      "q": "cucumber",
+      "kind": "exact",
+      "expected": [
+        "usda:168409"
+      ]
+    },
+    {
+      "id": "q229",
+      "q": "cucumbers",
+      "kind": "plural",
+      "expected": [
+        "usda:168409"
+      ]
+    },
+    {
+      "id": "q230",
+      "q": "cukes",
+      "kind": "alias",
+      "expected": [
+        "usda:168409"
+      ]
+    },
+    {
+      "id": "q231",
+      "q": "eggplant",
+      "kind": "exact",
+      "expected": [
+        "usda:169228"
+      ]
+    },
+    {
+      "id": "q232",
+      "q": "aubergine",
+      "kind": "alias",
+      "expected": [
+        "usda:169228"
+      ]
+    },
+    {
+      "id": "q233",
+      "q": "brinjal",
+      "kind": "alias",
+      "expected": [
+        "usda:169228"
+      ]
+    },
+    {
+      "id": "q234",
+      "q": "garlic",
+      "kind": "exact",
+      "expected": [
+        "usda:169230"
+      ]
+    },
+    {
+      "id": "q235",
+      "q": "garlic cloves",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169230"
+      ]
+    },
+    {
+      "id": "q236",
+      "q": "mushrooms",
+      "kind": "exact",
+      "expected": [
+        "usda:169251"
+      ]
+    },
+    {
+      "id": "q237",
+      "q": "mushroom",
+      "kind": "plural",
+      "expected": [
+        "usda:169251"
+      ]
+    },
+    {
+      "id": "q238",
+      "q": "button mushrooms",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169251"
+      ]
+    },
+    {
+      "id": "q239",
+      "q": "olives",
+      "kind": "exact",
+      "expected": [
+        "usda:169094"
+      ]
+    },
+    {
+      "id": "q240",
+      "q": "olive",
+      "kind": "plural",
+      "expected": [
+        "usda:169094"
+      ]
+    },
+    {
+      "id": "q241",
+      "q": "black olives",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169094"
+      ]
+    },
+    {
+      "id": "q242",
+      "q": "onion",
+      "kind": "exact",
+      "expected": [
+        "usda:170000"
+      ]
+    },
+    {
+      "id": "q243",
+      "q": "onions",
+      "kind": "plural",
+      "expected": [
+        "usda:170000"
+      ]
+    },
+    {
+      "id": "q244",
+      "q": "yellow onion",
+      "kind": "multi_word",
+      "expected": [
+        "usda:170000"
+      ]
+    },
+    {
+      "id": "q245",
+      "q": "potato",
+      "kind": "exact",
+      "expected": [
+        "usda:170027"
+      ]
+    },
+    {
+      "id": "q246",
+      "q": "potatoes",
+      "kind": "plural",
+      "expected": [
+        "usda:170027"
+      ]
+    },
+    {
+      "id": "q247",
+      "q": "russet potato",
+      "kind": "multi_word",
+      "expected": [
+        "usda:170027"
+      ]
+    },
+    {
+      "id": "q248",
+      "q": "spinach",
+      "kind": "exact",
+      "expected": [
+        "usda:168462"
+      ]
+    },
+    {
+      "id": "q249",
+      "q": "spinich",
+      "kind": "misspelling",
+      "expected": [
+        "usda:168462"
+      ]
+    },
+    {
+      "id": "q250",
+      "q": "baby spinach",
+      "kind": "multi_word",
+      "expected": [
+        "usda:168462"
+      ]
+    },
+    {
+      "id": "q251",
+      "q": "sweet potato",
+      "kind": "exact",
+      "expected": [
+        "usda:168482"
+      ]
+    },
+    {
+      "id": "q252",
+      "q": "sweetpotato",
+      "kind": "misspelling",
+      "expected": [
+        "usda:168482"
+      ]
+    },
+    {
+      "id": "q253",
+      "q": "sweet potatoes",
+      "kind": "plural",
+      "expected": [
+        "usda:168482"
+      ]
+    },
+    {
+      "id": "q254",
+      "q": "tomato",
+      "kind": "exact",
+      "expected": [
+        "usda:170457"
+      ]
+    },
+    {
+      "id": "q255",
+      "q": "tomatos",
+      "kind": "misspelling",
+      "expected": [
+        "usda:170457"
+      ]
+    },
+    {
+      "id": "q256",
+      "q": "tomatoes",
+      "kind": "plural",
+      "expected": [
+        "usda:170457"
+      ]
+    },
+    {
+      "id": "q257",
+      "q": "zucchini",
+      "kind": "exact",
+      "expected": [
+        "usda:169291"
+      ]
+    },
+    {
+      "id": "q258",
+      "q": "zuchini",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169291"
+      ]
+    },
+    {
+      "id": "q259",
+      "q": "courgette",
+      "kind": "alias",
+      "expected": [
+        "usda:169291"
+      ]
+    },
+    {
+      "id": "q260",
+      "q": "egg",
+      "kind": "exact",
+      "expected": [
+        "usda:171287"
+      ]
+    },
+    {
+      "id": "q261",
+      "q": "eggs",
+      "kind": "plural",
+      "expected": [
+        "usda:171287"
+      ]
+    },
+    {
+      "id": "q262",
+      "q": "large egg",
+      "kind": "multi_word",
+      "expected": [
+        "usda:171287"
+      ]
+    },
+    {
+      "id": "q263",
+      "q": "egg white",
+      "kind": "exact",
+      "expected": [
+        "usda:172183"
+      ]
+    },
+    {
+      "id": "q264",
+      "q": "egg whites",
+      "kind": "plural",
+      "expected": [
+        "usda:172183"
+      ]
+    },
+    {
+      "id": "q265",
+      "q": "albumen",
+      "kind": "alias",
+      "expected": [
+        "usda:172183"
+      ]
+    },
+    {
+      "id": "q266",
+      "q": "egg yolk",
+      "kind": "exact",
+      "expected": [
+        "usda:172184"
+      ]
+    },
+    {
+      "id": "q267",
+      "q": "egg yolks",
+      "kind": "plural",
+      "expected": [
+        "usda:172184"
+      ]
+    },
+    {
+      "id": "q268",
+      "q": "yolk",
+      "kind": "alias",
+      "expected": [
+        "usda:172184"
+      ]
+    },
+    {
+      "id": "q269",
+      "q": "egg substitute",
+      "kind": "exact",
+      "expected": [
+        "usda:173462"
+      ]
+    },
+    {
+      "id": "q270",
+      "q": "liquid eggs",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173462"
+      ]
+    },
+    {
+      "id": "q271",
+      "q": "egg replacer",
+      "kind": "alias",
+      "expected": [
+        "usda:173462"
+      ]
+    },
+    {
+      "id": "q272",
+      "q": "bacon",
+      "kind": "exact",
+      "expected": [
+        "usda:168277"
+      ]
+    },
+    {
+      "id": "q273",
+      "q": "bacon strips",
+      "kind": "multi_word",
+      "expected": [
+        "usda:168277"
+      ]
+    },
+    {
+      "id": "q274",
+      "q": "streaky bacon",
+      "kind": "alias",
+      "expected": [
+        "usda:168277"
+      ]
+    },
+    {
+      "id": "q275",
+      "q": "beef liver",
+      "kind": "exact",
+      "expected": [
+        "usda:169451"
+      ]
+    },
+    {
+      "id": "q276",
+      "q": "calf liver",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169451"
+      ]
+    },
+    {
+      "id": "q277",
+      "q": "liver",
+      "kind": "alias",
+      "expected": [
+        "usda:169451"
+      ]
+    },
+    {
+      "id": "q278",
+      "q": "ground beef",
+      "kind": "exact",
+      "expected": [
+        "usda:173110"
+      ]
+    },
+    {
+      "id": "q279",
+      "q": "minced beef",
+      "kind": "alias",
+      "expected": [
+        "usda:173110"
+      ]
+    },
+    {
+      "id": "q280",
+      "q": "hamburger meat",
+      "kind": "alias",
+      "expected": [
+        "usda:173110"
+      ]
+    },
+    {
+      "id": "q281",
+      "q": "ground bison",
+      "kind": "exact",
+      "expected": [
+        "usda:174421"
+      ]
+    },
+    {
+      "id": "q282",
+      "q": "buffalo meat",
+      "kind": "alias",
+      "expected": [
+        "usda:174421"
+      ]
+    },
+    {
+      "id": "q283",
+      "q": "bison",
+      "kind": "alias",
+      "expected": [
+        "usda:174421"
+      ]
+    },
+    {
+      "id": "q284",
+      "q": "ground lamb",
+      "kind": "exact",
+      "expected": [
+        "usda:174370"
+      ]
+    },
+    {
+      "id": "q285",
+      "q": "minced lamb",
+      "kind": "alias",
+      "expected": [
+        "usda:174370"
+      ]
+    },
+    {
+      "id": "q286",
+      "q": "pork tenderloin",
+      "kind": "exact",
+      "expected": [
+        "usda:168249"
+      ]
+    },
+    {
+      "id": "q287",
+      "q": "pork loin",
+      "kind": "alias",
+      "expected": [
+        "usda:168249"
+      ]
+    },
+    {
+      "id": "q288",
+      "q": "tempeh",
+      "kind": "exact",
+      "expected": [
+        "usda:174272"
+      ]
+    },
+    {
+      "id": "q289",
+      "q": "tempe",
+      "kind": "misspelling",
+      "expected": [
+        "usda:174272"
+      ]
+    },
+    {
+      "id": "q290",
+      "q": "tofu",
+      "kind": "exact",
+      "expected": [
+        "usda:172448"
+      ]
+    },
+    {
+      "id": "q291",
+      "q": "firm tofu",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172448"
+      ]
+    },
+    {
+      "id": "q292",
+      "q": "bean curd",
+      "kind": "alias",
+      "expected": [
+        "usda:172448"
+      ]
+    },
+    {
+      "id": "q293",
+      "q": "wheat gluten",
+      "kind": "exact",
+      "expected": [
+        "usda:2709163"
+      ]
+    },
+    {
+      "id": "q294",
+      "q": "wheat meat",
+      "kind": "multi_word",
+      "expected": [
+        "usda:2709163"
+      ]
+    },
+    {
+      "id": "q295",
+      "q": "seitan",
+      "kind": "alias",
+      "expected": [
+        "usda:2709163"
+      ]
+    },
+    {
+      "id": "q296",
+      "q": "chiken breast",
+      "kind": "misspelling",
+      "expected": [
+        "usda:171077"
+      ]
+    },
+    {
+      "id": "q297",
+      "q": "chicken breasts",
+      "kind": "plural",
+      "expected": [
+        "usda:171077"
+      ]
+    },
+    {
+      "id": "q298",
+      "q": "boneless skinless chicken breast",
+      "kind": "multi_word",
+      "expected": [
+        "usda:171077"
+      ]
+    },
+    {
+      "id": "q299",
+      "q": "grilled chicken breast",
+      "kind": "exact",
+      "expected": [
+        "usda:171477"
+      ]
+    },
+    {
+      "id": "q300",
+      "q": "cooked chicken breast",
+      "kind": "multi_word",
+      "expected": [
+        "usda:171477"
+      ]
+    },
+    {
+      "id": "q301",
+      "q": "roasted chicken breast",
+      "kind": "alias",
+      "expected": [
+        "usda:171477"
+      ]
+    },
+    {
+      "id": "q302",
+      "q": "duck",
+      "kind": "exact",
+      "expected": [
+        "usda:172410"
+      ]
+    },
+    {
+      "id": "q303",
+      "q": "duck breast",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172410"
+      ]
+    },
+    {
+      "id": "q304",
+      "q": "duckling",
+      "kind": "alias",
+      "expected": [
+        "usda:172410"
+      ]
+    },
+    {
+      "id": "q305",
+      "q": "turkey bacon",
+      "kind": "exact",
+      "expected": [
+        "usda:2706135"
+      ]
+    },
+    {
+      "id": "q306",
+      "q": "turkey rashers",
+      "kind": "alias",
+      "expected": [
+        "usda:2706135"
+      ]
+    },
+    {
+      "id": "q307",
+      "q": "raw turkey breast",
+      "kind": "exact",
+      "expected": [
+        "usda:171098"
+      ]
+    },
+    {
+      "id": "q308",
+      "q": "turkey fillet",
+      "kind": "alias",
+      "expected": [
+        "usda:171098"
+      ]
+    },
+    {
+      "id": "q309",
+      "q": "sliced turkey",
+      "kind": "exact",
+      "expected": [
+        "usda:172941"
+      ]
+    },
+    {
+      "id": "q310",
+      "q": "turkey slices",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172941"
+      ]
+    },
+    {
+      "id": "q311",
+      "q": "deli turkey",
+      "kind": "alias",
+      "expected": [
+        "usda:172941"
+      ]
+    },
+    {
+      "id": "q312",
+      "q": "anchovies",
+      "kind": "exact",
+      "expected": [
+        "usda:174183"
+      ]
+    },
+    {
+      "id": "q313",
+      "q": "anchovie",
+      "kind": "misspelling",
+      "expected": [
+        "usda:174183"
+      ]
+    },
+    {
+      "id": "q314",
+      "q": "anchovy",
+      "kind": "plural",
+      "expected": [
+        "usda:174183"
+      ]
+    },
+    {
+      "id": "q315",
+      "q": "cod",
+      "kind": "exact",
+      "expected": [
+        "usda:171955"
+      ]
+    },
+    {
+      "id": "q316",
+      "q": "cod filet",
+      "kind": "misspelling",
+      "expected": [
+        "usda:171955"
+      ]
+    },
+    {
+      "id": "q317",
+      "q": "codfish",
+      "kind": "alias",
+      "expected": [
+        "usda:171955"
+      ]
+    },
+    {
+      "id": "q318",
+      "q": "mussels",
+      "kind": "exact",
+      "expected": [
+        "usda:174216"
+      ]
+    },
+    {
+      "id": "q319",
+      "q": "mussel",
+      "kind": "plural",
+      "expected": [
+        "usda:174216"
+      ]
+    },
+    {
+      "id": "q320",
+      "q": "salmon",
+      "kind": "exact",
+      "expected": [
+        "usda:175167"
+      ]
+    },
+    {
+      "id": "q321",
+      "q": "salmon filet",
+      "kind": "misspelling",
+      "expected": [
+        "usda:175167"
+      ]
+    },
+    {
+      "id": "q322",
+      "q": "atlantic salmon",
+      "kind": "multi_word",
+      "expected": [
+        "usda:175167"
+      ]
+    },
+    {
+      "id": "q323",
+      "q": "shrimp",
+      "kind": "exact",
+      "expected": [
+        "usda:174210"
+      ]
+    },
+    {
+      "id": "q324",
+      "q": "shrimps",
+      "kind": "plural",
+      "expected": [
+        "usda:174210"
+      ]
+    },
+    {
+      "id": "q325",
+      "q": "prawns",
+      "kind": "alias",
+      "expected": [
+        "usda:174210"
+      ]
+    },
+    {
+      "id": "q326",
+      "q": "tilapia",
+      "kind": "exact",
+      "expected": [
+        "usda:175176"
+      ]
+    },
+    {
+      "id": "q327",
+      "q": "tilapa",
+      "kind": "misspelling",
+      "expected": [
+        "usda:175176"
+      ]
+    },
+    {
+      "id": "q328",
+      "q": "tuna",
+      "kind": "exact",
+      "expected": [
+        "usda:171986"
+      ]
+    },
+    {
+      "id": "q329",
+      "q": "canned tuna",
+      "kind": "multi_word",
+      "expected": [
+        "usda:171986"
+      ]
+    },
+    {
+      "id": "q330",
+      "q": "popcorn",
+      "kind": "exact",
+      "expected": [
+        "usda:167959"
+      ]
+    },
+    {
+      "id": "q331",
+      "q": "air popped popcorn",
+      "kind": "multi_word",
+      "expected": [
+        "usda:167959"
+      ]
+    },
+    {
+      "id": "q332",
+      "q": "potato chips",
+      "kind": "exact",
+      "expected": [
+        "usda:169677"
+      ]
+    },
+    {
+      "id": "q333",
+      "q": "crisps",
+      "kind": "alias",
+      "expected": [
+        "usda:169677"
+      ]
+    },
+    {
+      "id": "q334",
+      "q": "pretzels",
+      "kind": "exact",
+      "expected": [
+        "usda:167555"
+      ]
+    },
+    {
+      "id": "q335",
+      "q": "pretzel",
+      "kind": "plural",
+      "expected": [
+        "usda:167555"
+      ]
+    },
+    {
+      "id": "q336",
+      "q": "hard pretzels",
+      "kind": "multi_word",
+      "expected": [
+        "usda:167555"
+      ]
+    },
+    {
+      "id": "q337",
+      "q": "basil",
+      "kind": "exact",
+      "expected": [
+        "usda:172232"
+      ]
+    },
+    {
+      "id": "q338",
+      "q": "fresh basil",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172232"
+      ]
+    },
+    {
+      "id": "q339",
+      "q": "black pepper",
+      "kind": "exact",
+      "expected": [
+        "usda:170931"
+      ]
+    },
+    {
+      "id": "q340",
+      "q": "peppercorn",
+      "kind": "alias",
+      "expected": [
+        "usda:170931"
+      ]
+    },
+    {
+      "id": "q341",
+      "q": "chili powder",
+      "kind": "exact",
+      "expected": [
+        "usda:171319"
+      ]
+    },
+    {
+      "id": "q342",
+      "q": "chilli powder",
+      "kind": "alias",
+      "expected": [
+        "usda:171319"
+      ]
+    },
+    {
+      "id": "q343",
+      "q": "cilantro",
+      "kind": "exact",
+      "expected": [
+        "usda:169997"
+      ]
+    },
+    {
+      "id": "q344",
+      "q": "corriander",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169997"
+      ]
+    },
+    {
+      "id": "q345",
+      "q": "coriander",
+      "kind": "alias",
+      "expected": [
+        "usda:169997"
+      ]
+    },
+    {
+      "id": "q346",
+      "q": "dill",
+      "kind": "exact",
+      "expected": [
+        "usda:172233"
+      ]
+    },
+    {
+      "id": "q347",
+      "q": "dill weed",
+      "kind": "alias",
+      "expected": [
+        "usda:172233"
+      ]
+    },
+    {
+      "id": "q348",
+      "q": "ground cumin",
+      "kind": "exact",
+      "expected": [
+        "usda:170923"
+      ]
+    },
+    {
+      "id": "q349",
+      "q": "cumin",
+      "kind": "alias",
+      "expected": [
+        "usda:170923"
+      ]
+    },
+    {
+      "id": "q350",
+      "q": "jeera",
+      "kind": "alias",
+      "expected": [
+        "usda:170923"
+      ]
+    },
+    {
+      "id": "q351",
+      "q": "mint",
+      "kind": "exact",
+      "expected": [
+        "usda:173475"
+      ]
+    },
+    {
+      "id": "q352",
+      "q": "mint leaves",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173475"
+      ]
+    },
+    {
+      "id": "q353",
+      "q": "spearmint",
+      "kind": "alias",
+      "expected": [
+        "usda:173475"
+      ]
+    },
+    {
+      "id": "q354",
+      "q": "salt",
+      "kind": "exact",
+      "expected": [
+        "usda:173468"
+      ]
+    },
+    {
+      "id": "q355",
+      "q": "sea salt",
+      "kind": "multi_word",
+      "expected": [
+        "usda:173468"
+      ]
+    },
+    {
+      "id": "q356",
+      "q": "granulated sugar",
+      "kind": "exact",
+      "expected": [
+        "usda:169655"
+      ]
+    },
+    {
+      "id": "q357",
+      "q": "sugar",
+      "kind": "alias",
+      "expected": [
+        "usda:169655"
+      ]
+    },
+    {
+      "id": "q358",
+      "q": "gumdrops",
+      "kind": "exact",
+      "expected": [
+        "usda:167989"
+      ]
+    },
+    {
+      "id": "q359",
+      "q": "gum drops",
+      "kind": "multi_word",
+      "expected": [
+        "usda:167989"
+      ]
+    },
+    {
+      "id": "q360",
+      "q": "gummy candy",
+      "kind": "alias",
+      "expected": [
+        "usda:167989"
+      ]
+    },
+    {
+      "id": "q361",
+      "q": "honey",
+      "kind": "exact",
+      "expected": [
+        "usda:169640"
+      ]
+    },
+    {
+      "id": "q362",
+      "q": "raw honey",
+      "kind": "multi_word",
+      "expected": [
+        "usda:169640"
+      ]
+    },
+    {
+      "id": "q363",
+      "q": "maple syrup",
+      "kind": "exact",
+      "expected": [
+        "usda:169661"
+      ]
+    },
+    {
+      "id": "q364",
+      "q": "maple sirup",
+      "kind": "misspelling",
+      "expected": [
+        "usda:169661"
+      ]
+    },
+    {
+      "id": "q365",
+      "q": "chicken breast",
+      "kind": "exact",
+      "expected": [
+        "usda:171077",
+        "usda:171477"
+      ]
+    },
+    {
+      "id": "q366",
+      "q": "turkey breast",
+      "kind": "exact",
+      "expected": [
+        "usda:171098",
+        "usda:172941"
+      ]
+    },
+    {
+      "id": "q367",
+      "q": "quinoa",
+      "kind": "exact",
+      "expected": [
+        "usda:168874",
+        "usda:168917"
+      ]
+    },
+    {
+      "id": "q368",
+      "q": "lentils",
+      "kind": "exact",
+      "expected": [
+        "usda:172420",
+        "usda:172421"
+      ]
+    },
+    {
+      "id": "q369",
+      "q": "chickpeas",
+      "kind": "exact",
+      "expected": [
+        "usda:173756",
+        "usda:173800"
+      ]
+    },
+    {
+      "id": "q370",
+      "q": "garbanzo beans",
+      "kind": "alias",
+      "expected": [
+        "usda:173756",
+        "usda:173800"
+      ]
+    },
+    {
+      "id": "q371",
+      "q": "black beans",
+      "kind": "exact",
+      "expected": [
+        "usda:173734",
+        "usda:175238"
+      ]
+    },
+    {
+      "id": "q372",
+      "q": "brown rice",
+      "kind": "exact",
+      "expected": [
+        "usda:169703",
+        "usda:169704"
+      ]
+    },
+    {
+      "id": "q373",
+      "q": "white rice",
+      "kind": "exact",
+      "expected": [
+        "usda:169756",
+        "usda:169757"
+      ]
+    },
+    {
+      "id": "q374",
+      "q": "steamed rice",
+      "kind": "alias",
+      "expected": [
+        "usda:169704",
+        "usda:169757"
+      ]
+    },
+    {
+      "id": "q375",
+      "q": "macaroni",
+      "kind": "alias",
+      "expected": [
+        "usda:169736",
+        "usda:2708811"
+      ]
+    },
+    {
+      "id": "q376",
+      "q": "spaghetti",
+      "kind": "alias",
+      "expected": [
+        "usda:169737",
+        "usda:2708831"
+      ]
+    },
+    {
+      "id": "q377",
+      "q": "rice",
+      "kind": "exact",
+      "expected": [
+        "usda:169703",
+        "usda:169704",
+        "usda:169756",
+        "usda:169757"
+      ]
+    },
+    {
+      "id": "q378",
+      "q": "pasta",
+      "kind": "exact",
+      "expected": [
+        "usda:169736",
+        "usda:169737"
+      ]
+    },
+    {
+      "id": "q379",
+      "q": "cheese",
+      "kind": "exact",
+      "expected": [
+        "usda:172175",
+        "usda:328637",
+        "usda:173420",
+        "usda:2706967",
+        "usda:2708618",
+        "usda:2708811"
+      ]
+    },
+    {
+      "id": "q380",
+      "q": "beans",
+      "kind": "exact",
+      "expected": [
+        "usda:173734",
+        "usda:175238",
+        "usda:173756",
+        "usda:173800",
+        "usda:174285",
+        "usda:169282"
+      ]
+    },
+    {
+      "id": "q381",
+      "q": "milk",
+      "kind": "exact",
+      "expected": [
+        "usda:171267",
+        "usda:174832",
+        "usda:170173",
+        "usda:2705412",
+        "usda:175215"
+      ]
+    },
+    {
+      "id": "q382",
+      "q": "chicken",
+      "kind": "exact",
+      "expected": [
+        "usda:171077",
+        "usda:171477",
+        "usda:172909"
+      ]
+    },
+    {
+      "id": "q383",
+      "q": "oil",
+      "kind": "exact",
+      "expected": [
+        "usda:171413",
+        "usda:172336",
+        "usda:171412"
+      ]
+    },
+    {
+      "id": "q384",
+      "q": "whole wheat",
+      "kind": "multi_word",
+      "expected": [
+        "usda:172688",
+        "usda:174916",
+        "usda:2707825",
+        "usda:172749"
+      ]
+    },
+    {
+      "id": "q385",
+      "q": "fish",
+      "kind": "alias",
+      "expected": [
+        "usda:171955",
+        "usda:171986"
+      ]
+    },
+    {
+      "id": "q386",
+      "q": "nuts",
+      "kind": "alias",
+      "expected": [
+        "usda:170162",
+        "usda:170184"
+      ]
+    },
+    {
+      "id": "q387",
+      "q": "brocc",
+      "kind": "partial",
+      "expected": [
+        "usda:170379"
+      ]
+    },
+    {
+      "id": "q388",
+      "q": "cauli",
+      "kind": "partial",
+      "expected": [
+        "usda:169986"
+      ]
+    },
+    {
+      "id": "q389",
+      "q": "zucch",
+      "kind": "partial",
+      "expected": [
+        "usda:169291"
+      ]
+    },
+    {
+      "id": "q390",
+      "q": "avoca",
+      "kind": "partial",
+      "expected": [
+        "usda:171705"
+      ]
+    },
+    {
+      "id": "q391",
+      "q": "straw",
+      "kind": "partial",
+      "expected": [
+        "usda:167762"
+      ]
+    },
+    {
+      "id": "q392",
+      "q": "cucum",
+      "kind": "partial",
+      "expected": [
+        "usda:168409"
+      ]
+    },
+    {
+      "id": "q393",
+      "q": "mushro",
+      "kind": "partial",
+      "expected": [
+        "usda:169251"
+      ]
+    },
+    {
+      "id": "q394",
+      "q": "salmo",
+      "kind": "partial",
+      "expected": [
+        "usda:175167"
+      ]
+    },
+    {
+      "id": "q395",
+      "q": "shrim",
+      "kind": "partial",
+      "expected": [
+        "usda:174210"
+      ]
+    },
+    {
+      "id": "q396",
+      "q": "tilap",
+      "kind": "partial",
+      "expected": [
+        "usda:175176"
+      ]
+    },
+    {
+      "id": "q397",
+      "q": "hummu",
+      "kind": "partial",
+      "expected": [
+        "usda:174289"
+      ]
+    },
+    {
+      "id": "q398",
+      "q": "tahin",
+      "kind": "partial",
+      "expected": [
+        "usda:170189"
+      ]
+    },
+    {
+      "id": "q399",
+      "q": "pistach",
+      "kind": "partial",
+      "expected": [
+        "usda:170184"
+      ]
+    },
+    {
+      "id": "q400",
+      "q": "cashe",
+      "kind": "partial",
+      "expected": [
+        "usda:170162"
+      ]
+    },
+    {
+      "id": "q401",
+      "q": "chedd",
+      "kind": "partial",
+      "expected": [
+        "usda:328637"
+      ]
+    },
+    {
+      "id": "q402",
+      "q": "crois",
+      "kind": "partial",
+      "expected": [
+        "usda:174987"
+      ]
+    },
+    {
+      "id": "q403",
+      "q": "tortil",
+      "kind": "partial",
+      "expected": [
+        "usda:2707825"
+      ]
+    },
+    {
+      "id": "q404",
+      "q": "edama",
+      "kind": "partial",
+      "expected": [
+        "usda:169282"
+      ]
+    },
+    {
+      "id": "q405",
+      "q": "cilan",
+      "kind": "partial",
+      "expected": [
+        "usda:169997"
+      ]
+    },
+    {
+      "id": "q406",
+      "q": "walnu",
+      "kind": "partial",
+      "expected": [
+        "usda:170187"
+      ]
+    },
+    {
+      "id": "q407",
+      "q": "spina",
+      "kind": "partial",
+      "expected": [
+        "usda:168462"
+      ]
+    },
+    {
+      "id": "q408",
+      "q": "bulgu",
+      "kind": "partial",
+      "expected": [
+        "usda:170688"
+      ]
+    },
+    {
+      "id": "q409",
+      "q": "srirac",
+      "kind": "partial",
+      "expected": [
+        "usda:171186"
+      ]
+    },
+    {
+      "id": "q410",
+      "q": "mayon",
+      "kind": "partial",
+      "expected": [
+        "usda:171009"
+      ]
+    },
+    {
+      "id": "q411",
+      "q": "balsa",
+      "kind": "partial",
+      "expected": [
+        "usda:172241"
+      ]
+    },
+    {
+      "id": "q412",
+      "q": "popco",
+      "kind": "partial",
+      "expected": [
+        "usda:167959"
+      ]
+    },
+    {
+      "id": "q413",
+      "q": "pretz",
+      "kind": "partial",
+      "expected": [
+        "usda:167555"
+      ]
+    },
+    {
+      "id": "q414",
+      "q": "gumdr",
+      "kind": "partial",
+      "expected": [
+        "usda:167989"
+      ]
+    },
+    {
+      "id": "q415",
+      "q": "raisi",
+      "kind": "partial",
+      "expected": [
+        "usda:168165"
+      ]
+    },
+    {
+      "id": "q416",
+      "q": "sultan",
+      "kind": "partial",
+      "expected": [
+        "usda:168165"
+      ]
+    },
+    {
+      "id": "q417",
+      "q": "oatme",
+      "kind": "partial",
+      "expected": [
+        "usda:173904"
+      ]
+    },
+    {
+      "id": "q418",
+      "q": "anchov",
+      "kind": "partial",
+      "expected": [
+        "usda:174183"
+      ]
+    },
+    {
+      "id": "q419",
+      "q": "musse",
+      "kind": "partial",
+      "expected": [
+        "usda:174216"
+      ]
+    },
+    {
+      "id": "q420",
+      "q": "burri",
+      "kind": "partial",
+      "expected": [
+        "usda:2708549"
+      ]
+    },
+    {
+      "id": "q421",
+      "q": "capsic",
+      "kind": "partial",
+      "expected": [
+        "usda:170108"
+      ]
+    },
+    {
+      "id": "q422",
+      "q": "auberg",
+      "kind": "partial",
+      "expected": [
+        "usda:169228"
+      ]
+    },
+    {
+      "id": "q423",
+      "q": "courge",
+      "kind": "partial",
+      "expected": [
+        "usda:169291"
+      ]
+    },
+    {
+      "id": "q424",
+      "q": "kumar",
+      "kind": "partial",
+      "expected": [
+        "usda:168482"
+      ]
+    },
+    {
+      "id": "q425",
+      "q": "quino",
+      "kind": "partial",
+      "expected": [
+        "usda:168874",
+        "usda:168917"
+      ]
+    },
+    {
+      "id": "q426",
+      "q": "lenti",
+      "kind": "partial",
+      "expected": [
+        "usda:172420",
+        "usda:172421"
+      ]
+    }
+  ]
+}

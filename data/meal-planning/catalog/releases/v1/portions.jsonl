@@ -1,0 +1,139 @@
+{"food_source_key":"usda:167555","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:167746","description":"lemon","amount":1,"unit":"each","gram_weight":84,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:167762","description":"1 cup, halves","amount":152,"unit":"g","gram_weight":152,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:167959","description":"1 cup","amount":8,"unit":"g","gram_weight":8,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:167989","description":"1 cup","amount":182,"unit":"g","gram_weight":182,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168155","description":"lime","amount":1,"unit":"each","gram_weight":67,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168165","description":"1 cup","amount":145,"unit":"g","gram_weight":145,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168202","description":"medium apple","amount":1,"unit":"each","gram_weight":169,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168249","description":"4 oz","amount":4,"unit":"oz","gram_weight":113,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168277","description":"slice","amount":1,"unit":"slice","gram_weight":28,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168409","description":"0.5 cup, sliced","amount":52,"unit":"g","gram_weight":52,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168462","description":"1 cup","amount":30,"unit":"g","gram_weight":30,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168482","description":"1 cup, cubed","amount":133,"unit":"g","gram_weight":133,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168874","description":"1 cup","amount":170,"unit":"g","gram_weight":170,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168894","description":"1 cup","amount":125,"unit":"g","gram_weight":125,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:168917","description":"1 cup","amount":185,"unit":"g","gram_weight":185,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169094","description":"large olive","amount":1,"unit":"each","gram_weight":4.4,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169098","description":"1 cup","amount":248,"unit":"g","gram_weight":248,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169228","description":"1 cup, cubed","amount":82,"unit":"g","gram_weight":82,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169230","description":"clove","amount":1,"unit":"clove","gram_weight":3,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169251","description":"1 cup, sliced","amount":70,"unit":"g","gram_weight":70,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169282","description":"1 cup","amount":256,"unit":"g","gram_weight":256,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169291","description":"1 cup, sliced","amount":124,"unit":"g","gram_weight":124,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169451","description":"4 oz","amount":4,"unit":"oz","gram_weight":113,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169640","description":"1 tbsp","amount":21,"unit":"g","gram_weight":21,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169655","description":"1 tsp","amount":4.2,"unit":"g","gram_weight":4.2,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169661","description":"1 tbsp","amount":20,"unit":"g","gram_weight":20,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169677","description":"1 oz","amount":1,"unit":"oz","gram_weight":28,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169698","description":"1 cup","amount":128,"unit":"g","gram_weight":128,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169703","description":"1 cup","amount":185,"unit":"g","gram_weight":185,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169704","description":"1 cup","amount":202,"unit":"g","gram_weight":202,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169736","description":"2 oz","amount":2,"unit":"oz","gram_weight":57,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169737","description":"1 cup","amount":124,"unit":"g","gram_weight":124,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169756","description":"1 cup","amount":185,"unit":"g","gram_weight":185,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169757","description":"1 cup","amount":158,"unit":"g","gram_weight":158,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169910","description":"1 cup, pieces","amount":165,"unit":"g","gram_weight":165,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169928","description":"medium peach","amount":1,"unit":"each","gram_weight":150,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169975","description":"1 cup, chopped","amount":89,"unit":"g","gram_weight":89,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169986","description":"1 cup, chopped","amount":107,"unit":"g","gram_weight":107,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169988","description":"medium stalk","amount":1,"unit":"each","gram_weight":40,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:169997","description":"0.25 cup","amount":4,"unit":"g","gram_weight":4,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170000","description":"1 cup, chopped","amount":160,"unit":"g","gram_weight":160,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170027","description":"1 potato, medium","amount":213,"unit":"g","gram_weight":213,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170108","description":"1 cup, chopped","amount":149,"unit":"g","gram_weight":149,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170162","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170170","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170173","description":"1 cup","amount":226,"unit":"g","gram_weight":226,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170184","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170187","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170189","description":"1 tbsp","amount":15,"unit":"g","gram_weight":15,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170284","description":"1 cup","amount":200,"unit":"g","gram_weight":200,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170379","description":"0.5 cup, chopped","amount":44,"unit":"g","gram_weight":44,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170393","description":"medium carrot","amount":1,"unit":"each","gram_weight":61,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170457","description":"medium tomato","amount":1,"unit":"each","gram_weight":123,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170497","description":"pepper","amount":1,"unit":"each","gram_weight":45,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170562","description":"1 cup","amount":140,"unit":"g","gram_weight":140,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170567","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170688","description":"1 cup","amount":140,"unit":"g","gram_weight":140,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170859","description":"1 tbsp","amount":15,"unit":"g","gram_weight":15,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170923","description":"1 tsp","amount":2.1,"unit":"g","gram_weight":2.1,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:170931","description":"1 tsp","amount":2.3,"unit":"g","gram_weight":2.3,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171009","description":"1 tbsp","amount":13.8,"unit":"g","gram_weight":13.8,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171077","description":"4 oz","amount":4,"unit":"oz","gram_weight":113,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171098","description":"4 oz","amount":4,"unit":"oz","gram_weight":113,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171186","description":"1 tsp","amount":6.5,"unit":"g","gram_weight":6.5,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171267","description":"1 cup","amount":244,"unit":"g","gram_weight":244,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171287","description":"large egg","amount":1,"unit":"each","gram_weight":50,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171319","description":"1 tsp","amount":2.7,"unit":"g","gram_weight":2.7,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171412","description":"1 tbsp","amount":13.6,"unit":"g","gram_weight":13.6,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171413","description":"1 tbsp","amount":13.5,"unit":"g","gram_weight":13.5,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171477","description":"1 cup, diced","amount":140,"unit":"g","gram_weight":140,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171705","description":"avocado","amount":1,"unit":"each","gram_weight":201,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171890","description":"1 cup","amount":237,"unit":"g","gram_weight":237,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171955","description":"3 oz","amount":3,"unit":"oz","gram_weight":85,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:171986","description":"3 oz","amount":3,"unit":"oz","gram_weight":85,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172175","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172183","description":"large egg white","amount":1,"unit":"each","gram_weight":33,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172184","description":"large egg yolk","amount":1,"unit":"each","gram_weight":17,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172232","description":"0.25 cup, leaves","amount":6,"unit":"g","gram_weight":6,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172233","description":"5 sprigs","amount":1,"unit":"g","gram_weight":1,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172234","description":"1 tsp","amount":5,"unit":"g","gram_weight":5,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172241","description":"1 tbsp","amount":16,"unit":"g","gram_weight":16,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172336","description":"1 tbsp","amount":14,"unit":"g","gram_weight":14,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172410","description":"1 serving","amount":137,"unit":"g","gram_weight":137,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172420","description":"1 cup","amount":192,"unit":"g","gram_weight":192,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172421","description":"1 cup","amount":198,"unit":"g","gram_weight":198,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172448","description":"0.5 cup","amount":126,"unit":"g","gram_weight":126,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172470","description":"2 tbsp","amount":32,"unit":"g","gram_weight":32,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172688","description":"slice","amount":1,"unit":"slice","gram_weight":32,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172749","description":"1 serving","amount":28,"unit":"g","gram_weight":28,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172909","description":"1 cup","amount":248,"unit":"g","gram_weight":248,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:172941","description":"slice","amount":1,"unit":"slice","gram_weight":16,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173110","description":"4 oz","amount":4,"unit":"oz","gram_weight":113,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173227","description":"1 cup","amount":237,"unit":"g","gram_weight":237,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173410","description":"1 tbsp","amount":14.2,"unit":"g","gram_weight":14.2,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173420","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173462","description":"0.25 cup","amount":60,"unit":"g","gram_weight":60,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173468","description":"1 tsp","amount":6,"unit":"g","gram_weight":6,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173475","description":"2 tbsp","amount":11.4,"unit":"g","gram_weight":11.4,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173592","description":"1 tbsp","amount":15,"unit":"g","gram_weight":15,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173647","description":"1 cup","amount":237,"unit":"g","gram_weight":237,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173734","description":"1 cup","amount":194,"unit":"g","gram_weight":194,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173756","description":"1 cup","amount":200,"unit":"g","gram_weight":200,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173800","description":"253 g, drained","amount":253,"unit":"g","gram_weight":253,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173806","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173904","description":"1 cup","amount":81,"unit":"g","gram_weight":81,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:173944","description":"medium banana","amount":1,"unit":"each","gram_weight":118,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174183","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174210","description":"3 oz","amount":3,"unit":"oz","gram_weight":85,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174216","description":"3 oz","amount":3,"unit":"oz","gram_weight":85,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174272","description":"1 cup","amount":166,"unit":"g","gram_weight":166,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174277","description":"1 tbsp","amount":16,"unit":"g","gram_weight":16,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174285","description":"266 g, drained","amount":266,"unit":"g","gram_weight":266,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174289","description":"1 tbsp","amount":15,"unit":"g","gram_weight":15,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174370","description":"1 oz","amount":1,"unit":"oz","gram_weight":28.35,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174421","description":"1 patty","amount":113,"unit":"g","gram_weight":113,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174524","description":"2 tbsp","amount":36,"unit":"g","gram_weight":36,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174683","description":"1 cup","amount":151,"unit":"g","gram_weight":151,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174832","description":"1 cup","amount":262,"unit":"g","gram_weight":262,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174916","description":"large pita","amount":1,"unit":"each","gram_weight":64,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:174987","description":"medium croissant","amount":1,"unit":"each","gram_weight":57,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:175167","description":"3 oz","amount":3,"unit":"oz","gram_weight":85,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:175176","description":"fillet","amount":1,"unit":"each","gram_weight":116,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:175215","description":"1 cup","amount":243,"unit":"g","gram_weight":243,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:175238","description":"1 cup","amount":240,"unit":"g","gram_weight":240,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2705412","description":"1 cup","amount":244,"unit":"g","gram_weight":244,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2705424","description":"1 cup","amount":245,"unit":"g","gram_weight":245,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2706135","description":"slice","amount":1,"unit":"slice","gram_weight":11,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2706967","description":"sandwich","amount":1,"unit":"each","gram_weight":135,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2707825","description":"medium tortilla","amount":1,"unit":"each","gram_weight":45,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2708549","description":"burrito","amount":1,"unit":"each","gram_weight":220,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2708618","description":"slice","amount":1,"unit":"slice","gram_weight":100,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2708811","description":"1 cup","amount":230,"unit":"g","gram_weight":230,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2708831","description":"1 cup","amount":250,"unit":"g","gram_weight":250,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2709163","description":"1 cup, cubed","amount":146,"unit":"g","gram_weight":146,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2709823","description":"1 cup","amount":74,"unit":"g","gram_weight":74,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2710725","description":"1 cup","amount":248,"unit":"g","gram_weight":248,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:2710742","description":"1 scoop","amount":26,"unit":"g","gram_weight":26,"is_default":true,"source":"usda_food_portion"}
+{"food_source_key":"usda:328637","description":"slice","amount":1,"unit":"slice","gram_weight":17,"is_default":true,"source":"usda_food_portion"}
