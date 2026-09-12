@@ -14,12 +14,16 @@
 -- THIS IS NOT PART OF ANY DEPLOY, AND NOT PART OF ROLLBACK. Redeploying an
 -- earlier backend commit needs no schema change at all: every object here is
 -- additive and inert once the two feature gates are closed, so a rollback simply
--- leaves it in place (docs/meal-planning/release-and-recovery.md). Nothing in
--- this repository runs this folder - no npm script, no CI step, and no Prisma
--- command, since Prisma only ever reads prisma/migrations - and
+-- leaves it in place (docs/meal-planning/release-and-recovery.md). No npm
+-- script, CI step or Prisma command executes THIS file - nothing in the
+-- repository references it, and Prisma only ever reads prisma/migrations - and
 -- `prisma/manual-migrations` is listed in .dockerignore, so the runtime image
--- does not contain this file. It exists so that removal, if it is ever genuinely
--- required, is a reviewed procedure rather than DDL improvised under pressure.
+-- does not contain it. The one automated reader of this folder is the schema
+-- equivalence gate in src/__tests__/api/compat.test.ts, which applies the up
+-- script beside this one to a disposable database to prove the two ledgers
+-- agree; it never runs this file. It exists so that removal, if it is ever
+-- genuinely required, is a reviewed procedure rather than DDL improvised under
+-- pressure.
 -- These are the first DROP statements anywhere under prisma/, which is why the
 -- warning is this long.
 --

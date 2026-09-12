@@ -1,7 +1,10 @@
-import { readdirSync } from 'fs';
+import { existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 
-import type { Config } from '@jest/types';
+// From `jest` (which package.json declares), not `@jest/types` (present only
+// transitively) — a manifest that does not name what the code imports is how a
+// working tree and a fresh `npm ci` come to disagree.
+import type { Config } from 'jest';
 
 /**
  * The backend Jest configuration (Agent Action Plan §0.7.1 Group 1).
@@ -76,8 +79,8 @@ const readServicesDirectory = (servicesDirectory: string) => {
 
 /**
  * Every file the coverage gate covers: each `*.logic.ts` presently in
- * `src/services/`, sorted for a stable emission order, followed by the four
- * utility modules above.
+ * `src/services/`, sorted for a stable emission order, followed by whichever of
+ * the four utility modules above are on disk.
  *
  * `rootDir` is a parameter so a test can point the derivation at a fixture
  * directory, and defaults to this file's own directory — the repository root
@@ -95,7 +98,16 @@ export const coveredSourcePaths = (rootDir: string = __dirname): string[] => {
         .sort()
         .map((fileName) => `${SERVICES_DIRECTORY}/${fileName}`);
 
-    return [...logicModules, ...COVERED_UTIL_MODULES];
+    // Only utility modules that are actually on disk are gated. A threshold key
+    // matching no covered file is not ignored by Jest — it reports "Coverage
+    // data for <path> was not found" and fails the whole run, so naming a
+    // module before it exists would block the suite with a message about
+    // coverage rather than about the missing file. Deleting or renaming one is
+    // still caught loudly: `coverageInventory.test.ts` compares this result
+    // against the unfiltered `COVERED_UTIL_MODULES` list.
+    const utilModules = COVERED_UTIL_MODULES.filter((relativePath) => existsSync(join(rootDir, relativePath)));
+
+    return [...logicModules, ...utilModules];
 };
 
 /**
@@ -114,7 +126,20 @@ export const coverageThresholdFor = (paths: readonly string[]): Record<string, {
 
 const coveredPaths = coveredSourcePaths();
 
-const config: Config.InitialOptions = {
+const coverageThreshold = coverageThresholdFor(coveredPaths);
+
+/**
+ * The exact key set emitted into `coverageThreshold` above.
+ *
+ * Read back off the emitted map with `Object.keys` rather than recomputed, so
+ * it cannot describe a gate different from the one Jest is handed — which is
+ * the whole reason it is exported: `coverageInventory.test.ts` compares it with
+ * its own independent directory read, and a derivation that had quietly drifted
+ * (or been replaced by a hand-written list) fails there.
+ */
+export const coverageThresholdPaths: string[] = Object.keys(coverageThreshold);
+
+const config: Config = {
     preset: 'ts-jest',
     testEnvironment: 'node',
     roots: ['<rootDir>/src'],
@@ -126,16 +151,31 @@ const config: Config.InitialOptions = {
     transform: {
         // The modern per-transform form. The `globals: {'ts-jest': …}` spelling
         // is deprecated in ts-jest 29 and warns on every run.
-        '^.+\\.ts$': ['ts-jest', { tsconfig: 'tsconfig.test.json' }],
+        //
+        // The pattern matches the ts-jest preset's own key EXACTLY, which is
+        // load-bearing: Jest MERGES a config `transform` with the preset's
+        // rather than replacing it, so a narrower key (`^.+\.ts$`) leaves the
+        // preset's option-less entry in place beside this one and any `.tsx`
+        // would compile against tsconfig.json — which excludes the tests and
+        // roots at src/. Reusing the key overrides it, leaving one transform
+        // that applies tsconfig.test.json to every TypeScript file.
+        '^.+\\.tsx?$': ['ts-jest', { tsconfig: 'tsconfig.test.json' }],
     },
+    // Usage data (calls, instances, results) is cleared before each test so a
+    // mock cannot leak assertions between tests. `clearMocks` and not
+    // `resetMocks`/`restoreMocks`: those two drop implementations as well,
+    // which would strip the `jest.mock` factories jestSetup.ts installs for
+    // `utils/firebase` and `middleware/auth` and leave every API suite unable
+    // to import app.ts.
+    clearMocks: true,
     collectCoverageFrom: coveredPaths,
-    // The one cast in this file. `@jest/types`' `CoverageThreshold` declares
+    // The one cast in this file. Jest's `CoverageThreshold` type declares
     // `global` as a REQUIRED key, so a derived per-path map cannot satisfy it
     // structurally — and adding a `global` entry to satisfy the type is exactly
     // what §0.7.1 forbids, since it would let a module below its own threshold
     // hide behind the average. The cast keeps the type system out of a policy
     // decision; `coverageInventory.test.ts` asserts the absence of `global`.
-    coverageThreshold: coverageThresholdFor(coveredPaths) as Config.InitialOptions['coverageThreshold'],
+    coverageThreshold: coverageThreshold as Config['coverageThreshold'],
 };
 
 export default config;
