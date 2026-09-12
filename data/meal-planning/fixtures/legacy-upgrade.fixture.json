@@ -334,7 +334,7 @@
       "logging_type": "DISTANCE_TIME",
       "user_id": "fixtureUserOneTargetsFull001",
       "deleted_at": "2026-02-09T17:20:00.000Z",
-      "note": "Soft-deleted exercise that a personal record still points at, so strength history survives hiding the exercise. The six logging_type values across this collection are the vocabulary src/services/exercise.service.ts accepts."
+      "note": "Soft-deleted exercise that a personal record still points at, so strength history survives hiding the exercise. logging_type is an unconstrained String column (exercise.service.ts only substitutes 'WEIGHT_REPS' when the client omits it), and the six values across this collection are drawn from the client's LoggingTypeEnum. Four of them (BODYWEIGHT_REPS, WEIGHTED_BODYWEIGHT, TIME_ONLY, WEIGHT_TIME) workout.service.ts scores by name in bestSetScore; WEIGHT_REPS and DISTANCE_TIME fall to its default weight * reps branch."
     }
   ],
   "templates": [
@@ -408,7 +408,7 @@
       "has_synced": true,
       "updated_at": 1771030800000,
       "created_at": "2026-02-14T13:33:00.000Z",
-      "note": "Fully populated GPS run with splits and an encoded polyline. run_type stays 'OUTDOOR' and source is 'GPS' because those are the only values the shipped code produces; no third value is invented here."
+      "note": "Fully populated GPS run with splits and an encoded polyline, carrying the default run_type 'OUTDOOR' and the non-default source 'GPS'."
     },
     {
       "id": "0000000a-0000-4000-8000-000000000002",
@@ -423,14 +423,14 @@
       "avg_heart_rate": null,
       "max_heart_rate": null,
       "calories": null,
-      "run_type": "OUTDOOR",
+      "run_type": "INDOOR",
       "source": "MANUAL",
       "route_polyline": null,
-      "notes": "Entered by hand after the watch failed, so there is no trace.",
+      "notes": "Treadmill session typed in afterwards, so there is no GPS trace.",
       "has_synced": false,
       "updated_at": 0,
       "created_at": "2026-02-12T19:00:00.000Z",
-      "note": "The sparse counterpart: a hand-entered run with every optional metric null, no splits, and free-text notes. Together the two rows cover both source values and both ends of the nullability of this table."
+      "note": "The sparse counterpart: a hand-entered run with every optional metric null, no splits, and free-text notes. It also keeps both string columns off a single value: run_type 'INDOOR' against the first row's 'OUTDOOR', source the default 'MANUAL' against the first row's 'GPS'. Neither column has an enum or a check constraint (run.service.ts only substitutes 'OUTDOOR' when the client omits runType), so a column holding one value throughout could not catch a migration that coerced it to its default."
     }
   ],
   "body_weight_entries": [
@@ -535,6 +535,20 @@
       "exercise_id": "00000004-0000-4000-8000-000000000005",
       "order": null,
       "note": "order is explicitly NULL, which the nullable column allows and which is not the same stored value as the default 0."
+    },
+    {
+      "id": "00000007-0000-4000-8000-000000000004",
+      "workout_day_id": "00000006-0000-4000-8000-000000000001",
+      "exercise_id": "00000004-0000-4000-8000-000000000004",
+      "order": 2,
+      "note": "The Plank slot. The timed set below hangs off this row, which is what makes the MAX_DURATION record further down coherent: a duration record has to trace back through a set to a TIME_ONLY exercise, not to a reps exercise."
+    },
+    {
+      "id": "00000007-0000-4000-8000-000000000005",
+      "workout_day_id": "00000006-0000-4000-8000-000000000001",
+      "exercise_id": "00000004-0000-4000-8000-000000000003",
+      "order": 3,
+      "note": "The Weighted Dip slot, the only WEIGHTED_BODYWEIGHT work in the fixture. Its two sets below are the ones that carry added_weight and that cover both values of 'completed'."
     }
   ],
   "exercise_sets": [
@@ -585,7 +599,7 @@
     },
     {
       "id": "00000008-0000-4000-8000-000000000004",
-      "daily_exercise_id": "00000007-0000-4000-8000-000000000002",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000004",
       "reps": null,
       "weight": null,
       "added_weight": null,
@@ -594,9 +608,9 @@
       "rpe": null,
       "is_warmup": false,
       "completed": true,
-      "set_number": 2,
+      "set_number": 1,
       "completed_at": null,
-      "note": "Duration-only set with completed_at NULL: a set can be marked completed without ever being stamped with a day."
+      "note": "Duration-only set, on the Plank slot, with completed_at NULL: a set can be marked completed without ever being stamped with a day. It is the set the MAX_DURATION record below was achieved on."
     },
     {
       "id": "00000008-0000-4000-8000-000000000005",
@@ -612,6 +626,36 @@
       "set_number": 1,
       "completed_at": "2026-02-14",
       "note": "The second owner's set, carrying weight, duration and distance at once so every numeric column in this table is populated somewhere in the fixture."
+    },
+    {
+      "id": "00000008-0000-4000-8000-000000000006",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000005",
+      "reps": 8,
+      "weight": null,
+      "added_weight": 25,
+      "duration_seconds": null,
+      "distance_meters": null,
+      "rpe": null,
+      "is_warmup": false,
+      "completed": true,
+      "set_number": 1,
+      "completed_at": "2026-02-14",
+      "note": "The one completed set carrying added_weight, with weight NULL beside it: WEIGHTED_BODYWEIGHT work is scored as added_weight * reps, so a fixture that left this column null everywhere would score every dip at zero and never exercise that branch."
+    },
+    {
+      "id": "00000008-0000-4000-8000-000000000007",
+      "daily_exercise_id": "00000007-0000-4000-8000-000000000005",
+      "reps": 12,
+      "weight": null,
+      "added_weight": 35,
+      "duration_seconds": null,
+      "distance_meters": null,
+      "rpe": null,
+      "is_warmup": false,
+      "completed": false,
+      "set_number": 2,
+      "completed_at": null,
+      "note": "The one set with completed = false: a heavier set entered as a target and abandoned, so completed_at is NULL too. It deliberately outscores the completed set above (35 * 12 = 420 against 25 * 8 = 200), which makes the 'completed' filter load-bearing: code that drops the filter reports a different best set and a different bodyweight-rep total instead of agreeing by luck."
     }
   ],
   "meal_entries": [
@@ -705,7 +749,7 @@
       "serving_text": "1 handful",
       "servings": 0.5,
       "calories": 320,
-      "protein_g": 9,
+      "protein_g": 10,
       "carbs_g": 30,
       "fat_g": 20,
       "input_method": "ai_photo",
@@ -713,7 +757,7 @@
       "logged_at": "2026-02-14T15:35:00.000Z",
       "updated_at": "2026-02-14T15:35:00.000Z",
       "deleted_at": null,
-      "note": "input_method 'ai_photo' in the Snack bucket with a half serving, completing the four legacy input methods this fixture covers."
+      "note": "input_method 'ai_photo' in the Snack bucket with a half serving, completing the four legacy input methods this fixture covers. Every macro on this row is even on purpose, so that halving it cannot land on an exact .5: getDailyMacros rounds in JavaScript (Math.round, ties up) while getHistory rounds in SQL (round(double precision), ties to even on glibc), so a tie would read as two different numbers on the two screens. protein_g 9 here would have been 5 in the diary and 4 in history."
     },
     {
       "id": "00000003-0000-4000-8000-000000000006",

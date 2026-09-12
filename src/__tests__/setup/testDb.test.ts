@@ -21,7 +21,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { prisma } from '../../prisma/client';
-import { FIXTURE_CATALOG_FOOD_ID, FIXTURE_USER_ID, makeCatalogFood, makeUser } from './factories';
+import { makeCatalogFood, makeUser } from './factories';
 import { TEST_EMAIL_HEADER, TEST_USER_ID_HEADER, asUser, request } from './testApp';
 import {
     FEATURE_TABLES,
@@ -439,13 +439,13 @@ describe('truncateFeatureTables', () => {
     });
 
     it('empties the rows the factories create, leaving both tables readable', async () => {
-        await prisma.users.create({ data: makeUser() });
-        await prisma.catalog_foods.create({ data: makeCatalogFood() });
+        const user = await makeUser();
+        const food = await makeCatalogFood();
 
-        const createdUser = await prisma.users.findUnique({ where: { id: FIXTURE_USER_ID } });
-        const createdFood = await prisma.catalog_foods.findUnique({ where: { id: FIXTURE_CATALOG_FOOD_ID } });
+        const createdUser = await prisma.users.findUnique({ where: { id: user.id } });
+        const createdFood = await prisma.catalog_foods.findUnique({ where: { id: food.id } });
 
-        expect(createdUser?.email).toBe('fixture.user@example.test');
+        expect(createdUser?.email).toBe(user.email);
         expect(createdFood?.publication_status).toBe('published');
         expect(createdFood?.nutrition_provenance).toBe('source_backed');
         // The list columns the migration makes NOT NULL: an omitted list must
@@ -502,14 +502,14 @@ describe('testApp', () => {
     });
 
     it("propagates the header identity as the request's user", async () => {
-        await prisma.users.create({ data: makeUser() });
+        const user = await makeUser();
         await prisma.body_weight_entries.create({
-            data: { user_id: FIXTURE_USER_ID, weight: 81.5, logged_at: new Date('2026-01-05T07:00:00.000Z') },
+            data: { user_id: user.id, weight: 81.5, logged_at: new Date('2026-01-05T07:00:00.000Z') },
         });
 
         const response = await asUser(request.get('/api/weigh-ins'), {
-            uid: FIXTURE_USER_ID,
-            email: 'fixture.user@example.test',
+            uid: user.id,
+            email: user.email,
         });
 
         // Not merely "not 401": the row comes back only if the uid from the

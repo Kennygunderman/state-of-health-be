@@ -3,10 +3,13 @@ import {
     deleteMealEntry,
     getDailyMacros,
     getHistory,
+    logCatalogMealEntry,
     logMealEntry,
     updateMealEntry,
     updateTargets,
+    InvalidServingError,
 } from '../services/nutrition.service';
+import { parseLogEntryBody } from '../services/nutrition.logic';
 import { estimateMeal, scanLabel, EstimateFailedError } from '../services/estimate.service';
 import {
     assertAndConsumeAiCall,
@@ -14,14 +17,10 @@ import {
     DailyQuotaError,
     FeatureDisabledError,
 } from '../services/entitlement.service';
+import { CatalogFoodNotFoundError } from '../services/mealPlanning.errors';
 import { getUserId, getUserEmail } from '../utils/getUserId';
 
 const DAY_KEY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
-
-const isValidMacroPayload = (body: any): boolean =>
-    typeof body?.name === 'string' &&
-    body.name.trim().length > 0 &&
-    [body.calories, body.protein, body.carbs, body.fat].every((value: any) => Number.isFinite(Number(value)));
 
 export const getDailyMacrosController = async (req: Request, res: Response) => {
     try {
@@ -41,15 +40,28 @@ export const getDailyMacrosController = async (req: Request, res: Response) => {
 export const logMealEntryController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
-        if (!isValidMacroPayload(req.body)) {
-            return res.status(400).json({ error: 'name, calories, protein, carbs, and fat are required' });
+        const parsed = parseLogEntryBody(req.body);
+        if (parsed.kind === 'error') {
+            if (parsed.code === 'invalid_payload') {
+                return res.status(400).json({ error: 'invalid_payload', details: parsed.details });
+            }
+            return res.status(400).json({ error: parsed.message });
         }
-        const entry = await logMealEntry(userId, req.params.mealId, req.body);
+        const entry =
+            parsed.kind === 'catalog'
+                ? await logCatalogMealEntry(userId, req.params.mealId, parsed.payload)
+                : await logMealEntry(userId, req.params.mealId, parsed.payload);
         if (!entry) {
             return res.status(404).json({ error: 'Meal not found' });
         }
         return res.status(201).json(entry);
     } catch (error) {
+        if (error instanceof CatalogFoodNotFoundError) {
+            return res.status(404).json({ error: 'catalog_food_not_found' });
+        }
+        if (error instanceof InvalidServingError) {
+            return res.status(400).json({ error: 'invalid_serving' });
+        }
         console.error('Error logging meal entry:', error);
         res.status(500).json({ error: 'Failed to log meal entry' });
     }
