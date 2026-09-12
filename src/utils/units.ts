@@ -131,15 +131,27 @@ const assertFiniteQuantity = (value: number, label: string): void => {
 const clampPositiveToOne = (rounded: number, source: number): number =>
     rounded === 0 && source > 0 ? 1 : rounded;
 
+// Own properties only. The table is an object literal, so a bare index lookup
+// also reaches Object.prototype: "constructor" and "__proto__" normalise to
+// themselves and would resolve to a truthy non-definition, making `unitFamily`
+// answer `undefined` against its own return type and handing `toBaseQuantity` a
+// quantity with no family and a NaN amount. Both are the unrecognised-token
+// case, so both must take it.
+const definitionFor = (unit: string): UnitDefinition | null => {
+    const key = normaliseUnit(unit);
+
+    return Object.prototype.hasOwnProperty.call(UNIT_DEFINITIONS, key) ? UNIT_DEFINITIONS[key] : null;
+};
+
 export const unitFamily = (unit: string): UnitFamily | null => {
-    const definition = UNIT_DEFINITIONS[normaliseUnit(unit)];
+    const definition = definitionFor(unit);
     return definition ? definition.family : null;
 };
 
 export const toBaseQuantity = (amount: number, unit: string): BaseQuantity => {
     assertFiniteQuantity(amount, 'quantity');
 
-    const definition = UNIT_DEFINITIONS[normaliseUnit(unit)];
+    const definition = definitionFor(unit);
     if (!definition) {
         throw new UnitConversionError(`Unrecognised unit "${unit}"`);
     }

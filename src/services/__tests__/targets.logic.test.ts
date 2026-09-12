@@ -13,7 +13,9 @@
 //  * `>` versus `>=` at every bound and threshold, because those decide whether
 //    a user-visible caption or warning appears at all;
 //  * that a macro of 0 is refused and that nothing is ever rebalanced;
-//  * the four ways stored targets stop being attributable to a route.
+//  * the four ways stored targets stop being attributable to a route;
+//  * the complete × source matrix the planner gates generation on, so that gate
+//    is readable off the tests without consulting the planner.
 //
 // No database, no mocks, no clock: every function under test is pure, and the
 // determinism group asserts that directly.
@@ -40,6 +42,7 @@ import {
     TargetsPreferencesRow,
     TargetsUserRow,
 } from '../targets.logic';
+import { ActivityLevel, TargetsResponse } from '../../types/mealPlanning';
 
 /* ---------------------------------------------------------------------------
  * Fixtures
@@ -187,11 +190,22 @@ describe('calculateBmr', () => {
  * ------------------------------------------------------------------------- */
 
 describe('calculateTdee', () => {
-    it('multiplies the basal rate by the factor for each of the four levels', () => {
-        expect(calculateTdee(2000, 'not_very_active')).toBeCloseTo(2400, 10);
-        expect(calculateTdee(2000, 'lightly_active')).toBeCloseTo(2750, 10);
-        expect(calculateTdee(2000, 'active')).toBeCloseTo(3100, 10);
-        expect(calculateTdee(2000, 'very_active')).toBeCloseTo(3450, 10);
+    describe('the four activity factors', () => {
+        it('multiplies by 1.2 for not very active', () => {
+            expect(calculateTdee(2000, 'not_very_active')).toBeCloseTo(2400, 10);
+        });
+
+        it('multiplies by 1.375 for lightly active', () => {
+            expect(calculateTdee(2000, 'lightly_active')).toBeCloseTo(2750, 10);
+        });
+
+        it('multiplies by 1.55 for active', () => {
+            expect(calculateTdee(2000, 'active')).toBeCloseTo(3100, 10);
+        });
+
+        it('multiplies by 1.725 for very active', () => {
+            expect(calculateTdee(2000, 'very_active')).toBeCloseTo(3450, 10);
+        });
     });
 
     it('uses the declared product-policy factors', () => {
@@ -206,6 +220,26 @@ describe('calculateTdee', () => {
     it('applies the factor exactly once, never compounding it', () => {
         // Applying it twice would yield 3781.25 for the reference user.
         expect(calculateTdee(1606.25, 'lightly_active')).toBeCloseTo(2208.59375, 10);
+    });
+
+    it('cannot add logged workout or run energy on top, because it takes no such parameter', () => {
+        // The activity factor already accounts for the user's usual training,
+        // so adding logged sessions would count it twice. The signature is what
+        // makes that impossible: a basal rate and a level, and nothing else.
+        expect(calculateTdee).toHaveLength(2);
+        expect(calculateTdee(2000, 'active')).toBeCloseTo(3100, 10);
+    });
+
+    it('yields NaN for an unrecognised level rather than defaulting, which is why the guard upstream matters', () => {
+        // The activity column is plain TEXT with no enum, so an unrecognised
+        // value has no factor. Silently defaulting to 1.2 would present a
+        // plausible-looking target built on a value nobody chose; NaN cannot be
+        // mistaken for one, and resolveEstimateInputs refuses the row first.
+        expect(calculateTdee(2000, 'extremely_active' as ActivityLevel)).toBeNaN();
+        expect(resolveEstimateInputs({ ...REFERENCE_ROW, activity_level: 'extremely_active' })).toEqual({
+            kind: 'unavailable',
+            reason: 'missing_inputs',
+        });
     });
 
     it('is strictly increasing across the levels', () => {
@@ -352,6 +386,24 @@ describe('applyTargetBounds', () => {
                 clampReason: 'floor',
             });
         });
+
+        it('reports floor rather than below_bmr when the floor is the larger of the two lower bounds', () => {
+            // The low corner of the supported envelope, where a 389 kcal basal
+            // rate sits far below the 1200 kcal floor. Both lower bounds apply
+            // and the higher one decides, so the reason names the floor for
+            // every goal: maintenance at 466.8 kcal and the fastest permitted
+            // loss at −283.2 kcal alike.
+            expect(applyTargetBounds(466.8, 389, 'female')).toEqual({
+                calories: 1200,
+                clamped: true,
+                clampReason: 'floor',
+            });
+            expect(applyTargetBounds(-283.2, 389, 'female')).toEqual({
+                calories: 1200,
+                clamped: true,
+                clampReason: 'floor',
+            });
+        });
     });
 
     describe('the basal rate', () => {
@@ -450,6 +502,49 @@ describe('deriveMacroTargets', () => {
 
             expect(Math.abs(macroEnergy - calories)).toBeLessThanOrEqual(10);
         }
+    });
+
+    describe('rounding direction', () => {
+        it('rounds a half gram up', () => {
+            // 1940 kcal puts protein on exactly 145.5 g (30 % of 1940 ÷ 4), so
+            // the direction is visible rather than incidental: half away from
+            // zero, not half to even, which would give 146 here but 144 at a
+            // figure whose share landed on 144.5.
+            expect((1940 * 0.3) / 4).toBe(145.5);
+            expect(deriveMacroTargets(1940).protein).toBe(146);
+        });
+
+        it('rounds every macro the same way', () => {
+            // 1215 kcal lands carbohydrate on 121.5 g and fat on 40.5 g.
+            expect((1215 * 0.4) / 4).toBe(121.5);
+            expect((1215 * 0.3) / 9).toBe(40.5);
+            expect(deriveMacroTargets(1215)).toEqual({
+                calories: 1215,
+                protein: 91,
+                carbs: 122,
+                fat: 41,
+            });
+        });
+    });
+
+    describe('no rebalancing', () => {
+        it('leaves the macros\u2019 own energy differing from the calorie figure', () => {
+            // 146 P and 194 C at 4 kcal/g and 65 F at 9 kcal/g come to 1945
+            // kcal against a 1940 kcal target. The 5 kcal is the cost of whole
+            // grams, and it is left alone: the edit screen promises "Macros
+            // don't have to add up to your calorie target."
+            const derived = deriveMacroTargets(1940);
+            const macroEnergy = derived.protein * 4 + derived.carbs * 4 + derived.fat * 9;
+
+            expect(macroEnergy).toBe(1945);
+            expect(macroEnergy).not.toBe(derived.calories);
+        });
+
+        it('does not correct the calorie figure to match the macros it derived', () => {
+            // The reported figure stays the confirmed target, not the 1945
+            // kcal its own grams imply.
+            expect(deriveMacroTargets(1940).calories).toBe(1940);
+        });
     });
 });
 
@@ -993,6 +1088,15 @@ describe('assessFeasibility', () => {
     });
 
     describe('macro energy mismatch', () => {
+        it('is silent just inside the threshold', () => {
+            // 4(150) + 4(249) + 9(100) = 2496: a 496 kcal gap against a 500
+            // kcal tolerance.
+            expect(assessFeasibility({ calories: 2000, protein: 150, carbs: 249, fat: 100 })).toEqual({
+                ok: true,
+                warnings: [],
+            });
+        });
+
         it('is silent at exactly a quarter of the calorie figure', () => {
             // 4(150) + 4(250) + 9(100) = 2500, exactly 500 over 2000.
             expect(assessFeasibility({ calories: 2000, protein: 150, carbs: 250, fat: 100 })).toEqual({
@@ -1049,6 +1153,22 @@ describe('assessFeasibility', () => {
 
         expect(assessment.ok).toBe(false);
         expect(assessment.warnings).toEqual(['macro_energy_mismatch', 'above_catalog_max']);
+    });
+
+    it('never throws, however implausible the numbers it is handed', () => {
+        // The save succeeds and carries the warnings, so a throw here would
+        // turn an advisory note into a failed save.
+        const implausible = [
+            { calories: 800, protein: 1000, carbs: 1000, fat: 1000 },
+            { calories: 6000, protein: 1, carbs: 1, fat: 1 },
+            { calories: 1000, protein: 1, carbs: 1, fat: 1 },
+            { calories: 4500, protein: 500, carbs: 500, fat: 200 },
+        ];
+
+        for (const values of implausible) {
+            expect(() => assessFeasibility(values)).not.toThrow();
+            expect(assessFeasibility(values).warnings).toEqual(expect.any(Array));
+        }
     });
 });
 
@@ -1277,6 +1397,81 @@ describe('deriveTargetsResponse', () => {
                     preferencesRow({ confirmed_targets: { ...CONFIRMED, calories: 1940.5 } }),
                 ).source,
             ).toBe('legacy');
+        });
+    });
+
+    describe('the planner gate', () => {
+        // The planner generates only for `complete && source !== 'legacy'`,
+        // reporting `targets_missing` for the first failure and
+        // `targets_unconfirmed` for the second. One case per reachable
+        // combination, so the gate is readable off the tests alone.
+        const plannerAccepts = (response: TargetsResponse): boolean =>
+            response.complete && response.source !== 'legacy';
+
+        it('admits a complete confirmed estimate', () => {
+            const response = deriveTargetsResponse(userRow(), preferencesRow());
+
+            expect([response.complete, response.source]).toEqual([true, 'estimated']);
+            expect(plannerAccepts(response)).toBe(true);
+        });
+
+        it('admits complete manual targets', () => {
+            const response = deriveTargetsResponse(userRow(), preferencesRow({ target_source: 'manual' }));
+
+            expect([response.complete, response.source]).toEqual([true, 'manual']);
+            expect(plannerAccepts(response)).toBe(true);
+        });
+
+        it('admits a stale estimate, which generation uses as confirmed until the user recalculates', () => {
+            const response = deriveTargetsResponse(
+                userRow(),
+                preferencesRow({ targets_input_revision: 8, revision: 9 }),
+            );
+
+            expect([response.complete, response.source, response.stale]).toEqual([true, 'estimated', true]);
+            expect(plannerAccepts(response)).toBe(true);
+        });
+
+        it('refuses complete values that cannot be attributed to a route', () => {
+            const response = deriveTargetsResponse(userRow(), null);
+
+            expect([response.complete, response.source]).toEqual([true, 'legacy']);
+            expect(plannerAccepts(response)).toBe(false);
+        });
+
+        it('refuses a partially set account', () => {
+            const response = deriveTargetsResponse(userRow({ target_fat_g: null }), preferencesRow());
+
+            expect([response.complete, response.source]).toEqual([false, 'legacy']);
+            expect(plannerAccepts(response)).toBe(false);
+        });
+
+        it('refuses a user who never set targets', () => {
+            const response = deriveTargetsResponse(EMPTY_USER_ROW, null);
+
+            expect([response.targets, response.complete, response.source]).toEqual([null, false, null]);
+            expect(plannerAccepts(response)).toBe(false);
+        });
+
+        it('never reports an incomplete account as a named route, so the two conditions cannot disagree', () => {
+            const partials: Partial<TargetsUserRow>[] = [
+                { target_calories: null },
+                { target_protein_g: null },
+                { target_carbs_g: null },
+                { target_fat_g: null },
+            ];
+
+            for (const partial of partials) {
+                for (const route of ['estimated', 'manual']) {
+                    const response = deriveTargetsResponse(
+                        userRow(partial),
+                        preferencesRow({ target_source: route }),
+                    );
+
+                    expect(response.complete).toBe(false);
+                    expect(response.source).toBe('legacy');
+                }
+            }
         });
     });
 

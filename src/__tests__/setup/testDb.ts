@@ -215,13 +215,15 @@ export const assertTestDatabase = (env: NodeJS.ProcessEnv = process.env): void =
 };
 
 /**
- * Every table this feature owns, plus the three legacy tables its rows hang
- * off. Explicit and frozen rather than derived from the information schema: a
- * derived list would silently grow to include whatever else lives in the
- * database, and this list is the blast radius of `truncateFeatureTables`.
+ * Every table this feature owns, the three diary tables its rows hang off, and
+ * the legacy tables a `CASCADE` from `users` cannot reach. Explicit and frozen
+ * rather than derived from the information schema: a derived list would
+ * silently grow to include whatever else lives in the database, and this list
+ * is the blast radius of `truncateFeatureTables`.
  *
- * The sixteen meal-planning tables are in dependency order (parents last) for
- * readability only — one `TRUNCATE … CASCADE` statement is order-independent.
+ * Grouped for readability only — one `TRUNCATE … CASCADE` statement is
+ * order-independent — with the sixteen meal-planning tables in dependency
+ * order (parents last).
  */
 export const FEATURE_TABLES: readonly string[] = Object.freeze([
     'meal_plan_actions',
@@ -243,6 +245,22 @@ export const FEATURE_TABLES: readonly string[] = Object.freeze([
     'meal_entries',
     'meals',
     'users',
+    // Listed explicitly because a `CASCADE` from `users` does not reach them,
+    // which is not recoverable from the list above: `workout_days` carries a
+    // `user_id` but declares no foreign key to `users`, `usda_api_cache` has no
+    // `user_id` at all, and `ai_usage` keys on `(user_id, day)` without a
+    // foreign key either. Measured against the migrated schema rather than
+    // assumed — seeded rows in all three survived a `TRUNCATE … CASCADE` of the
+    // nineteen tables above, and a surviving `usda_api_cache` row is what makes
+    // an offline or catalog suite pass or fail on what ran before it.
+    // `daily_exercises` and `exercise_sets` DO cascade, through
+    // `user_exercises`; they are named anyway because they hang off
+    // `workout_days` just as directly, and it is now truncated by name.
+    'workout_days',
+    'daily_exercises',
+    'exercise_sets',
+    'usda_api_cache',
+    'ai_usage',
 ]);
 
 /** Unquoted identifier syntax: what may be interpolated into DDL at all. */
@@ -294,12 +312,15 @@ const requirePrismaClient = (): TestPrismaClient => {
  * can mutate `process.env` between files, and the cost of re-checking three
  * strings is nothing against truncating the wrong database once.
  *
- * `CASCADE` also empties whatever else references these tables (the legacy
- * per-user tables hanging off `users`), which is intended — §0.7.1 specifies
+ * `CASCADE` additionally empties every table holding a foreign key into these
+ * ones — the per-user legacy tables that do reference `users`, such as
+ * `templates`, `runs` and `foods` — which is intended: §0.7.1 specifies
  * `CASCADE`, and a test database with half a user's rows removed is worse than
- * an empty one. `TRUNCATE` cannot be parameterised, so the statement is built
- * from the frozen `FEATURE_TABLES` constant through `quoteIdentifier` and from
- * nothing else.
+ * an empty one. It reaches only what a foreign key leads to, which is why
+ * `FEATURE_TABLES` names the three tables nothing leads to.
+ *
+ * `TRUNCATE` cannot be parameterised, so the statement is built from the frozen
+ * `FEATURE_TABLES` constant through `quoteIdentifier` and from nothing else.
  */
 export const truncateFeatureTables = async (): Promise<void> => {
     assertTestDatabase();

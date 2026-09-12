@@ -1,0 +1,4792 @@
+{
+  "usdaManifestVersion": "v1",
+  "coveragePlanVersion": "v1",
+  "coveragePlanContract": "Every category and foodGroup below exists in coverage-plan.<coveragePlanVersion>.json, and each entry's category equals that foodGroup's own category there. That agreement holds by construction: the entries were emitted by a generator that refused to write the file on any mismatch, unknown category, unknown foodGroup or unknown foodState. scripts/lib/manifest.ts enforces only the version field at load time (loadUsdaManifest checks usdaManifestVersion against EXPECTED_USDA_MANIFEST_VERSION and throws ManifestError, which catalog-import-usda.ts preflight reports as the usda_manifest_unavailable gap); it passes no structural check for this document. Re-asserting the cross-file agreement against the loaded coverage plan therefore belongs to the importer, and a mismatch must stop the run before the first USDA request rather than halfway through an import.",
+  "apiKeyEnvVar": "USDA_API_KEY",
+  "usdaDataTypes": [
+    "Foundation",
+    "SR Legacy",
+    "Survey (FNDDS)",
+    "Branded"
+  ],
+  "usdaDataTypeEncoding": "Percent-encode dataType values (Survey%20(FNDDS)). URLSearchParams encodes a space as '+' and USDA answers 400 for 'Survey (FNDDS)' when it does.",
+  "brandedDataTypePolicy": "'Branded' is listed because the USDA API accepts it and the running API's branded search uses it, but no datasetSweep enumerates it and no entry below selects it: manufacturer records enter the catalog only through a curated entry, never through a bulk import. USDA FoodData Central is public domain with no retention restrictions (recorded in src/services/usda.service.ts and on the usda_api_cache model), which is what makes committing the identity data in this file and snapshotting per-100 g values into a release legal; no other provider's data appears here.",
+  "sourceKeyFormat": "usda:<fdcId>",
+  "sourceKeyContract": "catalog_foods.source_key is UNIQUE and is the key every import upserts on, so rerunning this manifest updates in place instead of inserting duplicates; catalog_foods.usda_fdc_id is UNIQUE too, so two entries may never name the same fdcId. Recipe seeds and search-benchmark expectations reference foods by this string and never by a database id, which is what lets a release load into any database.",
+  "entryIdentityContract": "Each foods entry carries exactly one of fdcId (an integer read from a live USDA response) or resolveBy, the shape scripts/lib/manifest.ts declares as UsdaFoodResolveBy {query, dataTypes?, requireDescription?}: a lookup the importer performs once, pins and reports, where requireDescription is the exact description the resolved record must carry. Never both fields, and never a guessed id, because a fabricated FDC id imports the wrong food under a name that looks right. Every entry in this version carries a verified fdcId, so resolveBy is unused here; the importer must still support it, because a later append may name a food whose id cannot be verified at authoring time.",
+  "expectedUsdaDescriptionContract": "expectedUsdaDescription is the description the record carried when its id was verified. The importer compares it with the live record and, on a mismatch, records identity_status \"ambiguous\" and reports the entry instead of trusting the id, so an upstream re-identification surfaces as a review item rather than a silently wrong food.",
+  "importLimits": {
+    "vendorRequestsPerHour": 1000,
+    "configuredRequestsPerHour": 900,
+    "rateLimitEnvVar": "USDA_IMPORT_RATE_LIMIT_PER_HOUR",
+    "rateLimitHeadroomReason": "Leaves 100 requests an hour on the same key for the running API's estimate, label-scan and branded-search traffic.",
+    "detailBatchSize": 20,
+    "maxListPageSize": 200,
+    "maxPhysicalAttemptsPerRequest": 4,
+    "retriedStatuses": [
+      400,
+      429,
+      500,
+      502,
+      503,
+      504
+    ],
+    "limiterCountsPhysicalAttempts": true,
+    "limiterNote": "fetchFromUsda retries 400 alongside 429 and 5xx because USDA intermittently rejects requests that succeed when retried verbatim, so one logical call can cost up to four tokens. The limiter therefore counts physical attempts, and pauses when the bucket empties instead of failing the run."
+  },
+  "nutrientNumbers": {
+    "protein": "203",
+    "fat": "204",
+    "carbs": "205",
+    "calories": "208"
+  },
+  "nutrientNumberMatching": "Compare String(foodNutrients[].nutrientNumber) with these values.",
+  "caloriesFallback": "4*protein + 4*carbs + 9*fat",
+  "nutrientShapes": {
+    "searchResults": "foodNutrients in /foods/search and /foods results are per 100 g (or per 100 ml), for every generic data type.",
+    "detailLabelNutrients": "labelNutrients in /food/{fdcId}?format=full are already per serving, and its keys are protein, carbohydrates (not carbs), fat and calories. The two shapes must never be mixed: this import reads the per-100 g foodNutrients and takes gram weights from foodPortions."
+  },
+  "portionResolution": {
+    "selectorNotWeight": "defaultPortion names a portion; it never carries a gram weight. The importer reads it from the gram weight on the record's own foodPortions entry, and an entry whose selector resolves to nothing is quarantined with check \"missing_gram_weight\" rather than published, because an invented gram weight is a fabricated number.",
+    "labelByDataset": "The portion label is `modifier` for SR Legacy; `measureUnit` plus any `portionDescription` qualifier, joined with a comma, for Foundation; and `portionDescription` for Survey (FNDDS), where the amount is embedded at the start of the string and must be parsed off first — an FNDDS `modifier` is a numeric measure code and is never a label. For SR Legacy and Foundation the amount is the separate `amount` field.",
+    "selectorFields": "defaultPortion carries the label in the field the record's own dataset uses, matching UsdaDefaultPortionSelector in scripts/lib/manifest.ts: `modifier` for SR Legacy and `portionDescription` for Survey (FNDDS) and Foundation. Exactly one of the two is present on every entry, so the importer reads the field for the dataset it is already dispatching on and never has to guess which one carries the label.",
+    "matching": "Consider only portions whose amount equals defaultPortion.amount and whose gram weight is greater than zero. Prefer a portion whose label equals the selector label (modifier or portionDescription) after case-insensitive whitespace normalization; fall back to portions whose label contains it. Where more than one remains, the lowest gram weight wins, so resolution is deterministic. Equality is preferred because a containment-only rule resolves \"medium\" against both a medium carrot and a medium carrot slice, and the amount must be compared separately because SR Legacy keeps it in its own `amount` field rather than in the label.",
+    "verified": "Every amount and label pair below resolved against the live record when its fdcId was verified: 143 of the 145 entries resolve to exactly one gram weight, and the two that remain multi-valued (potato chips at 28 and 28.35 g for \"oz\", granola bar at 21 and 25 g for \"bar\") are two genuine USDA rows for the same label, where the lowest-weight rule decides."
+  },
+  "foods": [
+    {
+      "fdcId": 169251,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Mushrooms, white, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "mushrooms, white",
+      "displayName": "Mushrooms, white",
+      "aliases": [
+        "mushroom",
+        "mushrooms",
+        "white mushrooms",
+        "button mushrooms",
+        "champignon"
+      ],
+      "foodGroup": "mushroom",
+      "defaultPortion": {
+        "description": "1 cup, sliced",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, pieces or slices"
+      },
+      "costClass": 2,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 170000,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Onions, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "onion",
+      "displayName": "Onion",
+      "aliases": [
+        "onions",
+        "yellow onion",
+        "white onion",
+        "brown onion",
+        "cooking onion"
+      ],
+      "foodGroup": "onion",
+      "defaultPortion": {
+        "description": "1 cup, chopped",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, chopped"
+      },
+      "costClass": 1,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 169230,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Garlic, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "garlic",
+      "displayName": "Garlic",
+      "aliases": [
+        "garlic cloves",
+        "fresh garlic",
+        "garlic bulb"
+      ],
+      "foodGroup": "garlic",
+      "defaultPortion": {
+        "description": "1 clove",
+        "amount": 1,
+        "unit": "clove",
+        "modifier": "clove"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170457,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Tomatoes, red, ripe, raw, year round average",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "tomato",
+      "displayName": "Tomato",
+      "aliases": [
+        "tomatoes",
+        "tomatos",
+        "fresh tomato",
+        "vine tomato"
+      ],
+      "foodGroup": "tomato",
+      "defaultPortion": {
+        "description": "1 tomato, medium",
+        "amount": 1,
+        "unit": "tomato",
+        "modifier": "medium whole"
+      },
+      "costClass": 1,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 170108,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Peppers, sweet, red, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "bell pepper, red",
+      "displayName": "Bell pepper, red",
+      "aliases": [
+        "bell peppers",
+        "red pepper",
+        "sweet pepper",
+        "capsicum"
+      ],
+      "foodGroup": "bell_pepper",
+      "defaultPortion": {
+        "description": "1 cup, chopped",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, chopped"
+      },
+      "costClass": 2,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 170497,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Peppers, hot chili, green, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "chili pepper, green",
+      "displayName": "Chili pepper, green",
+      "aliases": [
+        "chilli pepper",
+        "hot pepper",
+        "green chili",
+        "green chilli"
+      ],
+      "foodGroup": "chili_pepper",
+      "defaultPortion": {
+        "description": "1 pepper",
+        "amount": 1,
+        "unit": "pepper",
+        "modifier": "pepper"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170379,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Broccoli, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "broccoli",
+      "displayName": "Broccoli",
+      "aliases": [
+        "brocoli",
+        "brocolli",
+        "broccoli florets",
+        "broccoli crowns"
+      ],
+      "foodGroup": "broccoli",
+      "defaultPortion": {
+        "description": "0.5 cup, chopped",
+        "amount": 0.5,
+        "unit": "cup",
+        "modifier": "cup, chopped or diced"
+      },
+      "costClass": 1,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 169986,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cauliflower, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "cauliflower",
+      "displayName": "Cauliflower",
+      "aliases": [
+        "cauliflour",
+        "califlower",
+        "cauliflower florets"
+      ],
+      "foodGroup": "cauliflower",
+      "defaultPortion": {
+        "description": "1 cup, chopped",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup chopped"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169975,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cabbage, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "cabbage",
+      "displayName": "Cabbage",
+      "aliases": [
+        "green cabbage",
+        "white cabbage",
+        "shredded cabbage"
+      ],
+      "foodGroup": "cabbage",
+      "defaultPortion": {
+        "description": "1 cup, chopped",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, chopped"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168462,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Spinach, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "spinach",
+      "displayName": "Spinach",
+      "aliases": [
+        "baby spinach",
+        "spinach leaves",
+        "fresh spinach",
+        "spinich"
+      ],
+      "foodGroup": "leafy_green",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170393,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Carrots, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "carrot",
+      "displayName": "Carrot",
+      "aliases": [
+        "carrots",
+        "baby carrots",
+        "shredded carrot"
+      ],
+      "foodGroup": "carrot",
+      "defaultPortion": {
+        "description": "1 carrot, medium",
+        "amount": 1,
+        "unit": "carrot",
+        "modifier": "medium"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168482,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Sweet potato, raw, unprepared (Includes foods for USDA's Food Distribution Program)",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "sweet potato",
+      "displayName": "Sweet potato",
+      "aliases": [
+        "sweet potatoes",
+        "sweetpotato",
+        "kumara",
+        "yam"
+      ],
+      "foodGroup": "root_vegetable",
+      "defaultPortion": {
+        "description": "1 cup, cubed",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, cubes"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170027,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Potatoes, russet, flesh and skin, raw (Includes foods for USDA's Food Distribution Program)",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "potato, russet",
+      "displayName": "Potato, russet",
+      "aliases": [
+        "potatoes",
+        "russet potato",
+        "baking potato",
+        "white potato"
+      ],
+      "foodGroup": "potato",
+      "defaultPortion": {
+        "description": "1 potato, medium",
+        "amount": 1,
+        "unit": "potato",
+        "modifier": "Potato medium"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169291,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Squash, summer, zucchini, includes skin, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "zucchini",
+      "displayName": "Zucchini",
+      "aliases": [
+        "zuchini",
+        "courgette",
+        "summer squash"
+      ],
+      "foodGroup": "squash",
+      "defaultPortion": {
+        "description": "1 cup, sliced",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, chopped"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169988,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Celery, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "celery",
+      "displayName": "Celery",
+      "aliases": [
+        "celery stalks",
+        "celery sticks"
+      ],
+      "foodGroup": "celery",
+      "defaultPortion": {
+        "description": "1 stalk, medium",
+        "amount": 1,
+        "unit": "stalk",
+        "modifier": "stalk, medium"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169228,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Eggplant, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "eggplant",
+      "displayName": "Eggplant",
+      "aliases": [
+        "aubergine",
+        "brinjal",
+        "egg plant"
+      ],
+      "foodGroup": "eggplant",
+      "defaultPortion": {
+        "description": "1 cup, cubed",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, cubes"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169094,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Olives, ripe, canned (small-extra large)",
+      "category": "produce_vegetable",
+      "foodState": "prepared",
+      "canonicalName": "olives, black",
+      "displayName": "Olives, black",
+      "aliases": [
+        "olives",
+        "black olives",
+        "canned olives",
+        "ripe olives"
+      ],
+      "foodGroup": "olive",
+      "defaultPortion": {
+        "description": "1 olive, large",
+        "amount": 1,
+        "unit": "olive",
+        "modifier": "large"
+      },
+      "costClass": 2,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 168409,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cucumber, with peel, raw",
+      "category": "produce_vegetable",
+      "foodState": "raw",
+      "canonicalName": "cucumber",
+      "displayName": "Cucumber",
+      "aliases": [
+        "cucumbers",
+        "english cucumber",
+        "cukes"
+      ],
+      "foodGroup": "vegetable_other",
+      "defaultPortion": {
+        "description": "0.5 cup, sliced",
+        "amount": 0.5,
+        "unit": "cup",
+        "modifier": "cup slices"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168202,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Apples, raw, golden delicious, with skin",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "apple, golden delicious",
+      "displayName": "Apple, golden delicious",
+      "aliases": [
+        "apples",
+        "red apple",
+        "gala apple",
+        "fresh apple"
+      ],
+      "foodGroup": "apple",
+      "defaultPortion": {
+        "description": "1 apple, medium",
+        "amount": 1,
+        "unit": "apple",
+        "modifier": "medium"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173944,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Bananas, raw",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "banana",
+      "displayName": "Banana",
+      "aliases": [
+        "bananas",
+        "bannana",
+        "ripe banana"
+      ],
+      "foodGroup": "banana",
+      "defaultPortion": {
+        "description": "1 banana, medium",
+        "amount": 1,
+        "unit": "banana",
+        "modifier": "medium (7"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168155,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Limes, raw",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "lime",
+      "displayName": "Lime",
+      "aliases": [
+        "limes",
+        "fresh lime",
+        "key lime"
+      ],
+      "foodGroup": "citrus",
+      "defaultPortion": {
+        "description": "1 lime",
+        "amount": 1,
+        "unit": "lime",
+        "modifier": "fruit (2\" dia)"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 167746,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Lemons, raw, without peel",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "lemon",
+      "displayName": "Lemon",
+      "aliases": [
+        "lemons",
+        "fresh lemon",
+        "lemon juice fruit"
+      ],
+      "foodGroup": "citrus",
+      "defaultPortion": {
+        "description": "1 lemon",
+        "amount": 1,
+        "unit": "lemon",
+        "modifier": "fruit (2-3/8\" dia)"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 167762,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Strawberries, raw",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "strawberries",
+      "displayName": "Strawberries",
+      "aliases": [
+        "strawberry",
+        "strawberrys",
+        "fresh strawberries"
+      ],
+      "foodGroup": "berry",
+      "defaultPortion": {
+        "description": "1 cup, halves",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, halves"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169928,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Peaches, yellow, raw",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "peach, yellow",
+      "displayName": "Peach, yellow",
+      "aliases": [
+        "peaches",
+        "fresh peach"
+      ],
+      "foodGroup": "stone_fruit",
+      "defaultPortion": {
+        "description": "1 peach, medium",
+        "amount": 1,
+        "unit": "peach",
+        "modifier": "medium (2-2/3"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169910,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Mangos, raw",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "mango",
+      "displayName": "Mango",
+      "aliases": [
+        "mangoes",
+        "mangos",
+        "fresh mango"
+      ],
+      "foodGroup": "tropical_fruit",
+      "defaultPortion": {
+        "description": "1 cup, pieces",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup pieces"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171705,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Avocados, raw, all commercial varieties",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "avocado",
+      "displayName": "Avocado",
+      "aliases": [
+        "avocados",
+        "avacado",
+        "avocadoes",
+        "hass avocado"
+      ],
+      "foodGroup": "avocado",
+      "defaultPortion": {
+        "description": "1 avocado",
+        "amount": 1,
+        "unit": "avocado",
+        "modifier": "avocado, NS as to"
+      },
+      "costClass": 2,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 168165,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Raisins, dark, seedless (Includes foods for USDA's Food Distribution Program)",
+      "category": "produce_fruit",
+      "foodState": "dry",
+      "canonicalName": "raisins",
+      "displayName": "Raisins",
+      "aliases": [
+        "raisin",
+        "sultanas",
+        "dried grapes"
+      ],
+      "foodGroup": "dried_fruit",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup (not packed)"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174683,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Grapes, red or green (European type, such as Thompson seedless), raw",
+      "category": "produce_fruit",
+      "foodState": "raw",
+      "canonicalName": "grapes",
+      "displayName": "Grapes",
+      "aliases": [
+        "grape",
+        "seedless grapes",
+        "green grapes",
+        "red grapes"
+      ],
+      "foodGroup": "fruit_other",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173110,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beef, ground, 93% lean meat / 7% fat, raw",
+      "category": "protein_meat",
+      "foodState": "raw",
+      "canonicalName": "ground beef, 93% lean",
+      "displayName": "Ground beef, 93% lean",
+      "aliases": [
+        "ground beef",
+        "lean ground beef",
+        "minced beef",
+        "hamburger meat"
+      ],
+      "foodGroup": "beef",
+      "defaultPortion": {
+        "description": "4 oz",
+        "amount": 4,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168249,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Pork, fresh, loin, tenderloin, separable lean only, raw",
+      "category": "protein_meat",
+      "foodState": "raw",
+      "canonicalName": "pork tenderloin",
+      "displayName": "Pork tenderloin",
+      "aliases": [
+        "pork loin",
+        "tenderloin",
+        "pork fillet"
+      ],
+      "foodGroup": "pork",
+      "defaultPortion": {
+        "description": "4 oz",
+        "amount": 4,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174370,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Lamb, ground, raw",
+      "category": "protein_meat",
+      "foodState": "raw",
+      "canonicalName": "ground lamb",
+      "displayName": "Ground lamb",
+      "aliases": [
+        "lamb mince",
+        "minced lamb",
+        "lamb ground"
+      ],
+      "foodGroup": "lamb",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174421,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Game meat , bison, ground, raw",
+      "category": "protein_meat",
+      "foodState": "raw",
+      "canonicalName": "ground bison",
+      "displayName": "Ground bison",
+      "aliases": [
+        "bison",
+        "buffalo meat",
+        "bison mince"
+      ],
+      "foodGroup": "game_meat",
+      "defaultPortion": {
+        "description": "1 patty",
+        "amount": 1,
+        "unit": "patty",
+        "modifier": "patty"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168277,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Pork, cured, bacon, unprepared",
+      "category": "protein_meat",
+      "foodState": "raw",
+      "canonicalName": "bacon",
+      "displayName": "Bacon",
+      "aliases": [
+        "bacon strips",
+        "streaky bacon",
+        "raw bacon"
+      ],
+      "foodGroup": "cured_meat",
+      "defaultPortion": {
+        "description": "1 slice",
+        "amount": 1,
+        "unit": "slice",
+        "modifier": "slice raw"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169451,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beef, variety meats and by-products, liver, raw",
+      "category": "protein_meat",
+      "foodState": "raw",
+      "canonicalName": "beef liver",
+      "displayName": "Beef liver",
+      "aliases": [
+        "liver",
+        "calf liver",
+        "ox liver"
+      ],
+      "foodGroup": "organ_meat",
+      "defaultPortion": {
+        "description": "4 oz",
+        "amount": 4,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171077,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Chicken, broiler or fryers, breast, skinless, boneless, meat only, raw",
+      "category": "protein_poultry",
+      "foodState": "raw",
+      "canonicalName": "chicken breast",
+      "displayName": "Chicken breast",
+      "aliases": [
+        "chicken breasts",
+        "boneless skinless chicken breast",
+        "chicken fillet",
+        "chiken breast"
+      ],
+      "foodGroup": "chicken",
+      "defaultPortion": {
+        "description": "4 oz",
+        "amount": 4,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171477,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Chicken, broilers or fryers, breast, meat only, cooked, roasted",
+      "category": "protein_poultry",
+      "foodState": "cooked",
+      "canonicalName": "chicken breast, cooked",
+      "displayName": "Chicken breast, cooked",
+      "aliases": [
+        "cooked chicken breast",
+        "roasted chicken breast",
+        "grilled chicken breast"
+      ],
+      "foodGroup": "chicken",
+      "defaultPortion": {
+        "description": "1 cup, diced",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup, chopped or diced"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171098,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Turkey, whole, breast, meat only, raw",
+      "category": "protein_poultry",
+      "foodState": "raw",
+      "canonicalName": "turkey breast",
+      "displayName": "Turkey breast",
+      "aliases": [
+        "turkey",
+        "raw turkey breast",
+        "turkey fillet"
+      ],
+      "foodGroup": "turkey",
+      "defaultPortion": {
+        "description": "4 oz",
+        "amount": 4,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172941,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Turkey breast, sliced, prepackaged",
+      "category": "protein_poultry",
+      "foodState": "prepared",
+      "canonicalName": "turkey breast, sliced",
+      "displayName": "Turkey breast, sliced",
+      "aliases": [
+        "deli turkey",
+        "sliced turkey",
+        "turkey slices",
+        "turkey deli meat"
+      ],
+      "foodGroup": "turkey",
+      "defaultPortion": {
+        "description": "1 slice",
+        "amount": 1,
+        "unit": "slice",
+        "modifier": "slice"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172410,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Duck, domesticated, meat only, raw",
+      "category": "protein_poultry",
+      "foodState": "raw",
+      "canonicalName": "duck meat",
+      "displayName": "Duck meat",
+      "aliases": [
+        "duck",
+        "duckling",
+        "duck breast"
+      ],
+      "foodGroup": "duck",
+      "defaultPortion": {
+        "description": "1 serving",
+        "amount": 1,
+        "unit": "serving",
+        "modifier": "unit (yield from 1 lb"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2706135,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Turkey bacon, cooked",
+      "category": "protein_poultry",
+      "foodState": "cooked",
+      "canonicalName": "turkey bacon",
+      "displayName": "Turkey bacon",
+      "aliases": [
+        "turkey rashers",
+        "turkey strips"
+      ],
+      "foodGroup": "processed_poultry",
+      "defaultPortion": {
+        "description": "1 slice",
+        "amount": 1,
+        "unit": "slice",
+        "portionDescription": "slice, NFS"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 175167,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Fish, salmon, Atlantic, farmed, raw",
+      "category": "protein_seafood",
+      "foodState": "raw",
+      "canonicalName": "salmon fillet",
+      "displayName": "Salmon fillet",
+      "aliases": [
+        "salmon",
+        "atlantic salmon",
+        "salmon filet",
+        "fresh salmon"
+      ],
+      "foodGroup": "salmon",
+      "defaultPortion": {
+        "description": "3 oz",
+        "amount": 3,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171986,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Fish, tuna, light, canned in water, without salt, drained solids",
+      "category": "protein_seafood",
+      "foodState": "prepared",
+      "canonicalName": "tuna, canned in water",
+      "displayName": "Tuna, canned in water",
+      "aliases": [
+        "canned tuna",
+        "tuna",
+        "tinned tuna",
+        "tuna fish"
+      ],
+      "foodGroup": "tuna",
+      "defaultPortion": {
+        "description": "3 oz",
+        "amount": 3,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171955,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Fish, cod, Atlantic, raw",
+      "category": "protein_seafood",
+      "foodState": "raw",
+      "canonicalName": "cod fillet",
+      "displayName": "Cod fillet",
+      "aliases": [
+        "cod",
+        "codfish",
+        "white fish",
+        "cod filet"
+      ],
+      "foodGroup": "white_fish",
+      "defaultPortion": {
+        "description": "3 oz",
+        "amount": 3,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174183,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Fish, anchovy, european, canned in oil, drained solids",
+      "category": "protein_seafood",
+      "foodState": "prepared",
+      "canonicalName": "anchovies, canned",
+      "displayName": "Anchovies, canned",
+      "aliases": [
+        "anchovy",
+        "anchovies",
+        "anchovie",
+        "tinned anchovies"
+      ],
+      "foodGroup": "anchovy",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz, boneless"
+      },
+      "costClass": 2,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 174210,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Crustaceans, shrimp, mixed species, raw (may contain additives to retain moisture)",
+      "category": "protein_seafood",
+      "foodState": "raw",
+      "canonicalName": "shrimp",
+      "displayName": "Shrimp",
+      "aliases": [
+        "shrimps",
+        "prawns",
+        "prawn",
+        "raw shrimp"
+      ],
+      "foodGroup": "crustacean",
+      "defaultPortion": {
+        "description": "3 oz",
+        "amount": 3,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174216,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Mollusks, mussel, blue, raw",
+      "category": "protein_seafood",
+      "foodState": "raw",
+      "canonicalName": "mussels",
+      "displayName": "Mussels",
+      "aliases": [
+        "mussel",
+        "blue mussels"
+      ],
+      "foodGroup": "mollusk",
+      "defaultPortion": {
+        "description": "3 oz",
+        "amount": 3,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 175176,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Fish, tilapia, raw",
+      "category": "protein_seafood",
+      "foodState": "raw",
+      "canonicalName": "tilapia",
+      "displayName": "Tilapia",
+      "aliases": [
+        "tilapia fillet",
+        "tilapa"
+      ],
+      "foodGroup": "seafood_other",
+      "defaultPortion": {
+        "description": "1 fillet",
+        "amount": 1,
+        "unit": "fillet",
+        "modifier": "fillet"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171287,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Egg, whole, raw, fresh",
+      "category": "protein_egg",
+      "foodState": "raw",
+      "canonicalName": "egg",
+      "displayName": "Egg",
+      "aliases": [
+        "eggs",
+        "whole egg",
+        "large egg",
+        "chicken egg"
+      ],
+      "foodGroup": "chicken_egg",
+      "defaultPortion": {
+        "description": "1 egg, large",
+        "amount": 1,
+        "unit": "egg",
+        "modifier": "large"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172183,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Egg, white, raw, fresh",
+      "category": "protein_egg",
+      "foodState": "raw",
+      "canonicalName": "egg white",
+      "displayName": "Egg white",
+      "aliases": [
+        "egg whites",
+        "albumen"
+      ],
+      "foodGroup": "chicken_egg",
+      "defaultPortion": {
+        "description": "1 egg white, large",
+        "amount": 1,
+        "unit": "egg white",
+        "modifier": "large"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172184,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Egg, yolk, raw, fresh",
+      "category": "protein_egg",
+      "foodState": "raw",
+      "canonicalName": "egg yolk",
+      "displayName": "Egg yolk",
+      "aliases": [
+        "egg yolks",
+        "yolk"
+      ],
+      "foodGroup": "chicken_egg",
+      "defaultPortion": {
+        "description": "1 egg yolk, large",
+        "amount": 1,
+        "unit": "egg yolk",
+        "modifier": "large"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173462,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Egg substitute, liquid or frozen, fat free",
+      "category": "protein_egg",
+      "foodState": "prepared",
+      "canonicalName": "liquid egg substitute",
+      "displayName": "Liquid egg substitute",
+      "aliases": [
+        "egg substitute",
+        "liquid eggs",
+        "egg replacer"
+      ],
+      "foodGroup": "egg_product",
+      "defaultPortion": {
+        "description": "0.25 cup",
+        "amount": 0.25,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172448,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Tofu, firm, prepared with calcium sulfate and magnesium chloride (nigari)",
+      "category": "protein_plant",
+      "foodState": "raw",
+      "canonicalName": "tofu, firm",
+      "displayName": "Tofu, firm",
+      "aliases": [
+        "tofu",
+        "firm tofu",
+        "bean curd",
+        "soy curd"
+      ],
+      "foodGroup": "tofu",
+      "defaultPortion": {
+        "description": "0.5 cup",
+        "amount": 0.5,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 174272,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Tempeh",
+      "category": "protein_plant",
+      "foodState": "raw",
+      "canonicalName": "tempeh",
+      "displayName": "Tempeh",
+      "aliases": [
+        "tempe",
+        "fermented soybean cake"
+      ],
+      "foodGroup": "tempeh",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2709163,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Meat substitute, cereal- and vegetable protein-based, fried",
+      "category": "protein_plant",
+      "foodState": "prepared",
+      "canonicalName": "wheat-protein meat substitute",
+      "displayName": "Wheat-protein meat substitute",
+      "aliases": [
+        "wheat gluten",
+        "wheat meat"
+      ],
+      "foodGroup": "seitan",
+      "defaultPortion": {
+        "description": "1 cup, cubed",
+        "amount": 1,
+        "unit": "cup",
+        "portionDescription": "cup, cubes"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2707473,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Veggie burger patty, no bun",
+      "category": "protein_plant",
+      "foodState": "prepared",
+      "canonicalName": "veggie burger patty",
+      "displayName": "Veggie burger patty",
+      "aliases": [
+        "veggie burger",
+        "plant based burger",
+        "vegan patty"
+      ],
+      "foodGroup": "plant_based_meat",
+      "defaultPortion": {
+        "description": "1 patty",
+        "amount": 1,
+        "unit": "patty",
+        "portionDescription": "patty"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171267,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Milk, reduced fat, fluid, 2% milkfat, with added vitamin A and vitamin D",
+      "category": "dairy",
+      "foodState": "as_purchased",
+      "canonicalName": "milk, 2%",
+      "displayName": "Milk, 2%",
+      "aliases": [
+        "milk",
+        "2% milk",
+        "reduced fat milk",
+        "semi skimmed milk"
+      ],
+      "foodGroup": "milk",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170859,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cream, fluid, heavy whipping",
+      "category": "dairy",
+      "foodState": "as_purchased",
+      "canonicalName": "heavy cream",
+      "displayName": "Heavy cream",
+      "aliases": [
+        "heavy whipping cream",
+        "double cream",
+        "whipping cream"
+      ],
+      "foodGroup": "cream",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173410,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Butter, salted",
+      "category": "dairy",
+      "foodState": "as_purchased",
+      "canonicalName": "butter",
+      "displayName": "Butter",
+      "aliases": [
+        "salted butter",
+        "stick butter"
+      ],
+      "foodGroup": "butter",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2705424,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Yogurt, Greek, nonfat milk, plain",
+      "category": "dairy",
+      "foodState": "as_purchased",
+      "canonicalName": "greek yogurt, plain",
+      "displayName": "Greek yogurt, plain",
+      "aliases": [
+        "greek yogurt",
+        "greek yoghurt",
+        "plain yogurt",
+        "nonfat greek yogurt",
+        "yoghurt"
+      ],
+      "foodGroup": "yogurt",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "portionDescription": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 328637,
+      "usdaDataType": "Foundation",
+      "expectedUsdaDescription": "Cheese, cheddar",
+      "category": "dairy",
+      "foodState": "as_purchased",
+      "canonicalName": "cheddar cheese",
+      "displayName": "Cheddar cheese",
+      "aliases": [
+        "cheddar",
+        "sharp cheddar",
+        "cheeder cheese"
+      ],
+      "foodGroup": "cheese",
+      "defaultPortion": {
+        "description": "1 slice",
+        "amount": 1,
+        "unit": "slice",
+        "portionDescription": "slice"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173420,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cheese, feta",
+      "category": "dairy",
+      "foodState": "as_purchased",
+      "canonicalName": "feta cheese",
+      "displayName": "Feta cheese",
+      "aliases": [
+        "feta",
+        "fetta",
+        "greek cheese"
+      ],
+      "foodGroup": "cheese",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172175,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cheese, blue",
+      "category": "dairy",
+      "foodState": "as_purchased",
+      "canonicalName": "blue cheese",
+      "displayName": "Blue cheese",
+      "aliases": [
+        "bleu cheese",
+        "blue vein cheese",
+        "gorgonzola style cheese"
+      ],
+      "foodGroup": "blue_cheese",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 175215,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Soymilk (all flavors), unsweetened, with added calcium, vitamins A and D",
+      "category": "dairy_alternative",
+      "foodState": "as_purchased",
+      "canonicalName": "soy milk, unsweetened",
+      "displayName": "Soy milk, unsweetened",
+      "aliases": [
+        "soymilk",
+        "soya milk",
+        "unsweetened soy milk"
+      ],
+      "foodGroup": "soy_milk",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174832,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beverages, almond milk, unsweetened, shelf stable",
+      "category": "dairy_alternative",
+      "foodState": "as_purchased",
+      "canonicalName": "almond milk, unsweetened",
+      "displayName": "Almond milk, unsweetened",
+      "aliases": [
+        "almondmilk",
+        "unsweetened almond milk",
+        "almond beverage"
+      ],
+      "foodGroup": "nut_milk",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170173,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Nuts, coconut milk, canned (liquid expressed from grated meat and water)",
+      "category": "dairy_alternative",
+      "foodState": "as_purchased",
+      "canonicalName": "coconut milk, canned",
+      "displayName": "Coconut milk, canned",
+      "aliases": [
+        "coconut milk",
+        "tinned coconut milk"
+      ],
+      "foodGroup": "coconut_milk",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2705412,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Oat milk",
+      "category": "dairy_alternative",
+      "foodState": "as_purchased",
+      "canonicalName": "oat milk",
+      "displayName": "Oat milk",
+      "aliases": [
+        "oatmilk",
+        "oat beverage",
+        "oat drink"
+      ],
+      "foodGroup": "plant_dairy_other",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "portionDescription": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169756,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Rice, white, long-grain, regular, raw, unenriched",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "white rice, dry",
+      "displayName": "White rice, dry",
+      "aliases": [
+        "white rice",
+        "long grain rice",
+        "uncooked white rice",
+        "raw rice"
+      ],
+      "foodGroup": "rice",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169757,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Rice, white, long-grain, regular, unenriched, cooked without salt",
+      "category": "grain",
+      "foodState": "cooked",
+      "canonicalName": "white rice, cooked",
+      "displayName": "White rice, cooked",
+      "aliases": [
+        "cooked white rice",
+        "steamed rice",
+        "boiled rice"
+      ],
+      "foodGroup": "rice",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169703,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Rice, brown, long-grain, raw (Includes foods for USDA's Food Distribution Program)",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "brown rice, dry",
+      "displayName": "Brown rice, dry",
+      "aliases": [
+        "brown rice",
+        "uncooked brown rice",
+        "wholegrain rice"
+      ],
+      "foodGroup": "rice",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169704,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Rice, brown, long-grain, cooked (Includes foods for USDA's Food Distribution Program)",
+      "category": "grain",
+      "foodState": "cooked",
+      "canonicalName": "brown rice, cooked",
+      "displayName": "Brown rice, cooked",
+      "aliases": [
+        "cooked brown rice",
+        "steamed brown rice"
+      ],
+      "foodGroup": "rice",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170688,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Bulgur, dry",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "bulgur, dry",
+      "displayName": "Bulgur, dry",
+      "aliases": [
+        "bulghur",
+        "bulgar",
+        "cracked wheat"
+      ],
+      "foodGroup": "wheat_grain",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168894,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Wheat flour, white, all-purpose, enriched, bleached",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "all-purpose flour",
+      "displayName": "All-purpose flour",
+      "aliases": [
+        "flour",
+        "white flour",
+        "plain flour",
+        "wheat flour"
+      ],
+      "foodGroup": "wheat_grain",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173904,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cereals, oats, regular and quick, not fortified, dry",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "rolled oats, dry",
+      "displayName": "Rolled oats, dry",
+      "aliases": [
+        "oats",
+        "oatmeal",
+        "old fashioned oats",
+        "porridge oats"
+      ],
+      "foodGroup": "oat",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168874,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Quinoa, uncooked",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "quinoa, dry",
+      "displayName": "Quinoa, dry",
+      "aliases": [
+        "quinoa",
+        "uncooked quinoa",
+        "keenwa"
+      ],
+      "foodGroup": "quinoa",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 168917,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Quinoa, cooked",
+      "category": "grain",
+      "foodState": "cooked",
+      "canonicalName": "quinoa, cooked",
+      "displayName": "Quinoa, cooked",
+      "aliases": [
+        "cooked quinoa"
+      ],
+      "foodGroup": "quinoa",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169736,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Pasta, dry, enriched",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "pasta, dry",
+      "displayName": "Pasta, dry",
+      "aliases": [
+        "dry pasta",
+        "penne",
+        "macaroni",
+        "uncooked pasta"
+      ],
+      "foodGroup": "pasta",
+      "defaultPortion": {
+        "description": "2 oz",
+        "amount": 2,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169737,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Pasta, cooked, enriched, without added salt",
+      "category": "grain",
+      "foodState": "cooked",
+      "canonicalName": "pasta, cooked",
+      "displayName": "Pasta, cooked",
+      "aliases": [
+        "cooked pasta",
+        "boiled pasta",
+        "cooked spaghetti"
+      ],
+      "foodGroup": "pasta",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup spaghetti not packed"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170284,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Barley, pearled, raw",
+      "category": "grain",
+      "foodState": "dry",
+      "canonicalName": "pearl barley, dry",
+      "displayName": "Pearl barley, dry",
+      "aliases": [
+        "barley",
+        "pearled barley"
+      ],
+      "foodGroup": "grain_other",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172688,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Bread, whole-wheat, commercially prepared",
+      "category": "bread_bakery",
+      "foodState": "as_purchased",
+      "canonicalName": "whole wheat bread",
+      "displayName": "Whole wheat bread",
+      "aliases": [
+        "wholewheat bread",
+        "wholemeal bread",
+        "brown bread",
+        "whole grain bread"
+      ],
+      "foodGroup": "bread_leavened",
+      "defaultPortion": {
+        "description": "1 slice",
+        "amount": 1,
+        "unit": "slice",
+        "modifier": "slice"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174916,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Bread, pita, whole-wheat",
+      "category": "bread_bakery",
+      "foodState": "as_purchased",
+      "canonicalName": "pita bread, whole wheat",
+      "displayName": "Pita bread, whole wheat",
+      "aliases": [
+        "pita",
+        "pitta bread",
+        "whole wheat pita",
+        "flatbread"
+      ],
+      "foodGroup": "flatbread",
+      "defaultPortion": {
+        "description": "1 pita, large",
+        "amount": 1,
+        "unit": "pita",
+        "modifier": "pita, large"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2707825,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Tortilla, whole wheat",
+      "category": "bread_bakery",
+      "foodState": "as_purchased",
+      "canonicalName": "tortilla, whole wheat",
+      "displayName": "Tortilla, whole wheat",
+      "aliases": [
+        "tortillas",
+        "whole wheat tortilla",
+        "wheat wrap",
+        "soft tortilla"
+      ],
+      "foodGroup": "tortilla",
+      "defaultPortion": {
+        "description": "1 tortilla, medium",
+        "amount": 1,
+        "unit": "tortilla",
+        "portionDescription": "medium"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172749,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Crackers, whole-wheat",
+      "category": "bread_bakery",
+      "foodState": "as_purchased",
+      "canonicalName": "whole wheat crackers",
+      "displayName": "Whole wheat crackers",
+      "aliases": [
+        "crackers",
+        "wheat crackers",
+        "crispbread"
+      ],
+      "foodGroup": "cracker",
+      "defaultPortion": {
+        "description": "1 serving",
+        "amount": 1,
+        "unit": "serving",
+        "modifier": "serving"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174987,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Croissants, butter",
+      "category": "bread_bakery",
+      "foodState": "as_purchased",
+      "canonicalName": "croissant",
+      "displayName": "Croissant",
+      "aliases": [
+        "croissants",
+        "butter croissant",
+        "crossaint"
+      ],
+      "foodGroup": "pastry",
+      "defaultPortion": {
+        "description": "1 croissant, medium",
+        "amount": 1,
+        "unit": "croissant",
+        "modifier": "croissant, medium"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172420,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Lentils, raw",
+      "category": "legume",
+      "foodState": "dry",
+      "canonicalName": "lentils, dry",
+      "displayName": "Lentils, dry",
+      "aliases": [
+        "lentil",
+        "dry lentils",
+        "green lentils",
+        "red lentils"
+      ],
+      "foodGroup": "lentil",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172421,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Lentils, mature seeds, cooked, boiled, without salt",
+      "category": "legume",
+      "foodState": "cooked",
+      "canonicalName": "lentils, cooked",
+      "displayName": "Lentils, cooked",
+      "aliases": [
+        "cooked lentils",
+        "boiled lentils"
+      ],
+      "foodGroup": "lentil",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173756,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Chickpeas (garbanzo beans, bengal gram), mature seeds, raw",
+      "category": "legume",
+      "foodState": "dry",
+      "canonicalName": "chickpeas, dry",
+      "displayName": "Chickpeas, dry",
+      "aliases": [
+        "dry chickpeas",
+        "dry garbanzo beans",
+        "chick peas"
+      ],
+      "foodGroup": "chickpea",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173800,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Chickpeas (garbanzo beans, bengal gram), mature seeds, canned, drained solids",
+      "category": "legume",
+      "foodState": "cooked",
+      "canonicalName": "chickpeas, canned",
+      "displayName": "Chickpeas, canned",
+      "aliases": [
+        "canned chickpeas",
+        "garbanzo beans",
+        "tinned chickpeas"
+      ],
+      "foodGroup": "chickpea",
+      "defaultPortion": {
+        "description": "1 can, drained",
+        "amount": 1,
+        "unit": "can",
+        "modifier": "can drained"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173734,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beans, black, mature seeds, raw",
+      "category": "legume",
+      "foodState": "dry",
+      "canonicalName": "black beans, dry",
+      "displayName": "Black beans, dry",
+      "aliases": [
+        "dry black beans",
+        "turtle beans"
+      ],
+      "foodGroup": "black_bean",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 175238,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beans, black, mature seeds, canned, low sodium",
+      "category": "legume",
+      "foodState": "cooked",
+      "canonicalName": "black beans, canned",
+      "displayName": "Black beans, canned",
+      "aliases": [
+        "black beans",
+        "canned black beans",
+        "tinned black beans"
+      ],
+      "foodGroup": "black_bean",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169282,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Soybeans, green, raw",
+      "category": "legume",
+      "foodState": "raw",
+      "canonicalName": "edamame",
+      "displayName": "Edamame",
+      "aliases": [
+        "green soybeans",
+        "edaname",
+        "soy beans"
+      ],
+      "foodGroup": "soybean",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174285,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beans, kidney, red, mature seeds, canned, drained solids",
+      "category": "legume",
+      "foodState": "cooked",
+      "canonicalName": "kidney beans, canned",
+      "displayName": "Kidney beans, canned",
+      "aliases": [
+        "red kidney beans",
+        "canned kidney beans",
+        "rajma"
+      ],
+      "foodGroup": "bean_other",
+      "defaultPortion": {
+        "description": "1 can, drained",
+        "amount": 1,
+        "unit": "can",
+        "modifier": "can drained solids"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173806,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Peanuts, all types, dry-roasted, without salt",
+      "category": "nut_seed",
+      "foodState": "as_purchased",
+      "canonicalName": "peanuts, dry roasted",
+      "displayName": "Peanuts, dry roasted",
+      "aliases": [
+        "peanuts",
+        "roasted peanuts",
+        "groundnuts"
+      ],
+      "foodGroup": "peanut",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172470,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Peanut butter, smooth style, without salt",
+      "category": "nut_seed",
+      "foodState": "prepared",
+      "canonicalName": "peanut butter",
+      "displayName": "Peanut butter",
+      "aliases": [
+        "peanutbutter",
+        "smooth peanut butter",
+        "creamy peanut butter"
+      ],
+      "foodGroup": "peanut",
+      "defaultPortion": {
+        "description": "2 tbsp",
+        "amount": 2,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170567,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Nuts, almonds",
+      "category": "nut_seed",
+      "foodState": "as_purchased",
+      "canonicalName": "almonds",
+      "displayName": "Almonds",
+      "aliases": [
+        "almond",
+        "raw almonds",
+        "whole almonds"
+      ],
+      "foodGroup": "almond",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz (23 whole kernels)"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170162,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Nuts, cashew nuts, raw",
+      "category": "nut_seed",
+      "foodState": "as_purchased",
+      "canonicalName": "cashews",
+      "displayName": "Cashews",
+      "aliases": [
+        "cashew",
+        "cashew nuts",
+        "kaju"
+      ],
+      "foodGroup": "cashew",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170187,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Nuts, walnuts, english",
+      "category": "nut_seed",
+      "foodState": "as_purchased",
+      "canonicalName": "walnuts",
+      "displayName": "Walnuts",
+      "aliases": [
+        "walnut",
+        "english walnuts"
+      ],
+      "foodGroup": "walnut",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz (14 halves)"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170170,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Nuts, coconut meat, dried (desiccated), not sweetened",
+      "category": "nut_seed",
+      "foodState": "dry",
+      "canonicalName": "shredded coconut, unsweetened",
+      "displayName": "Shredded coconut, unsweetened",
+      "aliases": [
+        "desiccated coconut",
+        "coconut flakes",
+        "dried coconut",
+        "shredded coconut"
+      ],
+      "foodGroup": "coconut",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170189,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Seeds, sesame butter, tahini, from roasted and toasted kernels (most common type)",
+      "category": "nut_seed",
+      "foodState": "prepared",
+      "canonicalName": "tahini",
+      "displayName": "Tahini",
+      "aliases": [
+        "sesame paste",
+        "tahini paste",
+        "tahina"
+      ],
+      "foodGroup": "sesame",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170562,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Seeds, sunflower seed kernels, dried",
+      "category": "nut_seed",
+      "foodState": "dry",
+      "canonicalName": "sunflower seeds",
+      "displayName": "Sunflower seeds",
+      "aliases": [
+        "sunflower seed",
+        "sunflower kernels"
+      ],
+      "foodGroup": "sunflower_seed",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170184,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Nuts, pistachio nuts, raw",
+      "category": "nut_seed",
+      "foodState": "as_purchased",
+      "canonicalName": "pistachios",
+      "displayName": "Pistachios",
+      "aliases": [
+        "pistachio",
+        "pistachio nuts"
+      ],
+      "foodGroup": "nut_other",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz (49 kernels)"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171413,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Oil, olive, salad or cooking",
+      "category": "oil_fat",
+      "foodState": "as_purchased",
+      "canonicalName": "olive oil",
+      "displayName": "Olive oil",
+      "aliases": [
+        "extra virgin olive oil",
+        "evoo",
+        "virgin olive oil"
+      ],
+      "foodGroup": "olive_oil",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tablespoon"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172336,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Oil, canola",
+      "category": "oil_fat",
+      "foodState": "as_purchased",
+      "canonicalName": "canola oil",
+      "displayName": "Canola oil",
+      "aliases": [
+        "rapeseed oil",
+        "vegetable oil",
+        "canola"
+      ],
+      "foodGroup": "vegetable_oil",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171412,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Oil, coconut",
+      "category": "oil_fat",
+      "foodState": "as_purchased",
+      "canonicalName": "coconut oil",
+      "displayName": "Coconut oil",
+      "aliases": [
+        "virgin coconut oil",
+        "copra oil"
+      ],
+      "foodGroup": "coconut_oil",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171401,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Lard",
+      "category": "oil_fat",
+      "foodState": "as_purchased",
+      "canonicalName": "lard",
+      "displayName": "Lard",
+      "aliases": [
+        "pork fat",
+        "rendered lard"
+      ],
+      "foodGroup": "animal_fat",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171009,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Salad dressing, mayonnaise, regular",
+      "category": "condiment_sauce",
+      "foodState": "prepared",
+      "canonicalName": "mayonnaise",
+      "displayName": "Mayonnaise",
+      "aliases": [
+        "mayo",
+        "mayonaise",
+        "real mayonnaise"
+      ],
+      "foodGroup": "mayonnaise",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 172234,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Mustard, prepared, yellow",
+      "category": "condiment_sauce",
+      "foodState": "prepared",
+      "canonicalName": "yellow mustard",
+      "displayName": "Yellow mustard",
+      "aliases": [
+        "mustard",
+        "prepared mustard",
+        "american mustard"
+      ],
+      "foodGroup": "mustard",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp or 1 packet"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171186,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Sauce, hot chile, sriracha",
+      "category": "condiment_sauce",
+      "foodState": "prepared",
+      "canonicalName": "sriracha hot sauce",
+      "displayName": "Sriracha hot sauce",
+      "aliases": [
+        "hot sauce",
+        "sriracha",
+        "chilli sauce",
+        "chili sauce"
+      ],
+      "foodGroup": "hot_sauce",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174277,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Soy sauce made from soy and wheat (shoyu)",
+      "category": "condiment_sauce",
+      "foodState": "prepared",
+      "canonicalName": "soy sauce",
+      "displayName": "Soy sauce",
+      "aliases": [
+        "shoyu",
+        "soya sauce",
+        "light soy sauce"
+      ],
+      "foodGroup": "soy_sauce",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172241,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Vinegar, balsamic",
+      "category": "condiment_sauce",
+      "foodState": "as_purchased",
+      "canonicalName": "balsamic vinegar",
+      "displayName": "Balsamic vinegar",
+      "aliases": [
+        "vinegar",
+        "balsamic"
+      ],
+      "foodGroup": "vinegar",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173592,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Salad dressing, ranch dressing, regular",
+      "category": "condiment_sauce",
+      "foodState": "prepared",
+      "canonicalName": "ranch dressing",
+      "displayName": "Ranch dressing",
+      "aliases": [
+        "ranch",
+        "ranch salad dressing"
+      ],
+      "foodGroup": "salad_dressing",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tablespoon"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174289,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Hummus, commercial",
+      "category": "condiment_sauce",
+      "foodState": "prepared",
+      "canonicalName": "hummus",
+      "displayName": "Hummus",
+      "aliases": [
+        "houmous",
+        "humus",
+        "hommus",
+        "chickpea dip"
+      ],
+      "foodGroup": "condiment_other",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 174524,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Sauce, salsa, ready-to-serve",
+      "category": "condiment_sauce",
+      "foodState": "prepared",
+      "canonicalName": "salsa",
+      "displayName": "Salsa",
+      "aliases": [
+        "tomato salsa",
+        "pico de gallo",
+        "salza"
+      ],
+      "foodGroup": "condiment_other",
+      "defaultPortion": {
+        "description": "2 tbsp",
+        "amount": 2,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169997,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Coriander (cilantro) leaves, raw",
+      "category": "spice_herb",
+      "foodState": "raw",
+      "canonicalName": "cilantro",
+      "displayName": "Cilantro",
+      "aliases": [
+        "coriander",
+        "fresh coriander",
+        "corriander",
+        "chinese parsley"
+      ],
+      "foodGroup": "cilantro",
+      "defaultPortion": {
+        "description": "0.25 cup",
+        "amount": 0.25,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": true
+    },
+    {
+      "fdcId": 172232,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Basil, fresh",
+      "category": "spice_herb",
+      "foodState": "raw",
+      "canonicalName": "basil, fresh",
+      "displayName": "Basil, fresh",
+      "aliases": [
+        "fresh basil",
+        "sweet basil",
+        "basil leaves"
+      ],
+      "foodGroup": "basil",
+      "defaultPortion": {
+        "description": "0.25 cup, leaves",
+        "amount": 0.25,
+        "unit": "cup",
+        "modifier": "cup leaves, whole"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173475,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Spearmint, fresh",
+      "category": "spice_herb",
+      "foodState": "raw",
+      "canonicalName": "mint, fresh",
+      "displayName": "Mint, fresh",
+      "aliases": [
+        "fresh mint",
+        "spearmint",
+        "mint leaves"
+      ],
+      "foodGroup": "mint",
+      "defaultPortion": {
+        "description": "2 tbsp",
+        "amount": 2,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172233,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Dill weed, fresh",
+      "category": "spice_herb",
+      "foodState": "raw",
+      "canonicalName": "dill, fresh",
+      "displayName": "Dill, fresh",
+      "aliases": [
+        "fresh dill",
+        "dill weed"
+      ],
+      "foodGroup": "dill",
+      "defaultPortion": {
+        "description": "5 sprigs",
+        "amount": 5,
+        "unit": "sprig",
+        "modifier": "sprigs"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171319,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Spices, chili powder",
+      "category": "spice_herb",
+      "foodState": "dry",
+      "canonicalName": "chili powder",
+      "displayName": "Chili powder",
+      "aliases": [
+        "chilli powder",
+        "chile powder"
+      ],
+      "foodGroup": "chili_spice",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170923,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Spices, cumin seed",
+      "category": "spice_herb",
+      "foodState": "dry",
+      "canonicalName": "ground cumin",
+      "displayName": "Ground cumin",
+      "aliases": [
+        "cumin",
+        "cumin seed",
+        "jeera"
+      ],
+      "foodGroup": "spice_other",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp, whole"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173468,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Salt, table",
+      "category": "spice_herb",
+      "foodState": "dry",
+      "canonicalName": "salt",
+      "displayName": "Salt",
+      "aliases": [
+        "table salt",
+        "sea salt",
+        "kosher salt"
+      ],
+      "foodGroup": "spice_other",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170931,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Spices, pepper, black",
+      "category": "spice_herb",
+      "foodState": "dry",
+      "canonicalName": "black pepper",
+      "displayName": "Black pepper",
+      "aliases": [
+        "pepper",
+        "ground black pepper",
+        "peppercorn"
+      ],
+      "foodGroup": "spice_other",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp, ground"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 171890,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beverages, coffee, brewed, prepared with tap water",
+      "category": "beverage",
+      "foodState": "prepared",
+      "canonicalName": "coffee, brewed",
+      "displayName": "Coffee, brewed",
+      "aliases": [
+        "coffee",
+        "black coffee",
+        "brewed coffee"
+      ],
+      "foodGroup": "coffee",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup (8 fl oz)"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173227,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beverages, tea, black, brewed, prepared with tap water",
+      "category": "beverage",
+      "foodState": "prepared",
+      "canonicalName": "tea, brewed",
+      "displayName": "Tea, brewed",
+      "aliases": [
+        "tea",
+        "black tea",
+        "brewed tea"
+      ],
+      "foodGroup": "tea",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup (8 fl oz)"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169098,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Orange juice, raw (Includes foods for USDA's Food Distribution Program)",
+      "category": "beverage",
+      "foodState": "as_purchased",
+      "canonicalName": "orange juice",
+      "displayName": "Orange juice",
+      "aliases": [
+        "oj",
+        "fresh orange juice",
+        "orange juce"
+      ],
+      "foodGroup": "juice",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173647,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Beverages, water, tap, drinking",
+      "category": "beverage",
+      "foodState": "as_purchased",
+      "canonicalName": "water",
+      "displayName": "Water",
+      "aliases": [
+        "tap water",
+        "drinking water",
+        "plain water"
+      ],
+      "foodGroup": "beverage_other",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "serving 8 fl oz"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169677,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Snacks, potato chips, plain, salted",
+      "category": "snack",
+      "foodState": "as_purchased",
+      "canonicalName": "potato chips",
+      "displayName": "Potato chips",
+      "aliases": [
+        "chips",
+        "crisps",
+        "potato crisps"
+      ],
+      "foodGroup": "potato_chip",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 167959,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Snacks, popcorn, air-popped",
+      "category": "snack",
+      "foodState": "prepared",
+      "canonicalName": "popcorn, air-popped",
+      "displayName": "Popcorn, air-popped",
+      "aliases": [
+        "popcorn",
+        "air popped popcorn"
+      ],
+      "foodGroup": "popcorn",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 167542,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Snacks, granola bars, hard, plain",
+      "category": "snack",
+      "foodState": "as_purchased",
+      "canonicalName": "granola bar",
+      "displayName": "Granola bar",
+      "aliases": [
+        "granola bars",
+        "cereal bar",
+        "muesli bar"
+      ],
+      "foodGroup": "snack_bar",
+      "defaultPortion": {
+        "description": "1 bar",
+        "amount": 1,
+        "unit": "bar",
+        "modifier": "bar"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 167555,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Snacks, pretzels, hard, plain, salted",
+      "category": "snack",
+      "foodState": "as_purchased",
+      "canonicalName": "pretzels",
+      "displayName": "Pretzels",
+      "aliases": [
+        "pretzel",
+        "hard pretzels"
+      ],
+      "foodGroup": "snack_other",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 170273,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Chocolate, dark, 70-85% cacao solids",
+      "category": "sweet",
+      "foodState": "as_purchased",
+      "canonicalName": "dark chocolate, 70-85%",
+      "displayName": "Dark chocolate, 70-85%",
+      "aliases": [
+        "dark chocolate",
+        "chocolate",
+        "plain chocolate"
+      ],
+      "foodGroup": "chocolate",
+      "defaultPortion": {
+        "description": "1 oz",
+        "amount": 1,
+        "unit": "oz",
+        "modifier": "oz"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 167989,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Candies, gumdrops, starch jelly pieces",
+      "category": "sweet",
+      "foodState": "as_purchased",
+      "canonicalName": "gumdrops",
+      "displayName": "Gumdrops",
+      "aliases": [
+        "gummy candy",
+        "gum drops",
+        "jelly candy"
+      ],
+      "foodGroup": "candy",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup gumdrops"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169655,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Sugars, granulated",
+      "category": "sweet",
+      "foodState": "dry",
+      "canonicalName": "granulated sugar",
+      "displayName": "Granulated sugar",
+      "aliases": [
+        "sugar",
+        "white sugar",
+        "table sugar",
+        "caster sugar"
+      ],
+      "foodGroup": "sweetener",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169640,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Honey",
+      "category": "sweet",
+      "foodState": "as_purchased",
+      "canonicalName": "honey",
+      "displayName": "Honey",
+      "aliases": [
+        "raw honey",
+        "runny honey"
+      ],
+      "foodGroup": "sweetener",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169661,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Syrups, maple",
+      "category": "sweet",
+      "foodState": "as_purchased",
+      "canonicalName": "maple syrup",
+      "displayName": "Maple syrup",
+      "aliases": [
+        "pure maple syrup",
+        "maple sirup"
+      ],
+      "foodGroup": "sweet_other",
+      "defaultPortion": {
+        "description": "1 tbsp",
+        "amount": 1,
+        "unit": "tbsp",
+        "modifier": "tbsp"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2706967,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Ham sandwich on wheat, with cheese",
+      "category": "prepared_meal",
+      "foodState": "prepared",
+      "canonicalName": "ham and cheese sandwich",
+      "displayName": "Ham and cheese sandwich",
+      "aliases": [
+        "ham sandwich",
+        "cheese and ham sandwich"
+      ],
+      "foodGroup": "sandwich",
+      "defaultPortion": {
+        "description": "1 sandwich",
+        "amount": 1,
+        "unit": "sandwich",
+        "portionDescription": "regular"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2708549,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Burrito, with beans and rice, cheese",
+      "category": "prepared_meal",
+      "foodState": "prepared",
+      "canonicalName": "bean and rice burrito",
+      "displayName": "Bean and rice burrito",
+      "aliases": [
+        "burrito",
+        "bean burrito",
+        "rice and bean wrap"
+      ],
+      "foodGroup": "wrap",
+      "defaultPortion": {
+        "description": "1 burrito",
+        "amount": 1,
+        "unit": "burrito",
+        "portionDescription": "small/regular"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2708618,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Pizza, cheese, stuffed crust",
+      "category": "prepared_meal",
+      "foodState": "prepared",
+      "canonicalName": "cheese pizza, stuffed crust",
+      "displayName": "Cheese pizza, stuffed crust",
+      "aliases": [
+        "pizza",
+        "cheese pizza slice",
+        "margherita pizza"
+      ],
+      "foodGroup": "pizza",
+      "defaultPortion": {
+        "description": "1 slice",
+        "amount": 1,
+        "unit": "slice",
+        "portionDescription": "piece, medium pizza"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2708831,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Pasta with tomato-based sauce, home recipe",
+      "category": "prepared_meal",
+      "foodState": "prepared",
+      "canonicalName": "pasta with tomato sauce",
+      "displayName": "Pasta with tomato sauce",
+      "aliases": [
+        "spaghetti with tomato sauce",
+        "spaghetti marinara",
+        "spagetti with tomato sauce"
+      ],
+      "foodGroup": "pasta_dish",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "portionDescription": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172909,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Soup, chicken noodle, canned, prepared with equal volume water",
+      "category": "prepared_meal",
+      "foodState": "prepared",
+      "canonicalName": "chicken noodle soup",
+      "displayName": "Chicken noodle soup",
+      "aliases": [
+        "chicken soup",
+        "noodle soup"
+      ],
+      "foodGroup": "soup",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "serving 1 cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2709823,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Lettuce, salad with assorted vegetables excluding tomatoes and carrots, no dressing",
+      "category": "prepared_meal",
+      "foodState": "prepared",
+      "canonicalName": "lettuce salad with vegetables",
+      "displayName": "Lettuce salad with vegetables",
+      "aliases": [
+        "green salad",
+        "mixed salad",
+        "side salad"
+      ],
+      "foodGroup": "salad_dish",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "portionDescription": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2708811,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Macaroni or noodles with cheese",
+      "category": "prepared_meal",
+      "foodState": "prepared",
+      "canonicalName": "macaroni and cheese",
+      "displayName": "Macaroni and cheese",
+      "aliases": [
+        "mac and cheese",
+        "macaroni cheese"
+      ],
+      "foodGroup": "prepared_dish_other",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "portionDescription": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2710725,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Nutritional drink or shake, ready-to-drink, NFS",
+      "category": "other",
+      "foodState": "as_purchased",
+      "canonicalName": "meal replacement shake",
+      "displayName": "Meal replacement shake",
+      "aliases": [
+        "nutrition shake",
+        "meal shake"
+      ],
+      "foodGroup": "meal_replacement",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "portionDescription": "cup"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 2710742,
+      "usdaDataType": "Survey (FNDDS)",
+      "expectedUsdaDescription": "Nutritional powder mix, whey based, NFS",
+      "category": "other",
+      "foodState": "dry",
+      "canonicalName": "whey protein powder",
+      "displayName": "Whey protein powder",
+      "aliases": [
+        "protein powder",
+        "whey protein",
+        "protein supplement"
+      ],
+      "foodGroup": "nutritional_supplement",
+      "defaultPortion": {
+        "description": "1 scoop",
+        "amount": 1,
+        "unit": "scoop",
+        "portionDescription": "scoop, NFS"
+      },
+      "costClass": 3,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 172804,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Leavening agents, baking powder, double-acting, straight phosphate",
+      "category": "other",
+      "foodState": "dry",
+      "canonicalName": "baking powder",
+      "displayName": "Baking powder",
+      "aliases": [
+        "leavening agent",
+        "raising agent"
+      ],
+      "foodGroup": "food_ingredient_other",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 169698,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Cornstarch",
+      "category": "other",
+      "foodState": "dry",
+      "canonicalName": "cornstarch",
+      "displayName": "Cornstarch",
+      "aliases": [
+        "corn starch",
+        "cornflour"
+      ],
+      "foodGroup": "food_ingredient_other",
+      "defaultPortion": {
+        "description": "1 cup",
+        "amount": 1,
+        "unit": "cup",
+        "modifier": "cup"
+      },
+      "costClass": 1,
+      "isCommonDislike": false
+    },
+    {
+      "fdcId": 173471,
+      "usdaDataType": "SR Legacy",
+      "expectedUsdaDescription": "Vanilla extract",
+      "category": "other",
+      "foodState": "as_purchased",
+      "canonicalName": "vanilla extract",
+      "displayName": "Vanilla extract",
+      "aliases": [
+        "vanilla",
+        "vanilla essence"
+      ],
+      "foodGroup": "food_ingredient_other",
+      "defaultPortion": {
+        "description": "1 tsp",
+        "amount": 1,
+        "unit": "tsp",
+        "modifier": "tsp"
+      },
+      "costClass": 2,
+      "isCommonDislike": false
+    }
+  ],
+  "sweepClassificationRules": {
+    "appliesTo": "the USDA description, lower-cased",
+    "matching": "Each rule carries exactly one of descriptionStartsWith or descriptionContains, and matches when any of its strings matches. Rules are evaluated in array order and the first match wins, so order is load-bearing: composite-dish rules precede ingredient rules because an as-eaten description names its ingredients, spice rules precede produce rules so \"spices, onion powder\" is not an onion, oil and plant-milk rules precede nut and dairy rules so \"oil, coconut\" is not a coconut, and snack rules precede produce rules so \"snacks, potato chips\" is not a potato.",
+    "deterministic": "Classification is a pure function of the description and this table. No model call is made anywhere in this import, and no rule consults nutrition values.",
+    "rules": [
+      {
+        "descriptionContains": [
+          "sandwich",
+          "sub, ",
+          "hoagie",
+          "panini",
+          "cheeseburger",
+          "hamburger, on bun"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "sandwich"
+      },
+      {
+        "descriptionContains": [
+          "burrito",
+          "wrap, ",
+          "taco",
+          "quesadilla",
+          "gyro",
+          "shawarma",
+          "enchilada"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "wrap"
+      },
+      {
+        "descriptionContains": [
+          "pizza"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "pizza"
+      },
+      {
+        "descriptionContains": [
+          "pasta with",
+          "spaghetti with",
+          "macaroni or noodles with",
+          "lasagna",
+          "ravioli",
+          "tortellini",
+          "manicotti",
+          "stuffed shells",
+          "noodle casserole"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "pasta_dish"
+      },
+      {
+        "descriptionStartsWith": [
+          "soup,"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "soup"
+      },
+      {
+        "descriptionContains": [
+          "soup",
+          "chowder",
+          "bisque"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "soup"
+      },
+      {
+        "descriptionContains": [
+          "salad with",
+          "garden salad",
+          "coleslaw",
+          "potato salad",
+          "chicken salad",
+          "tuna salad",
+          "egg salad",
+          "pasta salad",
+          "lettuce, salad"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "salad_dish"
+      },
+      {
+        "descriptionContains": [
+          "casserole",
+          "stew",
+          "chili con carne",
+          "curry",
+          "stir fry",
+          "fried rice",
+          "risotto",
+          "paella",
+          "pot pie",
+          "meatloaf",
+          "shepherd",
+          "omelet",
+          "frittata",
+          "quiche",
+          "stuffed pepper",
+          "dumpling",
+          "sushi",
+          "hash, "
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "prepared_dish_other"
+      },
+      {
+        "descriptionContains": [
+          "cilantro",
+          "coriander (cilantro)",
+          "coriander leaf"
+        ],
+        "category": "spice_herb",
+        "foodGroup": "cilantro"
+      },
+      {
+        "descriptionContains": [
+          "basil"
+        ],
+        "category": "spice_herb",
+        "foodGroup": "basil"
+      },
+      {
+        "descriptionContains": [
+          "spearmint",
+          "peppermint",
+          "mint, fresh"
+        ],
+        "category": "spice_herb",
+        "foodGroup": "mint"
+      },
+      {
+        "descriptionContains": [
+          "dill weed",
+          "dill seed"
+        ],
+        "category": "spice_herb",
+        "foodGroup": "dill"
+      },
+      {
+        "descriptionContains": [
+          "chili powder",
+          "chile powder",
+          "paprika",
+          "cayenne",
+          "crushed red pepper"
+        ],
+        "category": "spice_herb",
+        "foodGroup": "chili_spice"
+      },
+      {
+        "descriptionStartsWith": [
+          "spices,",
+          "herbs,",
+          "salt, table",
+          "salt, kosher",
+          "seasoning"
+        ],
+        "category": "spice_herb",
+        "foodGroup": "spice_other"
+      },
+      {
+        "descriptionStartsWith": [
+          "oil, olive"
+        ],
+        "category": "oil_fat",
+        "foodGroup": "olive_oil"
+      },
+      {
+        "descriptionStartsWith": [
+          "oil, coconut"
+        ],
+        "category": "oil_fat",
+        "foodGroup": "coconut_oil"
+      },
+      {
+        "descriptionContains": [
+          "lard",
+          "tallow",
+          "duck fat",
+          "chicken fat",
+          "fat, beef",
+          "fat, pork"
+        ],
+        "category": "oil_fat",
+        "foodGroup": "animal_fat"
+      },
+      {
+        "descriptionStartsWith": [
+          "oil,",
+          "margarine",
+          "shortening"
+        ],
+        "category": "oil_fat",
+        "foodGroup": "vegetable_oil"
+      },
+      {
+        "descriptionContains": [
+          "soymilk",
+          "soy milk"
+        ],
+        "category": "dairy_alternative",
+        "foodGroup": "soy_milk"
+      },
+      {
+        "descriptionContains": [
+          "almond milk",
+          "cashew milk",
+          "nut milk"
+        ],
+        "category": "dairy_alternative",
+        "foodGroup": "nut_milk"
+      },
+      {
+        "descriptionContains": [
+          "coconut milk",
+          "coconut cream"
+        ],
+        "category": "dairy_alternative",
+        "foodGroup": "coconut_milk"
+      },
+      {
+        "descriptionContains": [
+          "oat milk",
+          "rice milk",
+          "hemp milk",
+          "pea milk"
+        ],
+        "category": "dairy_alternative",
+        "foodGroup": "plant_dairy_other"
+      },
+      {
+        "descriptionContains": [
+          "blue cheese",
+          "cheese, blue",
+          "gorgonzola",
+          "roquefort",
+          "stilton"
+        ],
+        "category": "dairy",
+        "foodGroup": "blue_cheese"
+      },
+      {
+        "descriptionContains": [
+          "cream cheese"
+        ],
+        "category": "dairy",
+        "foodGroup": "cheese"
+      },
+      {
+        "descriptionStartsWith": [
+          "cheese,",
+          "cheese spread"
+        ],
+        "category": "dairy",
+        "foodGroup": "cheese"
+      },
+      {
+        "descriptionStartsWith": [
+          "yogurt,"
+        ],
+        "category": "dairy",
+        "foodGroup": "yogurt"
+      },
+      {
+        "descriptionStartsWith": [
+          "butter,",
+          "butter "
+        ],
+        "category": "dairy",
+        "foodGroup": "butter"
+      },
+      {
+        "descriptionStartsWith": [
+          "cream,",
+          "sour cream",
+          "whipped cream"
+        ],
+        "category": "dairy",
+        "foodGroup": "cream"
+      },
+      {
+        "descriptionStartsWith": [
+          "milk,",
+          "milk shake",
+          "dry milk",
+          "buttermilk"
+        ],
+        "category": "dairy",
+        "foodGroup": "milk"
+      },
+      {
+        "descriptionStartsWith": [
+          "egg substitute",
+          "egg mix",
+          "egg, dried"
+        ],
+        "category": "protein_egg",
+        "foodGroup": "egg_product"
+      },
+      {
+        "descriptionStartsWith": [
+          "egg, ",
+          "eggs, ",
+          "egg white",
+          "egg yolk"
+        ],
+        "category": "protein_egg",
+        "foodGroup": "chicken_egg"
+      },
+      {
+        "descriptionContains": [
+          "salmon"
+        ],
+        "category": "protein_seafood",
+        "foodGroup": "salmon"
+      },
+      {
+        "descriptionContains": [
+          "tuna"
+        ],
+        "category": "protein_seafood",
+        "foodGroup": "tuna"
+      },
+      {
+        "descriptionContains": [
+          "anchovy",
+          "anchovies"
+        ],
+        "category": "protein_seafood",
+        "foodGroup": "anchovy"
+      },
+      {
+        "descriptionContains": [
+          "shrimp",
+          "prawn",
+          "crab",
+          "lobster",
+          "crayfish",
+          "crustaceans"
+        ],
+        "category": "protein_seafood",
+        "foodGroup": "crustacean"
+      },
+      {
+        "descriptionContains": [
+          "mussel",
+          "clam",
+          "oyster",
+          "scallop",
+          "squid",
+          "octopus",
+          "mollusks",
+          "snail"
+        ],
+        "category": "protein_seafood",
+        "foodGroup": "mollusk"
+      },
+      {
+        "descriptionContains": [
+          "cod",
+          "haddock",
+          "tilapia",
+          "pollock",
+          "halibut",
+          "sole,",
+          "flounder",
+          "sea bass",
+          "snapper",
+          "catfish",
+          "whiting",
+          "mahi"
+        ],
+        "category": "protein_seafood",
+        "foodGroup": "white_fish"
+      },
+      {
+        "descriptionStartsWith": [
+          "fish,"
+        ],
+        "category": "protein_seafood",
+        "foodGroup": "seafood_other"
+      },
+      {
+        "descriptionContains": [
+          "turkey bacon",
+          "turkey sausage",
+          "turkey ham",
+          "chicken sausage",
+          "chicken nugget",
+          "chicken patty",
+          "chicken frankfurter"
+        ],
+        "category": "protein_poultry",
+        "foodGroup": "processed_poultry"
+      },
+      {
+        "descriptionContains": [
+          "pheasant",
+          "quail",
+          "goose",
+          "guinea hen",
+          "emu",
+          "ostrich"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "game_meat"
+      },
+      {
+        "descriptionContains": [
+          "duck"
+        ],
+        "category": "protein_poultry",
+        "foodGroup": "duck"
+      },
+      {
+        "descriptionStartsWith": [
+          "chicken,"
+        ],
+        "category": "protein_poultry",
+        "foodGroup": "chicken"
+      },
+      {
+        "descriptionStartsWith": [
+          "turkey,",
+          "turkey breast"
+        ],
+        "category": "protein_poultry",
+        "foodGroup": "turkey"
+      },
+      {
+        "descriptionContains": [
+          "liver",
+          "tripe",
+          "tongue",
+          "gizzard",
+          "sweetbread",
+          "oxtail",
+          "heart, raw",
+          "variety meats"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "organ_meat"
+      },
+      {
+        "descriptionContains": [
+          "bacon",
+          "ham,",
+          "prosciutto",
+          "salami",
+          "pepperoni",
+          "sausage",
+          "hot dog",
+          "frankfurter",
+          "pastrami",
+          "corned beef",
+          "jerky",
+          "chorizo",
+          "bologna"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "cured_meat"
+      },
+      {
+        "descriptionContains": [
+          "bison",
+          "venison",
+          "elk",
+          "rabbit",
+          "boar",
+          "game meat"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "game_meat"
+      },
+      {
+        "descriptionStartsWith": [
+          "beef,",
+          "veal,"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "beef"
+      },
+      {
+        "descriptionStartsWith": [
+          "pork,"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "pork"
+      },
+      {
+        "descriptionStartsWith": [
+          "lamb,"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "lamb"
+      },
+      {
+        "descriptionStartsWith": [
+          "tofu"
+        ],
+        "category": "protein_plant",
+        "foodGroup": "tofu"
+      },
+      {
+        "descriptionStartsWith": [
+          "tempeh"
+        ],
+        "category": "protein_plant",
+        "foodGroup": "tempeh"
+      },
+      {
+        "descriptionContains": [
+          "seitan",
+          "wheat gluten"
+        ],
+        "category": "protein_plant",
+        "foodGroup": "seitan"
+      },
+      {
+        "descriptionContains": [
+          "meat substitute",
+          "meatless",
+          "veggie burger",
+          "plant-based meat",
+          "vegetarian patty"
+        ],
+        "category": "protein_plant",
+        "foodGroup": "plant_based_meat"
+      },
+      {
+        "descriptionStartsWith": [
+          "lentils"
+        ],
+        "category": "legume",
+        "foodGroup": "lentil"
+      },
+      {
+        "descriptionContains": [
+          "chickpeas",
+          "garbanzo"
+        ],
+        "category": "legume",
+        "foodGroup": "chickpea"
+      },
+      {
+        "descriptionStartsWith": [
+          "beans, black"
+        ],
+        "category": "legume",
+        "foodGroup": "black_bean"
+      },
+      {
+        "descriptionContains": [
+          "soybeans",
+          "edamame"
+        ],
+        "category": "legume",
+        "foodGroup": "soybean"
+      },
+      {
+        "descriptionStartsWith": [
+          "beans,",
+          "peas, split",
+          "cowpeas",
+          "lupins",
+          "fava"
+        ],
+        "category": "legume",
+        "foodGroup": "bean_other"
+      },
+      {
+        "descriptionStartsWith": [
+          "peanuts",
+          "peanut butter"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "peanut"
+      },
+      {
+        "descriptionContains": [
+          "almond"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "almond"
+      },
+      {
+        "descriptionContains": [
+          "cashew"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "cashew"
+      },
+      {
+        "descriptionContains": [
+          "walnut"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "walnut"
+      },
+      {
+        "descriptionContains": [
+          "coconut"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "coconut"
+      },
+      {
+        "descriptionContains": [
+          "sesame",
+          "tahini"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "sesame"
+      },
+      {
+        "descriptionContains": [
+          "sunflower seed"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "sunflower_seed"
+      },
+      {
+        "descriptionStartsWith": [
+          "nuts,",
+          "seeds,"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "nut_other"
+      },
+      {
+        "descriptionStartsWith": [
+          "rice,"
+        ],
+        "category": "grain",
+        "foodGroup": "rice"
+      },
+      {
+        "descriptionStartsWith": [
+          "pasta",
+          "macaroni,",
+          "noodles,"
+        ],
+        "category": "grain",
+        "foodGroup": "pasta"
+      },
+      {
+        "descriptionStartsWith": [
+          "oats",
+          "oatmeal",
+          "cereals, oats"
+        ],
+        "category": "grain",
+        "foodGroup": "oat"
+      },
+      {
+        "descriptionStartsWith": [
+          "quinoa"
+        ],
+        "category": "grain",
+        "foodGroup": "quinoa"
+      },
+      {
+        "descriptionStartsWith": [
+          "bulgur",
+          "wheat flour",
+          "wheat, ",
+          "couscous",
+          "farro",
+          "spelt"
+        ],
+        "category": "grain",
+        "foodGroup": "wheat_grain"
+      },
+      {
+        "descriptionStartsWith": [
+          "barley",
+          "cornmeal",
+          "millet",
+          "buckwheat",
+          "amaranth",
+          "sorghum",
+          "rye,",
+          "corn flour",
+          "polenta",
+          "grits",
+          "cereals"
+        ],
+        "category": "grain",
+        "foodGroup": "grain_other"
+      },
+      {
+        "descriptionContains": [
+          "pita",
+          "naan",
+          "lavash",
+          "flatbread",
+          "chapati",
+          "roti"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "flatbread"
+      },
+      {
+        "descriptionContains": [
+          "tortilla"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "tortilla"
+      },
+      {
+        "descriptionStartsWith": [
+          "crackers"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "cracker"
+      },
+      {
+        "descriptionStartsWith": [
+          "croissants",
+          "danish",
+          "muffins",
+          "doughnuts",
+          "pie crust",
+          "puff pastry",
+          "cake,",
+          "cookies",
+          "brownies",
+          "pastry",
+          "scone"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "pastry"
+      },
+      {
+        "descriptionStartsWith": [
+          "bread,",
+          "rolls,",
+          "bagel",
+          "english muffin",
+          "biscuits",
+          "buns"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "bread_leavened"
+      },
+      {
+        "descriptionContains": [
+          "potato chips",
+          "tortilla chips",
+          "corn chips"
+        ],
+        "category": "snack",
+        "foodGroup": "potato_chip"
+      },
+      {
+        "descriptionContains": [
+          "popcorn"
+        ],
+        "category": "snack",
+        "foodGroup": "popcorn"
+      },
+      {
+        "descriptionContains": [
+          "granola bar",
+          "energy bar",
+          "protein bar",
+          "cereal bar"
+        ],
+        "category": "snack",
+        "foodGroup": "snack_bar"
+      },
+      {
+        "descriptionStartsWith": [
+          "snacks,"
+        ],
+        "category": "snack",
+        "foodGroup": "snack_other"
+      },
+      {
+        "descriptionContains": [
+          "chocolate"
+        ],
+        "category": "sweet",
+        "foodGroup": "chocolate"
+      },
+      {
+        "descriptionContains": [
+          "candies",
+          "gumdrop",
+          "licorice",
+          "marshmallow",
+          "caramel"
+        ],
+        "category": "sweet",
+        "foodGroup": "candy"
+      },
+      {
+        "descriptionStartsWith": [
+          "sugars",
+          "syrups",
+          "honey",
+          "molasses",
+          "sweetener"
+        ],
+        "category": "sweet",
+        "foodGroup": "sweetener"
+      },
+      {
+        "descriptionContains": [
+          "stevia",
+          "aspartame",
+          "sucralose",
+          "agave"
+        ],
+        "category": "sweet",
+        "foodGroup": "sweetener"
+      },
+      {
+        "descriptionStartsWith": [
+          "ice cream",
+          "frozen dessert",
+          "pudding",
+          "gelatin dessert",
+          "jam",
+          "jelly",
+          "preserves",
+          "frosting",
+          "pie,",
+          "whipped topping"
+        ],
+        "category": "sweet",
+        "foodGroup": "sweet_other"
+      },
+      {
+        "descriptionContains": [
+          "mayonnaise",
+          "aioli"
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "mayonnaise"
+      },
+      {
+        "descriptionStartsWith": [
+          "mustard,"
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "mustard"
+      },
+      {
+        "descriptionContains": [
+          "hot sauce",
+          "sriracha",
+          "hot chile",
+          "chili garlic sauce"
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "hot_sauce"
+      },
+      {
+        "descriptionContains": [
+          "soy sauce",
+          "shoyu",
+          "tamari"
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "soy_sauce"
+      },
+      {
+        "descriptionStartsWith": [
+          "vinegar"
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "vinegar"
+      },
+      {
+        "descriptionStartsWith": [
+          "salad dressing"
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "salad_dressing"
+      },
+      {
+        "descriptionStartsWith": [
+          "sauce,",
+          "gravy",
+          "ketchup",
+          "catsup",
+          "relish",
+          "salsa",
+          "hummus",
+          "guacamole",
+          "dip,",
+          "horseradish",
+          "pesto",
+          "barbecue sauce",
+          "teriyaki"
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "condiment_other"
+      },
+      {
+        "descriptionContains": [
+          "mushroom"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "mushroom"
+      },
+      {
+        "descriptionContains": [
+          "onion",
+          "shallot",
+          "scallion",
+          "leek",
+          "chive"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "onion"
+      },
+      {
+        "descriptionStartsWith": [
+          "garlic"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "garlic"
+      },
+      {
+        "descriptionContains": [
+          "tomato"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "tomato"
+      },
+      {
+        "descriptionStartsWith": [
+          "peppers, sweet",
+          "peppers, bell"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "bell_pepper"
+      },
+      {
+        "descriptionContains": [
+          "chili pepper",
+          "jalapeno",
+          "habanero",
+          "serrano",
+          "peppers, hot"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "chili_pepper"
+      },
+      {
+        "descriptionStartsWith": [
+          "broccoli"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "broccoli"
+      },
+      {
+        "descriptionStartsWith": [
+          "cauliflower"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "cauliflower"
+      },
+      {
+        "descriptionContains": [
+          "cabbage",
+          "sauerkraut",
+          "bok choy",
+          "kimchi"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "cabbage"
+      },
+      {
+        "descriptionContains": [
+          "spinach",
+          "kale",
+          "lettuce",
+          "arugula",
+          "chard",
+          "collards",
+          "mustard greens",
+          "turnip greens",
+          "watercress",
+          "endive",
+          "radicchio"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "leafy_green"
+      },
+      {
+        "descriptionContains": [
+          "carrot"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "carrot"
+      },
+      {
+        "descriptionContains": [
+          "sweet potato",
+          "sweetpotato",
+          "yams",
+          "turnips",
+          "parsnips",
+          "beets",
+          "radishes",
+          "rutabagas",
+          "celeriac",
+          "jicama"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "root_vegetable"
+      },
+      {
+        "descriptionContains": [
+          "potato"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "potato"
+      },
+      {
+        "descriptionContains": [
+          "squash",
+          "pumpkin",
+          "zucchini",
+          "courgette"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "squash"
+      },
+      {
+        "descriptionStartsWith": [
+          "celery"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "celery"
+      },
+      {
+        "descriptionStartsWith": [
+          "eggplant"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "eggplant"
+      },
+      {
+        "descriptionContains": [
+          "olives",
+          "olive, ripe"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "olive"
+      },
+      {
+        "descriptionStartsWith": [
+          "cucumber",
+          "asparagus",
+          "green beans",
+          "peas, green",
+          "corn, sweet",
+          "artichokes",
+          "brussels sprouts",
+          "okra",
+          "sprouts",
+          "seaweed",
+          "pickles",
+          "peppers,"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "vegetable_other"
+      },
+      {
+        "descriptionContains": [
+          "pineapple",
+          "mango",
+          "papaya",
+          "guava",
+          "kiwi",
+          "passion fruit",
+          "lychee",
+          "dragon fruit",
+          "starfruit"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "tropical_fruit"
+      },
+      {
+        "descriptionContains": [
+          "raisins",
+          "dried fruit",
+          "prunes",
+          "dried apricot",
+          "dried cranberr",
+          "figs, dried",
+          "dates,"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "dried_fruit"
+      },
+      {
+        "descriptionContains": [
+          "apple",
+          "applesauce"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "apple"
+      },
+      {
+        "descriptionContains": [
+          "banana",
+          "plantain"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "banana"
+      },
+      {
+        "descriptionContains": [
+          "orange",
+          "lime",
+          "lemon",
+          "grapefruit",
+          "tangerine",
+          "clementine",
+          "mandarin",
+          "citrus"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "citrus"
+      },
+      {
+        "descriptionContains": [
+          "strawberr",
+          "blueberr",
+          "raspberr",
+          "blackberr",
+          "cranberr",
+          "currant",
+          "boysenberr",
+          "berries"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "berry"
+      },
+      {
+        "descriptionContains": [
+          "peach",
+          "plum",
+          "cherr",
+          "apricot",
+          "nectarine"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "stone_fruit"
+      },
+      {
+        "descriptionContains": [
+          "avocado"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "avocado"
+      },
+      {
+        "descriptionStartsWith": [
+          "grapes",
+          "pears",
+          "melons",
+          "watermelon",
+          "cantaloupe",
+          "honeydew",
+          "pomegranate",
+          "persimmon",
+          "rhubarb",
+          "figs"
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "fruit_other"
+      },
+      {
+        "descriptionContains": [
+          "coffee",
+          "espresso"
+        ],
+        "category": "beverage",
+        "foodGroup": "coffee"
+      },
+      {
+        "descriptionContains": [
+          "tea, ",
+          "tea brewed",
+          "matcha"
+        ],
+        "category": "beverage",
+        "foodGroup": "tea"
+      },
+      {
+        "descriptionContains": [
+          "juice"
+        ],
+        "category": "beverage",
+        "foodGroup": "juice"
+      },
+      {
+        "descriptionStartsWith": [
+          "beverages,",
+          "water,",
+          "alcoholic beverage",
+          "carbonated"
+        ],
+        "category": "beverage",
+        "foodGroup": "beverage_other"
+      },
+      {
+        "descriptionContains": [
+          "meal replacement",
+          "nutritional drink",
+          "nutritional shake",
+          "instant breakfast"
+        ],
+        "category": "other",
+        "foodGroup": "meal_replacement"
+      },
+      {
+        "descriptionContains": [
+          "protein powder",
+          "nutritional powder",
+          "whey protein",
+          "supplement",
+          "vitamin"
+        ],
+        "category": "other",
+        "foodGroup": "nutritional_supplement"
+      },
+      {
+        "descriptionStartsWith": [
+          "leavening agents",
+          "cornstarch",
+          "vanilla extract",
+          "yeast",
+          "gelatin,",
+          "baking",
+          "food starch",
+          "salt substitute"
+        ],
+        "category": "other",
+        "foodGroup": "food_ingredient_other"
+      }
+    ],
+    "fallback": {
+      "category": "other",
+      "foodGroup": "food_ingredient_other",
+      "requiresCuratorReview": true,
+      "reason": "A record that matches no rule is imported as a candidate and left unpublished pending a curator, rather than being published under a guessed category. Publishing an unclassified food would put it in the wrong grocery aisle and make it invisible to the dislike exclusions."
+    }
+  },
+  "sweepFoodStateRules": {
+    "appliesTo": "the USDA description, lower-cased",
+    "matching": "First match wins, as above.",
+    "rules": [
+      {
+        "descriptionContains": [
+          "cooked",
+          "boiled",
+          "roasted",
+          "baked",
+          "grilled",
+          "broiled",
+          "steamed",
+          "braised",
+          "fried",
+          "toasted"
+        ],
+        "foodState": "cooked"
+      },
+      {
+        "descriptionContains": [
+          "raw",
+          "unprepared"
+        ],
+        "foodState": "raw"
+      },
+      {
+        "descriptionContains": [
+          "dried",
+          "dehydrated",
+          "uncooked",
+          "powder",
+          ", dry"
+        ],
+        "foodState": "dry"
+      },
+      {
+        "descriptionContains": [
+          "canned",
+          "ready-to-eat",
+          "ready to serve",
+          "ready-to-serve",
+          "prepared with",
+          "frozen entree"
+        ],
+        "foodState": "prepared"
+      }
+    ],
+    "datasetFallback": [
+      {
+        "dataType": "Survey (FNDDS)",
+        "foodState": "prepared"
+      },
+      {
+        "dataType": "SR Legacy",
+        "foodState": "as_purchased"
+      },
+      {
+        "dataType": "Foundation",
+        "foodState": "as_purchased"
+      }
+    ],
+    "fallbackReason": "Survey (FNDDS) descriptions are as-eaten, so an unmatched FNDDS record is prepared; the reference datasets describe the food as bought, so an unmatched record there is as_purchased. The state is never guessed from nutrition, and raw, dry and cooked forms stay separate rows because grocery aggregation keys on (catalog_food_id, food_state) and must never merge them."
+  },
+  "sweepAliasPolicy": "A swept record's aliases are derived from its own description only: the comma-separated qualifiers reordered into natural order (\"Rice, brown, long-grain, raw\" yields \"brown rice\"), plus the plural of the head noun. The sweep invents no synonym, regional name or misspelling — those are curation decisions and exist only on the foods entries above.",
+  "sweepPageBounds": "Each sweep's observedLastNonEmptyPage and observedApproximateRecordCount were measured against GET /foods/list at pageSize 200 on observedOn, by binary-searching the last page that still returned a non-empty array. maxPages is a backstop bound and not that measurement: it sits above the observed count so a dataset that grows between authoring and import is not silently truncated, while an enumeration that never returns an empty page still terminates. The real stopping conditions are an empty page and stopWhenCategoryCandidateVolumeReached; maxPages only caps a runaway.",
+  "genericDatasetVolume": {
+    "measuredOn": "2026-09-12",
+    "foundation": 394,
+    "srLegacy": 7793,
+    "survey": 5432,
+    "total": 13619,
+    "coveragePlanCandidateVolumeTotal": 13765,
+    "consequence": "The three generic datasets hold about 13,619 records in total, which is below the coverage plan's candidateVolumeTotal, so this import cannot by itself reach the candidate volume however completely it sweeps — and a per-category ceiling binds sooner still, because these records are not distributed the way the plan's categories are. The gap is what catalog-generate-ai.ts fills (aiCandidates = max(0, candidateVolume - usdaCandidates) per category), and any remaining shortfall is reported exactly by catalog-report.ts rather than padded. Recorded as a measurement so the arithmetic downstream starts from an observed number instead of an assumed one."
+  },
+  "datasetSweeps": [
+    {
+      "sweepKey": "foundation-reference-foods",
+      "dataType": "Foundation",
+      "listEndpoint": "/foods/list",
+      "pageSize": 200,
+      "maxPages": 8,
+      "observedLastNonEmptyPage": 2,
+      "observedApproximateRecordCount": 394,
+      "observedOn": "2026-09-12",
+      "detailFetch": {
+        "endpoint": "/foods",
+        "method": "POST",
+        "batchSize": 20
+      },
+      "classificationRules": "sweepClassificationRules",
+      "foodStateRules": "sweepFoodStateRules",
+      "skipFdcIdsPresentInFoods": true,
+      "stopWhenCategoryCandidateVolumeReached": true,
+      "note": "Foundation records are the newest analytically measured reference foods and are swept first so that, where the same food exists in both, the Foundation measurement is the one already present when the SR Legacy sweep reaches it."
+    },
+    {
+      "sweepKey": "sr-legacy-reference-foods",
+      "dataType": "SR Legacy",
+      "listEndpoint": "/foods/list",
+      "pageSize": 200,
+      "maxPages": 50,
+      "observedLastNonEmptyPage": 39,
+      "observedApproximateRecordCount": 7793,
+      "observedOn": "2026-09-12",
+      "detailFetch": {
+        "endpoint": "/foods",
+        "method": "POST",
+        "batchSize": 20
+      },
+      "classificationRules": "sweepClassificationRules",
+      "foodStateRules": "sweepFoodStateRules",
+      "skipFdcIdsPresentInFoods": true,
+      "stopWhenCategoryCandidateVolumeReached": true,
+      "note": "SR Legacy is the bulk of the single-ingredient coverage and the richest source of household portions, which is why most curated entries above resolve to it."
+    },
+    {
+      "sweepKey": "fndds-survey-foods",
+      "dataType": "Survey (FNDDS)",
+      "listEndpoint": "/foods/list",
+      "pageSize": 200,
+      "maxPages": 40,
+      "observedLastNonEmptyPage": 28,
+      "observedApproximateRecordCount": 5432,
+      "observedOn": "2026-09-12",
+      "detailFetch": {
+        "endpoint": "/foods",
+        "method": "POST",
+        "batchSize": 20
+      },
+      "classificationRules": "sweepClassificationRules",
+      "foodStateRules": "sweepFoodStateRules",
+      "skipFdcIdsPresentInFoods": true,
+      "stopWhenCategoryCandidateVolumeReached": true,
+      "note": "Survey (FNDDS) supplies the as-eaten preparations and composite dishes that the prepared_meal category needs and that the reference datasets do not carry."
+    }
+  ],
+  "workListOrder": "The importer walks foods in array order and then datasetSweeps in array order, checkpointing by index across both sections, so entries are only ever appended and never reordered or removed: reordering would make an interrupted run resume at the wrong food. skipFdcIdsPresentInFoods keeps a sweep from overwriting a curated entry, so curation always wins over pattern classification."
+}

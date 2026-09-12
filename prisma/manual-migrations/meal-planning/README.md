@@ -1,143 +1,118 @@
 # `prisma/manual-migrations/meal-planning`
 
-An operator reference copy of the meal-planning DDL. **No tooling runs this
-folder** — it is excluded from the Docker image by `.dockerignore`, no npm script
-points at it, and Prisma only ever looks at `prisma/migrations`.
+An operator reference copy of the meal-planning DDL, plus a reference-only
+removal script. **The ledger that actually runs is
+`prisma/migrations/20260908000000_meal_planning/migration.sql`**, applied by
+Prisma. Nothing in this folder is ever applied automatically, and none of it
+introduces a second migration system.
 
-| File | What it is |
+Both exist because two instructions had to be honoured at once: the feature
+request asked for additive SQL under `prisma/manual-migrations/meal-planning/`,
+while this repository's deployment practice is a boot-time
+`prisma migrate deploy`. So the Prisma migration is the executed ledger, and this
+folder is the operator reference — the same DDL, written so a human can apply it
+by hand if Prisma ever cannot be used. The folder holds exactly these three
+files:
+
+| File | Role |
 | --- | --- |
-| `001_meal_planning.sql` | The idempotent copy of `prisma/migrations/20260908000000_meal_planning/migration.sql` — the same DDL, statement for statement, with `IF NOT EXISTS` on tables, columns and indexes and one table-scoped `DO $$` guard per foreign key. |
-| `001_meal_planning.down.sql` | The inverse of that file, for the one case below where removal is genuinely required. Reference only: it is part of no deploy and no rollback. |
+| `001_meal_planning.sql` | Idempotent copy of the authoritative migration's DDL — the same statements, guarded so re-running is safe. |
+| `001_meal_planning.down.sql` | Reference-only removal script. Part of no deploy and no rollback; see [Removing the schema](#removing-the-schema). |
+| `README.md` | This file: which ledger is authoritative, and what to do if you apply the copy by hand. |
 
-## Which ledger actually runs
+## How the schema actually reaches a database
 
-`prisma/migrations/20260908000000_meal_planning/migration.sql`. It is applied
-automatically in both places that matter:
+`prisma migrate deploy`, in both places that matter:
 
-- **Deployment** — the image's final command is
+- **Deploy** — the image's final command is
   `npx prisma migrate deploy && node dist/server.js` (`Dockerfile`), so the
-  schema is applied at container boot.
-- **CI** — the `Apply the migration ledger` step of `.github/workflows/ci.yml`
-  runs `npx prisma migrate deploy` against a throwaway `postgres:16-alpine`
-  service before the schema-drift gate and the test suite.
+  migration is applied at container boot.
+- **CI** — the `Apply the migration ledger` step in `.github/workflows/ci.yml`
+  runs the same command against a throwaway PostgreSQL service.
 
-So the normal answer to "should I run the file in this folder?" is **no**.
+Normal operation therefore needs no manual step in this folder at all.
 
-## When you would run it, and what to do afterwards
+## What runs this folder
 
-Run it by hand only when Prisma cannot be used at all — for example applying the
-schema through a DBA-operated SQL console, or bringing a database up to date
-where the `_prisma_migrations` bookkeeping table must be reconciled afterwards:
+Nothing that builds, deploys or migrates. No npm script, CI step, Prisma command
+or source file applies these files; Prisma only ever reads `prisma/migrations`,
+and `prisma/manual-migrations` is listed in `.dockerignore`, so the runtime image
+does not even contain them.
+
+The one automated reader is the ledger-equivalence gate —
+`describe('migration ledgers')` in `src/__tests__/api/compat.test.ts`. It applies
+the up script to disposable databases it creates and drops itself, purely to
+prove that both ledgers produce the same schema and that legacy rows survive
+either order. The equivalence claim above is therefore tested, not asserted. That
+gate never runs the down script.
+
+## If you apply the copy by hand
+
+Do this only when Prisma cannot be used — applying the schema through a
+DBA-operated SQL console, for example. Immediately afterwards, run:
 
 ```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f prisma/manual-migrations/meal-planning/001_meal_planning.sql
-# then, immediately, so `migrate deploy` does not try to re-apply the same DDL:
 npx prisma migrate resolve --applied 20260908000000_meal_planning
 ```
 
-Without that `resolve`, the next `prisma migrate deploy` treats the migration as
-pending and fails on objects that already exist.
+The copy applies the DDL without writing a row to Prisma's `_prisma_migrations`
+bookkeeping table, so without that command the next `prisma migrate deploy` still
+considers the migration pending and tries to apply the same DDL a second time.
+`resolve --applied` records it as already applied instead. The argument is the
+migration's **directory name**, and it has to match character for character.
 
-Re-running the file on a database that already has the schema is a no-op. It is
-**not** a repair tool for a half-applied schema: `CREATE TABLE IF NOT EXISTS`
-will not add a missing column, and it will not add a missing `NOT NULL` to a
-column that already exists. Restore from a backup instead.
+Re-running the copy against a database that already has the schema is a no-op:
+every statement is guarded — `IF NOT EXISTS` on tables, columns and indexes, and
+a `DO $$` block that checks `pg_constraint` before each foreign key, because
+`ADD CONSTRAINT` has no `IF NOT EXISTS` form. In the other direction, the
+`resolve` step above is what stops Prisma re-applying the migration over work the
+copy already did.
 
-## Removing the schema — `001_meal_planning.down.sql`
+It is re-runnable, not a repair tool. `CREATE TABLE IF NOT EXISTS` skips a table
+that already exists, so it will not add a missing column to a partially created
+one. Restore from a backup instead.
 
-**Rolling the backend back does not need this file.** Everything the migration
-adds is additive and inert once the two feature gates are closed, so redeploying
-an earlier commit leaves it in place; that is the documented rollback
-(`docs/meal-planning/release-and-recovery.md`). The down file exists for the
-separate case where a database must genuinely be returned to the pre-feature
-schema, so that removal is a reviewed procedure rather than DDL improvised
-under pressure. Take a backup you have confirmed restores, stop the API or close
-both gates, then:
+## Removing the schema
 
-```bash
-pg_dump --format=custom "$DATABASE_URL" > pre-removal.dump
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
-```
+`001_meal_planning.down.sql` is reference-only. It is part of no deploy and of no
+rollback — rolling the backend back needs no schema change, because everything
+the migration adds is additive and inert once the feature gates are closed. It
+exists so that removal, if it is ever genuinely required, is a reviewed procedure
+rather than DDL improvised under pressure. Run it only after a fresh `pg_dump`
+you have confirmed restores, and only against a disposable database you are
+prepared to lose.
 
-It drops the sixteen tables, the four columns the feature added to
-`meal_entries` and the three indexes it added to that table, in an order that
-needs no `CASCADE`. Diary history survives: those columns are nullable links, so
-planned and catalog-logged entries are **detached, not deleted** — each keeps its
-name, servings and macro snapshot and simply loses its provenance caption. Every
-statement is guarded, so re-running it is a no-op. Everything held in the tables
-themselves — plans, grocery state, preferences, recipes and the whole catalog —
-is gone with them, which is what the backup is for.
+Everything the dropped tables hold goes with them: plans, grocery state,
+preferences, recipes and the whole catalog, including the retained USDA-derived
+snapshot data. Diary history survives, by design — the links this feature added
+to `meal_entries` are nullable, so dropping them **detaches** planned and
+catalog-logged entries rather than deleting them, each row keeping its name,
+servings and macro snapshot and losing only its provenance caption. The script's
+own header carries the full warning and the complete inventory.
 
-Then reconcile the ledger. `_prisma_migrations` still records the migration as
-applied, so `prisma migrate deploy` would report nothing pending and leave the
-database without the schema. Remove that one row and re-apply normally:
-
-```bash
-psql "$DATABASE_URL" -c "DELETE FROM _prisma_migrations WHERE migration_name = '20260908000000_meal_planning';"
-npx prisma migrate deploy   # re-applies the migration when you want the feature back
-```
-
-`npx prisma migrate resolve --rolled-back 20260908000000_meal_planning` does
-**not** work here and is not the step to use: Prisma 6 accepts `--rolled-back`
-only for a migration in a *failed* state and answers `P3012 … cannot be rolled
-back because it is not in a failed state` for one that applied cleanly
-(reproduced against Prisma 6.9.0). Deleting the row is the reconciliation, and
-`migrate deploy` is the way back.
-
-## Three constructs that are not Prisma's output
-
-`prisma/schema.prisma` cannot express any of these, so both ledgers carry them by
-hand and they must be kept in step:
-
-1. the `STORED` generated expression on `catalog_foods.search_vector`;
-2. the block of expression and partial indexes before the foreign keys — the
-   `lower(alias)` index and the five partial indexes behind "one published
-   identity per canonical name and state", "one active plan per start date",
-   "one current version per recipe", "one default portion per food" and the live
-   logged-status lookup;
-3. `NOT NULL` on the twelve required `TEXT[]` / `UUID[]` columns — Prisma never
-   emits it for a scalar list, so without it the datamodel's required lists
-   would be nullable arrays in storage.
-
-All three are recorded in `docs/meal-planning/expected-schema-diff.sql` and
-compared against a freshly migrated database by the `Schema-drift evidence gate`
-step in CI.
-
-## Proving this copy still matches the authoritative ledger
-
-Two throwaway databases, the two application orders, and one dump comparison.
-Point `DATABASE_URL` at a development or test database — never at data you want
-to keep, since both databases are created and dropped here:
+The Prisma ledger then needs reconciling, because `_prisma_migrations` still
+records the migration as applied: `migrate deploy` would report nothing pending
+while the schema is gone. Delete that one row, and re-apply normally whenever the
+feature is wanted back:
 
 ```bash
-# Order A: Prisma first, then this copy (which must change nothing)
-createdb ledger_a
-DATABASE_URL=postgresql://…/ledger_a npx prisma migrate deploy
-psql postgresql://…/ledger_a -v ON_ERROR_STOP=1 -f prisma/manual-migrations/meal-planning/001_meal_planning.sql
-pg_dump --schema-only postgresql://…/ledger_a > /tmp/ledger_a.sql
-
-# Order B: this copy first, then reconcile the ledger
-createdb ledger_b
-psql postgresql://…/ledger_b -v ON_ERROR_STOP=1 -f prisma/migrations/20260706000000_init/migration.sql
-psql postgresql://…/ledger_b -v ON_ERROR_STOP=1 -f prisma/manual-migrations/meal-planning/001_meal_planning.sql
-DATABASE_URL=postgresql://…/ledger_b npx prisma migrate resolve --applied 20260706000000_init
-DATABASE_URL=postgresql://…/ledger_b npx prisma migrate resolve --applied 20260908000000_meal_planning
-DATABASE_URL=postgresql://…/ledger_b npx prisma migrate deploy   # must report no pending migrations
-pg_dump --schema-only postgresql://…/ledger_b > /tmp/ledger_b.sql
-
-# Compare, ignoring pg_dump's own preamble and per-run \restrict token
-norm() { grep -vE '^(--|SET |SELECT pg_catalog\.set_config|\\restrict|\\unrestrict|$)' "$1"; }
-diff <(norm /tmp/ledger_a.sql) <(norm /tmp/ledger_b.sql) && echo "ledgers equivalent"
+# $DISPOSABLE_DATABASE_URL is the database you just backed up — never production
+psql "$DISPOSABLE_DATABASE_URL" -c "DELETE FROM _prisma_migrations WHERE migration_name = '20260908000000_meal_planning';"
+DATABASE_URL="$DISPOSABLE_DATABASE_URL" npx prisma migrate deploy
 ```
 
-Both orders currently produce identical schemas, order A's second step reports
-only `already exists, skipping` notices, and order B's `migrate deploy` reports
-`No pending migrations to apply.`
+`prisma migrate resolve --rolled-back` is not the step here: Prisma 6 accepts it
+only for a migration in a failed state and answers `P3012` for one that applied
+cleanly.
 
-## Editing either ledger
+## Never against production
 
-Change `prisma/schema.prisma`, regenerate the authoritative migration, re-apply
-the three hand-written constructs above, mirror the result here, then regenerate
-`docs/meal-planning/expected-schema-diff.sql` (its header carries the two
-commands) and re-run the equivalence check above. A migration that has already
-been applied anywhere must never be edited — add a new one instead.
+Never point `DATABASE_URL` at production, never reset a database that holds user
+data, and run any SQL from this folder only against a disposable non-production
+database.
+
+## Where the release narrative lives
+
+`docs/meal-planning/release-and-recovery.md` — the release order, the
+`MEAL_PLANNING_ENABLED` sequencing and the rollback procedure. None of it is
+repeated here.

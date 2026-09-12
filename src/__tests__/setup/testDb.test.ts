@@ -210,10 +210,11 @@ describe('assertTestDatabase — DATABASE_URL', () => {
 });
 
 describe('FEATURE_TABLES', () => {
-    it('covers the sixteen feature tables plus the three legacy tables rows hang off', () => {
-        expect(FEATURE_TABLES).toHaveLength(19);
+    it('covers the sixteen feature tables, the three diary tables and the five legacy tables', () => {
+        expect(FEATURE_TABLES).toHaveLength(24);
         expect([...FEATURE_TABLES].sort()).toEqual(
             [
+                'ai_usage',
                 'catalog_food_aliases',
                 'catalog_food_components',
                 'catalog_food_portions',
@@ -221,6 +222,8 @@ describe('FEATURE_TABLES', () => {
                 'catalog_generation_batches',
                 'catalog_import_runs',
                 'catalog_validation_records',
+                'daily_exercises',
+                'exercise_sets',
                 'grocery_items',
                 'meal_entries',
                 'meal_plan_actions',
@@ -232,15 +235,23 @@ describe('FEATURE_TABLES', () => {
                 'recipe_ingredients',
                 'recipe_versions',
                 'recipes',
+                'usda_api_cache',
                 'users',
+                'workout_days',
             ].sort(),
         );
+    });
+
+    it('names the three tables a cascade from users cannot reach', () => {
+        expect(FEATURE_TABLES).toContain('workout_days');
+        expect(FEATURE_TABLES).toContain('usda_api_cache');
+        expect(FEATURE_TABLES).toContain('ai_usage');
     });
 
     it('is frozen, so no suite can widen the blast radius of a truncate', () => {
         expect(Object.isFrozen(FEATURE_TABLES)).toBe(true);
         expect(() => {
-            (FEATURE_TABLES as string[]).push('workout_days');
+            (FEATURE_TABLES as string[]).push('templates');
         }).toThrow();
     });
 

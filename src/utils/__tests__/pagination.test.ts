@@ -1,201 +1,200 @@
 /**
- * `src/utils/pagination.ts` is the one shared offset parser every paginated
- * endpoint uses, so the cases worth pinning are the hostile ones: a stale
- * `limit` in a saved client request, a repeated query parameter, and a caller
- * that passes its own bound as `0` or `NaN`. Each of those has a specific
- * answer — clamp, first-occurrence-wins, sanitize — and each would be a real
- * production bug if it changed (an unbounded `limit`, a `null` in the wire
- * block, an infinite page count).
+ * `src/utils/pagination.ts` replaces an idiom repeated across six shipped
+ * controllers (`parseInt(req.query.page) || 1`), and it changes that idiom's
+ * answer in two places on purpose: a `0` is clamped rather than defaulted, and
+ * a negative value is clamped rather than passed through to the query. The
+ * cases below are chosen for the decisions someone could reverse — the clamps,
+ * the first-occurrence-wins reader, the caller-option sanitizing, and the two
+ * `totalPages` answers the mobile client's pagination loop and io-ts codec
+ * depend on.
  */
 
-import {
-    DEFAULT_LIMIT,
-    DEFAULT_PAGE,
-    MAX_LIMIT,
-    parsePagination,
-    toPaginationBlock,
-} from '../pagination';
+import { DEFAULT_LIMIT, DEFAULT_PAGE, MAX_LIMIT, parsePagination, toPaginationBlock } from '../pagination';
 
-describe('parsePagination — defaults', () => {
-    it('falls back to page 1 and the default limit for an empty query', () => {
-        expect(parsePagination({})).toEqual({ page: DEFAULT_PAGE, limit: DEFAULT_LIMIT });
-    });
+describe('parsePagination', () => {
+    describe('page', () => {
+        it('falls back to the default page when the query names none', () => {
+            expect(parsePagination({}).page).toBe(DEFAULT_PAGE);
+        });
 
-    it('treats undefined members as absent', () => {
-        expect(parsePagination({ page: undefined, limit: undefined })).toEqual({
-            page: DEFAULT_PAGE,
-            limit: DEFAULT_LIMIT,
+        it('reads a well-formed page, as Express delivers it', () => {
+            expect(parsePagination({ page: '1' }).page).toBe(1);
+            expect(parsePagination({ page: '7' }).page).toBe(7);
+        });
+
+        it('reads a page a caller has already coerced to a number', () => {
+            expect(parsePagination({ page: 4 }).page).toBe(4);
+        });
+
+        it('ignores a page that does not parse', () => {
+            expect(parsePagination({ page: 'abc' }).page).toBe(DEFAULT_PAGE);
+            expect(parsePagination({ page: '' }).page).toBe(DEFAULT_PAGE);
+            expect(parsePagination({ page: '   ' }).page).toBe(DEFAULT_PAGE);
+        });
+
+        it('clamps a zero page up to the first page', () => {
+            expect(parsePagination({ page: '0' }).page).toBe(1);
+        });
+
+        it('clamps a negative page up to the first page', () => {
+            expect(parsePagination({ page: '-3' }).page).toBe(1);
+            expect(parsePagination({ page: '-100000' }).page).toBe(1);
+        });
+
+        it('truncates a fractional page rather than rejecting it', () => {
+            // `parseInt` truncation, kept deliberately so the parser answers
+            // exactly what the six shipped controllers answer today. Do not
+            // "correct" it into rounding: 2.7 must stay page 2.
+            expect(parsePagination({ page: '2.7' }).page).toBe(2);
+            expect(parsePagination({ page: '2abc' }).page).toBe(2);
+        });
+
+        it('takes the first occurrence of a repeated page parameter', () => {
+            expect(parsePagination({ page: ['3', '9'] }).page).toBe(3);
         });
     });
 
-    it('reads well-formed string parameters, as Express delivers them', () => {
-        expect(parsePagination({ page: '3', limit: '10' })).toEqual({ page: 3, limit: 10 });
-    });
+    describe('limit', () => {
+        it('falls back to the default limit when the query names none', () => {
+            expect(parsePagination({}).limit).toBe(DEFAULT_LIMIT);
+        });
 
-    it('reads numeric parameters too, for a caller that already coerced them', () => {
-        expect(parsePagination({ page: 4, limit: 5 })).toEqual({ page: 4, limit: 5 });
-    });
-});
+        it('ignores a limit that does not parse', () => {
+            expect(parsePagination({ limit: 'abc' }).limit).toBe(DEFAULT_LIMIT);
+        });
 
-describe('parsePagination — repeated parameters', () => {
-    it.each([
-        ['page', { page: ['3', '9'] }, { page: 3, limit: DEFAULT_LIMIT }],
-        ['limit', { limit: ['10', '50'] }, { page: DEFAULT_PAGE, limit: 10 }],
-    ])('takes the first occurrence of a repeated %s', (_case, query, expected) => {
-        // `?page=3&page=9` arrives as an array through `qs`. Taking the last
-        // would let an appended parameter override an earlier one, and reading
-        // the array itself would stringify to "3,9" and parse as 3 by accident.
-        expect(parsePagination(query)).toEqual(expected);
-    });
+        it('passes a limit inside the supported range through untouched', () => {
+            expect(parsePagination({ limit: '1' }).limit).toBe(1);
+            expect(parsePagination({ limit: '50' }).limit).toBe(50);
+        });
 
-    it('falls back to the defaults for an empty array', () => {
-        expect(parsePagination({ page: [], limit: [] })).toEqual({
-            page: DEFAULT_PAGE,
-            limit: DEFAULT_LIMIT,
+        it('caps a limit above the shared maximum of 50', () => {
+            expect(MAX_LIMIT).toBe(50);
+            expect(parsePagination({ limit: '51' }).limit).toBe(50);
+            expect(parsePagination({ limit: '1000' }).limit).toBe(50);
+        });
+
+        it('clamps a zero or negative limit up to one row, not to the default', () => {
+            expect(parsePagination({ limit: '0' }).limit).toBe(1);
+            expect(parsePagination({ limit: '-5' }).limit).toBe(1);
+        });
+
+        it('takes the first occurrence of a repeated limit parameter', () => {
+            expect(parsePagination({ limit: ['10', '50'] }).limit).toBe(10);
         });
     });
-});
 
-describe('parsePagination — values that do not parse', () => {
-    it.each([
-        ['a word', 'abc'],
-        ['a blank string', ''],
-        ['whitespace', '   '],
-        ['null', null],
-        ['an object', { page: 2 }],
-        ['a boolean', true],
-    ])('ignores %s and uses the default page', (_case, value) => {
-        expect(parsePagination({ page: value }).page).toBe(DEFAULT_PAGE);
+    describe('options', () => {
+        it('uses the caller default when the request names no limit', () => {
+            expect(parsePagination({}, { defaultLimit: 12, maxLimit: 30 }).limit).toBe(12);
+        });
+
+        it('applies the caller maximum to a requested limit', () => {
+            expect(parsePagination({ limit: '31' }, { defaultLimit: 12, maxLimit: 30 }).limit).toBe(30);
+        });
+
+        it('keeps the shared maximum when the caller names only a default', () => {
+            expect(parsePagination({}, { defaultLimit: 30 }).limit).toBe(30);
+            expect(parsePagination({ limit: '51' }, { defaultLimit: 30 }).limit).toBe(50);
+        });
+
+        it('clamps a caller default above the maximum down to it', () => {
+            expect(parsePagination({}, { defaultLimit: 100 }).limit).toBe(50);
+            expect(parsePagination({}, { defaultLimit: 100, maxLimit: 30 }).limit).toBe(30);
+        });
+
+        it('sanitizes a non-positive or fractional caller default', () => {
+            expect(parsePagination({}, { defaultLimit: 0 }).limit).toBe(1);
+            expect(parsePagination({}, { defaultLimit: -5 }).limit).toBe(1);
+            expect(parsePagination({}, { defaultLimit: 10.7 }).limit).toBe(10);
+        });
+
+        it('falls back to the module default when the caller default is not finite', () => {
+            expect(parsePagination({}, { defaultLimit: Number.NaN }).limit).toBe(DEFAULT_LIMIT);
+            expect(parsePagination({}, { defaultLimit: Number.POSITIVE_INFINITY }).limit).toBe(DEFAULT_LIMIT);
+        });
+
+        it('sanitizes a non-positive caller maximum to one row', () => {
+            expect(parsePagination({ limit: '25' }, { maxLimit: 0 }).limit).toBe(1);
+            expect(parsePagination({ limit: '25' }, { maxLimit: -1 }).limit).toBe(1);
+        });
+
+        it('falls back to the module maximum when the caller maximum is not finite', () => {
+            expect(parsePagination({ limit: '999' }, { maxLimit: Number.NaN }).limit).toBe(50);
+            expect(parsePagination({ limit: '999' }, { maxLimit: Number.POSITIVE_INFINITY }).limit).toBe(50);
+        });
     });
 
-    it.each([
-        ['a word', 'abc'],
-        ['null', null],
-    ])('ignores %s and uses the default limit', (_case, value) => {
-        expect(parsePagination({ limit: value }).limit).toBe(DEFAULT_LIMIT);
+    describe('contract shape', () => {
+        it('returns a page and a limit only, with the options argument omitted', () => {
+            expect(parsePagination({})).toEqual({ page: DEFAULT_PAGE, limit: DEFAULT_LIMIT });
+        });
+
+        it('treats an empty options object as no options at all', () => {
+            expect(parsePagination({ limit: '999' }, {})).toEqual({ page: DEFAULT_PAGE, limit: 50 });
+        });
     });
 
-    it('truncates a numeric prefix rather than rejecting it', () => {
-        expect(parsePagination({ page: '2abc', limit: '10.9' })).toEqual({ page: 2, limit: 10 });
-    });
-});
+    describe('hostile input', () => {
+        it('returns the defaults for members of the wrong type, and never throws', () => {
+            const query = { page: {}, limit: [] };
 
-describe('parsePagination — out-of-range values', () => {
-    it.each([
-        ['zero', '0'],
-        ['negative', '-5'],
-        ['deeply negative', '-100000'],
-    ])('clamps a %s page up to the first page', (_case, page) => {
-        expect(parsePagination({ page }).page).toBe(DEFAULT_PAGE);
-    });
+            expect(() => parsePagination(query)).not.toThrow();
+            expect(parsePagination(query)).toEqual({ page: DEFAULT_PAGE, limit: DEFAULT_LIMIT });
+            expect(parsePagination({ page: true, limit: false })).toEqual({
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            });
+        });
 
-    it('clamps a limit above the maximum down to it', () => {
-        expect(parsePagination({ limit: '999' }).limit).toBe(MAX_LIMIT);
-    });
-
-    it.each([
-        ['zero', '0'],
-        ['negative', '-10'],
-    ])('clamps a %s limit up to one row', (_case, limit) => {
-        // Never 0: a zero limit reaches `Math.ceil(total / limit)` as Infinity
-        // and serialises as null in the response block.
-        expect(parsePagination({ limit }).limit).toBe(1);
-    });
-
-    it('accepts the maximum itself', () => {
-        expect(parsePagination({ limit: String(MAX_LIMIT) }).limit).toBe(MAX_LIMIT);
-    });
-});
-
-describe('parsePagination — caller options', () => {
-    it('uses the caller default when the request names no limit', () => {
-        expect(parsePagination({}, { defaultLimit: 10 }).limit).toBe(10);
-    });
-
-    it('applies the caller maximum to a requested limit', () => {
-        expect(parsePagination({ limit: '40' }, { maxLimit: 20 }).limit).toBe(20);
-    });
-
-    it('clamps the caller default to the caller maximum', () => {
-        // An endpoint declaring `defaultLimit: 100, maxLimit: 30` is a
-        // configuration mistake; answering 100 rows would break its own bound.
-        expect(parsePagination({}, { defaultLimit: 100, maxLimit: 30 }).limit).toBe(30);
-    });
-
-    it.each([
-        ['zero', 0, 1],
-        ['negative', -5, 1],
-        ['fractional', 10.7, 10],
-    ])('sanitizes a %s caller default', (_case, defaultLimit, expected) => {
-        expect(parsePagination({}, { defaultLimit }).limit).toBe(expected);
-    });
-
-    it.each([
-        ['NaN', Number.NaN],
-        ['Infinity', Number.POSITIVE_INFINITY],
-    ])('falls back to the module default when the caller default is %s', (_case, defaultLimit) => {
-        expect(parsePagination({}, { defaultLimit }).limit).toBe(DEFAULT_LIMIT);
-    });
-
-    it.each([
-        ['zero', 0, 1],
-        ['negative', -1, 1],
-    ])('sanitizes a %s caller maximum to one row', (_case, maxLimit, expected) => {
-        expect(parsePagination({ limit: '25' }, { maxLimit }).limit).toBe(expected);
-    });
-
-    it.each([
-        ['NaN', Number.NaN],
-        ['Infinity', Number.POSITIVE_INFINITY],
-    ])('falls back to the module maximum when the caller maximum is %s', (_case, maxLimit) => {
-        expect(parsePagination({ limit: '999' }, { maxLimit }).limit).toBe(MAX_LIMIT);
-    });
-
-    it('treats an empty options object as no options at all', () => {
-        expect(parsePagination({ limit: '999' }, {})).toEqual({ page: DEFAULT_PAGE, limit: MAX_LIMIT });
+        it('treats null and undefined members as absent', () => {
+            expect(parsePagination({ page: null, limit: undefined })).toEqual({
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            });
+            expect(parsePagination({ page: undefined, limit: null })).toEqual({
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            });
+        });
     });
 });
 
 describe('toPaginationBlock', () => {
-    it('reports no pages for an empty result set', () => {
-        // Not 1: the client pages while `page < totalPages`, so a phantom page
-        // would make it request an empty second page for every empty list.
-        expect(toPaginationBlock(0, 1, 25)).toEqual({ page: 1, limit: 25, total: 0, totalPages: 0 });
+    describe('totalPages', () => {
+        it('reports no pages for an empty result set', () => {
+            // Not 1. The mobile client pages while `page < totalPages`, so a
+            // phantom first page would make every empty list fetch a second.
+            expect(toPaginationBlock(0, 1, 25)).toEqual({ page: 1, limit: 25, total: 0, totalPages: 0 });
+        });
+
+        it('rounds a partial last page up', () => {
+            expect(toPaginationBlock(1, 1, 25).totalPages).toBe(1);
+            expect(toPaginationBlock(26, 1, 25).totalPages).toBe(2);
+            expect(toPaginationBlock(51, 1, 25).totalPages).toBe(3);
+        });
+
+        it('adds no page for an exact multiple of the limit', () => {
+            expect(toPaginationBlock(25, 1, 25).totalPages).toBe(1);
+            expect(toPaginationBlock(50, 1, 25).totalPages).toBe(2);
+        });
+
+        it('reports no pages for a non-positive limit instead of Infinity', () => {
+            // `JSON.stringify(Infinity)` emits `null`, and a null `totalPages`
+            // fails the client's `io.number` codec for the whole response.
+            expect(toPaginationBlock(100, 1, 0).totalPages).toBe(0);
+            expect(toPaginationBlock(100, 1, -5).totalPages).toBe(0);
+        });
     });
 
-    it.each([
-        [25, 25, 1],
-        [26, 25, 2],
-        [50, 25, 2],
-        [51, 25, 3],
-    ])('rounds %i rows at %i per page up to %i pages', (total, limit, totalPages) => {
-        expect(toPaginationBlock(total, 1, limit).totalPages).toBe(totalPages);
-    });
+    describe('the wire block', () => {
+        it('echoes the total, page and limit it was given without re-clamping them', () => {
+            expect(toPaginationBlock(100, 2, 25)).toEqual({ page: 2, limit: 25, total: 100, totalPages: 4 });
+            expect(toPaginationBlock(10, 7, 3)).toEqual({ page: 7, limit: 3, total: 10, totalPages: 4 });
+        });
 
-    it.each([
-        ['zero', 0],
-        ['negative', -5],
-    ])('reports no pages for a %s limit instead of Infinity', (_case, limit) => {
-        // Guards the raw caller: Infinity serialises as null, and a null
-        // totalPages fails the client's io-ts codec.
-        const block = toPaginationBlock(100, 1, limit);
-
-        expect(block.totalPages).toBe(0);
-        expect(Number.isFinite(block.totalPages)).toBe(true);
-    });
-
-    it('echoes the page and limit it was given without re-clamping them', () => {
-        // Clamping belongs to `parsePagination`; a block that silently altered
-        // the page would disagree with the rows the caller actually queried.
-        expect(toPaginationBlock(10, 7, 3)).toEqual({ page: 7, limit: 3, total: 10, totalPages: 4 });
-    });
-});
-
-describe('the module defaults', () => {
-    it('pins the shared page size and its ceiling', () => {
-        expect(DEFAULT_PAGE).toBe(1);
-        expect(DEFAULT_LIMIT).toBe(25);
-        expect(MAX_LIMIT).toBe(50);
-        expect(DEFAULT_LIMIT).toBeLessThanOrEqual(MAX_LIMIT);
+        it('emits the four keys the client decodes, in the order the shipped endpoints emit them', () => {
+            expect(Object.keys(toPaginationBlock(100, 2, 25))).toEqual(['page', 'limit', 'total', 'totalPages']);
+        });
     });
 });

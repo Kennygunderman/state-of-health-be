@@ -4,6 +4,7 @@ import {
     DailyMacrosResponse,
     DailySummaryResponse,
     DaySummaryMealResponse,
+    LogCatalogMealEntryPayload,
     LogMealEntryPayload,
     MacroTargetsResponse,
     MacroTotals,
@@ -12,9 +13,10 @@ import {
     NutritionProvenance,
     UpdateMealEntryPayload,
 } from '../types/nutrition';
+import { CatalogFoodNotFoundError } from './mealPlanning.errors';
 
 const DEFAULT_MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
-const INPUT_METHODS = ['library', 'search', 'ai_text', 'ai_photo'];
+const INPUT_METHODS = ['library', 'search', 'ai_text', 'ai_photo', 'meal_plan'];
 
 const NUTRITION_PROVENANCES: NutritionProvenance[] = [
     'source_backed',
@@ -22,6 +24,20 @@ const NUTRITION_PROVENANCES: NutritionProvenance[] = [
     'ai_estimated',
     'user_entered',
 ];
+
+// The portion a catalog entry names must be one this food actually stores, and
+// only the catalog row can say which those are — so the check cannot live in
+// nutrition.logic.ts with the rest of the body validation, and this is the
+// failure it reports instead. Declared here rather than in mealPlanning.errors
+// for the reason that file states: a failure belongs to the module that raises
+// it, the way estimate.service owns EstimateFailedError. The controller maps it
+// to 400 invalid_serving; nothing here knows that status (§8).
+export class InvalidServingError extends Error {
+    constructor(public readonly servingText: string) {
+        super('servingText does not name a stored portion of this food');
+        this.name = 'InvalidServingError';
+    }
+}
 
 interface MealEntryRow {
     id: string;
@@ -44,6 +60,10 @@ interface MealEntryRow {
     // null rather than omitting the field.
     meal_plan_meal_id: string | null;
     nutrition_provenance: string | null;
+    // The other two links are read, never mapped: they stay off the DTO, and
+    // updateMealEntry consults all three to decide whether an edit detaches.
+    catalog_food_id: string | null;
+    recipe_version_id: string | null;
 }
 
 interface MealRow {
@@ -193,10 +213,256 @@ export const logMealEntry = async (
             carbs_g: Math.round(payload.carbs),
             fat_g: Math.round(payload.fat),
             input_method: inputMethod,
+            // The macros above arrived from the client, so the server cannot
+            // call them source-backed however they were obtained. Rows written
+            // before this column existed keep NULL and read as the same
+            // "unknown" class; neither earns a provenance label.
+            nutrition_provenance: 'user_entered',
             raw_input: payload.rawInput ?? null,
         },
     });
     return mapEntry(entry);
+};
+
+interface CatalogPortionRow {
+    description: string;
+    gram_weight: number;
+    is_default: boolean;
+}
+
+interface CatalogFoodRow {
+    id: string;
+    display_name: string;
+    nutrition_provenance: string;
+    nutrition_basis: string;
+    basis_amount: number;
+    calories: number | null;
+    protein_g: number | null;
+    carbs_g: number | null;
+    fat_g: number | null;
+    density_g_per_ml: number | null;
+    catalog_food_portions: CatalogPortionRow[];
+}
+
+// A published food is guaranteed to carry all four macros and a default portion
+// with a known gram weight, so anything missing here is a data fault rather
+// than a bad request: inventing a weight or reading a NULL nutrient as zero
+// would log numbers nobody measured under a source-backed label.
+const requireCatalogValue = (value: number | null, foodId: string, what: string): number => {
+    if (value === null || !Number.isFinite(value) || value <= 0) {
+        throw new Error(`Published catalog food ${foodId} has no usable ${what}`);
+    }
+    return value;
+};
+
+const requireNutrient = (value: number | null, foodId: string, nutrient: string): number => {
+    if (value === null || !Number.isFinite(value)) {
+        throw new Error(`Published catalog food ${foodId} has no ${nutrient} value`);
+    }
+    return value;
+};
+
+// The mass a food's stated nutrient values describe, so one per-gram rate can
+// be scaled to any stored portion. 'per_100g' states them against a mass
+// already; 'per_100ml' needs the density to become one; 'per_serving' states
+// them against basis_amount of the food's own default portion.
+const basisGrams = (food: CatalogFoodRow, defaultPortion: CatalogPortionRow): number => {
+    const basisAmount = requireCatalogValue(food.basis_amount, food.id, 'nutrition basis amount');
+
+    switch (food.nutrition_basis) {
+        case 'per_100g':
+            return basisAmount;
+        case 'per_100ml':
+            return basisAmount * requireCatalogValue(food.density_g_per_ml, food.id, 'density');
+        case 'per_serving':
+            return basisAmount * requireCatalogValue(defaultPortion.gram_weight, food.id, 'default portion weight');
+        default:
+            throw new Error(`Published catalog food ${food.id} has an unsupported nutrition basis`);
+    }
+};
+
+// Resolves the portion the entry is logged against, and derives that portion's
+// per-serving macros from it.
+//
+// The portion drives the stored label AND the stored numbers together. An
+// omitted servingText takes the default portion; a named one must match a
+// portion this food actually stores, because the text is what the saved macros
+// claim to describe — labelling one portion's numbers with another portion's
+// name, or storing a string the catalog never measured, is the unverifiable
+// claim the servingText check exists to prevent.
+const catalogPortionSnapshot = (
+    food: CatalogFoodRow,
+    servingText: string | undefined,
+): { description: string; perServing: MacroTotals } => {
+    const defaultPortion = food.catalog_food_portions.find((portion) => portion.is_default);
+    if (!defaultPortion) {
+        throw new Error(`Published catalog food ${food.id} has no default portion`);
+    }
+
+    let portion = defaultPortion;
+    if (servingText !== undefined) {
+        const named = food.catalog_food_portions.find((candidate) => candidate.description === servingText);
+        if (!named) {
+            throw new InvalidServingError(servingText);
+        }
+        portion = named;
+    }
+
+    const scale =
+        requireCatalogValue(portion.gram_weight, food.id, 'portion weight') / basisGrams(food, defaultPortion);
+
+    // Rounded to integers because meal_entries stores per-serving macros as
+    // Int, and rounded here only: the read path multiplies this snapshot by
+    // servings, so scaling it first would round twice and drift.
+    return {
+        description: portion.description,
+        perServing: {
+            calories: Math.round(requireNutrient(food.calories, food.id, 'calories') * scale),
+            protein: Math.round(requireNutrient(food.protein_g, food.id, 'protein') * scale),
+            carbs: Math.round(requireNutrient(food.carbs_g, food.id, 'carbs') * scale),
+            fat: Math.round(requireNutrient(food.fat_g, food.id, 'fat') * scale),
+        },
+    };
+};
+
+// The catalog counterpart of logMealEntry: the client names a published catalog
+// food and a portion, and every number and label is derived here from that
+// row — any macros the body carried were already discarded by the parser, and
+// this function would ignore them regardless.
+export const logCatalogMealEntry = async (
+    userId: string,
+    mealId: string,
+    payload: LogCatalogMealEntryPayload,
+): Promise<MealEntryResponse | null> => {
+    const meal = await prisma.meals.findFirst({ where: { id: mealId, user_id: userId, deleted_at: null } });
+    if (!meal) return null;
+
+    // Not published is indistinguishable from not existing, deliberately: a
+    // candidate, quarantined, rejected or retired food is simply absent to a
+    // caller, so no request can confirm one exists before it is publishable.
+    const food = await prisma.catalog_foods.findFirst({
+        where: { id: payload.catalogFoodId, publication_status: 'published' },
+        include: { catalog_food_portions: true },
+    });
+    if (!food) {
+        throw new CatalogFoodNotFoundError();
+    }
+
+    const snapshot = catalogPortionSnapshot(food, payload.servingText);
+    const entry = await prisma.meal_entries.create({
+        data: {
+            meal_id: mealId,
+            user_id: userId,
+            date: meal.date,
+            // A catalog food is not one of the user's personal foods: no foods
+            // row is created and none is referenced, so the legacy food_id
+            // dedupe branch above cannot apply and two logs are two entries.
+            food_id: null,
+            catalog_food_id: food.id,
+            name: food.display_name,
+            serving_text: snapshot.description,
+            servings: payload.servings,
+            calories: snapshot.perServing.calories,
+            protein_g: snapshot.perServing.protein,
+            carbs_g: snapshot.perServing.carbs,
+            fat_g: snapshot.perServing.fat,
+            // Stamped server-side whatever the body claimed, and paired with the
+            // catalog row's own provenance so the caption the diary renders and
+            // the numbers it labels come from the same snapshot.
+            input_method: 'search',
+            nutrition_provenance: food.nutrition_provenance,
+        },
+    });
+    return mapEntry(entry);
+};
+
+// Everything insertPlannedMealEntry writes. The per-serving macros arrive at
+// full precision and are rounded here, once.
+export interface PlannedMealEntryInsert {
+    userId: string;
+    mealId: string;
+    date: Date;
+    mealPlanMealId: string;
+    recipeVersionId: string;
+    name: string;
+    servingText: string | null;
+    servings: number;
+    perServing: MacroTotals;
+}
+
+// Takes the transaction client first, breaking this module's userId-first
+// convention (§5): it is a tx-scoped helper with exactly one caller,
+// plannedMealLog.service.ts, which has already taken the per-user advisory
+// lock, reserved the action row, checked the plan's status and revision, and
+// verified this diary meal is the user's and matches `date`. Re-checking any of
+// that here would let the two copies drift, so this function only inserts.
+export const insertPlannedMealEntry = async (
+    tx: Prisma.TransactionClient,
+    params: PlannedMealEntryInsert,
+): Promise<MealEntryResponse> => {
+    const entry = await tx.meal_entries.create({
+        data: {
+            meal_id: params.mealId,
+            user_id: params.userId,
+            date: params.date,
+            food_id: null,
+            meal_plan_meal_id: params.mealPlanMealId,
+            recipe_version_id: params.recipeVersionId,
+            name: params.name,
+            serving_text: params.servingText,
+            servings: params.servings,
+            // The single rounding in the planned-meal contract: the planned
+            // portion is computed at full precision, rounded once into this
+            // snapshot, and the diary then shows Math.round(snapshot *
+            // servings). Rounding anywhere else makes the app's "This adds"
+            // card and the server's totals disagree.
+            calories: Math.round(params.perServing.calories),
+            protein_g: Math.round(params.perServing.protein),
+            carbs_g: Math.round(params.perServing.carbs),
+            fat_g: Math.round(params.perServing.fat),
+            input_method: 'meal_plan',
+            // Planning admits only source-backed ingredients, so a planned meal
+            // is never an estimate.
+            nutrition_provenance: 'source_backed',
+        },
+    });
+    return mapEntry(entry);
+};
+
+// What an entry keeps once its numbers are no longer the plan's or the
+// catalog's: every link is cleared, so the plan card returns to unlogged and
+// both captions — "From meal plan" and any source label — go with them.
+// 'library' is this column's own schema default and the value logMealEntry
+// already falls back to for an unrecognised method, so no new input method
+// enters the wire and an older client decodes a detached entry unchanged.
+const DETACHED_SNAPSHOT = {
+    meal_plan_meal_id: null,
+    catalog_food_id: null,
+    recipe_version_id: null,
+    input_method: 'library',
+    nutrition_provenance: 'user_entered',
+} as const;
+
+// A servings edit only says how much was eaten, which the linked plan meal or
+// catalog food still describes, so the links stand and the plan stays logged.
+// Rewriting the name or any macro replaces what the entry claims the food IS —
+// the plan did not produce those numbers, so nothing may keep vouching for them.
+const detachesFromSource = (
+    existing: Pick<MealEntryRow, 'meal_plan_meal_id' | 'catalog_food_id' | 'recipe_version_id'>,
+    payload: UpdateMealEntryPayload,
+): boolean => {
+    const isLinked =
+        existing.meal_plan_meal_id !== null ||
+        existing.catalog_food_id !== null ||
+        existing.recipe_version_id !== null;
+    const rewritesSnapshot =
+        payload.name !== undefined ||
+        payload.calories !== undefined ||
+        payload.protein !== undefined ||
+        payload.carbs !== undefined ||
+        payload.fat !== undefined;
+
+    return isLinked && rewritesSnapshot;
 };
 
 export const updateMealEntry = async (
@@ -209,7 +475,7 @@ export const updateMealEntry = async (
     });
     if (!existing) return null;
     const entry = await prisma.meal_entries.update({
-        where: { id: entryId },
+        where: { id: entryId, user_id: userId },
         data: {
             ...(payload.servings !== undefined ? { servings: payload.servings } : {}),
             ...(payload.name !== undefined ? { name: payload.name.trim() } : {}),
@@ -217,6 +483,7 @@ export const updateMealEntry = async (
             ...(payload.protein !== undefined ? { protein_g: Math.round(payload.protein) } : {}),
             ...(payload.carbs !== undefined ? { carbs_g: Math.round(payload.carbs) } : {}),
             ...(payload.fat !== undefined ? { fat_g: Math.round(payload.fat) } : {}),
+            ...(detachesFromSource(existing, payload) ? DETACHED_SNAPSHOT : {}),
         },
     });
     return mapEntry(entry);
@@ -339,13 +606,19 @@ export const getHistory = async (
     };
 };
 
+// `db` defaults to the shared client, so the existing caller is unchanged. A
+// transaction client may be passed instead: targets.service.ts writes
+// users.target_* and meal_plan_preferences in one transaction, and both must
+// commit or neither, or a confirmed target would be recorded against
+// preferences that never got it.
 export const updateTargets = async (
     userId: string,
     targets: Partial<MacroTargetsResponse>,
+    db: Prisma.TransactionClient = prisma,
 ): Promise<MacroTargetsResponse | null> => {
-    const existing = await prisma.users.findUnique({ where: { id: userId } });
+    const existing = await db.users.findUnique({ where: { id: userId } });
     if (!existing) return null;
-    const user = await prisma.users.update({
+    const user = await db.users.update({
         where: { id: userId },
         data: {
             ...(targets.calories !== undefined ? { target_calories: targets.calories } : {}),
