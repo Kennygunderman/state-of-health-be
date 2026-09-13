@@ -20,7 +20,12 @@
  *    so `decideReplay`'s signature is asserted, not just its outputs;
  *  - a status re-derived at read time would retroactively rewrite what an
  *    already-stored action replays, so the read-back is checked with a status
- *    no derivation would ever produce.
+ *    no derivation would ever produce;
+ *  - a replay asserted as identical JSON TEXT would fail against correct code,
+ *    because `response_snapshot` is a `jsonb` column and PostgreSQL reorders an
+ *    object's keys at rest, so the equality the ledger really guarantees — a
+ *    deep-equal body, an exactly equal status and revision — is pinned in that
+ *    form and the textual difference is pinned with it.
  */
 
 import type { Prisma, PrismaClient } from '../../generated/prisma';
@@ -848,7 +853,7 @@ describe('readStoredResponse', () => {
         expect(readStoredResponse(stored)?.body).toBe(logBody);
     });
 
-    it('round-trips a nested plan snapshot without reordering a key or drifting a number', () => {
+    it('passes a nested plan snapshot through untouched — the caller\'s own object, not a copy of it', () => {
         const nested = {
             id: 'plan-1',
             revision: 2,
@@ -861,12 +866,19 @@ describe('readStoredResponse', () => {
             ],
         } as unknown as MealPlanResponse;
 
-        const replayed = readStoredResponse(shapeStoredResponse('generate', nested, 3));
+        const stored = shapeStoredResponse('generate', nested, 3);
+        const replayed = readStoredResponse(stored);
 
-        // Serialised, not only compared structurally: `toEqual` would accept a
-        // reordered copy, and the two-decimal rounding the fingerprint applies
-        // to a REQUEST must never reach a stored response.
-        expect(JSON.stringify(replayed?.body)).toBe(JSON.stringify(nested));
+        // Identity, not serialised text. This layer is a pass-through — the body
+        // is stored by reference and read back by reference — so `toBe` pins the
+        // whole of what it guarantees at once: no copy, no re-derivation, and no
+        // rounding drift, which is what keeps the two-decimal rounding the
+        // fingerprint applies to a REQUEST out of a stored response. A
+        // JSON-text comparison here would compare one object with itself and
+        // prove none of that; run through the real `jsonb` column it would fail
+        // on key order alone, which is the contract pinned further down.
+        expect(stored.responseSnapshot).toBe(nested);
+        expect(replayed?.body).toBe(nested);
         expect(replayed?.planRevisionAfter).toBe(3);
     });
 
@@ -936,6 +948,177 @@ describe('readStoredResponse', () => {
     it('replays a falsy but present body, which is still a stored response', () => {
         expect(readStoredResponse({ responseStatus: 200, responseSnapshot: 0, planRevisionAfter: 1 })?.body).toBe(0);
         expect(readStoredResponse({ responseStatus: 200, responseSnapshot: '', planRevisionAfter: 1 })?.body).toBe('');
+    });
+});
+
+describe('the replay equality contract across the jsonb round trip', () => {
+    /**
+     * Orders two keys the way `jsonb` does: by length first, then by bytes.
+     *
+     * `Buffer` rather than string comparison because the length that orders keys
+     * is the UTF-8 BYTE length. Measured against PostgreSQL 16:
+     * `SELECT '{"ab":1,"é":2,"zzz":3}'::jsonb` returns `ab, é, zzz` — `é` is one
+     * JS character but two bytes, so it ties with `ab` on length and loses on
+     * bytes (`0xC3` > `0x62`).
+     */
+    const jsonbKeyOrder = (left: string, right: string): number => {
+        const leftKey = Buffer.from(left, 'utf8');
+        const rightKey = Buffer.from(right, 'utf8');
+
+        return leftKey.length - rightKey.length || Buffer.compare(leftKey, rightKey);
+    };
+
+    /**
+     * A MODEL of what `meal_plan_actions.response_snapshot` does to a body at
+     * rest — this suite has no database, so the column's one observable effect is
+     * reproduced here rather than measured here.
+     *
+     * PostgreSQL stores a `jsonb` object with its keys sorted, at every nesting
+     * level, and leaves array order untouched. Ground truth for the model, also
+     * measured against PostgreSQL 16: a body whose keys were written
+     * `id, revision, targets{calories, protein, fat}, days, note, big, nothing,
+     * dup` came back as `id, big, dup, days, note, nothing, targets, revision`
+     * with `targets` as `fat, protein, calories` and the `days` array in its
+     * original order. Key order is the ONLY deviation the round trip produces:
+     * `65.5`, `610.4`, `9007199254740992`, `null` and a unicode/emoji string all
+     * came back unchanged, which is why the model reorders and does nothing else.
+     * The body below was also driven through the real ledger against
+     * PostgreSQL 16, and `runKeyedAction`'s replay of it serialised
+     * byte-identically to this model's output — so what follows pins the
+     * ordering rule itself, not an approximation of it.
+     *
+     * The equality of a real committed action's replay is
+     * `src/__tests__/api/concurrency.test.ts`'s to assert against the database;
+     * what is pinned here is the FORM those assertions have to take.
+     */
+    const storeLikeJsonbColumn = (value: unknown): unknown => {
+        if (Array.isArray(value)) {
+            return value.map(storeLikeJsonbColumn);
+        }
+
+        if (value === null || typeof value !== 'object') {
+            return value;
+        }
+
+        const object = value as Record<string, unknown>;
+
+        return Object.fromEntries(
+            Object.keys(object)
+                .sort(jsonbKeyOrder)
+                .map((key) => [key, storeLikeJsonbColumn(object[key])]),
+        );
+    };
+
+    /**
+     * A first response with differing-length keys at three nesting levels, one
+     * of every scalar class a keyed body can hold, and a two-element array whose
+     * order matters.
+     */
+    const firstResponse = {
+        id: 'plan-1',
+        revision: 1,
+        targets: { calories: 1940, protein: 146, fat: 65.5 },
+        days: [
+            { date: '2026-07-05', meals: [{ slot: 'lunch', planned: { calories: 610.4, protein: 45 } }] },
+            { date: '2026-07-06', meals: [{ slot: 'dinner', planned: { calories: 720, protein: 52 } }] },
+        ],
+        note: 'café — crème brûlée 🥗',
+        big: 9007199254740992,
+        nothing: null,
+        isLocked: false,
+        wasRegenerated: true,
+    } as unknown as MealPlanResponse;
+
+    /** The same action, answered from the column instead of from memory. */
+    const replayFromColumn = (): ReturnType<typeof readStoredResponse> => {
+        const stored = shapeStoredResponse('generate', firstResponse, 1);
+
+        return readStoredResponse({
+            responseStatus: stored.responseStatus,
+            responseSnapshot: storeLikeJsonbColumn(stored.responseSnapshot),
+            planRevisionAfter: stored.planRevisionAfter,
+        });
+    };
+
+    it('models the column the way the measured column behaves: by key length, then bytes, at every level', () => {
+        // The model is what the assertions below rest on, so it is pinned
+        // against the measurement rather than trusted.
+        const normalized = storeLikeJsonbColumn({
+            id: 'plan-1',
+            revision: 1,
+            targets: { calories: 1940, protein: 146, fat: 65.5 },
+            days: ['2026-07-05', '2026-07-06'],
+            note: 'n',
+            big: 1,
+            nothing: null,
+            dup: 2,
+        }) as Record<string, unknown>;
+
+        expect(Object.keys(normalized)).toEqual([
+            'id',
+            'big',
+            'dup',
+            'days',
+            'note',
+            'nothing',
+            'targets',
+            'revision',
+        ]);
+        expect(Object.keys(normalized.targets as Record<string, unknown>)).toEqual(['fat', 'protein', 'calories']);
+        expect(normalized.days).toEqual(['2026-07-05', '2026-07-06']);
+    });
+
+    it('replays a body DEEP-EQUAL to the first response', () => {
+        // AAP §0.9.2's replay row — "returns the stored 201/200 body
+        // byte-for-byte" — is achievable in exactly this form, and this is the
+        // assertion every test of it must make: `toEqual` on the parsed body.
+        expect(replayFromColumn()?.body).toEqual(firstResponse);
+    });
+
+    it('does NOT replay the same JSON text, because jsonb reorders object keys at rest', () => {
+        // Pinned as a known property, not left to be rediscovered as a bug: an
+        // implementer who writes §0.9.2's row as a JSON-text or
+        // `toMatchInlineSnapshot` comparison gets a failing test against
+        // correct code. The reordering is asserted where it happens — the top
+        // level and two nested levels — so this cannot pass for some other
+        // reason.
+        const replayed = replayFromColumn()?.body as Record<string, unknown>;
+
+        expect(JSON.stringify(replayed)).not.toBe(JSON.stringify(firstResponse));
+        expect(Object.keys(replayed)).not.toEqual(Object.keys(firstResponse));
+        expect(Object.keys(replayed.targets as Record<string, unknown>)).toEqual(['fat', 'protein', 'calories']);
+
+        const replayedMeal = (replayed.days as Record<string, unknown>[])[0].meals as Record<string, unknown>[];
+
+        expect(Object.keys(replayedMeal[0].planned as Record<string, unknown>)).toEqual(['protein', 'calories']);
+    });
+
+    it('replays the status and the revision exactly — the parts that really are identical', () => {
+        const replayed = replayFromColumn();
+
+        expect(replayed?.status).toBe(201);
+        expect(replayed?.planRevisionAfter).toBe(1);
+    });
+
+    it('preserves every scalar class and every array order across the round trip', () => {
+        // The other half of "deep-equal is exact": a reordered body would be
+        // harmless, a rounded, truncated or reordered VALUE would not. `65.5`
+        // and `610.4` are the rounding cases, `9007199254740992` is
+        // Number.MAX_SAFE_INTEGER + 1 (a bigint-adjacent magnitude), and the
+        // note carries multi-byte characters and an astral-plane emoji.
+        const replayed = replayFromColumn()?.body as Record<string, unknown>;
+        const targets = replayed.targets as Record<string, number>;
+        const days = replayed.days as Record<string, unknown>[];
+        const lunch = ((days[0].meals as Record<string, unknown>[])[0].planned as Record<string, number>).calories;
+
+        expect(targets.fat).toBe(65.5);
+        expect(lunch).toBe(610.4);
+        expect(replayed.big).toBe(9007199254740992);
+        expect(replayed.nothing).toBeNull();
+        expect(replayed.note).toBe('café — crème brûlée 🥗');
+        expect(replayed.isLocked).toBe(false);
+        expect(replayed.wasRegenerated).toBe(true);
+        expect(days.map((day) => day.date)).toEqual(['2026-07-05', '2026-07-06']);
     });
 });
 

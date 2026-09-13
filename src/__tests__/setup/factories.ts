@@ -55,6 +55,7 @@ import type {
     users,
 } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
+import { DAY_KEY_PATTERN, isCalendarDayKey } from '../../utils/calendarDay';
 
 /** Reserved by RFC 2606, so no fixture address can belong to anyone. */
 const FIXTURE_EMAIL_DOMAIN = 'test.invalid';
@@ -211,8 +212,6 @@ const nextSequence = (): number => {
 
 const resolveSequence = (sequence: number | undefined): number => sequence ?? nextSequence();
 
-const DAY_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-
 /** Characters of an ISO timestamp that make up its `yyyy-MM-dd` day key. */
 const DAY_KEY_LENGTH = 10;
 
@@ -220,6 +219,14 @@ const DAY_KEY_LENGTH = 10;
  * A `@db.Date` column value. Parsed at UTC midnight so day arithmetic is exact
  * (no zone, so no DST step), and rejected loudly rather than handed to Postgres
  * as an `Invalid Date` that surfaces as an opaque driver error.
+ *
+ * Shape and calendar are asked as two questions so the failure names which one
+ * the fixture got wrong, and the calendar question goes to the shared rule in
+ * `utils/calendarDay.ts` — the same rule the services apply, so a fixture can
+ * never be built on a date a service would refuse. It is asked instead of a
+ * `Date` round trip because V8 does not reject an out-of-range day in an ISO
+ * string, it rolls it over ("2026-02-30" parses as 2 March), which would leave
+ * a fixture sitting on a date its caller never wrote.
  */
 const toUtcMidnight = (dayKey: string): Date => {
     if (!DAY_KEY_PATTERN.test(dayKey)) {
@@ -228,10 +235,7 @@ const toUtcMidnight = (dayKey: string): Date => {
 
     const parsed = new Date(`${dayKey}T00:00:00.000Z`);
 
-    // The round trip is the real check: V8 does not reject an out-of-range day
-    // in an ISO string, it rolls it over — "2026-02-30" parses as 2 March — so
-    // a fixture would silently sit on a date its caller never wrote.
-    if (Number.isNaN(parsed.getTime()) || !parsed.toISOString().startsWith(dayKey)) {
+    if (!isCalendarDayKey(dayKey) || Number.isNaN(parsed.getTime())) {
         throw new Error(`Fixture day key "${dayKey}" is not a real calendar date.`);
     }
 

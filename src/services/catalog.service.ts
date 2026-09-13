@@ -274,25 +274,51 @@ export interface CatalogSearchResult {
  *     stemmed query has no prefix semantics at all, so a two-character `q` such
  *     as "mu" matches NOTHING through 1 or 2 while a user is still typing. The
  *     comparison is written `lower(col) LIKE pattern` rather than `col ILIKE`
- *     because that is the form able to use the committed
- *     `idx_catalog_food_aliases_lower_alias` index, and left-anchored because a
- *     prefix is what the index can serve; an interior whole word is already
- *     covered by 1 and 2, which tokenise every word of the text.
+ *     because `ILIKE` has no index support at all without `pg_trgm`, and
+ *     left-anchored because a prefix is the only LIKE shape a btree can answer
+ *     with a range scan; an interior whole word is already covered by 1 and 2,
+ *     which tokenise every word of the text.
  *
- * The alias branches read the whole published alias set for a query, because the
- * schema declares no GIN index over aliases and a trigram index would need
- * `CREATE EXTENSION pg_trgm`, which this schema deliberately does not use. That
- * cost is stated here rather than hidden, and it is what
- * `npm run search:benchmark` measures against the p95 threshold.
+ * WHAT AN INDEX SCAN ON THE ALIAS PREFIX ACTUALLY NEEDS — TWO CONDITIONS, BOTH
+ * MEASURED, AND THE SECOND IS WHY THE PATTERN IS BOUND INTO THE BRANCHES BELOW
+ * RATHER THAN PROJECTED THROUGH THE CTE.
+ *
+ *  * The index must carry `text_pattern_ops`. PostgreSQL derives the `>=`/`<`
+ *    range bounds a LIKE prefix becomes only when the indexed comparison is
+ *    byte order — a `*_pattern_ops` operator class, or a column collation of C.
+ *    The databases this project creates are `en_US.utf8`, and the one this
+ *    service's own suite runs against is ICU `und`, so neither gives that for
+ *    free; `idx_catalog_food_aliases_lower_alias` is declared with the class in
+ *    `prisma/migrations/20260908000000_meal_planning/migration.sql` for exactly
+ *    this predicate. Under the default `text_ops` the planner refuses the index
+ *    even with `enable_seqscan = off` — it is unusable, not merely unattractive.
+ *  * The pattern must reach the planner as a CONSTANT. The bound-derivation only
+ *    runs when the LIKE right-hand side is a plan-time `Const`; a value
+ *    projected out of a CTE arrives as a `Var`, and PostgreSQL materialises this
+ *    CTE anyway because `search` is referenced more than once. Measured with the
+ *    class in place: the same statement with the pattern selected from the CTE
+ *    used no index at all, while binding it into each branch — which is what the
+ *    two branches below do — produced the index scan.
+ *
+ * Both conditions are asserted, not asserted-to: `catalog.service.test.ts` pins
+ * the operator class out of `pg_opclass`, pins the plan under
+ * `enable_seqscan = off`, and reads the `pg_stat_user_indexes.idx_scan` delta
+ * across a real `searchPublishedFoods` call. The cost direction they protect,
+ * measured on a 10,000-alias corpus at 1% selectivity: ~2.5-3.0 ms for the
+ * sequential scan against ~0.1-0.2 ms for the index scan.
+ *
+ * The alias branches still read the whole published alias set for the two
+ * full-text contributions, because the schema declares no GIN index over aliases
+ * and a trigram index would need `CREATE EXTENSION pg_trgm`, which this schema
+ * deliberately does not use. That cost is stated here rather than hidden, and it
+ * is what `npm run search:benchmark` measures against the p95 threshold.
  */
 const catalogMatchSet = (q: string): Prisma.Sql => {
     const prefixPattern = `${q.toLowerCase().replace(LIKE_METACHARACTERS, '\\$&')}%`;
 
     return Prisma.sql`
         WITH search AS (
-            SELECT
-                plainto_tsquery(${TEXT_SEARCH_CONFIG}::regconfig, ${q}) AS tsq,
-                ${prefixPattern} AS prefix
+            SELECT plainto_tsquery(${TEXT_SEARCH_CONFIG}::regconfig, ${q}) AS tsq
         ),
         contributions AS (
             SELECT f.id, ts_rank(f.search_vector, s.tsq) AS rank
@@ -305,9 +331,8 @@ const catalogMatchSet = (q: string): Prisma.Sql => {
 
             SELECT f.id, ${PREFIX_MATCH_RANK}::real AS rank
             FROM catalog_foods f
-            CROSS JOIN search s
             WHERE f.publication_status = ${PUBLISHED}
-                AND (lower(f.display_name) LIKE s.prefix OR lower(f.canonical_name) LIKE s.prefix)
+                AND (lower(f.display_name) LIKE ${prefixPattern} OR lower(f.canonical_name) LIKE ${prefixPattern})
 
             UNION ALL
 
@@ -326,9 +351,8 @@ const catalogMatchSet = (q: string): Prisma.Sql => {
             SELECT a.catalog_food_id AS id, ${PREFIX_MATCH_RANK}::real AS rank
             FROM catalog_food_aliases a
             JOIN catalog_foods f ON f.id = a.catalog_food_id
-            CROSS JOIN search s
             WHERE f.publication_status = ${PUBLISHED}
-                AND lower(a.alias) LIKE s.prefix
+                AND lower(a.alias) LIKE ${prefixPattern}
         )
     `;
 };

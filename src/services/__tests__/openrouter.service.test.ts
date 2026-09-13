@@ -27,7 +27,13 @@
  *  - **Every failure leaves as an `OpenRouterError`.** A raw `Response`, a bare
  *    `TypeError` from serialisation, a `SyntaxError` from an unreadable body or
  *    an `AbortError` escaping this module would all force callers to
- *    pattern-match a vendor error shape (Rule 7 §9).
+ *    pattern-match a vendor error shape (Rule 7 §9). `throw` accepts any
+ *    value, so that promise is also driven with rejections that are not
+ *    `Error`s at all — `null`, a string, an object, a symbol, a value whose
+ *    accessors throw — each of which must still leave as an `OpenRouterError`
+ *    naming what went wrong, because `estimate.service.ts` translates by
+ *    `instanceof` and a value that slips past it answers a client 500 instead
+ *    of the 502 the controller maps.
  *  - **The accessor fails loudly and for free.** A missing key costs neither a
  *    request nor a timer, because `getOpenRouterConfig()` runs before either
  *    exists.
@@ -149,7 +155,11 @@ const TIMED_OUT_MESSAGE = 'OpenRouter request timed out';
 const UNPARSEABLE_MESSAGE = 'Model returned unparseable output';
 /** `http`: `OpenRouter returned ${status}: ${body.slice(0, 300)}`. */
 const HTTP_MESSAGE_PREFIX = 'OpenRouter returned ';
-/** `network`: `OpenRouter request failed: ${(error as Error).message}`. */
+/**
+ * `network`: `OpenRouter request failed: ` followed by the thrown value's own
+ * `message`, or — when it has none, because `throw` accepts any value — a
+ * description of the value itself.
+ */
 const VENDOR_FAILURE_PREFIX = 'OpenRouter request failed:';
 
 /** The number of leading body characters the `http` message carries. */
@@ -940,6 +950,26 @@ describe('OpenRouterError', () => {
             expect(error.kind).toBe('timeout');
             expect(error.message).toBe(TIMED_OUT_MESSAGE);
         });
+
+        // The abort carrier is not one shape: undici raises a DOMException,
+        // a renamed Error is what a hand-rolled transport usually raises, and
+        // a double may raise an object carrying nothing but the name. All
+        // three are timeouts, which is why the name is read off the value AS
+        // THROWN. Rebuilding it as an Error first would keep the first two and
+        // reclassify this one as `network` — a silent downgrade of a timeout,
+        // so it is pinned here rather than left to the implementation's shape.
+        it('recognises an abort carrier that is not an Error at all', async () => {
+            const openRouter = loadConfigured();
+            const stub = rejectWith({ name: 'AbortError' });
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('timeout');
+            expect(error.message).toBe('OpenRouter request timed out');
+            expect(error.message).toBe(TIMED_OUT_MESSAGE);
+            expect(error.kind).not.toBe('network');
+            expect(error.message).not.toContain(VENDOR_FAILURE_PREFIX);
+        });
     });
 
     describe('network', () => {
@@ -974,14 +1004,184 @@ describe('OpenRouterError', () => {
             expect(error.message).toBe('OpenRouter request failed: socket hang up');
         });
 
-        it('reports a rejection that is not an Error without crashing on it', async () => {
+        it('names a rejection that is not an Error, rather than reporting it as undefined', async () => {
             const openRouter = loadConfigured();
             const stub = rejectWith('not even an error');
 
             const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
 
             expect(error.kind).toBe('network');
-            expect(error.message).toBe('OpenRouter request failed: undefined');
+            expect(error.message).toBe('OpenRouter request failed: not even an error');
+            expect(error.message).not.toBe('OpenRouter request failed: undefined');
+        });
+
+        /**
+         * REJECTIONS THAT ARE NOT `Error`s.
+         *
+         * `throw` accepts any value, and this boundary is reached through a
+         * declared `fetchImpl` seam — every double in this repository is an
+         * injected impl, and the catalog scripts' rate limiter wraps
+         * `globalThis.fetch` — so a rejection carrying no `message`, or no
+         * properties at all, is a shape the module has to answer rather than a
+         * shape it may assume away. Two things are asserted for each:
+         * `vendorFailure` proves an `OpenRouterError` left the module (a raw
+         * `TypeError` from reading `.name` off `null` would be caught here, and
+         * it is what made the two shipped endpoints answer 500 instead of the
+         * 502 their controller maps), and the message proves the thrown value's
+         * own content reached the text a client is shown.
+         *
+         * A thrown string is carried verbatim rather than JSON-encoded, since
+         * its quotes would otherwise appear in that text; anything else is
+         * serialised, because that is what names an object's fields.
+         */
+        const nonErrorRejections: Array<[string, () => unknown, string]> = [
+            ['null', () => null, 'OpenRouter request failed: null'],
+            ['undefined', () => undefined, 'OpenRouter request failed: undefined'],
+            ['a string', () => 'connection reset by peer', 'OpenRouter request failed: connection reset by peer'],
+            ['an empty string', () => '', 'OpenRouter request failed: '],
+            ['a number', () => 503, 'OpenRouter request failed: 503'],
+            ['a boolean', () => false, 'OpenRouter request failed: false'],
+            [
+                'a plain object',
+                () => ({ code: 'ECONNRESET', syscall: 'read' }),
+                'OpenRouter request failed: {"code":"ECONNRESET","syscall":"read"}',
+            ],
+            ['an array', () => ['read', 'ECONNRESET'], 'OpenRouter request failed: ["read","ECONNRESET"]'],
+            ['a symbol', () => Symbol('transport'), 'OpenRouter request failed: Symbol(transport)'],
+            // JSON.stringify THROWS on a bigint and on a cycle. Both are here
+            // to prove that its throw cannot leave the catch whose whole job is
+            // to stop this class of escape; the description degrades to what
+            // String() can say instead of disappearing.
+            ['a bigint', () => BigInt('9007199254740993'), 'OpenRouter request failed: 9007199254740993'],
+            [
+                'a circular object',
+                () => {
+                    const cycle: Record<string, unknown> = { code: 'ECONNRESET' };
+                    cycle.self = cycle;
+
+                    return cycle;
+                },
+                'OpenRouter request failed: [object Object]',
+            ],
+        ];
+
+        it.each(nonErrorRejections)('reports %s as a network failure that names it', async (_label, buildThrown, expected) => {
+            const openRouter = loadConfigured();
+            const stub = rejectWith(buildThrown());
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe(expected);
+            expect(error.status).toBeUndefined();
+        });
+
+        // A carrier that is not an Error but does have a message is described
+        // by that message: the value's own account of the failure is better
+        // than a serialisation of its fields, and this is the shape a
+        // transport wrapper produces when it rejects with a POJO.
+        it('prefers a non-Error carriers own message over a description of its fields', async () => {
+            const openRouter = loadConfigured();
+            const stub = rejectWith({ code: 'ECONNRESET', message: 'read ECONNRESET' });
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe('OpenRouter request failed: read ECONNRESET');
+            expect(error.message).not.toContain('ECONNRESET"');
+        });
+
+        // The empty message is the one case where the separator is the whole
+        // of what follows the prefix, and it is asserted as such because a
+        // "helpful" fallback for a blank message would change shipped text.
+        it('reports an Error whose message is empty as the prefix and nothing else', async () => {
+            const openRouter = loadConfigured();
+            const stub = rejectWith(new Error(''));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe('OpenRouter request failed: ');
+            expect(error.message).toBe(`${VENDOR_FAILURE_PREFIX} `);
+        });
+
+        /**
+         * The description of a thrown value is bounded by the same 300
+         * characters the `http` branch allows a vendor response body, because
+         * it reaches the same two places: a client's 502 body and the server
+         * log. An Error's own `message` is NOT bounded — it never has been, and
+         * the truncated-JSON parse failure surfaces a SyntaxError message
+         * through this very function — so the two are asserted together, one
+         * capped and one whole.
+         */
+        it('caps the description of an oversized thrown string at the vendor-body limit', async () => {
+            const openRouter = loadConfigured();
+            const stub = rejectWith('x'.repeat(1_000));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe(`OpenRouter request failed: ${'x'.repeat(HTTP_BODY_LIMIT)}`);
+        });
+
+        it('caps the description of an oversized thrown object at the vendor-body limit', async () => {
+            const openRouter = loadConfigured();
+            const serialised = JSON.stringify({ detail: 'y'.repeat(1_000) });
+            const stub = rejectWith({ detail: 'y'.repeat(1_000) });
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe(`OpenRouter request failed: ${serialised.slice(0, HTTP_BODY_LIMIT)}`);
+        });
+
+        it('does not cap an Errors own message', async () => {
+            const openRouter = loadConfigured();
+            const stub = rejectWith(new Error('z'.repeat(1_000)));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe(`OpenRouter request failed: ${'z'.repeat(1_000)}`);
+        });
+
+        // A property whose getter throws must be answered exactly as an absent
+        // property is, or the guarded read is only guarded against the values
+        // that were thought of: an accessor that throws would raise from inside
+        // the catch that exists to stop anything but an OpenRouterError from
+        // leaving, which is the same escape in a second form.
+        it('treats a thrown value whose message getter throws as one that has no message', async () => {
+            const openRouter = loadConfigured();
+            const hostile = Object.defineProperty({ code: 'ECONNRESET' }, 'message', {
+                get: (): never => {
+                    throw new Error('this getter is hostile');
+                },
+                enumerable: false,
+            });
+            const stub = rejectWith(hostile);
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe('OpenRouter request failed: {"code":"ECONNRESET"}');
+            expect(error.message).not.toContain('this getter is hostile');
+        });
+
+        it('reports a message that cannot be converted to text at all without crashing', async () => {
+            const openRouter = loadConfigured();
+            const stub = rejectWith({
+                message: {
+                    toString: (): never => {
+                        throw new Error('this toString is hostile');
+                    },
+                },
+            });
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe('OpenRouter request failed: an unreadable value');
+            expect(error.message).not.toContain('this toString is hostile');
         });
 
         it('reports an unreadable success body as a transport failure, not as empty output', async () => {
@@ -1627,6 +1827,18 @@ describe('estimate.service regression', () => {
             'network',
             () => rejectWith(new TypeError('fetch failed')),
             'OpenRouter request failed: fetch failed',
+        ],
+        // A rejection that is not an Error travels the same translation seam as
+        // one that is: `callModel` translates by `instanceof OpenRouterError`,
+        // so a value the boundary failed to wrap would arrive at the
+        // controller untranslated and be answered as a 500 rather than the 502
+        // `estimation_failed` these two endpoints owe a client. Driven at both
+        // endpoints, and through the no-nesting check, from this one row.
+        [
+            'a transport rejection that is not an Error',
+            'network',
+            () => rejectWith(null),
+            'OpenRouter request failed: null',
         ],
         [
             'unreadable content',

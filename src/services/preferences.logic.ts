@@ -99,6 +99,7 @@ import {
     WeightUnitPref,
 } from '../types/mealPlanning';
 import { evaluatePlanningEligibility, PlanningPreferences, PlanningRecipeVersion } from './recipe.logic';
+import { isCalendarDayKey } from '../utils/calendarDay';
 
 /* ---------------------------------------------------------------------------
  * Closed vocabularies
@@ -259,7 +260,9 @@ export const MAX_DISLIKED_FOOD_IDS = 100;
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-const DAY_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+// The day-key shape is NOT declared here. It lives once, with the predicate that
+// uses it, in `utils/calendarDay.ts` — a second copy is how three services came
+// to disagree about the calendar.
 
 /**
  * A 24-hour wall-clock time, zero-padded.
@@ -422,13 +425,14 @@ const comparisonKey = (value: string): string =>
         .replace(WHITESPACE_RUN_PATTERN, ' ')
         .trim();
 
-const DAYS_IN_MONTH: readonly number[] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
-const isLeapYear = (year: number): boolean =>
-    (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
-
 /**
  * Whether a value is a real `YYYY-MM-DD` calendar day.
+ *
+ * THE implementation, which this module used to own, now lives in
+ * `utils/calendarDay.ts` and is shared with `mealPlan.logic.ts` and
+ * `plannedMealLog.logic.ts`. It is re-exported here — the same binding, not a
+ * wrapper — because this module's callers and its test have always asked it
+ * this question and the name is part of its surface.
  *
  * The month length is computed from the proleptic Gregorian rules rather than
  * from a `Date`, so `2026-02-30` is refused, `2024-02-29` is accepted, and no
@@ -436,21 +440,7 @@ const isLeapYear = (year: number): boolean =>
  * RANGE for a plan is a different question, and not this module's: it needs
  * today's date in the user's zone, which only the caller can establish.
  */
-export const isCalendarDayKey = (value: unknown): value is string => {
-    if (typeof value !== 'string' || !DAY_KEY_PATTERN.test(value)) {
-        return false;
-    }
-
-    const [year, month, day] = value.split('-').map(Number);
-
-    if (month < 1 || month > 12 || day < 1) {
-        return false;
-    }
-
-    const lastDay = month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
-
-    return day <= lastDay;
-};
+export { isCalendarDayKey };
 
 /** Whether a value is a zero-padded 24-hour `HH:mm` wall-clock time. */
 export const isClockTime = (value: unknown): value is string =>

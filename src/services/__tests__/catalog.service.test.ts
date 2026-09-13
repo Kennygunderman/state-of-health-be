@@ -43,6 +43,21 @@
 // the order itself), so the conditions the evidence was produced under are part
 // of the run and not a claim about it.
 //
+// A SECOND PROOF RIDES ON THE SAME DATABASE: that the alias index is usable by
+// the service's own predicate. `idx_catalog_food_aliases_lower_alias` exists for
+// the prefix fallback in `catalogMatchSet`, and a btree can answer
+// `lower(alias) LIKE 'x%'` with a range scan only when the indexed comparison is
+// byte order — a `*_pattern_ops` operator class, or a column collation of C. The
+// database this suite creates has neither by accident: its default collation is
+// ICU `und`, which is the hostile case, and the index therefore carries
+// `text_pattern_ops` explicitly. The final describe pins that class out of
+// `pg_opclass`, pins the plan (with `enable_seqscan = off`, so cost is not a
+// variable), reads the `pg_stat_user_indexes.idx_scan` delta across a real
+// `searchPublishedFoods` call, and confirms equality is still served. The
+// committed schema-evidence gate cannot see an operator class at all —
+// `pg_get_indexdef(oid, k, …)` omits it — so these assertions are where that
+// property is held.
+//
 // Everything here is read-only with respect to the developer's own data: the
 // database is created and dropped by this file and is named after the ambient
 // test database, so parallel clones cannot collide.
@@ -416,5 +431,234 @@ describe('catalog read ordering across databases', () => {
                 /catalog_foods\.allergen_tags\[1\]/,
             );
         });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The alias-prefix index, proven usable by the predicate it exists for.
+ *
+ * DECLARED LAST, AND THAT IS LOAD-BEARING. Jest runs a describe-scoped
+ * `beforeAll` immediately before that describe's first test, in declaration
+ * order, and every assertion above depends on exact global state: five published
+ * foods, `searchPublishedFoods('beans').total === 5`, `getSuggestions` returning
+ * exactly those five names, and `getStatus` counting four published and one
+ * quarantined. The food and aliases seeded below would break all three if they
+ * existed earlier, so they are created here and nothing above can see them.
+ * ------------------------------------------------------------------------- */
+describe('the alias-prefix index the search fallback depends on', () => {
+    const INDEX_NAME = 'idx_catalog_food_aliases_lower_alias';
+
+    /**
+     * The seeded corpus, and why it is this size.
+     *
+     * The plan the FREE planner picks is a cost decision, so the test that reads
+     * the real service's index usage has to make the index the cheaper option.
+     * Measured on this database shape, the crossover sits between 200 and 1,000
+     * aliases (200: not used; 1,000, 2,000 and 5,000: used), so 2,000 is chosen
+     * with margin on the right side of it while staying quick to seed. The
+     * matching group is 1% of that, which is a realistic prefix selectivity —
+     * a pattern matching every row is legitimately a sequential scan and would
+     * prove nothing.
+     */
+    const ALIAS_COUNT = 2_000;
+    const ALIAS_GROUPS = 100;
+
+    /**
+     * Alias text that cannot collide with anything above.
+     *
+     * The five foods already seeded are the `beans` family, and the suite's
+     * assertions count matches of `beans` exactly. These aliases share no prefix
+     * with that term, the food they hang off is not a common dislike (so it
+     * cannot appear in `getSuggestions`), and its own `display_name` and
+     * `canonical_name` do not match the prefix either — so a row reaching the
+     * result can only have come through the ALIAS prefix branch.
+     */
+    const ALIAS_STEM = 'zalix murnen';
+    const MATCHING_GROUP = '007';
+    const PREFIX_QUERY = `${ALIAS_STEM} ${MATCHING_GROUP}`;
+    const PREFIX_PATTERN = `${PREFIX_QUERY}%`;
+    const EXACT_ALIAS = `${ALIAS_STEM} ${MATCHING_GROUP} 7`;
+    const FOOD_SEQUENCE = 901;
+
+    let foodId = '';
+
+    /** The `pg_stat_user_indexes` counter for this index, on this database. */
+    const readIndexScanCount = async (): Promise<number> => {
+        // Statistics accumulate in the backend that did the work and are flushed
+        // at transaction end, at most once a second. `pg_stat_force_next_flush`
+        // lifts that interval for the calling backend, and
+        // `pg_stat_clear_snapshot` drops the per-transaction cached view so the
+        // read that follows sees what was just flushed. Both return `void`,
+        // which `$queryRaw` cannot deserialize, hence `$executeRawUnsafe` —
+        // neither statement interpolates anything.
+        await prisma.$executeRawUnsafe('SELECT pg_stat_force_next_flush()');
+        await prisma.$executeRawUnsafe('SELECT pg_stat_clear_snapshot()');
+
+        const rows = await prisma.$queryRaw<{ idx_scan: string }[]>`
+            SELECT COALESCE(idx_scan, 0)::text AS idx_scan
+            FROM pg_stat_user_indexes
+            WHERE schemaname = 'public' AND indexrelname = ${INDEX_NAME}
+        `;
+        if (rows.length !== 1) {
+            throw new Error(`${INDEX_NAME} is absent from pg_stat_user_indexes; the migration did not create it.`);
+        }
+        return Number(rows[0].idx_scan);
+    };
+
+    /**
+     * The counter once the work that produced it is visible.
+     *
+     * The search runs on a pooled connection, and the flush above only forces
+     * the connection it runs on, so the first read can legitimately precede the
+     * flush of the backend that served the search. Polling makes the assertion
+     * deterministic instead of racing that: it returns as soon as the counter
+     * moves and only spends time when it has not.
+     */
+    const indexScanCountAbove = async (baseline: number): Promise<number> => {
+        const attempts = 40;
+        const pauseMs = 250;
+
+        for (let attempt = 0; attempt < attempts; attempt += 1) {
+            const observed = await readIndexScanCount();
+            if (observed > baseline) {
+                return observed;
+            }
+            await new Promise((resolve) => setTimeout(resolve, pauseMs));
+        }
+        return readIndexScanCount();
+    };
+
+    /**
+     * The plan for one statement, as text.
+     *
+     * The pattern is a literal rather than a bound parameter on purpose: these
+     * two tests are about the OPERATOR CLASS, and a literal removes the second
+     * condition an index scan needs (the pattern reaching the planner as a
+     * constant) as a variable. That condition is what the `idx_scan` test
+     * covers, through the real caller. `enable_seqscan = off` is set with `SET
+     * LOCAL` inside the transaction, so it cannot leak to another test.
+     */
+    const explain = async (predicate: string, disableSeqScan: boolean): Promise<string> =>
+        prisma.$transaction(async (tx) => {
+            if (disableSeqScan) {
+                await tx.$executeRawUnsafe('SET LOCAL enable_seqscan = off');
+            }
+            const rows = await tx.$queryRawUnsafe<{ 'QUERY PLAN': string }[]>(
+                `EXPLAIN SELECT catalog_food_id FROM catalog_food_aliases WHERE ${predicate}`,
+            );
+            return rows.map((row) => row['QUERY PLAN']).join('\n');
+        });
+
+    beforeAll(async () => {
+        const food = await makeCatalogFood({
+            sequence: FOOD_SEQUENCE,
+            search_text: 'index probe food',
+            // Excluded from the dislike suggestions by construction, so this food
+            // is invisible to every assertion that counts them.
+            is_common_dislike: false,
+        });
+        foodId = food.id;
+
+        // One statement rather than 2,000 round trips: `generate_series` builds
+        // the alias text server-side. The only value crossing from this process
+        // is the food id, and it is BOUND; the stem and the two counts are
+        // constants of this file, placed in the statement because PostgreSQL
+        // cannot infer a type for a bare parameter used as a modulus or as a
+        // `generate_series` bound.
+        await prisma.$executeRawUnsafe(
+            `INSERT INTO catalog_food_aliases (catalog_food_id, alias)
+             SELECT $1::uuid,
+                    '${ALIAS_STEM} ' || lpad((series % ${ALIAS_GROUPS})::text, 3, '0') || ' ' || series
+             FROM generate_series(0, ${ALIAS_COUNT - 1}) AS series`,
+            foodId,
+        );
+
+        // Without statistics the planner costs the table from its defaults, and
+        // the cost-based test below would be measuring the absence of an ANALYZE
+        // rather than the index.
+        await prisma.$executeRawUnsafe('ANALYZE catalog_food_aliases');
+    });
+
+    it('seeded the corpus the plan assertions are made against', async () => {
+        const [counts] = await prisma.$queryRaw<{ total: bigint; matching: bigint }[]>`
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE lower(alias) LIKE ${PREFIX_PATTERN}) AS matching
+            FROM catalog_food_aliases
+            WHERE catalog_food_id = ${foodId}::uuid
+        `;
+
+        expect(Number(counts.total)).toBe(ALIAS_COUNT);
+        // 1% of the corpus: selective enough for an index scan to be the cheaper
+        // plan, which is the premise of the idx_scan test.
+        expect(Number(counts.matching)).toBe(ALIAS_COUNT / ALIAS_GROUPS);
+    });
+
+    it('is declared with the text_pattern_ops operator class on its first key', async () => {
+        // Read from the catalog because this is precisely what the §0.9.1 schema
+        // gate could not see before this change: `pg_get_indexdef(oid, k, …)`
+        // renders the key expression WITHOUT its operator class, so the class has
+        // to be joined out of pg_opclass by the per-key oid in `indclass` (an
+        // oidvector, zero-based).
+        const [index] = await prisma.$queryRaw<{ amname: string; opcname: string; keys: number }[]>`
+            SELECT am.amname, oc.opcname, i.indnkeyatts AS keys
+            FROM pg_index i
+            JOIN pg_class ic ON ic.oid = i.indexrelid
+            JOIN pg_class tc ON tc.oid = i.indrelid
+            JOIN pg_namespace n ON n.oid = tc.relnamespace
+            JOIN pg_am am ON am.oid = ic.relam
+            JOIN pg_opclass oc ON oc.oid = i.indclass[0]
+            WHERE n.nspname = 'public' AND ic.relname = ${INDEX_NAME}
+        `;
+
+        expect(index).toBeDefined();
+        expect(index.amname).toBe('btree');
+        expect(index.keys).toBe(1);
+        expect(index.opcname).toBe('text_pattern_ops');
+    });
+
+    it('is the plan for a left-anchored alias prefix even with sequential scans disabled', async () => {
+        const plan = await explain(`lower(alias) LIKE '${PREFIX_PATTERN}'`, true);
+
+        // This is the assertion that fails if the operator class is reverted.
+        // With the default `text_ops` the planner cannot derive the >=/< bounds a
+        // LIKE prefix becomes — the column collation here is ICU `und`, not C —
+        // and it then refuses this index even with `enable_seqscan = off`,
+        // falling back to a scan or to an unrelated index. `~>=~` and `~<~` are
+        // the pattern-ops comparison operators those bounds are expressed with,
+        // so their presence is what distinguishes a genuine range scan on this
+        // index from an index chosen for some other reason and filtered.
+        expect(plan).toContain(INDEX_NAME);
+        expect(plan).toMatch(/~>=~/);
+        expect(plan).toMatch(/~<~/);
+    });
+
+    it('is used by searchPublishedFoods itself, under the planner´s own costing', async () => {
+        const before = await readIndexScanCount();
+        const result = await searchPublishedFoods(PREFIX_QUERY, 1, 25);
+        const after = await indexScanCountAbove(before);
+
+        // The service must have answered from the alias prefix branch: this food
+        // matches on no name and no `search_text`, only on its aliases.
+        expect(result.total).toBe(1);
+        expect(result.items.map((item) => item.name)).toEqual([`Fixture Food ${FOOD_SEQUENCE}`]);
+
+        // And the fallback must have READ the index while doing it. This is the
+        // assertion that fails if the pattern goes back to being projected
+        // through the `search` CTE: a value selected out of a materialised CTE
+        // reaches the planner as a Var rather than a constant, the LIKE bounds
+        // cannot be derived from it, and the same call was measured to leave this
+        // counter at zero across a 10,000-alias corpus.
+        expect(after).toBeGreaterThan(before);
+    });
+
+    it('still serves equality on lower(alias), which is why no second index is added', async () => {
+        const plan = await explain(`lower(alias) = '${EXACT_ALIAS}'`, false);
+
+        // `text_pattern_ops` supports =, < and > as well as the pattern
+        // operators, so replacing `text_ops` costs nothing. That is the evidence
+        // behind not adding a second `text_ops` index for equality — and the
+        // check that would catch its loss if one day a caller needed it.
+        expect(plan).toContain(INDEX_NAME);
+        expect(plan).toContain('Index Scan');
     });
 });

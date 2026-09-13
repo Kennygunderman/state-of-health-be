@@ -817,6 +817,37 @@ describe('migration ledgers', () => {
             expect(a).toBe(b);
         });
 
+        it('declares the alias index with the same text_pattern_ops class under both', () => {
+            const aliasIndexLines = (catalogue: string[]): string[] =>
+                catalogue.filter((line) => line.includes('idx_catalog_food_aliases_lower_alias'));
+
+            const a = aliasIndexLines(outcomeOf(ledgerA, 'A').catalogue);
+            const b = aliasIndexLines(outcomeOf(ledgerB, 'B').catalogue);
+
+            // The non-vacuity guard for this construct, in the same shape as the
+            // generated column above. The catalogue equality test at the top of
+            // this describe is satisfied by two databases that BOTH lost the
+            // operator class, so only a positive assertion holds the manual copy
+            // to the authoritative migration here — and the class is a
+            // correctness property, not a preference: without
+            // `text_pattern_ops` the index cannot serve the left-anchored
+            // `lower(alias) LIKE` predicate `catalog.service.ts` wrote it for,
+            // because the collation of a database created the ordinary way is
+            // not C. `pg_indexes.indexdef`, which `readCatalogue` records, does
+            // carry the class, so the comparison can see it; the pg_catalog
+            // section of `docs/meal-planning/expected-schema-diff.sql` is what
+            // pins it against the ledger being wrong in the same way twice.
+            //
+            // It also matters that this is the only ledger-equivalence evidence
+            // this run produces: `pg_dump` is absent on this host, so the schema
+            // dump comparison below is skipped and the catalogue is all there is.
+            expect(a).toHaveLength(1);
+            expect(b).toHaveLength(1);
+            expect(a[0]).toContain('text_pattern_ops');
+            expect(b[0]).toContain('text_pattern_ops');
+            expect(a).toEqual(b);
+        });
+
         (pgDumpAvailable ? it : it.skip)(
             `produces an identical pg_dump schema${pgDumpAvailable ? '' : ' — not run because pg_dump is unavailable'}`,
             () => {

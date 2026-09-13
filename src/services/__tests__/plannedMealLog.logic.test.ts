@@ -304,6 +304,31 @@ describe('isCalendarDayKey', () => {
         expect(isCalendarDayKey(undefined)).toBe(false);
         expect(isCalendarDayKey(new Date('2026-07-05T00:00:00.000Z'))).toBe(false);
     });
+
+    /**
+     * This name now resolves to the shared rule in `utils/calendarDay.ts`,
+     * which is the same binding `preferences.logic.ts` exposes.
+     *
+     * It replaces a round trip through `Date.UTC(year, month - 1, day)`. That
+     * constructor maps a year of 0-99 to 1900-1999, so this route read
+     * `0004-02-29` as 1904, the round trip could not match, and the log request
+     * was refused with `invalid_date` — while the preference review step, which
+     * used a month-length table, accepted the very same day as a plan's
+     * `startDate`. One request contradicting another about the calendar is the
+     * defect; these cases pin the agreement.
+     */
+    it.each(['0000-01-01', '0001-01-01', '0004-02-29', '0050-06-15', '0099-12-31'])(
+        'accepts %s, which the Date round trip placed in the twentieth century',
+        (value) => {
+            expect(isCalendarDayKey(value)).toBe(true);
+        },
+    );
+
+    it('takes the leap rule with it, rather than waiving it for those years', () => {
+        expect(isCalendarDayKey('0003-02-29')).toBe(false);
+        expect(isCalendarDayKey('0100-02-29')).toBe(false);
+        expect(isCalendarDayKey('0004-02-30')).toBe(false);
+    });
 });
 
 /* ---------------------------------------------------------------------------

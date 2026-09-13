@@ -870,6 +870,14 @@ export type ParsedCatalogSearchQuery =
 
 const SEARCH_QUERY_FIELD = 'q';
 
+/**
+ * The C0 control characters plus DEL. A plain character class with no `u` flag
+ * on purpose: `tsconfig.json` targets es2016 and declares no `lib`, so the
+ * unicode property escape `\p{Cc}` this would otherwise be written as does not
+ * compile against this program.
+ */
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001F\u007F]/;
+
 const invalidSearchQuery = (message: string, code: string): ParsedCatalogSearchQuery => ({
     kind: 'error',
     code: 'invalid_request',
@@ -879,13 +887,26 @@ const invalidSearchQuery = (message: string, code: string): ParsedCatalogSearchQ
 
 /**
  * Validates `?q=` for `GET /catalog/foods`: the trimmed query must be 2 to 60
- * characters.
+ * characters and must carry no control character.
  *
  * The lower bound is the rule worth pinning — a one-character query matches
  * most of a ten-thousand-item catalog, so it is rejected rather than served.
  * The page and limit of the same request belong to `parsePagination`, which
  * caps `limit` at the controller boundary; this module never clamps a limit,
  * because the in-process benchmark fetch deliberately reads past that cap.
+ *
+ * A control character is refused HERE, and before the length is measured. The
+ * refusal has to happen in the parser because U+0000 cannot be represented in
+ * a PostgreSQL `text` value at all, and `q` reaches the database as a bound
+ * parameter of `plainto_tsquery` and the alias `LIKE` in `catalog.service.ts`
+ * — so the statement fails while the parameter is being bound, surfacing as an
+ * opaque driver error (SQLSTATE 22021 wrapped as Prisma P2010) instead of the
+ * `400 invalid_request` a bad query string owes the caller (§0.5.2). The
+ * refused class is the whole of C0 plus DEL rather than U+0000 alone: the rest
+ * bind cleanly, but only to search for text no user typed. It precedes the
+ * length test because the length of a string carrying control bytes is not a
+ * meaningful complaint, and it rejects rather than strips, because a stripped
+ * query is a different query silently answered.
  *
  * `unknown` rather than `string`: `req.query` members are user input, and `qs`
  * yields an array when a parameter repeats — the first occurrence wins, exactly
@@ -899,6 +920,10 @@ export const parseCatalogSearchQuery = (query: unknown): ParsedCatalogSearchQuer
     }
 
     const q = raw.trim();
+
+    if (CONTROL_CHARACTER_PATTERN.test(q)) {
+        return invalidSearchQuery('q must not contain control characters', 'invalid_characters');
+    }
 
     if (q.length < MIN_SEARCH_QUERY_LENGTH || q.length > MAX_SEARCH_QUERY_LENGTH) {
         return invalidSearchQuery(

@@ -318,6 +318,26 @@ describe('isCalendarDayKey', () => {
     it.each([undefined, null, 20260705, {}, ['2026-07-05']])('refuses the non-string %p', (value) => {
         expect(isCalendarDayKey(value)).toBe(false);
     });
+
+    /**
+     * This module's implementation is now THE implementation, shared from
+     * `utils/calendarDay.ts` with `mealPlan.logic.ts` and
+     * `plannedMealLog.logic.ts`.
+     *
+     * It won because it was the correct one. The other two round-tripped
+     * through `Date.UTC(year, month - 1, day)`, which maps a year of 0-99 to
+     * 1900-1999 and so refused every day before 0100 — while this table-driven
+     * rule accepted them. The visible split was between two requests: a
+     * `startDate` of `0004-02-29` was accepted by the review step here and
+     * refused as a `date` by the log route. The band is pinned at this name so
+     * the answer cannot quietly change back.
+     */
+    it.each(['0000-01-01', '0001-01-01', '0004-02-29', '0050-06-15', '0099-12-31'])(
+        'accepts %s, which the two Date-based implementations refused',
+        (value) => {
+            expect(isCalendarDayKey(value)).toBe(true);
+        },
+    );
 });
 
 describe('isClockTime', () => {

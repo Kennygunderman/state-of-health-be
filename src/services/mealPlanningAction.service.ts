@@ -9,8 +9,10 @@
  *
  *   1. lock     — the per-user advisory lock, first statement of the transaction
  *   2. reserve  — INSERT … ON CONFLICT (user_id, idempotency_key) DO NOTHING
- *   3. replay   — a key seen before either replays its stored response verbatim
- *                 or is a conflict; BOTH decided before any plan check
+ *   3. replay   — a key seen before either replays its stored response
+ *                 unchanged ({@link KeyedActionResult} says what "unchanged"
+ *                 guarantees) or is a conflict; BOTH decided before any plan
+ *                 check
  *   4. check    — only now the caller's plan status and revision checks
  *   5. work     — the caller's write, then its revision bump
  *   6. complete — freeze the response into the reserved row, ONCE: the
@@ -240,6 +242,20 @@ export type KeyedActionCompletion<TAction extends KeyedActionType = KeyedActionT
  * `unknown` and this module propagates that rather than asserting a shape it
  * did not verify. The controller only forwards it.
  *
+ * **The two attempts agree by VALUE, and the paths they take are why they
+ * cannot agree byte for byte.** A fresh action answers from the body held in
+ * memory ({@link runKeyedAction} returns what `shapeStoredResponse` froze); only
+ * a replay reads `meal_plan_actions.response_snapshot` back, and that column is
+ * `jsonb`, which has normalised the object's key order at rest. So `status` and
+ * `planRevisionAfter` are exactly equal across attempts and every value in the
+ * body is preserved exactly, while the body's serialised key order may differ —
+ * invisible to a JSON client, and the reason anything comparing the two must
+ * compare parsed bodies rather than JSON text. `readStoredResponse` in
+ * `mealPlanningAction.logic.ts` states that contract in full; storing the
+ * snapshot in a `json` column instead would be the only way to make the texts
+ * identical, and §0.5.1 asks for an indistinguishable response, not identical
+ * bytes.
+ *
  * `planRevisionAfter` is a plain `number` in both directions. A fresh action
  * knows the revision it produced, and a replay is only ever answered from a row
  * whose three completion columns are all filled — a half-completed row is
@@ -466,9 +482,10 @@ const readReservedAction = async (
  * a status or a revision, so there is no way to order it wrong.
  *
  * The stored status and body are returned unchanged — never re-derived from the
- * action type — so every replay of a committed action is identical to every
- * other. (`jsonb` normalises key order at rest, so assert on the value rather
- * than on the serialized text.) A row's age is never consulted: rows are kept
+ * action type — so every replay of a committed action answers with the same
+ * status, revision and values as every other. (`jsonb` normalises key order at
+ * rest, so assert on the value rather than on the serialized text; see
+ * {@link KeyedActionResult}.) A row's age is never consulted: rows are kept
  * indefinitely and a committed action replays for as long as its row exists.
  *
  * Two abnormal shapes are reported rather than answered. A PENDING row is
@@ -591,10 +608,10 @@ const failedCompletion = async (
  *    pending state §0.5.1 defines. A row that has already completed therefore
  *    matches nothing, so a duplicate or misordered completion updates ZERO
  *    rows and fails instead of silently replacing the stored status, body,
- *    revision or created ids. Verbatim first-response replay depends on the
- *    stored response never changing after it is written, and nothing but this
- *    predicate enforces that: the columns are nullable by design, so the
- *    database will happily accept a second write.
+ *    revision or created ids. Replaying the FIRST response depends on the stored
+ *    response never changing after it is written, and nothing but this predicate
+ *    enforces that: the columns are nullable by design, so the database will
+ *    happily accept a second write.
  *
  * The created ids are resolved through the pure per-action rule first, so a
  * completion that does not describe its own action aborts the transaction
@@ -643,8 +660,10 @@ export const completeAction = async <TAction extends KeyedActionType>(
  * Runs one keyed write at most once.
  *
  * Lock, reserve, and — if the key is new — run `work` and freeze its response.
- * If the key is not new, replay the stored response verbatim or answer
+ * If the key is not new, replay the stored response unchanged or answer
  * `IdempotencyConflictError` (409), before `work` or any plan check is reached.
+ * What a fresh answer and a replay of it are guaranteed to share, and what they
+ * are not, is {@link KeyedActionResult}'s.
  *
  * `tx` must be an open interactive transaction — obtain it from
  * {@link withMealPlanningTransaction}. The type refuses the global client and
@@ -693,7 +712,9 @@ export const runKeyedAction = async <TAction extends KeyedActionType>(
         await completeAction(lockedTx, reservation, response, completion);
 
         // The stored values, so the first response and every later replay of it
-        // are the same response.
+        // carry the same status, revision and body values. This is the in-memory
+        // body — the column is read only on the replay path, which is the
+        // asymmetry KeyedActionResult describes.
         return {
             status: response.responseStatus,
             body: response.responseSnapshot,

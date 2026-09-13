@@ -10,7 +10,9 @@
  *   2. reserve the row: INSERT … ON CONFLICT (user_id, idempotency_key)
  *      DO NOTHING RETURNING id
  *   3. if nothing came back, {@link decideReplay} — replay the stored response
- *      verbatim and end the transaction, or answer 409 idempotency_conflict
+ *      unchanged ({@link readStoredResponse} states exactly what that means for
+ *      the status, the revision and the body) and end the transaction, or answer
+ *      409 idempotency_conflict
  *   4. ONLY THEN check the plan's status and revision
  *   5. do the work, bump `meal_plans.revision`
  *   6. complete the reserved row with {@link shapeStoredResponse}
@@ -470,8 +472,10 @@ export const buildRequestFingerprint = (
  * reserve:
  *
  *  - `proceed` — the key is new; do the work.
- *  - `replay`  — the key and the request both match; return the stored
- *                response verbatim.
+ *  - `replay`  — the key and the request both match; return the stored response
+ *                as {@link readStoredResponse} hands it back — the recorded
+ *                status and revision exactly, the body deep-equal to the first
+ *                one rather than byte-identical to it.
  *  - `conflict` — the key matches but the request does not; the service throws
  *                 `IdempotencyConflictError` (409).
  */
@@ -564,8 +568,9 @@ export interface StoredActionResponse {
 }
 
 /**
- * A stored response, ready to be sent again exactly as it was sent the first
- * time.
+ * A stored response, ready to be sent again — the status and revision exactly as
+ * they were recorded, the body deep-equal to the first one (see
+ * {@link readStoredResponse}).
  *
  * `planRevisionAfter` is a plain `number`, not `number | null`: a response is
  * only replayable once all three completion columns are filled (see
@@ -717,11 +722,30 @@ export const shapeStoredResponse = <TAction extends KeyedActionType>(
 /**
  * Reads a stored response back for replay, or `null` when the row has none yet.
  *
- * **The status is read, never re-derived.** Deriving it from the action type at
- * read time would let a future change to an endpoint's success status
- * retroactively rewrite what an already-stored action replays; a client can
- * never distinguish a replay from the original response precisely because both
- * the status and the body come back byte-for-byte as they were first sent.
+ * **The status and the revision are read, never re-derived.** Deriving the
+ * status from the action type at read time would let a future change to an
+ * endpoint's success status retroactively rewrite what an already-stored action
+ * replays. Both are integers and both come back exactly as they were recorded.
+ *
+ * **The body comes back as the stored VALUE: deep-equal to the first response,
+ * with no guarantee of identical text.** `meal_plan_actions.response_snapshot`
+ * is a `jsonb` column, and PostgreSQL normalises an object's key order at rest —
+ * keys sorted by length, then by bytes, at every nesting level — so a replay
+ * serialises its keys in THAT order whatever order they were written in, while
+ * every value it carries is preserved exactly. Each of the three keyed response
+ * types is reordered somewhere in its tree, so the text does differ in practice;
+ * what holds either way is the VALUE, and the value is the only thing to assert
+ * on. A client still cannot distinguish the two, which is what §0.5.1 requires:
+ * key order carries no meaning in a JSON object, and the mobile io-ts decoders
+ * read by key rather than by position.
+ *
+ * So the achievable form of §0.9.2's replay row — "returns the stored 201/200
+ * body byte-for-byte" — is a DEEP-EQUAL parsed body with an exactly equal status
+ * and revision, and anything that tests it must compare the PARSED body
+ * (`toEqual`), never the serialised JSON text and never a stored snapshot of it.
+ * A text comparison there fails against correct code, which is why this
+ * module's own suite pins the textual difference as a known property instead of
+ * leaving it to be rediscovered as a bug.
  *
  * Age is not consulted, and there is nothing to consult it with: a committed
  * action replays for as long as its row exists (see the file header).

@@ -787,6 +787,71 @@ describe('parseCatalogSearchQuery', () => {
             });
         }
     });
+
+    // The regression guard. A U+0000 cannot be represented in a PostgreSQL
+    // `text` value at all, and `q` reaches `plainto_tsquery` and the alias
+    // `LIKE` as a BOUND PARAMETER, so a query the parser answered `ok` failed
+    // while the parameter was being bound — SQLSTATE 22021 wrapped as Prisma
+    // P2010 — instead of returning a validation verdict.
+    it.each([
+        ['an interior NUL byte', 'zen\u0000til'],
+        ['a trailing NUL byte', 'a\u0000'],
+    ])('reports `invalid_characters` for %s', (_label, raw) => {
+        expect(parseCatalogSearchQuery(raw)).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'q must not contain control characters',
+            details: [{ field: 'q', code: 'invalid_characters' }],
+        });
+    });
+
+    it.each([
+        ['U+0001, start of heading', 'ri\u0001ce'],
+        ['U+001F, unit separator', 'ri\u001fce'],
+        ['U+007F, DEL', 'ri\u007fce'],
+        ['an interior newline', 'zen\ntil'],
+    ])('reports `invalid_characters` for %s inside an otherwise valid query', (_label, raw) => {
+        expect(parseCatalogSearchQuery(raw)).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'q must not contain control characters',
+            details: [{ field: 'q', code: 'invalid_characters' }],
+        });
+    });
+
+    // Precedence: the length of a string carrying control bytes is not a
+    // meaningful complaint, so the character class is checked first — in both
+    // directions, a query too long and one too short.
+    it('reports `invalid_characters` rather than `invalid_length` for an out-of-band query', () => {
+        const controlCharacterVerdict = {
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'q must not contain control characters',
+            details: [{ field: 'q', code: 'invalid_characters' }],
+        };
+        const tooLong = `${'x'.repeat(MAX_SEARCH_QUERY_LENGTH)}\u0000`;
+
+        expect(tooLong.length).toBe(MAX_SEARCH_QUERY_LENGTH + 1);
+        expect(parseCatalogSearchQuery(tooLong)).toEqual(controlCharacterVerdict);
+        // NUL is not whitespace, so this survives `trim` as a one-character
+        // query and is refused for what it carries, not for its length.
+        expect(parseCatalogSearchQuery('\u0000')).toEqual(controlCharacterVerdict);
+    });
+
+    // The other side of the new branch. `trim` removes the edge whitespace
+    // before the class is tested, so a tab or newline around a query is not
+    // what this rejects, and every non-control character is still searchable
+    // text.
+    it('accepts a query padded with whitespace control characters', () => {
+        expect(parseCatalogSearchQuery('\t chicken \n')).toEqual({ kind: 'ok', q: 'chicken' });
+    });
+
+    it.each([
+        ['accented text', 'café — crème brûlée'],
+        ['a well-formed emoji', 'salad \ud83e\udd57 bowl'],
+    ])('accepts %s unchanged', (_label, raw) => {
+        expect(parseCatalogSearchQuery(raw)).toEqual({ kind: 'ok', q: raw });
+    });
 });
 
 /* ---------------------------------------------------------------------------

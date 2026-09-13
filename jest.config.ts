@@ -44,16 +44,22 @@ const SERVICES_DIRECTORY = 'src/services';
 const LOGIC_MODULE_SUFFIX = '.logic.ts';
 
 /**
- * The four pure utility modules §0.7.1 names explicitly, as repo-relative
- * paths. They are listed rather than derived because `src/utils/` also holds
- * I/O boundaries (`firebase.ts`, `getUserId.ts`) that the plan excludes from
- * coverage; the exclusion is the point, so it is written where it can be read.
+ * The pure utility modules held to the bar, as repo-relative paths: the four
+ * §0.7.1 names explicitly, plus `calendarDay.ts`, which was extracted from
+ * three services that had each grown their own copy of the calendar rule and
+ * had drifted apart on years before 0100.
+ *
+ * Listed rather than derived because `src/utils/` also holds I/O boundaries
+ * (`firebase.ts`, `getUserId.ts`) that the plan excludes from coverage; the
+ * exclusion is the point, so it is written where it can be read. A module
+ * added here needs a colocated test, which the inventory test enforces.
  */
 export const COVERED_UTIL_MODULES: readonly string[] = [
     'src/utils/units.ts',
     'src/utils/seededRandom.ts',
     'src/utils/pagination.ts',
     'src/utils/featureFlags.ts',
+    'src/utils/calendarDay.ts',
 ];
 
 /**
@@ -80,7 +86,7 @@ const readServicesDirectory = (servicesDirectory: string) => {
 /**
  * Every file the coverage gate covers: each `*.logic.ts` presently in
  * `src/services/`, sorted for a stable emission order, followed by whichever of
- * the four utility modules above are on disk.
+ * the utility modules above are on disk.
  *
  * `rootDir` is a parameter so a test can point the derivation at a fixture
  * directory, and defaults to this file's own directory — the repository root

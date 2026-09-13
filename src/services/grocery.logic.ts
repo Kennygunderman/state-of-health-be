@@ -82,6 +82,7 @@ import {
     ToggleGroceryItemPayload,
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
+import { isCalendarDayKey } from '../utils/calendarDay';
 import {
     UnitFamily,
     formatCount,
@@ -147,7 +148,8 @@ const RAW_FOOD_STATE = 'raw';
 /** Separates the two halves of an aggregation key; neither half can contain it. */
 const IDENTITY_KEY_SEPARATOR = '\u0000';
 
-const DAY_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+// The day-key shape is NOT declared here: `utils/calendarDay.ts` owns it and
+// the calendar rule that applies it.
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -1295,8 +1297,18 @@ const ACTIVE_PLAN_STATUS = 'active';
 
 const ENDED_REASON: PlanEndedErrorData['reason'] = 'ended';
 
+/**
+ * A stored day key this module may compare, or a data fault.
+ *
+ * Asks the shared calendar predicate rather than the shape alone. The shape
+ * would accept `2026-02-30`, and a plan whose stored `end_date` names a day
+ * that does not exist has its lifecycle decided by a string comparison against
+ * a date no calendar contains — which is exactly the "malformed one would
+ * silently decide a plan's lifecycle by comparing nonsense" this guard exists
+ * to prevent, so it is refused on the same ground.
+ */
 const requireDayKey = (value: string, label: string): string => {
-    if (!DAY_KEY_PATTERN.test(value)) {
+    if (!isCalendarDayKey(value)) {
         throw new GroceryDataError(`${label} must be a YYYY-MM-DD day key, received ${JSON.stringify(value)}`);
     }
 

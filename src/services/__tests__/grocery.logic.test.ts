@@ -1772,6 +1772,32 @@ describe('requireGroceryWritablePlan', () => {
         it('refuses to judge a lifecycle against a malformed today', () => {
             expect(() => requireGroceryWritablePlan(activePlan, 'today')).toThrow(GroceryDataError);
         });
+
+        /**
+         * The guard asks the shared calendar rule, not the shape alone.
+         *
+         * Shape is not enough for what this function does with the value: it
+         * decides a plan's whole writability by comparing the two keys as
+         * strings, and `2026-02-30` compares perfectly well while naming no day
+         * at all. A stored `end_date` like that would put the plan's lifecycle
+         * on the wrong side of a boundary with nothing to show why.
+         */
+        it('refuses a stored end_date that is well shaped but names no day', () => {
+            expect(() => requireGroceryWritablePlan({ ...activePlan, end_date: '2026-02-30' }, '2026-07-05')).toThrow(
+                GroceryDataError,
+            );
+        });
+
+        it('refuses a today that is well shaped but names no day', () => {
+            expect(() => requireGroceryWritablePlan(activePlan, '2026-02-30')).toThrow(GroceryDataError);
+        });
+
+        it('still accepts a real leap day on either side of the comparison', () => {
+            const leapPlan = { ...activePlan, end_date: '2024-02-29' };
+
+            expect(requireGroceryWritablePlan(leapPlan, '2024-02-29')).toBe(leapPlan);
+            expect(() => requireGroceryWritablePlan(leapPlan, '2024-03-01')).toThrow(PlanNotActiveError);
+        });
     });
 });
 

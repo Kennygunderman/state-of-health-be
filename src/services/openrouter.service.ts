@@ -111,11 +111,87 @@ export const getOpenRouterConfig = (): OpenRouterConfig => {
 
 const unparseableError = (message: string): OpenRouterError => new OpenRouterError('unparseable', message);
 
+// How much of a thrown value's own description a failure message carries. The
+// same bound the `http` branch applies to a vendor response body, and for the
+// same reason: this text reaches a client through a 502 and the server log, so
+// an arbitrarily large thrown value must not be able to inflate either.
+const THROWN_DETAIL_LIMIT = 300;
+
+// Used only when every conversion below fails, which needs a value whose
+// `toString` throws and which JSON cannot serialise. Constant rather than
+// empty, because a failure that names nothing is indistinguishable from a bug
+// in this module.
+const UNDESCRIBABLE_THROWN_VALUE = 'an unreadable value';
+
+// A property read off a thrown value that cannot itself fail.
+//
+// `throw` accepts any value, so the catch below may receive null, undefined, a
+// primitive, or an object whose accessors throw — and it is the one place that
+// guarantees only an OpenRouterError leaves this module. Reading `.name` or
+// `.message` through an `as Error` cast breaks that guarantee from inside the
+// guarantee: a thrown null makes the read raise a TypeError that escapes
+// unwrapped. Optional chaining answers null/undefined with `undefined`, and the
+// try/catch answers a throwing getter exactly as it answers an absent property.
+const propertyOfThrown = (error: unknown, key: 'name' | 'message'): unknown => {
+    try {
+        return (error as Record<string, unknown> | null | undefined)?.[key];
+    } catch {
+        return undefined;
+    }
+};
+
+// `String()` with the same guard: a `message` is not necessarily a string, and
+// a non-string one may carry a `toString` that throws.
+const asText = (value: unknown): string => {
+    try {
+        return String(value);
+    } catch {
+        return UNDESCRIBABLE_THROWN_VALUE;
+    }
+};
+
+// Names a thrown value that carries no `message` of its own, so its content
+// survives into the client's 502 instead of the literal text 'undefined'.
+//
+// A thrown string is returned as it stands rather than JSON-encoded, so the
+// quotes and escapes a vendor string may contain are not added to what a user
+// reads. Anything else is serialised, because that is what names an object's
+// fields; both conversions are guarded because each one fails on a value a
+// transport is free to throw — JSON.stringify throws on a BigInt and on a
+// circular object, and returns `undefined` for a symbol or a function, while
+// `String()` runs a `toString` this module does not own.
+const describeThrown = (error: unknown): string => {
+    if (typeof error === 'string') {
+        return error.slice(0, THROWN_DETAIL_LIMIT);
+    }
+
+    let serialised: string | undefined;
+    try {
+        serialised = JSON.stringify(error);
+    } catch {
+        // A BigInt or a cycle: unserialisable, but `String()` below still names
+        // the value, so the description degrades rather than disappearing.
+        serialised = undefined;
+    }
+
+    return (serialised ?? asText(error)).slice(0, THROWN_DETAIL_LIMIT);
+};
+
 // The single source of the wrapped-failure wording. Two paths surface a caught
 // error's own message to the client (the transport catch below and the
 // fallback-slice parse failure in parseModelJson), and both have returned this
 // exact format since the endpoints shipped, so the format is defined once.
-const vendorFailureMessage = (error: unknown): string => `OpenRouter request failed: ${(error as Error).message}`;
+//
+// A value that has a `message` is described by it, converted exactly as the
+// template literal used to convert it and never truncated, so every message an
+// Error has ever produced here — including the empty one, which yields the
+// trailing separator and nothing else — is unchanged. Only a value with no
+// `message` at all takes the description path.
+const vendorFailureMessage = (error: unknown): string => {
+    const message = propertyOfThrown(error, 'message');
+
+    return `OpenRouter request failed: ${message === undefined ? describeThrown(error) : asText(message)}`;
+};
 
 // Not every routed model honors json_schema strictly — strip code fences and
 // parse the first {...} block as a fallback.
@@ -239,7 +315,13 @@ export const callOpenRouter = async (
         return parseModelJson(content);
     } catch (error) {
         if (error instanceof OpenRouterError) throw error;
-        if ((error as Error).name === 'AbortError') {
+        // `name` is read off the value as thrown, not off a normalised Error.
+        // The abort carrier is not one shape: undici raises a DOMException,
+        // a caller's own transport raises an Error renamed 'AbortError', and a
+        // hand-rolled double may raise a plain object carrying only that name.
+        // Rebuilding the value first would keep the first two and silently
+        // reclassify the third as `network`.
+        if (propertyOfThrown(error, 'name') === 'AbortError') {
             throw new OpenRouterError('timeout', 'OpenRouter request timed out');
         }
         throw new OpenRouterError('network', vendorFailureMessage(error));

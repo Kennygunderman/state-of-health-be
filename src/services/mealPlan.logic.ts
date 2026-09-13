@@ -108,6 +108,7 @@ import type {
     SetupStep,
 } from '../types/mealPlanning';
 import type { MealSlot, RecipePerServingNutrition } from '../types/recipe';
+import { isCalendarDayKey } from '../utils/calendarDay';
 import { mulberry32 } from '../utils/seededRandom';
 
 /* ---------------------------------------------------------------------------
@@ -245,7 +246,8 @@ const ACTIVE_PLAN_STATUS: PlanStatus = 'active';
 
 const ENDED_REASON: PlanEndedErrorData['reason'] = 'ended';
 
-const DAY_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+// The day-key shape is NOT declared here: it lives once in
+// `utils/calendarDay.ts` beside the predicate that applies it.
 const TIME_OF_DAY_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -433,24 +435,21 @@ export interface PlanLifecycleState {
  *
  * The regex alone is not enough: it accepts `2026-02-30` and `2026-13-01`, and
  * a plan that silently started on a non-existent date would put six of its
- * seven days somewhere the user never asked for. The round-trip through UTC
- * rejects those, and UTC — not local time — is what keeps a day key a day key
- * rather than a moment that shifts with the server's zone.
+ * seven days somewhere the user never asked for.
+ *
+ * THE implementation is shared — `utils/calendarDay.ts` — and this is an alias
+ * of it rather than a wrapper, so the binding is identical to the one
+ * `preferences.logic.ts` and `plannedMealLog.logic.ts` expose and the three
+ * cannot answer differently. The name stays `isDayKey` because that is what
+ * this module's rules and `swap.logic.ts` already call it.
+ *
+ * It replaces a round trip through `Date.UTC(year, month - 1, day)`, which was
+ * subtly wrong rather than merely duplicated: that constructor maps years 0–99
+ * to 1900–1999, so it read `0004-02-29` as 1904 and the round trip refused the
+ * whole band — while the table-driven implementation accepted it. The shared
+ * rule consults no `Date`, so no mapping and no rollover can reach it.
  */
-export const isDayKey = (value: unknown): value is string => {
-    if (typeof value !== 'string' || !DAY_KEY_PATTERN.test(value)) {
-        return false;
-    }
-
-    const year = Number(value.slice(0, 4));
-    const month = Number(value.slice(5, 7));
-    const day = Number(value.slice(8, 10));
-    const parsed = new Date(Date.UTC(year, month - 1, day));
-
-    return (
-        parsed.getUTCFullYear() === year && parsed.getUTCMonth() === month - 1 && parsed.getUTCDate() === day
-    );
-};
+export const isDayKey: (value: unknown) => value is string = isCalendarDayKey;
 
 const requireDayKey = (value: string, field: string): string => {
     if (!isDayKey(value)) {
@@ -463,10 +462,46 @@ const requireDayKey = (value: string, field: string): string => {
     return value;
 };
 
-const dayKeyToUtcMillis = (dayKey: string): number =>
-    Date.UTC(Number(dayKey.slice(0, 4)), Number(dayKey.slice(5, 7)) - 1, Number(dayKey.slice(8, 10)));
+/**
+ * A day key as the UTC instant of its midnight — the form day arithmetic needs.
+ *
+ * NOT `Date.UTC(year, month - 1, day)`, which is the obvious spelling and is
+ * wrong for part of the range {@link isDayKey} accepts: that constructor maps a
+ * year of 0–99 to 1900–1999, so it would place `0004-02-29` in 1904. Reading a
+ * validated key as a year 1,900 off is worse than refusing it — every rule
+ * built on this function ({@link addDaysToDayKey},
+ * {@link daysBetweenDayKeys}, {@link planDatesFrom} and `swap.logic.ts`'s
+ * repetition window) would compute a real but wrong answer, silently.
+ *
+ * `setUTCFullYear` applies no such mapping, so the written year is the year
+ * used. Starting from epoch 0 and setting all three fields together makes the
+ * result depend on nothing but the key.
+ */
+const dayKeyToUtcMillis = (dayKey: string): number => {
+    const instant = new Date(0);
 
-const formatDayKey = (utcMillis: number): string => new Date(utcMillis).toISOString().slice(0, 10);
+    instant.setUTCFullYear(
+        Number(dayKey.slice(0, 4)),
+        Number(dayKey.slice(5, 7)) - 1,
+        Number(dayKey.slice(8, 10)),
+    );
+    instant.setUTCHours(0, 0, 0, 0);
+
+    return instant.getTime();
+};
+
+/**
+ * The day key of a UTC instant — the inverse of {@link dayKeyToUtcMillis}.
+ *
+ * The result is re-validated rather than returned on trust, because the slice
+ * is only a day key while the year has four digits: `toISOString` switches to
+ * the expanded `±YYYYYY` form outside years 0000–9999, so an arithmetic step
+ * past either end of that range would return `'+0100'` — a key-shaped fragment
+ * naming no day. A shift that far is a fault in the caller's arithmetic, and it
+ * surfaces here as a {@link MealPlanInputError} instead of being stored.
+ */
+const formatDayKey = (utcMillis: number): string =>
+    requireDayKey(new Date(utcMillis).toISOString().slice(0, 10), 'dayKey');
 
 /**
  * THE derivation of a user's calendar day from an instant — the one place an
@@ -1193,6 +1228,43 @@ export const compareCandidateMoves = (left: ScoredCandidate, right: ScoredCandid
  * Day tolerances — the only hard nutrition test
  * ------------------------------------------------------------------------- */
 
+/**
+ * Guards a value that was SUMMED rather than chosen — a day total, or one
+ * meal's planned figure on the way into one.
+ *
+ * Finite-only, and deliberately NOT {@link requirePositiveTarget}: zero is a
+ * legal total (an empty day sums to zero, and every band below then reports it
+ * as a breach, which is the correct answer) and a negative one is arithmetic to
+ * judge rather than an input to refuse. What is never legal is a value that is
+ * not a number at all.
+ *
+ * It has to be refused HERE rather than judged downstream because every band in
+ * {@link evaluateDayTolerance} is written in the positive form — `> band`, and
+ * `< low || > high` — and every relational comparison with NaN is false. An
+ * unguarded NaN pushes no breach, so a day of corrupt arithmetic would be
+ * reported as `withinTolerance: true`, the search would accept it as its first
+ * feasible assignment, and the fault would reach the user as a published plan.
+ *
+ * A throw is the right answer and a breach is not. A breach is a FEASIBILITY
+ * verdict, which the caller renders as "these preferences don't fit this week";
+ * a non-finite stored figure is a programming or data-integrity fault, so it
+ * takes the same route as an impossible target one section above — a
+ * {@link MealPlanInputError} naming the field, for the controller to surface
+ * and an engineer to fix. Infinity is refused on the same ground: it happens to
+ * trip a band today, but "your week is infeasible" is the wrong thing to tell a
+ * user whose stored data is broken.
+ */
+const requireFiniteTotal = (value: number, field: string): number => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new MealPlanInputError(
+            `${field} must be a finite number to judge a day against its targets, received ${String(value)}`,
+            field,
+        );
+    }
+
+    return value;
+};
+
 /** Which of a completed day's four values fell outside its band. */
 export type DayToleranceBreach = 'calories' | 'protein' | 'carbs' | 'fat';
 
@@ -1229,26 +1301,36 @@ export const evaluateDayTolerance = (
     const carbsTarget = requirePositiveTarget(targets.carbs, 'targets.carbs');
     const fatTarget = requirePositiveTarget(targets.fat, 'targets.fat');
 
+    // Targets are judged first and on stricter terms — a target must be a
+    // usable number to plan against, where a total need only be a number. Both
+    // halves are guarded before the first band is applied, and every band below
+    // reads the guarded local rather than the argument, so no comparison can be
+    // reached by a value this function has not established is finite.
+    const calories = requireFiniteTotal(totals.calories, 'totals.calories');
+    const protein = requireFiniteTotal(totals.protein, 'totals.protein');
+    const carbs = requireFiniteTotal(totals.carbs, 'totals.carbs');
+    const fat = requireFiniteTotal(totals.fat, 'totals.fat');
+
     const breaches: DayToleranceBreach[] = [];
 
-    if (Math.abs(totals.calories - calorieTarget) > CALORIE_TOLERANCE_RATIO * calorieTarget + TOLERANCE_EPSILON) {
+    if (Math.abs(calories - calorieTarget) > CALORIE_TOLERANCE_RATIO * calorieTarget + TOLERANCE_EPSILON) {
         breaches.push('calories');
     }
 
     if (
-        totals.protein < proteinTarget - PROTEIN_TOLERANCE_UNDER_G - TOLERANCE_EPSILON ||
-        totals.protein > proteinTarget + PROTEIN_TOLERANCE_OVER_G + TOLERANCE_EPSILON
+        protein < proteinTarget - PROTEIN_TOLERANCE_UNDER_G - TOLERANCE_EPSILON ||
+        protein > proteinTarget + PROTEIN_TOLERANCE_OVER_G + TOLERANCE_EPSILON
     ) {
         breaches.push('protein');
     }
 
     const carbsBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * carbsTarget);
-    if (Math.abs(totals.carbs - carbsTarget) > carbsBand + TOLERANCE_EPSILON) {
+    if (Math.abs(carbs - carbsTarget) > carbsBand + TOLERANCE_EPSILON) {
         breaches.push('carbs');
     }
 
     const fatBand = Math.max(MACRO_TOLERANCE_ABSOLUTE_G, MACRO_TOLERANCE_RATIO * fatTarget);
-    if (Math.abs(totals.fat - fatTarget) > fatBand + TOLERANCE_EPSILON) {
+    if (Math.abs(fat - fatTarget) > fatBand + TOLERANCE_EPSILON) {
         breaches.push('fat');
     }
 
@@ -1268,17 +1350,28 @@ export const isDayWithinTolerance = (
  * `nutrition.service.ts::insertPlannedMealEntry` rounds the diary snapshot once
  * on insert; rounding each meal first and summing the results would drift the
  * day total away from both.
+ *
+ * Each meal's four figures are guarded as they are added, so a non-finite one
+ * is named with the meal it came from rather than anonymised into the sum. A
+ * sum is where a NaN stops being attributable: `400 + NaN` and `NaN + 400` are
+ * the same value, and by the time the total reaches
+ * {@link evaluateDayTolerance} nothing can say which meal spoiled it. Summing
+ * an empty list still returns four zeros — that is a day with no meals, not a
+ * fault.
  */
 export const computeDayTotals = (
     meals: readonly { planned: MealPlanMacroTotals }[],
 ): MealPlanMacroTotals => {
     const totals: MealPlanMacroTotals = { calories: 0, protein: 0, carbs: 0, fat: 0 };
 
-    for (const meal of meals) {
-        totals.calories += meal.planned.calories;
-        totals.protein += meal.planned.protein;
-        totals.carbs += meal.planned.carbs;
-        totals.fat += meal.planned.fat;
+    for (let index = 0; index < meals.length; index += 1) {
+        const { planned } = meals[index];
+        const at = `meals[${index}].planned`;
+
+        totals.calories += requireFiniteTotal(planned.calories, `${at}.calories`);
+        totals.protein += requireFiniteTotal(planned.protein, `${at}.protein`);
+        totals.carbs += requireFiniteTotal(planned.carbs, `${at}.carbs`);
+        totals.fat += requireFiniteTotal(planned.fat, `${at}.fat`);
     }
 
     return totals;

@@ -518,7 +518,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS "meal_entries_id_user_id_key" ON "meal_entries
 CREATE INDEX IF NOT EXISTS "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("search_vector");
 
 -- CreateIndex
-CREATE INDEX IF NOT EXISTS "idx_catalog_food_aliases_lower_alias" ON "catalog_food_aliases"(lower("alias"));
+-- The operator class is explicit, and it is the whole point of this index.
+-- Its only caller is catalog.service.ts's prefix fallback, whose predicate is a
+-- left-anchored `lower(alias) LIKE 'x%'`. A btree can turn a LIKE pattern into
+-- a range scan only when the indexed column's comparison is byte order - that
+-- is, under a `*_pattern_ops` operator class or a column collation of C - and
+-- the databases this project creates are en_US.utf8. Under the default
+-- `text_ops` the planner cannot derive the bounds and refuses the index even
+-- with enable_seqscan off, so the predicate falls back to a sequential scan of
+-- every alias. `text_pattern_ops` still serves `=`, and no caller compares
+-- lower(alias) with `=`, `<` or `>`, so no second `text_ops` index is needed.
+-- An operator class is part of `pg_indexes.indexdef`, which is what the
+-- ledger-equivalence gate compares, so this line and the authoritative
+-- migration's must stay identical in it as well as in the key expression.
+CREATE INDEX IF NOT EXISTS "idx_catalog_food_aliases_lower_alias" ON "catalog_food_aliases"(lower("alias") text_pattern_ops);
 
 -- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "unique_published_catalog_food_identity" ON "catalog_foods"("canonical_name", "food_state") WHERE "publication_status" = 'published';

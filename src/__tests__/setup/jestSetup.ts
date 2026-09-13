@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
 
-import { assertTestDatabase } from './testDb';
+import { assertSchemaFreshnessOnce, assertTestDatabase } from './testDb';
 
 assertTestDatabase();
 
@@ -65,3 +65,22 @@ jest.mock('../../middleware/auth', () => ({
         return next();
     },
 }));
+
+// The second gate, and the only asynchronous work this file can do. Jest awaits
+// a setup file's module export when that export IS a function — `jest-runner`
+// does `const setupFile = runtime.requireModule(path); if (typeof setupFile ===
+// 'function') { await setupFile(); }` — which runs it after everything above and
+// before the file's first test.
+//
+// `export =`, not `export default`: TypeScript's CommonJS emit puts a default
+// export on `exports.default`, which that check never sees, so the gate would
+// silently never run. Nothing else in this file is exported, so the assignment
+// is the whole module's shape, and `testDb.test.ts` pins both facts.
+//
+// It answers "is this database the schema the code expects" — see the schema
+// section of `./testDb`. A database that cannot be read, or has no applied
+// migration, is a skip rather than a failure: 25 of the 30 test files never open
+// a connection, and this file runs before every one of them.
+export = async (): Promise<void> => {
+    await assertSchemaFreshnessOnce();
+};

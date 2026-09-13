@@ -423,6 +423,59 @@ describe('currentDayTotalsFor', () => {
 
         expect(inputErrorField(() => currentDayTotalsFor(context))).toBe('slot');
     });
+
+    /**
+     * The day-total guard in `mealPlan.logic.ts` is inherited here, and it
+     * matters more on this path than on the generator's.
+     *
+     * A non-finite figure in a meal the swap KEEPS used to flow straight
+     * through: the tolerance gate answered `true` for a NaN day (every band is
+     * written in the positive form, and NaN fails every comparison), so
+     * {@link selectSwapPortion} would compute a NaN calorie distance, a NaN
+     * `calorieDelta` and a NaN `targetProximity` — and then offer that
+     * candidate, ranked by a value no comparison can order. The user would be
+     * shown alternatives in an arbitrary order with blank arithmetic behind
+     * them. Now the fault surfaces named.
+     */
+    describe('a non-finite planned figure in the day', () => {
+        const dayWithNaNBreakfast = (): SwapDayMeal[] =>
+            dayMeals().map((meal) =>
+                meal.id === BREAKFAST_MEAL_ID
+                    ? { ...meal, planned: { ...meal.planned, calories: Number.NaN } }
+                    : meal,
+            );
+
+        it('refuses to sum the day, naming the meal that carries it', () => {
+            const context = makeContext({ dayMeals: dayWithNaNBreakfast() });
+
+            expect(() => currentDayTotalsFor(context)).toThrow(MealPlanInputError);
+            expect(inputErrorField(() => currentDayTotalsFor(context))).toBe('meals[0].planned.calories');
+        });
+
+        it('refuses to choose a portion against it, rather than ranking by NaN', () => {
+            const context = makeContext({ dayMeals: dayWithNaNBreakfast() });
+
+            expect(() => selectSwapPortion(context, makeRecipe({ slug: 'turkey-wrap' }))).toThrow(
+                MealPlanInputError,
+            );
+        });
+
+        it('refuses when the figure is on the meal being replaced', () => {
+            const context = makeContext({
+                dayMeals: dayMeals({ planned: { ...proportional(700), protein: undefined as unknown as number } }),
+            });
+
+            expect(inputErrorField(() => currentDayTotalsFor(context))).toBe('meals[1].planned.protein');
+        });
+
+        it('still sums a day whose meals are legitimately zero', () => {
+            const context = makeContext({
+                dayMeals: dayMeals().map((meal) => ({ ...meal, planned: proportional(0) })),
+            });
+
+            expect(currentDayTotalsFor(context).calories).toBe(0);
+        });
+    });
 });
 
 /* ---------------------------------------------------------------------------

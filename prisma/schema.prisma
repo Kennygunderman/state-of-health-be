@@ -475,9 +475,24 @@ model catalog_foods {
   @@index([search_vector(ops: raw("tsvector_ops"))], map: "idx_catalog_foods_search_vector", type: Gin)
 }
 
-// Search aliases. The lower(alias) expression index is appended in the
-// migration SQL; one alias hit must never produce a duplicate search row, which
-// is why search aggregates to one row per food rather than joining these out.
+// Search aliases. One alias hit must never produce a duplicate search row,
+// which is why search aggregates to one row per food rather than joining these
+// out.
+//
+// The lower(alias) expression index is appended in the migration SQL, which
+// Prisma cannot express either as an expression or with its operator class, and
+// the operator class is load-bearing: the index is declared
+// `lower("alias") text_pattern_ops` because its only caller's predicate is a
+// left-anchored `lower(alias) LIKE 'x%'`, and a btree derives LIKE range bounds
+// only under a `*_pattern_ops` class or a C column collation — which the
+// en_US.utf8 databases this project creates do not have. With the default
+// `text_ops` the planner refuses the index outright, so this is a correctness
+// property of the index rather than a tuning preference. Equality is still
+// served, so the class replaces `text_ops` rather than joining it.
+// Unlike idx_catalog_foods_search_vector above, no @@index can mirror this one,
+// so the schema-diff gate is blind to it by design and
+// docs/meal-planning/expected-schema-diff.sql reads the class back out of
+// pg_opclass instead.
 model catalog_food_aliases {
   id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   catalog_food_id String        @db.Uuid
@@ -867,9 +882,15 @@ model grocery_items {
 // log). A row is RESERVED first and completed by the same transaction, so
 // response_status, response_snapshot and plan_revision_after are nullable and
 // deliberately carry no defaults: NULL means "reserved but not yet completed",
-// and a replay returns the stored status and body verbatim so a client cannot
-// tell a replay from the original response. request_fingerprint is what
-// distinguishes a genuine retry from a reused key with a different body.
+// and a replay returns the stored status exactly and the stored body as a
+// VALUE deep-equal to the first response — jsonb normalises an object's key
+// order at rest, so the text can differ while every value is preserved — which
+// is why a client cannot tell a replay from the original response and why a
+// test of it must compare the parsed body rather than its JSON text. The
+// precise statement lives with the code that makes the guarantee, in
+// src/services/mealPlanningAction.logic.ts (readStoredResponse).
+// request_fingerprint is what distinguishes a genuine retry from a reused key
+// with a different body.
 model meal_plan_actions {
   id                     String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   user_id                String

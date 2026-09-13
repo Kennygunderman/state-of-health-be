@@ -478,7 +478,22 @@ CREATE UNIQUE INDEX "meal_entries_id_user_id_key" ON "meal_entries"("id", "user_
 CREATE INDEX "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("search_vector");
 
 -- CreateIndex
-CREATE INDEX "idx_catalog_food_aliases_lower_alias" ON "catalog_food_aliases"(lower("alias"));
+-- The operator class is explicit, and it is the whole point of this index.
+-- Its only caller is catalog.service.ts's prefix fallback, whose predicate is a
+-- left-anchored `lower(alias) LIKE 'x%'`. A btree can turn a LIKE pattern into
+-- a range scan only when the indexed column's comparison is byte order - that
+-- is, under a `*_pattern_ops` operator class or a column collation of C - and
+-- the databases this project creates are en_US.utf8 (and, in the catalog
+-- service's own suite, ICU 'und'). Under the default `text_ops` the planner
+-- cannot derive the bounds and refuses the index even with enable_seqscan off,
+-- so the predicate falls back to a sequential scan of every alias; measured on
+-- a 10,000-alias corpus at 1% selectivity, ~2.5-3.0 ms for the scan against
+-- ~0.1-0.2 ms for the index scan this opclass enables.
+-- `text_pattern_ops` still serves `=`, so nothing is lost by replacing
+-- `text_ops` here and no second `text_ops` index is needed: no caller compares
+-- lower(alias) with `=`, `<` or `>`, and the equality path is proven in
+-- src/services/__tests__/catalog.service.test.ts rather than assumed.
+CREATE INDEX "idx_catalog_food_aliases_lower_alias" ON "catalog_food_aliases"(lower("alias") text_pattern_ops);
 
 -- CreateIndex
 CREATE UNIQUE INDEX "unique_published_catalog_food_identity" ON "catalog_foods"("canonical_name", "food_state") WHERE "publication_status" = 'published';

@@ -18,10 +18,10 @@ const LOGIC_MODULE_SUFFIX = '.logic.ts';
 
 const TEST_DIRECTORY_NAME = '__tests__';
 
-// The four utility modules and the two exclusions are spelled out HERE rather
-// than imported from the config, and the services directory is read with this
-// file's own `readdirSync` rather than by calling `coveredSourcePaths`. A test
-// that built its expectation from the derivation it is checking would agree
+// The covered utility modules and the two exclusions are spelled out HERE
+// rather than imported from the config, and the services directory is read with
+// this file's own `readdirSync` rather than by calling `coveredSourcePaths`. A
+// test that built its expectation from the derivation it is checking would agree
 // with itself no matter what the derivation said — it would stay green while a
 // module silently fell out of the gate, which is the one thing this suite
 // exists to prevent.
@@ -30,6 +30,7 @@ const COVERED_UTILS: readonly string[] = [
     'src/utils/seededRandom.ts',
     'src/utils/pagination.ts',
     'src/utils/featureFlags.ts',
+    'src/utils/calendarDay.ts',
 ];
 
 const EXCLUDED_UTILS: readonly string[] = ['src/utils/firebase.ts', 'src/utils/getUserId.ts'];
@@ -139,8 +140,8 @@ describe('coverage inventory', () => {
         });
     });
 
-    describe('the four pure utility modules', () => {
-        it('gates the four the plan names, and exactly those', () => {
+    describe('the pure utility modules', () => {
+        it('gates exactly the ones named, and no others', () => {
             expect(normalised(COVERED_UTIL_MODULES)).toEqual(normalised(COVERED_UTILS));
         });
 

@@ -1075,6 +1075,108 @@ describe('evaluateDayTolerance', () => {
             MealPlanInputError,
         );
     });
+
+    /**
+     * Every band above is written in the positive form — `> band`, and
+     * `< low || > high` — and every relational comparison with NaN is false. An
+     * unguarded non-finite total therefore pushed NO breach and this function
+     * answered `{withinTolerance: true, breaches: []}`: a day of corrupt
+     * arithmetic declared acceptable, which the search would take as its first
+     * feasible assignment and publish.
+     *
+     * The answer is a throw and not a breach. A breach is a feasibility verdict
+     * the caller renders as "these preferences don't fit"; a non-finite stored
+     * figure is a data fault, and telling the user their week is infeasible
+     * would be both wrong and unactionable.
+     */
+    describe('non-finite totals', () => {
+        const fieldOf = (act: () => unknown): string => {
+            try {
+                act();
+            } catch (error) {
+                if (error instanceof MealPlanInputError) {
+                    return error.field;
+                }
+
+                throw error;
+            }
+
+            throw new Error('expected a MealPlanInputError');
+        };
+
+        it.each(['calories', 'protein', 'carbs', 'fat'] as const)(
+            'refuses a NaN %s instead of reporting the day as within tolerance',
+            (key) => {
+                expect(() => evaluateDayTolerance(totals({ [key]: Number.NaN }), TARGETS)).toThrow(
+                    MealPlanInputError,
+                );
+                expect(fieldOf(() => evaluateDayTolerance(totals({ [key]: Number.NaN }), TARGETS))).toBe(
+                    `totals.${key}`,
+                );
+            },
+        );
+
+        it.each(['calories', 'protein', 'carbs', 'fat'] as const)(
+            'refuses a missing %s, which arrives as undefined from a partial row',
+            (key) => {
+                const partial = totals({ [key]: undefined as unknown as number });
+
+                expect(fieldOf(() => evaluateDayTolerance(partial, TARGETS))).toBe(`totals.${key}`);
+            },
+        );
+
+        it('refuses an infinite total, which trips a band only by accident', () => {
+            expect(fieldOf(() => evaluateDayTolerance(totals({ calories: Infinity }), TARGETS))).toBe(
+                'totals.calories',
+            );
+            expect(fieldOf(() => evaluateDayTolerance(totals({ protein: -Infinity }), TARGETS))).toBe(
+                'totals.protein',
+            );
+        });
+
+        it('refuses a numeric string, rather than coercing it in a comparison', () => {
+            expect(fieldOf(() => evaluateDayTolerance(totals({ calories: '2000' as unknown as number }), TARGETS))).toBe(
+                'totals.calories',
+            );
+        });
+
+        it('names the first bad total in declaration order when several are bad', () => {
+            expect(
+                fieldOf(() =>
+                    evaluateDayTolerance(
+                        { calories: Number.NaN, protein: Number.NaN, carbs: Number.NaN, fat: Number.NaN },
+                        TARGETS,
+                    ),
+                ),
+            ).toBe('totals.calories');
+        });
+
+        it('judges the target before the total, so an impossible target still names itself', () => {
+            // Order matters for the message a controller renders: a request with
+            // both a broken target and a broken total is a broken target first.
+            expect(
+                fieldOf(() =>
+                    evaluateDayTolerance(totals({ calories: Number.NaN }), { ...TARGETS, protein: 0 }),
+                ),
+            ).toBe('targets.protein');
+        });
+
+        it('refuses the same inputs through the boolean the search calls', () => {
+            expect(() => isDayWithinTolerance(totals({ calories: Number.NaN }), TARGETS)).toThrow(
+                MealPlanInputError,
+            );
+        });
+
+        it('still judges a legitimately zero or negative total rather than refusing it', () => {
+            // Finite-only, deliberately not positive-only: an empty day sums to
+            // zero and must be REPORTED as breaching, not thrown on.
+            expect(evaluateDayTolerance(zeroTotals, TARGETS)).toEqual({
+                withinTolerance: false,
+                breaches: ['calories', 'protein', 'carbs', 'fat'],
+            });
+            expect(isDayWithinTolerance({ ...TARGETS, fat: -1 }, TARGETS)).toBe(false);
+        });
+    });
 });
 
 describe('computeDayTotals', () => {
@@ -1091,6 +1193,56 @@ describe('computeDayTotals', () => {
 
     it('is zero for a day with no meals', () => {
         expect(computeDayTotals([])).toEqual(zeroTotals);
+    });
+
+    /**
+     * A sum is where a non-finite figure stops being attributable: `400 + NaN`
+     * and `NaN + 400` are the same value, so by the time the total reaches the
+     * tolerance gate nothing can say which meal spoiled it. Guarding here names
+     * the meal.
+     */
+    describe('non-finite planned figures', () => {
+        const fieldOf = (act: () => unknown): string => {
+            try {
+                act();
+            } catch (error) {
+                if (error instanceof MealPlanInputError) {
+                    return error.field;
+                }
+
+                throw error;
+            }
+
+            throw new Error('expected a MealPlanInputError');
+        };
+
+        it.each(['calories', 'protein', 'carbs', 'fat'] as const)(
+            'refuses a NaN %s and names the meal it came from',
+            (key) => {
+                const meals = [{ planned: { ...proportional(500), [key]: Number.NaN } }];
+
+                expect(fieldOf(() => computeDayTotals(meals))).toBe(`meals[0].planned.${key}`);
+            },
+        );
+
+        it('names the offending meal by index, not the sum', () => {
+            const meals = [
+                { planned: proportional(500) },
+                { planned: { ...proportional(700), fat: undefined as unknown as number } },
+            ];
+
+            expect(fieldOf(() => computeDayTotals(meals))).toBe('meals[1].planned.fat');
+        });
+
+        it('refuses an infinite planned figure', () => {
+            const meals = [{ planned: { ...proportional(500), protein: Infinity } }];
+
+            expect(fieldOf(() => computeDayTotals(meals))).toBe('meals[0].planned.protein');
+        });
+
+        it('still sums a zero-calorie meal, which is data rather than a fault', () => {
+            expect(computeDayTotals([{ planned: zeroTotals }])).toEqual(zeroTotals);
+        });
     });
 });
 
@@ -1113,6 +1265,30 @@ describe('isDayKey', () => {
     it.each([undefined, null, 20260705, {}])('refuses the non-string %p', (value) => {
         expect(isDayKey(value)).toBe(false);
     });
+
+    /**
+     * This predicate used to be its own round trip through
+     * `Date.UTC(year, month - 1, day)`, which maps a year of 0–99 to 1900–1999:
+     * it read `0004-02-29` as 1904, the round trip could not match, and the
+     * whole band before 0100 was refused — while `preferences.logic.ts`'s
+     * table-driven twin accepted it. The same date was a real day to the review
+     * step and not a real day to the log route.
+     *
+     * It is now an alias of the shared rule, so the band is accepted and the
+     * three names cannot diverge again. `utils/__tests__/calendarDay.test.ts`
+     * asserts the identity; these cases pin the behaviour at this name.
+     */
+    it.each(['0000-01-01', '0001-01-01', '0004-02-29', '0050-06-15', '0099-12-31'])(
+        'accepts %s, which a Date-based check placed in the twentieth century',
+        (value) => {
+            expect(isDayKey(value)).toBe(true);
+        },
+    );
+
+    it('applies the leap rule to those years too, rather than waiving it', () => {
+        expect(isDayKey('0003-02-29')).toBe(false);
+        expect(isDayKey('0100-02-29')).toBe(false);
+    });
 });
 
 describe('addDaysToDayKey', () => {
@@ -1133,8 +1309,61 @@ describe('addDaysToDayKey', () => {
     });
 
     it('refuses a malformed key and a fractional offset', () => {
-        expect(() => addDaysToDayKey('2026-02-30', 1)).toThrow(MealPlanInputError);
         expect(() => addDaysToDayKey('2026-07-05', 1.5)).toThrow(MealPlanInputError);
+        expect(() => addDaysToDayKey('2026-02-30', 1)).toThrow(MealPlanInputError);
+    });
+
+    /**
+     * Arithmetic has to stay in the year it was handed, across the WHOLE range
+     * {@link isDayKey} accepts.
+     *
+     * `Date.UTC(year, month - 1, day)` — the obvious way to turn a key into an
+     * instant, and what this module used — maps a year of 0–99 to 1900–1999. It
+     * was harmless only while the predicate refused that band; once the shared
+     * rule accepts it, every step built on it would return a real but wrong
+     * answer, silently: a step from `0004-02-28` would land in 1904, and
+     * `swap.logic.ts`'s repetition window would compare the wrong neighbours
+     * and stop spacing that recipe out. A wrong answer is worse than a refusal,
+     * so these are pinned rather than left to the predicate's tests.
+     */
+    describe('years before 0100, which a Date-based conversion silently relocated', () => {
+        it('steps within the year it was given', () => {
+            expect(addDaysToDayKey('0004-02-28', 1)).toBe('0004-02-29');
+            expect(addDaysToDayKey('0004-02-29', 1)).toBe('0004-03-01');
+            expect(addDaysToDayKey('0050-06-15', 7)).toBe('0050-06-22');
+        });
+
+        it('crosses into and out of the band without jumping to the 1900s', () => {
+            expect(addDaysToDayKey('0099-12-31', 1)).toBe('0100-01-01');
+            expect(addDaysToDayKey('0100-01-01', -1)).toBe('0099-12-31');
+        });
+
+        it('measures a distance in that band correctly', () => {
+            expect(daysBetweenDayKeys('0004-02-28', '0004-03-01')).toBe(2);
+            expect(daysBetweenDayKeys('0099-12-31', '0100-01-01')).toBe(1);
+        });
+
+        it('lays out a plan week there without leaving the year', () => {
+            expect(planDatesFrom('0004-02-26').map((date) => date.date)).toEqual([
+                '0004-02-26',
+                '0004-02-27',
+                '0004-02-28',
+                '0004-02-29',
+                '0004-03-01',
+                '0004-03-02',
+                '0004-03-03',
+            ]);
+            expect(planEndDate('0004-02-26')).toBe('0004-03-03');
+        });
+
+        it('refuses a step out of the representable range instead of returning a fragment', () => {
+            // Below year 0000 and above 9999, toISOString switches to the
+            // expanded ±YYYYYY form, and slicing ten characters off that yields
+            // a key-shaped fragment naming no day ('+0100', '-0000'). The
+            // result is re-validated, so the fault surfaces here.
+            expect(() => addDaysToDayKey('0000-01-01', -1)).toThrow(MealPlanInputError);
+            expect(() => addDaysToDayKey('9999-12-31', 1)).toThrow(MealPlanInputError);
+        });
     });
 });
 

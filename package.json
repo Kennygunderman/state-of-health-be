@@ -8,6 +8,8 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "prisma": "prisma",
+    "check:test-db": "ts-node --project tsconfig.test.json src/__tests__/setup/testDb.ts",
+    "pretest": "npm run check:test-db",
     "test": "jest --ci --runInBand --coverage",
     "test:watch": "jest --watch",
     "typecheck": "tsc --noEmit",

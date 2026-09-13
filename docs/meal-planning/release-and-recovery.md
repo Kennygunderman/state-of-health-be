@@ -110,6 +110,38 @@ Two independent gates, both reversible without a deploy:
 `off` whenever `NODE_ENV=production`, and an unrecognised value fails startup
 everywhere else, so it can neither be used in production nor silently ignored.
 
+## Replaying a lost response
+
+Generate, regenerate, swap and log each carry an idempotency key. A client whose
+response never arrived retries with the same key, and the `meal_plan_actions`
+ledger answers that retry from the row it already wrote rather than doing the
+work a second time: the same status, the same plan revision and the same values
+the first response carried, for as long as the row exists. To produce that case
+deliberately, set `MEAL_PLANNING_FAULT=log` in a development or test environment
+and log a planned meal — the write commits and the response is dropped at the
+socket — then repeat the request with the same key and the same body. The
+`generation` and `swap` values are decoded failures instead: they persist
+nothing, so there is no ledger row and nothing to replay.
+
+Expect the two bodies to be **equal by value, not identical byte for byte.**
+`response_snapshot` is a `jsonb` column, so PostgreSQL keeps the stored body with
+its object keys sorted and a replay serialises those keys in a different order
+than the first response did. No value changes, and key order means nothing to a
+JSON client. So compare the two as parsed JSON — `diff <(jq -S . first.json)
+<(jq -S . replay.json)` — and read a difference reported by `diff` or `cmp` on
+the raw response text as an artefact of the column, not a fault. Confirm the
+other half against the database: exactly one row for that key
+(`SELECT count(*) FROM meal_plan_actions WHERE user_id = '<uuid>' AND
+idempotency_key = '<key>'` returns 1) with `response_status` and
+`plan_revision_after` both filled. A repeated key with a *different* body is not
+a replay — it answers `409 idempotency_conflict` and writes nothing.
+
+Both checks need the `/api/meal-planning/*` routes, which land with this
+branch's API commits — the same commits the status table above tracks for
+`/api/catalog`. The ledger service itself is in the tree; the HTTP surface in
+front of it is not, so run this check once those routes are reachable rather
+than assuming it passes.
+
 ## Rollback
 
 The migration is additive, so redeploying the previous backend commit leaves

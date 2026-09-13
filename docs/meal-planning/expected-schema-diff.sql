@@ -67,9 +67,23 @@
 -- AAP-versus-tool divergence, and the pg_catalog sections are the mechanism
 -- that closes the two classes the tool omits: they pin the generated column's
 -- expression, every hand-managed index's access method, uniqueness, key
--- expressions and predicate, and every array column's NOT NULL and default.
--- The query is scoped to those three classes, so an ordinary scalar column or a
--- plain btree index added later cannot churn the evidence.
+-- expressions, OPERATOR CLASSES and predicate, and every array column's NOT
+-- NULL and default. The query is scoped to those three classes, so an ordinary
+-- scalar column or a plain btree index added later cannot churn the evidence.
+--
+-- WHY THE OPERATOR CLASS IS READ SEPARATELY. `pg_get_indexdef(oid, k, ...)`
+-- renders the k-th key expression and OMITS its operator class - measured at
+-- both pretty=true and pretty=false - so an index's class is invisible in
+-- key_text. That is not cosmetic here: idx_catalog_food_aliases_lower_alias is
+-- declared `lower(alias) text_pattern_ops` because a btree derives LIKE range
+-- bounds only under a `*_pattern_ops` class or a C column collation, and under
+-- the default `text_ops` the planner refuses the index for the only predicate
+-- the index exists to serve. Rendering key_text alone, this gate was measured to
+-- produce byte-identical output for a patched and an unpatched ledger, so the
+-- class could be changed or silently revert and pass. The `opclasses=(...)`
+-- field is therefore captured from pg_opclass by the per-key oid in
+-- pg_index.indclass (an oidvector, zero-based, hence `k - 1`), one name per key
+-- in key order, and it is what makes that reversion loud.
 --
 -- WHICH LEDGER THIS MEASURES. The pg_catalog sections read the database that
 -- `npx prisma migrate deploy` builds from prisma/migrations - the authoritative
@@ -126,16 +140,18 @@ WITH generated_columns AS (
      AND a.attgenerated <> ''
 ), index_keys AS (
   SELECT i.indexrelid,
-         string_agg(pg_get_indexdef(i.indexrelid, k::int, true), ', ' ORDER BY k) AS key_text
+         string_agg(pg_get_indexdef(i.indexrelid, k::int, true), ', ' ORDER BY k) AS key_text,
+         string_agg(oc.opcname, ', ' ORDER BY k) AS opclass_text
     FROM pg_index i
     CROSS JOIN LATERAL generate_series(1, i.indnkeyatts) AS k
+    JOIN pg_opclass oc ON oc.oid = i.indclass[k - 1]
    GROUP BY i.indexrelid
 ), hand_managed_indexes AS (
   SELECT 2 AS section,
-         format('index %s.%s am=%s unique=%s keys=(%s) predicate=%s',
+         format('index %s.%s am=%s unique=%s keys=(%s) opclasses=(%s) predicate=%s',
                 tc.relname, ic.relname, am.amname,
                 CASE WHEN i.indisunique THEN 'true' ELSE 'false' END,
-                ik.key_text,
+                ik.key_text, ik.opclass_text,
                 COALESCE(pg_get_expr(i.indpred, i.indrelid, true), '-')) AS line
     FROM pg_index i
     JOIN pg_class     ic ON ic.oid = i.indexrelid
@@ -174,13 +190,13 @@ SELECT line FROM normalised ORDER BY section, line COLLATE "C";
 generated_column catalog_foods.search_vector tsvector stored to_tsvector('english'::regconfig, COALESCE(search_text, ''::text))
 -- Seven hand-managed indexes: the lower(alias) expression index, the GIN
 -- index over search_vector, and the five partial-index predicates.
-index catalog_food_aliases.idx_catalog_food_aliases_lower_alias am=btree unique=false keys=(lower(alias)) predicate=-
-index catalog_food_portions.unique_default_catalog_food_portion am=btree unique=true keys=(catalog_food_id) predicate=is_default
-index catalog_foods.idx_catalog_foods_search_vector am=gin unique=false keys=(search_vector) predicate=-
-index catalog_foods.unique_published_catalog_food_identity am=btree unique=true keys=(canonical_name, food_state) predicate=publication_status = 'published'::text
-index meal_entries.idx_meal_entries_meal_plan_meal_id am=btree unique=false keys=(meal_plan_meal_id) predicate=deleted_at IS NULL
-index meal_plans.unique_active_meal_plan_start_date am=btree unique=true keys=(user_id, start_date) predicate=status = 'active'::text
-index recipe_versions.unique_current_recipe_version am=btree unique=true keys=(recipe_id) predicate=status = 'current'::text
+index catalog_food_aliases.idx_catalog_food_aliases_lower_alias am=btree unique=false keys=(lower(alias)) opclasses=(text_pattern_ops) predicate=-
+index catalog_food_portions.unique_default_catalog_food_portion am=btree unique=true keys=(catalog_food_id) opclasses=(uuid_ops) predicate=is_default
+index catalog_foods.idx_catalog_foods_search_vector am=gin unique=false keys=(search_vector) opclasses=(tsvector_ops) predicate=-
+index catalog_foods.unique_published_catalog_food_identity am=btree unique=true keys=(canonical_name, food_state) opclasses=(text_ops, text_ops) predicate=publication_status = 'published'::text
+index meal_entries.idx_meal_entries_meal_plan_meal_id am=btree unique=false keys=(meal_plan_meal_id) opclasses=(uuid_ops) predicate=deleted_at IS NULL
+index meal_plans.unique_active_meal_plan_start_date am=btree unique=true keys=(user_id, start_date) opclasses=(text_ops, date_ops) predicate=status = 'active'::text
+index recipe_versions.unique_current_recipe_version am=btree unique=true keys=(recipe_id) opclasses=(uuid_ops) predicate=status = 'current'::text
 -- Thirteen array columns: the twelve required TEXT[]/UUID[] columns the
 -- migration marks NOT NULL by hand, plus templates.exercise_ids from the
 -- init migration, which is legacy and correctly pinned nullable.

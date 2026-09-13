@@ -67,6 +67,7 @@ import { MAX_REVISION } from './preferences.logic';
 import { scalePlannedNutrition } from './recipe.logic';
 import { InvalidRequestDetail, LogPlannedMealPayload } from '../types/mealPlanning';
 import { MacroTotals, NutritionProvenance } from '../types/nutrition';
+import { isCalendarDayKey } from '../utils/calendarDay';
 
 /* ---------------------------------------------------------------------------
  * The stored facts, and the local failure class
@@ -170,14 +171,14 @@ const SERVINGS_SCALE = 10 ** EATEN_SERVINGS_DECIMALS;
  */
 const SERVINGS_SCALE_TOLERANCE = 1e-9;
 
-/** Captures the three parts so the day key can be checked against the calendar. */
-const DAY_KEY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
+// The day-key shape is NOT declared here. It lives once in
+// `utils/calendarDay.ts` with the predicate that applies it, which is also why
+// this module no longer needs a capturing variant of it.
 
+/** Characters of an ISO timestamp that make up its day key. */
 const DAY_KEY_LENGTH = 10;
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-const MONTH_OFFSET = 1;
 
 /** The one portion multiplier at which a planned portion IS one recipe serving. */
 const PORTION_MULTIPLIER_ONE = 1;
@@ -195,30 +196,18 @@ const isUuidV4 = (value: unknown): value is string => typeof value === 'string' 
  * The calendar check is not decoration. `'2026-02-30'` matches the shape and
  * sorts inside a late-February plan week, and `new Date('2026-02-30')` rolls
  * forward to 2 March — so a shape-only check would let a request store an entry
- * on a day the user never chose. Verified by round-trip rather than by a
- * month-length table, so leap years need no special case.
+ * on a day the user never chose.
+ *
+ * THE implementation is shared — `utils/calendarDay.ts` — and re-exported here
+ * as the same binding, so this route and the preference steps cannot disagree
+ * about the calendar. They did: the round trip this module used to perform went
+ * through `Date.UTC(year, month - 1, day)`, which maps years 0–99 to 1900–1999,
+ * so `'0004-02-29'` was refused here and accepted by
+ * `preferences.logic.ts` — one request contradicting another about whether a
+ * day exists. The shared rule reads a month-length table and the leap rule, so
+ * it needs no round trip and has no year mapping to be caught by.
  */
-export const isCalendarDayKey = (value: unknown): value is string => {
-    if (typeof value !== 'string') {
-        return false;
-    }
-
-    const parts = DAY_KEY_PATTERN.exec(value);
-    if (!parts) {
-        return false;
-    }
-
-    const year = Number(parts[1]);
-    const month = Number(parts[2]);
-    const day = Number(parts[3]);
-    const parsed = new Date(Date.UTC(year, month - MONTH_OFFSET, day));
-
-    return (
-        parsed.getUTCFullYear() === year &&
-        parsed.getUTCMonth() === month - MONTH_OFFSET &&
-        parsed.getUTCDate() === day
-    );
-};
+export { isCalendarDayKey };
 
 /**
  * Whether a portion eaten is inside the servings contract: a real number in
