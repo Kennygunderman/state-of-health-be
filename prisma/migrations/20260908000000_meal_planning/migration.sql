@@ -261,6 +261,7 @@ CREATE TABLE "meal_plan_preferences" (
     "targets_input_revision" INTEGER,
     "estimated_targets" JSONB,
     "revision" INTEGER NOT NULL DEFAULT 0,
+    "estimate_inputs_revision" INTEGER NOT NULL DEFAULT 0,
 
     CONSTRAINT "meal_plan_preferences_pkey" PRIMARY KEY ("id")
 );

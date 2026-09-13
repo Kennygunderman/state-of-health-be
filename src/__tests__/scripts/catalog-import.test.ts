@@ -22,6 +22,7 @@ import type { UsdaManifest, UsdaManifestFood } from '../../../scripts/lib/manife
 import type { UsdaFoodDetail, UsdaFoodPortion, UsdaFoodSummary } from '../../services/usda.service';
 import {
     buildImportPlan,
+    describeFailure,
     importRunScope,
     matchSelectorPortion,
     parsePortionLabel,
@@ -492,5 +493,57 @@ describe('--limit is one budget over the whole work list (N03)', () => {
         expect(plan.assignments.size).toBeGreaterThan(curatedEntries.length);
         const batched = plan.batches.reduce((total, batch) => total + batch.fdcIds.length, 0);
         expect(batched).toBe(plan.assignments.size);
+    });
+});
+
+/**
+ * The operator code a failed run reports.
+ *
+ * `describeFailure` is the last thing this stage does before it exits, and the
+ * code it prints is the difference between "re-run with `--resume`" and "read
+ * the code": a vendor failure — USDA's definitive `401`/`403`/`404`, or a
+ * request that passed its deadline — is a `UsdaError` from
+ * `src/services/usda.service.ts` and has its own code, while anything this
+ * file does not recognise stays `unexpected_error` rather than being dressed
+ * up as a vendor problem.
+ *
+ * The vendor case is matched by `error.name`, not `instanceof`: narrowing on
+ * the class would mean importing the USDA service's value side at script load,
+ * which constructs a Prisma client — the very thing `main()` defers with a
+ * dynamic import so that these tests can import this module without a
+ * database. `usda.service.test.ts` asserts the name from the other side.
+ */
+describe('describeFailure', () => {
+    const usdaError = (message: string): Error => {
+        const error = new Error(message);
+        error.name = 'UsdaError';
+
+        return error;
+    };
+
+    it('reports a definitive vendor status under its own code', () => {
+        const described = describeFailure(usdaError('USDA returned 403'));
+
+        expect(described.code).toBe('usda_request_failed');
+        expect(described.error).toEqual({ name: 'UsdaError', message: 'USDA returned 403' });
+    });
+
+    it('reports a vendor timeout under the same code', () => {
+        expect(describeFailure(usdaError('USDA request timed out after 30000ms')).code).toBe('usda_request_failed');
+    });
+
+    it('leaves an unrecognised failure as unexpected_error', () => {
+        const described = describeFailure(new TypeError('cannot read properties of undefined'));
+
+        expect(described.code).toBe('unexpected_error');
+        expect(described.error.name).toBe('TypeError');
+    });
+
+    it('does not mistake an error that merely mentions USDA for a vendor failure', () => {
+        expect(describeFailure(new Error('the USDA manifest is unreadable')).code).toBe('unexpected_error');
+    });
+
+    it('reports a non-Error value without throwing', () => {
+        expect(describeFailure('something went wrong').code).toBe('unexpected_error');
     });
 });

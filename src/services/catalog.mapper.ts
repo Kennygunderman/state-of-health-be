@@ -37,9 +37,10 @@
 //
 //  * A BROKEN PROMISE IS A FAULT, NOT A DEFAULT. The response type promises a
 //    non-null `defaultPortion` and four non-null macros because validation
-//    quarantines any candidate missing them. A published row that contradicts
-//    that is a data-integrity fault and this file throws — see
-//    `CatalogMappingError`.
+//    quarantines any candidate missing them, and it promises the allergen and
+//    diet lists because their columns are NOT NULL. A published row that
+//    contradicts any of that is a data-integrity fault and this file throws —
+//    see `CatalogMappingError`.
 
 import {
     CatalogAllergenStatus,
@@ -49,6 +50,7 @@ import {
     CatalogIdentitySource,
     CatalogNutritionBasis,
     CatalogNutritionProvenance,
+    CatalogPortionNutritionResponse,
     CatalogStatusResponse,
     CatalogSuggestionResponse,
 } from '../types/catalog';
@@ -68,8 +70,9 @@ import {
 /**
  * A stored row contradicted a guarantee `src/types/catalog.ts` makes to the
  * client: a published food with no default portion, a core macro that is null
- * or non-finite, a code column holding a value outside its closed set, or an
- * ingredient snapshot that is not an object.
+ * or non-finite, a code column holding a value outside its closed set, a
+ * required allergen or diet list that is absent or is not an array of strings,
+ * or an ingredient snapshot that is not an object.
  *
  * Loud on purpose, because every one of these is prevented upstream — the
  * validation pipeline quarantines such candidates and `catalog.logic.ts` owns
@@ -130,9 +133,19 @@ export interface CatalogFoodRow {
     carbs_g: number | null;
     fat_g: number | null;
     fiber_g: number | null;
-    // Nullable on the row though the column is `String[] @default([])`: a
-    // `$queryRaw` projection can hand back SQL NULL where the model type cannot.
-    allergen_tags: string[] | null;
+    // Read because the default-portion projection needs it: a `per_100ml` food
+    // states its nutrients against a volume, and density is the only thing that
+    // turns that volume into the grams a portion is measured in. Nullable
+    // because the column is, and null is a fault on a `per_100ml` row rather
+    // than a value to substitute — see {@link deriveDefaultPortionNutrition}.
+    density_g_per_ml: number | null;
+    // Non-null, because the column is `TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]`
+    // and the response declares `allergenTags: string[]`. It is still read
+    // through `requireTagArray` on the way out: this type is the claim
+    // `$queryRaw<CatalogFoodRow[]>` makes about its own statement, not a proof
+    // of it, and the value is a SAFETY claim, so an absent one fails the
+    // response instead of becoming "contains no allergens".
+    allergen_tags: string[];
     allergen_status: string;
     food_group: string;
 }
@@ -174,6 +187,12 @@ export interface CatalogStatusCounts {
  * `snapshot_per_100g` is `unknown` because the column is JSONB: the generated
  * client types it as a JSON value, and a `$queryRaw` projection as whatever it
  * finds. It is read defensively rather than asserted.
+ *
+ * The two tag columns are NOT NULL (`TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]`)
+ * and are the frozen SAFETY metadata the whole snapshot exists to preserve, so
+ * they are typed non-null and read through `requireTagArray`: an absent one is
+ * drift, and defaulting it would restate a published recipe's allergen and diet
+ * facts as "none" after the fact.
  */
 export interface RecipeIngredientSnapshotRow {
     catalog_food_id: string;
@@ -182,8 +201,8 @@ export interface RecipeIngredientSnapshotRow {
     snapshot_per_100g: unknown;
     snapshot_name: string;
     snapshot_provenance: string;
-    snapshot_allergen_tags: string[] | null;
-    snapshot_diet_tags: string[] | null;
+    snapshot_allergen_tags: string[];
+    snapshot_diet_tags: string[];
 }
 
 /**
@@ -267,6 +286,47 @@ const requireCoreNutrient = (value: number | null, column: string, foodId: strin
 const optionalNutrient = (value: unknown): number | null =>
     typeof value === 'number' && Number.isFinite(value) ? value : null;
 
+/**
+ * A required allergen or diet list as the array the contract promises, throwing
+ * on anything else.
+ *
+ * These are the columns a safety decision is made from — planning eligibility
+ * compares the user's allergens and diet against the union of every
+ * ingredient's tags (§0.7.3), and the client shows what a food contains — so
+ * `[]` is not "unknown" on this contract. It is the positive claim "contains
+ * none of the named allergens" / "carries no dietary restriction". Every one of
+ * these columns is NOT NULL, so an absent value is drift or a projection that
+ * dropped the column, and `?? []` would answer it by making that claim on
+ * behalf of a row that never made it. Whether a food's allergen data IS unknown
+ * is stated separately and explicitly, by `allergen_status`.
+ *
+ * `reps ?? 0` is a safe default; `allergenTags ?? []` is a false safety claim —
+ * the same distinction {@link CatalogMappingError} draws for a null macro, on
+ * the field where getting it wrong hurts a user rather than a number. A
+ * non-string member throws for the adjacent reason: the wire type is
+ * `string[]`, the tag vocabularies are deliberately open so nothing filters
+ * them, and a number inside the list would reach the client as a tag.
+ */
+const requireTagArray = (value: unknown, table: string, column: string, rowId: string): string[] => {
+    if (!Array.isArray(value)) {
+        throw new CatalogMappingError(
+            `${table}.${column} is ${value === null ? 'null' : typeof value}, not an array, for row ` +
+                `${rowId}; the column is NOT NULL, and an empty list here would state that the food ` +
+                'carries none of these tags rather than that they are unknown',
+        );
+    }
+
+    return value.map((member, index) => {
+        if (typeof member !== 'string') {
+            throw new CatalogMappingError(
+                `${table}.${column}[${index}] is ${typeof member}, not a string, for row ${rowId}`,
+            );
+        }
+
+        return member;
+    });
+};
+
 /* ---------------------------------------------------------------------------
  * Portions
  * ------------------------------------------------------------------------- */
@@ -312,6 +372,125 @@ const resolveDefaultPortion = (
 };
 
 /* ---------------------------------------------------------------------------
+ * The default-portion nutrition projection
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A row value the projection multiplies or divides a mass by.
+ *
+ * Stricter than {@link requireCoreNutrient} in one way that matters: zero and
+ * negative are rejected as well as null and non-finite, because these are
+ * factors, not measurements. A zero basis amount or a zero density makes the
+ * basis mass zero, and dividing by it yields an `Infinity` the rounding would
+ * then hand to the client as a nutrition claim. Every such value is positive by
+ * validation, so arriving here at all is a data-integrity fault — and the one
+ * alternative, inventing a density, is the fabricated number the catalog's
+ * nutrition-integrity policy exists to prevent.
+ */
+const requirePositiveFactor = (value: number | null, table: string, column: string, foodId: string): number => {
+    if (value === null || !Number.isFinite(value) || value <= 0) {
+        throw new CatalogMappingError(
+            `${table}.${column} is ${value === null ? 'null' : String(value)} for published food ${foodId}; ` +
+                'the default-portion projection requires a positive, finite value and never substitutes one',
+        );
+    }
+
+    return value;
+};
+
+/**
+ * The mass the food's stated nutrient values describe, in grams.
+ *
+ * `per_100g` states them against a mass already; `per_100ml` states them
+ * against a volume, which only `density_g_per_ml` can turn into a mass; and
+ * `per_serving` states them against `basis_amount` of the food's own default
+ * portion.
+ */
+const basisGrams = (food: CatalogFoodRow, defaultPortion: CatalogFoodPortionResponse): number => {
+    const basisAmount = requirePositiveFactor(food.basis_amount, 'catalog_foods', 'basis_amount', food.id);
+    const basis = narrowColumn<CatalogNutritionBasis>(
+        food.nutrition_basis,
+        isCatalogNutritionBasis,
+        'catalog_foods',
+        'nutrition_basis',
+        food.id,
+    );
+
+    switch (basis) {
+        case 'per_100g':
+            return basisAmount;
+        case 'per_100ml':
+            return (
+                basisAmount * requirePositiveFactor(food.density_g_per_ml, 'catalog_foods', 'density_g_per_ml', food.id)
+            );
+        case 'per_serving':
+            return (
+                basisAmount *
+                requirePositiveFactor(
+                    defaultPortion.gramWeight,
+                    'catalog_food_portions',
+                    'gram_weight',
+                    food.id,
+                )
+            );
+    }
+};
+
+/**
+ * The four macros of ONE default portion, as `defaultPortionNutrition` carries
+ * them.
+ *
+ * THE SAME FORMULA RUNS IN `nutrition.service.ts` (`basisGrams` /
+ * `catalogPortionSnapshot`, presently being extracted into `nutrition.logic.ts`
+ * under review finding F05), where it produces the per-serving snapshot stored
+ * on `meal_entries` when a catalog food is logged. The two must stay
+ * NUMERICALLY IDENTICAL — same basis rules, same scale, same single rounding —
+ * because this projection's whole promise is that the pre-log card equals the
+ * diary row it produces to the integer. Whoever merges the two implementations
+ * is merging one rule, not reconciling two.
+ *
+ * Rounded to integers exactly ONCE, after scaling, for the same reason the
+ * stored snapshot is: `meal_entries` holds the per-serving macros as `Int`, and
+ * the read path multiplies that snapshot by the eaten servings, so rounding an
+ * intermediate value would round twice and drift away from the stored numbers.
+ *
+ * Fiber is not projected: `meal_entries` has no fiber column, so no stored
+ * value exists for a fiber projection to equal.
+ */
+export const deriveDefaultPortionNutrition = (
+    food: CatalogFoodRow,
+    defaultPortion: CatalogFoodPortionResponse,
+): CatalogPortionNutritionResponse => {
+    const portionGrams = requirePositiveFactor(
+        defaultPortion.gramWeight,
+        'catalog_food_portions',
+        'gram_weight',
+        food.id,
+    );
+    const scale = portionGrams / basisGrams(food, defaultPortion);
+
+    // Finite inputs can still overflow — a denormal basis mass under a real
+    // portion weight divides to `Infinity` — and a scale that is not a real
+    // number makes every value derived from it meaningless. It stops here
+    // rather than reaching the client as an `Infinity` macro, which
+    // `JSON.stringify` would emit as the `null` this member promises never to
+    // be.
+    if (!Number.isFinite(scale)) {
+        throw new CatalogMappingError(
+            `default-portion scale for published food ${food.id} is ${String(scale)}; a portion of ` +
+                `${String(portionGrams)} g against a ${food.nutrition_basis} basis is not a usable ratio`,
+        );
+    }
+
+    return {
+        calories: Math.round(requireCoreNutrient(food.calories, 'calories', food.id) * scale),
+        protein: Math.round(requireCoreNutrient(food.protein_g, 'protein_g', food.id) * scale),
+        carbs: Math.round(requireCoreNutrient(food.carbs_g, 'carbs_g', food.id) * scale),
+        fat: Math.round(requireCoreNutrient(food.fat_g, 'fat_g', food.id) * scale),
+    };
+};
+
+/* ---------------------------------------------------------------------------
  * The catalog food itself
  * ------------------------------------------------------------------------- */
 
@@ -324,65 +503,79 @@ const resolveDefaultPortion = (
  * and the rest inform conversions the server performs.
  *
  * The four macros and `fiber` are stated per `basisAmount` of `nutritionBasis`
- * (100 for `per_100g`), never per `defaultPortion`.
+ * (100 for `per_100g`), never per `defaultPortion`. `defaultPortionNutrition`
+ * is the projection of those macros onto one default portion, so the client has
+ * an unambiguous per-portion figure without needing the basis metadata or the
+ * density the conversion would require.
+ *
+ * The default portion is resolved once and used twice — as the reported portion
+ * and as the projection's divisor — so the response cannot report one portion
+ * while its nutrition describes another.
  */
 export const mapCatalogFood = (
     food: CatalogFoodRow,
     portions: readonly CatalogFoodPortionRow[],
-): CatalogFoodResponse => ({
-    id: food.id,
-    name: food.display_name,
-    category: food.category,
-    foodState: narrowColumn<CatalogFoodState>(
-        food.food_state,
-        isCatalogFoodState,
-        'catalog_foods',
-        'food_state',
-        food.id,
-    ),
-    identitySource: narrowColumn<CatalogIdentitySource>(
-        food.identity_source,
-        isCatalogIdentitySource,
-        'catalog_foods',
-        'identity_source',
-        food.id,
-    ),
-    nutritionProvenance: narrowColumn<CatalogNutritionProvenance>(
-        food.nutrition_provenance,
-        isCatalogNutritionProvenance,
-        'catalog_foods',
-        'nutrition_provenance',
-        food.id,
-    ),
-    nutritionBasis: narrowColumn<CatalogNutritionBasis>(
-        food.nutrition_basis,
-        isCatalogNutritionBasis,
-        'catalog_foods',
-        'nutrition_basis',
-        food.id,
-    ),
-    basisAmount: food.basis_amount,
-    calories: requireCoreNutrient(food.calories, 'calories', food.id),
-    protein: requireCoreNutrient(food.protein_g, 'protein_g', food.id),
-    carbs: requireCoreNutrient(food.carbs_g, 'carbs_g', food.id),
-    fat: requireCoreNutrient(food.fat_g, 'fat_g', food.id),
-    // null here means UNKNOWN, not zero, and is passed through as null: the
-    // sources behind the catalog often state no fibre value at all, and a 0
-    // would claim the food contains none. This is the one nutrient on the
-    // response that may be unknown — the four above cannot be, on a published
-    // row — which is why it alone is nullable in the contract.
-    fiber: optionalNutrient(food.fiber_g),
-    defaultPortion: resolveDefaultPortion(food.id, portions),
-    allergenTags: food.allergen_tags ?? [],
-    allergenStatus: narrowColumn<CatalogAllergenStatus>(
-        food.allergen_status,
-        isCatalogAllergenStatus,
-        'catalog_foods',
-        'allergen_status',
-        food.id,
-    ),
-    foodGroup: food.food_group,
-});
+): CatalogFoodResponse => {
+    const defaultPortion = resolveDefaultPortion(food.id, portions);
+
+    return {
+        id: food.id,
+        name: food.display_name,
+        category: food.category,
+        foodState: narrowColumn<CatalogFoodState>(
+            food.food_state,
+            isCatalogFoodState,
+            'catalog_foods',
+            'food_state',
+            food.id,
+        ),
+        identitySource: narrowColumn<CatalogIdentitySource>(
+            food.identity_source,
+            isCatalogIdentitySource,
+            'catalog_foods',
+            'identity_source',
+            food.id,
+        ),
+        nutritionProvenance: narrowColumn<CatalogNutritionProvenance>(
+            food.nutrition_provenance,
+            isCatalogNutritionProvenance,
+            'catalog_foods',
+            'nutrition_provenance',
+            food.id,
+        ),
+        nutritionBasis: narrowColumn<CatalogNutritionBasis>(
+            food.nutrition_basis,
+            isCatalogNutritionBasis,
+            'catalog_foods',
+            'nutrition_basis',
+            food.id,
+        ),
+        basisAmount: food.basis_amount,
+        calories: requireCoreNutrient(food.calories, 'calories', food.id),
+        protein: requireCoreNutrient(food.protein_g, 'protein_g', food.id),
+        carbs: requireCoreNutrient(food.carbs_g, 'carbs_g', food.id),
+        fat: requireCoreNutrient(food.fat_g, 'fat_g', food.id),
+        // null here means UNKNOWN, not zero, and is passed through as null: the
+        // sources behind the catalog often state no fibre value at all, and a 0
+        // would claim the food contains none. This is the one nutrient on the
+        // response that may be unknown — the four above cannot be, on a published
+        // row — which is why it alone is nullable in the contract.
+        fiber: optionalNutrient(food.fiber_g),
+        defaultPortion,
+        defaultPortionNutrition: deriveDefaultPortionNutrition(food, defaultPortion),
+        // Read, never defaulted: an absent list would otherwise reach the client as
+        // "contains no allergens" on a food nothing established that about.
+        allergenTags: requireTagArray(food.allergen_tags, 'catalog_foods', 'allergen_tags', food.id),
+        allergenStatus: narrowColumn<CatalogAllergenStatus>(
+            food.allergen_status,
+            isCatalogAllergenStatus,
+            'catalog_foods',
+            'allergen_status',
+            food.id,
+        ),
+        foodGroup: food.food_group,
+    };
+};
 
 /* ---------------------------------------------------------------------------
  * Suggestions and operator status
@@ -482,8 +675,21 @@ export const mapIngredientSnapshot = (
         'snapshot_provenance',
         ingredient.catalog_food_id,
     ),
-    allergenTags: ingredient.snapshot_allergen_tags ?? [],
-    dietTags: ingredient.snapshot_diet_tags ?? [],
+    // The frozen safety facts, read rather than defaulted: these two lists are
+    // what a recipe's allergen and diet claims are derived from, so an absent
+    // one fails the recipe instead of quietly widening what it is safe for.
+    allergenTags: requireTagArray(
+        ingredient.snapshot_allergen_tags,
+        'recipe_ingredients',
+        'snapshot_allergen_tags',
+        ingredient.catalog_food_id,
+    ),
+    dietTags: requireTagArray(
+        ingredient.snapshot_diet_tags,
+        'recipe_ingredients',
+        'snapshot_diet_tags',
+        ingredient.catalog_food_id,
+    ),
     per100g: readSnapshotNutrients(ingredient.snapshot_per_100g, ingredient.catalog_food_id),
     nutritionVersion: ingredient.catalog_nutrition_version,
     metadataVersion: ingredient.catalog_metadata_version,

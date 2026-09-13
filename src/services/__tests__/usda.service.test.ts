@@ -60,6 +60,7 @@ import { parseCanonicalFdcId } from '../catalog.logic';
 import {
     MAX_BATCH_FDC_IDS,
     MAX_LIST_PAGE_SIZE,
+    USDA_REQUEST_CALL_BUDGET_MS,
     UsdaError,
     cacheKeyFor,
     cacheKeyForRequest,
@@ -67,6 +68,7 @@ import {
     getBrandedFood,
     getFoodDetail,
     getFoodsBatch,
+    isRetryableUsdaStatus,
     listFoods,
     normalizeFdcIds,
     searchBrandedFoods,
@@ -118,6 +120,16 @@ const MAX_ATTEMPTS = 4;
 const BACKOFF_SEQUENCE_MS = [250, 500, 750];
 const TOTAL_BACKOFF_MS = BACKOFF_SEQUENCE_MS.reduce((total, delay) => total + delay, 0);
 
+/**
+ * The per-attempt deadlines, also private to the module. The call budgets are
+ * not restated: the request-path one is exported (`estimate.service.ts` sizes
+ * its grounding reserve from it) and the import one is derived below from the
+ * attempt count it has to admit.
+ */
+const REQUEST_ATTEMPT_TIMEOUT_MS = 3_000;
+const IMPORT_ATTEMPT_TIMEOUT_MS = 30_000;
+const IMPORT_CALL_BUDGET_MS = 120_000;
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** `SEARCH_TTL_MS` and `DETAIL_TTL_MS`, also private to the module. */
 const SEARCH_TTL_MS = 30 * DAY_MS;
@@ -137,6 +149,7 @@ const PLACEHOLDER_MESSAGE = 'USDA request failed';
 
 const statusMessage = (status: number): string => `USDA returned ${status}`;
 const vendorFailureMessage = (cause: string): string => `USDA request failed: ${cause}`;
+const timedOutMessage = (afterMs: number): string => `USDA request timed out after ${afterMs}ms`;
 const invalidFdcIdMessage = (value: string): string => `Invalid USDA FDC id: ${value}`;
 const overLengthBatchMessage = (received: number): string =>
     `USDA accepts at most ${MAX_BATCH_FDC_IDS} FDC ids per batch request, received ${received}`;
@@ -258,6 +271,52 @@ const rejectWith = (error: unknown): FetchStub =>
         }) as unknown as FetchStub,
     );
 
+/** What `fetch` rejects with when the signal it was given aborts. */
+const abortError = (): Error => {
+    const error = new Error('This operation was aborted');
+    error.name = 'AbortError';
+
+    return error;
+};
+
+/**
+ * A stub that never answers, and rejects only when the request's own signal
+ * aborts — which is what a stalled DNS lookup, TLS handshake or body read looks
+ * like to this module. Before the deadline existed, a call against this stub
+ * never settled at all.
+ */
+const neverAnswers = (): FetchStub =>
+    install(
+        jest.fn(
+            (_input: unknown, init?: RequestInit): Promise<Response> =>
+                new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () => {
+                        reject(abortError());
+                    });
+                }),
+        ) as unknown as FetchStub,
+    );
+
+/** Stalls the first attempt until it is aborted, then answers every later one. */
+const stallThenRespond = (payload: unknown): FetchStub => {
+    let stalled = false;
+
+    return install(
+        jest.fn((_input: unknown, init?: RequestInit): Promise<Response> => {
+            if (stalled) {
+                return Promise.resolve(jsonResponse(payload));
+            }
+            stalled = true;
+
+            return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener('abort', () => {
+                    reject(abortError());
+                });
+            });
+        }) as unknown as FetchStub,
+    );
+};
+
 interface Deferred {
     stub: FetchStub;
     settle: () => void;
@@ -288,11 +347,12 @@ const respondWhenSettled = (payload: unknown): Deferred => {
 
 interface SentRequest {
     url: string;
-    /** 1 for a plain `fetch(url)`, 2 once an init object is passed. */
+    /** Always 2: every request carries an init, if only to hold the signal. */
     argumentCount: number;
     method: string | undefined;
     headers: unknown;
     body: unknown;
+    signal: AbortSignal | null | undefined;
 }
 
 const sentRequest = (index = 0): SentRequest => {
@@ -311,7 +371,27 @@ const sentRequest = (index = 0): SentRequest => {
         method: init?.method,
         headers: init?.headers,
         body: typeof rawBody === 'string' ? (JSON.parse(rawBody) as unknown) : rawBody,
+        signal: init?.signal,
     };
+};
+
+/**
+ * The GET contract, asserted in one place because six tests depend on it.
+ *
+ * A GET's init exists only to carry the abort signal every attempt runs under:
+ * no method, no headers and no body, so what USDA receives is byte-for-byte the
+ * request this module sent before it had a deadline — `fetch(url)` with a
+ * default method of GET and no content type. The signal itself is the change,
+ * and it is asserted rather than ignored: without it a stalled DNS lookup, TLS
+ * handshake or body read waits for the socket's lifetime (the defect this
+ * suite's `deadlines` group covers).
+ */
+const expectSignalOnlyGet = (request: SentRequest): void => {
+    expect(request.argumentCount).toBe(2);
+    expect(request.method).toBeUndefined();
+    expect(request.headers).toBeUndefined();
+    expect(request.body).toBeUndefined();
+    expect(request.signal).toBeInstanceOf(AbortSignal);
 };
 
 // ---------------------------------------------------------------------------
@@ -933,16 +1013,12 @@ describe('fetchFromUsda', () => {
             );
         });
 
-        it('sends a GET as a single-argument fetch, with no init object', async () => {
+        it('sends a GET whose init carries the abort signal and nothing else', async () => {
             respondWith(jsonResponse(listPayload()));
 
             await listFoods('Branded');
 
-            const request = sentRequest();
-
-            expect(request.argumentCount).toBe(1);
-            expect(request.method).toBeUndefined();
-            expect(request.body).toBeUndefined();
+            expectSignalOnlyGet(sentRequest());
         });
 
         it('sends the search query verbatim even though the cache key normalises it', async () => {
@@ -1083,6 +1159,240 @@ describe('fetchFromUsda', () => {
 
             expect(writtenKeys()).toEqual([]);
             expect(rows.size).toBe(0);
+        });
+    });
+
+    /**
+     * Which statuses earn a second request, and which end the call.
+     *
+     * The boundary retries what a retry can change — `400` (USDA's documented
+     * intermittent rejection of a valid request), `408`, `429` and every 5xx —
+     * and stops on what it cannot. A definitive `401`, `403` or `404` answered
+     * four times is the same answer four times: three of the hour's 900 import
+     * requests spent on it, three backoffs of latency added before the operator
+     * learns the key is wrong, and on the request path three more seconds of a
+     * client's deadline burned.
+     */
+    describe('the retryable-status classification', () => {
+        it.each([400, 408, 429, 500, 502, 503, 504])('retries %i', (status) => {
+            expect(isRetryableUsdaStatus(status)).toBe(true);
+        });
+
+        it.each([401, 403, 404, 405, 410, 413, 415, 422, 451])('does not retry %i', (status) => {
+            expect(isRetryableUsdaStatus(status)).toBe(false);
+        });
+
+        it.each([401, 403, 404])(
+            'issues exactly one request for a definitive %i and reports the status',
+            async (status) => {
+                alwaysRespond(() => failureResponse(status));
+
+                // No timer is advanced: a terminal status must reject without
+                // waiting out a backoff that is never going to be served.
+                const error = await vendorFailure(searchBrandedFoods('yogurt'));
+
+                expect(error.message).toBe(statusMessage(status));
+                expect(requestCount()).toBe(1);
+            },
+        );
+
+        it('charges one rate-limiter token for a definitive 4xx, not four', async () => {
+            alwaysRespond(() => failureResponse(403));
+
+            await vendorFailure(listFoods('Branded'));
+
+            expect(requestCount()).toBe(1);
+        });
+
+        it('caches nothing when the answer is definitive', async () => {
+            alwaysRespond(() => failureResponse(404));
+
+            await vendorFailure(getBrandedFood('9000301'));
+
+            expect(writtenKeys()).toEqual([]);
+            expect(rows.size).toBe(0);
+        });
+
+        it('leaves a retryable status retried, so a definitive answer is the only thing that stops early', async () => {
+            alwaysRespond(() => failureResponse(429));
+
+            await exhaustAttempts(listFoods('Branded'));
+
+            expect(requestCount()).toBe(MAX_ATTEMPTS);
+        });
+    });
+
+    /**
+     * The deadlines.
+     *
+     * `fetch` has no timeout of its own, so before these existed a stalled DNS
+     * lookup, TLS handshake or body read never settled: the request path held
+     * an `/api/macros/estimate` call open past the mobile client's own 25 s
+     * deadline, and an import stopped making progress without ever failing.
+     * Every attempt now runs under an `AbortController`, and — because a
+     * per-attempt deadline multiplies by `MAX_ATTEMPTS` — the whole logical
+     * call runs under one budget, with each attempt taking whichever is nearer.
+     *
+     * The two endpoint classes are asserted separately because the numbers are
+     * chosen for different readers: a request-path call has a client waiting on
+     * it, an import call has an operator who would rather wait than re-run.
+     */
+    describe('deadlines', () => {
+        /**
+         * When the call settled, on the fake clock. Captured as the rejection
+         * is handled rather than read after the advance, because
+         * `advanceTimersByTimeAsync` moves the clock to the end of the window
+         * it was given whether or not anything was still waiting.
+         */
+        const settlementOf = (call: Promise<unknown>): Promise<{ error: unknown; elapsedMs: number }> =>
+            rejectionOf(call).then((error) => ({ error, elapsedMs: Date.now() - FIXED_NOW }));
+
+        it('aborts a stalled request-path attempt at its deadline and says it timed out', async () => {
+            neverAnswers();
+
+            const settled = settlementOf(searchBrandedFoods('yogurt'));
+            await jest.advanceTimersByTimeAsync(REQUEST_ATTEMPT_TIMEOUT_MS);
+
+            // The attempt is over; the call itself keeps going into its retry.
+            expect(sentRequest().signal?.aborted).toBe(true);
+
+            await jest.advanceTimersByTimeAsync(USDA_REQUEST_CALL_BUDGET_MS);
+            const error = asUsdaError((await settled).error);
+
+            expect(error.message.startsWith('USDA request timed out after ')).toBe(true);
+        });
+
+        it('does not abort one millisecond before the attempt deadline', async () => {
+            neverAnswers();
+
+            const settled = rejectionOf(searchBrandedFoods('yogurt'));
+            await jest.advanceTimersByTimeAsync(REQUEST_ATTEMPT_TIMEOUT_MS - 1);
+
+            expect(sentRequest().signal?.aborted).toBe(false);
+            expect(requestCount()).toBe(1);
+
+            await jest.advanceTimersByTimeAsync(USDA_REQUEST_CALL_BUDGET_MS);
+            await settled;
+            expect(sentRequest().signal?.aborted).toBe(true);
+        });
+
+        /**
+         * A timeout is a transient failure, so it is retried like a 429 — the
+         * deadline bounds the wait, it does not give up on the call.
+         */
+        it('retries after a timed-out attempt and resolves when the next one answers', async () => {
+            const envelope = searchSample('brandedComplete');
+            stallThenRespond(envelope.payload);
+
+            const call = searchBrandedFoods('yogurt');
+            await jest.advanceTimersByTimeAsync(REQUEST_ATTEMPT_TIMEOUT_MS + BACKOFF_SEQUENCE_MS[0]);
+
+            await expect(call).resolves.toEqual([envelope.expectedBrandedFood]);
+            expect(requestCount()).toBe(2);
+        });
+
+        /**
+         * Four attempts of 3 s plus 1.5 s of backoff would be a 13.5 s call on
+         * a path whose whole slice of the request is 6 s, so the budget — not
+         * the attempt count — is what ends a stalled request-path call, and it
+         * ends it at exactly the budget.
+         */
+        it('stops a stalled request-path call at the call budget, short of four attempts', async () => {
+            neverAnswers();
+
+            const settled = rejectionOf(searchBrandedFoods('yogurt'));
+            await jest.advanceTimersByTimeAsync(USDA_REQUEST_CALL_BUDGET_MS);
+
+            const error = asUsdaError(await settled);
+
+            // Attempt 1 runs 0 → 3,000 and attempt 2 is handed the 2,750 ms
+            // left after the first backoff, which is why the reported deadline
+            // is the shortened one.
+            expect(error.message).toBe(timedOutMessage(USDA_REQUEST_CALL_BUDGET_MS - REQUEST_ATTEMPT_TIMEOUT_MS - BACKOFF_SEQUENCE_MS[0]));
+            expect(requestCount()).toBe(2);
+        });
+
+        /**
+         * The property `estimate.service.ts` reserves against: one
+         * request-path call cannot outlast `USDA_REQUEST_CALL_BUDGET_MS`, so
+         * the grounding slice of an estimate request is a known quantity
+         * rather than an open-ended wait.
+         */
+        it('settles a wholly unresponsive request-path call within the budget', async () => {
+            neverAnswers();
+
+            const settled = settlementOf(searchBrandedFoods('yogurt'));
+            await jest.advanceTimersByTimeAsync(USDA_REQUEST_CALL_BUDGET_MS * 10);
+
+            expect((await settled).elapsedMs).toBeLessThanOrEqual(USDA_REQUEST_CALL_BUDGET_MS);
+        });
+
+        it('gives an import attempt the longer deadline, so a large batch response is not cut off', async () => {
+            neverAnswers();
+
+            const settled = rejectionOf(getFoodsBatch([9000301]));
+            await jest.advanceTimersByTimeAsync(REQUEST_ATTEMPT_TIMEOUT_MS);
+
+            expect(sentRequest().signal?.aborted).toBe(false);
+
+            await jest.advanceTimersByTimeAsync(IMPORT_ATTEMPT_TIMEOUT_MS - REQUEST_ATTEMPT_TIMEOUT_MS);
+            expect(sentRequest().signal?.aborted).toBe(true);
+
+            await jest.advanceTimersByTimeAsync(IMPORT_CALL_BUDGET_MS);
+            expect(asUsdaError(await settled).name).toBe('UsdaError');
+        });
+
+        it('still makes all four attempts on an import path, inside its own budget', async () => {
+            neverAnswers();
+
+            const settled = settlementOf(listFoods('Branded'));
+            await jest.advanceTimersByTimeAsync(IMPORT_CALL_BUDGET_MS * 2);
+
+            // The import budget is wide enough that MAX_ATTEMPTS, not the
+            // budget, is what ends the call — which is the attempt count
+            // `scripts/lib/rateLimiter.ts` charges tokens against.
+            expect(requestCount()).toBe(MAX_ATTEMPTS);
+            expect((await settled).elapsedMs).toBeLessThanOrEqual(IMPORT_CALL_BUDGET_MS);
+        });
+
+        it('clears the attempt timer once the request answers, leaving nothing pending', async () => {
+            respondWith(jsonResponse([portionSample('srLegacyPortions').payload]));
+
+            await listFoods('Branded');
+
+            // An un-cleared abort timer would hold the event loop open for the
+            // rest of its delay after the call has already returned.
+            expect(jest.getTimerCount()).toBe(0);
+        });
+
+        it('clears the attempt timer when the request fails', async () => {
+            alwaysRespond(() => failureResponse(403));
+
+            await vendorFailure(listFoods('Branded'));
+
+            expect(jest.getTimerCount()).toBe(0);
+        });
+
+        /**
+         * `scripts/catalog-import-usda.ts` reports a vendor failure under its
+         * own operator code (`usda_request_failed`) and narrows on
+         * `error.name`, not `instanceof`: importing this module's value side at
+         * script load would construct a Prisma client, which that file
+         * deliberately defers to `main()`. The name is therefore a cross-file
+         * contract, asserted here across every failure the import path can
+         * actually raise.
+         */
+        it('names a timeout, a definitive status and a transport failure UsdaError alike', async () => {
+            neverAnswers();
+            const timedOut = rejectionOf(getFoodsBatch([9000301]));
+            await jest.advanceTimersByTimeAsync(IMPORT_CALL_BUDGET_MS);
+            expect(asUsdaError(await timedOut).name).toBe('UsdaError');
+
+            alwaysRespond(() => failureResponse(403));
+            expect((await vendorFailure(listFoods('Branded'))).name).toBe('UsdaError');
+
+            rejectWith(new TypeError('fetch failed'));
+            expect((await exhaustAttempts(listFoods('Foundation'))).name).toBe('UsdaError');
         });
     });
 
@@ -1272,7 +1582,7 @@ describe('the new fetchers', () => {
             const request = sentRequest();
 
             expect(request.url).toBe(`${DEFAULT_BASE_URL}/food/9000301?format=full&api_key=${API_KEY}`);
-            expect(request.argumentCount).toBe(1);
+            expectSignalOnlyGet(request);
         });
 
         it('accepts a string id and needs no path escaping, the id being a proven integer', async () => {
@@ -1792,7 +2102,7 @@ describe('unchanged behaviour', () => {
                     '&dataType=Survey%20(FNDDS)%2CSR%20Legacy%2CFoundation' +
                     `&pageSize=4&pageNumber=1&api_key=${API_KEY}`,
             );
-            expect(request.argumentCount).toBe(1);
+            expectSignalOnlyGet(request);
         });
 
         it('defaults the limit to six', async () => {
@@ -1889,7 +2199,7 @@ describe('unchanged behaviour', () => {
                 `${DEFAULT_BASE_URL}/foods/search?query=yogurt&dataType=Branded` +
                     `&pageSize=20&pageNumber=1&api_key=${API_KEY}`,
             );
-            expect(request.argumentCount).toBe(1);
+            expectSignalOnlyGet(request);
         });
 
         it('reads through the legacy cache key, not the method-aware one', async () => {
@@ -1980,7 +2290,7 @@ describe('unchanged behaviour', () => {
             const request = sentRequest();
 
             expect(request.url).toBe(`${DEFAULT_BASE_URL}/food/9000301%20x?format=full&api_key=${API_KEY}`);
-            expect(request.argumentCount).toBe(1);
+            expectSignalOnlyGet(request);
         });
 
         it('reads through the legacy cache key, not the method-aware one', async () => {
@@ -2155,12 +2465,7 @@ describe('unchanged behaviour', () => {
             await getBrandedFood('9000301');
 
             for (let index = 0; index < 3; index += 1) {
-                const request = sentRequest(index);
-
-                expect(request.argumentCount).toBe(1);
-                expect(request.method).toBeUndefined();
-                expect(request.headers).toBeUndefined();
-                expect(request.body).toBeUndefined();
+                expectSignalOnlyGet(sentRequest(index));
             }
         });
     });

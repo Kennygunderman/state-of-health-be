@@ -55,13 +55,21 @@
 //  * NO HTTP. No `res`, no status codes. The success statuses the two keyed
 //    writes return are values the pure layer produced and the ledger persisted;
 //    every typed error is mapped once, at the controller (§8).
-//  * NO FIELD VALIDATION OF ITS OWN. `parseGeneratePlanRequest` and
-//    `parseRegeneratePlanRequest` are pure verdicts in `mealPlan.logic.ts`, and
+//  * NO FIELD VALIDATION OF ITS OWN. `parseGeneratePlanRequest`,
+//    `parseRegeneratePlanRequest`, `parseMealPlanDayPath` and
+//    `parseAffectedMealsPath` are pure verdicts in `mealPlan.logic.ts`, and
 //    their refusal is RETURNED unchanged rather than thrown — the convention
 //    `preferences.service.ts` and `targets.service.ts` already follow, and the
 //    reason both generation entry points take `body: unknown`: the parser needs
 //    a `StartDateWindow` that only a database read can supply, so the parse
 //    cannot happen in the controller.
+//
+//    THE TWO READ ENTRY POINTS PARSE FIRST, BEFORE ANY `await`, which the two
+//    write entry points cannot (see the window above): a `:planId` that is not
+//    a UUID would otherwise reach a PostgreSQL `uuid` predicate and a `:date`
+//    that is not a real calendar day would reach `toStoredDate`'s
+//    `new Date(`${dayKey}T00:00:00.000Z`)`, and each would surface as a generic
+//    `500` where §0.5.2 promises a `400 invalid_request` naming the field.
 //  * NO FLAG RECOMPUTATION. `preferences.service.ts::recomputeActivePlanFlags`
 //    owns it. This file READS `meal_plan_meals.flags` and never writes it.
 //  * NO READ OF `meal_plans.incompatibility_flags`. That column is an audit
@@ -106,7 +114,9 @@ import {
     PlanLifecycleState,
     PlanRecipeCandidate,
     generateWeeklyPlan,
+    parseAffectedMealsPath,
     parseGeneratePlanRequest,
+    parseMealPlanDayPath,
     parseRegeneratePlanRequest,
     requireNonConflictingWeek,
     requireWritablePlan,
@@ -118,15 +128,21 @@ import {
     PreferencesIncompleteError,
     StalePlanError,
     StaleRevisionError,
+    TargetsUnconfirmedError,
 } from './mealPlanning.errors';
 import { KeyedActionType, buildRequestFingerprint } from './mealPlanningAction.logic';
-import { KeyedActionParams, KeyedActionResult, runKeyedAction } from './mealPlanningAction.service';
+import {
+    KeyedActionParams,
+    KeyedActionResult,
+    MealPlanningTransactionClient,
+    runKeyedAction,
+} from './mealPlanningAction.service';
 import { isClockTime } from './preferences.logic';
 import { PreferencesRow, dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
 import { PlanningPreferences, isMealSlot } from './recipe.logic';
 import { mapPlannedRecipeSummary } from './recipe.mapper';
 import { getRecipeVersionsForPlanning } from './recipe.service';
-import { getTargets, requireConfirmedTargets } from './targets.service';
+import { getTargets, previewConfirmedTargets, requireConfirmedTargets } from './targets.service';
 
 /* ---------------------------------------------------------------------------
  * Policy constants
@@ -1055,8 +1071,38 @@ export const getCurrentMealPlan = async (
 };
 
 /**
+ * The two READ entry points' outcomes: the response, or the path parser's
+ * refusal verbatim.
+ *
+ * Both reuse {@link MealPlanRefusal} — declared with the generation entry
+ * points below, and by construction `mealPlan.logic.ts`'s one error verdict —
+ * because `parseMealPlanDayPath` and `parseAffectedMealsPath` carry exactly the
+ * shape `parseGeneratePlanRequest` does. One refusal type for the module means
+ * the controller maps one vocabulary for every `400 invalid_request` this file
+ * can produce, and a hand-written second copy would be free to drift from the
+ * details the client renders beside its fields.
+ */
+export type MealPlanDayResult = { kind: 'ok'; envelope: MealPlanDayEnvelopeResponse } | MealPlanRefusal;
+
+/** Either the plan's incompatible meals, or the path parser's refusal verbatim. */
+export type AffectedMealsResult = { kind: 'ok'; response: AffectedMealsResponse } | MealPlanRefusal;
+
+/**
  * `GET /api/meal-planning/plans/:planId/days/:date` — one day, with fresh logged
  * state, without refetching the week.
+ *
+ * THE PATH IS PARSED BEFORE ANY I/O, as the first statement, so no `await` can
+ * precede the judgement (§0.5.2: "server-side validation applied before any
+ * Prisma or planning work"). This is the route-facing parse boundary — the
+ * arrangement `generatePlan`, `regeneratePlan` and `targets.service.ts::saveTargets`
+ * already use — and it is what keeps the two malformed inputs this route can
+ * receive out of the database: a `planId` that is not a UUID would otherwise
+ * reach a PostgreSQL `uuid` predicate, and a malformed `date` would reach
+ * `new Date(\`${dayKey}T00:00:00.000Z\`)` inside {@link loadMealPlanDayResponse},
+ * each surfacing as a generic 500 where the contract promises a
+ * `400 invalid_request` naming the field. The refusal is RETURNED unchanged for
+ * the controller to map, never thrown: a field-level failure is data the client
+ * renders (§8).
  *
  * READABLE FOR A SUPERSEDED OR ENDED PLAN, deliberately: §0.5.2 declares no
  * `plan_not_active` for this route, because history has to keep working — the
@@ -1068,15 +1114,23 @@ export const getCurrentMealPlan = async (
  * `PlanNotFoundError` covers a plan that is absent or not the caller's AND a
  * date outside the plan's week — §0.5.2's 404 for this route — because
  * distinguishing them would confirm the existence of a plan the caller has no
- * right to (§8).
+ * right to (§8). A WELL-FORMED id or day key that names nothing is therefore
+ * still that 404; only a value that could never denote a plan or a calendar day
+ * is the returned 400.
  */
 export const getMealPlanDay = async (
     userId: string,
     planId: string,
     date: string,
-): Promise<MealPlanDayEnvelopeResponse> => {
+): Promise<MealPlanDayResult> => {
+    const parsed = parseMealPlanDayPath({ planId, date });
+
+    if (parsed.kind !== 'ok') {
+        return parsed;
+    }
+
     const plan = await prisma.meal_plans.findFirst({
-        where: { id: planId, user_id: userId },
+        where: { id: parsed.planId, user_id: userId },
         select: { id: true, revision: true, status: true },
     });
 
@@ -1084,17 +1138,20 @@ export const getMealPlanDay = async (
         throw new PlanNotFoundError();
     }
 
-    const day = await loadMealPlanDayResponse(prisma, userId, planId, date);
+    const day = await loadMealPlanDayResponse(prisma, userId, parsed.planId, parsed.date);
 
     if (day === null) {
         throw new PlanNotFoundError();
     }
 
     return {
-        planId: plan.id,
-        planRevision: plan.revision,
-        planStatus: readPlanStatus(plan.status, plan.id),
-        day,
+        kind: 'ok',
+        envelope: {
+            planId: plan.id,
+            planRevision: plan.revision,
+            planStatus: readPlanStatus(plan.status, plan.id),
+            day,
+        },
     };
 };
 
@@ -1111,10 +1168,22 @@ export const getMealPlanDay = async (
  * re-derived them would either duplicate that rule or report a verdict the
  * stored plan does not carry. No clock parameter for the same reason as the day
  * read — the answer is the plan's stored state.
+ *
+ * `:planId` is parsed as the FIRST statement, for the reason
+ * {@link getMealPlanDay} states: a malformed id would otherwise reach the
+ * PostgreSQL `uuid` predicate below as a 500 instead of the contract's
+ * `400 invalid_request`. A well-formed id that names no plan of this caller's is
+ * still `PlanNotFoundError`.
  */
-export const getAffectedMeals = async (userId: string, planId: string): Promise<AffectedMealsResponse> => {
+export const getAffectedMeals = async (userId: string, planId: string): Promise<AffectedMealsResult> => {
+    const parsed = parseAffectedMealsPath({ planId });
+
+    if (parsed.kind !== 'ok') {
+        return parsed;
+    }
+
     const plan = await prisma.meal_plans.findFirst({
-        where: { id: planId, user_id: userId },
+        where: { id: parsed.planId, user_id: userId },
         select: { id: true },
     });
 
@@ -1123,7 +1192,7 @@ export const getAffectedMeals = async (userId: string, planId: string): Promise<
     }
 
     const meals = await prisma.meal_plan_meals.findMany({
-        where: { meal_plan_id: planId, user_id: userId },
+        where: { meal_plan_id: parsed.planId, user_id: userId },
         select: {
             id: true,
             slot: true,
@@ -1152,7 +1221,7 @@ export const getAffectedMeals = async (userId: string, planId: string): Promise<
         });
     }
 
-    return { meals: affected };
+    return { kind: 'ok', response: { meals: affected } };
 };
 
 /* ---------------------------------------------------------------------------
@@ -1449,7 +1518,12 @@ const searchCandidateWeek = async (
     payload: { startDate: string; expectedPreferencesRevision: number; expectedTargetsRevision: number },
     generationAttempt: number,
 ): Promise<CandidateWeek> => {
-    const { targets, targetsRevision } = await requireConfirmedTargets(prisma, userId);
+    // The ADVISORY read, named as such: it runs outside any transaction, takes
+    // no lock, and exists only to refuse a request that could never publish
+    // before the search spends five seconds proving it. `requirePinnedInputs`
+    // re-judges the same gate under the per-user advisory lock AND the owning
+    // user row's lock, and that is the one a publication rests on.
+    const { targets, targetsRevision } = await previewConfirmedTargets(userId, prisma);
 
     if (
         payload.expectedPreferencesRevision !== row.revision ||
@@ -1491,18 +1565,38 @@ const searchCandidateWeek = async (
  * built on the user's answers. `requireConfirmedTargets` is also what turns that
  * legacy write into `409 targets_unconfirmed` rather than a silently unconfirmed
  * plan.
+ *
+ * THE TARGETS READ HERE LOCKS THE OWNING USER ROW AND KEEPS IT LOCKED. The
+ * legacy writer takes no advisory lock, so the advisory lock alone would leave
+ * it free to commit between this check and the insert a few statements later;
+ * `requireConfirmedTargets` therefore reads the pair in one statement with
+ * `FOR UPDATE OF u`, and that row lock lives until this transaction commits.
+ * Everything after this call — including `insertGeneratedPlan`, which writes
+ * `targets_snapshot` — runs against a target value that cannot move.
  */
 const requirePinnedInputs = async (
-    tx: Prisma.TransactionClient,
+    tx: MealPlanningTransactionClient,
     userId: string,
     candidate: CandidateWeek,
 ): Promise<void> => {
     const row = await loadPreferencesRow(userId, tx);
-    const { targetsRevision } = await requireConfirmedTargets(tx, userId);
+    const { targets, targetsRevision } = await requireConfirmedTargets(tx, userId);
     const preferencesRevision = row?.revision ?? 0;
 
     if (preferencesRevision !== candidate.preferencesRevision || targetsRevision !== candidate.targetsRevision) {
         throw new StaleRevisionError({ preferencesRevision, targetsRevision });
+    }
+
+    // The invariant the whole lock exists for, asserted rather than argued:
+    // what is about to be stored as `targets_snapshot` is what the locked gate
+    // just certified as confirmed. It cannot fire — a canonical save moves
+    // `targets_revision` and is caught above, and a legacy write makes the
+    // source `legacy` inside `requireConfirmedTargets` — so reaching it means
+    // one of those two mechanisms has been broken by a later change, and
+    // `targets_unconfirmed` is the honest answer: these numbers are no longer
+    // ones this feature can attest to.
+    if (!sameTotals(targets, candidate.targets)) {
+        throw new TargetsUnconfirmedError();
     }
 };
 

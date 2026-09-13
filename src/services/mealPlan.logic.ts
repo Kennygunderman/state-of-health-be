@@ -86,6 +86,7 @@ import {
     PlanOverlapError,
     UpcomingExistsError,
 } from './mealPlanning.errors';
+import { MAX_REVISION } from './preferences.logic';
 import {
     isEligibleForPlanning,
     PlanningPreferences,
@@ -263,7 +264,8 @@ const SEED_FIELD_SEPARATOR = '|';
  * The wire vocabulary for a plan `details[].code`. Machine-readable only — the
  * client maps each code to its own copy:
  *  - `invalid_id` — a path id or idempotency key that is not a v4 UUID.
- *  - `invalid_date` — `startDate` is not a real `YYYY-MM-DD` calendar date.
+ *  - `invalid_date` — `startDate`, or a `:date` path segment, is not a real
+ *    `YYYY-MM-DD` calendar date.
  *  - `required` — the field is absent or null.
  *  - `invalid_type` — present, but not the type the contract declares.
  *  - `out_of_range` — a well-formed value outside its permitted window.
@@ -279,6 +281,8 @@ export const MEAL_PLAN_FIELD_CODES = {
 const START_DATE_FIELD = 'startDate';
 const IDEMPOTENCY_KEY_FIELD = 'idempotencyKey';
 const PLAN_ID_FIELD = 'planId';
+/** The `:date` path segment of the single-day read — not the body's `startDate`. */
+const DATE_FIELD = 'date';
 const EXPECTED_PLAN_REVISION_FIELD = 'expectedPlanRevision';
 const EXPECTED_PREFERENCES_REVISION_FIELD = 'expectedPreferencesRevision';
 const EXPECTED_TARGETS_REVISION_FIELD = 'expectedTargetsRevision';
@@ -2407,6 +2411,12 @@ export type ParsedRegeneratePlanRequest =
     | { kind: 'ok'; planId: string; payload: RegeneratePlanPayload }
     | MealPlanErrorVerdict;
 
+export type ParsedMealPlanDayPath =
+    | { kind: 'ok'; planId: string; date: string }
+    | MealPlanErrorVerdict;
+
+export type ParsedAffectedMealsPath = { kind: 'ok'; planId: string } | MealPlanErrorVerdict;
+
 /** The inclusive window a new plan may start in. */
 export interface StartDateWindow {
     earliest: string;
@@ -2429,10 +2439,14 @@ const asRecord = (value: unknown): Record<string, unknown> | null =>
         : null;
 
 /**
- * Judges one revision field: present, an integer, and at least `minimum`.
+ * Judges one revision field: present, an integer, at least `minimum`, and
+ * within the range a revision column can hold.
  *
  * Split from the field list so the three revisions cannot drift apart, and
  * split by code so the client can tell "you sent a string" from "you sent -1".
+ * Both bounds of the window answer with `out_of_range` — that map's documented
+ * code for a well-formed value outside its permitted window — so one field
+ * reports one code whichever end it fell off.
  */
 const revisionDetail = (
     value: unknown,
@@ -2446,6 +2460,19 @@ const revisionDetail = (
         return { field, code: MEAL_PLAN_FIELD_CODES.INVALID_TYPE };
     }
     if (value < minimum) {
+        return { field, code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE };
+    }
+    // The integer check above is not sufficient on its own: `Number.isInteger`
+    // is true for `1e30`, a whole number that is neither exactly representable
+    // nor storable in the PostgreSQL `integer` column every revision counter
+    // lives in. Both halves are one bound, spelt as `preferences.logic.ts`
+    // spells it — above `MAX_REVISION` no column can hold the value, and above
+    // `Number.MAX_SAFE_INTEGER` the comparison against a stored revision would
+    // itself be unsound. Left unchecked, such a value reaches
+    // `mealPlanningAction.logic.ts::buildRequestFingerprint`, which refuses it
+    // with a TypeError — a 500 for what is plainly a malformed request — or
+    // Prisma, which refuses it as an out-of-range `Int`.
+    if (!Number.isSafeInteger(value) || value > MAX_REVISION) {
         return { field, code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE };
     }
 
@@ -2475,6 +2502,58 @@ export const startDateWindow = (today: string, activePlanEndDate: string | null)
     const successor = addDaysToDayKey(requireDayKey(activePlanEndDate, 'activePlanEndDate'), 1);
 
     return { earliest: today, latest: successor > horizon ? successor : horizon };
+};
+
+/**
+ * Validates `:planId` and `:date` for `GET /meal-planning/plans/:planId/days/:date`.
+ *
+ * BOTH SEGMENTS ARE JUDGED BEFORE ANY I/O, which is the point of the parser: a
+ * malformed id would otherwise reach a PostgreSQL `uuid` predicate and a
+ * malformed key would reach `new Date(\`${dayKey}T00:00:00.000Z\`)`, and each
+ * would surface as a generic 500 where §0.5.2 promises a
+ * `400 invalid_request` naming the field. `isDayKey` is the real-calendar test,
+ * not the shape test, so `2026-02-30` is refused here rather than becoming an
+ * `Invalid Date` the query then compares against.
+ *
+ * Both are reported in one verdict, so a request with two malformed segments
+ * does not send the caller back twice.
+ */
+export const parseMealPlanDayPath = (params: {
+    planId?: unknown;
+    date?: unknown;
+}): ParsedMealPlanDayPath => {
+    const details: InvalidRequestDetail[] = [];
+
+    if (!isUuidV4(params.planId)) {
+        details.push({ field: PLAN_ID_FIELD, code: MEAL_PLAN_FIELD_CODES.INVALID_ID });
+    }
+
+    if (!isDayKey(params.date)) {
+        details.push({ field: DATE_FIELD, code: MEAL_PLAN_FIELD_CODES.INVALID_DATE });
+    }
+
+    if (details.length > 0) {
+        return invalidRequest('planId must be a UUID and date a YYYY-MM-DD calendar date', details);
+    }
+
+    return { kind: 'ok', planId: params.planId as string, date: params.date as string };
+};
+
+/**
+ * Validates `:planId` for `GET /meal-planning/plans/:planId/affected-meals`.
+ *
+ * The same rule as the day read's id half, kept as its own named parser because
+ * the route is its own contract: a controller that borrowed the day parser
+ * would have to supply a `date` the route does not have.
+ */
+export const parseAffectedMealsPath = (params: { planId?: unknown }): ParsedAffectedMealsPath => {
+    if (!isUuidV4(params.planId)) {
+        return invalidRequest('planId must be a UUID', [
+            { field: PLAN_ID_FIELD, code: MEAL_PLAN_FIELD_CODES.INVALID_ID },
+        ]);
+    }
+
+    return { kind: 'ok', planId: params.planId };
 };
 
 /**

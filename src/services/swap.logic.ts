@@ -56,6 +56,12 @@
 //    truthful empty screen for a meal that breaks the day the user just
 //    approved.
 //
+// ALSO HERE, and nowhere else: the pure REQUEST PARSERS for the three swap
+// routes (§0.5.2, Rule backend-architecture §4). They are the same kind of
+// thing as the rules above — a decision over values, taken before any I/O — and
+// keeping them beside the portion sets they judge against is what stops a
+// controller from inventing a second, looser idea of an admissible portion.
+//
 // Not this module's job: reading or writing anything, the keyed-write sequence
 // (`mealPlanningAction.service.ts`), the grocery diff a commit produces
 // (`grocery.logic.ts`), the logged-state derivation a swapped slot displays
@@ -76,8 +82,12 @@ import {
     violatesRepetitionRule,
 } from './mealPlan.logic';
 import { PreviewStaleError, RecipeIneligibleError } from './mealPlanning.errors';
+// The maximum of the PostgreSQL `integer` column every revision counter lives
+// in, imported rather than restated: `preferences.logic.ts` owns that number
+// and a second copy of 2147483647 is a second thing to keep in step.
+import { MAX_REVISION } from './preferences.logic';
 import { PlanningPreferences, evaluatePlanningEligibility, scalePlannedNutrition } from './recipe.logic';
-import type { MealFlag, MealPlanMacroTotals } from '../types/mealPlanning';
+import type { InvalidRequestDetail, MealFlag, MealPlanMacroTotals, SwapMealPayload } from '../types/mealPlanning';
 import type { MealSlot } from '../types/recipe';
 
 /* ---------------------------------------------------------------------------
@@ -802,5 +812,396 @@ export const swapMealWrite = (meal: SwapDayMeal, candidate: SwapCandidate, now: 
         swapped_at: now,
         revision: meal.revision + 1,
         flags: [],
+    };
+};
+
+/* ---------------------------------------------------------------------------
+ * Request parsing
+ *
+ * The pre-I/O validation §0.5.2 requires of the three swap routes, in the layer
+ * Rule backend-architecture §4 puts it in: the controller reads the request,
+ * these decide whether it IS one, and only then does `swap.service.ts` open a
+ * transaction. Two silent failures are what they exist to prevent. A malformed
+ * `planId`/`mealId` reaching the service is a plan lookup that cannot match,
+ * reported as a generic failure instead of the `400` it is; and a malformed
+ * `portionMultiplier` reaching {@link requireBoundPortion} — which fails closed
+ * for ANY value that is not the recomputed portion, non-finite included — is
+ * answered `409 preview_stale`, telling the user their preview went stale when
+ * in fact the request was never well formed.
+ *
+ * VERDICTS ARE RETURNED, NEVER THROWN: a field-level failure is data the client
+ * renders beside the field, every one of these is a `400 invalid_request`, and
+ * no status code appears anywhere in this module (Rule §8). Every offending
+ * field is judged before answering, so a request with three problems reports
+ * three details rather than sending the caller back three times.
+ *
+ * The primitives below — the UUID pattern, `isUuidV4`, `asRecord`, the code map
+ * and the `Parsed*` verdict types — are declared LOCALLY, as every other parser
+ * module in this repo declares its own (`grocery.logic.ts`,
+ * `mealPlan.logic.ts`, `plannedMealLog.logic.ts`, `nutrition.logic.ts` and
+ * `preferences.logic.ts` each carry a copy). The shared contract is the CODE
+ * VOCABULARY, which is spelt here exactly as those modules spell the same
+ * conditions so the client needs one mapping and not five; the three-line
+ * helpers are not a contract worth a shared module.
+ * ------------------------------------------------------------------------- */
+
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * `meal_plans.revision` starts at 1, so no smaller value can pin a real plan.
+ *
+ * Deliberately distinct from {@link MIN_MEAL_REVISION}, which is the same floor
+ * for `meal_plan_meals.revision`: a commit PINS the plan's revision (the
+ * stale-plan guard the client echoes back from the preview) and ADVANCES the
+ * meal's, and the two counters move independently. Declared here rather than
+ * imported from `plannedMealLog.logic.ts` — the diary log is a different domain,
+ * and a cross-domain import for the literal 1 would couple two parsers that
+ * share nothing else.
+ */
+const MIN_PLAN_REVISION = 1;
+
+/**
+ * The wire vocabulary for a swap `details[].code`. Machine-readable only — the
+ * client maps each code to its own copy:
+ *  - `invalid_id` — a path id, `recipeVersionId` or `idempotencyKey` that is not
+ *    a v4 UUID (a non-string included; a path id is always a string when a route
+ *    matched, so nothing is gained by telling those two apart).
+ *  - `required` — a body field is absent or null.
+ *  - `invalid_type` — present, but not the JSON type the contract declares.
+ *  - `unknown_value` — a well-formed number outside the closed set the contract
+ *    offers, which is what `portionMultiplier` is judged against.
+ *  - `not_an_integer` — `expectedPlanRevision` is a fractional number.
+ *  - `below_minimum` — `expectedPlanRevision` is below the first revision a plan
+ *    can have.
+ *  - `above_maximum` — `expectedPlanRevision` cannot denote a stored revision at
+ *    all: above the `integer` column's maximum, or outside JavaScript's
+ *    exact-integer range.
+ *  - `unknown_field` — a body key this endpoint does not accept.
+ *
+ * Spelt as `grocery.logic.ts`, `plannedMealLog.logic.ts`, `targets.logic.ts` and
+ * `preferences.logic.ts` spell the same conditions, so the client maps one
+ * vocabulary rather than one per endpoint.
+ */
+export const SWAP_FIELD_CODES = {
+    INVALID_ID: 'invalid_id',
+    REQUIRED: 'required',
+    INVALID_TYPE: 'invalid_type',
+    UNKNOWN_VALUE: 'unknown_value',
+    NOT_AN_INTEGER: 'not_an_integer',
+    BELOW_MINIMUM: 'below_minimum',
+    ABOVE_MAXIMUM: 'above_maximum',
+    UNKNOWN_FIELD: 'unknown_field',
+} as const;
+
+type SwapFieldCode = (typeof SWAP_FIELD_CODES)[keyof typeof SWAP_FIELD_CODES];
+
+const PLAN_ID_FIELD = 'planId';
+const MEAL_ID_FIELD = 'mealId';
+const RECIPE_VERSION_ID_FIELD = 'recipeVersionId';
+const PORTION_MULTIPLIER_FIELD = 'portionMultiplier';
+const EXPECTED_PLAN_REVISION_FIELD = 'expectedPlanRevision';
+const IDEMPOTENCY_KEY_FIELD = 'idempotencyKey';
+
+/**
+ * Every key the commit body accepts — and therefore, by omission, the definition
+ * of an unknown one.
+ *
+ * `planId` and `mealId` are absent deliberately: they are PATH values, and
+ * honouring them in the body would let a client aim a commit at one meal while
+ * the route named another.
+ */
+const ACCEPTED_COMMIT_FIELDS: readonly string[] = [
+    RECIPE_VERSION_ID_FIELD,
+    PORTION_MULTIPLIER_FIELD,
+    EXPECTED_PLAN_REVISION_FIELD,
+    IDEMPOTENCY_KEY_FIELD,
+];
+
+type SwapErrorVerdict = {
+    kind: 'error';
+    code: 'invalid_request';
+    message: string;
+    details: InvalidRequestDetail[];
+};
+
+/** `GET /meal-planning/plans/:planId/meals/:mealId/alternatives`. */
+export type ParsedSwapAlternativesPath = { kind: 'ok'; planId: string; mealId: string } | SwapErrorVerdict;
+
+/** `GET …/plans/:planId/meals/:mealId/alternatives/:recipeVersionId/preview`. */
+export type ParsedSwapPreviewPath =
+    | { kind: 'ok'; planId: string; mealId: string; recipeVersionId: string }
+    | SwapErrorVerdict;
+
+/** `POST …/plans/:planId/meals/:mealId/swap`. */
+export type ParsedSwapCommitRequest =
+    | { kind: 'ok'; planId: string; mealId: string; payload: SwapMealPayload }
+    | SwapErrorVerdict;
+
+const isUuidV4 = (value: unknown): value is string => typeof value === 'string' && UUID_V4_PATTERN.test(value);
+
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+    typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : null;
+
+const isPresent = (value: unknown): boolean => value !== undefined && value !== null;
+
+const invalidRequest = (message: string, details: InvalidRequestDetail[]): SwapErrorVerdict => ({
+    kind: 'error',
+    code: 'invalid_request',
+    message,
+    details,
+});
+
+/**
+ * The portions a commit may name: the union of the main-slot and snack sets
+ * {@link DEFAULT_PORTION_POLICY} carries, at the stored two-decimal
+ * representation.
+ *
+ * THE UNION, because a parser cannot know the slot. The slot lives on the
+ * `meal_plan_meals` row the path names, which is a database read, and this
+ * function runs before any. Accepting the union is therefore the widest honest
+ * answer at parse time, and the SLOT-SPECIFIC narrowing stays exactly where it
+ * already is: {@link selectSwapPortion} offers only
+ * `portionMultipliersForSlot(slot)`, and {@link requireBoundPortion} then binds
+ * the commit to the one portion the preview showed. A snack committed at 1.75 is
+ * consequently not a `400` — it is a portion no candidate is ever offered at, so
+ * the recomputed value cannot equal it and the commit is refused there.
+ *
+ * NEVER `EXTENDED_PORTION_POLICY`: that set exists only to diagnose
+ * `portion_limits` (a counterfactual "would wider portions have closed this
+ * week?"), and widening the accepted request set with it would accept a portion
+ * the client cannot render or edit.
+ */
+const ADMISSIBLE_PORTION_MULTIPLIERS: ReadonlySet<number> = new Set(
+    [...DEFAULT_PORTION_POLICY.mainSlot, ...DEFAULT_PORTION_POLICY.snack].map(toStoredPortion),
+);
+
+/**
+ * Whether a number is one of the offered portions, compared the way the contract
+ * stores and transports one.
+ *
+ * Normalised through {@link toStoredPortion} — the same two-decimal rounding
+ * every other portion comparison in this module uses — so a value that has been
+ * through a JSON round trip and differs in its fifteenth digit is still
+ * recognised as the portion the user tapped. A raw `Set.has` would refuse it and
+ * the user would have done nothing wrong.
+ */
+const isAdmissiblePortionMultiplier = (value: number): boolean =>
+    Number.isFinite(value) && ADMISSIBLE_PORTION_MULTIPLIERS.has(toStoredPortion(value));
+
+/**
+ * Judges one path id. Anything that is not a v4 UUID is `invalid_id`, absence
+ * included: a route cannot match without its parameters, so an absent path id is
+ * a malformed request rather than a missing field — the same call
+ * `grocery.logic.ts`'s path parsers make.
+ */
+const pathIdDetail = (value: unknown, field: string): InvalidRequestDetail | null =>
+    isUuidV4(value) ? null : { field, code: SWAP_FIELD_CODES.INVALID_ID };
+
+/**
+ * Judges one body id: `required` when it was never sent, `invalid_id` when it
+ * was sent malformed. The two are split because they are different mistakes —
+ * one client forgot a field, the other sent a value it built wrong.
+ */
+const bodyIdFieldCode = (value: unknown): SwapFieldCode | null => {
+    if (!isPresent(value)) {
+        return SWAP_FIELD_CODES.REQUIRED;
+    }
+
+    return isUuidV4(value) ? null : SWAP_FIELD_CODES.INVALID_ID;
+};
+
+/**
+ * `portionMultiplier` is required, must be a JSON number, and must be one of the
+ * offered portions.
+ *
+ * A NUMERIC STRING IS REFUSED AND NEVER COERCED, for the reason
+ * `plannedMealLog.logic.ts` gives for `servings`: the value is part of the
+ * request fingerprint, so `'1'` and `1` must not become the same intent wearing
+ * two spellings — coercing one would let a retry under the same key be compared
+ * against a digest it cannot match.
+ *
+ * THIS CHECK IS WHAT KEEPS A MALFORMED PORTION A `400`. Without it, `'half'`,
+ * `NaN` and `0` all travel as far as {@link requireBoundPortion}, which refuses
+ * every value that is not the recomputed portion by raising
+ * {@link PreviewStaleError} — so the user is told their preview went stale and
+ * sent back to re-preview a request that will fail again the same way.
+ */
+const portionMultiplierFieldCode = (value: unknown): SwapFieldCode | null => {
+    if (!isPresent(value)) {
+        return SWAP_FIELD_CODES.REQUIRED;
+    }
+
+    if (typeof value !== 'number') {
+        return SWAP_FIELD_CODES.INVALID_TYPE;
+    }
+
+    return isAdmissiblePortionMultiplier(value) ? null : SWAP_FIELD_CODES.UNKNOWN_VALUE;
+};
+
+/**
+ * `expectedPlanRevision` is required and never defaulted: it is the stale-plan
+ * guard, and a commit that omitted it would overwrite whatever the plan had
+ * become since the preview was drawn.
+ *
+ * THE UPPER BOUND IS NOT OPTIONAL. `Number.isInteger(1e30)` is `true`, so the
+ * integer check alone admits a magnitude that cannot denote a stored revision:
+ * it is beyond the `integer` column the counter lives in, beyond the range in
+ * which the comparison against that column would even be sound, and beyond what
+ * `mealPlanningAction.logic.ts::buildRequestFingerprint` can canonicalise — it
+ * raises a `TypeError` there, which reaches the client as a `500` for a request
+ * that was plainly invalid. Both halves are one bound, which is why they are one
+ * branch with one code.
+ */
+const planRevisionFieldCode = (value: unknown): SwapFieldCode | null => {
+    if (!isPresent(value)) {
+        return SWAP_FIELD_CODES.REQUIRED;
+    }
+
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return SWAP_FIELD_CODES.INVALID_TYPE;
+    }
+
+    if (!Number.isInteger(value)) {
+        return SWAP_FIELD_CODES.NOT_AN_INTEGER;
+    }
+
+    if (value < MIN_PLAN_REVISION) {
+        return SWAP_FIELD_CODES.BELOW_MINIMUM;
+    }
+
+    return !Number.isSafeInteger(value) || value > MAX_REVISION ? SWAP_FIELD_CODES.ABOVE_MAXIMUM : null;
+};
+
+/**
+ * Validates the alternatives path.
+ *
+ * BOTH IDS ARE JUDGED, so a request with two malformed ids reports two details
+ * instead of sending the caller back twice.
+ */
+export const parseSwapAlternativesPath = (params: {
+    planId?: unknown;
+    mealId?: unknown;
+}): ParsedSwapAlternativesPath => {
+    const details = [
+        pathIdDetail(params.planId, PLAN_ID_FIELD),
+        pathIdDetail(params.mealId, MEAL_ID_FIELD),
+    ].filter((detail): detail is InvalidRequestDetail => detail !== null);
+
+    if (details.length > 0) {
+        return invalidRequest('planId and mealId must be UUIDs', details);
+    }
+
+    return { kind: 'ok', planId: params.planId as string, mealId: params.mealId as string };
+};
+
+/**
+ * Validates the preview path — all THREE ids, every one judged.
+ *
+ * `recipeVersionId` is a path value here and a body value on the commit, and it
+ * is validated in both places: the preview is a read the client may reach
+ * directly, and an unvalidated id would be answered `422 recipe_ineligible` by
+ * {@link selectSwapCandidate} — "that meal no longer fits", which is not what
+ * happened to a caller that sent `alternatives/undefined/preview`.
+ */
+export const parseSwapPreviewPath = (params: {
+    planId?: unknown;
+    mealId?: unknown;
+    recipeVersionId?: unknown;
+}): ParsedSwapPreviewPath => {
+    const details = [
+        pathIdDetail(params.planId, PLAN_ID_FIELD),
+        pathIdDetail(params.mealId, MEAL_ID_FIELD),
+        pathIdDetail(params.recipeVersionId, RECIPE_VERSION_ID_FIELD),
+    ].filter((detail): detail is InvalidRequestDetail => detail !== null);
+
+    if (details.length > 0) {
+        return invalidRequest('planId, mealId and recipeVersionId must be UUIDs', details);
+    }
+
+    return {
+        kind: 'ok',
+        planId: params.planId as string,
+        mealId: params.mealId as string,
+        recipeVersionId: params.recipeVersionId as string,
+    };
+};
+
+/**
+ * Validates the commit — the path ids and the body TOGETHER, in one pass, as
+ * `mealPlan.logic.ts::parseRegeneratePlanRequest` does, so one round trip
+ * reports every problem the request has.
+ *
+ * A body that is not a JSON object reports the four fields it should have
+ * carried rather than throwing: the caller sent no body at all, or sent an array
+ * or a bare string, and the four `required` details say what a body is. The path
+ * ids are still judged in that case, because they are wrong or right
+ * independently of the body.
+ *
+ * UNKNOWN KEYS ARE REPORTED, NOT IGNORED — the call
+ * `plannedMealLog.logic.ts::parseLogPlannedMealRequest` makes for the same
+ * reason: silently dropping a key lets a client believe a value it sent was
+ * honoured, and a misspelt `portionMultipler` would otherwise commit at
+ * whatever the server recomputed instead of failing.
+ */
+export const parseSwapCommitRequest = (
+    params: { planId?: unknown; mealId?: unknown },
+    body: unknown,
+): ParsedSwapCommitRequest => {
+    const details: InvalidRequestDetail[] = [];
+    const judge = (field: string, code: SwapFieldCode | null): void => {
+        if (code) {
+            details.push({ field, code });
+        }
+    };
+
+    for (const detail of [
+        pathIdDetail(params.planId, PLAN_ID_FIELD),
+        pathIdDetail(params.mealId, MEAL_ID_FIELD),
+    ]) {
+        if (detail) {
+            details.push(detail);
+        }
+    }
+
+    const record = asRecord(body);
+
+    if (!record) {
+        for (const field of ACCEPTED_COMMIT_FIELDS) {
+            details.push({ field, code: SWAP_FIELD_CODES.REQUIRED });
+        }
+
+        return invalidRequest('A request body is required', details);
+    }
+
+    judge(RECIPE_VERSION_ID_FIELD, bodyIdFieldCode(record[RECIPE_VERSION_ID_FIELD]));
+    judge(PORTION_MULTIPLIER_FIELD, portionMultiplierFieldCode(record[PORTION_MULTIPLIER_FIELD]));
+    judge(EXPECTED_PLAN_REVISION_FIELD, planRevisionFieldCode(record[EXPECTED_PLAN_REVISION_FIELD]));
+    judge(IDEMPOTENCY_KEY_FIELD, bodyIdFieldCode(record[IDEMPOTENCY_KEY_FIELD]));
+
+    for (const key of Object.keys(record)) {
+        if (!ACCEPTED_COMMIT_FIELDS.includes(key)) {
+            details.push({ field: key, code: SWAP_FIELD_CODES.UNKNOWN_FIELD });
+        }
+    }
+
+    if (details.length > 0) {
+        return invalidRequest('The swap request is not valid', details);
+    }
+
+    // The guards above established every type; the assertions carry that
+    // knowledge into the payload, as the other parser layers do, rather than
+    // re-testing it in a branch no input could reach.
+    return {
+        kind: 'ok',
+        planId: params.planId as string,
+        mealId: params.mealId as string,
+        payload: {
+            recipeVersionId: record[RECIPE_VERSION_ID_FIELD] as string,
+            portionMultiplier: record[PORTION_MULTIPLIER_FIELD] as number,
+            expectedPlanRevision: record[EXPECTED_PLAN_REVISION_FIELD] as number,
+            idempotencyKey: record[IDEMPOTENCY_KEY_FIELD] as string,
+        },
     };
 };

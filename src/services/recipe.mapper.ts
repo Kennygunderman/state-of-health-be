@@ -26,7 +26,19 @@
 // `$queryRaw` has no model type to offer, and a mapper that demanded one would
 // push its callers into casts.
 //
-// Five conventions this file holds the line on:
+// Six conventions this file holds the line on:
+//
+//  * A BROKEN PROMISE IS A FAULT, NOT A DEFAULT. Every field
+//    `src/types/recipe.ts` declares non-optional is backed by a NOT NULL
+//    column, so a row that cannot supply one is drift rather than a client
+//    condition and this file throws `RecipeMappingError`. That applies with
+//    most force to the two safety lists and to the instructions: an empty
+//    `allergenTags` is the claim "contains none of the named allergens" and an
+//    empty `instructions` is a recipe that cannot be cooked, so neither may be
+//    manufactured from an absent value. `reps ?? 0` is a safe default;
+//    `allergenTags ?? []` is a false safety claim. What DOES degrade is named
+//    on `mapRecipeVersion`, and it is one thing only: an unrecognised member of
+//    the two closed-set code lists.
 //
 //  * THE SNAPSHOT IS THE SOURCE. An ingredient's name and provenance come from
 //    the frozen `recipe_ingredients` snapshot columns, never from a joined
@@ -80,9 +92,10 @@ import { isMealSlot, isRecipeBadge, isRecipeIconKey } from './recipe.logic';
 
 /**
  * A stored row contradicted a guarantee `src/types/recipe.ts` makes to the
- * client: a code column holding a value outside its closed set, an instruction
- * step that is not a string, or a planned recipe whose nutrition is not
- * source-backed.
+ * client: a code column holding a value outside its closed set, a required
+ * TEXT[] column that is absent or is not an array of strings, an instruction
+ * list that is absent, not an array or empty, an instruction step that is not a
+ * string, or a planned recipe whose nutrition is not source-backed.
  *
  * Loud on purpose, because every one of these is prevented upstream —
  * `recipe.logic.ts` owns the closed sets, `scripts/recipes-seed.ts` refuses a
@@ -146,8 +159,16 @@ export interface RecipeIngredientRow extends RecipeIngredientSnapshotRow {
  * types it as a JSON value and a raw projection as whatever it finds, so it is
  * read defensively rather than asserted.
  *
- * The three list columns are nullable though two carry `@default([])`: a
- * `$queryRaw` projection can hand back SQL NULL where the model type cannot.
+ * The four list columns are NOT NULL — `meal_slots` unconditionally and
+ * `diet_tags`, `allergen_tags` and `badges` with `DEFAULT ARRAY[]::TEXT[]`
+ * (`prisma/migrations/20260908000000_meal_planning/migration.sql`) — so they are
+ * typed non-null here, which is what stops a caller from reaching for a default
+ * that the schema says cannot be needed. They are still READ through
+ * `requireStringArray` below, because this type is a claim about the projection
+ * rather than a proof of it: `$queryRaw<RecipeVersionRow[]>` asserts the shape
+ * of whatever the statement returns, so a column dropped from a projection, a
+ * view, or a row written around the migration can still arrive as `null` or as
+ * something that is not an array of strings.
  */
 export interface RecipeVersionRow {
     id: string;
@@ -163,12 +184,12 @@ export interface RecipeVersionRow {
     cook_minutes: number;
     /** `prep_minutes + cook_minutes` as `recipe.logic.ts::deriveTotalMinutes` computed it at publication. */
     total_minutes: number;
-    meal_slots: string[] | null;
-    diet_tags: string[] | null;
-    allergen_tags: string[] | null;
+    meal_slots: string[];
+    diet_tags: string[];
+    allergen_tags: string[];
     allergen_status: string;
     budget_tier: number;
-    badges: string[] | null;
+    badges: string[];
     nutrition_provenance: string;
     per_serving_calories: number;
     per_serving_protein_g: number;
@@ -275,19 +296,79 @@ const narrowColumn = <T>(
 };
 
 /**
+ * A required TEXT[] column as the array the contract promises, throwing on
+ * anything else.
+ *
+ * `meal_slots`, `diet_tags`, `allergen_tags` and `badges` are all NOT NULL, so
+ * an absent value is drift or corruption rather than a state the schema admits
+ * — and for the two SAFETY columns a default would be the worst possible
+ * reading of it. `dietTags` and `allergenTags` are the derived union of every
+ * ingredient's frozen tags (§0.7.3, `recipe.logic.ts::deriveAllergenTags`), and
+ * planning eligibility compares the user's allergens against exactly that
+ * union, so `[]` does not mean "unknown" on this contract: it means "contains
+ * none of the nine named allergens" and "carries no dietary restriction". A
+ * `?? []` here would publish that claim on behalf of a row that never made it,
+ * which is the `allergenStatus ?? 'known'` side of the distinction
+ * {@link RecipeMappingError} draws.
+ *
+ * It reads `unknown` rather than `string[]` deliberately, even though
+ * {@link RecipeVersionRow} now types these columns non-null: that type is a
+ * claim a `$queryRaw` projection makes about its own statement, not a proof, so
+ * the check has to survive it. A non-string MEMBER throws for the same reason —
+ * `filter(isMealSlot)` would quietly drop a number, understating the recipe's
+ * slots or badges, and on a tag column there is no filter at all, so a
+ * non-string would reach the client inside a field it declares `string[]`.
+ */
+const requireStringArray = (value: unknown, column: string, versionId: string): string[] => {
+    if (!Array.isArray(value)) {
+        throw new RecipeMappingError(
+            `recipe_versions.${column} is ${value === null ? 'null' : typeof value}, not an array, for ` +
+                `version ${versionId}; the column is NOT NULL, and an empty list here would state that the ` +
+                'recipe carries none of these values rather than that they are unknown',
+        );
+    }
+
+    return value.map((member, index) => {
+        if (typeof member !== 'string') {
+            throw new RecipeMappingError(
+                `recipe_versions.${column}[${index}] is ${typeof member}, not a string, for version ` +
+                    `${versionId}`,
+            );
+        }
+
+        return member;
+    });
+};
+
+/**
  * The `instructions` JSONB column as the ordered list of steps the client
  * renders.
  *
- * Anything that is not an array reads as no instructions — the array default
- * every list field on this contract carries, never `undefined` for the client
- * to guess about. A non-string INSIDE the array is a different matter and
- * throws: dropping it would silently renumber the steps and hand the user a
- * recipe they cannot follow, which is a worse outcome than a loud failure on a
- * row nothing in the sanctioned write path can produce.
+ * A root that is not an array THROWS, and so does an empty one. The column is
+ * `JSONB NOT NULL` holding the steps `scripts/recipes-seed.ts` published, and a
+ * published recipe has steps — frame 12 renders them as the numbered list a
+ * user cooks from, and §0.5.2 declares `instructions: string[]` as part of what
+ * a recipe IS. So neither absence nor emptiness is a state the write path can
+ * produce, and reading either as "no instructions" would hand the user a recipe
+ * that looks complete and cannot be followed: the screen renders a title,
+ * badges, nutrition, an ingredient list and then nothing, with no way to tell
+ * that the steps were lost rather than never written. A non-string INSIDE the
+ * array throws for the adjacent reason: dropping it would silently renumber the
+ * steps.
  */
 const readInstructions = (value: unknown, versionId: string): string[] => {
     if (!Array.isArray(value)) {
-        return [];
+        throw new RecipeMappingError(
+            `recipe_versions.instructions is ${value === null ? 'null' : typeof value}, not an array, for ` +
+                `version ${versionId}; a published recipe carries the steps it is cooked from`,
+        );
+    }
+
+    if (value.length === 0) {
+        throw new RecipeMappingError(
+            `recipe_versions.instructions is empty for version ${versionId}; a published recipe carries at ` +
+                'least one step, so an empty list is lost data rather than a recipe with nothing to do',
+        );
     }
 
     return value.map((step, index) => {
@@ -332,6 +413,20 @@ const readInstructions = (value: unknown, versionId: string): string[] => {
  * (`recipe.logic.ts::deriveAllergenTags` includes it), so a client that could
  * not distinguish it would imply the recipe requires something it merely
  * allows.
+ *
+ * EVERY AMOUNT HERE IS A WHOLE-RECIPE AMOUNT — `quantity`, `gramWeight` and
+ * the pre-formatted `displayText` alike — because that is what
+ * `recipe_ingredients` stores: the recipe as published, which yields
+ * `yieldServings` servings. Nothing on this projection is scaled, and nothing
+ * on it could be: a recipe response carries no planned-meal context, so the
+ * portion is not known here (see the NO PLANNED-MEAL CONTEXT convention). A
+ * consumer showing one portion derives it — `quantity × portionMultiplier /
+ * yieldServings` — from the multiplier its own response carries beside the
+ * recipe: `MealPlanMealResponse.portionMultiplier` for a planned meal,
+ * `SwapPreviewAlternative.portionMultiplier` for the swap preview. Both mobile
+ * screens do exactly that through one shared helper
+ * (`mobile/src/utility/RecipeIngredientUtility.ts`), which is what keeps the
+ * amounts on screen consistent with the portion-scaled nutrition beside them.
  */
 export const mapRecipeIngredient = (ingredient: RecipeIngredientRow): RecipeIngredientResponse => {
     const snapshot = mapIngredientSnapshot(ingredient);
@@ -398,23 +493,34 @@ export const mapRecipeVersion = (
     prepMinutes: version.prep_minutes,
     cookMinutes: version.cook_minutes,
     totalMinutes: version.total_minutes,
-    // The two LIST code columns DROP an unrecognised member instead of
-    // throwing — the only place this file degrades rather than fails, and it
-    // is what the mobile converter already does ("Unknown slot and badge codes
-    // are dropped, never substituted"), so client and server agree on the same
-    // wire value. Dropping a member of a list states less, which is honest;
-    // failing the whole recipe over one unrecognised code would take the screen
-    // down for exactly the future value this contract is designed to survive.
-    // Neither list decides anything here either — planning eligibility reads
-    // the meal_slots COLUMN through `recipe.logic.ts`, never this DTO — and the
-    // loud rejection of an out-of-set code belongs to `recipes-seed.ts`, where
-    // it can still be fixed. The single-value code columns cannot degrade this
-    // way: there is nothing to omit, and substituting a plausible code would
-    // state a fact about the recipe that nothing established.
-    mealSlots: (version.meal_slots ?? []).filter(isMealSlot),
-    badges: (version.badges ?? []).filter(isRecipeBadge),
-    dietTags: version.diet_tags ?? [],
-    allergenTags: version.allergen_tags ?? [],
+    // All four list columns are READ through `requireStringArray`, so an absent
+    // or malformed one fails the response instead of becoming an empty list.
+    // The two SAFETY columns are why: `allergenTags` and `dietTags` are the
+    // derived union of every ingredient's frozen tags, so `[]` is the positive
+    // claim "contains none of the named allergens, carries no dietary
+    // restriction" — a claim `?? []` would make on behalf of a row that never
+    // made it.
+    //
+    // What still degrades is an unrecognised MEMBER of the two code lists, and
+    // only there: `filter` drops it rather than throwing, which is what the
+    // mobile converter already does ("Unknown slot and badge codes are dropped,
+    // never substituted"), so client and server agree on the same wire value.
+    // Dropping a member states less, which is honest; failing the whole recipe
+    // over one unrecognised code would take the screen down for exactly the
+    // future value this contract is designed to survive. Neither list decides
+    // anything here either — planning eligibility reads the meal_slots COLUMN
+    // through `recipe.logic.ts`, never this DTO — and the loud rejection of an
+    // out-of-set code belongs to `recipes-seed.ts`, where it can still be
+    // fixed. The two TAG lists have no filter at all, because their vocabulary
+    // is deliberately open (`src/types/recipe.ts`), which is the second reason
+    // a non-string member throws rather than being dropped. The single-value
+    // code columns cannot degrade either way: there is nothing to omit, and
+    // substituting a plausible code would state a fact about the recipe that
+    // nothing established.
+    mealSlots: requireStringArray(version.meal_slots, 'meal_slots', version.id).filter(isMealSlot),
+    badges: requireStringArray(version.badges, 'badges', version.id).filter(isRecipeBadge),
+    dietTags: requireStringArray(version.diet_tags, 'diet_tags', version.id),
+    allergenTags: requireStringArray(version.allergen_tags, 'allergen_tags', version.id),
     allergenStatus: narrowColumn(version.allergen_status, isAllergenStatus, 'allergen_status', version.id),
     budgetTier: narrowColumn(version.budget_tier, isBudgetTier, 'budget_tier', version.id),
     nutritionProvenance: narrowColumn(
@@ -471,7 +577,7 @@ export const mapPlannedRecipeSummary = (version: RecipeVersionRow): MealPlanMeal
         name: version.name,
         iconKey: narrowColumn(version.icon_key, isRecipeIconKey, 'icon_key', version.id),
         totalMinutes: version.total_minutes,
-        badges: (version.badges ?? []).filter(isRecipeBadge),
+        badges: requireStringArray(version.badges, 'badges', version.id).filter(isRecipeBadge),
         nutritionProvenance: PLANNED_RECIPE_PROVENANCE,
     };
 };

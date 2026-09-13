@@ -47,6 +47,15 @@ export interface MealEntryResponse {
     // which the client reads as unknown. A client-supplied snapshot logged through
     // the legacy entries path carries 'user_entered' instead, because the server
     // cannot verify numbers it did not derive; neither class earns a source label.
+    //
+    // Every OTHER value is one this union names, and that is an invariant of the
+    // write path rather than of the column: `meal_entries.nutrition_provenance`
+    // is unrestricted TEXT, so `nutrition.logic.ts` is what keeps an unknown
+    // string out of it — `resolveCatalogEntrySnapshot` narrows a catalog food's
+    // own provenance before an entry is written and refuses the insert
+    // otherwise, because a value outside this union would be read back as
+    // `null` here and would silently strip the estimate label §0.1.4(i)
+    // requires an AI-estimated or ingredient-derived food to carry in the diary.
     nutritionProvenance: NutritionProvenance | null;
     loggedAt: string;
 }
@@ -104,6 +113,23 @@ export interface LogCatalogMealEntryPayload {
     inputMethod: 'search';
 }
 
+// A partial edit of a logged entry: absent members are columns the request does
+// not mention and the update leaves alone.
+//
+// `servings` says how much was eaten and never changes what the food IS, so it
+// is always compatible with a plan, recipe or catalog link. The other five
+// describe the food itself, and an edit that CHANGES any of them detaches the
+// entry from whatever was vouching for those numbers (§0.5.1). "Changes" is
+// literal and is decided by `nutrition.logic.ts::planMealEntryEdit` on the
+// normalized value — a trimmed name, a rounded macro — compared with what the
+// column holds, so re-sending a whole entry unaltered, or retrying a request
+// whose response was lost, keeps the link, the "From meal plan" caption and the
+// source label rather than erasing them.
+//
+// The members are typed as the values the endpoint means, not as what an
+// unvalidated body may contain: this route has never validated its body, so a
+// caller that sends a name or macro of another type reaches the column and is
+// refused there, exactly as it has always been.
 export interface UpdateMealEntryPayload {
     servings?: number;
     name?: string;

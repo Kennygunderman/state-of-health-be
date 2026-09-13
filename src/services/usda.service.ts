@@ -32,6 +32,104 @@ const getApiKey = (): string => {
 const MAX_ATTEMPTS = 4;
 const RETRY_DELAY_MS = 250;
 
+// ---------------------------------------------------------------------------
+// Deadlines.
+//
+// `fetch` imposes no timeout of its own, so a stalled DNS lookup, TLS
+// handshake or body read waits for as long as the socket lives — which on the
+// request path is an `/api/macros/estimate` or `/api/macros/search-branded-foods`
+// call a client is sitting on, and on the import path is a multi-hour run that
+// stops making progress without ever failing. Every attempt therefore runs
+// under an `AbortController`.
+//
+// A per-attempt deadline is not sufficient on its own: it multiplies by
+// `MAX_ATTEMPTS`, so "3 seconds" for four attempts is a twelve-second call.
+// That is the same trap `evidence.service.ts` records for redirect hops ("One
+// deadline for the whole operation, not one per hop"), so the retry loop also
+// runs under one budget for the whole logical call, and each attempt gets
+// whichever of the two is nearer. The budget can only end the loop early —
+// `MAX_ATTEMPTS` remains the upper bound that `scripts/lib/rateLimiter.ts`
+// charges tokens against.
+//
+// Two classes of caller need different numbers, and which endpoint is being
+// called says which class it is — the same derivation `ttlForPath` makes below:
+//
+//   - Request path (`/foods/search`, `/food/{id}`): reached while a mobile
+//     client waits. `httpRequest.ts` abandons the request at 25 s, and USDA
+//     grounding is one of three vendor steps inside `POST /api/macros/estimate`,
+//     so this budget is the slice `estimate.service.ts` reserves for grounding
+//     (it imports `USDA_REQUEST_CALL_BUDGET_MS` rather than restating it) and
+//     is deliberately a small fraction of the client's deadline.
+//   - Offline import (`POST /foods`, `/foods/list`): no user is waiting, and a
+//     twenty-record `format=full` batch is a large response, so the numbers are
+//     generous. They exist to stop a hung socket, not to pace the run — pacing
+//     is the rate limiter's job.
+// ---------------------------------------------------------------------------
+
+/** One physical attempt, on an endpoint a client is waiting on. */
+const REQUEST_ATTEMPT_TIMEOUT_MS = 3_000;
+
+/**
+ * Every attempt and backoff of one request-path call, combined.
+ *
+ * Exported because `estimate.service.ts` sizes its grounding reserve from it:
+ * the number has to be the same on both sides or the request budget it belongs
+ * to is fiction.
+ */
+export const USDA_REQUEST_CALL_BUDGET_MS = 6_000;
+
+/** One physical attempt, on a batch or enumeration endpoint. */
+const IMPORT_ATTEMPT_TIMEOUT_MS = 30_000;
+
+/** Every attempt and backoff of one import call, combined. */
+const IMPORT_CALL_BUDGET_MS = 120_000;
+
+interface UsdaDeadlines {
+    attemptMs: number;
+    callMs: number;
+}
+
+const REQUEST_DEADLINES: UsdaDeadlines = {
+    attemptMs: REQUEST_ATTEMPT_TIMEOUT_MS,
+    callMs: USDA_REQUEST_CALL_BUDGET_MS,
+};
+
+const IMPORT_DEADLINES: UsdaDeadlines = { attemptMs: IMPORT_ATTEMPT_TIMEOUT_MS, callMs: IMPORT_CALL_BUDGET_MS };
+
+// Only the two endpoints the offline pipeline reads are listed, so an endpoint
+// added later inherits the request-path deadlines and is bounded by the tighter
+// pair until someone decides otherwise. `/food/{id}` is request-path because
+// `getBrandedFood` serves it to a waiting client; `getFoodDetail` shares that
+// path and, per `scripts/catalog-import-usda.ts`, the import never calls it.
+const IMPORT_PATHS = new Set(['/foods', '/foods/list']);
+
+const deadlinesForPath = (path: string): UsdaDeadlines =>
+    IMPORT_PATHS.has(path) ? IMPORT_DEADLINES : REQUEST_DEADLINES;
+
+// Statuses worth a second request, and nothing else.
+//
+// `400` is here deliberately and is the surprising one: USDA intermittently
+// answers 400 to a request that succeeds when retried verbatim (~1 in 5
+// observed), which is why this boundary has always retried it. `408` and `429`
+// are the vendor asking to be asked again, and 5xx is its own failure.
+//
+// Everything absent is definitive: a second identical request to `401`, `403`
+// (api.data.gov's answer to a missing, invalid or unauthorised key), `404` or
+// any other 4xx returns the same answer, so retrying only spends three more of
+// the hour's requests and delays the real error — which on the import path is
+// the operator's signal that the key is wrong.
+const RETRYABLE_STATUSES = new Set([400, 408, 429]);
+
+export const isRetryableUsdaStatus = (status: number): boolean =>
+    status >= 500 || RETRYABLE_STATUSES.has(status);
+
+// Our own abort, always: this module attaches the only signal its requests
+// carry. Matches `evidence.service.ts`'s predicate, because an abort surfaces
+// as a `DOMException` named `AbortError` on some runtimes and as an
+// `ABORT_ERR`-coded error on others.
+const isAbortError = (error: unknown): boolean =>
+    error instanceof Error && (error.name === 'AbortError' || (error as NodeJS.ErrnoException).code === 'ABORT_ERR');
+
 // The batch endpoint is the only non-GET call this module makes; omitting the
 // options leaves the request byte-for-byte the GET it has always been.
 interface UsdaRequestOptions {
@@ -63,25 +161,70 @@ const fetchFromUsda = async (
                 body: options.body === undefined ? undefined : JSON.stringify(options.body),
             };
 
+    const { attemptMs, callMs } = deadlinesForPath(path);
+    const startedAt = Date.now();
+    const remainingMs = (): number => callMs - (Date.now() - startedAt);
+
     let lastError: Error = new UsdaError('USDA request failed');
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const budgetLeft = remainingMs();
+        if (budgetLeft <= 0) {
+            // The call's budget is spent. The attempt that exhausted it has
+            // already recorded why, so that error is what the caller hears
+            // rather than a second failure invented here.
+            break;
+        }
+
+        // Each attempt gets whichever deadline is nearer, so a slow first
+        // attempt shortens the second rather than extending the call.
+        const attemptTimeoutMs = Math.min(attemptMs, budgetLeft);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
+        // A definitive answer ends the loop without spending another of the
+        // hour's requests on it.
+        let terminal = false;
         try {
             // fetch is read from the global on every attempt because
             // scripts/lib/rateLimiter.ts wraps globalThis.fetch to charge a
             // token per physical attempt and must observe all four.
-            const response = init === undefined ? await fetch(url) : await fetch(url, init);
+            //
+            // The init now always exists because an abort cannot be delivered
+            // without one, but a GET's init carries nothing except the signal:
+            // no method, no headers and no body, so the request USDA receives
+            // is byte-for-byte the one this module has always sent.
+            const response =
+                init === undefined
+                    ? await fetch(url, { signal: controller.signal })
+                    : await fetch(url, { ...init, signal: controller.signal });
             if (response.ok) {
                 return await response.json();
             }
-            // USDA's API intermittently 400s on requests that succeed when
-            // retried verbatim (~1 in 5 observed) — so unlike a normal client
-            // error, 400 is retried here alongside 429/5xx.
             lastError = new UsdaError(`USDA returned ${response.status}`);
+            terminal = !isRetryableUsdaStatus(response.status);
         } catch (error) {
-            lastError = new UsdaError(`USDA request failed: ${(error as Error).message}`);
+            // A timeout is reported as one rather than as the runtime's abort
+            // wording: "the vendor did not answer in time" and "the exchange
+            // broke" are different things to an operator reading an import log,
+            // and only the first is worth waiting longer for.
+            lastError = isAbortError(error)
+                ? new UsdaError(`USDA request timed out after ${attemptTimeoutMs}ms`)
+                : new UsdaError(`USDA request failed: ${(error as Error).message}`);
+        } finally {
+            // In `finally` because an un-cleared timer holds the event loop
+            // open for the rest of its delay after the call has returned.
+            clearTimeout(timer);
+        }
+
+        if (terminal) {
+            break;
         }
         if (attempt < MAX_ATTEMPTS) {
-            await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+            // Backoff is bounded by the same budget: sleeping past the deadline
+            // would spend the remainder of the call doing nothing.
+            const backoffMs = Math.min(RETRY_DELAY_MS * attempt, Math.max(remainingMs(), 0));
+            if (backoffMs > 0) {
+                await new Promise((resolve) => setTimeout(resolve, backoffMs));
+            }
         }
     }
     throw lastError;

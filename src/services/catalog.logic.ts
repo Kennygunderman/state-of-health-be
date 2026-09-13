@@ -185,6 +185,20 @@ export const CATALOG_IDENTITY_STATUSES: readonly CatalogIdentityStatus[] = ident
 export const isCatalogIdentityStatus: (value: unknown) => value is CatalogIdentityStatus =
     identityStatuses.includes;
 
+/**
+ * The provenance set, and the guard every reader of the unrestricted
+ * `nutrition_provenance` TEXT column narrows through.
+ *
+ * Two of those readers are outside this domain and neither tolerates a value
+ * this set does not name, so the set is the enforcement point for both:
+ * `recipe.service.ts` downgrades an unrecognised value to the unverifiable
+ * class, which can only make a recipe ineligible for planning, and
+ * `nutrition.logic.ts` refuses to write a diary entry for it at all — a stored
+ * class the diary cannot read renders no label, which would suppress the
+ * estimate warning an AI-estimated or ingredient-derived food must carry
+ * (§0.1.4(i)). Adding a member here therefore widens what may be logged and
+ * labelled, not merely what validation accepts.
+ */
 export const CATALOG_NUTRITION_PROVENANCES: readonly CatalogNutritionProvenance[] =
     nutritionProvenances.values;
 export const isCatalogNutritionProvenance: (value: unknown) => value is CatalogNutritionProvenance =

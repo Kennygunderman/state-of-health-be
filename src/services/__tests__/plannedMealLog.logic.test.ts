@@ -57,6 +57,8 @@ import {
     isDateInPlanWeek,
     isDiaryMealAcceptable,
     isEatenServingsInContract,
+    parseLogPlannedMealCall,
+    parseLogPlannedMealPath,
     parseLogPlannedMealRequest,
     requireLoggableTarget,
 } from '../plannedMealLog.logic';
@@ -64,6 +66,9 @@ import {
 // the end of this file; both modules are pure, so nothing is mocked.
 import { plannedIngredientGrams } from '../grocery.logic';
 import { PlanNotFoundError } from '../mealPlanning.errors';
+// The one bound every revision parser in this layer shares, imported from the
+// module that publishes it rather than restated as a literal here.
+import { MAX_REVISION } from '../preferences.logic';
 import { RecipeDerivationError } from '../recipe.logic';
 
 /* ---------------------------------------------------------------------------
@@ -185,6 +190,8 @@ const RECIPE_VERSION_ID = recipeVersionRow('lemon-herb-chicken-and-rice', 2).id;
 const OTHER_RECIPE_VERSION_ID = recipeVersionRow('lemon-herb-chicken-and-rice', 1).id;
 const THIRD_RECIPE_VERSION_ID = recipeVersionRow('spinach-egg-white-scramble', 1).id;
 const MEAL_ID = '45c48cce-2e2d-4fd8-a0a1-9c8a1b2c3d4e';
+/** The `:planId` segment of `POST …/plans/:planId/meals/:mealId/log`. */
+const PLAN_ID = 'd3d94468-02a4-4c58-a2a4-1a7b2c3d4e5f';
 const DIARY_MEAL_ID = '6512bd43-d9ca-46da-a4d0-f0bcc51aa551';
 const IDEMPOTENCY_KEY = 'c20ad4d7-6fe9-4779-a1a0-1a7b2c3d4e5f';
 const USER_ID = 'firebase-uid-alice';
@@ -753,6 +760,37 @@ describe('parseLogPlannedMealRequest', () => {
         );
     });
 
+    it('requires expectedPlanRevision to be a magnitude a revision column can hold', () => {
+        // `Number.isInteger(1e30)` is true, so the integer check alone admits
+        // whole numbers that no `Int` column can store and that JavaScript
+        // cannot compare exactly. Left unchecked they reach
+        // `buildRequestFingerprint` (a TypeError, so a 500) or Prisma (an
+        // out-of-range `Int`, so a 500) — for what is plainly a malformed
+        // request. The bound is `preferences.logic.ts`'s, imported rather than
+        // restated.
+        expect(MAX_REVISION).toBe(2_147_483_647);
+        expect(parsedPayload(validBody({ expectedPlanRevision: MAX_REVISION })).expectedPlanRevision).toBe(
+            MAX_REVISION,
+        );
+
+        for (const expectedPlanRevision of [MAX_REVISION + 1, 1e30, Number.MAX_SAFE_INTEGER + 2]) {
+            expect(codeFor(validBody({ expectedPlanRevision }), 'expectedPlanRevision')).toBe(
+                LOG_PLANNED_MEAL_FIELD_CODES.ABOVE_MAXIMUM,
+            );
+        }
+    });
+
+    it('tells a too-large revision apart from a too-small one', () => {
+        // Two different things to say to the client: one pinned a revision the
+        // plan has not reached yet, the other pinned one no plan can ever have.
+        expect(
+            codeFor(validBody({ expectedPlanRevision: MIN_PLAN_REVISION - 1 }), 'expectedPlanRevision'),
+        ).toBe(LOG_PLANNED_MEAL_FIELD_CODES.BELOW_MINIMUM);
+        expect(codeFor(validBody({ expectedPlanRevision: MAX_REVISION + 1 }), 'expectedPlanRevision')).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.ABOVE_MAXIMUM,
+        );
+    });
+
     it('requires expectedPlanRevision to be a whole revision a plan can have', () => {
         expect(codeFor(validBody({ expectedPlanRevision: '3' }), 'expectedPlanRevision')).toBe(
             LOG_PLANNED_MEAL_FIELD_CODES.INVALID_TYPE,
@@ -794,6 +832,200 @@ describe('parseLogPlannedMealRequest', () => {
             expect(parsed.message).toContain('date');
             expect(parsed.message).toContain('diaryMealId');
             expect(parsed.message).toContain('mealName');
+        }
+    });
+});
+
+describe('parseLogPlannedMealPath', () => {
+    /** The details of a rejected path, or a failure that says it was accepted. */
+    const pathDetails = (params: { planId?: unknown; mealId?: unknown }) => {
+        const parsed = parseLogPlannedMealPath(params);
+        if (parsed.kind !== 'error') {
+            throw new Error('expected the parser to reject this path');
+        }
+
+        return parsed.details;
+    };
+
+    const pathCodeFor = (params: { planId?: unknown; mealId?: unknown }, field: string) =>
+        pathDetails(params).find((detail) => detail.field === field)?.code;
+
+    it('accepts two v4 UUIDs and returns them unchanged', () => {
+        expect(parseLogPlannedMealPath({ planId: PLAN_ID, mealId: MEAL_ID })).toEqual({
+            kind: 'ok',
+            planId: PLAN_ID,
+            mealId: MEAL_ID,
+        });
+    });
+
+    it('accepts an upper-case UUID unchanged, as the body parser does', () => {
+        expect(
+            parseLogPlannedMealPath({ planId: PLAN_ID.toUpperCase(), mealId: MEAL_ID }),
+        ).toMatchObject({ kind: 'ok', planId: PLAN_ID.toUpperCase() });
+    });
+
+    it.each([
+        ['a malformed id', 'plan-1'],
+        // A v1 UUID: right shape, wrong version nibble.
+        ['a v1 UUID', 'c20ad4d7-6fe9-1779-a1a0-1a7b2c3d4e5f'],
+        ['an empty segment', ''],
+        ['a number', 42],
+        ['an object', {}],
+    ])('refuses %s as an invalid plan id', (_label, planId) => {
+        expect(pathCodeFor({ planId, mealId: MEAL_ID }, 'planId')).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID,
+        );
+    });
+
+    it.each([
+        ['a malformed id', 'meal-1'],
+        ['a v1 UUID', 'c20ad4d7-6fe9-1779-a1a0-1a7b2c3d4e5f'],
+        ['an empty segment', ''],
+        ['a number', 42],
+    ])('refuses %s as an invalid meal id', (_label, mealId) => {
+        expect(pathCodeFor({ planId: PLAN_ID, mealId }, 'mealId')).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID,
+        );
+    });
+
+    it('reports an absent or null segment as an invalid id, as every other path parser does', () => {
+        // A route does not match without its parameters, so an absent segment
+        // is not a request a client can issue — `required` would describe a
+        // shape that cannot reach the handler. Every path parser in this layer
+        // answers `invalid_id` for any state that is not a well-formed id.
+        expect(pathCodeFor({ mealId: MEAL_ID }, 'planId')).toBe(LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID);
+        expect(pathCodeFor({ planId: null, mealId: MEAL_ID }, 'planId')).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID,
+        );
+        expect(pathCodeFor({ planId: PLAN_ID }, 'mealId')).toBe(LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID);
+        expect(pathCodeFor({ planId: PLAN_ID, mealId: null }, 'mealId')).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID,
+        );
+    });
+
+    it('reports both malformed ids in one verdict, in path order', () => {
+        expect(pathDetails({ planId: 'plan-1', mealId: 'meal-1' })).toEqual([
+            { field: 'planId', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID },
+            { field: 'mealId', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID },
+        ]);
+    });
+
+    it('names every offending segment in the message', () => {
+        const parsed = parseLogPlannedMealPath({});
+
+        expect(parsed.kind).toBe('error');
+        if (parsed.kind === 'error') {
+            expect(parsed.code).toBe('invalid_request');
+            expect(parsed.message).toContain('planId');
+            expect(parsed.message).toContain('mealId');
+        }
+    });
+
+    it('judges the path without reading the body, and the body without the path', () => {
+        // One parser per part of the request: a valid path beside an invalid
+        // body is still a valid path, which is what lets the controller report
+        // the two together instead of guessing which came first.
+        expect(parseLogPlannedMealPath({ planId: PLAN_ID, mealId: MEAL_ID }).kind).toBe('ok');
+        expect(parseLogPlannedMealRequest(validBody()).kind).toBe('ok');
+        expect(parseLogPlannedMealPath({ planId: PLAN_ID, mealId: 'meal-1' }).kind).toBe('error');
+    });
+});
+
+describe('parseLogPlannedMealCall', () => {
+    /** The whole call's rejection details, or a failure that says it was accepted. */
+    const callDetails = (params: { planId?: unknown; mealId?: unknown }, body: unknown) => {
+        const parsed = parseLogPlannedMealCall(params, body);
+        if (parsed.kind !== 'error') {
+            throw new Error('expected the parser to reject this call');
+        }
+
+        return parsed.details;
+    };
+
+    /** The path half's rejection details, or a failure that says the path was accepted. */
+    const refusedPathDetails = (params: { planId?: unknown; mealId?: unknown }) => {
+        const parsed = parseLogPlannedMealPath(params);
+        if (parsed.kind !== 'error') {
+            throw new Error('expected the parser to reject this path');
+        }
+
+        return parsed.details;
+    };
+
+    it('accepts a valid path beside a valid body and returns both halves', () => {
+        expect(parseLogPlannedMealCall({ planId: PLAN_ID, mealId: MEAL_ID }, validBody())).toEqual({
+            kind: 'ok',
+            planId: PLAN_ID,
+            mealId: MEAL_ID,
+            payload: parsedPayload(validBody()),
+        });
+    });
+
+    it('produces exactly the payload the body parser produces', () => {
+        // The composition adds no coercion of its own: the payload the write
+        // fingerprints is the one `parseLogPlannedMealRequest` admitted, or the
+        // two would hash different intents for one request.
+        const body = validBody({ servings: 0.33, expectedPlanRevision: MIN_PLAN_REVISION });
+        const parsed = parseLogPlannedMealCall({ planId: PLAN_ID, mealId: MEAL_ID }, body);
+
+        expect(parsed.kind).toBe('ok');
+        if (parsed.kind === 'ok') {
+            expect(parsed.payload).toEqual(parsedPayload(body));
+        }
+    });
+
+    it('refuses a malformed path id on its own, reporting only that field', () => {
+        expect(callDetails({ planId: 'plan-1', mealId: MEAL_ID }, validBody())).toEqual([
+            { field: 'planId', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID },
+        ]);
+    });
+
+    it('refuses a malformed body on its own, reporting only the body fields', () => {
+        expect(callDetails({ planId: PLAN_ID, mealId: MEAL_ID }, validBody({ servings: 99 }))).toEqual([
+            { field: 'servings', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_SERVINGS },
+        ]);
+    });
+
+    it('refuses a body that is not an object at all', () => {
+        expect(callDetails({ planId: PLAN_ID, mealId: MEAL_ID }, null)).toEqual([
+            { field: 'body', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_TYPE },
+        ]);
+    });
+
+    it('reports a malformed id and three bad body fields as four details, path first', () => {
+        // The whole point of judging the two halves together: a client with a
+        // bad id and a bad body is sent back ONCE, with everything it has to fix.
+        const params = { planId: 'plan-1', mealId: MEAL_ID };
+        const body = validBody({ servings: 99, date: 'nope', mealName: 'Lunch' });
+
+        expect(callDetails(params, body)).toEqual([
+            { field: 'planId', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID },
+            { field: 'servings', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_SERVINGS },
+            { field: 'date', code: LOG_PLANNED_MEAL_FIELD_CODES.INVALID_DATE },
+            { field: 'mealName', code: LOG_PLANNED_MEAL_FIELD_CODES.UNKNOWN_FIELD },
+        ]);
+    });
+
+    it('is the concatenation of the two parsers it composes, in path-then-body order', () => {
+        // Asserted against the two parsers rather than a hand-written list, so
+        // a change to either one's details travels here instead of drifting.
+        const params = { planId: 'plan-1', mealId: 'meal-1' };
+        const body = validBody({ diaryMealId: 'not-a-uuid', expectedPlanRevision: 0.5 });
+
+        expect(callDetails(params, body)).toEqual([
+            ...refusedPathDetails(params),
+            ...rejectionDetails(body),
+        ]);
+    });
+
+    it('names every offending field of both halves in the message', () => {
+        const parsed = parseLogPlannedMealCall({ mealId: MEAL_ID }, validBody({ date: 'nope' }));
+
+        expect(parsed.kind).toBe('error');
+        if (parsed.kind === 'error') {
+            expect(parsed.code).toBe('invalid_request');
+            expect(parsed.message).toContain('planId');
+            expect(parsed.message).toContain('date');
         }
     });
 });

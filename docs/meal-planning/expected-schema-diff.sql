@@ -2,12 +2,31 @@
 --
 -- Nothing executes this file. The executed ledger is
 -- prisma/migrations/20260908000000_meal_planning/migration.sql; this is the
--- reviewed output of one command, committed so that the ledger and
--- prisma/schema.prisma cannot drift apart unnoticed.
+-- reviewed evidence of what that ledger holds, committed so that the ledger,
+-- prisma/schema.prisma and the applied database cannot drift apart unnoticed.
 --
--- THE COMMAND. Run from backend/, with SHADOW_DATABASE_URL naming a DISPOSABLE
--- database - the command resets the database it is given, so never the one
--- holding the applied ledger and never anything that matters:
+-- THREE SECTIONS, each delimited by its own `-- >>> BEGIN <name>` and
+-- `-- >>> END <name>` marker line. The gate extracts them by those markers, so
+-- each marker appears exactly once and the sections keep this order:
+--
+--   prisma-migrate-diff   the output of the migrate-diff command below: what
+--                         the ledger creates and prisma/schema.prisma cannot
+--                         express, as that command sees it.
+--   pg-catalog-query      the extraction SQL itself, committed as the query so
+--                         CI and a local run cannot use different ones.
+--   pg-catalog-expected   that query's expected output against a database
+--                         holding the applied ledger.
+--
+-- Inside each section, every line beginning with `--` and every empty line is
+-- deleted from both sides (`sed '/^--/d;/^$/d'`) and what remains is compared
+-- byte for byte, in both directions - an added line fails as loudly as a
+-- removed one. Whitespace inside or around a payload line is content. Use line
+-- comments only, each starting at column 0: a block comment, or a `--` that
+-- starts after a space, survives the strip and is compared as payload.
+--
+-- REGENERATING prisma-migrate-diff. From backend/, with SHADOW_DATABASE_URL
+-- naming a DISPOSABLE database - the command resets the database it is given,
+-- so never the one holding the applied ledger and never anything that matters:
 --
 --   npx prisma migrate diff \
 --     --from-migrations prisma/migrations \
@@ -15,86 +34,167 @@
 --     --shadow-database-url "$SHADOW_DATABASE_URL" \
 --     --exit-code --script
 --
--- Everything below this header is that command's output, byte for byte. It is
--- the whole of the file's payload: there is no second capture and no other
--- contract here.
+-- --exit-code makes 2 the expected result: it means the datamodel and the
+-- ledger differ, which is what this section records. 0 means either that the
+-- section is stale - the two now agree - or that the construct its statement
+-- stands for is gone from the migration. 1 means the command itself failed,
+-- usually an unreachable or non-empty shadow database.
 --
--- EXIT CODE. --exit-code makes 2 the expected result: it means the datamodel
--- and the ledger differ, which is what the statement below records. 0 means
--- either that this file is stale - the two now agree and there is nothing left
--- to record - or that the construct the statement stands for is gone from the
--- migration. 1 means the command itself failed, usually an unreachable or
--- non-empty shadow database.
+-- REGENERATING pg-catalog-expected. From backend/, with DATABASE_URL naming a
+-- non-production database that `npx prisma migrate deploy` has already brought
+-- up to this ledger. The query is section two of this file, so it is piped
+-- straight out of it and the two cannot drift:
 --
--- WHAT THE ONE STATEMENT IS. The migration creates catalog_foods.search_vector
--- as a STORED generated column, which prisma/schema.prisma can only carry as
--- Unsupported("tsvector")?. Prisma's schema describer reads a generated
--- expression through the column-default slot, so the difference it reports is
--- the loss of that default rather than the expression itself. Measured on this
--- tree: replacing the generated column with a plain tsvector column makes the
--- command print "This is an empty migration." and exit 0, so the gate's
--- exit-code requirement is what makes that loss loud.
+--   sed -n '/^-- >>> BEGIN pg-catalog-query$/,/^-- >>> END pg-catalog-query$/p' \
+--     docs/meal-planning/expected-schema-diff.sql | psql "$DATABASE_URL" -tA
 --
--- WHAT THE PLAN ASKS OF THIS FILE, AND WHAT THE COMMAND CAN GIVE. Agent Action
--- Plan sections 0.5.1 and 0.9.1 specify this artefact as the committed output of
--- the command above, whose "only statements" are the three constructs the Prisma
--- datamodel cannot express: the generated search_vector expression, the
--- lower(alias) expression index on catalog_food_aliases, and the partial
--- indexes' predicates. The prohibition holds here - there is no statement in the
--- payload outside those three classes, which is what the gate enforces. The
--- expectation that all three appear does not hold, and cannot: measured against
--- prisma 6.9.0, the command reports the first class and nothing else.
+-- The query only reads pg_attribute, pg_index, pg_am and pg_attrdef, and CI
+-- runs it inside `BEGIN TRANSACTION READ ONLY` so a write introduced into the
+-- section cannot execute. CI renders it with a small node + `pg` helper rather
+-- than psql, which the runner does not have; that helper's output is
+-- byte-identical to `psql -tA` - one row per line, one trailing newline.
 --
--- This tree proves why, without tampering with anything. The migration creates
--- six indexes Prisma cannot express - the lower(alias) index and five partial
--- indexes - and prisma/schema.prisma declares no counterpart for any of them.
--- Were they visible on the migration side of the comparison, a diff toward a
--- datamodel that lacks them would have to emit six DROP INDEX statements. It
--- emits none, with --from-migrations and with --from-url against an already
--- migrated database alike, so Prisma's schema describer leaves those constructs
--- out of the schema it compares rather than finding them unchanged in it.
--- Tampering only confirms the consequence: deleting the lower(alias) index,
--- changing a partial unique index's predicate, or dropping NOT NULL from a
--- required array column each leave this output and the exit code untouched.
+-- WHY THERE IS A SECOND CAPTURE. Agent Action Plan 0.5.1 and 0.9.1 specify this
+-- artefact as the output of the migrate-diff command above and expect that
+-- output to carry the three constructs the Prisma datamodel cannot express: the
+-- generated search_vector expression, the lower(alias) expression index on
+-- catalog_food_aliases, and the partial indexes' predicates. Measured against
+-- prisma 6.9.0 it carries only the first. Prisma's schema describer leaves
+-- expression indexes, index predicates and scalar-list NOT NULL out of both
+-- sides of its comparison, so deleting the lower(alias) index, changing a
+-- partial index's predicate, or dropping NOT NULL from a required array column
+-- each leave that output and its exit code untouched. That is a recorded
+-- AAP-versus-tool divergence, and the pg_catalog sections are the mechanism
+-- that closes the two classes the tool omits: they pin the generated column's
+-- expression, every hand-managed index's access method, uniqueness, key
+-- expressions and predicate, and every array column's NOT NULL and default.
+-- The query is scoped to those three classes, so an ordinary scalar column or a
+-- plain btree index added later cannot churn the evidence.
 --
--- So the gap between the three classes the plan expects here and the one class
--- the specified command emits is an AAP-versus-tool conflict, recorded for
--- authorized resolution. It is NOT a reinterpretation of the contract, and it is
--- not closed by this file: closing it needs either an amendment naming a second,
--- approved mechanism for the expression index and the partial predicates, or a
--- tool that reports them. Do not close it by adding a capture of your own here -
--- a second contract inside this file is exactly what review rejected.
+-- WHICH LEDGER THIS MEASURES. The pg_catalog sections read the database that
+-- `npx prisma migrate deploy` builds from prisma/migrations - the authoritative
+-- ledger, as applied, rather than as written. They say nothing about the
+-- operator copy under prisma/manual-migrations/meal-planning/, which this gate
+-- never applies: what holds that copy to the authoritative migration is the
+-- ledger-equivalence gate, describe('migration ledgers') in
+-- src/__tests__/api/compat.test.ts, which applies both and compares the
+-- resulting columns, indexes and constraints. The two are complementary - that
+-- gate compares one ledger against the other and so cannot see a construct
+-- dropped from both, which is precisely what these sections catch.
 --
--- Until it is resolved, this gate polices the generated column and nothing else.
--- The nearest existing cover for the other two constructs - partial, and no
--- substitute for the plan's contract - is the ledger-equivalence gate,
--- describe('migration ledgers') in src/__tests__/api/compat.test.ts: it applies
--- the Prisma ledger and the operator copy under
--- prisma/manual-migrations/meal-planning/ and compares the resulting columns,
--- indexes and constraints, so one of the two losing a construct the other keeps
--- fails there. A construct dropped from both at once is caught by neither, and
--- reviewing the migration is the only thing that covers it.
+-- The generated column is evidenced twice on purpose. In prisma-migrate-diff
+-- the exit-code requirement is what makes its loss loud: replacing it with a
+-- plain tsvector column makes the command print "This is an empty migration."
+-- and exit 0.
+--
+-- A RED GATE is fixed in prisma/schema.prisma and the migration, never by
+-- editing this file to match - unless the DDL change was the intended one, in
+-- which case regenerate both captures with the commands above, replace their
+-- payloads, and review the new content.
 --
 -- THE GATE is the `Schema-drift evidence gate` step of
--- .github/workflows/ci.yml. It runs the command above against a throwaway
--- shadow database of its own, requires exit code 2, and then compares the
--- output with this file after deleting from both sides every line that begins
--- with `--` and every empty line (`sed '/^--/d;/^$/d'`) - and nothing else, so
--- whitespace inside or around a payload line is compared as content. It fails
--- on any difference in either direction, which makes an added statement as loud
--- as a removed one.
---
--- Fix a failure in prisma/schema.prisma and the migration, never by editing this
--- file to match - unless the change to those two was the intended one, in which
--- case re-run the command, replace the payload below with its output, and review
--- the new content.
---
--- Use line comments only, each starting at column 0. A block comment, or a `--`
--- that starts after a space, survives the strip above and is compared as
--- payload.
+-- .github/workflows/ci.yml. It requires exit code 2 from the migrate-diff
+-- command run against a throwaway shadow database of its own and compares
+-- prisma-migrate-diff with the output; it executes pg-catalog-query read-only
+-- against the database the `Apply the migration ledger` step migrated and
+-- compares pg-catalog-expected with the result; and it requires that section to
+-- keep at least one generated column, seven hand-managed indexes and twelve
+-- NOT NULL array columns - the three classes the migration's own header names
+-- as hand-edited - so deleting evidence lines cannot buy a pass either.
 --
 -- Captured against prisma and @prisma/client 6.9.0 on PostgreSQL 16.15, ledger
 -- prisma/migrations through 20260908000000_meal_planning.
 
+-- >>> BEGIN prisma-migrate-diff
 -- AlterTable
 ALTER TABLE "catalog_foods" ALTER COLUMN "search_vector" DROP DEFAULT;
+-- >>> END prisma-migrate-diff
+
+-- >>> BEGIN pg-catalog-query
+WITH generated_columns AS (
+  SELECT 1 AS section,
+         format('generated_column %s.%s %s %s %s',
+                c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
+                CASE a.attgenerated::text WHEN 's' THEN 'stored' ELSE a.attgenerated::text END,
+                pg_get_expr(d.adbin, d.adrelid, true)) AS line
+    FROM pg_attribute a
+    JOIN pg_class        c ON c.oid = a.attrelid
+    JOIN pg_namespace    n ON n.oid = c.relnamespace
+    JOIN pg_attrdef      d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+   WHERE n.nspname = 'public' AND c.relkind = 'r'
+     AND a.attnum > 0 AND NOT a.attisdropped
+     AND a.attgenerated <> ''
+), index_keys AS (
+  SELECT i.indexrelid,
+         string_agg(pg_get_indexdef(i.indexrelid, k::int, true), ', ' ORDER BY k) AS key_text
+    FROM pg_index i
+    CROSS JOIN LATERAL generate_series(1, i.indnkeyatts) AS k
+   GROUP BY i.indexrelid
+), hand_managed_indexes AS (
+  SELECT 2 AS section,
+         format('index %s.%s am=%s unique=%s keys=(%s) predicate=%s',
+                tc.relname, ic.relname, am.amname,
+                CASE WHEN i.indisunique THEN 'true' ELSE 'false' END,
+                ik.key_text,
+                COALESCE(pg_get_expr(i.indpred, i.indrelid, true), '-')) AS line
+    FROM pg_index i
+    JOIN pg_class     ic ON ic.oid = i.indexrelid
+    JOIN pg_class     tc ON tc.oid = i.indrelid
+    JOIN pg_namespace n  ON n.oid  = tc.relnamespace
+    JOIN pg_am        am ON am.oid = ic.relam
+    JOIN index_keys   ik ON ik.indexrelid = i.indexrelid
+   WHERE n.nspname = 'public'
+     AND (i.indexprs IS NOT NULL OR i.indpred IS NOT NULL OR am.amname <> 'btree')
+), array_columns AS (
+  SELECT 3 AS section,
+         format('array_column %s.%s %s not_null=%s default=%s',
+                c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
+                CASE WHEN a.attnotnull THEN 'true' ELSE 'false' END,
+                COALESCE(pg_get_expr(d.adbin, d.adrelid, true), '-')) AS line
+    FROM pg_attribute a
+    JOIN pg_class        c ON c.oid = a.attrelid
+    JOIN pg_namespace    n ON n.oid = c.relnamespace
+    JOIN pg_type         t ON t.oid = a.atttypid
+    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+   WHERE n.nspname = 'public' AND c.relkind = 'r'
+     AND a.attnum > 0 AND NOT a.attisdropped
+     AND t.typcategory = 'A'
+), collected AS (
+            SELECT section, line FROM generated_columns
+  UNION ALL SELECT section, line FROM hand_managed_indexes
+  UNION ALL SELECT section, line FROM array_columns
+), normalised AS (
+  SELECT section, regexp_replace(line, '\s+', ' ', 'g') AS line FROM collected
+)
+SELECT line FROM normalised ORDER BY section, line COLLATE "C";
+-- >>> END pg-catalog-query
+
+-- >>> BEGIN pg-catalog-expected
+-- One generated column: the STORED search_vector expression.
+generated_column catalog_foods.search_vector tsvector stored to_tsvector('english'::regconfig, COALESCE(search_text, ''::text))
+-- Seven hand-managed indexes: the lower(alias) expression index, the GIN
+-- index over search_vector, and the five partial-index predicates.
+index catalog_food_aliases.idx_catalog_food_aliases_lower_alias am=btree unique=false keys=(lower(alias)) predicate=-
+index catalog_food_portions.unique_default_catalog_food_portion am=btree unique=true keys=(catalog_food_id) predicate=is_default
+index catalog_foods.idx_catalog_foods_search_vector am=gin unique=false keys=(search_vector) predicate=-
+index catalog_foods.unique_published_catalog_food_identity am=btree unique=true keys=(canonical_name, food_state) predicate=publication_status = 'published'::text
+index meal_entries.idx_meal_entries_meal_plan_meal_id am=btree unique=false keys=(meal_plan_meal_id) predicate=deleted_at IS NULL
+index meal_plans.unique_active_meal_plan_start_date am=btree unique=true keys=(user_id, start_date) predicate=status = 'active'::text
+index recipe_versions.unique_current_recipe_version am=btree unique=true keys=(recipe_id) predicate=status = 'current'::text
+-- Thirteen array columns: the twelve required TEXT[]/UUID[] columns the
+-- migration marks NOT NULL by hand, plus templates.exercise_ids from the
+-- init migration, which is legacy and correctly pinned nullable.
+array_column catalog_foods.allergen_tags text[] not_null=true default=ARRAY[]::text[]
+array_column catalog_foods.diet_tags text[] not_null=true default=ARRAY[]::text[]
+array_column catalog_validation_records.aliases text[] not_null=true default=ARRAY[]::text[]
+array_column meal_plan_preferences.allergens text[] not_null=true default=ARRAY[]::text[]
+array_column meal_plan_preferences.disliked_food_groups text[] not_null=true default=ARRAY[]::text[]
+array_column meal_plan_preferences.disliked_food_ids uuid[] not_null=true default=ARRAY[]::uuid[]
+array_column recipe_ingredients.snapshot_allergen_tags text[] not_null=true default=ARRAY[]::text[]
+array_column recipe_ingredients.snapshot_diet_tags text[] not_null=true default=ARRAY[]::text[]
+array_column recipe_versions.allergen_tags text[] not_null=true default=ARRAY[]::text[]
+array_column recipe_versions.badges text[] not_null=true default=ARRAY[]::text[]
+array_column recipe_versions.diet_tags text[] not_null=true default=ARRAY[]::text[]
+array_column recipe_versions.meal_slots text[] not_null=true default=-
+array_column templates.exercise_ids text[] not_null=false default=-
+-- >>> END pg-catalog-expected

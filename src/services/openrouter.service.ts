@@ -4,7 +4,32 @@
 // ledger. Nothing here is user-aware, so nothing here meters.
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * How long one model call may take, and the budget a whole request-time
+ * estimate has to fit inside.
+ *
+ * This number is derived from the client's deadline, not chosen on its own.
+ * The mobile app abandons every API request at `HTTP_REQUEST_TIMEOUT_MS`
+ * (25 s, `mobile/src/service/http/httpRequest.ts`), and it is the only
+ * consumer of the two endpoints that reach this module. A vendor deadline at
+ * or above that number cannot produce a usable outcome: the client is already
+ * gone when the call gives up, so it never receives the
+ * `502 estimation_failed` the controller would have returned, the paid call
+ * carries on being paid for, and the user's retry spends a second unit of the
+ * daily AI quota for one answer. The gap left here — 7 s — is the request's
+ * own overhead: uploading a base64 photo, verifying the Firebase token,
+ * metering the call, and serialising the response.
+ *
+ * It is also the ceiling for a whole request rather than for one call, which
+ * matters because `estimate.service.ts` makes up to two sequential calls (the
+ * estimate and the grounding judge) plus USDA lookups. That service starts one
+ * budget of this size per request and passes the remainder to each call, so the
+ * total cannot grow with the number of calls. A caller with no client waiting —
+ * the offline catalog scripts — may pass a longer `timeoutMs` explicitly.
+ */
+export const OPENROUTER_REQUEST_TIMEOUT_MS = 18_000;
+
 const DEFAULT_MODEL = 'google/gemini-2.5-flash';
 
 // The classification model, for callers whose task is "pick the matching row"
@@ -145,22 +170,42 @@ const readCompletionContent = (payload: unknown): string | undefined => {
     return typeof content === 'string' && content.trim() ? content : undefined;
 };
 
+// A caller-supplied deadline, or the default when there is none.
+//
+// Guarded rather than trusted because the value a caller passes is arithmetic —
+// `estimate.service.ts` passes what is left of its request budget — and a
+// zero, negative or non-finite remainder would arm a timer that fires
+// immediately or never. A caller that has genuinely run out of budget is
+// expected to skip the call instead of asking for a zero-length one, which is
+// what that service does; this is the boundary refusing to send a request it
+// cannot bound.
+const resolveTimeoutMs = (timeoutMs?: number): number =>
+    timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? timeoutMs
+        : OPENROUTER_REQUEST_TIMEOUT_MS;
+
 // Returns the model's parsed JSON as `unknown`: the vendor boundary guarantees
 // the transport and the syntax, never the shape, so every caller narrows what
 // it reads (see estimate.service's readers) instead of trusting a cast here.
+//
+// `timeoutMs` is how a caller that makes several calls for one user request
+// keeps their total inside one budget (and how an offline caller asks for
+// longer than the request-time default); omitted, the call is bounded by
+// `OPENROUTER_REQUEST_TIMEOUT_MS`.
 export const callOpenRouter = async (
     systemPrompt: string,
     userContent: MessageContent,
     jsonSchema: object,
     modelOverride?: string,
     fetchImpl?: typeof fetch,
+    timeoutMs?: number,
 ): Promise<unknown> => {
     const { apiKey, model: configuredModel } = getOpenRouterConfig();
     const model = modelOverride || configuredModel;
     const doFetch = fetchImpl ?? fetch;
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), resolveTimeoutMs(timeoutMs));
     try {
         const response = await doFetch(OPENROUTER_URL, {
             method: 'POST',

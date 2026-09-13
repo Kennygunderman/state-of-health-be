@@ -862,3 +862,486 @@ describe('migration ledgers', () => {
         });
     });
 });
+
+// ==========================================================================
+// The diary entries endpoint's request and provenance contract.
+//
+// The suite above proves the SCHEMA the migration produces; this one proves the
+// BEHAVIOUR of the endpoint that writes into it, over HTTP, against the
+// database `DATABASE_URL` names — not the disposable ones above, which the
+// Prisma client cannot reach. `POST /api/macros/meal/:mealId/entries` is a
+// shipped endpoint that has gained a second body shape and four additive
+// columns (§0.5.2), and §0.9.1 makes it one of the contract-compatibility
+// gates, so what is asserted here is what an existing client and a new one may
+// each rely on:
+//
+//   * a malformed path id is answered `400 invalid_request` with `invalid_id`,
+//     for BOTH body shapes, instead of reaching a @db.Uuid predicate and
+//     returning a 500 — while a malformed BODY still earns the frozen 400
+//     message shipped clients read, and a well-formed id that is absent or
+//     someone else's still earns the 404 that keeps those two cases
+//     indistinguishable;
+//   * a client-supplied snapshot is stored as `user_entered` and a row written
+//     before the column existed keeps `null`, and neither carries a source
+//     label;
+//   * a catalog food's own provenance class reaches the diary intact, and a
+//     published row whose class this release cannot read is REFUSED rather than
+//     logged with the label silently missing;
+//   * an edit detaches an entry from the food vouching for its numbers only
+//     when a normalized value actually changes, so a whole-entry resubmission
+//     keeps the link, the input method and the provenance;
+//   * an update that loses a race with a soft delete writes nothing and answers
+//     404, which is asserted by injecting the delete into the window between
+//     the authorization read and the write rather than by hoping for a
+//     schedule.
+// ==========================================================================
+
+import { prisma } from '../../prisma/client';
+import { makeCatalogFood, makeUser } from '../setup/factories';
+import { asUser, request } from '../setup/testApp';
+import { truncateFeatureTables } from '../setup/testDb';
+
+/** A syntactically valid v4 UUID that names nothing. */
+const ABSENT_UUID = 'e3b0c442-98fc-4c14-9afb-f4c8996fb924';
+
+const LEGACY_REQUIRED_MESSAGE = 'name, calories, protein, carbs, and fat are required';
+
+const DAY_KEY = '2026-03-11';
+
+const legacyBody = () => ({
+    name: 'Scrambled eggs',
+    calories: 220,
+    protein: 14,
+    carbs: 2,
+    fat: 16,
+});
+
+interface StoredEntryColumns {
+    name: string;
+    calories: number;
+    protein_g: number;
+    carbs_g: number;
+    fat_g: number;
+    servings: number;
+    input_method: string;
+    nutrition_provenance: string | null;
+    catalog_food_id: string | null;
+    meal_plan_meal_id: string | null;
+    recipe_version_id: string | null;
+    deleted_at: Date | null;
+}
+
+const storedEntry = async (entryId: string): Promise<StoredEntryColumns> => {
+    const row = await prisma.meal_entries.findUnique({
+        where: { id: entryId },
+        select: {
+            name: true,
+            calories: true,
+            protein_g: true,
+            carbs_g: true,
+            fat_g: true,
+            servings: true,
+            input_method: true,
+            nutrition_provenance: true,
+            catalog_food_id: true,
+            meal_plan_meal_id: true,
+            recipe_version_id: true,
+            deleted_at: true,
+        },
+    });
+
+    if (row === null) {
+        throw new Error(`entry ${entryId} was not written`);
+    }
+
+    return row;
+};
+
+describe('the diary entries endpoint', () => {
+    const owner = { uid: '' };
+    let breakfastId = '';
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+
+        const user = await makeUser();
+        owner.uid = user.id;
+
+        // The day read is what materializes the four buckets (§0.7.4), so the
+        // meal id every test below posts to is one a client obtains exactly as
+        // the app does.
+        const day = await asUser(request.get(`/api/macros/${DAY_KEY}`), owner).expect(200);
+        const breakfast = (day.body.meals as { id: string; name: string }[]).find(
+            (meal) => meal.name === 'Breakfast',
+        );
+
+        if (breakfast === undefined) {
+            throw new Error('the day read did not return a Breakfast bucket');
+        }
+
+        breakfastId = breakfast.id;
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    describe('a malformed path id', () => {
+        it.each([
+            ['a string that is not a UUID', 'not-a-uuid'],
+            ['a SQL fragment', "'%20OR%201=1--"],
+            ['a UUID missing its hyphens', '9b2fbd4c7c214a178b361d5a2d4f9c10'],
+            ['a v1 UUID', '9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10'],
+        ])('is refused with invalid_id for a legacy body: %s', async (_case, mealId) => {
+            const response = await asUser(
+                request.post(`/api/macros/meal/${mealId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({
+                error: 'invalid_request',
+                details: [{ field: 'mealId', code: 'invalid_id' }],
+            });
+        });
+
+        it('is refused with invalid_id for a catalog body', async () => {
+            const food = await makeCatalogFood();
+
+            const response = await asUser(
+                request
+                    .post('/api/macros/meal/not-a-uuid/entries')
+                    .send({ catalogFoodId: food.id, servings: 1, inputMethod: 'search' }),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({
+                error: 'invalid_request',
+                details: [{ field: 'mealId', code: 'invalid_id' }],
+            });
+        });
+
+        it('writes nothing', async () => {
+            await asUser(request.post('/api/macros/meal/not-a-uuid/entries').send(legacyBody()), owner).expect(400);
+
+            expect(await prisma.meal_entries.count({ where: { user_id: owner.uid } })).toBe(0);
+        });
+
+        it('does not pre-empt the frozen 400 a malformed body earns', async () => {
+            // Order matters for compatibility: a client sending a bad body must
+            // keep seeing the message it has always seen, so the path is judged
+            // after the body and only where the request would otherwise have
+            // reached the database.
+            const response = await asUser(
+                request.post('/api/macros/meal/not-a-uuid/entries').send({ name: 'Eggs' }),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({ error: LEGACY_REQUIRED_MESSAGE });
+        });
+
+        it('is refused on the update and delete routes too', async () => {
+            const updateResponse = await asUser(
+                request.put('/api/macros/entry/entry-1').send({ servings: 2 }),
+                owner,
+            ).expect(400);
+            const deleteResponse = await asUser(request.delete('/api/macros/entry/entry-1'), owner).expect(400);
+
+            expect(updateResponse.body).toStrictEqual({
+                error: 'invalid_request',
+                details: [{ field: 'id', code: 'invalid_id' }],
+            });
+            expect(deleteResponse.body).toStrictEqual({
+                error: 'invalid_request',
+                details: [{ field: 'id', code: 'invalid_id' }],
+            });
+        });
+    });
+
+    describe('a well-formed path id', () => {
+        it('still answers 404 for a meal that does not exist', async () => {
+            const response = await asUser(
+                request.post(`/api/macros/meal/${ABSENT_UUID}/entries`).send(legacyBody()),
+                owner,
+            ).expect(404);
+
+            expect(response.body).toStrictEqual({ error: 'Meal not found' });
+        });
+
+        it('answers 404 identically for another user´s meal, so existence never leaks', async () => {
+            const stranger = await makeUser();
+            const strangerDay = await asUser(request.get(`/api/macros/${DAY_KEY}`), { uid: stranger.id }).expect(200);
+            const strangerBreakfast = (strangerDay.body.meals as { id: string; name: string }[]).find(
+                (meal) => meal.name === 'Breakfast',
+            );
+
+            const response = await asUser(
+                request.post(`/api/macros/meal/${strangerBreakfast?.id ?? ABSENT_UUID}/entries`).send(legacyBody()),
+                owner,
+            ).expect(404);
+
+            expect(response.body).toStrictEqual({ error: 'Meal not found' });
+        });
+
+        it('answers 404 for an entry id that is not the caller´s', async () => {
+            const created = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(201);
+            const stranger = await makeUser();
+
+            await asUser(request.put(`/api/macros/entry/${created.body.id}`).send({ servings: 3 }), {
+                uid: stranger.id,
+            }).expect(404);
+        });
+    });
+
+    describe('the provenance a stored snapshot carries', () => {
+        it('classifies a client-supplied snapshot as user-entered and shows no source label', async () => {
+            const response = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(201);
+
+            expect(response.body.nutritionProvenance).toBe('user_entered');
+            expect(response.body.mealPlanMealId).toBeNull();
+            expect(response.body.inputMethod).toBe('library');
+            expect((await storedEntry(response.body.id)).nutrition_provenance).toBe('user_entered');
+        });
+
+        it('leaves a row written before the column existed unclassified', async () => {
+            const created = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(201);
+
+            // The state the migration leaves every pre-feature row in: the
+            // column is nullable and nothing backfills it.
+            await prisma.meal_entries.update({
+                where: { id: created.body.id },
+                data: { nutrition_provenance: null },
+            });
+
+            const day = await asUser(request.get(`/api/macros/${DAY_KEY}`), owner).expect(200);
+            const entry = (day.body.meals as { entries: { id: string; nutritionProvenance: unknown }[] }[])
+                .flatMap((meal) => meal.entries)
+                .find((candidate) => candidate.id === created.body.id);
+
+            expect(entry?.nutritionProvenance).toBeNull();
+        });
+
+        it('carries a catalog food´s own class into the diary', async () => {
+            const food = await makeCatalogFood({ nutrition_provenance: 'ai_estimated' });
+
+            const response = await asUser(
+                request
+                    .post(`/api/macros/meal/${breakfastId}/entries`)
+                    .send({ catalogFoodId: food.id, servings: 1, inputMethod: 'search' }),
+                owner,
+            ).expect(201);
+
+            // The label is the whole point: an AI-estimated food must reach the
+            // diary as an estimate, never as an unlabelled row.
+            expect(response.body.nutritionProvenance).toBe('ai_estimated');
+            expect(response.body.inputMethod).toBe('search');
+            expect((await storedEntry(response.body.id)).catalog_food_id).toBe(food.id);
+        });
+
+        it('refuses to log a published food whose class this release cannot read', async () => {
+            const food = await makeCatalogFood({ nutrition_provenance: 'verified' });
+
+            // Copied verbatim, this value would be stored and then read back as
+            // `null` — an entry with no provenance label at all. Failing closed
+            // writes nothing instead, so the label can never go missing silently.
+            await asUser(
+                request
+                    .post(`/api/macros/meal/${breakfastId}/entries`)
+                    .send({ catalogFoodId: food.id, servings: 1, inputMethod: 'search' }),
+                owner,
+            ).expect(500);
+
+            expect(await prisma.meal_entries.count({ where: { meal_id: breakfastId } })).toBe(0);
+        });
+
+        it('refuses a serving the food does not store, rather than relabelling the default portion', async () => {
+            const food = await makeCatalogFood();
+
+            const response = await asUser(
+                request
+                    .post(`/api/macros/meal/${breakfastId}/entries`)
+                    .send({ catalogFoodId: food.id, servings: 1, servingText: '1 slice', inputMethod: 'search' }),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({ error: 'invalid_serving' });
+            expect(await prisma.meal_entries.count({ where: { meal_id: breakfastId } })).toBe(0);
+        });
+    });
+
+    describe('editing an entry that something vouches for', () => {
+        const logCatalogEntry = async (): Promise<{ entryId: string; foodId: string }> => {
+            const food = await makeCatalogFood();
+            const created = await asUser(
+                request
+                    .post(`/api/macros/meal/${breakfastId}/entries`)
+                    .send({ catalogFoodId: food.id, servings: 1, inputMethod: 'search' }),
+                owner,
+            ).expect(201);
+
+            return { entryId: created.body.id as string, foodId: food.id };
+        };
+
+        it('keeps the link for a servings-only edit', async () => {
+            const { entryId, foodId } = await logCatalogEntry();
+
+            await asUser(request.put(`/api/macros/entry/${entryId}`).send({ servings: 2 }), owner).expect(200);
+
+            const stored = await storedEntry(entryId);
+            expect(stored.servings).toBe(2);
+            expect(stored.catalog_food_id).toBe(foodId);
+            expect(stored.input_method).toBe('search');
+            expect(stored.nutrition_provenance).toBe('source_backed');
+        });
+
+        it('keeps the link when the whole entry is re-submitted unaltered', async () => {
+            const { entryId, foodId } = await logCatalogEntry();
+            const before = await storedEntry(entryId);
+
+            // What a form save or a retry of a lost response sends: every field,
+            // none of them different. Detaching here would strip the source
+            // label and un-log a planned meal without a number moving.
+            await asUser(
+                request.put(`/api/macros/entry/${entryId}`).send({
+                    name: before.name,
+                    calories: before.calories,
+                    protein: before.protein_g,
+                    carbs: before.carbs_g,
+                    fat: before.fat_g,
+                    servings: before.servings,
+                }),
+                owner,
+            ).expect(200);
+
+            const after = await storedEntry(entryId);
+            expect(after.catalog_food_id).toBe(foodId);
+            expect(after.input_method).toBe('search');
+            expect(after.nutrition_provenance).toBe('source_backed');
+        });
+
+        it('keeps the link when a padded name and a rounding-equal macro are sent', async () => {
+            const { entryId, foodId } = await logCatalogEntry();
+            const before = await storedEntry(entryId);
+
+            await asUser(
+                request
+                    .put(`/api/macros/entry/${entryId}`)
+                    .send({ name: `  ${before.name}  `, calories: before.calories + 0.4 }),
+                owner,
+            ).expect(200);
+
+            const after = await storedEntry(entryId);
+            expect(after.name).toBe(before.name);
+            expect(after.calories).toBe(before.calories);
+            expect(after.catalog_food_id).toBe(foodId);
+        });
+
+        it('accepts an edit that names no column at all', async () => {
+            const { entryId, foodId } = await logCatalogEntry();
+
+            // The active-row condition is in the write predicate, and Prisma
+            // applies it even when the update names no column — so a request
+            // that changes nothing still answers 200 for a live entry, exactly
+            // as it did before that condition was added.
+            const response = await asUser(request.put(`/api/macros/entry/${entryId}`).send({}), owner).expect(200);
+
+            expect(response.body.id).toBe(entryId);
+            expect((await storedEntry(entryId)).catalog_food_id).toBe(foodId);
+        });
+
+        it('detaches when a macro is actually rewritten', async () => {
+            const { entryId } = await logCatalogEntry();
+            const before = await storedEntry(entryId);
+
+            await asUser(
+                request.put(`/api/macros/entry/${entryId}`).send({ calories: before.calories + 100 }),
+                owner,
+            ).expect(200);
+
+            // The catalog did not produce these numbers, so nothing may keep
+            // vouching for them — and the fallback classes are ones an older
+            // client already decodes.
+            const after = await storedEntry(entryId);
+            expect(after.calories).toBe(before.calories + 100);
+            expect(after.catalog_food_id).toBeNull();
+            expect(after.meal_plan_meal_id).toBeNull();
+            expect(after.recipe_version_id).toBeNull();
+            expect(after.input_method).toBe('library');
+            expect(after.nutrition_provenance).toBe('user_entered');
+        });
+
+        it('detaches when the name is rewritten', async () => {
+            const { entryId } = await logCatalogEntry();
+
+            const response = await asUser(
+                request.put(`/api/macros/entry/${entryId}`).send({ name: 'Something I made up' }),
+                owner,
+            ).expect(200);
+
+            expect(response.body.nutritionProvenance).toBe('user_entered');
+            expect((await storedEntry(entryId)).catalog_food_id).toBeNull();
+        });
+    });
+
+    describe('an update that races a soft delete', () => {
+        it('writes nothing and answers 404 when the delete commits first', async () => {
+            const created = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(201);
+            const entryId = created.body.id as string;
+
+            // The race, made deterministic. The writer authorizes with a read
+            // and then writes, and the two statements run in separate READ
+            // COMMITTED snapshots — so this middleware commits the delete in
+            // exactly the window a concurrent DELETE request would land in. The
+            // proof is the outcome: with `deleted_at` in the write predicate the
+            // UPDATE matches nothing and the caller is told 404; without it the
+            // update succeeds and describes a row the user has already removed.
+            let armed = true;
+            prisma.$use(async (params, next) => {
+                if (armed && params.model === 'meal_entries' && params.action === 'update') {
+                    armed = false;
+                    await prisma.$executeRaw`UPDATE meal_entries SET deleted_at = now() WHERE id = ${entryId}::uuid`;
+                }
+
+                return next(params);
+            });
+
+            try {
+                const response = await asUser(
+                    request.put(`/api/macros/entry/${entryId}`).send({ servings: 4, name: 'Rewritten' }),
+                    owner,
+                ).expect(404);
+
+                expect(response.body).toStrictEqual({ error: 'Entry not found' });
+
+                const stored = await storedEntry(entryId);
+                expect(stored.deleted_at).not.toBeNull();
+                expect(stored.servings).toBe(1);
+                expect(stored.name).toBe('Scrambled eggs');
+            } finally {
+                armed = false;
+            }
+        });
+
+        it('answers 404 for an entry the caller has already deleted', async () => {
+            const created = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(201);
+
+            await asUser(request.delete(`/api/macros/entry/${created.body.id}`), owner).expect(200);
+            await asUser(request.put(`/api/macros/entry/${created.body.id}`).send({ servings: 2 }), owner).expect(404);
+            await asUser(request.delete(`/api/macros/entry/${created.body.id}`), owner).expect(404);
+        });
+    });
+});

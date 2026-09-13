@@ -2480,14 +2480,36 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
     return fields;
 };
 
+/**
+ * The one error class this stage observes that it cannot name by `instanceof`.
+ *
+ * `UsdaError` is the vendor boundary's own error, and every batch and
+ * enumeration failure arrives as one: a definitive `401`/`403`/`404`, which the
+ * boundary now reports after a single attempt instead of four, and a request
+ * that passed its deadline. Narrowing on the class would mean importing
+ * `src/services/usda.service.ts` at module load, which constructs a Prisma
+ * client — the very thing `main()` defers with a dynamic import so that this
+ * file's pure exports stay importable without a database. The name is set in
+ * the class's constructor and pinned by `usda.service.test.ts`, so it is the
+ * stable handle available here.
+ */
+const isUsdaError = (error: unknown): boolean => error instanceof Error && error.name === 'UsdaError';
+
 // Every error class this file can observe gets its own reported code, so an
 // operator never has to read a stack trace to know which layer refused. The
 // three library classes carry a `code` of their own; RateLimitConfigError
-// carries its numbers instead, so it is reported under a fixed code. Anything
+// carries its numbers instead, so it is reported under a fixed code, as is a
+// vendor failure — `usda_request_failed` says the run stopped on USDA's answer
+// (or its silence) rather than on a defect here, which is the difference
+// between re-running with `--resume` and reading code. Anything
 // unrecognised is reported through safeError under `unexpected_error` — it is
 // never swallowed and never printed raw, because a raw error on this pipeline
 // can carry a connection URL or a vendor key.
-const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
+//
+// Exported for the same reason every other decision in this file is: the code
+// an operator reads is a behaviour, and `src/__tests__/scripts/` asserts it
+// without running a stage.
+export const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
     if (error instanceof DatabaseOriginError) {
         return { code: error.code, error: safeError(error) };
     }
@@ -2502,6 +2524,9 @@ const describeFailure = (error: unknown): { code: string; error: { name: string;
     }
     if (error instanceof RateLimitConfigError) {
         return { code: 'rate_limit_misconfigured', error: safeError(error) };
+    }
+    if (isUsdaError(error)) {
+        return { code: 'usda_request_failed', error: safeError(error) };
     }
     return { code: 'unexpected_error', error: safeError(error) };
 };

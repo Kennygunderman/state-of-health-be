@@ -58,7 +58,9 @@ import {
     PlanningRecipeVersion,
     RecipeAllergenStatus,
     RecipeIngredientIdentity,
+    RecipeVersionPathRefusal,
     RecipeVersionStatus,
+    parseRecipeVersionPath,
 } from './recipe.logic';
 
 /* ---------------------------------------------------------------------------
@@ -232,9 +234,31 @@ const isVersionReferencedByUser = async (
     return diaryEntry !== null;
 };
 
+/** Either the version this caller may see (or `null`), or the path parser's refusal verbatim. */
+export type RecipeVersionResult =
+    | { kind: 'ok'; version: RecipeVersionResponse | null }
+    | RecipeVersionPathRefusal;
+
 /**
  * `GET /api/recipes/:recipeVersionId` — one recipe version, if this caller may
  * see it.
+ *
+ * THE PATH IS PARSED BEFORE ANY I/O, as the first statement, so no `await` can
+ * precede the judgement (§0.5.2: "server-side validation applied before any
+ * Prisma or planning work"). This is the route-facing parse boundary — the
+ * arrangement `mealPlan.service.ts`'s entry points and
+ * `targets.service.ts::saveTargets` already use — and it separates the two
+ * answers this route owes, which a Prisma failure would otherwise collapse into
+ * one 500:
+ *
+ *  * a value that could never denote a version — not a v4 UUID — is the
+ *    parser's refusal, RETURNED unchanged for the controller to map to
+ *    `400 invalid_request` naming `recipeVersionId` (§8: a field-level failure
+ *    is data the client renders, not a throw). Before this, such a segment went
+ *    straight into a PostgreSQL `uuid` predicate.
+ *  * `version: null` keeps its existing meaning — no such version, a retired
+ *    one nobody here references, or one referenced only by someone else — which
+ *    is the route's 404, and the three stay indistinguishable on purpose (§1.5).
  *
  * The rule, exactly as AAP §0.5.2 states it: a version is visible when its
  * `status` is `current`, OR when the caller owns a `meal_plan_meals` row whose
@@ -258,32 +282,54 @@ const isVersionReferencedByUser = async (
  * lock reads the same snapshot it is about to write in, and defaults to the
  * shared client for a plain request read — the convention `nutrition.service.ts`
  * established for every meal-planning read.
+ *
+ * A row that contradicts the response contract is the one thing this read does
+ * NOT answer with `null`: `recipe.mapper.ts` raises `RecipeMappingError` for a
+ * code column outside its closed set, a required safety list that is absent,
+ * and instructions that are absent or empty. That surfaces as a 500 rather than
+ * a 404 on purpose — the resource exists and the caller may see it; what failed
+ * is the data behind it, and the quiet alternatives would be a recipe presented
+ * as free of allergens or as having no steps. `null` keeps its single meaning:
+ * you may not see this, or it is not there.
  */
 export const getRecipeVersionForUser = async (
     userId: string,
     recipeVersionId: string,
     db: Prisma.TransactionClient = prisma,
-): Promise<RecipeVersionResponse | null> => {
-    const version = await loadVersionWithIngredients(recipeVersionId, db);
+): Promise<RecipeVersionResult> => {
+    const parsed = parseRecipeVersionPath({ recipeVersionId });
+
+    if (parsed.kind !== 'ok') {
+        return parsed;
+    }
+
+    const version = await loadVersionWithIngredients(parsed.recipeVersionId, db);
 
     if (version === null) {
-        return null;
+        return { kind: 'ok', version: null };
     }
 
     if (version.status !== CURRENT_VERSION_STATUS) {
-        const referenced = await isVersionReferencedByUser(userId, recipeVersionId, db);
+        const referenced = await isVersionReferencedByUser(userId, parsed.recipeVersionId, db);
 
         if (!referenced) {
-            return null;
+            return { kind: 'ok', version: null };
         }
     }
 
-    return mapRecipeVersion(version, version.recipe_ingredients);
+    return { kind: 'ok', version: mapRecipeVersion(version, version.recipe_ingredients) };
 };
 
 /**
  * The same read WITHOUT the visibility rule, for a caller that has already
  * established the user's right to see this version.
+ *
+ * NOT A ROUTE-FACING ENTRY POINT, which is why it parses nothing: its `id` is
+ * the swap preview's INTERNAL read of a candidate that came from the plannable
+ * set — `swap.logic.ts::selectSwapCandidates` run against the user's own plan —
+ * so the value was produced by this server from a stored column, never by a
+ * client. The path parse belongs at the boundary a client actually reaches,
+ * which is {@link getRecipeVersionForUser}.
  *
  * Exactly one kind of caller qualifies, and the swap preview is it: the
  * candidate it is previewing came from `swap.logic.ts::selectSwapCandidates`

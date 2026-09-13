@@ -78,7 +78,9 @@ import {
     isPlanWritable,
     localDayKey,
     nextCookingTimeTier,
+    parseAffectedMealsPath,
     parseGeneratePlanRequest,
+    parseMealPlanDayPath,
     parseRegeneratePlanRequest,
     parseRegenerateRequest,
     planCandidateIdentity,
@@ -104,6 +106,9 @@ import {
 // The grocery side of the plan -> grocery gram hop asserted at the end of this
 // file. Both modules are pure, so nothing is mocked.
 import { plannedIngredientGrams } from '../grocery.logic';
+// The one bound every revision parser in this layer shares, imported from the
+// module that publishes it rather than restated as a literal here.
+import { MAX_REVISION } from '../preferences.logic';
 import {
     NoMatchingMealsError,
     PlanGenerationError,
@@ -3311,6 +3316,261 @@ describe('parseRegeneratePlanRequest', () => {
             'expectedTargetsRevision',
             'idempotencyKey',
         ]);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Revision magnitudes
+ *
+ * The bound `preferences.logic.ts` publishes as `MAX_REVISION`, asserted on
+ * every revision field of both write bodies. `Number.isInteger(1e30)` is true,
+ * so without the safe-integer half such a value would pass the parser and fail
+ * later — in `buildRequestFingerprint` as a TypeError, or in Prisma as an
+ * out-of-range `Int`. Both are 500s for a plainly malformed request.
+ * ------------------------------------------------------------------------- */
+
+describe('revision magnitudes', () => {
+    const WINDOW = startDateWindow('2026-07-08', null);
+    const PLAN_ID = 'b3c9f2e1-4d5a-4b6c-8d7e-9f0a1b2c3d4e';
+    const IDEMPOTENCY_KEY = '8f1f4d7e-0d2c-4a0b-9f3e-2b6a1c5d4e7f';
+
+    const generateBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        startDate: '2026-07-12',
+        idempotencyKey: IDEMPOTENCY_KEY,
+        expectedPreferencesRevision: 3,
+        expectedTargetsRevision: 2,
+        ...overrides,
+    });
+
+    const regenerateBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        idempotencyKey: IDEMPOTENCY_KEY,
+        expectedPlanRevision: 1,
+        expectedPreferencesRevision: 3,
+        expectedTargetsRevision: 2,
+        ...overrides,
+    });
+
+    /** The codes reported for one field, so the assertions read as the contract. */
+    const codesFor = (
+        verdict: { kind: string; details?: { field: string; code: string }[] },
+        field: string,
+    ): string[] =>
+        (verdict.details ?? []).filter((detail) => detail.field === field).map((detail) => detail.code);
+
+    const UNSTORABLE: [string, unknown][] = [
+        ['one above the column maximum', MAX_REVISION + 1],
+        // Whole by `Number.isInteger`, exactly representable by neither the
+        // column nor the comparison.
+        ['1e30', 1e30],
+        ['two above the safe-integer ceiling', Number.MAX_SAFE_INTEGER + 2],
+    ];
+
+    it('pins the bound to the integer column revisions live in', () => {
+        expect(MAX_REVISION).toBe(2_147_483_647);
+    });
+
+    describe('POST /meal-planning/plans', () => {
+        it.each(['expectedPreferencesRevision', 'expectedTargetsRevision'])(
+            'accepts %s at the column maximum',
+            (field) => {
+                expect(parseGeneratePlanRequest(generateBody({ [field]: MAX_REVISION }), WINDOW).kind).toBe(
+                    'ok',
+                );
+            },
+        );
+
+        it.each([
+            ['expectedPreferencesRevision', 'one above the column maximum', MAX_REVISION + 1],
+            ['expectedPreferencesRevision', '1e30', 1e30],
+            [
+                'expectedPreferencesRevision',
+                'two above the safe-integer ceiling',
+                Number.MAX_SAFE_INTEGER + 2,
+            ],
+            ['expectedTargetsRevision', 'one above the column maximum', MAX_REVISION + 1],
+            ['expectedTargetsRevision', '1e30', 1e30],
+            ['expectedTargetsRevision', 'two above the safe-integer ceiling', Number.MAX_SAFE_INTEGER + 2],
+        ])('refuses %s %s as out of range', (field, _label, value) => {
+            const verdict = parseGeneratePlanRequest(generateBody({ [field]: value }), WINDOW);
+
+            expect(verdict.kind).toBe('error');
+            expect(codesFor(verdict, field)).toEqual([MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE]);
+        });
+
+        it('answers both ends of the window with one code, so the client maps one message', () => {
+            const below = parseGeneratePlanRequest(
+                generateBody({ expectedTargetsRevision: -1 }),
+                WINDOW,
+            );
+            const above = parseGeneratePlanRequest(
+                generateBody({ expectedTargetsRevision: MAX_REVISION + 1 }),
+                WINDOW,
+            );
+
+            expect(codesFor(below, 'expectedTargetsRevision')).toEqual([
+                MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE,
+            ]);
+            expect(codesFor(above, 'expectedTargetsRevision')).toEqual([
+                MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE,
+            ]);
+        });
+    });
+
+    describe('POST /meal-planning/plans/:planId/regenerate', () => {
+        it.each(['expectedPlanRevision', 'expectedPreferencesRevision', 'expectedTargetsRevision'])(
+            'accepts %s at the column maximum',
+            (field) => {
+                expect(
+                    parseRegeneratePlanRequest({ planId: PLAN_ID }, regenerateBody({ [field]: MAX_REVISION }))
+                        .kind,
+                ).toBe('ok');
+            },
+        );
+
+        it.each([
+            'expectedPlanRevision',
+            'expectedPreferencesRevision',
+            'expectedTargetsRevision',
+        ])('refuses every unstorable magnitude of %s', (field) => {
+            for (const [, value] of UNSTORABLE) {
+                const verdict = parseRegeneratePlanRequest(
+                    { planId: PLAN_ID },
+                    regenerateBody({ [field]: value }),
+                );
+
+                expect(verdict.kind).toBe('error');
+                expect(codesFor(verdict, field)).toEqual([MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE]);
+            }
+        });
+
+        it('reports all three unstorable revisions in one verdict', () => {
+            const verdict = parseRegeneratePlanRequest(
+                { planId: PLAN_ID },
+                regenerateBody({
+                    expectedPlanRevision: 1e30,
+                    expectedPreferencesRevision: MAX_REVISION + 1,
+                    expectedTargetsRevision: Number.MAX_SAFE_INTEGER + 2,
+                }),
+            );
+
+            expect(verdict.kind === 'error' ? verdict.details : []).toEqual([
+                { field: 'expectedPlanRevision', code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE },
+                { field: 'expectedPreferencesRevision', code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE },
+                { field: 'expectedTargetsRevision', code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE },
+            ]);
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Path parsing
+ *
+ * Both read routes are judged before any I/O: a malformed plan id reaches a
+ * PostgreSQL `uuid` predicate and a malformed day key reaches
+ * `new Date(`${dayKey}T00:00:00.000Z`)`, and each becomes a generic 500 where
+ * the contract promises a 400 naming the field.
+ * ------------------------------------------------------------------------- */
+
+describe('parseMealPlanDayPath', () => {
+    const PLAN_ID = 'b3c9f2e1-4d5a-4b6c-8d7e-9f0a1b2c3d4e';
+
+    it('accepts a UUID plan id and a real calendar day', () => {
+        expect(parseMealPlanDayPath({ planId: PLAN_ID, date: '2026-07-12' })).toEqual({
+            kind: 'ok',
+            planId: PLAN_ID,
+            date: '2026-07-12',
+        });
+    });
+
+    it('accepts an upper-case UUID unchanged, as the other parsers do', () => {
+        expect(
+            parseMealPlanDayPath({ planId: PLAN_ID.toUpperCase(), date: '2026-07-12' }),
+        ).toMatchObject({ kind: 'ok', planId: PLAN_ID.toUpperCase() });
+    });
+
+    it.each([
+        ['a malformed id', 'plan-1'],
+        // A v1 UUID: right shape, wrong version nibble.
+        ['a v1 UUID', 'b3c9f2e1-4d5a-1b6c-8d7e-9f0a1b2c3d4e'],
+        ['an empty segment', ''],
+        ['an absent segment', undefined],
+        ['an explicit null', null],
+        ['a number', 42],
+        ['an object', { id: 'b3c9f2e1-4d5a-4b6c-8d7e-9f0a1b2c3d4e' }],
+    ])('refuses %s as an invalid plan id', (_label, planId) => {
+        expect(parseMealPlanDayPath({ planId, date: '2026-07-12' })).toMatchObject({
+            kind: 'error',
+            code: 'invalid_request',
+            details: [{ field: 'planId', code: MEAL_PLAN_FIELD_CODES.INVALID_ID }],
+        });
+    });
+
+    it.each([
+        ['a day that does not exist', '2026-02-30'],
+        ['a month that does not exist', '2026-13-01'],
+        ['an un-padded key', '2026-1-5'],
+        ['an empty segment', ''],
+        ['a timestamp', '2026-07-12T00:00:00.000Z'],
+        ['an absent segment', undefined],
+        ['an explicit null', null],
+        ['a number', 20260712],
+    ])('refuses %s as an invalid date', (_label, date) => {
+        expect(parseMealPlanDayPath({ planId: PLAN_ID, date })).toMatchObject({
+            kind: 'error',
+            code: 'invalid_request',
+            details: [{ field: 'date', code: MEAL_PLAN_FIELD_CODES.INVALID_DATE }],
+        });
+    });
+
+    it('accepts a leap day that exists and refuses one that does not', () => {
+        expect(parseMealPlanDayPath({ planId: PLAN_ID, date: '2028-02-29' }).kind).toBe('ok');
+        expect(parseMealPlanDayPath({ planId: PLAN_ID, date: '2026-02-29' }).kind).toBe('error');
+    });
+
+    it('reports both malformed segments in one verdict', () => {
+        const verdict = parseMealPlanDayPath({ planId: 'plan-1', date: '2026-02-30' });
+
+        expect(verdict.kind === 'error' ? verdict.details : []).toEqual([
+            { field: 'planId', code: MEAL_PLAN_FIELD_CODES.INVALID_ID },
+            { field: 'date', code: MEAL_PLAN_FIELD_CODES.INVALID_DATE },
+        ]);
+    });
+
+    it('reports an empty path as both segments rather than as a missing route', () => {
+        const verdict = parseMealPlanDayPath({});
+
+        expect(verdict.kind === 'error' ? verdict.details : []).toHaveLength(2);
+    });
+});
+
+describe('parseAffectedMealsPath', () => {
+    const PLAN_ID = 'b3c9f2e1-4d5a-4b6c-8d7e-9f0a1b2c3d4e';
+
+    it('accepts a UUID plan id', () => {
+        expect(parseAffectedMealsPath({ planId: PLAN_ID })).toEqual({ kind: 'ok', planId: PLAN_ID });
+    });
+
+    it.each([
+        ['a malformed id', 'plan-1'],
+        ['a v1 UUID', 'b3c9f2e1-4d5a-1b6c-8d7e-9f0a1b2c3d4e'],
+        ['an empty segment', ''],
+        ['an absent segment', undefined],
+        ['an explicit null', null],
+        ['a number', 42],
+    ])('refuses %s', (_label, planId) => {
+        expect(parseAffectedMealsPath({ planId })).toMatchObject({
+            kind: 'error',
+            code: 'invalid_request',
+            details: [{ field: 'planId', code: MEAL_PLAN_FIELD_CODES.INVALID_ID }],
+        });
+    });
+
+    it('judges the id exactly as the day read does, so one route cannot be looser', () => {
+        for (const planId of [PLAN_ID, 'plan-1', undefined]) {
+            expect(parseAffectedMealsPath({ planId }).kind).toBe(
+                parseMealPlanDayPath({ planId, date: '2026-07-12' }).kind,
+            );
+        }
     });
 });
 

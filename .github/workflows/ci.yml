@@ -54,14 +54,22 @@ jobs:
       - run: npm run typecheck:test
       - run: npm run typecheck:scripts
 
-      # docs/meal-planning/expected-schema-diff.sql is the reviewed output of
-      # one `prisma migrate diff` run: the record of what the migration ledger
-      # holds that prisma/schema.prisma cannot express. This step re-runs that
-      # exact command against a throwaway shadow database, requires the same
-      # exit code, and compares the output with the committed file, failing on
-      # any difference in either direction. The file's header documents the same
-      # command for local use; the node helper below stands in for psql, which
-      # the runner does not have.
+      # docs/meal-planning/expected-schema-diff.sql is the reviewed evidence of
+      # what the migration ledger holds that prisma/schema.prisma cannot
+      # express, in three marker-delimited sections, and this step polices all
+      # three. It re-runs the `prisma migrate diff` command against a throwaway
+      # shadow database, requires the same exit code, and compares the output
+      # with the `prisma-migrate-diff` section; then it executes the committed
+      # `pg-catalog-query` section, read-only, against the database the previous
+      # step applied the ledger to, and compares the result with
+      # `pg-catalog-expected`. The second comparison is not redundant: Prisma's
+      # schema describer leaves expression indexes, index predicates and
+      # scalar-list NOT NULL out of both sides of its diff, so the lower(alias)
+      # index, the five partial-index predicates and the required array
+      # nullability are invisible to the first one. Both fail on any difference
+      # in either direction. The file's header documents both commands for local
+      # use; the node helpers below stand in for psql, which the runner does not
+      # have.
       - name: Schema-drift evidence gate
         run: |
           # Actions runs this under `bash -e`; set it here too so the script
@@ -76,6 +84,63 @@ jobs:
           BASE="${DATABASE_URL%%\?*}"
           ADMIN_URL="${BASE%/*}/postgres"
           SHADOW_URL="${BASE}_schema_evidence"
+
+          if [ ! -f "$EVIDENCE" ]; then
+            echo "$EVIDENCE is missing; the gate has nothing to compare against."
+            exit 1
+          fi
+
+          # Each section of the evidence is delimited by a marker line starting
+          # at column 0, so the artefact stays SQL-commented and every section
+          # can still be comment-stripped before it is compared. A missing,
+          # duplicated, reordered or empty section is drift in its own right:
+          # without this check, deleting a whole section would pass silently.
+          section_end=0
+          for section in prisma-migrate-diff pg-catalog-query pg-catalog-expected; do
+            begins=$(grep -c "^-- >>> BEGIN $section\$" "$EVIDENCE" || true)
+            ends=$(grep -c "^-- >>> END $section\$" "$EVIDENCE" || true)
+            if [ "$begins" -ne 1 ] || [ "$ends" -ne 1 ]; then
+              echo "$EVIDENCE must carry exactly one '-- >>> BEGIN $section' line and one '-- >>> END $section' line, each starting at column 0 (found $begins and $ends)."
+              exit 1
+            fi
+
+            section_begin=$(grep -n "^-- >>> BEGIN $section\$" "$EVIDENCE" | cut -d: -f1)
+            next_end=$(grep -n "^-- >>> END $section\$" "$EVIDENCE" | cut -d: -f1)
+            if [ "$section_begin" -le "$section_end" ] || [ "$next_end" -le "$section_begin" ]; then
+              echo "$EVIDENCE must open and close its sections in the order prisma-migrate-diff, pg-catalog-query, pg-catalog-expected; $section spans lines $section_begin-$next_end."
+              exit 1
+            fi
+            section_end=$next_end
+
+            sed -n "$((section_begin + 1)),$((next_end - 1))p" "$EVIDENCE" \
+              | sed '/^--/d;/^$/d' > "$WORK/$section.txt"
+            if [ ! -s "$WORK/$section.txt" ]; then
+              echo "The $section section of $EVIDENCE is empty once comment lines and blank lines are stripped."
+              exit 1
+            fi
+          done
+
+          # Floors, not exact counts. The schema only grows additively, and
+          # these three numbers are the three classes
+          # prisma/migrations/20260908000000_meal_planning/migration.sql names as
+          # hand-edited in its own header: the STORED search_vector expression,
+          # the block of expression, GIN and partial indexes, and NOT NULL on
+          # the twelve required TEXT[]/UUID[] columns. A floor survives a column
+          # added later; it does not survive a construct being dropped from the
+          # ledgers and from the evidence together, which is the case no
+          # ledger-against-ledger check can see.
+          generated_columns=$(grep -c '^generated_column ' "$WORK/pg-catalog-expected.txt" || true)
+          hand_managed_indexes=$(grep -c '^index ' "$WORK/pg-catalog-expected.txt" || true)
+          not_null_arrays=$(grep '^array_column ' "$WORK/pg-catalog-expected.txt" | grep -c ' not_null=true' || true)
+
+          if [ "$generated_columns" -lt 1 ] || [ "$hand_managed_indexes" -lt 7 ] || [ "$not_null_arrays" -lt 12 ]; then
+            echo "The pg-catalog-expected section of $EVIDENCE no longer carries the evidence it must:"
+            echo "  generated columns:      $generated_columns (at least 1)"
+            echo "  hand-managed indexes:   $hand_managed_indexes (at least 7)"
+            echo "  NOT NULL array columns: $not_null_arrays (at least 12)"
+            echo "Those are the classes the meal-planning migration hand-edits; their evidence cannot be deleted."
+            exit 1
+          fi
 
           cat > "$WORK/run-sql.js" <<'JS'
           // Resolved from the checkout, not from this script's directory: the
@@ -121,15 +186,64 @@ jobs:
 
           # Comment lines and empty lines only, on both sides. Whitespace inside
           # or around a statement is compared as content.
-          sed '/^--/d;/^$/d' "$EVIDENCE" > "$WORK/expected.sql"
           sed '/^--/d;/^$/d' "$WORK/actual.sql" > "$WORK/normalised.sql"
 
-          if ! diff -u "$WORK/expected.sql" "$WORK/normalised.sql"; then
-            echo "$EVIDENCE no longer matches what the command reports."
-            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the evidence if the change was intended."
+          if ! diff -u "$WORK/prisma-migrate-diff.txt" "$WORK/normalised.sql"; then
+            echo "The prisma-migrate-diff section of $EVIDENCE no longer matches what the command reports."
+            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the section if the change was intended."
             exit 1
           fi
-          echo "schema-drift evidence gate: PASS ($(wc -l < "$WORK/expected.sql") statement(s) compared)"
+
+          # The committed extraction, run against the database the `Apply the
+          # migration ledger` step migrated, so what it measures is the ledger
+          # as applied rather than either ledger as written.
+          cat > "$WORK/render-evidence.js" <<'JS'
+          // Resolved from the checkout, for the same reason as run-sql.js above.
+          const { Client } = require(require('path').join(process.cwd(), 'node_modules', 'pg'));
+
+          const sql = require('fs').readFileSync(0, 'utf8');
+          const client = new Client({ connectionString: process.env.PGURL });
+
+          const render = async () => {
+            await client.connect();
+            // The committed query is data this script executes, so it runs in a
+            // read-only transaction: a write introduced into that section fails
+            // here instead of reaching the database.
+            await client.query('BEGIN TRANSACTION READ ONLY');
+            const result = await client.query(sql);
+            await client.query('ROLLBACK');
+
+            if (Array.isArray(result)) {
+              throw new Error('the extraction must be one SELECT, not several statements');
+            }
+
+            const lines = result.rows.map((row) => row.line);
+            if (lines.some((line) => typeof line !== 'string')) {
+              throw new Error('the extraction must select exactly one text column, named "line"');
+            }
+
+            process.stdout.write(lines.join('\n') + '\n');
+            await client.end();
+          };
+
+          render().catch((error) => {
+            console.error(error.message || error);
+            process.exit(1);
+          });
+          JS
+
+          PGURL="$DATABASE_URL" node "$WORK/render-evidence.js" \
+            < "$WORK/pg-catalog-query.txt" > "$WORK/pg-catalog-actual.txt" || exit 1
+
+          if ! diff -u "$WORK/pg-catalog-expected.txt" "$WORK/pg-catalog-actual.txt"; then
+            echo "The applied ledger no longer matches the pg-catalog-expected section of $EVIDENCE."
+            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the section if the change was intended."
+            exit 1
+          fi
+
+          echo "schema-drift evidence gate: PASS"
+          echo "  prisma-migrate-diff: $(wc -l < "$WORK/prisma-migrate-diff.txt") statement(s) compared"
+          echo "  pg-catalog-expected: $(wc -l < "$WORK/pg-catalog-actual.txt") line(s) compared - $generated_columns generated column(s), $hand_managed_indexes hand-managed index(es), $not_null_arrays NOT NULL array column(s)"
 
       - run: npm test
       - run: docker build -t soh-be-ci .

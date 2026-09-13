@@ -51,6 +51,29 @@ export interface CatalogFoodPortionResponse {
     gramWeight: number;
 }
 
+// The nutrition of ONE `defaultPortion` — the server's own projection of the
+// per-basis values onto that portion's gram weight, so the client never has to
+// perform the conversion.
+//
+// It cannot: a `per_100ml` food is converted through `density_g_per_ml`, a
+// column no response carries, so combining the per-basis macros with
+// `defaultPortion` is the unit mismatch this member exists to remove.
+//
+// These four numbers are exactly what `meal_entries` stores per serving when
+// the food is logged at its default portion, which is why they arrive ALREADY
+// ROUNDED to integers: the stored snapshot is rounded once, on insert, and the
+// pre-log card must equal the diary row it produces to the integer.
+//
+// fiber is deliberately NOT projected. `meal_entries` stores no fiber column,
+// so the guarantee above — equality with the stored snapshot — could not hold
+// for it; fiber stays stated per basis on `CatalogFoodResponse`.
+export interface CatalogPortionNutritionResponse {
+    calories: number;
+    protein: number;
+    carbs: number;
+    fat: number;
+}
+
 export interface CatalogFoodResponse {
     id: string;
     name: string;
@@ -80,6 +103,10 @@ export interface CatalogFoodResponse {
     // reaches this response. The guarantee lives in the validation pipeline,
     // not in this type.
     defaultPortion: CatalogFoodPortionResponse;
+    // Required and never null, for the same reason `defaultPortion` is: it is
+    // derived from that portion and the four non-null macros above, so a row
+    // that can be projected at all can always be projected.
+    defaultPortionNutrition: CatalogPortionNutritionResponse;
     allergenTags: string[];
     allergenStatus: CatalogAllergenStatus;
     foodGroup: string;

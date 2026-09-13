@@ -68,8 +68,13 @@
 // (`swap.logic.ts`), grocery aggregation (`grocery.logic.ts`), and the
 // catalog-side facts about a food's publication status
 // (`catalog.logic.ts::isRecipeEligibleCatalogFood`).
+//
+// It DOES own the request parser for `GET /recipes/:recipeVersionId` (the last
+// section below), because a path id must be judged before the service's
+// `uuid` predicate sees it and the rule puts every parser in the pure layer.
 
 import { normalizeCanonicalName, PER_100G_BASIS_AMOUNT } from './catalog.logic';
+import type { InvalidRequestDetail } from '../types/mealPlanning';
 import { NutritionProvenance } from '../types/nutrition';
 import {
     MEAL_SLOTS,
@@ -1903,4 +1908,93 @@ export const validateRecipeDeclaration = (
     }
 
     return { valid: mismatches.length === 0, derived, mismatches };
+};
+
+/* ---------------------------------------------------------------------------
+ * Request parsing
+ *
+ * Verdicts are RETURNED, not thrown: a field-level failure is data the client
+ * renders, every one of these is a 400, and no status code appears here
+ * (Rule backend-architecture §8).
+ *
+ * The vocabulary below is declared LOCALLY and deliberately so. `mealPlan.logic.ts`
+ * and `swap.logic.ts` both import this module, so importing either of them
+ * back — for their field-code map, their UUID predicate or their verdict type —
+ * would close a cycle. A few duplicated lines is the price of this module
+ * staying the leaf of that graph, which is the same trade every parser module
+ * in this layer makes.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The wire vocabulary for a recipe `details[].code`. Machine-readable only —
+ * the client maps the code to its own copy:
+ *  - `invalid_id` — the `:recipeVersionId` segment is not a v4 UUID.
+ *
+ * One member, because one condition is distinguishable on this route: an absent
+ * or non-string segment is not a well-formed id either, and reporting "required"
+ * for a path a router only matches WITH the segment would describe a request
+ * nobody can send.
+ */
+export const RECIPE_FIELD_CODES = {
+    INVALID_ID: 'invalid_id',
+} as const;
+
+const RECIPE_VERSION_ID_FIELD = 'recipeVersionId';
+
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const isUuidV4 = (value: unknown): value is string =>
+    typeof value === 'string' && UUID_V4_PATTERN.test(value);
+
+/** The refusal shape this module's parsers carry. */
+type RecipeErrorVerdict = {
+    kind: 'error';
+    code: 'invalid_request';
+    message: string;
+    details: InvalidRequestDetail[];
+};
+
+export type ParsedRecipeVersionPath =
+    | { kind: 'ok'; recipeVersionId: string }
+    | RecipeErrorVerdict;
+
+/**
+ * The refusal branch of {@link parseRecipeVersionPath}, named so a caller can
+ * declare it in its own return type without re-declaring the shape.
+ *
+ * `recipe.service.ts::getRecipeVersionForUser` is that caller: it is the
+ * route-facing read, so its result is "the version (or `null`)" or "this id
+ * could never denote a version", and the second half is exactly this type.
+ * Derived with `Exclude` rather than written out, so it stays the shape this
+ * module produces by construction — a hand-written copy would be free to drift
+ * from the `details` the client renders beside its fields, and
+ * `mealPlan.service.ts::MealPlanRefusal` derives its own the same way.
+ */
+export type RecipeVersionPathRefusal = Exclude<ParsedRecipeVersionPath, { kind: 'ok' }>;
+
+/**
+ * Validates `:recipeVersionId` for `GET /recipes/:recipeVersionId`.
+ *
+ * JUDGED BEFORE ANY I/O, which is the point of the parser: the id goes straight
+ * into a PostgreSQL `uuid` predicate in
+ * `recipe.service.ts::getRecipeVersionForUser`, so a malformed segment would
+ * become a Prisma failure and a generic 500 where §0.5.2 promises a
+ * `400 invalid_request` naming the field. A WELL-FORMED id that names nothing,
+ * or names a version this caller may not read, is still the route's 404 — this
+ * parser decides only whether the value could denote a version at all, and
+ * never whether one exists.
+ */
+export const parseRecipeVersionPath = (params: { recipeVersionId?: unknown }): ParsedRecipeVersionPath => {
+    if (!isUuidV4(params.recipeVersionId)) {
+        return {
+            kind: 'error',
+            code: 'invalid_request',
+            // A server-side diagnostic; the client renders `details`, never
+            // this string.
+            message: `invalid recipe version path: ${RECIPE_VERSION_ID_FIELD} (${RECIPE_FIELD_CODES.INVALID_ID})`,
+            details: [{ field: RECIPE_VERSION_ID_FIELD, code: RECIPE_FIELD_CODES.INVALID_ID }],
+        };
+    }
+
+    return { kind: 'ok', recipeVersionId: params.recipeVersionId };
 };

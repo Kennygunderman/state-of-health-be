@@ -48,10 +48,21 @@
 //    client's pinned meal revision for a write that did not touch the meal.
 //    `meal_plans.revision` IS bumped, because the plan's derived logged state
 //    changed and the response carries the new value.
-//  * NO BODY VALIDATION. `parseLogPlannedMealRequest` is a pure verdict in
-//    `plannedMealLog.logic.ts` and is called by the controller (§4): servings,
-//    date, uuid and revision checks answering `400 invalid_request` need no
-//    database state, so the payload arrives typed.
+//  * NO FIELD VALIDATION OF ITS OWN. `parseLogPlannedMealCall` is a pure verdict
+//    in `plannedMealLog.logic.ts` — the composition of that module's path and
+//    body parsers, so the two path ids and the five body fields are answered
+//    together — and `logPlannedMeal` CALLS IT as its first statement, before any
+//    await, returning its refusal unchanged for the controller to map to
+//    `400 invalid_request` (§4's "validation lives at this boundary, but the
+//    predicate is pure logic"; §8's "a field-level failure is a value, not a
+//    throw"). The parse boundary is the route-facing service entry point rather
+//    than the controller, exactly as `mealPlan.service.ts`'s two generation
+//    entry points and `targets.service.ts::saveTargets` place it, which is why
+//    this function takes `body: unknown`. It also has to be here rather than
+//    upstream of it: `buildRequestFingerprint` hashes the PARSED payload
+//    (`mealPlanningAction.logic.ts`), so a raw body reaching the reservation
+//    below would make a hostile value a 500 from the canonicaliser instead of a
+//    400 from the parser.
 //  * NO DIARY BUCKET CREATION. The bucket always already exists — the client took
 //    `diaryMealId` from `GET /macros/:date`, which backfills the four default
 //    buckets on every read — so this path verifies and never creates. A
@@ -70,7 +81,12 @@ import { PlanNotFoundError, StalePlanError } from './mealPlanning.errors';
 import { buildRequestFingerprint } from './mealPlanningAction.logic';
 import { KeyedActionResult, runKeyedAction } from './mealPlanningAction.service';
 import { insertPlannedMealEntry } from './nutrition.service';
-import { derivePlannedSnapshot, requireLoggableTarget } from './plannedMealLog.logic';
+import {
+    ParsedLogPlannedMealRequest,
+    derivePlannedSnapshot,
+    parseLogPlannedMealCall,
+    requireLoggableTarget,
+} from './plannedMealLog.logic';
 import { dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
 
 /* ---------------------------------------------------------------------------
@@ -232,8 +248,37 @@ const requireMealResponse = async (
  * ------------------------------------------------------------------------- */
 
 /**
+ * The refusal half of this route — `parseLogPlannedMealCall`'s verdict,
+ * unchanged.
+ *
+ * Derived from `ParsedLogPlannedMealRequest` rather than re-declared, so it is
+ * the same shape `plannedMealLog.logic.ts` produces by construction (both of
+ * that module's parsers and their composition carry one verdict type). A
+ * hand-written copy would be free to drift from the `details` the client
+ * renders beside its fields, which is the reason `mealPlan.service.ts` derives
+ * its own `MealPlanRefusal` the same way.
+ */
+export type LogPlannedMealRefusal = Exclude<ParsedLogPlannedMealRequest, { kind: 'ok' }>;
+
+/** Either the ledger's result for a logged meal, or the parser's refusal verbatim. */
+export type LogPlannedMealResult = { kind: 'ok'; result: KeyedActionResult } | LogPlannedMealRefusal;
+
+/**
  * `POST /api/meal-planning/plans/:planId/meals/:mealId/log` — record that a
  * planned meal was eaten.
+ *
+ * THE REQUEST IS PARSED FIRST, before any await, and that ordering is a rule
+ * rather than a style: this is a WRITE, so an unvalidated value would reach the
+ * advisory lock, the ledger reservation and `buildRequestFingerprint` — which
+ * hashes the PARSED payload and rightly refuses a magnitude it cannot represent
+ * faithfully, turning a malformed request into a 500 where §0.5.2 promises a
+ * `400 invalid_request` naming the field. Both path ids and the body are judged
+ * in one verdict by `parseLogPlannedMealCall`, so a request with a malformed
+ * `planId` and three bad body fields reports all four at once, and the refusal
+ * is RETURNED unchanged for the controller to map (§8). Every other failure on
+ * this path stays a THROWN typed error — `PlanNotFoundError`,
+ * `StalePlanError`, `IdempotencyConflictError` — because those are states of
+ * the stored data rather than faults in the request.
  *
  * ONE TRANSACTION, and the sequence inside `work` is §0.5.1's, in this order for
  * stated reasons:
@@ -270,27 +315,45 @@ export const logPlannedMeal = async (
     userId: string,
     planId: string,
     mealId: string,
-    payload: LogPlannedMealPayload,
+    body: unknown,
     now: Date = new Date(),
-): Promise<KeyedActionResult> =>
-    prisma.$transaction((tx) =>
+): Promise<LogPlannedMealResult> => {
+    const parsed = parseLogPlannedMealCall({ planId, mealId }, body);
+
+    if (parsed.kind !== 'ok') {
+        return parsed;
+    }
+
+    // The parsed values from here down, never the arguments: the fingerprint,
+    // the reservation and every predicate below must see the request the parser
+    // admitted, so the ids and the payload have exactly one representation once
+    // the parse has passed.
+    const payload: LogPlannedMealPayload = parsed.payload;
+    const { planId: parsedPlanId, mealId: parsedMealId } = parsed;
+
+    const result = await prisma.$transaction((tx) =>
         runKeyedAction(
             tx,
             {
                 userId,
                 actionType: 'log',
                 idempotencyKey: payload.idempotencyKey,
-                fingerprint: buildRequestFingerprint('POST', 'log', { planId, mealId }, payload),
+                fingerprint: buildRequestFingerprint(
+                    'POST',
+                    'log',
+                    { planId: parsedPlanId, mealId: parsedMealId },
+                    payload,
+                ),
             },
             async (lockedTx) => {
-                const plan = await requireWritablePlanForLog(lockedTx, userId, planId, now);
+                const plan = await requireWritablePlanForLog(lockedTx, userId, parsedPlanId, now);
 
                 if (plan.revision !== payload.expectedPlanRevision) {
                     throw new StalePlanError(plan.revision);
                 }
 
                 const meal = await lockedTx.meal_plan_meals.findFirst({
-                    where: { id: mealId, meal_plan_id: planId, user_id: userId },
+                    where: { id: parsedMealId, meal_plan_id: parsedPlanId, user_id: userId },
                     select: PLANNED_MEAL_SELECT,
                 });
 
@@ -336,21 +399,29 @@ export const logPlannedMeal = async (
                 const planRevisionAfter = await bumpPlanRevision(
                     lockedTx,
                     userId,
-                    planId,
+                    parsedPlanId,
                     payload.expectedPlanRevision,
                 );
 
                 return {
                     body: {
                         entry,
-                        mealPlanMeal: await requireMealResponse(lockedTx, userId, planId, mealId),
+                        mealPlanMeal: await requireMealResponse(
+                            lockedTx,
+                            userId,
+                            parsedPlanId,
+                            parsedMealId,
+                        ),
                         planRevision: planRevisionAfter,
                     },
                     planRevisionAfter,
-                    mealPlanId: planId,
+                    mealPlanId: parsedPlanId,
                     mealPlanMealId: meal.id,
                     mealEntryId: entry.id,
                 };
             },
         ),
     );
+
+    return { kind: 'ok', result };
+};

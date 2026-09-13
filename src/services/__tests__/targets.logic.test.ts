@@ -15,7 +15,12 @@
 //  * that a macro of 0 is refused and that nothing is ever rebalanced;
 //  * the four ways stored targets stop being attributable to a route;
 //  * the complete × source matrix the planner gates generation on, so that gate
-//    is readable off the tests without consulting the planner.
+//    is readable off the tests without consulting the planner;
+//  * which stored answers can make a confirmed estimate stale, asserted from
+//    both sides — every column the equation reads, and every column it does
+//    not — because comparing against the wrong revision is how an unrelated
+//    diet or schedule edit came to ask a user to recalculate an unchanged
+//    figure.
 //
 // No database, no mocks, no clock: every function under test is pure, and the
 // determinism group asserts that directly.
@@ -33,15 +38,29 @@ import {
     computeTargetEstimate,
     deriveMacroTargets,
     deriveTargetsResponse,
+    ESTIMATE_INPUT_COLUMNS,
+    ESTIMATED_SAVE_KEYS,
     EstimateInputsRow,
+    estimateInputsChanged,
     KCAL_PER_POUND_PER_WEEK_PER_DAY,
     MANUAL_CALORIE_RANGE,
     MANUAL_MACRO_RANGE,
+    MANUAL_SAVE_KEYS,
+    ParsedSaveTargets,
     parseManualTargets,
+    parseOptionalRevision,
+    parseRequiredRevision,
+    parseSaveTargetsRequest,
     resolveEstimateInputs,
+    TARGET_SOURCES,
     TargetsPreferencesRow,
     TargetsUserRow,
 } from '../targets.logic';
+// The save envelope reports an unrecognised `source` with the code the
+// preferences parsers publish for a value outside a closed set, and bounds
+// every revision by the one `MAX_REVISION` this layer shares. Both are
+// imported from the module that owns them rather than restated here.
+import { MAX_REVISION, PREFERENCE_FIELD_CODES } from '../preferences.logic';
 import { ActivityLevel, TargetsResponse } from '../../types/mealPlanning';
 
 /* ---------------------------------------------------------------------------
@@ -121,7 +140,7 @@ const preferencesRow = (overrides: Partial<TargetsPreferencesRow> = {}): Targets
     targets_revision: 3,
     confirmed_targets: { ...CONFIRMED },
     targets_input_revision: 9,
-    revision: 9,
+    estimate_inputs_revision: 9,
     ...overrides,
 });
 
@@ -1093,6 +1112,452 @@ describe('parseManualTargets', () => {
  * assessFeasibility
  * ------------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------------
+ * The save envelope
+ *
+ * `PUT /meal-planning/targets` carries one of two shapes, and this parser is
+ * the only thing that decides which was sent. Tested directly here — not
+ * through the service — because it is pure: the stored-revision half of the
+ * rule (whether an omitted `expectedTargetsRevision` is legal THIS time) is
+ * deliberately not its business and stays under the lock in `saveTargets`.
+ * ------------------------------------------------------------------------- */
+
+describe('parseSaveTargetsRequest', () => {
+    const estimatedBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        source: 'estimated',
+        estimateRevision: 9,
+        expectedTargetsRevision: 3,
+        ...overrides,
+    });
+
+    const manualSaveBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        source: 'manual',
+        ...MANUAL_BODY,
+        expectedTargetsRevision: 3,
+        ...overrides,
+    });
+
+    /** The accepted request, or a failure naming what the parser refused. */
+    const accepted = (parsed: ParsedSaveTargets) => {
+        if (parsed.kind !== 'ok') {
+            throw new Error(`expected an accepted envelope, got ${JSON.stringify(parsed.details)}`);
+        }
+
+        return parsed.request;
+    };
+
+    /** The codes reported for a body, keyed by field. */
+    const envelopeCodes = (body: unknown): Record<string, string> => {
+        const parsed = parseSaveTargetsRequest(body);
+
+        if (parsed.kind !== 'error') {
+            throw new Error('expected the envelope to be refused');
+        }
+
+        const codes: Record<string, string> = {};
+        for (const detail of parsed.details) {
+            codes[detail.field] = detail.code;
+        }
+
+        return codes;
+    };
+
+    it('declares exactly the two sources the DTO union allows', () => {
+        expect(Object.keys(TARGET_SOURCES).sort()).toEqual(['estimated', 'manual']);
+    });
+
+    describe('the estimated arm', () => {
+        it('carries the pinned estimate revision and no values, because the server recomputes them', () => {
+            expect(accepted(parseSaveTargetsRequest(estimatedBody()))).toEqual({
+                source: 'estimated',
+                estimateRevision: 9,
+                expectedTargetsRevision: 3,
+            });
+        });
+
+        it('requires the estimate revision, without which the figure cannot be judged', () => {
+            expect(envelopeCodes(estimatedBody({ estimateRevision: undefined }))).toEqual({
+                estimateRevision: 'required',
+            });
+            expect(envelopeCodes(estimatedBody({ estimateRevision: null }))).toEqual({
+                estimateRevision: 'required',
+            });
+        });
+
+        it('refuses manual values sent alongside it, because the estimated shape carries none', () => {
+            // The damaging case for a silent drop, and the reason this arm's
+            // shape is exact: the server recomputes the figures from stored
+            // preferences, so a client whose `calories` was quietly ignored
+            // would be told its save succeeded and then read back numbers it
+            // never sent.
+            expect(envelopeCodes(estimatedBody(MANUAL_BODY))).toEqual({
+                calories: 'unknown_field',
+                protein: 'unknown_field',
+                carbs: 'unknown_field',
+                fat: 'unknown_field',
+            });
+        });
+    });
+
+    describe('the manual arm', () => {
+        it('carries the four values exactly as entered', () => {
+            expect(accepted(parseSaveTargetsRequest(manualSaveBody()))).toEqual({
+                source: 'manual',
+                values: { calories: 1940, protein: 146, carbs: 194, fat: 65 },
+                expectedTargetsRevision: 3,
+            });
+        });
+
+        it('needs no estimate revision, because nothing was recomputed', () => {
+            // Stated by omission rather than by a key set to undefined:
+            // `estimateRevision` is not part of this shape at all, so a body
+            // that carries one is refused (see "keys outside the declared
+            // shape") instead of tolerated.
+            expect(Object.prototype.hasOwnProperty.call(manualSaveBody(), 'estimateRevision')).toBe(false);
+            expect(parseSaveTargetsRequest(manualSaveBody()).kind).toBe('ok');
+        });
+
+        it('delegates the four values to parseManualTargets rather than re-judging them', () => {
+            expect(envelopeCodes(manualSaveBody({ carbs: 0 }))).toEqual({ carbs: 'below_minimum' });
+            expect(envelopeCodes(manualSaveBody({ calories: '1940' }))).toEqual({
+                calories: 'invalid_type',
+            });
+        });
+
+        it('reports the offending values and the offending revision in one verdict', () => {
+            // One round trip: the edit screen shows every inline message at
+            // once, and a body with both kinds of problem must not report only
+            // the half the parser reached first.
+            expect(envelopeCodes(manualSaveBody({ carbs: 0, fat: null, expectedTargetsRevision: -1 }))).toEqual(
+                {
+                    expectedTargetsRevision: 'below_minimum',
+                    carbs: 'below_minimum',
+                    fat: 'required',
+                },
+            );
+        });
+    });
+
+    describe('keys outside the declared shape', () => {
+        // Each arm accepts exactly the keys its wire DTO declares (§0.5.2).
+        // Silently dropping the rest would let a client believe a value it sent
+        // was honoured — the same reason `parseLogPlannedMealRequest` refuses
+        // `mealName` rather than ignoring it.
+        it('declares exactly the keys each wire shape carries', () => {
+            expect(Object.keys(ESTIMATED_SAVE_KEYS).sort()).toEqual([
+                'estimateRevision',
+                'expectedTargetsRevision',
+                'source',
+            ]);
+            expect(Object.keys(MANUAL_SAVE_KEYS).sort()).toEqual([
+                'calories',
+                'carbs',
+                'expectedTargetsRevision',
+                'fat',
+                'protein',
+                'source',
+            ]);
+        });
+
+        it('accepts both minimal bodies, so the accepted sets are not too narrow', () => {
+            expect(parseSaveTargetsRequest({ source: 'estimated', estimateRevision: 9 })).toEqual({
+                kind: 'ok',
+                request: { source: 'estimated', estimateRevision: 9, expectedTargetsRevision: null },
+            });
+            expect(parseSaveTargetsRequest({ source: 'manual', ...MANUAL_BODY })).toEqual({
+                kind: 'ok',
+                request: {
+                    source: 'manual',
+                    values: { calories: 1940, protein: 146, carbs: 194, fat: 65 },
+                    expectedTargetsRevision: null,
+                },
+            });
+        });
+
+        it('accepts every declared key of either shape sent together', () => {
+            expect(accepted(parseSaveTargetsRequest(estimatedBody()))).toEqual({
+                source: 'estimated',
+                estimateRevision: 9,
+                expectedTargetsRevision: 3,
+            });
+            expect(accepted(parseSaveTargetsRequest(manualSaveBody()))).toEqual({
+                source: 'manual',
+                values: { calories: 1940, protein: 146, carbs: 194, fat: 65 },
+                expectedTargetsRevision: 3,
+            });
+        });
+
+        it('refuses an arbitrary extra key on the manual arm', () => {
+            expect(envelopeCodes(manualSaveBody({ surprise: true }))).toEqual({
+                surprise: 'unknown_field',
+            });
+        });
+
+        it('refuses an arbitrary extra key on the estimated arm', () => {
+            expect(envelopeCodes(estimatedBody({ surprise: true }))).toEqual({
+                surprise: 'unknown_field',
+            });
+        });
+
+        it('refuses a key that is legal only on the manual arm', () => {
+            expect(envelopeCodes(estimatedBody({ calories: 9999 }))).toEqual({
+                calories: 'unknown_field',
+            });
+        });
+
+        it('refuses a key that is legal only on the estimated arm', () => {
+            expect(envelopeCodes(manualSaveBody({ estimateRevision: 9 }))).toEqual({
+                estimateRevision: 'unknown_field',
+            });
+        });
+
+        it('judges own keys only, so a prototype member is never mistaken for an accepted one', () => {
+            expect(envelopeCodes(manualSaveBody({ toString: 'x' }))).toEqual({
+                toString: 'unknown_field',
+            });
+        });
+
+        it('reports the extra key and the offending values in one verdict', () => {
+            // One round trip: a body with both kinds of problem must not report
+            // only the half the parser reached first.
+            expect(
+                envelopeCodes(
+                    manualSaveBody({ calories: '1940', protein: 0, carbs: 1.5, fat: null, surprise: true }),
+                ),
+            ).toEqual({
+                calories: 'invalid_type',
+                protein: 'below_minimum',
+                carbs: 'not_an_integer',
+                fat: 'required',
+                surprise: 'unknown_field',
+            });
+        });
+
+        it('reports the extra key and an unusable revision in one verdict', () => {
+            expect(envelopeCodes(estimatedBody({ expectedTargetsRevision: -1, surprise: true }))).toEqual({
+                expectedTargetsRevision: 'below_minimum',
+                surprise: 'unknown_field',
+            });
+            expect(envelopeCodes(manualSaveBody({ expectedTargetsRevision: 1e30, surprise: true }))).toEqual({
+                expectedTargetsRevision: 'above_maximum',
+                surprise: 'unknown_field',
+            });
+        });
+
+        it('names the unknown key in the diagnostic message', () => {
+            const parsed = parseSaveTargetsRequest(estimatedBody({ surprise: true }));
+
+            expect(parsed.kind).toBe('error');
+            if (parsed.kind === 'error') {
+                expect(parsed.code).toBe('invalid_request');
+                expect(parsed.message).toContain('surprise');
+                expect(parsed.message).toContain('unknown_field');
+            }
+        });
+    });
+
+    describe('the source discriminator', () => {
+        it('reports an absent source alone, because the two shapes need different fields', () => {
+            expect(envelopeCodes({ expectedTargetsRevision: 3 })).toEqual({ source: 'required' });
+            expect(envelopeCodes({ source: null })).toEqual({ source: 'required' });
+        });
+
+        it.each(['legacy', 'Estimated', 'estimate', '', 'toString'])(
+            'reports the unrecognised source %p as an unknown value',
+            (source) => {
+                expect(envelopeCodes({ source, expectedTargetsRevision: 3 })).toEqual({
+                    source: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE,
+                });
+            },
+        );
+
+        it.each([[42], [true], [{ source: 'manual' }], [['manual']]])(
+            'reports the non-string source %p as an unknown value',
+            (source) => {
+                expect(envelopeCodes({ source })).toEqual({
+                    source: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE,
+                });
+            },
+        );
+
+        it('reports a bad source alone even when the rest of the body is also wrong', () => {
+            // Reporting "calories is required" for a body whose source is
+            // misspelled would describe a shape the client never meant to send.
+            expect(envelopeCodes({ source: 'legacy', expectedTargetsRevision: -1, calories: 0 })).toEqual({
+                source: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE,
+            });
+        });
+
+        it('reports an unusable source alone even when unknown keys are present', () => {
+            // Which keys are legal is the ARM's answer, and an unusable source
+            // establishes no arm — so the rest of the body is not judged as
+            // unknown keys either, in any of the three ways a source can be
+            // unusable.
+            expect(envelopeCodes({ surprise: true, calories: 1940 })).toEqual({ source: 'required' });
+            expect(envelopeCodes({ source: null, surprise: true })).toEqual({ source: 'required' });
+            expect(envelopeCodes({ source: 'Estimated', surprise: true })).toEqual({
+                source: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE,
+            });
+        });
+    });
+
+    describe('bodies that are not objects', () => {
+        it.each([
+            ['null', null],
+            ['undefined', undefined],
+            ['a string', 'source=manual'],
+            ['a number', 1940],
+            ['an array', [{ source: 'manual' }]],
+        ])('refuses %s as a body-level type problem', (_label, body) => {
+            expect(envelopeCodes(body)).toEqual({ body: 'invalid_type' });
+        });
+    });
+
+    describe('the pinned targets revision', () => {
+        it('resolves an omitted revision to null, which is legal before the first save', () => {
+            // A pure parser cannot know the stored revision, so the omission is
+            // carried forward as null and `saveTargets` applies the half of the
+            // rule that needs the row.
+            expect(accepted(parseSaveTargetsRequest(estimatedBody({ expectedTargetsRevision: undefined })))).toEqual(
+                { source: 'estimated', estimateRevision: 9, expectedTargetsRevision: null },
+            );
+            expect(
+                accepted(parseSaveTargetsRequest(manualSaveBody({ expectedTargetsRevision: null })))
+                    .expectedTargetsRevision,
+            ).toBeNull();
+        });
+
+        it('accepts a pinned zero, which a user with no preferences row is at', () => {
+            expect(
+                accepted(parseSaveTargetsRequest(estimatedBody({ expectedTargetsRevision: 0 })))
+                    .expectedTargetsRevision,
+            ).toBe(0);
+        });
+    });
+
+    describe('numeric boundaries, on both revision fields', () => {
+        // `Number.isInteger(1e30)` is true, so the integer check alone admits
+        // whole numbers that no `Int` column can hold and that JavaScript
+        // cannot compare exactly — which later fails in fingerprinting or in
+        // Prisma as a 500 rather than as this 400.
+        const REFUSED: [string, unknown, string][] = [
+            ['one above the column maximum', MAX_REVISION + 1, 'above_maximum'],
+            ['1e30', 1e30, 'above_maximum'],
+            ['two above the safe-integer ceiling', Number.MAX_SAFE_INTEGER + 2, 'above_maximum'],
+            ['a negative revision', -1, 'below_minimum'],
+            ['a fractional revision', 1.5, 'not_an_integer'],
+            ['a numeric string', '3', 'invalid_type'],
+            ['NaN', Number.NaN, 'invalid_type'],
+            ['Infinity', Number.POSITIVE_INFINITY, 'invalid_type'],
+        ];
+
+        it('pins the bound to the integer column revisions live in', () => {
+            expect(MAX_REVISION).toBe(2_147_483_647);
+        });
+
+        it('accepts the column maximum on both fields', () => {
+            expect(
+                accepted(
+                    parseSaveTargetsRequest(
+                        estimatedBody({
+                            estimateRevision: MAX_REVISION,
+                            expectedTargetsRevision: MAX_REVISION,
+                        }),
+                    ),
+                ),
+            ).toEqual({
+                source: 'estimated',
+                estimateRevision: MAX_REVISION,
+                expectedTargetsRevision: MAX_REVISION,
+            });
+        });
+
+        it.each(REFUSED)('refuses %s as estimateRevision (%s)', (_label, estimateRevision, code) => {
+            expect(envelopeCodes(estimatedBody({ estimateRevision }))).toEqual({
+                estimateRevision: code,
+            });
+        });
+
+        it.each(REFUSED)(
+            'refuses %s as expectedTargetsRevision (%s)',
+            (_label, expectedTargetsRevision, code) => {
+                expect(envelopeCodes(estimatedBody({ expectedTargetsRevision }))).toEqual({
+                    expectedTargetsRevision: code,
+                });
+            },
+        );
+
+        it('reports both offending revisions in one verdict', () => {
+            expect(
+                envelopeCodes(
+                    estimatedBody({ estimateRevision: 1e30, expectedTargetsRevision: MAX_REVISION + 1 }),
+                ),
+            ).toEqual({
+                estimateRevision: 'above_maximum',
+                expectedTargetsRevision: 'above_maximum',
+            });
+        });
+    });
+
+    it('names every offending field in the diagnostic message', () => {
+        const parsed = parseSaveTargetsRequest(manualSaveBody({ carbs: 0, expectedTargetsRevision: -1 }));
+
+        expect(parsed.kind).toBe('error');
+        if (parsed.kind === 'error') {
+            expect(parsed.code).toBe('invalid_request');
+            expect(parsed.message).toContain('expectedTargetsRevision');
+            expect(parsed.message).toContain('carbs');
+        }
+    });
+
+    it('returns its verdict rather than throwing, and names no status code', () => {
+        for (const body of [estimatedBody(), manualSaveBody(), null, 42, { source: 'legacy' }]) {
+            expect(() => parseSaveTargetsRequest(body)).not.toThrow();
+        }
+    });
+});
+
+describe('parseOptionalRevision and parseRequiredRevision', () => {
+    it('reads an absent optional revision as null rather than as a failure', () => {
+        expect(parseOptionalRevision(undefined, 'expectedTargetsRevision')).toEqual({ revision: null });
+        expect(parseOptionalRevision(null, 'expectedTargetsRevision')).toEqual({ revision: null });
+    });
+
+    it('accepts every magnitude a revision column can hold', () => {
+        expect(parseOptionalRevision(0, 'expectedTargetsRevision')).toEqual({ revision: 0 });
+        expect(parseOptionalRevision(MAX_REVISION, 'expectedTargetsRevision')).toEqual({
+            revision: MAX_REVISION,
+        });
+    });
+
+    it('refuses an absent required revision, which the optional form allows', () => {
+        expect(parseRequiredRevision(undefined, 'estimateRevision')).toEqual({
+            field: 'estimateRevision',
+            code: 'required',
+        });
+        expect(parseRequiredRevision(null, 'estimateRevision')).toEqual({
+            field: 'estimateRevision',
+            code: 'required',
+        });
+    });
+
+    it('returns the number itself when the required form is satisfied', () => {
+        expect(parseRequiredRevision(9, 'estimateRevision')).toBe(9);
+        expect(parseRequiredRevision(MAX_REVISION, 'estimateRevision')).toBe(MAX_REVISION);
+    });
+
+    it('names the field it was asked about in every refusal', () => {
+        expect(parseOptionalRevision(1e30, 'expectedTargetsRevision')).toEqual({
+            field: 'expectedTargetsRevision',
+            code: 'above_maximum',
+        });
+        expect(parseRequiredRevision(1e30, 'estimateRevision')).toEqual({
+            field: 'estimateRevision',
+            code: 'above_maximum',
+        });
+    });
+});
+
 describe('assessFeasibility', () => {
     it('reports nothing for a coherent set', () => {
         expect(assessFeasibility({ calories: 1940, protein: 146, carbs: 194, fat: 65 })).toEqual({
@@ -1273,7 +1738,7 @@ describe('deriveTargetsResponse', () => {
             expect(
                 deriveTargetsResponse(
                     userRow(),
-                    preferencesRow({ targets_input_revision: 9, revision: 9 }),
+                    preferencesRow({ targets_input_revision: 9, estimate_inputs_revision: 9 }),
                 ).stale,
             ).toBe(false);
         });
@@ -1281,7 +1746,7 @@ describe('deriveTargetsResponse', () => {
         it('becomes stale once the inputs move on, without being recalculated', () => {
             const response = deriveTargetsResponse(
                 userRow(),
-                preferencesRow({ targets_input_revision: 8, revision: 9 }),
+                preferencesRow({ targets_input_revision: 8, estimate_inputs_revision: 9 }),
             );
 
             // The stored numbers are untouched: staleness is a flag the review
@@ -1312,7 +1777,7 @@ describe('deriveTargetsResponse', () => {
             expect(
                 deriveTargetsResponse(
                     userRow(),
-                    preferencesRow({ target_source: 'manual', targets_input_revision: 1, revision: 9 }),
+                    preferencesRow({ target_source: 'manual', targets_input_revision: 1, estimate_inputs_revision: 9 }),
                 ).stale,
             ).toBe(false);
         });
@@ -1380,7 +1845,7 @@ describe('deriveTargetsResponse', () => {
             expect(
                 deriveTargetsResponse(
                     userRow({ target_calories: 2100 }),
-                    preferencesRow({ targets_input_revision: 1, revision: 9 }),
+                    preferencesRow({ targets_input_revision: 1, estimate_inputs_revision: 9 }),
                 ).stale,
             ).toBe(false);
         });
@@ -1439,7 +1904,7 @@ describe('deriveTargetsResponse', () => {
         it('admits a stale estimate, which generation uses as confirmed until the user recalculates', () => {
             const response = deriveTargetsResponse(
                 userRow(),
-                preferencesRow({ targets_input_revision: 8, revision: 9 }),
+                preferencesRow({ targets_input_revision: 8, estimate_inputs_revision: 9 }),
             );
 
             expect([response.complete, response.source, response.stale]).toEqual([true, 'estimated', true]);
@@ -1492,7 +1957,7 @@ describe('deriveTargetsResponse', () => {
     it('reports the targets revision rather than the preferences revision', () => {
         const response = deriveTargetsResponse(
             userRow(),
-            preferencesRow({ targets_revision: 2, revision: 11, targets_input_revision: 11 }),
+            preferencesRow({ targets_revision: 2, estimate_inputs_revision: 11, targets_input_revision: 11 }),
         );
 
         expect(response.revision).toBe(2);
@@ -1508,6 +1973,260 @@ describe('deriveTargetsResponse', () => {
 
         expect(user).toEqual(userSnapshot);
         expect(preferences).toEqual(preferencesSnapshot);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * estimateInputsChanged
+ *
+ * The rule behind `estimate_inputs_revision`, and therefore behind `stale`.
+ * Asserted from both sides: every column the equation reads must count, and
+ * every column it does not read must not. The second half is the one that
+ * matters — treating an unrelated edit as an input change is what made a
+ * confirmed estimate go stale after a diet or schedule save.
+ * ------------------------------------------------------------------------- */
+
+describe('estimateInputsChanged', () => {
+    /** A stored row whose every estimate input is set. */
+    const stored: EstimateInputsRow = { ...REFERENCE_ROW };
+
+    /** One changed value per estimate input, all genuinely different from `stored`. */
+    const changes: Partial<EstimateInputsRow>[] = [
+        { goal: 'gain' },
+        { pace_lb_per_week: 1.5 },
+        { age: 35 },
+        { height_cm: 180 },
+        { weight_kg: 83 },
+        { sex_for_estimate: 'male' },
+        { activity_level: 'very_active' },
+    ];
+
+    it('covers every column the equation reads, and only those', () => {
+        // Keyed off the exported list rather than a second hand-written one, so
+        // adding an input to the equation without classifying it here fails.
+        expect([...ESTIMATE_INPUT_COLUMNS].sort()).toEqual(
+            [
+                'activity_level',
+                'age',
+                'goal',
+                'height_cm',
+                'pace_lb_per_week',
+                'sex_for_estimate',
+                'weight_kg',
+            ].sort(),
+        );
+        expect(changes.map((change) => Object.keys(change)[0]).sort()).toEqual(
+            [...ESTIMATE_INPUT_COLUMNS].sort(),
+        );
+    });
+
+    it('reports a change for each of the seven inputs', () => {
+        for (const change of changes) {
+            expect(estimateInputsChanged(stored, change)).toBe(true);
+        }
+    });
+
+    it('reports no change when a save rewrites the same values', () => {
+        // Revisiting the body step and pressing Continue is not a change: the
+        // user's details still produce the confirmed figure, so nothing needs
+        // recalculating. A rule keyed off which step was saved would say
+        // otherwise.
+        expect(estimateInputsChanged(stored, { ...stored })).toBe(false);
+
+        for (const column of ESTIMATE_INPUT_COLUMNS) {
+            expect(estimateInputsChanged(stored, { [column]: stored[column] })).toBe(false);
+        }
+    });
+
+    it('reports a change when a stored input is cleared', () => {
+        expect(estimateInputsChanged(stored, { activity_level: null })).toBe(true);
+        expect(estimateInputsChanged(stored, { weight_kg: null })).toBe(true);
+    });
+
+    it('ignores a column the write does not mention', () => {
+        // `undefined` is Prisma's "do not write this column", so it must read as
+        // absent here or the rule would disagree with the statement it guards.
+        expect(estimateInputsChanged(stored, {})).toBe(false);
+        expect(estimateInputsChanged(stored, { activity_level: undefined })).toBe(false);
+    });
+
+    it('ignores every preference that is not an input to the equation', () => {
+        // THIS IS THE FINDING. Each of these advances the all-purpose
+        // `revision`, and none of them can move a calculated target, so none
+        // may make a confirmed estimate stale. `goal_weight_kg` is in the list
+        // deliberately: it is a destination the user typed, and no term of the
+        // equation reads it.
+        const unrelatedWrites: Record<string, unknown>[] = [
+            { goal_weight_kg: 70 },
+            { goal_weight_kg: null },
+            { diet: 'vegan' },
+            { allergens: ['milk', 'peanuts'] },
+            { disliked_food_groups: ['mushroom'] },
+            { disliked_food_ids: [] },
+            { meal_schedule: 'three_plus_snack' },
+            { meal_times: [{ slot: 'breakfast', time: '09:00' }] },
+            { cooking_time_limit_min: 15 },
+            { budget_amount: 120 },
+            { budget_currency: 'USD' },
+            { no_budget_preference: false },
+            { budget_tier: 2 },
+            { review_start_date: new Date('2026-07-05T00:00:00.000Z') },
+            { height_unit_pref: 'cm' },
+            { weight_unit_pref: 'kg' },
+        ];
+
+        for (const write of unrelatedWrites) {
+            expect(estimateInputsChanged(stored, write as Partial<EstimateInputsRow>)).toBe(false);
+        }
+    });
+
+    it('reports a change only for the input half of a mixed write', () => {
+        const unrelatedOnly = { diet: 'vegan', cooking_time_limit_min: 45 } as Partial<EstimateInputsRow>;
+        const withAnInput = { diet: 'vegan', activity_level: 'active' } as Partial<EstimateInputsRow>;
+
+        expect(estimateInputsChanged(stored, unrelatedOnly)).toBe(false);
+        expect(estimateInputsChanged(stored, withAnInput)).toBe(true);
+    });
+
+    describe('on the row that does not exist yet', () => {
+        it('counts writing an input as a change, because there was no answer before it', () => {
+            expect(estimateInputsChanged(null, { goal: 'lose' })).toBe(true);
+            expect(estimateInputsChanged(null, { age: 34 })).toBe(true);
+        });
+
+        it('does not count an explicit null, or a write with no input in it', () => {
+            expect(estimateInputsChanged(null, {})).toBe(false);
+            expect(estimateInputsChanged(null, { pace_lb_per_week: null })).toBe(false);
+            expect(estimateInputsChanged(null, { diet: 'none' } as Partial<EstimateInputsRow>)).toBe(false);
+        });
+    });
+
+    it('is pure: it mutates neither argument', () => {
+        const current = { ...stored };
+        const writes: Partial<EstimateInputsRow> = { activity_level: 'active' };
+        const currentSnapshot = { ...current };
+        const writesSnapshot = { ...writes };
+
+        estimateInputsChanged(current, writes);
+
+        expect(current).toEqual(currentSnapshot);
+        expect(writes).toEqual(writesSnapshot);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The staleness rule, composed with the counter that drives it
+ *
+ * `deriveTargetsResponse` reads a counter; `estimateInputsChanged` decides when
+ * that counter moves. Neither half proves the user-visible claim on its own, so
+ * this group applies the real rule to a stored row the way
+ * `preferences.service.ts` applies it, and then reads the verdict.
+ * ------------------------------------------------------------------------- */
+
+describe('a confirmed estimate through a sequence of preference saves', () => {
+    /** The stored row, as the two halves together see it. */
+    interface StoredRow extends EstimateInputsRow, TargetsPreferencesRow {
+        revision: number;
+    }
+
+    const confirmedRow = (): StoredRow => ({
+        ...REFERENCE_ROW,
+        target_source: 'estimated',
+        targets_revision: 4,
+        confirmed_targets: { ...CONFIRMED },
+        targets_input_revision: 7,
+        estimate_inputs_revision: 7,
+        revision: 12,
+    });
+
+    /**
+     * One preference save, applying exactly the two rules
+     * `preferences.service.ts` applies: the all-purpose revision always
+     * advances, and the estimate-input counter advances only when the pure rule
+     * says an input moved.
+     */
+    const save = (row: StoredRow, writes: Partial<EstimateInputsRow>): StoredRow => ({
+        ...row,
+        ...writes,
+        revision: row.revision + 1,
+        estimate_inputs_revision: estimateInputsChanged(row, writes)
+            ? row.estimate_inputs_revision + 1
+            : row.estimate_inputs_revision,
+    });
+
+    const staleAfter = (...writes: Partial<EstimateInputsRow>[]): boolean =>
+        deriveTargetsResponse(userRow(), writes.reduce(save, confirmedRow())).stale;
+
+    it('starts fresh', () => {
+        expect(deriveTargetsResponse(userRow(), confirmedRow())).toEqual({
+            targets: { ...CONFIRMED },
+            complete: true,
+            source: 'estimated',
+            stale: false,
+            revision: 4,
+        });
+    });
+
+    it('survives a diet, schedule or budget edit, however many of them there are', () => {
+        expect(staleAfter({ diet: 'vegan' } as Partial<EstimateInputsRow>)).toBe(false);
+        expect(staleAfter({ meal_schedule: 'three_plus_snack' } as Partial<EstimateInputsRow>)).toBe(false);
+        expect(staleAfter({ cooking_time_limit_min: 15 } as Partial<EstimateInputsRow>)).toBe(false);
+        expect(
+            staleAfter(
+                { diet: 'vegan' } as Partial<EstimateInputsRow>,
+                { allergens: ['milk'] } as Partial<EstimateInputsRow>,
+                { disliked_food_groups: ['mushroom'] } as Partial<EstimateInputsRow>,
+                { meal_schedule: 'three_plus_snack' } as Partial<EstimateInputsRow>,
+                { cooking_time_limit_min: 60 } as Partial<EstimateInputsRow>,
+                { budget_amount: 90 } as Partial<EstimateInputsRow>,
+                { review_start_date: new Date('2026-07-05T00:00:00.000Z') } as Partial<EstimateInputsRow>,
+                { goal_weight_kg: 70 } as Partial<EstimateInputsRow>,
+            ),
+        ).toBe(false);
+    });
+
+    it('survives a body step re-saved with the same measurements', () => {
+        const row = confirmedRow();
+
+        expect(
+            staleAfter({
+                age: row.age,
+                height_cm: row.height_cm,
+                weight_kg: row.weight_kg,
+                sex_for_estimate: row.sex_for_estimate,
+            }),
+        ).toBe(false);
+    });
+
+    it('goes stale on a goal, pace, body or activity change', () => {
+        expect(staleAfter({ goal: 'maintain' })).toBe(true);
+        expect(staleAfter({ pace_lb_per_week: 0.5 })).toBe(true);
+        expect(staleAfter({ weight_kg: 80 })).toBe(true);
+        expect(staleAfter({ age: 35 })).toBe(true);
+        expect(staleAfter({ height_cm: 175 })).toBe(true);
+        expect(staleAfter({ sex_for_estimate: 'male' })).toBe(true);
+        expect(staleAfter({ activity_level: 'active' })).toBe(true);
+    });
+
+    it('stays stale once it is stale, whatever is edited afterwards', () => {
+        expect(
+            staleAfter({ activity_level: 'active' }, { diet: 'vegan' } as Partial<EstimateInputsRow>),
+        ).toBe(true);
+    });
+
+    it('keeps the confirmed numbers and the targets revision throughout', () => {
+        // Staleness is a flag the review screen acts on. Nothing here recomputes
+        // a target or bumps the counter a client pins for its own saves.
+        const edited = [
+            { diet: 'vegan' } as Partial<EstimateInputsRow>,
+            { activity_level: 'active' },
+        ].reduce(save, confirmedRow());
+        const response = deriveTargetsResponse(userRow(), edited);
+
+        expect(response.targets).toEqual({ ...CONFIRMED });
+        expect(response.revision).toBe(4);
+        expect(edited.revision).toBe(14);
+        expect(response.stale).toBe(true);
     });
 });
 

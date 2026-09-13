@@ -2555,7 +2555,9 @@ export const resolveTargetRouteForBodyStep = (payload: BodyStepPayload): TargetR
  * DTO, and written by exactly one thing: a body-step save resolving it (Skip,
  * "prefer not to say", or a measured answer). So a non-null route means the body
  * step was answered whichever branch it took, including Skip, which stores no
- * measurements at all.
+ * measurements at all. `PreferencesResponse.targetRoute` carries the same proof
+ * on the wire, so a client resuming setup reads it rather than re-deriving the
+ * step from the measurements — which would call a saved Skip unanswered.
  *
  * `dislikes` is DELIBERATELY ABSENT and cannot be added: an empty
  * `disliked_food_ids` is a legitimate answer — the food-preferences screen's

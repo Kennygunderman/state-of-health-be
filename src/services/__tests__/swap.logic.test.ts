@@ -40,6 +40,13 @@
 //    `plannedMealLog.logic.ts::deriveLoggedStatus` rather than re-implemented in
 //    `swap.logic.ts`: the audit column names B while the diary entries still
 //    name A, and it is the entries the caption must come from.
+//  - THE REQUEST PARSERS ANSWER IN DATA, AND ANSWER ONCE. The three parsers
+//    report every offending field of a request in ONE verdict, never throw, and
+//    refuse a `portionMultiplier` that is not one of the offered portions — the
+//    check that keeps a malformed portion a 400 instead of the `preview_stale`
+//    `requireBoundPortion` would call it. The revision bound is pinned at
+//    `MAX_REVISION` and one above it, because `Number.isInteger(1e30)` is true
+//    and such a value becomes a 500 in the fingerprinter rather than a 400.
 //
 // Fixtures put every recipe on the TARGET'S OWN MACRO RATIO, so the day
 // tolerance binds on calories alone and each scenario's arithmetic is readable
@@ -50,12 +57,19 @@
 
 import {
     MAX_SWAP_ALTERNATIVES,
+    ParsedSwapAlternativesPath,
+    ParsedSwapCommitRequest,
+    ParsedSwapPreviewPath,
+    SWAP_FIELD_CODES,
     SwapCandidate,
     SwapDayMeal,
     SwapSelectionContext,
     SwapWeekMeal,
     compareSwapCandidates,
     currentDayTotalsFor,
+    parseSwapAlternativesPath,
+    parseSwapCommitRequest,
+    parseSwapPreviewPath,
     requireBoundPortion,
     selectSwapCandidate,
     selectSwapCandidates,
@@ -63,6 +77,7 @@ import {
     swapMealWrite,
 } from '../swap.logic';
 import {
+    EXTENDED_PORTION_POLICY,
     MAIN_SLOT_PORTION_MULTIPLIERS,
     MealPlanInputError,
     PlanRecipeCandidate,
@@ -74,8 +89,9 @@ import {
 } from '../mealPlan.logic';
 import { PreviewStaleError, RecipeIneligibleError } from '../mealPlanning.errors';
 import { LinkedDiaryEntryRow, deriveLoggedStatus } from '../plannedMealLog.logic';
+import { MAX_REVISION } from '../preferences.logic';
 import { PlanningPreferences } from '../recipe.logic';
-import type { MealPlanMacroTotals } from '../../types/mealPlanning';
+import type { InvalidRequestDetail, MealPlanMacroTotals, SwapMealPayload } from '../../types/mealPlanning';
 import type { MealSlot } from '../../types/recipe';
 
 /* ---------------------------------------------------------------------------
@@ -1269,5 +1285,468 @@ describe('a logged meal swapped twice', () => {
 
         expect(state.status).toBe('logged');
         expect(state.isLogged).toBe(true);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Request parsing
+ *
+ * Object literals only: a parser takes the request's own values, so each test
+ * states a whole request and asserts the returned verdict. Nothing is thrown
+ * and nothing is mocked.
+ *
+ * The valid ids below are v4 UUIDs; each malformed variant breaks exactly ONE
+ * property of the form, so a test that fails names the property that stopped
+ * being checked. Thresholds are never hand-copied: the accepted portions come
+ * from `mealPlan.logic.ts`'s own exported sets and the revision ceiling from
+ * `preferences.logic.ts`'s `MAX_REVISION`.
+ * ------------------------------------------------------------------------- */
+
+const PARSE_PLAN_ID = '3f7c2b1e-9d4a-4b6c-8e1f-0a2b3c4d5e6f';
+const PARSE_MEAL_ID = 'a1b2c3d4-e5f6-4a7b-9c8d-0e1f2a3b4c5d';
+const PARSE_RECIPE_VERSION_ID = '7d6c5b4a-3e2f-4d1c-b0a9-8f7e6d5c4b3a';
+const PARSE_IDEMPOTENCY_KEY = '0c1d2e3f-4a5b-4c6d-8e9f-1a2b3c4d5e6f';
+
+/** A v1 UUID: well formed, wrong version nibble. */
+const WRONG_VERSION_UUID = '3f7c2b1e-9d4a-1b6c-8e1f-0a2b3c4d5e6f';
+/** A v4 UUID whose variant nibble is not one of `8`, `9`, `a`, `b`. */
+const WRONG_VARIANT_UUID = '3f7c2b1e-9d4a-4b6c-ce1f-0a2b3c4d5e6f';
+/** One hex pair short. */
+const WRONG_LENGTH_UUID = '3f7c2b1e-9d4a-4b6c-8e1f-0a2b3c4d5e';
+
+/** Every portion the product offers, which is the union the parser accepts. */
+const ADMISSIBLE_PORTIONS: number[] = [
+    ...new Set([...MAIN_SLOT_PORTION_MULTIPLIERS, ...SNACK_PORTION_MULTIPLIERS]),
+];
+
+/** In the diagnostic-only extended policy and NOT in the offered set. */
+const EXTENDED_ONLY_PORTIONS: number[] = EXTENDED_PORTION_POLICY.mainSlot.filter(
+    (multiplier) => !ADMISSIBLE_PORTIONS.includes(multiplier),
+);
+
+const COMMIT_PATH = { planId: PARSE_PLAN_ID, mealId: PARSE_MEAL_ID };
+
+const VALID_COMMIT_BODY: SwapMealPayload = {
+    recipeVersionId: PARSE_RECIPE_VERSION_ID,
+    portionMultiplier: 1.25,
+    expectedPlanRevision: 3,
+    idempotencyKey: PARSE_IDEMPOTENCY_KEY,
+};
+
+/** The commit body with one field replaced — the shape every field test uses. */
+const commitBodyWith = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+    ...VALID_COMMIT_BODY,
+    ...overrides,
+});
+
+/** The details a verdict reports, or a failure when it accepted the request. */
+const detailsOf = (
+    parsed: ParsedSwapAlternativesPath | ParsedSwapPreviewPath | ParsedSwapCommitRequest,
+): InvalidRequestDetail[] => {
+    if (parsed.kind !== 'error') {
+        throw new Error(`expected an invalid_request verdict, received ${JSON.stringify(parsed)}`);
+    }
+
+    return parsed.details;
+};
+
+/** The `field:code` pairs a verdict reports, in the order it reports them. */
+const fieldCodesOf = (
+    parsed: ParsedSwapAlternativesPath | ParsedSwapPreviewPath | ParsedSwapCommitRequest,
+): string[] => detailsOf(parsed).map((detail) => `${detail.field}:${detail.code}`);
+
+/** The code a commit verdict reports for one body field. */
+const commitBodyCode = (overrides: Record<string, unknown>, field: string): string | undefined =>
+    detailsOf(parseSwapCommitRequest(COMMIT_PATH, commitBodyWith(overrides))).find(
+        (detail) => detail.field === field,
+    )?.code;
+
+describe('parseSwapAlternativesPath', () => {
+    it('accepts two v4 UUIDs', () => {
+        expect(parseSwapAlternativesPath({ planId: PARSE_PLAN_ID, mealId: PARSE_MEAL_ID })).toEqual({
+            kind: 'ok',
+            planId: PARSE_PLAN_ID,
+            mealId: PARSE_MEAL_ID,
+        });
+    });
+
+    it('returns a verdict rather than throwing, with no status code in it', () => {
+        const parsed = parseSwapAlternativesPath({ planId: 'not-a-uuid', mealId: PARSE_MEAL_ID });
+
+        expect(parsed).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'planId and mealId must be UUIDs',
+            details: [{ field: 'planId', code: SWAP_FIELD_CODES.INVALID_ID }],
+        });
+    });
+
+    it('reports only the offending id', () => {
+        expect(fieldCodesOf(parseSwapAlternativesPath({ planId: PARSE_PLAN_ID, mealId: 'nope' }))).toEqual([
+            `mealId:${SWAP_FIELD_CODES.INVALID_ID}`,
+        ]);
+    });
+
+    it('reports both ids at once, so the caller is not sent back twice', () => {
+        expect(fieldCodesOf(parseSwapAlternativesPath({ planId: 'nope', mealId: 42 }))).toEqual([
+            `planId:${SWAP_FIELD_CODES.INVALID_ID}`,
+            `mealId:${SWAP_FIELD_CODES.INVALID_ID}`,
+        ]);
+    });
+
+    it('refuses a UUID that is not version 4, however well formed', () => {
+        expect(parseSwapAlternativesPath({ planId: WRONG_VERSION_UUID, mealId: PARSE_MEAL_ID }).kind).toBe(
+            'error',
+        );
+        expect(parseSwapAlternativesPath({ planId: WRONG_VARIANT_UUID, mealId: PARSE_MEAL_ID }).kind).toBe(
+            'error',
+        );
+    });
+
+    it('refuses a truncated id, a non-string, an absent one and an explicit null', () => {
+        expect(parseSwapAlternativesPath({ planId: WRONG_LENGTH_UUID, mealId: PARSE_MEAL_ID }).kind).toBe(
+            'error',
+        );
+        expect(parseSwapAlternativesPath({ planId: 42, mealId: PARSE_MEAL_ID }).kind).toBe('error');
+        expect(fieldCodesOf(parseSwapAlternativesPath({}))).toEqual([
+            `planId:${SWAP_FIELD_CODES.INVALID_ID}`,
+            `mealId:${SWAP_FIELD_CODES.INVALID_ID}`,
+        ]);
+        expect(fieldCodesOf(parseSwapAlternativesPath({ planId: null, mealId: null }))).toEqual([
+            `planId:${SWAP_FIELD_CODES.INVALID_ID}`,
+            `mealId:${SWAP_FIELD_CODES.INVALID_ID}`,
+        ]);
+    });
+});
+
+describe('parseSwapPreviewPath', () => {
+    const validPath = {
+        planId: PARSE_PLAN_ID,
+        mealId: PARSE_MEAL_ID,
+        recipeVersionId: PARSE_RECIPE_VERSION_ID,
+    };
+
+    it('accepts three v4 UUIDs', () => {
+        expect(parseSwapPreviewPath(validPath)).toEqual({ kind: 'ok', ...validPath });
+    });
+
+    it('judges the recipe version id, so a malformed one is a 400 and not recipe_ineligible', () => {
+        expect(parseSwapPreviewPath({ ...validPath, recipeVersionId: 'undefined' })).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'planId, mealId and recipeVersionId must be UUIDs',
+            details: [{ field: 'recipeVersionId', code: SWAP_FIELD_CODES.INVALID_ID }],
+        });
+    });
+
+    it('reports each id on its own', () => {
+        expect(fieldCodesOf(parseSwapPreviewPath({ ...validPath, planId: WRONG_VERSION_UUID }))).toEqual([
+            `planId:${SWAP_FIELD_CODES.INVALID_ID}`,
+        ]);
+        expect(fieldCodesOf(parseSwapPreviewPath({ ...validPath, mealId: WRONG_LENGTH_UUID }))).toEqual([
+            `mealId:${SWAP_FIELD_CODES.INVALID_ID}`,
+        ]);
+        expect(fieldCodesOf(parseSwapPreviewPath({ ...validPath, recipeVersionId: null }))).toEqual([
+            `recipeVersionId:${SWAP_FIELD_CODES.INVALID_ID}`,
+        ]);
+    });
+
+    it('reports all three ids at once', () => {
+        expect(fieldCodesOf(parseSwapPreviewPath({ planId: 'nope', mealId: 42, recipeVersionId: {} }))).toEqual(
+            [
+                `planId:${SWAP_FIELD_CODES.INVALID_ID}`,
+                `mealId:${SWAP_FIELD_CODES.INVALID_ID}`,
+                `recipeVersionId:${SWAP_FIELD_CODES.INVALID_ID}`,
+            ],
+        );
+        expect(fieldCodesOf(parseSwapPreviewPath({}))).toHaveLength(3);
+    });
+});
+
+describe('parseSwapCommitRequest', () => {
+    it('accepts the path ids and the body the contract declares', () => {
+        expect(parseSwapCommitRequest(COMMIT_PATH, VALID_COMMIT_BODY)).toEqual({
+            kind: 'ok',
+            planId: PARSE_PLAN_ID,
+            mealId: PARSE_MEAL_ID,
+            payload: VALID_COMMIT_BODY,
+        });
+    });
+
+    it('carries exactly the four payload fields the service takes', () => {
+        const parsed = parseSwapCommitRequest(COMMIT_PATH, VALID_COMMIT_BODY);
+
+        if (parsed.kind !== 'ok') {
+            throw new Error('expected the valid request to be accepted');
+        }
+
+        expect(Object.keys(parsed.payload).sort()).toEqual([
+            'expectedPlanRevision',
+            'idempotencyKey',
+            'portionMultiplier',
+            'recipeVersionId',
+        ]);
+    });
+
+    it('judges the path ids here too', () => {
+        expect(
+            fieldCodesOf(parseSwapCommitRequest({ planId: 'nope', mealId: 42 }, VALID_COMMIT_BODY)),
+        ).toEqual([`planId:${SWAP_FIELD_CODES.INVALID_ID}`, `mealId:${SWAP_FIELD_CODES.INVALID_ID}`]);
+    });
+
+    describe('a body that is not a JSON object', () => {
+        it('reports the four fields a body should have carried', () => {
+            expect(parseSwapCommitRequest(COMMIT_PATH, null)).toEqual({
+                kind: 'error',
+                code: 'invalid_request',
+                message: 'A request body is required',
+                details: [
+                    { field: 'recipeVersionId', code: SWAP_FIELD_CODES.REQUIRED },
+                    { field: 'portionMultiplier', code: SWAP_FIELD_CODES.REQUIRED },
+                    { field: 'expectedPlanRevision', code: SWAP_FIELD_CODES.REQUIRED },
+                    { field: 'idempotencyKey', code: SWAP_FIELD_CODES.REQUIRED },
+                ],
+            });
+        });
+
+        it('treats a bare string, an array and a missing body the same way', () => {
+            expect(fieldCodesOf(parseSwapCommitRequest(COMMIT_PATH, 'recipeVersionId'))).toHaveLength(4);
+            expect(fieldCodesOf(parseSwapCommitRequest(COMMIT_PATH, [VALID_COMMIT_BODY]))).toHaveLength(4);
+            expect(fieldCodesOf(parseSwapCommitRequest(COMMIT_PATH, undefined))).toHaveLength(4);
+        });
+
+        it('still judges the path ids, which are wrong or right independently of the body', () => {
+            expect(fieldCodesOf(parseSwapCommitRequest({ planId: 'nope', mealId: 'nope' }, null))).toEqual([
+                `planId:${SWAP_FIELD_CODES.INVALID_ID}`,
+                `mealId:${SWAP_FIELD_CODES.INVALID_ID}`,
+                `recipeVersionId:${SWAP_FIELD_CODES.REQUIRED}`,
+                `portionMultiplier:${SWAP_FIELD_CODES.REQUIRED}`,
+                `expectedPlanRevision:${SWAP_FIELD_CODES.REQUIRED}`,
+                `idempotencyKey:${SWAP_FIELD_CODES.REQUIRED}`,
+            ]);
+        });
+    });
+
+    describe('recipeVersionId and idempotencyKey', () => {
+        it('requires both, telling an absent field from a malformed one', () => {
+            expect(commitBodyCode({ recipeVersionId: undefined }, 'recipeVersionId')).toBe(
+                SWAP_FIELD_CODES.REQUIRED,
+            );
+            expect(commitBodyCode({ idempotencyKey: null }, 'idempotencyKey')).toBe(
+                SWAP_FIELD_CODES.REQUIRED,
+            );
+            expect(commitBodyCode({ recipeVersionId: WRONG_VERSION_UUID }, 'recipeVersionId')).toBe(
+                SWAP_FIELD_CODES.INVALID_ID,
+            );
+            expect(commitBodyCode({ idempotencyKey: WRONG_LENGTH_UUID }, 'idempotencyKey')).toBe(
+                SWAP_FIELD_CODES.INVALID_ID,
+            );
+        });
+
+        it('refuses a non-string id', () => {
+            expect(commitBodyCode({ recipeVersionId: 7 }, 'recipeVersionId')).toBe(
+                SWAP_FIELD_CODES.INVALID_ID,
+            );
+            expect(commitBodyCode({ idempotencyKey: { key: PARSE_IDEMPOTENCY_KEY } }, 'idempotencyKey')).toBe(
+                SWAP_FIELD_CODES.INVALID_ID,
+            );
+        });
+    });
+
+    describe('portionMultiplier', () => {
+        it('accepts every portion the product offers', () => {
+            expect(
+                ADMISSIBLE_PORTIONS.map(
+                    (multiplier) =>
+                        parseSwapCommitRequest(COMMIT_PATH, commitBodyWith({ portionMultiplier: multiplier }))
+                            .kind,
+                ),
+            ).toEqual(ADMISSIBLE_PORTIONS.map(() => 'ok'));
+        });
+
+        it('accepts float noise within the two-decimal representation the contract stores', () => {
+            expect(
+                parseSwapCommitRequest(COMMIT_PATH, commitBodyWith({ portionMultiplier: 1.2500000000001 }))
+                    .kind,
+            ).toBe('ok');
+        });
+
+        it('refuses a value outside the offered set as unknown_value', () => {
+            for (const multiplier of [0, -1, 1.1, 0.6, 3.5]) {
+                expect(commitBodyCode({ portionMultiplier: multiplier }, 'portionMultiplier')).toBe(
+                    SWAP_FIELD_CODES.UNKNOWN_VALUE,
+                );
+            }
+        });
+
+        it('never widens the set with the diagnostic-only extended policy', () => {
+            expect(EXTENDED_ONLY_PORTIONS).toEqual([0.25, 2.5, 3]);
+
+            for (const multiplier of EXTENDED_ONLY_PORTIONS) {
+                expect(commitBodyCode({ portionMultiplier: multiplier }, 'portionMultiplier')).toBe(
+                    SWAP_FIELD_CODES.UNKNOWN_VALUE,
+                );
+            }
+        });
+
+        it('refuses a numeric string rather than coercing it, because the value is fingerprinted', () => {
+            expect(commitBodyCode({ portionMultiplier: '1' }, 'portionMultiplier')).toBe(
+                SWAP_FIELD_CODES.INVALID_TYPE,
+            );
+            expect(commitBodyCode({ portionMultiplier: true }, 'portionMultiplier')).toBe(
+                SWAP_FIELD_CODES.INVALID_TYPE,
+            );
+        });
+
+        it('requires the field', () => {
+            expect(commitBodyCode({ portionMultiplier: undefined }, 'portionMultiplier')).toBe(
+                SWAP_FIELD_CODES.REQUIRED,
+            );
+            expect(commitBodyCode({ portionMultiplier: null }, 'portionMultiplier')).toBe(
+                SWAP_FIELD_CODES.REQUIRED,
+            );
+        });
+
+        it('answers 400 for a non-finite portion, which requireBoundPortion would call a stale preview', () => {
+            for (const multiplier of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+                expect(commitBodyCode({ portionMultiplier: multiplier }, 'portionMultiplier')).toBe(
+                    SWAP_FIELD_CODES.UNKNOWN_VALUE,
+                );
+            }
+
+            // The harm this parser removes, stated in one assertion: the binding
+            // check fails CLOSED for any value that is not the recomputed
+            // portion, so without the parse above a malformed portion reaches
+            // the user as "your preview went stale".
+            expect(() => requireBoundPortion(Number.NaN, 1.25)).toThrow(PreviewStaleError);
+        });
+    });
+
+    describe('expectedPlanRevision', () => {
+        it('accepts the first revision a plan can have and the column maximum', () => {
+            expect(
+                parseSwapCommitRequest(COMMIT_PATH, commitBodyWith({ expectedPlanRevision: 1 })).kind,
+            ).toBe('ok');
+            expect(
+                parseSwapCommitRequest(COMMIT_PATH, commitBodyWith({ expectedPlanRevision: MAX_REVISION }))
+                    .kind,
+            ).toBe('ok');
+            expect(MAX_REVISION).toBe(2_147_483_647);
+        });
+
+        it('refuses a revision below the first one', () => {
+            expect(commitBodyCode({ expectedPlanRevision: 0 }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.BELOW_MINIMUM,
+            );
+            expect(commitBodyCode({ expectedPlanRevision: -1 }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.BELOW_MINIMUM,
+            );
+        });
+
+        it('refuses a magnitude that cannot denote a stored revision', () => {
+            expect(commitBodyCode({ expectedPlanRevision: MAX_REVISION + 1 }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.ABOVE_MAXIMUM,
+            );
+            // `Number.isInteger(1e30)` is true, which is exactly why the integer
+            // check alone is not enough: this value would reach the fingerprinter
+            // as an unrepresentable magnitude and surface as a 500.
+            expect(Number.isInteger(1e30)).toBe(true);
+            expect(commitBodyCode({ expectedPlanRevision: 1e30 }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.ABOVE_MAXIMUM,
+            );
+            expect(
+                commitBodyCode({ expectedPlanRevision: Number.MAX_SAFE_INTEGER + 2 }, 'expectedPlanRevision'),
+            ).toBe(SWAP_FIELD_CODES.ABOVE_MAXIMUM);
+        });
+
+        it('refuses a fractional revision', () => {
+            expect(commitBodyCode({ expectedPlanRevision: 1.5 }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.NOT_AN_INTEGER,
+            );
+        });
+
+        it('refuses a numeric string and a non-finite number', () => {
+            expect(commitBodyCode({ expectedPlanRevision: '3' }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.INVALID_TYPE,
+            );
+            expect(commitBodyCode({ expectedPlanRevision: Number.NaN }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.INVALID_TYPE,
+            );
+            expect(
+                commitBodyCode({ expectedPlanRevision: Number.POSITIVE_INFINITY }, 'expectedPlanRevision'),
+            ).toBe(SWAP_FIELD_CODES.INVALID_TYPE);
+        });
+
+        it('requires the field, because it is the stale-plan guard', () => {
+            expect(commitBodyCode({ expectedPlanRevision: undefined }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.REQUIRED,
+            );
+            expect(commitBodyCode({ expectedPlanRevision: null }, 'expectedPlanRevision')).toBe(
+                SWAP_FIELD_CODES.REQUIRED,
+            );
+        });
+    });
+
+    describe('unknown body keys', () => {
+        it('reports a key this endpoint does not accept rather than dropping it', () => {
+            expect(fieldCodesOf(parseSwapCommitRequest(COMMIT_PATH, commitBodyWith({ mealName: 'Lunch' })))).toEqual(
+                [`mealName:${SWAP_FIELD_CODES.UNKNOWN_FIELD}`],
+            );
+        });
+
+        it('reports a misspelt field twice over: the missing one and the unknown one', () => {
+            const parsed = parseSwapCommitRequest(COMMIT_PATH, {
+                recipeVersionId: PARSE_RECIPE_VERSION_ID,
+                portionMultipler: 1.25,
+                expectedPlanRevision: 3,
+                idempotencyKey: PARSE_IDEMPOTENCY_KEY,
+            });
+
+            expect(fieldCodesOf(parsed)).toEqual([
+                `portionMultiplier:${SWAP_FIELD_CODES.REQUIRED}`,
+                `portionMultipler:${SWAP_FIELD_CODES.UNKNOWN_FIELD}`,
+            ]);
+        });
+
+        it('refuses path ids smuggled into the body', () => {
+            expect(
+                fieldCodesOf(
+                    parseSwapCommitRequest(
+                        COMMIT_PATH,
+                        commitBodyWith({ planId: PARSE_PLAN_ID, mealId: PARSE_MEAL_ID }),
+                    ),
+                ),
+            ).toEqual([
+                `planId:${SWAP_FIELD_CODES.UNKNOWN_FIELD}`,
+                `mealId:${SWAP_FIELD_CODES.UNKNOWN_FIELD}`,
+            ]);
+        });
+    });
+
+    it('reports every field of a fully malformed request at once', () => {
+        const parsed = parseSwapCommitRequest(
+            { planId: WRONG_VERSION_UUID, mealId: undefined },
+            {
+                recipeVersionId: 'nope',
+                portionMultiplier: '1',
+                expectedPlanRevision: 0,
+                surprise: true,
+            },
+        );
+
+        expect(parsed).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'The swap request is not valid',
+            details: [
+                { field: 'planId', code: SWAP_FIELD_CODES.INVALID_ID },
+                { field: 'mealId', code: SWAP_FIELD_CODES.INVALID_ID },
+                { field: 'recipeVersionId', code: SWAP_FIELD_CODES.INVALID_ID },
+                { field: 'portionMultiplier', code: SWAP_FIELD_CODES.INVALID_TYPE },
+                { field: 'expectedPlanRevision', code: SWAP_FIELD_CODES.BELOW_MINIMUM },
+                { field: 'idempotencyKey', code: SWAP_FIELD_CODES.REQUIRED },
+                { field: 'surprise', code: SWAP_FIELD_CODES.UNKNOWN_FIELD },
+            ],
+        });
     });
 });

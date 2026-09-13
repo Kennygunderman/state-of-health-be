@@ -85,7 +85,34 @@ const DEFAULT_MODEL = 'google/gemini-2.5-flash';
  * this default is vendor configuration and is asserted as such below.
  */
 const DEFAULT_JUDGE_MODEL = 'openai/gpt-4o-mini';
-const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * The mobile client's own deadline, `HTTP_REQUEST_TIMEOUT_MS` in
+ * `mobile/src/service/http/httpRequest.ts`.
+ *
+ * Restated here because the two repositories cannot import from each other and
+ * this is the number the vendor deadline is derived from: the app abandons
+ * every request at 25 s, so a vendor deadline at or beyond it means the client
+ * has already gone when the call gives up — it never sees the
+ * `502 estimation_failed` the controller would have sent, the paid call
+ * continues, and the user's retry is charged again. The assertion below is what
+ * makes editing one side without the other visible.
+ */
+const MOBILE_CLIENT_TIMEOUT_MS = 25_000;
+
+/**
+ * The headroom the server needs inside that deadline for everything that is
+ * not the vendor call: uploading a base64 photo, verifying the Firebase token,
+ * metering the AI quota, and serialising the response.
+ */
+const MIN_CLIENT_HEADROOM_MS = 5_000;
+
+/**
+ * `estimate.service.ts`'s reserve for grounding — the USDA boundary's
+ * per-call budget (6 s) plus the least a judge call is worth starting with
+ * (1.5 s). Below this the estimate is returned ungrounded.
+ */
+const GROUNDING_MIN_BUDGET_MS = 7_500;
 
 /** Obviously fake: nothing here may resemble a real provider credential. */
 const API_KEY = 'test-openrouter-key';
@@ -599,7 +626,7 @@ describe('callOpenRouter', () => {
             const call = openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub);
             expect(jest.getTimerCount()).toBe(1);
 
-            jest.advanceTimersByTime(REQUEST_TIMEOUT_MS);
+            jest.advanceTimersByTime(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS);
             const error = await vendorFailure(openRouter, call);
 
             expect(error.kind).toBe('timeout');
@@ -614,7 +641,7 @@ describe('callOpenRouter', () => {
             const call = openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub);
             expect(sentRequest(stub).signal?.aborted).toBe(false);
 
-            jest.advanceTimersByTime(REQUEST_TIMEOUT_MS);
+            jest.advanceTimersByTime(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS);
             await rejectionOf(call);
 
             expect(sentRequest(stub).signal?.aborted).toBe(true);
@@ -626,7 +653,7 @@ describe('callOpenRouter', () => {
             const stub = abortAwareFetch();
 
             const call = openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub);
-            jest.advanceTimersByTime(REQUEST_TIMEOUT_MS - 1);
+            jest.advanceTimersByTime(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS - 1);
 
             expect(sentRequest(stub).signal?.aborted).toBe(false);
             expect(jest.getTimerCount()).toBe(1);
@@ -634,6 +661,106 @@ describe('callOpenRouter', () => {
             jest.advanceTimersByTime(1);
             await rejectionOf(call);
             expect(sentRequest(stub).signal?.aborted).toBe(true);
+        });
+    });
+
+    /**
+     * The deadline as a policy rather than a number.
+     *
+     * Two endpoints reach this boundary and both are called only by the mobile
+     * app, which abandons every request at `HTTP_REQUEST_TIMEOUT_MS`. A vendor
+     * deadline that outlives the client's therefore cannot produce a usable
+     * failure: the 502 arrives at nobody, the paid call runs on, and the retry
+     * is charged a second time. The first test is the guard on that
+     * relationship; the rest cover the per-call override that lets one request
+     * spend one budget across several calls.
+     */
+    describe('the deadline policy', () => {
+        it('leaves the client enough headroom to receive the failure it causes', () => {
+            const openRouter = loadConfigured();
+
+            expect(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS).toBeLessThanOrEqual(
+                MOBILE_CLIENT_TIMEOUT_MS - MIN_CLIENT_HEADROOM_MS,
+            );
+        });
+
+        it('is wide enough for a grounded estimate to still attempt grounding', () => {
+            const openRouter = loadConfigured();
+
+            // A budget below the reserve would make `estimate.service.ts` skip
+            // USDA grounding on every request, silently turning a shipped
+            // feature off in the name of a deadline.
+            expect(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS).toBeGreaterThan(GROUNDING_MIN_BUDGET_MS);
+        });
+
+        it('honours an explicit timeout shorter than the default', async () => {
+            jest.useFakeTimers();
+            const openRouter = loadConfigured();
+            const stub = abortAwareFetch();
+            const budgetMs = 4_000;
+
+            const call = openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub, budgetMs);
+            jest.advanceTimersByTime(budgetMs - 1);
+
+            expect(sentRequest(stub).signal?.aborted).toBe(false);
+
+            jest.advanceTimersByTime(1);
+            const error = await vendorFailure(openRouter, call);
+
+            expect(error.kind).toBe('timeout');
+            expect(error.message).toBe(TIMED_OUT_MESSAGE);
+        });
+
+        it('honours an explicit timeout longer than the default, for a caller with nobody waiting', async () => {
+            jest.useFakeTimers();
+            const openRouter = loadConfigured();
+            const stub = abortAwareFetch();
+            const budgetMs = openRouter.OPENROUTER_REQUEST_TIMEOUT_MS * 2;
+
+            const call = openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub, budgetMs);
+            jest.advanceTimersByTime(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS);
+
+            expect(sentRequest(stub).signal?.aborted).toBe(false);
+
+            jest.advanceTimersByTime(budgetMs - openRouter.OPENROUTER_REQUEST_TIMEOUT_MS);
+            expect((await vendorFailure(openRouter, call)).kind).toBe('timeout');
+        });
+
+        /**
+         * A caller's remaining budget is arithmetic, so these are the values
+         * arithmetic produces when it goes wrong. Falling back to the default
+         * keeps a bounded request rather than arming a timer that fires
+         * instantly or never; a caller genuinely out of budget is expected to
+         * skip the call, which is what `estimate.service.ts` does.
+         */
+        it.each([
+            ['zero', 0],
+            ['negative', -1_000],
+            ['not a number', Number.NaN],
+            ['infinite', Number.POSITIVE_INFINITY],
+        ])('falls back to the default deadline when the timeout is %s', async (_label, timeoutMs) => {
+            jest.useFakeTimers();
+            const openRouter = loadConfigured();
+            const stub = abortAwareFetch();
+
+            const call = openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub, timeoutMs);
+            jest.advanceTimersByTime(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS - 1);
+
+            expect(sentRequest(stub).signal?.aborted).toBe(false);
+
+            jest.advanceTimersByTime(1);
+            expect((await vendorFailure(openRouter, call)).kind).toBe('timeout');
+        });
+
+        it('bounds a call that was given no timeout at all by the default', async () => {
+            jest.useFakeTimers();
+            const openRouter = loadConfigured();
+            const stub = abortAwareFetch();
+
+            const call = openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub);
+            jest.advanceTimersByTime(openRouter.OPENROUTER_REQUEST_TIMEOUT_MS);
+
+            expect((await vendorFailure(openRouter, call)).kind).toBe('timeout');
         });
     });
 });
@@ -1982,6 +2109,253 @@ describe('estimate.service regression', () => {
 
             expect(result.items[0]).toMatchObject({ grams: 0, calories: 221, protein: 0, carbs: 0, fat: 16 });
             expect(result.total).toStrictEqual({ calories: 221, protein: 0, carbs: 0, fat: 16 });
+        });
+    });
+
+    /**
+     * ONE BUDGET PER REQUEST, NOT ONE PER CALL.
+     *
+     * An estimate is up to three vendor steps — the model call, the USDA
+     * candidate searches and the grounding judge — and each used to carry its
+     * own deadline. Separate deadlines add up, so a request could spend 30 s on
+     * the estimate and another 30 s on the judge while the mobile client
+     * abandoned it at 25 s: the user saw a bare transport error instead of the
+     * `502 estimation_failed` the controller would have returned, the paid call
+     * ran on, and the retry spent a second unit of the daily AI quota for one
+     * answer. Bounding one call was never enough; what has to be bounded is the
+     * request.
+     *
+     * These tests drive the real path through the `EstimateDependencies` seam —
+     * injected candidates for USDA, an injected transport for the vendor — with
+     * fake timers standing in for vendor latency, and assert the property the
+     * client depends on: the last vendor deadline of a request lands at the
+     * budget's end, not a full deadline after the call that opened it.
+     */
+    describe('the request budget', () => {
+        const groundableItem = modelItem({ grams: 92, calories: 180 });
+
+        const CANDIDATE: GenericFoodCandidate = {
+            fdcId: '173424',
+            description: 'Egg, whole, cooked, scrambled',
+            dataType: 'Survey (FNDDS)',
+            caloriesPer100g: 200,
+            proteinPer100g: 13,
+            carbsPer100g: 2,
+            fatPer100g: 15,
+        };
+
+        /** The model's own numbers, which an ungrounded outcome must preserve. */
+        const modelNumbers = {
+            name: 'Scrambled eggs',
+            quantityText: '2',
+            grams: 92,
+            calories: 180,
+            protein: 14,
+            carbs: 2,
+            fat: 16,
+            source: 'estimated',
+            matchedTo: null,
+        };
+
+        type SearchStub = jest.MockedFunction<NonNullable<EstimateDependencies['searchGenericFoods']>>;
+
+        const candidateSearch = (...candidates: GenericFoodCandidate[]): SearchStub =>
+            jest.fn(async (): Promise<GenericFoodCandidate[]> => candidates) as unknown as SearchStub;
+
+        /**
+         * A search that takes `delayMs` of vendor time before answering.
+         *
+         * The real boundary bounds one request-path lookup at
+         * `USDA_REQUEST_CALL_BUDGET_MS` (6 s) and runs the per-item lookups in
+         * parallel; this stub stands in for that slice so the branch that
+         * depends on how much of it was spent can be driven at all.
+         */
+        const slowCandidateSearch = (delayMs: number, ...candidates: GenericFoodCandidate[]): SearchStub =>
+            jest.fn(
+                (): Promise<GenericFoodCandidate[]> =>
+                    new Promise<GenericFoodCandidate[]>((resolve) => {
+                        setTimeout(() => resolve(candidates), delayMs);
+                    }),
+            ) as unknown as SearchStub;
+
+        /**
+         * Answers the first request `delayMs` into it, then delegates. The
+         * delay is what moves the fake clock, so the budget the later steps see
+         * is the budget a slow model would really have left them.
+         */
+        const respondAfter = (delayMs: number, first: Response, later?: FetchStub): FetchStub => {
+            let answeredFirst = false;
+            const delegate = later as unknown as ((input: unknown, init?: RequestInit) => Promise<Response>) | undefined;
+
+            return jest.fn((input: unknown, init?: RequestInit): Promise<Response> => {
+                if (!answeredFirst) {
+                    answeredFirst = true;
+
+                    return new Promise<Response>((resolve) => {
+                        setTimeout(() => resolve(first), delayMs);
+                    });
+                }
+                if (delegate === undefined) {
+                    throw new Error('The stub received a second request it was given no answer for.');
+                }
+
+                return delegate(input, init);
+            }) as unknown as FetchStub;
+        };
+
+        const REAL_CONSOLE = { error: console.error, warn: console.warn, log: console.log };
+        let loggedWarnings: unknown[][] = [];
+
+        beforeEach(() => {
+            loggedWarnings = [];
+            console.warn = (...args: unknown[]): void => {
+                loggedWarnings.push(args);
+            };
+            console.error = (): void => undefined;
+            console.log = (): void => undefined;
+            delete process.env.ESTIMATE_GROUNDING;
+            jest.useFakeTimers();
+        });
+
+        afterEach(() => {
+            console.error = REAL_CONSOLE.error;
+            console.warn = REAL_CONSOLE.warn;
+            console.log = REAL_CONSOLE.log;
+        });
+
+        const warningsMatching = (fragment: string): unknown[][] =>
+            loggedWarnings.filter((entry) => entry.some((value) => String(value).includes(fragment)));
+
+        it('gives the judge only what the estimate call left, so both fit in one budget', async () => {
+            const harness = configuredHarness();
+            const budgetMs = harness.openRouter.OPENROUTER_REQUEST_TIMEOUT_MS;
+            const estimateMs = 10_000;
+            const vendor = respondAfter(
+                estimateMs,
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                abortAwareFetch(),
+            );
+
+            const call = harness.estimate.estimateMeal('two eggs', undefined, {
+                searchGenericFoods: candidateSearch(CANDIDATE),
+                fetchImpl: vendor,
+            });
+
+            // Past the estimate call, into the judge call.
+            await jest.advanceTimersByTimeAsync(estimateMs);
+            expect(vendor).toHaveBeenCalledTimes(2);
+
+            // One millisecond before the REQUEST's budget runs out — not
+            // before the judge call's own would have.
+            await jest.advanceTimersByTimeAsync(budgetMs - estimateMs - 1);
+            expect(sentRequest(vendor, 1).signal?.aborted).toBe(false);
+
+            await jest.advanceTimersByTimeAsync(1);
+            expect(sentRequest(vendor, 1).signal?.aborted).toBe(true);
+
+            // Grounding is fail-soft, so the client still receives the
+            // estimate — on time, with the model's own numbers.
+            const result = await call;
+            expect(result.items).toStrictEqual([modelNumbers]);
+        });
+
+        it('skips grounding altogether when the estimate call has spent the budget', async () => {
+            const harness = configuredHarness();
+            const estimateMs = harness.openRouter.OPENROUTER_REQUEST_TIMEOUT_MS - GROUNDING_MIN_BUDGET_MS + 1;
+            const vendor = respondAfter(estimateMs, estimateCompletion({ items: [groundableItem], confidence: 'high' }));
+            const search = candidateSearch(CANDIDATE);
+
+            const call = harness.estimate.estimateMeal('two eggs', undefined, {
+                searchGenericFoods: search,
+                fetchImpl: vendor,
+            });
+            await jest.advanceTimersByTimeAsync(estimateMs);
+            const result = await call;
+
+            // No judge call, and no USDA work either: a refinement the client
+            // will never receive is not worth starting.
+            expect(vendor).toHaveBeenCalledTimes(1);
+            expect(search).not.toHaveBeenCalled();
+            expect(result.items).toStrictEqual([modelNumbers]);
+            expect(warningsMatching('USDA grounding skipped')).toHaveLength(1);
+        });
+
+        it('still grounds when the estimate call was quick', async () => {
+            const harness = configuredHarness();
+            const vendor = respondAfter(
+                1_000,
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                respondWith(completion('{"matches":[0]}')),
+            );
+
+            const call = harness.estimate.estimateMeal('two eggs', undefined, {
+                searchGenericFoods: candidateSearch(CANDIDATE),
+                fetchImpl: vendor,
+            });
+            await jest.advanceTimersByTimeAsync(1_000);
+            const result = await call;
+
+            expect(vendor).toHaveBeenCalledTimes(2);
+            expect(result.items[0].source).toBe('db_matched');
+            expect(warningsMatching('skipped')).toHaveLength(0);
+        });
+
+        it('skips the judge when the candidate lookup used the rest of the budget', async () => {
+            const harness = configuredHarness();
+            const budgetMs = harness.openRouter.OPENROUTER_REQUEST_TIMEOUT_MS;
+            const vendor = respondAfter(1_000, estimateCompletion({ items: [groundableItem], confidence: 'high' }));
+
+            const call = harness.estimate.estimateMeal('two eggs', undefined, {
+                searchGenericFoods: slowCandidateSearch(budgetMs - 1_000, CANDIDATE),
+                fetchImpl: vendor,
+            });
+            await jest.advanceTimersByTimeAsync(budgetMs);
+            const result = await call;
+
+            // Paying for a classification that would abort before answering
+            // buys nothing: the outcome either way is these numbers.
+            expect(vendor).toHaveBeenCalledTimes(1);
+            expect(result.items).toStrictEqual([modelNumbers]);
+            expect(warningsMatching('Grounding judge skipped')).toHaveLength(1);
+        });
+
+        it('bounds the whole request by the budget even when every vendor step stalls', async () => {
+            const harness = configuredHarness();
+            const budgetMs = harness.openRouter.OPENROUTER_REQUEST_TIMEOUT_MS;
+            const vendor = abortAwareFetch();
+            const startedAt = Date.now();
+            let failedAt = 0;
+
+            const call = rejectionOf(
+                harness.estimate.estimateMeal('two eggs', undefined, {
+                    searchGenericFoods: candidateSearch(CANDIDATE),
+                    fetchImpl: vendor,
+                }),
+            ).then((error) => {
+                failedAt = Date.now();
+
+                return error;
+            });
+
+            // Ten times the budget: a request that never answers still has to
+            // fail inside it, because that is the only way the controller's
+            // 502 reaches a client that gives up at 25 s.
+            await jest.advanceTimersByTimeAsync(budgetMs * 10);
+            const error = asFailedEstimate(await call, harness);
+
+            expect(error.message).toBe(TIMED_OUT_MESSAGE);
+            expect(failedAt - startedAt).toBeLessThanOrEqual(budgetMs);
+        });
+
+        it('bounds a label scan by the same budget', async () => {
+            const harness = configuredHarness();
+            const budgetMs = harness.openRouter.OPENROUTER_REQUEST_TIMEOUT_MS;
+            globalThis.fetch = abortAwareFetch();
+
+            const call = rejectionOf(harness.estimate.scanLabel('QUJD'));
+            await jest.advanceTimersByTimeAsync(budgetMs);
+
+            expect(asFailedEstimate(await call, harness).message).toBe(TIMED_OUT_MESSAGE);
         });
     });
 });

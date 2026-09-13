@@ -806,7 +806,14 @@ export type MakePreferencesOptions = Omit<
  * `makeUser({ ...FIXTURE_USER_TARGET_COLUMNS })` with this factory's defaults;
  * overriding `confirmed_targets` (or `target_source`) alone is how a suite
  * reaches the `legacy` verdict, and lowering `targets_input_revision` below
- * `revision` is how it reaches `stale`.
+ * `estimate_inputs_revision` is how it reaches `stale`.
+ *
+ * `estimate_inputs_revision` matches `targets_input_revision` here, which is
+ * what makes the default a FRESH confirmed estimate. It is deliberately NOT
+ * `revision`: the all-purpose revision moves on every preference save, while
+ * this counter moves only when goal, pace, age, height, weight, sex or activity
+ * changes, so a suite that saves an unrelated preference and then reads the
+ * targets must still see `stale: false`.
  */
 export const makePreferences = async (
     userId: string,
@@ -850,6 +857,7 @@ export const makePreferences = async (
             targets_revision: 1,
             confirmed_targets: asJsonColumnValue(FIXTURE_TARGETS),
             targets_input_revision: 1,
+            estimate_inputs_revision: 1,
             revision: 1,
             ...options,
         },

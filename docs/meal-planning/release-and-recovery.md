@@ -9,17 +9,29 @@ an older API is not.
 ## Status at this commit
 
 This document is the release runbook for the whole feature, and parts of the
-feature arrive across several commits on this branch. What it references falls
-into three groups, so nothing here reads as a claim about code that is not yet
-present:
+feature arrive across several commits on this branch. Every step below is
+therefore written as an instruction to an operator, never as a record of
+something already done — and this table says which of the things those steps
+name are in the tree yet, so nothing here reads as a claim about code that is
+not present. It is the one place that tracks that; the removal script and its
+folder README point here rather than repeating it.
 
 | Referenced thing | State |
 | --- | --- |
 | `prisma/migrations/20260908000000_meal_planning` (the schema), `prisma/manual-migrations/meal-planning/*`, `docs/meal-planning/expected-schema-diff.sql`, `.github/workflows/ci.yml`, `src/utils/featureFlags.ts`, `MEAL_PLANNING_ENABLED` | present |
-| `npm run catalog:load`, `npm run recipes:seed`, `npm run search:benchmark`, `GET /api/catalog/status`, `data/meal-planning/catalog/releases/v1/` | declared in `package.json`; the scripts, routes and release artefact land with the catalog and API commits of this branch. Verify with `--help`/`GET /api/catalog/status` before relying on a step below. |
+| `data/meal-planning/catalog/releases/v1/` — the reviewed release artefact, with a `manifest.json` carrying a SHA-256 and a row count for each of its five files (11,046 foods, 15,939 aliases, 31,899 portions, 0 components, 11,046 validation records) | present. This is the input a release loads, not loaded data: committing it puts no row in any database. |
+| `npm run catalog:load`, `npm run recipes:seed`, `npm run search:benchmark` | present as commands, each already checking its own inputs — `catalog:load -- --release v1` finds and accepts the manifest above — but **none of them writes to a database yet**: each ends by reporting `stage_pipeline_pending`, or `stage_prerequisites_unmet` for an input it cannot see (`recipes:seed` reports `gap_recipes_directory_absent` while `data/meal-planning/recipes/` is absent), and exits non-zero without touching the database. The loading, seeding and measurement bodies land with this branch's catalog commits. |
+| `GET /api/catalog/status` | `catalog.service.getStatus` is present; the `/api/catalog` route and controller land with this branch's API commits, so the endpoint is not yet reachable. |
 | Firebase Remote Config `meal_planning_enabled`, the mobile store build | outside this repository |
 
-`npm test` fails until the Jest configuration and suites land — that is the test
+Run a stage before depending on it, and re-read this table after pulling. Each
+stage names its own unmet inputs on stderr and exits non-zero rather than
+half-loading, so "did this environment's catalog actually load?" is answered by
+running the command and by `GET /api/catalog/status` once it is reachable —
+never by this table alone.
+
+`npm test` is a real Jest run: `jest.config.ts`, `tsconfig.test.json` and the
+suites under `src/**/__tests__/` are present. What it reports is the test
 toolchain's own milestone, not a release blocker introduced here.
 
 ## Release order
@@ -135,10 +147,26 @@ database the connection is actually on — deliberate, because the development
 environment here exports a production `DATABASE_URL` into every new shell. The
 procedure in its header, and in that folder's README, uses one explicitly named
 URL for the read-back, the backup, the guarded run and the ledger step below.
-Re-populating the catalog afterwards is a fresh `catalog:load` plus
-`recipes:seed` rather than a restore of those rows, and per the status table
-above that pipeline lands with this branch's catalog commits — so until it does,
-the backup is the only way back to the data the removal destroys.
+Re-populating afterwards and restoring afterwards are two different things, and
+the removal is only recoverable if you keep both in view:
+
+- A **fresh load** — `catalog:load` of a reviewed release, then `recipes:seed` —
+  rebuilds catalog and recipe content from the artefact committed in this
+  repository, which is the same route step 4 of the release order uses. It
+  writes new rows with new identifiers, so nothing that referenced the old ones
+  finds them again, and it rebuilds **only** that shared content. Plans, grocery
+  state and its check marks, preferences, confirmed-target bookkeeping and the
+  `meal_plan_actions` ledger are user data: no release contains them, so a load
+  does not bring them back and detached diary entries stay detached.
+- The **pre-removal backup** is the only thing that returns those exact rows —
+  same ids, same plan and shopping history, same stored responses. That is why
+  the `pg_dump` in the script's step 3 is a precondition and not a precaution.
+
+Today the backup is also the *only* route back to either kind of data: as this
+commit stands, `catalog:load` and `recipes:seed` both stop before any database
+write — the status table above is where that is tracked — so plan a removal
+around the backup, and check the state of the load path rather than assuming it
+has changed.
 
 Afterwards, `_prisma_migrations` still records `20260908000000_meal_planning` as
 applied, so `migrate deploy` would report nothing pending and leave the database
@@ -152,30 +180,52 @@ That folder's README carries the full procedure.
 
 ## Schema drift
 
-`docs/meal-planning/expected-schema-diff.sql` is the reviewed output of one
-`prisma migrate diff --script` run between the migration ledger and
-`prisma/schema.prisma`, committed so the two cannot drift apart unnoticed. Its
-single statement is what that command reports for the `STORED` generated
-`search_vector` expression, which the datamodel can only carry as
-`Unsupported("tsvector")?`.
+`docs/meal-planning/expected-schema-diff.sql` is the committed evidence that
+the migration ledger and `prisma/schema.prisma` have not drifted apart
+unnoticed. It carries **three sections**, each delimited by its own
+`-- >>> BEGIN <name>` / `-- >>> END <name>` marker, and the file's header
+records the exact command that regenerates each one:
 
-The migration also writes three things by hand that the command does not report
-at all — the `lower(alias)` expression index, the five partial indexes, and
-`NOT NULL` on the twelve required array columns. The plan expects this file to
-carry the first two of those alongside the generated column; Prisma 6.9 emits
+- `prisma-migrate-diff` — the reviewed output of one `prisma migrate diff
+  --script` run between the ledger and the datamodel. Its single statement is
+  what that command reports for the `STORED` generated `search_vector`
+  expression, which the datamodel can only carry as `Unsupported("tsvector")?`.
+- `pg-catalog-query` — a read-only `pg_catalog` query, scoped to generated
+  columns, hand-managed indexes and array columns.
+- `pg-catalog-expected` — that query's expected result: the generated column's
+  expression, and every hand-managed index's access method, uniqueness, key
+  expressions and predicate, and every array column's `NOT NULL` and default.
+
+The migration writes three things by hand that `prisma migrate diff` does not
+report at all — the `lower(alias)` expression index, the five partial indexes,
+and `NOT NULL` on the twelve required array columns. Prisma 6.9 still emits
 only the generated column, and the evidence file's header records that as an
-open plan-versus-tool conflict, with the measurements behind it, rather than as
-a settled narrower contract. Until it is settled, what holds the operator copy
-of the migration to those constructs is the ledger-equivalence gate
-(`describe('migration ledgers')` in `src/__tests__/api/compat.test.ts`), which
-applies both ledgers and compares the resulting columns, indexes and
-constraints. Dropping one of them from *both* ledgers at once is a review
-responsibility, not an automated one.
+AAP-versus-tool divergence with the measurements behind it. What closes the two
+classes the tool omits is the second and third sections: deleting the
+`lower(alias)` index, changing a partial index's predicate, or dropping
+`NOT NULL` from a required array column each change the `pg_catalog` result and
+fail the gate.
 
-CI runs the same command against a throwaway shadow database in its
-`Schema-drift evidence gate` step, requires its exit code 2, and compares the
-output with the committed file after stripping comment and blank lines from both
-sides — failing on any difference in either direction. The command is in the
+Those sections read the database `npx prisma migrate deploy` builds from
+`prisma/migrations` — the authoritative ledger, as applied. They say nothing
+about the operator copy under `prisma/manual-migrations/meal-planning/`, which
+the gate never applies. What holds that copy to the authoritative migration is
+the ledger-equivalence gate (`describe('migration ledgers')` in
+`src/__tests__/api/compat.test.ts`), which applies both ledgers and compares the
+resulting columns, indexes and constraints. The two are complementary: the
+equivalence gate compares one ledger against the other and so cannot see a
+construct dropped from both, which is precisely what the `pg_catalog` sections
+catch.
+
+CI's `Schema-drift evidence gate` step runs all three. It runs the migrate-diff
+command against a throwaway shadow database of its own, requires its exit code
+2, and compares `prisma-migrate-diff` with the output after stripping comment
+and blank lines from both sides — failing on any difference in either direction.
+It then executes `pg-catalog-query` read-only against the database the
+`Apply the migration ledger` step migrated and compares `pg-catalog-expected`
+with the result. It also requires that section to keep at least one generated
+column, seven hand-managed indexes and twelve `NOT NULL` array columns, so
+deleting evidence lines cannot buy a pass either. Every command is in the
 evidence file's header for local use. To prove the ledger and its operator copy
 still agree, follow the equivalence procedure in
 `prisma/manual-migrations/meal-planning/README.md`.

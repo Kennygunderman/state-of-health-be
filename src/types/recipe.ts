@@ -45,6 +45,26 @@ export interface RecipePerServingNutrition {
     fat: number;
 }
 
+// EVERY AMOUNT ON THIS SHAPE IS A WHOLE-RECIPE AMOUNT — the recipe as
+// published, which yields RecipeVersionResponse.yieldServings servings. That
+// holds for quantity, gramWeight and the pre-formatted displayText alike,
+// because all three are stored that way in recipe_ingredients and nothing here
+// is scaled: a recipe response carries no planned-meal context, so the portion
+// is not known at this layer.
+//
+// A consumer that shows ONE PORTION therefore scales, using the multiplier that
+// arrives beside the recipe in its own response —
+// MealPlanMealResponse.portionMultiplier for a planned meal,
+// SwapPreviewAlternative.portionMultiplier for the swap preview:
+//
+//     portion amount = quantity × portionMultiplier / yieldServings
+//
+// Stated here because it is the one thing about this shape that is not visible
+// from the shape: a reader who assumes displayText is already the portion's
+// amount ships ingredient quantities that contradict the portion-scaled
+// nutrition printed beside them. Both mobile screens apply the formula through
+// one shared helper (mobile/src/utility/RecipeIngredientUtility.ts) rather than
+// each carrying its own copy of it.
 export interface RecipeIngredientResponse {
     catalogFoodId: string;
     // name and nutritionProvenance are read from the frozen recipe_ingredients
@@ -53,9 +73,14 @@ export interface RecipeIngredientResponse {
     // recipe was published with even after a catalog refresh renames or
     // re-derives that food.
     name: string;
+    // The whole recipe's amount of this ingredient, in `unit`.
     quantity: number;
     unit: string;
+    // The whole recipe's grams of this ingredient — what the recipe's nutrition
+    // was derived from at publication and what the grocery list aggregates.
     gramWeight: number;
+    // The whole recipe's amount, pre-formatted ("¾ cup"). Not a portion amount,
+    // and not a substitute for the formula above.
     displayText: string;
     nutritionProvenance: RecipeNutritionProvenance;
     isOptional: boolean;
@@ -72,7 +97,14 @@ export interface RecipeVersionResponse {
     // client renders nothing without branching on null.
     description: string;
     iconKey: RecipeIconKey;
+    // Never empty. The steps are what a recipe is cooked from (frame 12 renders
+    // them as a numbered list), the column is JSONB NOT NULL, and the seed
+    // publishes them with the version — so recipe.mapper.ts fails the response
+    // rather than emitting an empty list, which would read as a complete recipe
+    // with nothing to do.
     instructions: string[];
+    // How many servings the whole recipe makes, and the divisor every
+    // per-portion amount on RecipeIngredientResponse is derived with.
     yieldServings: number;
     servingDescription: string;
     prepMinutes: number;
@@ -88,6 +120,15 @@ export interface RecipeVersionResponse {
     // Left open on purpose, unlike their tightened neighbours above: these are
     // taxonomies drawn from catalog food metadata, so a legitimate new diet or
     // allergen tag must not become a compile error in this repository.
+    //
+    // Both are the derived union of every ingredient's frozen tags, optional
+    // ingredients included, and planning eligibility is decided against exactly
+    // that union — so an EMPTY list is the positive claim "contains none of the
+    // named allergens" / "carries no dietary restriction", never "unknown".
+    // Whether a recipe's allergen data is unknown is stated separately by
+    // allergenStatus. Their columns are NOT NULL and recipe.mapper.ts reads
+    // them rather than defaulting them, so a row that cannot supply one fails
+    // the response instead of widening what the recipe appears safe for.
     dietTags: string[];
     allergenTags: string[];
     allergenStatus: 'known' | 'unknown';

@@ -399,6 +399,7 @@ const selectSearchPage = (db: SnapshotClient, matchSet: Prisma.Sql, limit: numbe
             f.carbs_g,
             f.fat_g,
             f.fiber_g,
+            f.density_g_per_ml,
             f.allergen_tags,
             f.allergen_status,
             f.food_group

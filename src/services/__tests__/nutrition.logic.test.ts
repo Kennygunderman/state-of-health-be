@@ -42,16 +42,64 @@
  * call the rule needs a database to test, and the rule — that a body may never
  * ask for a method the server writes on its own authority — is worth pinning,
  * because the app reads that one field as the diary's "From meal plan" origin.
+ *
+ * The suites after it cover the rest of this endpoint's decisions, each of them
+ * here for the same reason — written beside a Prisma call they needed a database
+ * and a seeded catalog to exercise, so their branches went untested:
+ *
+ *  - **`parseMealEntryPath` / `parseEntryPath`.** Both routes address a row by a
+ *    `@db.Uuid` key, so an unparsable id is a PostgreSQL syntax error, and
+ *    handing one to the writer answers a fixable request with a 500. The
+ *    verdicts pin `400 invalid_request` with `invalid_id` on the field the
+ *    caller must fix, and that a well-formed id is still left to the 404 that
+ *    keeps "missing" and "not yours" indistinguishable.
+ *  - **The stored-provenance vocabulary.** `toNutritionProvenance` reads an
+ *    unrestricted TEXT column, and what it does with a value it does not know —
+ *    report `null`, the unlabelled class — is safe for HISTORY and destructive
+ *    for a NEW entry, which is why the catalog snapshot narrows before writing.
+ *    The suite pins both halves, including that every class a catalog food may
+ *    carry survives the read path, so a narrowed value can never come back
+ *    unlabelled.
+ *  - **`resolveCatalogEntrySnapshot`.** Which portion the entry is logged
+ *    against, how that portion's macros are scaled from the food's basis, that
+ *    they are rounded exactly once, and which provenance class they belong to.
+ *    Every refusal is a published row that cannot produce a truthful snapshot,
+ *    and each one fails closed: nothing is written rather than an invented gram
+ *    weight, a NULL nutrient read as zero, or a provenance the diary cannot
+ *    label.
+ *  - **`planMealEntryEdit`.** Whether an edit detaches the entry from the plan
+ *    meal, recipe version or catalog food that vouches for its numbers.
+ *    Detachment turns on an effective value change and never on field presence,
+ *    so the suite's centre of gravity is the cases that must NOT detach: a
+ *    servings edit, a whole-entry resubmission, a padded name, a macro that
+ *    rounds to what is already stored.
  */
 
+import { CATALOG_NUTRITION_PROVENANCES } from '../catalog.logic';
 import {
     CLIENT_INPUT_METHODS,
+    CLIENT_SNAPSHOT_PROVENANCE,
+    CatalogEntryFood,
+    CatalogSnapshotError,
     DEFAULT_INPUT_METHOD,
+    DETACHED_ENTRY_SNAPSHOT,
     ENTRY_INPUT_METHODS,
+    ENTRY_NUTRITION_PROVENANCES,
+    InvalidServingError,
     PLANNED_INPUT_METHOD,
+    PLANNED_SNAPSHOT_PROVENANCE,
+    ParsedEntryPath,
     ParsedLogEntryBody,
+    ParsedMealEntryPath,
+    StoredMealEntrySnapshot,
+    isEntryNutritionProvenance,
+    parseEntryPath,
     parseLogEntryBody,
+    parseMealEntryPath,
+    planMealEntryEdit,
+    resolveCatalogEntrySnapshot,
     resolveLegacyInputMethod,
+    toNutritionProvenance,
 } from '../nutrition.logic';
 
 /** A syntactically valid v4 UUID: version nibble `4`, variant nibble `9`. */
@@ -777,6 +825,689 @@ describe('resolveLegacyInputMethod', () => {
                     method === PLANNED_INPUT_METHOD ? DEFAULT_INPUT_METHOD : method,
                 );
             });
+        });
+    });
+});
+
+/** A syntactically valid v4 UUID, distinct from the catalog one above. */
+const MEAL_ID = '9b2fbd4c-7c21-4a17-8b36-1d5a2d4f9c10';
+const ENTRY_ID = 'c0a80121-7ac0-4f2e-b1f7-3f8c1d9a4e62';
+
+const asPathError = (verdict: ParsedMealEntryPath | ParsedEntryPath): ErrorVerdict => {
+    if (verdict.kind !== 'error') {
+        throw new Error(`expected an error verdict, received "${verdict.kind}"`);
+    }
+
+    return verdict;
+};
+
+describe('parseMealEntryPath', () => {
+    it('accepts a v4 UUID and hands back the id the writers address the meal by', () => {
+        expect(parseMealEntryPath({ mealId: MEAL_ID })).toStrictEqual({ kind: 'ok', mealId: MEAL_ID });
+    });
+
+    it('accepts an upper-case UUID, which PostgreSQL parses identically', () => {
+        const upper = MEAL_ID.toUpperCase();
+
+        expect(parseMealEntryPath({ mealId: upper })).toStrictEqual({ kind: 'ok', mealId: upper });
+    });
+
+    it.each([
+        ['a string that is not a UUID at all', 'not-a-uuid'],
+        ['a SQL fragment', "' OR 1=1--"],
+        ['an empty segment', ''],
+        ['a UUID missing its hyphens', '9b2fbd4c7c214a178b361d5a2d4f9c10'],
+        ['a brace-wrapped UUID PostgreSQL would accept but no row can hold', `{${MEAL_ID}}`],
+        ['a padded UUID', ` ${MEAL_ID} `],
+        ['a v1 UUID, which gen_random_uuid never produces', '9b2fbd4c-7c21-1a17-8b36-1d5a2d4f9c10'],
+        ['a UUID with an out-of-range variant nibble', '9b2fbd4c-7c21-4a17-1b36-1d5a2d4f9c10'],
+        ['a truncated UUID', '9b2fbd4c-7c21-4a17-8b36'],
+        ['an absent parameter', undefined],
+        ['null', null],
+        ['a number', 7],
+        ['an array of ids', [MEAL_ID]],
+        ['an object', { mealId: MEAL_ID }],
+    ])('refuses %s with invalid_id on mealId', (_case, mealId) => {
+        // The whole point of the verdict: every one of these would otherwise
+        // reach `meals.id`, a @db.Uuid column, and come back as a 500 for a
+        // request the caller could have fixed.
+        const verdict = parseMealEntryPath({ mealId });
+
+        expect(asPathError(verdict).code).toBe('invalid_request');
+        expect(asPathError(verdict).details).toStrictEqual([{ field: 'mealId', code: 'invalid_id' }]);
+        expect(asPathError(verdict).message).toBe('mealId must be a v4 UUID');
+    });
+
+    it('leaves a well-formed id that names nothing to the 404', () => {
+        // Existence is not this parser's business, and must not be: answering
+        // differently for an id that exists and one that does not is how an
+        // endpoint tells a caller whose rows they are looking at.
+        expect(parseMealEntryPath({ mealId: ENTRY_ID }).kind).toBe('ok');
+    });
+});
+
+describe('parseEntryPath', () => {
+    it('accepts a v4 UUID and hands back the entry id', () => {
+        expect(parseEntryPath({ id: ENTRY_ID })).toStrictEqual({ kind: 'ok', entryId: ENTRY_ID });
+    });
+
+    it.each([
+        ['a string that is not a UUID', 'entry-1'],
+        ['an empty segment', ''],
+        ['an absent parameter', undefined],
+        ['null', null],
+        ['a number', 12],
+        ['an object', {}],
+    ])('refuses %s with invalid_id on id', (_case, id) => {
+        const verdict = parseEntryPath({ id });
+
+        expect(asPathError(verdict).code).toBe('invalid_request');
+        expect(asPathError(verdict).details).toStrictEqual([{ field: 'id', code: 'invalid_id' }]);
+    });
+
+    it('names the route parameter the caller sees rather than an internal name', () => {
+        // `PUT /macros/entry/:id` — the detail has to name `id`, because that is
+        // the segment the client is being told to fix.
+        expect(asPathError(parseEntryPath({ id: 'nope' })).details[0].field).toBe('id');
+        expect(asPathError(parseMealEntryPath({ mealId: 'nope' })).details[0].field).toBe('mealId');
+    });
+});
+
+describe('the stored nutrition-provenance vocabulary', () => {
+    it('holds the four classes the column may carry', () => {
+        expect([...ENTRY_NUTRITION_PROVENANCES]).toStrictEqual([
+            'source_backed',
+            'ingredient_derived',
+            'ai_estimated',
+            'user_entered',
+        ]);
+    });
+
+    it('reads every class it names back as itself', () => {
+        ENTRY_NUTRITION_PROVENANCES.forEach((provenance) => {
+            expect(isEntryNutritionProvenance(provenance)).toBe(true);
+            expect(toNutritionProvenance(provenance)).toBe(provenance);
+        });
+    });
+
+    it.each([
+        ['a NULL column, which is a row written before the column existed', null],
+        ['a class nobody defined', 'verified'],
+        ['an empty string', ''],
+        ['the right class in the wrong case', 'Source_Backed'],
+        ['a padded class', ' source_backed '],
+    ])('reads %s as the unlabelled class', (_case, stored) => {
+        // `null` is "unknown / user-entered" and renders no provenance caption.
+        // For HISTORY that is the honest reading; for a NEW entry it would be a
+        // lost label, which is why `resolveCatalogEntrySnapshot` refuses to
+        // write a value this function cannot read.
+        expect(toNutritionProvenance(stored)).toBeNull();
+    });
+
+    it.each([
+        ['an inherited object property', 'toString'],
+        ['a prototype member', 'constructor'],
+    ])('does not admit %s as a class', (_case, stored) => {
+        // The membership test is `hasOwnProperty`, not `in`: `'toString' in
+        // members` is true of every object literal.
+        expect(isEntryNutritionProvenance(stored)).toBe(false);
+        expect(toNutritionProvenance(stored)).toBeNull();
+    });
+
+    it.each([
+        ['undefined', undefined],
+        ['a number', 1],
+        ['an object', { provenance: 'source_backed' }],
+        ['an array', ['source_backed']],
+    ])('does not admit %s as a class', (_case, value) => {
+        expect(isEntryNutritionProvenance(value)).toBe(false);
+    });
+
+    it('classifies a client-supplied snapshot as user-entered and a planned one as source-backed', () => {
+        expect(CLIENT_SNAPSHOT_PROVENANCE).toBe('user_entered');
+        expect(PLANNED_SNAPSHOT_PROVENANCE).toBe('source_backed');
+        expect(ENTRY_NUTRITION_PROVENANCES).toContain(CLIENT_SNAPSHOT_PROVENANCE);
+        expect(ENTRY_NUTRITION_PROVENANCES).toContain(PLANNED_SNAPSHOT_PROVENANCE);
+    });
+
+    it('can read back every class a catalog food may carry', () => {
+        // The invariant behind the snapshot's narrowing: the catalog set is a
+        // SUBSET of what an entry may hold, so a provenance the snapshot accepts
+        // always survives `mapEntry` and reaches the diary as a label. If a
+        // class were ever added to the catalog set alone, a logged entry would
+        // carry a value this module reads as `null` and the label would vanish.
+        CATALOG_NUTRITION_PROVENANCES.forEach((provenance) => {
+            expect(toNutritionProvenance(provenance)).toBe(provenance);
+        });
+    });
+});
+
+/**
+ * A published food as the columns hold it: per 100 g, 150 kcal / 15 P / 20 C /
+ * 2 F, with one default portion of 200 g — so the default portion is exactly
+ * twice the basis and the scaling is legible in the expectations.
+ */
+const catalogFood = (overrides: Partial<CatalogEntryFood> = {}): CatalogEntryFood => ({
+    id: '2f9a1c44-5d3e-4b21-9f77-8c6b0e4d1a55',
+    nutrition_basis: 'per_100g',
+    basis_amount: 100,
+    calories: 150,
+    protein_g: 15,
+    carbs_g: 20,
+    fat_g: 2,
+    density_g_per_ml: null,
+    nutrition_provenance: 'source_backed',
+    catalog_food_portions: [{ description: '1 cup', gram_weight: 200, is_default: true }],
+    ...overrides,
+});
+
+describe('resolveCatalogEntrySnapshot', () => {
+    describe('the portion the entry is logged against', () => {
+        it('takes the default portion when the request names none', () => {
+            const snapshot = resolveCatalogEntrySnapshot(catalogFood(), undefined);
+
+            expect(snapshot.servingText).toBe('1 cup');
+            expect(snapshot.perServing).toStrictEqual({ calories: 300, protein: 30, carbs: 40, fat: 4 });
+        });
+
+        it('takes a named portion and scales that portion, not the default', () => {
+            const food = catalogFood({
+                catalog_food_portions: [
+                    { description: '1 cup', gram_weight: 200, is_default: true },
+                    { description: '1 tbsp', gram_weight: 15, is_default: false },
+                ],
+            });
+
+            const snapshot = resolveCatalogEntrySnapshot(food, '1 tbsp');
+
+            // 15 g of a 150 kcal/100 g food: 22.5 rounded once.
+            expect(snapshot).toStrictEqual({
+                servingText: '1 tbsp',
+                perServing: { calories: 23, protein: 2, carbs: 3, fat: 0 },
+                nutritionProvenance: 'source_backed',
+            });
+        });
+
+        it('stores the portion description the catalog measured, not the text the client sent', () => {
+            // The two are equal strings here, and that is the point: the stored
+            // label comes from the matched portion, so it can only ever describe
+            // the numbers stored beside it.
+            const snapshot = resolveCatalogEntrySnapshot(catalogFood(), '1 cup');
+
+            expect(snapshot.servingText).toBe('1 cup');
+        });
+
+        it.each([
+            ['a portion this food does not store', '1 slice'],
+            ['the right portion in the wrong case', '1 CUP'],
+            ['a padded description', ' 1 cup '],
+            ['an empty description', ''],
+        ])('refuses %s rather than falling back to the default portion', (_case, servingText) => {
+            // Falling back would label one portion's numbers with another
+            // portion's name — the unverifiable claim this refusal exists for.
+            expect(() => resolveCatalogEntrySnapshot(catalogFood(), servingText)).toThrow(InvalidServingError);
+        });
+
+        it('reports the text it refused, so the caller learns which value to fix', () => {
+            try {
+                resolveCatalogEntrySnapshot(catalogFood(), '1 slice');
+                throw new Error('expected InvalidServingError');
+            } catch (error) {
+                expect(error).toBeInstanceOf(InvalidServingError);
+                expect((error as InvalidServingError).servingText).toBe('1 slice');
+            }
+        });
+
+        it('refuses a food with no default portion', () => {
+            const food = catalogFood({
+                catalog_food_portions: [{ description: '1 cup', gram_weight: 200, is_default: false }],
+            });
+
+            expect(() => resolveCatalogEntrySnapshot(food, undefined)).toThrow(CatalogSnapshotError);
+        });
+
+        it('refuses a food with no portions at all', () => {
+            expect(() => resolveCatalogEntrySnapshot(catalogFood({ catalog_food_portions: [] }), undefined)).toThrow(
+                CatalogSnapshotError,
+            );
+        });
+
+        it.each([
+            ['zero', 0],
+            ['negative', -50],
+            ['not a number', Number.NaN],
+            ['infinite', Number.POSITIVE_INFINITY],
+        ])('refuses a %s portion weight instead of inventing one', (_case, gram_weight) => {
+            const food = catalogFood({
+                catalog_food_portions: [{ description: '1 cup', gram_weight, is_default: true }],
+            });
+
+            expect(() => resolveCatalogEntrySnapshot(food, undefined)).toThrow(CatalogSnapshotError);
+        });
+    });
+
+    describe('the basis the stated values are scaled from', () => {
+        it('scales a per-100g basis by mass', () => {
+            const food = catalogFood({ basis_amount: 50, calories: 75, protein_g: 7, carbs_g: 10, fat_g: 1 });
+
+            // 75 kcal per 50 g, logged as a 200 g portion.
+            expect(resolveCatalogEntrySnapshot(food, undefined).perServing).toStrictEqual({
+                calories: 300,
+                protein: 28,
+                carbs: 40,
+                fat: 4,
+            });
+        });
+
+        it('scales a per-100ml basis through the food´s own density', () => {
+            const food = catalogFood({
+                nutrition_basis: 'per_100ml',
+                basis_amount: 100,
+                density_g_per_ml: 1.03,
+                catalog_food_portions: [{ description: '1 cup', gram_weight: 206, is_default: true }],
+            });
+
+            // 100 ml at 1.03 g/ml is 103 g, and the portion is exactly twice that.
+            expect(resolveCatalogEntrySnapshot(food, undefined).perServing).toStrictEqual({
+                calories: 300,
+                protein: 30,
+                carbs: 40,
+                fat: 4,
+            });
+        });
+
+        it.each([
+            ['an absent density', null],
+            ['a zero density', 0],
+            ['a negative density', -1],
+        ])('refuses a per-100ml basis with %s rather than reading millilitres as grams', (_case, density) => {
+            const food = catalogFood({ nutrition_basis: 'per_100ml', density_g_per_ml: density });
+
+            expect(() => resolveCatalogEntrySnapshot(food, undefined)).toThrow(CatalogSnapshotError);
+        });
+
+        it('scales a per-serving basis by the default portion´s gram weight', () => {
+            const food = catalogFood({
+                nutrition_basis: 'per_serving',
+                basis_amount: 1,
+                calories: 90,
+                protein_g: 9,
+                carbs_g: 12,
+                fat_g: 1,
+                catalog_food_portions: [{ description: '1 bar', gram_weight: 40, is_default: true }],
+            });
+
+            // One serving weighs 40 g and the logged portion IS that serving.
+            expect(resolveCatalogEntrySnapshot(food, undefined).perServing).toStrictEqual({
+                calories: 90,
+                protein: 9,
+                carbs: 12,
+                fat: 1,
+            });
+        });
+
+        it('reads a per-serving basis_amount as a count of servings', () => {
+            const food = catalogFood({
+                nutrition_basis: 'per_serving',
+                basis_amount: 2,
+                calories: 180,
+                protein_g: 18,
+                carbs_g: 24,
+                fat_g: 2,
+                catalog_food_portions: [{ description: '1 bar', gram_weight: 40, is_default: true }],
+            });
+
+            // A label stating two servings' worth describes 80 g, so one 40 g bar
+            // is half of it. Treating basis_amount as one serving would double
+            // every value.
+            expect(resolveCatalogEntrySnapshot(food, undefined).perServing).toStrictEqual({
+                calories: 90,
+                protein: 9,
+                carbs: 12,
+                fat: 1,
+            });
+        });
+
+        it('scales a named portion from the default portion´s basis on a per-serving food', () => {
+            const food = catalogFood({
+                nutrition_basis: 'per_serving',
+                basis_amount: 1,
+                calories: 90,
+                protein_g: 9,
+                carbs_g: 12,
+                fat_g: 1,
+                catalog_food_portions: [
+                    { description: '1 bar', gram_weight: 40, is_default: true },
+                    { description: '1 box', gram_weight: 200, is_default: false },
+                ],
+            });
+
+            // The basis is still the DEFAULT portion's weight; the named portion
+            // only decides how much of it the entry logs.
+            expect(resolveCatalogEntrySnapshot(food, '1 box').perServing).toStrictEqual({
+                calories: 450,
+                protein: 45,
+                carbs: 60,
+                fat: 5,
+            });
+        });
+
+        it.each([
+            ['a basis nobody defined', 'per_ounce'],
+            ['the right basis in the wrong case', 'PER_100G'],
+            ['an empty basis', ''],
+        ])('refuses %s', (_case, nutrition_basis) => {
+            expect(() => resolveCatalogEntrySnapshot(catalogFood({ nutrition_basis }), undefined)).toThrow(
+                CatalogSnapshotError,
+            );
+        });
+
+        it.each([
+            ['zero', 0],
+            ['negative', -100],
+            ['not a number', Number.NaN],
+        ])('refuses a %s basis amount', (_case, basis_amount) => {
+            expect(() => resolveCatalogEntrySnapshot(catalogFood({ basis_amount }), undefined)).toThrow(
+                CatalogSnapshotError,
+            );
+        });
+    });
+
+    describe('the nutrients it stores', () => {
+        it('keeps a genuine zero rather than treating it as missing', () => {
+            const food = catalogFood({ calories: 0, protein_g: 0, carbs_g: 0, fat_g: 0 });
+
+            expect(resolveCatalogEntrySnapshot(food, undefined).perServing).toStrictEqual({
+                calories: 0,
+                protein: 0,
+                carbs: 0,
+                fat: 0,
+            });
+        });
+
+        it.each(['calories', 'protein_g', 'carbs_g', 'fat_g'] as const)(
+            'refuses a food whose %s is NULL instead of reading it as zero',
+            (nutrient) => {
+                // Reading NULL as 0 would log a number nobody measured under a
+                // source-backed label, which is the one thing this path may not do.
+                expect(() => resolveCatalogEntrySnapshot(catalogFood({ [nutrient]: null }), undefined)).toThrow(
+                    CatalogSnapshotError,
+                );
+            },
+        );
+
+        it.each(['calories', 'protein_g', 'carbs_g', 'fat_g'] as const)(
+            'refuses a negative %s, which no food has and validation cannot publish',
+            (nutrient) => {
+                expect(() => resolveCatalogEntrySnapshot(catalogFood({ [nutrient]: -1 }), undefined)).toThrow(
+                    CatalogSnapshotError,
+                );
+            },
+        );
+
+        it.each(['calories', 'protein_g', 'carbs_g', 'fat_g'] as const)('refuses a non-finite %s', (nutrient) => {
+            expect(() => resolveCatalogEntrySnapshot(catalogFood({ [nutrient]: Number.NaN }), undefined)).toThrow(
+                CatalogSnapshotError,
+            );
+        });
+
+        it('rounds the scaled value once, not the stated value before scaling', () => {
+            const food = catalogFood({
+                basis_amount: 100,
+                calories: 10.4,
+                protein_g: 1.4,
+                carbs_g: 0.5,
+                fat_g: 0.04,
+                catalog_food_portions: [{ description: '1 kg', gram_weight: 1000, is_default: true }],
+            });
+
+            // Rounding first and scaling after would give 100 / 10 / 0 / 0.
+            expect(resolveCatalogEntrySnapshot(food, undefined).perServing).toStrictEqual({
+                calories: 104,
+                protein: 14,
+                carbs: 5,
+                fat: 0,
+            });
+        });
+
+        it('stores integers, because the column is an Int', () => {
+            const snapshot = resolveCatalogEntrySnapshot(
+                catalogFood({ calories: 133.33, protein_g: 6.66, carbs_g: 2.22, fat_g: 1.11 }),
+                undefined,
+            );
+
+            Object.values(snapshot.perServing).forEach((value) => {
+                expect(Number.isInteger(value)).toBe(true);
+            });
+        });
+    });
+
+    describe('the provenance class it writes', () => {
+        it.each(CATALOG_NUTRITION_PROVENANCES)('carries the food´s own %s class through', (provenance) => {
+            expect(
+                resolveCatalogEntrySnapshot(catalogFood({ nutrition_provenance: provenance }), undefined)
+                    .nutritionProvenance,
+            ).toBe(provenance);
+        });
+
+        it.each([
+            ['a class nobody defined', 'verified'],
+            ['an empty class', ''],
+            ['the right class in the wrong case', 'Source_Backed'],
+            ['a padded class', ' ai_estimated '],
+            ['the client-supplied class, which no catalog food may claim', 'user_entered'],
+        ])('refuses %s rather than storing a value the diary cannot label', (_case, nutrition_provenance) => {
+            // The failure this narrowing exists for: stored as given, an
+            // unreadable class comes back from `toNutritionProvenance` as `null`,
+            // which renders NO caption — so an AI-estimated food would be logged
+            // with its mandatory estimate label silently missing. Failing closed
+            // writes no entry at all, which is the direction a nutrition label
+            // has to fail in.
+            expect(() =>
+                resolveCatalogEntrySnapshot(catalogFood({ nutrition_provenance }), undefined),
+            ).toThrow(CatalogSnapshotError);
+        });
+
+        it('refuses a corrupt class before it considers the portion the request named', () => {
+            // A published row that cannot be labelled is refused whatever the
+            // request asked for, so no combination of request values reaches the
+            // insert past it.
+            expect(() =>
+                resolveCatalogEntrySnapshot(catalogFood({ nutrition_provenance: 'verified' }), '1 slice'),
+            ).toThrow(CatalogSnapshotError);
+        });
+    });
+});
+
+/** A logged planned meal as the row holds it: 420 kcal / 32 P / 44 C / 11 F per serving. */
+const storedEntry = (overrides: Partial<StoredMealEntrySnapshot> = {}): StoredMealEntrySnapshot => ({
+    name: 'Greek yogurt bowl',
+    calories: 420,
+    protein_g: 32,
+    carbs_g: 44,
+    fat_g: 11,
+    meal_plan_meal_id: 'a6e1b5c2-9d47-4c8a-8f31-2b7e6c0d5a94',
+    catalog_food_id: null,
+    recipe_version_id: null,
+    ...overrides,
+});
+
+/** The same numbers the row holds, as a client re-submitting the form would send them. */
+const unchangedPayload = () => ({ name: 'Greek yogurt bowl', calories: 420, protein: 32, carbs: 44, fat: 11 });
+
+describe('planMealEntryEdit', () => {
+    describe('edits that must NOT detach', () => {
+        it('leaves the links alone for a servings-only edit', () => {
+            const plan = planMealEntryEdit(storedEntry(), { servings: 2 });
+
+            expect(plan).toStrictEqual({ fields: { servings: 2 }, detachesFromSource: false });
+        });
+
+        it('leaves the links alone when a client re-submits the whole entry unaltered', () => {
+            // The case that made this rule necessary: a full-form save, or a
+            // retry of a request whose response was lost, changes nothing about
+            // what the food IS — so the planned meal stays LOGGED, "From meal
+            // plan" stays under the row, and the source label survives.
+            const plan = planMealEntryEdit(storedEntry(), unchangedPayload());
+
+            expect(plan.detachesFromSource).toBe(false);
+            expect(plan.fields).toStrictEqual({
+                name: 'Greek yogurt bowl',
+                calories: 420,
+                protein_g: 32,
+                carbs_g: 44,
+                fat_g: 11,
+            });
+        });
+
+        it('leaves the links alone for a servings edit sent alongside the unchanged snapshot', () => {
+            const plan = planMealEntryEdit(storedEntry(), { ...unchangedPayload(), servings: 0.5 });
+
+            expect(plan.detachesFromSource).toBe(false);
+            expect(plan.fields.servings).toBe(0.5);
+        });
+
+        it('compares the name as the column would hold it, so padding is not an edit', () => {
+            const plan = planMealEntryEdit(storedEntry(), { name: '  Greek yogurt bowl  ' });
+
+            expect(plan.fields.name).toBe('Greek yogurt bowl');
+            expect(plan.detachesFromSource).toBe(false);
+        });
+
+        it.each([
+            ['a macro that rounds to the stored value', { calories: 420.4 }],
+            ['a macro that rounds up to the stored value', { protein: 31.6 }],
+            ['every macro sent with sub-integer noise', { calories: 419.5, protein: 32.2, carbs: 43.8, fat: 11.4 }],
+        ])('compares macros as the column would hold them: %s is not an edit', (_case, payload) => {
+            expect(planMealEntryEdit(storedEntry(), payload).detachesFromSource).toBe(false);
+        });
+
+        it('does not detach an entry that carries no link, however much the edit changes', () => {
+            const plan = planMealEntryEdit(
+                storedEntry({ meal_plan_meal_id: null }),
+                { name: 'Something else', calories: 900 },
+            );
+
+            expect(plan.detachesFromSource).toBe(false);
+            expect(plan.fields).toStrictEqual({ name: 'Something else', calories: 900 });
+        });
+
+        it('writes nothing and detaches nothing for an empty payload', () => {
+            expect(planMealEntryEdit(storedEntry(), {})).toStrictEqual({ fields: {}, detachesFromSource: false });
+        });
+    });
+
+    describe('edits that MUST detach', () => {
+        it('detaches when the name is rewritten', () => {
+            const plan = planMealEntryEdit(storedEntry(), { name: 'Greek yogurt bowl with honey' });
+
+            expect(plan.detachesFromSource).toBe(true);
+        });
+
+        it.each([
+            ['calories', { calories: 421 }],
+            ['protein', { protein: 33 }],
+            ['carbs', { carbs: 45 }],
+            ['fat', { fat: 12 }],
+        ])('detaches when %s is rewritten', (_case, payload) => {
+            expect(planMealEntryEdit(storedEntry(), payload).detachesFromSource).toBe(true);
+        });
+
+        it('detaches when one macro changes among several that did not', () => {
+            const plan = planMealEntryEdit(storedEntry(), { ...unchangedPayload(), fat: 20 });
+
+            expect(plan.detachesFromSource).toBe(true);
+            expect(plan.fields.fat_g).toBe(20);
+        });
+
+        it.each([
+            ['a planned meal', { meal_plan_meal_id: 'a6e1b5c2-9d47-4c8a-8f31-2b7e6c0d5a94' }],
+            ['a catalog food', { catalog_food_id: '2f9a1c44-5d3e-4b21-9f77-8c6b0e4d1a55' }],
+            ['a recipe version', { recipe_version_id: '7d3c9f10-2a56-4e83-9b1d-4f8e2c6a0b37' }],
+        ])('detaches an entry linked to %s', (_case, links) => {
+            const existing = storedEntry({
+                meal_plan_meal_id: null,
+                catalog_food_id: null,
+                recipe_version_id: null,
+                ...links,
+            });
+
+            expect(planMealEntryEdit(existing, { calories: 500 }).detachesFromSource).toBe(true);
+        });
+
+        it('treats a macro it cannot compare as a rewrite', () => {
+            // `NaN !== NaN`, so an uncomparable value must not be read as "equal
+            // to what is stored". The write it belongs to is refused at the
+            // column, so nothing is actually detached — but the decision itself
+            // may never default to "unchanged".
+            expect(planMealEntryEdit(storedEntry(), { calories: Number.NaN }).detachesFromSource).toBe(true);
+        });
+    });
+
+    describe('the values it writes', () => {
+        it('maps each payload field to the column it belongs to', () => {
+            const plan = planMealEntryEdit(storedEntry(), {
+                servings: 1.5,
+                name: 'Renamed',
+                calories: 1,
+                protein: 2,
+                carbs: 3,
+                fat: 4,
+            });
+
+            expect(plan.fields).toStrictEqual({
+                servings: 1.5,
+                name: 'Renamed',
+                calories: 1,
+                protein_g: 2,
+                carbs_g: 3,
+                fat_g: 4,
+            });
+        });
+
+        it('omits every column the request did not mention', () => {
+            const plan = planMealEntryEdit(storedEntry(), { carbs: 50 });
+
+            expect(Object.keys(plan.fields)).toStrictEqual(['carbs_g']);
+        });
+
+        it('writes servings exactly as sent, because how much was eaten is not rounded', () => {
+            expect(planMealEntryEdit(storedEntry(), { servings: 0.33 }).fields.servings).toBe(0.33);
+        });
+
+        it('passes a name that is not a string straight through', () => {
+            // This route has never validated its body, so a non-string `name` is
+            // reachable and the shipped writer answered it with a 500 (it called
+            // `.trim()` on it). Passing it through keeps that answer — Prisma
+            // refuses it at the `String` column — where coercing it to '42' would
+            // store a name the caller never sent and dropping it would turn a
+            // broken request into a silent success. The cast is the point: only
+            // an untyped body can get here.
+            const plan = planMealEntryEdit(storedEntry(), { name: 42 as unknown as string });
+
+            expect(plan.fields.name).toBe(42);
+            expect(plan.detachesFromSource).toBe(true);
+        });
+    });
+
+    describe('what a detached entry keeps', () => {
+        it('clears all three links and falls back to the client-entered classes', () => {
+            expect(DETACHED_ENTRY_SNAPSHOT).toStrictEqual({
+                meal_plan_meal_id: null,
+                catalog_food_id: null,
+                recipe_version_id: null,
+                input_method: 'library',
+                nutrition_provenance: 'user_entered',
+            });
+        });
+
+        it('falls back to values an older client already decodes', () => {
+            // 'library' is the column default and a method a body could have
+            // asked for anyway; 'user_entered' renders no source label. Neither
+            // adds a wire value a shipped client has not seen.
+            expect(DETACHED_ENTRY_SNAPSHOT.input_method).toBe(DEFAULT_INPUT_METHOD);
+            expect(DETACHED_ENTRY_SNAPSHOT.nutrition_provenance).toBe(CLIENT_SNAPSHOT_PROVENANCE);
+            expect(DETACHED_ENTRY_SNAPSHOT.input_method).not.toBe(PLANNED_INPUT_METHOD);
         });
     });
 });

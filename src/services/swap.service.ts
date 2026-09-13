@@ -64,10 +64,31 @@
 //    `PlanNotActiveError`, `StalePlanError`, `RecipeIneligibleError`,
 //    `PreviewStaleError`, `IdempotencyConflictError` — is mapped once, at the
 //    controller (§8).
-//  * NO BODY VALIDATION. `commitSwap` takes a typed `SwapMealPayload` because
-//    the swap body needs no database state to judge: uuid, portion and revision
-//    checks are the controller's (§4), so by the time a request reaches here its
-//    shape is settled.
+//  * NO REQUEST SHAPE OF ITS OWN — IT PARSES ONE. Each of the three entry
+//    points calls its parser from `swap.logic.ts`
+//    ({@link parseSwapAlternativesPath}, {@link parseSwapPreviewPath},
+//    {@link parseSwapCommitRequest}) as its FIRST statement and returns that
+//    parser's verdict UNCHANGED when it refuses, which is the arrangement
+//    `mealPlan.service.ts::generatePlan` and `targets.service.ts::saveTargets`
+//    already have: the route-facing service function is the parse boundary, the
+//    parsers stay pure and testable in the logic module (Rule
+//    backend-architecture §4, §0.5.2's "validation applied before any Prisma or
+//    planning work"), and the controller still owns every status — it maps a
+//    returned refusal to `400 invalid_request` (§8) exactly as it maps
+//    `MealPlanRefusal`.
+//
+//    THE PARSE PRECEDES EVERY `await`, and two separate failures are what
+//    makes that position load-bearing rather than tidy. A malformed id must not
+//    reach Prisma through {@link loadSwapContext}, nor a malformed portion
+//    reach `swap.logic.ts::requireBoundPortion` — which refuses every value
+//    that is not the recomputed portion, so `'half'` would be answered
+//    `409 preview_stale` ("your preview went stale, re-preview it") for a
+//    request that was simply invalid and would fail the same way again. And the
+//    commit's idempotency fingerprint is built from the PARSED payload, as
+//    `mealPlanningAction.logic.ts::buildRequestFingerprint` requires: it raises
+//    a `TypeError` on a magnitude it cannot canonicalise faithfully, which
+//    would surface as a `500` for a body the parser had already judged
+//    invalid.
 //  * NO DEDUPLICATION OF ITS OWN. A double tap or a retry replays the stored
 //    `200` through `runKeyedAction`; a second guard here would be a second
 //    policy.
@@ -107,10 +128,14 @@ import { isMealSlot, roundNutritionForDisplay } from './recipe.logic';
 import { RecipeVersionRow, mapSwapAlternative } from './recipe.mapper';
 import { getRecipeVersionDetail, getRecipeVersionsForPlanning } from './recipe.service';
 import {
+    ParsedSwapCommitRequest,
     SwapCandidate,
     SwapDayMeal,
     SwapSelectionContext,
     SwapWeekMeal,
+    parseSwapAlternativesPath,
+    parseSwapCommitRequest,
+    parseSwapPreviewPath,
     requireBoundPortion,
     selectSwapCandidate,
     selectSwapCandidates,
@@ -480,6 +505,39 @@ const requireDayResponse = async (
 };
 
 /* ---------------------------------------------------------------------------
+ * What the three entry points answer with
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A malformed request, exactly as `swap.logic.ts`'s parsers report one.
+ *
+ * DERIVED rather than re-declared, for the reason
+ * `mealPlan.service.ts::MealPlanRefusal` states: the logic module does not
+ * export its error branch by name, and a hand-written copy would be free to
+ * drift from the `message`/`details` pairs the client renders beside its own
+ * fields. `ParsedSwapCommitRequest` is the one derived from because the three
+ * parsers share ONE error verdict — only their `ok` branches differ — so a
+ * single refusal type serves all three routes and the alternatives, preview and
+ * commit cannot come to disagree about what an `invalid_request` looks like.
+ *
+ * RETURNED, never thrown, and carrying no status code: the controller maps it to
+ * `400 invalid_request` (§8), while a state conflict stays one of the typed
+ * classes in `mealPlanning.errors.ts`. That split is the same one
+ * `targets.service.ts` documents, and it is why there is no
+ * `InvalidRequestError` to throw.
+ */
+export type SwapRefusal = Exclude<ParsedSwapCommitRequest, { kind: 'ok' }>;
+
+/** The alternatives list, or the path parser's refusal verbatim. */
+export type SwapAlternativesResult = { kind: 'ok'; response: SwapAlternativesResponse } | SwapRefusal;
+
+/** One candidate's preview, or the path parser's refusal verbatim. */
+export type SwapPreviewResult = { kind: 'ok'; response: SwapPreviewResponse } | SwapRefusal;
+
+/** The ledger's result for a committed swap, or the request parser's refusal verbatim. */
+export type CommitSwapResult = { kind: 'ok'; result: KeyedActionResult } | SwapRefusal;
+
+/* ---------------------------------------------------------------------------
  * The list
  * ------------------------------------------------------------------------- */
 
@@ -512,25 +570,40 @@ const requireDayResponse = async (
  * composes around it. Ownership is still absolute: a foreign or invented plan or
  * meal id is `PlanNotFoundError` from `loadSwapContext`, whatever the plan's
  * status.
+ *
+ * BOTH PATH IDS ARE PARSED FIRST, before the read: an id that is not a UUID v4
+ * is {@link SwapRefusal} (the controller's `400 invalid_request`) rather than a
+ * predicate handed to Prisma, so a route reached with `meals/undefined` says
+ * what was wrong with the request instead of answering `404` for a plan that was
+ * never named.
  */
 export const getSwapAlternatives = async (
     userId: string,
     planId: string,
     mealId: string,
-): Promise<SwapAlternativesResponse> => {
-    const context = await loadSwapContext(prisma, userId, planId, mealId);
+): Promise<SwapAlternativesResult> => {
+    const parsed = parseSwapAlternativesPath({ planId, mealId });
+
+    if (parsed.kind !== 'ok') {
+        return parsed;
+    }
+
+    const context = await loadSwapContext(prisma, userId, parsed.planId, parsed.mealId);
     const candidates = selectSwapCandidates(context.selection);
     const versions = await loadCandidateVersions(prisma, candidates);
 
     return {
-        current: await requireMealResponse(prisma, userId, planId, mealId),
-        alternatives: candidates.map((candidate) =>
-            mapSwapAlternative(
-                requireCandidateVersion(versions, candidate),
-                candidate.portionMultiplier,
-                roundNutritionForDisplay(candidate.nutrition),
+        kind: 'ok',
+        response: {
+            current: await requireMealResponse(prisma, userId, parsed.planId, parsed.mealId),
+            alternatives: candidates.map((candidate) =>
+                mapSwapAlternative(
+                    requireCandidateVersion(versions, candidate),
+                    candidate.portionMultiplier,
+                    roundNutritionForDisplay(candidate.nutrition),
+                ),
             ),
-        ),
+        },
     };
 };
 
@@ -567,6 +640,25 @@ export const getSwapAlternatives = async (
  * with the day card's, and the integer it shows for this candidate is the same
  * integer the alternatives row showed.
  *
+ * `nutrition` IS THE PORTION'S; `alternative.recipe.ingredients` ARE THE WHOLE
+ * RECIPE'S. That asymmetry is inherent to the envelope rather than an
+ * oversight, and it is written down here because a client that misses it draws
+ * frame 13b with whole-recipe ingredient amounts beside portion-scaled
+ * nutrition. `nutrition` is this candidate AT `portionMultiplier`, already
+ * scaled by `recipe.logic.ts::scalePlannedNutrition`, while the recipe is the
+ * unmodified `RecipeVersionResponse` — that DTO carries no planned-meal context
+ * by design (§0.5.2), so its `quantity`, `gramWeight` and `displayText` are the
+ * recipe as published, for `recipe.yieldServings` servings.
+ *
+ * No second, pre-scaled ingredient collection is sent, because the envelope
+ * already carries both factors the client needs — `portionMultiplier` here and
+ * `yieldServings` on the recipe — so a portion amount is
+ * `quantity × portionMultiplier / yieldServings`, exactly as recipe detail
+ * derives its "Your portion" column. Emitting a scaled copy as well would give
+ * one number two sources of truth and put a display-rounding rule in a second
+ * place. The mobile side applies that formula through the one shared helper
+ * both screens call (`mobile/src/utility/RecipeIngredientUtility.ts`).
+ *
  * `planRevision` is the revision the preview was computed against; the client
  * sends it back as `expectedPlanRevision` to commit, and a plan that has moved
  * since is answered `409 stale_plan` there.
@@ -580,15 +672,28 @@ export const getSwapAlternatives = async (
  * `409 plan_not_active` belongs, which is also where the client learns to move
  * to the replacement week. Ownership is unaffected: a foreign or invented id is
  * still `PlanNotFoundError`.
+ *
+ * ALL THREE PATH IDS ARE PARSED FIRST, before the read, and `recipeVersionId`
+ * is the one that would otherwise be mislabelled: an unvalidated value reaches
+ * `selectSwapCandidate`, which answers `422 recipe_ineligible` — "that meal no
+ * longer fits" — for a caller that in fact requested
+ * `alternatives/undefined/preview`. Parsed here, it is {@link SwapRefusal} and
+ * the controller's `400 invalid_request`.
  */
 export const getSwapPreview = async (
     userId: string,
     planId: string,
     mealId: string,
     recipeVersionId: string,
-): Promise<SwapPreviewResponse> => {
-    const context = await loadSwapContext(prisma, userId, planId, mealId);
-    const candidate = selectSwapCandidate(context.selection, recipeVersionId);
+): Promise<SwapPreviewResult> => {
+    const parsed = parseSwapPreviewPath({ planId, mealId, recipeVersionId });
+
+    if (parsed.kind !== 'ok') {
+        return parsed;
+    }
+
+    const context = await loadSwapContext(prisma, userId, parsed.planId, parsed.mealId);
+    const candidate = selectSwapCandidate(context.selection, parsed.recipeVersionId);
     const recipe = await getRecipeVersionDetail(candidate.recipe.recipe_version_id, prisma);
 
     if (recipe === null) {
@@ -601,16 +706,19 @@ export const getSwapPreview = async (
     }
 
     return {
-        alternative: {
-            recipe,
-            portionMultiplier: candidate.portionMultiplier,
-            portionText: formatPortionText(candidate.portionMultiplier),
-            nutrition: candidate.nutrition,
+        kind: 'ok',
+        response: {
+            alternative: {
+                recipe,
+                portionMultiplier: candidate.portionMultiplier,
+                portionText: formatPortionText(candidate.portionMultiplier),
+                nutrition: candidate.nutrition,
+            },
+            dayTotalsIfSwapped: candidate.dayTotalsIfSwapped,
+            targets: context.selection.targets,
+            calorieDelta: candidate.calorieDelta,
+            planRevision: context.planRevision,
         },
-        dayTotalsIfSwapped: candidate.dayTotalsIfSwapped,
-        targets: context.selection.targets,
-        calorieDelta: candidate.calorieDelta,
-        planRevision: context.planRevision,
     };
 };
 
@@ -669,29 +777,52 @@ export const getSwapPreview = async (
  *     confirmation copy renders.
  *  8. `meal_plans.revision` is incremented, as a compare-and-swap on the pinned
  *     value, and the response carries the new number.
+ *
+ * STEP ZERO IS THE PARSE, and it is outside the transaction because it reads no
+ * state: `parseSwapCommitRequest` judges the two path ids and the four body
+ * fields together, and its refusal is returned for the controller to answer
+ * `400 invalid_request`. Nothing below may run before it. The fingerprint the
+ * reservation is keyed against is built from `parsed.payload` — the requirement
+ * `mealPlanningAction.logic.ts::buildRequestFingerprint` states, because it
+ * refuses a magnitude it cannot canonicalise and a raw body would make that a
+ * `500` — and `requireBoundPortion` at step 4 must never see an unparsed
+ * portion, which it would refuse as `409 preview_stale` and send the client back
+ * to re-preview a request that is invalid however often it is retried.
  */
 export const commitSwap = async (
     userId: string,
     planId: string,
     mealId: string,
-    payload: SwapMealPayload,
+    body: unknown,
     now: Date = new Date(),
-): Promise<KeyedActionResult> =>
-    prisma.$transaction((tx) =>
+): Promise<CommitSwapResult> => {
+    const parsed = parseSwapCommitRequest({ planId, mealId }, body);
+
+    if (parsed.kind !== 'ok') {
+        return parsed;
+    }
+
+    const payload: SwapMealPayload = parsed.payload;
+    const result = await prisma.$transaction((tx) =>
         runKeyedAction(
             tx,
             {
                 userId,
                 actionType: 'swap',
                 idempotencyKey: payload.idempotencyKey,
-                fingerprint: buildRequestFingerprint('POST', 'swap', { planId, mealId }, payload),
+                fingerprint: buildRequestFingerprint(
+                    'POST',
+                    'swap',
+                    { planId: parsed.planId, mealId: parsed.mealId },
+                    payload,
+                ),
             },
             async (lockedTx) => {
                 const today = await resolveToday(userId, now, lockedTx);
 
-                requireWritablePlan(await loadSwapPlanState(lockedTx, userId, planId), today);
+                requireWritablePlan(await loadSwapPlanState(lockedTx, userId, parsed.planId), today);
 
-                const context = await loadSwapContext(lockedTx, userId, planId, mealId);
+                const context = await loadSwapContext(lockedTx, userId, parsed.planId, parsed.mealId);
 
                 if (context.planRevision !== payload.expectedPlanRevision) {
                     throw new StalePlanError(context.planRevision);
@@ -710,25 +841,28 @@ export const commitSwap = async (
                 });
                 const groceryChangeSummary = await rebuildPlanGroceries(lockedTx, {
                     userId,
-                    planId,
-                    meals: await loadPlannedMealsForGroceries(lockedTx, userId, planId),
+                    planId: parsed.planId,
+                    meals: await loadPlannedMealsForGroceries(lockedTx, userId, parsed.planId),
                     now,
                 });
 
                 return {
                     body: {
-                        meal: await requireMealResponse(lockedTx, userId, planId, mealId),
-                        day: await requireDayResponse(lockedTx, userId, planId, context.date),
+                        meal: await requireMealResponse(lockedTx, userId, parsed.planId, parsed.mealId),
+                        day: await requireDayResponse(lockedTx, userId, parsed.planId, context.date),
                         planRevision: planRevisionAfter,
                         groceryChangeSummary,
                     },
                     planRevisionAfter,
-                    mealPlanId: planId,
-                    mealPlanMealId: mealId,
+                    mealPlanId: parsed.planId,
+                    mealPlanMealId: parsed.mealId,
                 };
             },
         ),
     );
+
+    return { kind: 'ok', result };
+};
 
 /** What one committed swap writes, beyond the grocery reconciliation. */
 interface SwapWrite {

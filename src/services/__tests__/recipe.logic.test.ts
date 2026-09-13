@@ -46,15 +46,19 @@ import {
     isMealSlot,
     isRecipeBadge,
     isRecipeIconKey,
+    ParsedRecipeVersionPath,
+    parseRecipeVersionPath,
     PlanningEligibilityCode,
     PlanningPreferences,
     PlanningRecipeVersion,
     PREFERENCE_FLAG_CODES,
+    RECIPE_FIELD_CODES,
     QUICK_MAX_TOTAL_MINUTES,
     RecipeDeclaration,
     RecipeDerivationError,
     RecipeIngredientSnapshot,
     RecipePublicationIngredient,
+    RecipeVersionPathRefusal,
     roundNutritionForDisplay,
     scaleIngredients,
     scalePlannedNutrition,
@@ -1947,6 +1951,103 @@ describe('evaluatePlanningEligibility', () => {
             'slot',
         ]);
         expect(isEligibleForPlanning(recipe, preferences, 'breakfast')).toBe(false);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Request parsing
+ *
+ * `GET /recipes/:recipeVersionId` puts its path segment straight into a
+ * PostgreSQL `uuid` predicate, so a malformed one would become a Prisma
+ * failure and a generic 500 where the contract promises a 400 naming the
+ * field. The parser decides only whether the value COULD denote a version;
+ * whether one exists, and whether this caller may read it, stays the service's
+ * 404.
+ * ------------------------------------------------------------------------- */
+
+describe('parseRecipeVersionPath', () => {
+    const RECIPE_VERSION_ID = '9d2c5b3a-7e41-4f6b-8c1d-0a2b3c4d5e6f';
+
+    /** The single detail of a refusal, or a failure that says it was accepted. */
+    const refusal = (parsed: ParsedRecipeVersionPath) => {
+        if (parsed.kind !== 'error') {
+            throw new Error('expected the parser to reject this path');
+        }
+
+        return parsed;
+    };
+
+    it('accepts a v4 UUID and returns it unchanged', () => {
+        expect(parseRecipeVersionPath({ recipeVersionId: RECIPE_VERSION_ID })).toEqual({
+            kind: 'ok',
+            recipeVersionId: RECIPE_VERSION_ID,
+        });
+    });
+
+    it('accepts an upper-case UUID unchanged, because the column comparison is not case sensitive', () => {
+        expect(parseRecipeVersionPath({ recipeVersionId: RECIPE_VERSION_ID.toUpperCase() })).toEqual({
+            kind: 'ok',
+            recipeVersionId: RECIPE_VERSION_ID.toUpperCase(),
+        });
+    });
+
+    it.each([
+        ['a malformed id', 'recipe-1'],
+        // A v1 UUID: right shape, wrong version nibble.
+        ['a v1 UUID', '9d2c5b3a-7e41-1f6b-8c1d-0a2b3c4d5e6f'],
+        // The v4 nibble is right but the variant nibble is not.
+        ['a wrong variant', '9d2c5b3a-7e41-4f6b-2c1d-0a2b3c4d5e6f'],
+        ['a truncated id', '9d2c5b3a-7e41-4f6b-8c1d-0a2b3c4d5e'],
+        ['a braced id', '{9d2c5b3a-7e41-4f6b-8c1d-0a2b3c4d5e6f}'],
+        ['an unhyphenated id', '9d2c5b3a7e414f6b8c1d0a2b3c4d5e6f'],
+        ['an empty segment', ''],
+        ['a whitespace segment', ' '],
+        ['an absent segment', undefined],
+        ['an explicit null', null],
+        ['a number', 42],
+        ['an object', { recipeVersionId: '9d2c5b3a-7e41-4f6b-8c1d-0a2b3c4d5e6f' }],
+        ['an array', ['9d2c5b3a-7e41-4f6b-8c1d-0a2b3c4d5e6f']],
+    ])('refuses %s', (_label, recipeVersionId) => {
+        expect(parseRecipeVersionPath({ recipeVersionId })).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: expect.stringContaining('recipeVersionId'),
+            details: [{ field: 'recipeVersionId', code: RECIPE_FIELD_CODES.INVALID_ID }],
+        });
+    });
+
+    it('names the field and its code in the diagnostic message', () => {
+        const parsed = refusal(parseRecipeVersionPath({ recipeVersionId: 'recipe-1' }));
+
+        expect(parsed.message).toContain('recipeVersionId');
+        expect(parsed.message).toContain(RECIPE_FIELD_CODES.INVALID_ID);
+    });
+
+    it('speaks the layer\u2019s one code vocabulary', () => {
+        expect(RECIPE_FIELD_CODES.INVALID_ID).toBe('invalid_id');
+    });
+
+    it('returns its verdict rather than throwing, for every input', () => {
+        for (const recipeVersionId of [RECIPE_VERSION_ID, 'recipe-1', undefined, null, 42]) {
+            expect(() => parseRecipeVersionPath({ recipeVersionId })).not.toThrow();
+        }
+    });
+
+    it('exports its refusal branch as a type a caller can declare', () => {
+        // `recipe.service.ts::getRecipeVersionForUser` returns this branch
+        // verbatim beside its own ok shape, so the alias has to remain both
+        // exported and assignable from a real refusal — a narrowing that stops
+        // compiling, or an alias quietly dropped, is what would push that
+        // service back to re-declaring the verdict shape by hand.
+        const refused: RecipeVersionPathRefusal = refusal(
+            parseRecipeVersionPath({ recipeVersionId: 'recipe-1' }),
+        );
+
+        expect(refused.kind).toBe('error');
+        expect(refused.code).toBe('invalid_request');
+        expect(refused.details).toEqual([
+            { field: 'recipeVersionId', code: RECIPE_FIELD_CODES.INVALID_ID },
+        ]);
     });
 });
 

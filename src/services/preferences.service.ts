@@ -71,6 +71,11 @@ import {
 import { startDateWindow } from './mealPlan.logic';
 import { PlanningPreferences, PREFERENCE_FLAG_CODES, isMealSlot } from './recipe.logic';
 import { getPlanningRecipeVersionsByIds } from './recipe.service';
+// The pure rule that decides whether a write moves the energy equation's own
+// inputs. It lives in the targets domain because that is whose truth it serves
+// — `TargetsResponse.stale` — and this service is the only thing that advances
+// the counter it guards.
+import { estimateInputsChanged } from './targets.logic';
 
 /**
  * The IANA zone assumed when a user has no preferences row yet, or has one that
@@ -186,6 +191,14 @@ export interface PreferencesRow {
     targets_revision: number;
     confirmed_targets: unknown;
     targets_input_revision: number | null;
+    /**
+     * The counter behind `TargetsResponse.stale`, advanced by this service and
+     * read by `targets.logic.ts::deriveTargetsResponse`. It is NOT `revision`:
+     * `revision` moves on every save of any preference, while this one moves
+     * only when one of the seven answers the energy equation reads changes
+     * value, so an unrelated edit cannot mark a confirmed estimate stale.
+     */
+    estimate_inputs_revision: number;
     revision: number;
 }
 
@@ -533,6 +546,13 @@ const NOT_STARTED_PREFERENCES: PreferencesResponse = {
  *
  * `dislikedFoods` and `hasActivePlan` are passed in rather than read here: this
  * function is pure, and both need I/O the caller has already done.
+ *
+ * `targetRoute` is narrowed the same cautious way, and it carries more than the
+ * route: it is the response's record that the body step was answered (the
+ * contract states it on `PreferencesResponse`, and `PROVABLE_STEP_ANSWERS`
+ * reads the column for the same purpose). A value the vocabulary no longer
+ * contains therefore reports null, which re-asks that step rather than
+ * resuming past it on an answer nobody can read.
  */
 const mapPreferences = (
     row: PreferencesRow,
@@ -1273,6 +1293,37 @@ const setupStateOf = (row: PreferencesRow | null): SetupStateSnapshot => ({
 });
 
 /**
+ * The `estimate_inputs_revision` this write leaves behind, or `undefined` when
+ * it moves none of the estimate's inputs.
+ *
+ * `undefined` is Prisma's "do not write this column", so an unrelated save
+ * leaves the counter exactly where it stood — and that is the whole point. A
+ * diet, allergy, dislike, schedule, budget, review-date, unit-preference or
+ * time-zone edit bumps `revision` (a client pins it to detect a lost update)
+ * but must NOT make a confirmed estimate stale, because none of those answers
+ * can move the figure the equation produces. On creation `undefined` falls
+ * through to the column's own `DEFAULT 0`.
+ *
+ * The decision is `targets.logic.ts::estimateInputsChanged` — a pure, tested
+ * rule read in Prisma's own write semantics (absent or `undefined` is not a
+ * write; an explicit `null` is a clear; an identical value is not a change), so
+ * this service only turns its verdict into the next value. Nothing here writes
+ * `targets_input_revision`: that column belongs to `targets.service.ts`, which
+ * is the single canonical target writer, and each counter keeping exactly one
+ * writer is what stops the two drifting.
+ */
+const nextEstimateInputsRevision = (
+    current: PreferencesRow | null,
+    writes: PreferenceColumnWrites,
+): number | undefined => {
+    if (!estimateInputsChanged(current, writes)) {
+        return undefined;
+    }
+
+    return current === null ? FIRST_REVISION : current.estimate_inputs_revision + 1;
+};
+
+/**
  * `PUT /api/meal-planning/preferences/steps/:step` — one setup answer.
  *
  * THE PARSE HAPPENS TWICE, DELIBERATELY. The first call rejects a malformed body
@@ -1356,6 +1407,7 @@ export const saveSetupStep = async (
                         setup_step: transition.setupStep,
                         target_route: transition.targetRoute,
                         revision: FIRST_REVISION,
+                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
                         ...columns.writes,
                     },
                 });
@@ -1372,6 +1424,10 @@ export const saveSetupStep = async (
                         setup_step: transition.setupStep,
                         target_route: transition.targetRoute,
                         revision: current.revision + 1,
+                        // Advanced only by a real change to goal, pace, age,
+                        // height, weight, sex or activity — see
+                        // `nextEstimateInputsRevision`.
+                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
                         ...columns.writes,
                     },
                 });
@@ -1558,6 +1614,7 @@ export const savePreferences = async (
                         time_zone: timeZone,
                         setup_status: 'not_started',
                         revision: FIRST_REVISION,
+                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
                         ...columns.writes,
                     },
                 });
@@ -1567,6 +1624,10 @@ export const savePreferences = async (
                     data: {
                         time_zone: timeZone,
                         revision: current.revision + 1,
+                        // A settings edit that moves an estimate input advances
+                        // this counter and so flips `TargetsResponse.stale`; one
+                        // that moves anything else leaves it alone.
+                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
                         ...columns.writes,
                     },
                 });

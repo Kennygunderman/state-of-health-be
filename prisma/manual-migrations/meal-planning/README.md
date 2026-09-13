@@ -119,10 +119,17 @@ preferences, recipes and the whole catalog, including the retained USDA-derived
 snapshot data. Diary history survives, by design — the links this feature added
 to `meal_entries` are nullable, so dropping them **detaches** planned and
 catalog-logged entries rather than deleting them, each row keeping its name,
-servings and macro snapshot and losing only its provenance caption. Loading a
-catalog back afterwards is a fresh load rather than a restore, and the pipeline
-that does it is still landing on this branch — `docs/meal-planning/release-and-recovery.md`
-tracks what is wired — so the backup is the only way back to that data today.
+servings and macro snapshot and losing only its provenance caption.
+
+Re-populating afterwards is not the same as restoring. A `catalog:load` of a
+reviewed release plus `recipes:seed` rebuilds the shared catalog and recipe
+content with **new identifiers** — never the rows that were dropped, and never
+the user data beside them, since plans, grocery check state, preferences and the
+action ledger appear in no release. Only the backup you took first returns
+those. Whether that load path can run in the tree you are holding is tracked in
+one place, `docs/meal-planning/release-and-recovery.md` — as this is written the
+stages stop before any database write, so today the backup is the only way back
+to either, as well as the only way back to the exact rows.
 
 The Prisma ledger then needs reconciling, because `_prisma_migrations` still
 records the migration as applied: `migrate deploy` would report nothing pending

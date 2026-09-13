@@ -40,12 +40,10 @@
 import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
 import {
-    InvalidRequestDetail,
     MealPlanMacroTotals,
     NutritionTargetValues,
     SaveTargetsResponse,
     TargetEstimateResponse,
-    TargetRoute,
     TargetsResponse,
 } from '../types/mealPlanning';
 import {
@@ -55,17 +53,18 @@ import {
     TargetsMissingError,
     TargetsUnconfirmedError,
 } from './mealPlanning.errors';
-import { withUserLock } from './mealPlanningAction.service';
+import { MealPlanningTransactionClient, withUserLock } from './mealPlanningAction.service';
 import { updateTargets } from './nutrition.service';
-import { PREFERENCE_FIELD_CODES } from './preferences.logic';
 import { PreferencesRow, loadPreferencesRow } from './preferences.service';
 import {
-    MANUAL_TARGET_FIELD_CODES,
+    EstimatedSaveRequest,
+    TargetsErrorVerdict,
+    TargetsPreferencesRow,
     TargetsUserRow,
     assessFeasibility,
     computeTargetEstimate,
     deriveTargetsResponse,
-    parseManualTargets,
+    parseSaveTargetsRequest,
     resolveEstimateInputs,
 } from './targets.logic';
 
@@ -101,28 +100,145 @@ const NO_STORED_TARGETS: TargetsUserRow = {
 };
 
 /**
- * The stored targets of one user.
+ * Whether a target read also pins the owning `users` row against the legacy
+ * writer for the rest of the transaction.
  *
- * `where: {id: userId}` IS the owner key (§5.1) — the primary key of the owning
- * row — so this read is user-scoped by construction. The four columns are
- * projected explicitly because nothing else about the user belongs in a target
- * response.
+ *  - `'read_only'` — no lock. Every display read: `GET /meal-planning/targets`,
+ *    Account, Progress, and the plan response's current-targets reconciliation.
+ *    A value that changes the instant after it was read is not a correctness
+ *    problem for a screen; an INCOHERENT PAIR would be, which is why even this
+ *    mode is one statement.
+ *  - `'locked_for_write'` — `SELECT … FOR UPDATE OF u`. The publication gate,
+ *    and only inside an interactive transaction: the row lock is held until
+ *    COMMIT, so `PUT /api/user/targets` — which writes `users.target_*` outside
+ *    the per-user advisory lock by design — cannot commit between the check and
+ *    the plan insert.
  */
-const loadStoredTargets = async (
+type TargetsReadMode = 'read_only' | 'locked_for_write';
+
+/** `FOR UPDATE OF u` — the non-nullable side of the outer join, the only side Postgres allows locking. */
+const USERS_ROW_LOCK = Prisma.sql`FOR UPDATE OF u`;
+
+/**
+ * The join as it comes back from Postgres. Every `p.*` column is nullable here
+ * whatever the table says, because a LEFT JOIN with no match fills them all
+ * with NULL; `preferences_user_id` is the sentinel that tells the two cases
+ * apart, since `meal_plan_preferences.user_id` is NOT NULL and unique.
+ */
+interface TargetsJoinRow {
+    target_calories: number | null;
+    target_protein_g: number | null;
+    target_carbs_g: number | null;
+    target_fat_g: number | null;
+    preferences_user_id: string | null;
+    target_source: string | null;
+    targets_revision: number | null;
+    confirmed_targets: unknown;
+    targets_input_revision: number | null;
+    estimate_inputs_revision: number | null;
+}
+
+/** The two rows `deriveTargetsResponse` judges, read together. */
+interface StoredTargetsPair {
+    user: TargetsUserRow;
+    preferences: TargetsPreferencesRow | null;
+}
+
+/**
+ * The stored targets of one user and the record that attributes them, read in
+ * ONE STATEMENT.
+ *
+ * WHY ONE STATEMENT AND NOT TWO READS. The verdict
+ * `deriveTargetsResponse` reaches is a COMPARISON BETWEEN THESE TWO ROWS: the
+ * four `users.target_*` columns against `confirmed_targets`. Read as two
+ * statements, each takes its own READ COMMITTED snapshot, and the untouched
+ * `PUT /api/user/targets` — which holds no meal-planning lock — can commit
+ * between them. The pair then looks self-consistent (`users` T1 equals the
+ * snapshot T1, so the source resolves to a confirmed route) while the committed
+ * canonical value is already T2, and a week can be published against T1 and
+ * presented as confirmed. One statement is one snapshot, so that reading cannot
+ * be assembled: either both rows predate the legacy write or both follow it,
+ * and in the second case the values differ from the snapshot and the source is
+ * `legacy` — exactly the signal the planner refuses on.
+ *
+ * `WHERE u.id = $1` IS the owner key (§5.1) — the primary key of the owning row
+ * — so the read is user-scoped by construction, and the join predicate
+ * `p.user_id = u.id` keeps the preferences half scoped to the same owner. No
+ * other column of either table is projected: nothing else about the user
+ * belongs in a target response.
+ *
+ * A user with no `users` row yields no rows at all, which reads back as
+ * all-null targets — the honest answer, since a row cannot hold a target it does
+ * not have. It is unreachable on an authenticated request, because the account
+ * exists before any token is issued for it.
+ */
+const readStoredTargets = async (
     userId: string,
     db: Prisma.TransactionClient,
-): Promise<TargetsUserRow> => {
-    const user = await db.users.findUnique({
-        where: { id: userId },
-        select: {
-            target_calories: true,
-            target_protein_g: true,
-            target_carbs_g: true,
-            target_fat_g: true,
-        },
-    });
+    mode: TargetsReadMode,
+): Promise<StoredTargetsPair> => {
+    const rows = await db.$queryRaw<TargetsJoinRow[]>(Prisma.sql`
+        SELECT
+            u.target_calories,
+            u.target_protein_g,
+            u.target_carbs_g,
+            u.target_fat_g,
+            p.user_id AS preferences_user_id,
+            p.target_source,
+            p.targets_revision,
+            p.confirmed_targets,
+            p.targets_input_revision,
+            p.estimate_inputs_revision
+        FROM users u
+        LEFT JOIN meal_plan_preferences p ON p.user_id = u.id
+        WHERE u.id = ${userId}
+        ${mode === 'locked_for_write' ? USERS_ROW_LOCK : Prisma.empty}
+    `);
 
-    return user ?? NO_STORED_TARGETS;
+    const row = rows[0];
+
+    if (row === undefined) {
+        return { user: NO_STORED_TARGETS, preferences: null };
+    }
+
+    return {
+        user: {
+            target_calories: row.target_calories,
+            target_protein_g: row.target_protein_g,
+            target_carbs_g: row.target_carbs_g,
+            target_fat_g: row.target_fat_g,
+        },
+        preferences: readPreferencesHalf(row),
+    };
+};
+
+/**
+ * The preferences half of the join, or null when the user has no row.
+ *
+ * The two NOT NULL revision columns are re-checked because a raw projection is
+ * typed by hand: the only way they can arrive NULL is the no-row case the
+ * sentinel has already answered, so this cannot fire — and if it ever did,
+ * failing loudly is the only alternative to inventing a revision that a stale
+ * check or a client's pin would then be compared against.
+ */
+const readPreferencesHalf = (row: TargetsJoinRow): TargetsPreferencesRow | null => {
+    if (row.preferences_user_id === null) {
+        return null;
+    }
+
+    if (row.targets_revision === null || row.estimate_inputs_revision === null) {
+        throw new Error(
+            `meal_plan_preferences row for ${row.preferences_user_id} returned NULL in a NOT NULL revision column`,
+        );
+    }
+
+    return {
+        target_source: row.target_source,
+        targets_revision: row.targets_revision,
+        confirmed_targets: row.confirmed_targets,
+        targets_input_revision: row.targets_input_revision,
+        estimate_inputs_revision: row.estimate_inputs_revision,
+    };
 };
 
 /* ---------------------------------------------------------------------------
@@ -140,18 +256,21 @@ const loadStoredTargets = async (
  * show "review your targets" while another silently planned a week on the same
  * numbers.
  *
- * The two reads are sequential because `db` may be an interactive transaction
- * client — generation calls this under the per-user lock through
- * {@link requireConfirmedTargets} — and that client is a single connection.
+ * THE TWO ROWS ARE READ IN ONE STATEMENT, so the pair is always one consistent
+ * snapshot even while the untouched legacy writer is committing (see
+ * {@link readStoredTargets}). This read takes no lock: a display value that
+ * moves the moment after it was read is not a correctness problem, and locking
+ * the owning row on a GET would make every screen wait behind a target write.
+ * The WRITE path is what needs the lock, and it asks for it explicitly through
+ * {@link requireConfirmedTargets}.
  */
 export const getTargets = async (
     userId: string,
     db: Prisma.TransactionClient = prisma,
 ): Promise<TargetsResponse> => {
-    const userRow = await loadStoredTargets(userId, db);
-    const preferencesRow = await loadPreferencesRow(userId, db);
+    const { user, preferences } = await readStoredTargets(userId, db, 'read_only');
 
-    return deriveTargetsResponse(userRow, preferencesRow);
+    return deriveTargetsResponse(user, preferences);
 };
 
 /* ---------------------------------------------------------------------------
@@ -201,64 +320,11 @@ export const getTargetEstimate = async (
 /* ---------------------------------------------------------------------------
  * PUT /meal-planning/targets — the envelope
  *
- * THIS PARSER BELONGS IN `targets.logic.ts` AND IS HERE ONLY BECAUSE THAT FILE
- * IS ANOTHER UNIT'S AT THIS CHECKPOINT. It is written the way every parser in
- * that layer is written — pure, synchronous, returning a verdict rather than
- * throwing, reporting every offending field in one answer — so moving it is a
- * cut and paste with no behavioural change. `parseManualTargets` already owns
- * the four manual VALUES and is called rather than re-implemented; what is added
- * here is only the envelope around them: which of the two shapes was sent, the
- * estimate revision the estimated shape pins, and the targets revision both
- * shapes pin.
+ * The parser itself lives in `targets.logic.ts` with every other request parser
+ * (Rule backend-architecture §2); this file only calls it and returns its
+ * refusal verbatim. What remains here is the one Prisma column concern the
+ * write needs.
  * ------------------------------------------------------------------------- */
-
-/** The two sources the envelope may declare, as a closed set keyed off the DTO union. */
-const TARGET_SOURCES: Readonly<Record<TargetRoute, true>> = { estimated: true, manual: true };
-
-/** Confirming the server-calculated estimate: the client never sends the numbers. */
-interface EstimatedSaveRequest {
-    source: 'estimated';
-    /** The preferences revision the displayed estimate was computed from. */
-    estimateRevision: number;
-    /** null when the body pinned no targets revision, which is legal only before the first save. */
-    expectedTargetsRevision: number | null;
-}
-
-/** Hand-entered targets, stored exactly as given. */
-interface ManualSaveRequest {
-    source: 'manual';
-    values: MealPlanMacroTotals;
-    expectedTargetsRevision: number | null;
-}
-
-type SaveTargetsRequest = EstimatedSaveRequest | ManualSaveRequest;
-
-/** The refusal shape both this parser and {@link SaveTargetsResult} carry. */
-interface TargetsErrorVerdict {
-    kind: 'error';
-    code: 'invalid_request';
-    message: string;
-    details: InvalidRequestDetail[];
-}
-
-type ParsedSaveTargets = { kind: 'ok'; request: SaveTargetsRequest } | TargetsErrorVerdict;
-
-const invalidRequest = (details: InvalidRequestDetail[]): TargetsErrorVerdict => ({
-    kind: 'error',
-    code: 'invalid_request',
-    // A server-side diagnostic naming every offending field, in the same shape
-    // `targets.logic.ts::parseManualTargets` produces. The client renders
-    // `details`, never this string.
-    message: `invalid targets request: ${details
-        .map((detail) => `${detail.field} (${detail.code})`)
-        .join(', ')}`,
-    details,
-});
-
-const asRecord = (value: unknown): Record<string, unknown> | null =>
-    typeof value === 'object' && value !== null && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : null;
 
 /**
  * The confirmed snapshot as the JSONB column takes it.
@@ -273,124 +339,6 @@ const asRecord = (value: unknown): Record<string, unknown> | null =>
  */
 const asSnapshotColumnValue = (values: MealPlanMacroTotals): Prisma.InputJsonValue =>
     values as unknown as Prisma.InputJsonValue;
-
-/**
- * One optional revision field: absent, or a whole number that is not negative.
- *
- * Absent is reported as `null` rather than as a failure, because "no revision
- * pinned" is legal before the first save; whether it is legal THIS time depends
- * on the stored revision, which no pure parser can know, so that half of the
- * rule is applied under the lock in {@link saveTargets}.
- */
-const parseOptionalRevision = (
-    value: unknown,
-    field: string,
-): { revision: number | null } | InvalidRequestDetail => {
-    if (value === undefined || value === null) {
-        return { revision: null };
-    }
-
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-        return { field, code: MANUAL_TARGET_FIELD_CODES.INVALID_TYPE };
-    }
-
-    if (!Number.isInteger(value)) {
-        return { field, code: MANUAL_TARGET_FIELD_CODES.NOT_AN_INTEGER };
-    }
-
-    if (value < 0) {
-        return { field, code: MANUAL_TARGET_FIELD_CODES.BELOW_MINIMUM };
-    }
-
-    return { revision: value };
-};
-
-/** The same field, required — the estimated shape cannot be judged without it. */
-const parseRequiredRevision = (value: unknown, field: string): number | InvalidRequestDetail => {
-    if (value === undefined || value === null) {
-        return { field, code: MANUAL_TARGET_FIELD_CODES.REQUIRED };
-    }
-
-    const parsed = parseOptionalRevision(value, field);
-
-    return 'revision' in parsed ? (parsed.revision as number) : parsed;
-};
-
-/**
- * Validates the save envelope and reports every problem in one verdict.
- *
- * `source` is judged first and alone when it is unusable: the two shapes have
- * different required fields, so reporting "calories is required" for a body
- * whose `source` is misspelled would describe a shape the client never meant to
- * send.
- */
-const parseSaveTargetsRequest = (body: unknown): ParsedSaveTargets => {
-    const record = asRecord(body);
-
-    if (record === null) {
-        return invalidRequest([{ field: 'body', code: MANUAL_TARGET_FIELD_CODES.INVALID_TYPE }]);
-    }
-
-    const source = record.source;
-
-    if (source === undefined || source === null) {
-        return invalidRequest([{ field: 'source', code: MANUAL_TARGET_FIELD_CODES.REQUIRED }]);
-    }
-
-    if (typeof source !== 'string' || !Object.prototype.hasOwnProperty.call(TARGET_SOURCES, source)) {
-        // The same spelling every other parser in this feature uses for a value
-        // outside a closed set, imported rather than restated so the client maps
-        // one code.
-        return invalidRequest([{ field: 'source', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE }]);
-    }
-
-    const details: InvalidRequestDetail[] = [];
-    const expected = parseOptionalRevision(record.expectedTargetsRevision, 'expectedTargetsRevision');
-
-    if (!('revision' in expected)) {
-        details.push(expected);
-    }
-
-    if (source === 'manual') {
-        const values = parseManualTargets(record);
-
-        if (values.kind !== 'valid') {
-            details.push(...values.details);
-        }
-
-        if (details.length > 0 || values.kind !== 'valid') {
-            return invalidRequest(details);
-        }
-
-        return {
-            kind: 'ok',
-            request: {
-                source: 'manual',
-                values: values.values,
-                expectedTargetsRevision: (expected as { revision: number | null }).revision,
-            },
-        };
-    }
-
-    const estimateRevision = parseRequiredRevision(record.estimateRevision, 'estimateRevision');
-
-    if (typeof estimateRevision !== 'number') {
-        details.push(estimateRevision);
-    }
-
-    if (details.length > 0 || typeof estimateRevision !== 'number') {
-        return invalidRequest(details);
-    }
-
-    return {
-        kind: 'ok',
-        request: {
-            source: 'estimated',
-            estimateRevision,
-            expectedTargetsRevision: (expected as { revision: number | null }).revision,
-        },
-    };
-};
 
 /* ---------------------------------------------------------------------------
  * PUT /meal-planning/targets — the write
@@ -410,11 +358,18 @@ const NOT_STARTED_SETUP_STATUS = 'not_started';
  * them.
  *
  * `targetsInputRevision` is non-null only for a confirmed ESTIMATE: it is the
- * preferences revision whose goal, body, activity and pace produced the figure,
- * and `TargetsResponse.stale` is exactly its inequality with the current
- * revision. Manual targets carry null, because the user typed them and a later
- * change of inputs says nothing about them — leaving a previous estimate's input
- * revision behind would make a manual target claim an ancestry it does not have.
+ * `estimate_inputs_revision` whose goal, body, activity and pace produced the
+ * figure, and `TargetsResponse.stale` is exactly its inequality with the
+ * CURRENT `estimate_inputs_revision`. That counter — not the all-purpose
+ * `revision` — is what makes staleness mean "your details no longer produce
+ * this figure": `revision` advances on every preference save, so recording it
+ * here would make the next diet or schedule edit ask the user to recalculate a
+ * number nothing had moved (`targets.logic.ts::estimateInputsChanged` holds the
+ * rule that advances the right one).
+ *
+ * Manual targets carry null, because the user typed them and a later change of
+ * inputs says nothing about them — leaving a previous estimate's input revision
+ * behind would make a manual target claim an ancestry it does not have.
  */
 interface ResolvedTargetValues {
     values: MealPlanMacroTotals;
@@ -463,7 +418,12 @@ const resolveEstimatedValues = (
             carbs: estimate.carbs,
             fat: estimate.fat,
         },
-        targetsInputRevision: row.revision,
+        // `row.revision` is what `estimateRevision` pins — the wire check a few
+        // lines above, which refuses an estimate computed from answers that have
+        // since changed at all. What is RECORDED is the estimate-input counter,
+        // because that is what staleness is later judged against. Two revisions,
+        // two jobs; storing the wrong one is the whole of finding F02.
+        targetsInputRevision: row.estimate_inputs_revision,
     };
 };
 
@@ -605,17 +565,20 @@ export const saveTargets = async (
 const missingTargetFields = (targets: NutritionTargetValues | null): string[] =>
     targets === null ? [...TARGET_FIELDS] : TARGET_FIELDS.filter((field) => targets[field] === null);
 
+/** The four confirmed targets a plan may be built from. */
+export interface ConfirmedTargets {
+    targets: MealPlanMacroTotals;
+    targetsRevision: number;
+}
+
 /**
- * The four confirmed targets a plan may be built from, or the reason it may not
- * be.
+ * The verdict on a target read: the four confirmed values, or the typed reason a
+ * plan may not be built from them.
  *
- * THIS IS WHAT STOPS A WEEK BEING BUILT ON NUMBERS NOBODY CONFIRMED, and it runs
- * inside the caller's transaction on purpose: generation takes the per-user lock
- * and then re-reads the targets, so a legacy `PUT /api/user/targets` that slipped
- * in between the user's confirmation and the publication is caught here as
- * `targets_unconfirmed` rather than becoming a plan built on unconfirmed values
- * (AAP §0.5.1). `tx` is therefore required, not defaulted: a `prisma`-shaped
- * default would read outside the lock and silently give that up.
+ * Pure, and shared by the locked gate and the unlocked preflight so the two can
+ * never judge the same read differently — the preflight exists only to fail a
+ * hopeless request before a five-second search, and it would be worse than
+ * useless if it applied a different rule from the authoritative check.
  *
  * The three outcomes, in the order they are judged:
  *
@@ -634,12 +597,7 @@ const missingTargetFields = (targets: NutritionTargetValues | null): string[] =>
  * all-number. The re-check cannot fire, and if it ever did, failing loudly is
  * the only alternative to inventing a target.
  */
-export const requireConfirmedTargets = async (
-    tx: Prisma.TransactionClient,
-    userId: string,
-): Promise<{ targets: MealPlanMacroTotals; targetsRevision: number }> => {
-    const response = await getTargets(userId, tx);
-
+const judgeConfirmedTargets = (response: TargetsResponse): ConfirmedTargets => {
     if (response.targets === null || !response.complete) {
         throw new TargetsMissingError(missingTargetFields(response.targets));
     }
@@ -659,3 +617,72 @@ export const requireConfirmedTargets = async (
         targetsRevision: response.revision,
     };
 };
+
+/**
+ * The confirmed targets a plan may be built from, read under the OWNING USER
+ * ROW'S LOCK and held there until the transaction commits.
+ *
+ * THIS IS WHAT STOPS A WEEK BEING BUILT ON NUMBERS NOBODY CONFIRMED (AAP
+ * §0.5.1), and the lock is the half of it that the advisory lock cannot supply.
+ * `PUT /api/user/targets` stays untouched for API compatibility and writes
+ * `users.target_*` WITHOUT taking the per-user advisory lock, so that lock
+ * serialises this feature's own writes and nothing else. Two separate hazards
+ * follow, and both are closed here:
+ *
+ *  1. AN INCOHERENT PAIR. `deriveTargetsResponse`'s verdict compares the four
+ *     `users` columns with `confirmed_targets`. Read as two statements the
+ *     legacy write can land between them, and the pair then agrees with itself
+ *     while the committed value has already moved. `readStoredTargets` reads
+ *     both rows in one statement, so that reading cannot be assembled.
+ *  2. A WRITE AFTER THE CHECK. Even a coherent pair says nothing about the
+ *     instant after it was read, and the plan is inserted later in the same
+ *     transaction. `SELECT … FOR UPDATE OF u` takes the row lock the legacy
+ *     writer's own UPDATE must wait for, and an advisory-transaction lock is
+ *     released only at COMMIT or ROLLBACK — so from this call until the plan is
+ *     published, the confirmed pair this gate judged IS the committed pair.
+ *     `meal_plans.targets_snapshot` therefore cannot differ from
+ *     `confirmed_targets` at the moment it commits.
+ *
+ * A legacy write that landed BEFORE this read is seen by it: the values no
+ * longer match the snapshot, the source resolves to `legacy`, and the caller
+ * gets `409 targets_unconfirmed` instead of a plan. One that arrives after is
+ * blocked until this transaction ends and then applies to a plan that was built
+ * on values which were confirmed when it was built — the two orderings AAP
+ * §0.9.2 requires, with nothing in between.
+ *
+ * `tx` is `MealPlanningTransactionClient`, so the global client is a COMPILE
+ * ERROR rather than a comment asking callers not to pass it: on the autocommit
+ * client the row lock would be released the moment its own statement returned
+ * and hazard 2 would be wide open again while this code looked unchanged. A
+ * caller that only wants to fail fast before searching uses
+ * {@link previewConfirmedTargets} instead, and says so.
+ */
+export const requireConfirmedTargets = async (
+    tx: MealPlanningTransactionClient,
+    userId: string,
+): Promise<ConfirmedTargets> => {
+    const { user, preferences } = await readStoredTargets(userId, tx, 'locked_for_write');
+
+    return judgeConfirmedTargets(deriveTargetsResponse(user, preferences));
+};
+
+/**
+ * The same verdict, read WITHOUT the row lock and outside any transaction.
+ *
+ * ADVISORY ONLY, and never the basis of a publication. It exists so that a
+ * request which cannot possibly produce a plan — no targets, or targets nobody
+ * confirmed — is refused before the generator spends up to five seconds
+ * searching a week that could never be published. The authoritative check is
+ * {@link requireConfirmedTargets}, which runs inside the transaction under the
+ * per-user advisory lock and the users-row lock; whatever this one returns is
+ * re-judged there before anything is written.
+ *
+ * The read is still a single statement, so the values it returns are a coherent
+ * pair rather than two rows from different instants — a candidate week searched
+ * against a self-inconsistent pair would be discarded by the locked gate
+ * anyway, but there is no reason to search it.
+ */
+export const previewConfirmedTargets = async (
+    userId: string,
+    db: Prisma.TransactionClient = prisma,
+): Promise<ConfirmedTargets> => judgeConfirmedTargets(await getTargets(userId, db));

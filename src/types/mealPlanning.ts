@@ -165,6 +165,14 @@ export interface PreferencesResponse {
     // server computes "today" and every date bound in it. null before the first
     // save.
     timeZone: string | null;
+    // Which target route the user is on, and — because a body-step save is the only writer of it
+    // — the server's record THAT the body step was answered: 'manual' after Skip or "Prefer not
+    // to say", 'estimated' after a measured answer, null while the step is unanswered. This is
+    // the proof `preferences.logic.ts::PROVABLE_STEP_ANSWERS` reads for that step, and a client
+    // resuming setup must read it the same way: a saved Skip stores NO measurements (see
+    // `stepColumnWrites`), so treating null measurements as an unanswered step re-asks a screen
+    // the user has already finished, and a route inferred from measurement presence would be
+    // wrong in the other direction — a Skip taken after a measured pass keeps its measurements.
     targetRoute: TargetRoute | null;
     // Optimistic-concurrency token: echo it back as expectedRevision on the next
     // write. 0 when no row exists yet.

@@ -31,15 +31,21 @@
 -- before the foreign keys, and NOT NULL on the twelve required TEXT[]/UUID[]
 -- columns. Prisma cannot express any of them, which is why the authoritative
 -- migration writes them by hand and this copy repeats them verbatim. Of the
--- three, the generated expression is the one `prisma migrate diff` reports:
--- docs/meal-planning/expected-schema-diff.sql is that command's committed
--- output and CI compares it on every run. The expression index, the partial
--- indexes and the array NOT NULLs are invisible to that command - a shortfall
--- against what the Agent Action Plan expects of that file, recorded there as an
--- open conflict rather than settled - so for now what holds this copy to the
--- authoritative migration for them is the ledger-equivalence gate in
+-- three, the generated expression is the one `prisma migrate diff` reports.
+-- The expression index, the partial indexes and the array NOT NULLs are
+-- invisible to that command - a recorded AAP-versus-tool divergence, with the
+-- measurements behind it in the evidence file's header. All three classes are
+-- nonetheless policed on every CI run: docs/meal-planning/expected-schema-diff.sql
+-- carries the migrate-diff output AND two pg_catalog sections that pin the
+-- generated column's expression, every hand-managed index's access method,
+-- uniqueness, keys and predicate, and every array column's NOT NULL and
+-- default. Those sections measure the AUTHORITATIVE ledger as applied, never
+-- this operator copy, which that gate does not run - so what holds this copy to
+-- the authoritative migration remains the ledger-equivalence gate in
 -- src/__tests__/api/compat.test.ts, which applies both and compares the
--- resulting columns, indexes and constraints.
+-- resulting columns, indexes and constraints. The two are complementary: the
+-- equivalence gate cannot see a construct dropped from both ledgers at once,
+-- which is what the pg_catalog sections catch.
 --
 -- README.md in this folder explains when an operator would run this file and how
 -- to prove it still matches the authoritative ledger;
@@ -292,6 +298,7 @@ CREATE TABLE IF NOT EXISTS "meal_plan_preferences" (
     "targets_input_revision" INTEGER,
     "estimated_targets" JSONB,
     "revision" INTEGER NOT NULL DEFAULT 0,
+    "estimate_inputs_revision" INTEGER NOT NULL DEFAULT 0,
 
     CONSTRAINT "meal_plan_preferences_pkey" PRIMARY KEY ("id")
 );

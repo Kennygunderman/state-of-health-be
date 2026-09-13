@@ -93,19 +93,35 @@
 --   Retained vendor-derived data goes with those tables: the USDA identity and
 --   description fields on "catalog_foods", the ingredient snapshots on
 --   "recipe_ingredients", "meal_plans"."targets_snapshot" and
---   "meal_plan_actions"."response_snapshot". Putting a catalog back afterwards
---   is never a restore of these rows: it is a fresh load, and the identifiers
---   will not be the ones they used. The route for it is
---   `npm run catalog:load -- --release <v>` of a reviewed, checksummed release
---   followed by `npm run recipes:seed` - but that pipeline is still landing on
---   this branch (Agent Action Plan section 0.7.1, groups 3 and 4), so it is not
---   a recovery path to count on yet: as this file is committed, both scripts
---   stop at their input contract and report `stage_pipeline_pending`, and
---   data/meal-planning/catalog/releases/v1/ carries no manifest.json for the
---   loader to verify against. Check the state before relying on it - the status
---   table in docs/meal-planning/release-and-recovery.md tracks it, and
---   `npm run catalog:load -- --release v1` reports its own unmet inputs - and
---   until it is wired, the backup from step 3 is the only way back to this data.
+--   "meal_plan_actions"."response_snapshot".
+--
+-- WHAT A LOAD CAN PUT BACK, AND WHAT ONLY THE BACKUP CAN
+--   These are two different recoveries, and only one of them returns the rows
+--   this file destroyed.
+--   - A fresh load - `npm run catalog:load -- --release <v>` of a reviewed,
+--     checksummed release, then `npm run recipes:seed` - rebuilds the shared
+--     catalog and recipe content from the artefact committed in this repository
+--     (data/meal-planning/catalog/releases/), by the same route step 4 of the
+--     release order uses. It is never a restore of the dropped rows: the
+--     identifiers are new ones, so nothing that referenced the old rows finds
+--     them again, and the detached diary entries described below stay detached.
+--     It also rebuilds that shared content ONLY. Plans, grocery lists and their
+--     check marks, preferences, the confirmed-target bookkeeping and the
+--     "meal_plan_actions" ledger are user data that no release contains, so no
+--     load brings them back.
+--   - The backup from step 3 is the only thing that returns those exact rows -
+--     the same ids, the same plan and shopping history, the same stored
+--     responses. That is why step 3 is a precondition of this file and not a
+--     precaution around it.
+--   Whether the load path can run at all in the tree you are holding is tracked
+--   in one place, the status table in
+--   docs/meal-planning/release-and-recovery.md, and every stage reports its own
+--   unmet inputs on stderr and exits non-zero rather than half-loading, so
+--   `npm run catalog:load -- --release v1` answers the question directly. As
+--   this file is committed the answer is no - the stages verify their inputs,
+--   including the release manifest, and stop before any database write - which
+--   makes the backup the only way back to either kind of data today, as well as
+--   the only way back to the exact rows.
 --
 -- WHAT SURVIVES
 --   Diary history is left intact, which is the point of the ordering below. The

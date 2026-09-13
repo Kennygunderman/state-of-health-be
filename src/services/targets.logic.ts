@@ -1,8 +1,9 @@
 // The pure nutrition-target domain: the deterministic calorie/macro estimate,
-// the bounds that move it, the parser for hand-entered targets, and the truth
-// rules that tell every surface — review, plan settings, Account, Progress and
-// the diary — whether the numbers on screen are a confirmed estimate, a manual
-// entry, a legacy write, or a stale estimate.
+// the bounds that move it, the request parsers for the save route — the
+// hand-entered values and the envelope around them — and the truth rules that
+// tell every surface — review, plan settings, Account, Progress and the diary —
+// whether the numbers on screen are a confirmed estimate, a manual entry, a
+// legacy write, or a stale estimate.
 //
 // Everything here is deterministic and synchronous: no Prisma, no network, no
 // `process.env`, and no clock. The database rows this module reads are declared
@@ -25,6 +26,7 @@
 //  * BOUNDS ARE NOT A GOAL-SPECIFIC RULE. The floor applies to every goal, not
 //    just weight loss. See `applyTargetBounds`.
 
+import { MAX_REVISION, PREFERENCE_FIELD_CODES } from './preferences.logic';
 import {
     ActivityLevel,
     ClampReason,
@@ -35,9 +37,12 @@ import {
     MealPlanMacroTotals,
     NutritionTargetValues,
     PaceLbPerWeek,
+    SaveEstimatedTargetsPayload,
+    SaveManualTargetsPayload,
     SexForEstimate,
     TargetEstimateInputs,
     TargetEstimateResponse,
+    TargetRoute,
     TargetSource,
     TargetsFeasibility,
     TargetsResponse,
@@ -271,13 +276,26 @@ export interface TargetsUserRow {
  *
  * `confirmed_targets` is `unknown` because the column is `Json?`: it is data
  * this module must inspect defensively, never a shape it may assume.
+ *
+ * THE ALL-PURPOSE `revision` COLUMN IS DELIBERATELY NOT HERE. It advances on
+ * every preference save, so anything that compared against it would report a
+ * confirmed estimate as stale after a diet, allergy, dislike, schedule, budget,
+ * review-date or time-zone edit. Staleness is the inequality of the two
+ * ESTIMATE-INPUT counters below, and leaving `revision` out of the shape this
+ * read accepts is what stops that comparison being written again by accident —
+ * `deriveTargetsResponse` cannot reach a column it is never given. The revision
+ * that pins an estimate's inputs for `PUT /meal-planning/targets`
+ * (`estimateRevision`, AAP §0.5.2) is a separate concern and is read by
+ * `targets.service.ts` straight from the row.
  */
 export interface TargetsPreferencesRow {
     target_source: string | null;
     targets_revision: number;
     confirmed_targets: unknown;
+    /** The `estimate_inputs_revision` the confirmed estimate was computed at. */
     targets_input_revision: number | null;
-    revision: number;
+    /** Advanced only by a real change to one of {@link ESTIMATE_INPUT_COLUMNS}. */
+    estimate_inputs_revision: number;
 }
 
 /**
@@ -289,6 +307,12 @@ export interface TargetsPreferencesRow {
  *  - `below_minimum` — under the field's minimum. A macro of 0 is this code,
  *    and it is what the edit screen renders as "Enter a carb target above 0 g".
  *  - `above_maximum` — over the field's maximum.
+ *  - `unknown_field` — a key the save envelope does not accept for the `source`
+ *    it declared, which includes a key that is only legal on the OTHER arm (see
+ *    {@link parseSaveTargetsRequest}). Spelt as `plannedMealLog.logic.ts` and
+ *    `swap.logic.ts` spell the same condition, and deliberately not
+ *    `preferences.logic.ts`'s `read_only_field`, which names a server-owned
+ *    field rather than an unrecognised one.
  */
 export const MANUAL_TARGET_FIELD_CODES = {
     REQUIRED: 'required',
@@ -296,6 +320,7 @@ export const MANUAL_TARGET_FIELD_CODES = {
     NOT_AN_INTEGER: 'not_an_integer',
     BELOW_MINIMUM: 'below_minimum',
     ABOVE_MAXIMUM: 'above_maximum',
+    UNKNOWN_FIELD: 'unknown_field',
 } as const;
 
 type ManualTargetFieldCode = (typeof MANUAL_TARGET_FIELD_CODES)[keyof typeof MANUAL_TARGET_FIELD_CODES];
@@ -600,6 +625,75 @@ export const computeTargetEstimate = (
 };
 
 /* ---------------------------------------------------------------------------
+ * The estimate's inputs, and when they have changed
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The seven stored answers the energy equation reads — and therefore the
+ * complete set whose change can make a confirmed estimate stale.
+ *
+ * Typed as keys of {@link EstimateInputsRow}, so a column added to that shape
+ * stops this list compiling until it has been classified. The alternative is a
+ * silent omission, and an omitted input is one whose change never flips
+ * `stale`: a confirmed estimate presented as fresh against details that no
+ * longer produce it.
+ *
+ * `goal_weight_kg` IS DELIBERATELY ABSENT, and it is not an oversight. It is a
+ * destination the user typed, not a term in the equation — `calculateBmr` reads
+ * weight, height, age and sex, `calculateTdee` the activity level, and
+ * `calculateGoalAdjustment` the goal and the pace; nothing reads the goal
+ * weight. Changing "I'd like to reach 170 lb" moves no target, so it must not
+ * ask the user to recalculate one.
+ */
+export const ESTIMATE_INPUT_COLUMNS: readonly (keyof EstimateInputsRow)[] = [
+    'goal',
+    'pace_lb_per_week',
+    'age',
+    'height_cm',
+    'weight_kg',
+    'sex_for_estimate',
+    'activity_level',
+];
+
+/**
+ * Whether a pending column write actually changes one of the estimate's inputs.
+ *
+ * This is the rule behind `meal_plan_preferences.estimate_inputs_revision`, the
+ * counter `TargetsResponse.stale` is derived from, and it exists because the
+ * all-purpose `revision` column cannot answer the question: `revision` advances
+ * on EVERY preference save, so comparing against it reports a confirmed
+ * estimate as stale after a diet, allergy, dislike, schedule, budget,
+ * review-date, unit-preference or time-zone edit and asks the user to
+ * recalculate a number nothing has moved.
+ *
+ * `writes` is the patch a save is about to apply, read in PRISMA'S OWN
+ * SEMANTICS so that this rule and the statement it guards cannot disagree: a
+ * key that is absent or `undefined` is not being written and is ignored, while
+ * an explicit `null` is a clear and counts as a change when a value was stored.
+ *
+ * EQUALITY, NOT MENTION. Re-saving the body step with the same measurements is
+ * not a change, because the user's details still produce the confirmed figure
+ * and there is nothing to recalculate. Keying this off which step was saved
+ * instead would flip `stale` on every revisit of a wizard screen.
+ *
+ * `current === null` is the row's creation: writing an input then is a change
+ * (there was no answer before it), writing an explicit null is not.
+ */
+export const estimateInputsChanged = (
+    current: EstimateInputsRow | null,
+    writes: Partial<EstimateInputsRow>,
+): boolean =>
+    ESTIMATE_INPUT_COLUMNS.some((column) => {
+        const next = writes[column];
+
+        if (next === undefined) {
+            return false;
+        }
+
+        return current === null ? next !== null : next !== current[column];
+    });
+
+/* ---------------------------------------------------------------------------
  * Manual targets
  * ------------------------------------------------------------------------- */
 
@@ -693,6 +787,265 @@ export const parseManualTargets = (body: unknown): ParsedManualTargets => {
     }
 
     return { kind: 'valid', values: { calories, protein, carbs, fat } };
+};
+
+/* ---------------------------------------------------------------------------
+ * PUT /meal-planning/targets — the envelope
+ *
+ * The request parser for the save route, in the pure layer the
+ * `backend-architecture` rule puts every parser in (§2): synchronous, returning
+ * a verdict rather than throwing, reporting every offending field in one
+ * answer, and naming no HTTP status code. `targets.service.ts` calls
+ * {@link parseSaveTargetsRequest} and returns its refusal verbatim.
+ *
+ * {@link parseManualTargets} above already owns the four manual VALUES and is
+ * called rather than re-implemented; what is added here is only the envelope
+ * around them: which of the two shapes was sent, the estimate revision the
+ * estimated shape pins, and the targets revision both shapes pin.
+ * ------------------------------------------------------------------------- */
+
+/** The two sources the envelope may declare, as a closed set keyed off the DTO union. */
+export const TARGET_SOURCES: Readonly<Record<TargetRoute, true>> = { estimated: true, manual: true };
+
+/**
+ * Every key the ESTIMATED shape accepts (AAP §0.5.2:
+ * `{source, estimateRevision, expectedTargetsRevision}`) — and therefore, by
+ * omission, the definition of an unknown one on that arm.
+ *
+ * Keyed off `SaveEstimatedTargetsPayload` rather than written out as strings,
+ * so a member added to the wire DTO fails to compile here until this parser
+ * decides what to do with it. `expectedTargetsRevision` is optional on the DTO
+ * and still a key of the shape: it may be omitted, never renamed.
+ */
+export const ESTIMATED_SAVE_KEYS: Readonly<Record<keyof SaveEstimatedTargetsPayload, true>> = {
+    source: true,
+    estimateRevision: true,
+    expectedTargetsRevision: true,
+};
+
+/**
+ * Every key the MANUAL shape accepts (AAP §0.5.2:
+ * `{source, calories, protein, carbs, fat, expectedTargetsRevision}`), keyed
+ * off `SaveManualTargetsPayload` for the same reason.
+ *
+ * `estimateRevision` is absent deliberately: nothing was recomputed, so there
+ * are no inputs to pin, and a body that pins some is describing the other
+ * shape.
+ */
+export const MANUAL_SAVE_KEYS: Readonly<Record<keyof SaveManualTargetsPayload, true>> = {
+    source: true,
+    calories: true,
+    protein: true,
+    carbs: true,
+    fat: true,
+    expectedTargetsRevision: true,
+};
+
+/** Confirming the server-calculated estimate: the client never sends the numbers. */
+export interface EstimatedSaveRequest {
+    source: 'estimated';
+    /** The preferences revision the displayed estimate was computed from. */
+    estimateRevision: number;
+    /** null when the body pinned no targets revision, which is legal only before the first save. */
+    expectedTargetsRevision: number | null;
+}
+
+/** Hand-entered targets, stored exactly as given. */
+export interface ManualSaveRequest {
+    source: 'manual';
+    values: MealPlanMacroTotals;
+    expectedTargetsRevision: number | null;
+}
+
+export type SaveTargetsRequest = EstimatedSaveRequest | ManualSaveRequest;
+
+/** The refusal shape both this parser and `targets.service.ts::SaveTargetsResult` carry. */
+export interface TargetsErrorVerdict {
+    kind: 'error';
+    code: 'invalid_request';
+    message: string;
+    details: InvalidRequestDetail[];
+}
+
+export type ParsedSaveTargets = { kind: 'ok'; request: SaveTargetsRequest } | TargetsErrorVerdict;
+
+const invalidRequest = (details: InvalidRequestDetail[]): TargetsErrorVerdict => ({
+    kind: 'error',
+    code: 'invalid_request',
+    // A server-side diagnostic naming every offending field, in the same shape
+    // {@link parseManualTargets} produces. The client renders `details`, never
+    // this string.
+    message: `invalid targets request: ${details
+        .map((detail) => `${detail.field} (${detail.code})`)
+        .join(', ')}`,
+    details,
+});
+
+/**
+ * One optional revision field: absent, or a whole number that is not negative
+ * and that a revision column can actually hold.
+ *
+ * Absent is reported as `null` rather than as a failure, because "no revision
+ * pinned" is legal before the first save; whether it is legal THIS time depends
+ * on the stored revision, which no pure parser can know, so that half of the
+ * rule is applied under the lock in `targets.service.ts::saveTargets`.
+ */
+export const parseOptionalRevision = (
+    value: unknown,
+    field: string,
+): { revision: number | null } | InvalidRequestDetail => {
+    if (value === undefined || value === null) {
+        return { revision: null };
+    }
+
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return { field, code: MANUAL_TARGET_FIELD_CODES.INVALID_TYPE };
+    }
+
+    if (!Number.isInteger(value)) {
+        return { field, code: MANUAL_TARGET_FIELD_CODES.NOT_AN_INTEGER };
+    }
+
+    if (value < 0) {
+        return { field, code: MANUAL_TARGET_FIELD_CODES.BELOW_MINIMUM };
+    }
+
+    // The integer check above is not sufficient on its own: `Number.isInteger`
+    // is true for `1e30`, a whole number that is neither exactly representable
+    // nor storable in the PostgreSQL `integer` column revisions live in. Both
+    // halves are one bound, spelt as `preferences.logic.ts` spells it — above
+    // `MAX_REVISION` no column can hold the value, and above
+    // `Number.MAX_SAFE_INTEGER` the comparison against a stored revision would
+    // itself be unsound. Left unchecked, such a value reaches
+    // `buildRequestFingerprint`, which refuses it with a TypeError — a 500 for
+    // what is plainly a malformed request.
+    if (!Number.isSafeInteger(value) || value > MAX_REVISION) {
+        return { field, code: MANUAL_TARGET_FIELD_CODES.ABOVE_MAXIMUM };
+    }
+
+    return { revision: value };
+};
+
+/** The same field, required — the estimated shape cannot be judged without it. */
+export const parseRequiredRevision = (value: unknown, field: string): number | InvalidRequestDetail => {
+    if (value === undefined || value === null) {
+        return { field, code: MANUAL_TARGET_FIELD_CODES.REQUIRED };
+    }
+
+    const parsed = parseOptionalRevision(value, field);
+
+    return 'revision' in parsed ? (parsed.revision as number) : parsed;
+};
+
+/**
+ * Validates the save envelope and reports every problem in one verdict.
+ *
+ * `source` is judged first and alone when it is unusable: the two shapes have
+ * different required fields, so reporting "calories is required" for a body
+ * whose `source` is misspelled would describe a shape the client never meant to
+ * send. It is also why the key check below runs only after an arm is
+ * established — an unusable `source` names no arm, and therefore says nothing
+ * about which keys are legal.
+ *
+ * THE ARM'S SHAPE IS EXACT, AND A KEY OUTSIDE IT IS REFUSED RATHER THAN
+ * DROPPED. Accepting a body and ignoring part of it lets a client believe a
+ * value it sent was honoured, and on the estimated arm that is the damaging
+ * case: `{source: 'estimated', estimateRevision, calories: 9999}` would be
+ * stored with whatever the server recomputes, so a client that believed it was
+ * confirming the numbers it sent gets different ones with no signal that its
+ * `calories` was never read. A key that is legal only on the OTHER arm is
+ * reported the same way — for the shape the client declared it is simply not a
+ * key of the contract. This is the reasoning
+ * `plannedMealLog.logic.ts::parseLogPlannedMealRequest` applies to `mealName`,
+ * and the code is spelt the same (`unknown_field`).
+ *
+ * Unknown keys are collected into the SAME verdict as the field errors, in body
+ * order and after them, so one round trip tells the client everything that is
+ * wrong with its request.
+ */
+export const parseSaveTargetsRequest = (body: unknown): ParsedSaveTargets => {
+    const record = asRecord(body);
+
+    if (record === null) {
+        return invalidRequest([{ field: 'body', code: MANUAL_TARGET_FIELD_CODES.INVALID_TYPE }]);
+    }
+
+    const source = record.source;
+
+    if (source === undefined || source === null) {
+        return invalidRequest([{ field: 'source', code: MANUAL_TARGET_FIELD_CODES.REQUIRED }]);
+    }
+
+    if (typeof source !== 'string' || !Object.prototype.hasOwnProperty.call(TARGET_SOURCES, source)) {
+        // The same spelling every other parser in this feature uses for a value
+        // outside a closed set, imported rather than restated so the client maps
+        // one code.
+        return invalidRequest([{ field: 'source', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE }]);
+    }
+
+    const details: InvalidRequestDetail[] = [];
+    const expected = parseOptionalRevision(record.expectedTargetsRevision, 'expectedTargetsRevision');
+
+    if (!('revision' in expected)) {
+        details.push(expected);
+    }
+
+    // Every own key of the body that the declared arm does not accept. Held
+    // aside rather than pushed here so both arms report their own field
+    // problems first and these last, which is the order the other parsers in
+    // this layer report them in.
+    const acceptedKeys: Readonly<Record<string, true>> =
+        source === 'manual' ? MANUAL_SAVE_KEYS : ESTIMATED_SAVE_KEYS;
+    const unknownFieldDetails: InvalidRequestDetail[] = Object.keys(record)
+        .filter((key) => !Object.prototype.hasOwnProperty.call(acceptedKeys, key))
+        .map((field) => ({ field, code: MANUAL_TARGET_FIELD_CODES.UNKNOWN_FIELD }));
+
+    if (source === 'manual') {
+        // Called with the whole record on purpose: {@link parseManualTargets}
+        // reads only the four value keys and is used on its own elsewhere, so
+        // the envelope's own keys are this parser's business, not its.
+        const values = parseManualTargets(record);
+
+        if (values.kind !== 'valid') {
+            details.push(...values.details);
+        }
+
+        details.push(...unknownFieldDetails);
+
+        if (details.length > 0 || values.kind !== 'valid') {
+            return invalidRequest(details);
+        }
+
+        return {
+            kind: 'ok',
+            request: {
+                source: 'manual',
+                values: values.values,
+                expectedTargetsRevision: (expected as { revision: number | null }).revision,
+            },
+        };
+    }
+
+    const estimateRevision = parseRequiredRevision(record.estimateRevision, 'estimateRevision');
+
+    if (typeof estimateRevision !== 'number') {
+        details.push(estimateRevision);
+    }
+
+    details.push(...unknownFieldDetails);
+
+    if (details.length > 0 || typeof estimateRevision !== 'number') {
+        return invalidRequest(details);
+    }
+
+    return {
+        kind: 'ok',
+        request: {
+            source: 'estimated',
+            estimateRevision,
+            expectedTargetsRevision: (expected as { revision: number | null }).revision,
+        },
+    };
 };
 
 /**
@@ -812,6 +1165,17 @@ const resolveTargetSource = (
  *    Manual targets never go stale — the user typed them, so a change of inputs
  *    says nothing about them — and `legacy` needs no staleness because those
  *    surfaces already treat it as "review your targets".
+ *
+ *    ONLY THE ESTIMATE'S OWN INPUTS COUNT, which is why the comparison is
+ *    between `targets_input_revision` (the `estimate_inputs_revision` the
+ *    confirmed figure was computed at) and the CURRENT
+ *    `estimate_inputs_revision` — a counter `preferences.service.ts` advances
+ *    only when one of {@link ESTIMATE_INPUT_COLUMNS} actually changes value.
+ *    Comparing against the all-purpose `revision` instead would mark a
+ *    confirmed estimate stale after a diet, allergy, dislike, schedule, budget,
+ *    review-date, unit-preference or time-zone edit, and send the user to
+ *    recalculate a figure that none of those edits can move; `revision` is
+ *    therefore not even a member of {@link TargetsPreferencesRow}.
  *  - `revision` is the targets counter, and 0 when there is no preferences row.
  */
 export const deriveTargetsResponse = (
@@ -839,10 +1203,15 @@ export const deriveTargetsResponse = (
     // `source === 'estimated'` implies a preferences row, since resolving to
     // either named route requires one; the explicit check is what lets the
     // compiler see it.
+    //
+    // A null `targets_input_revision` is stale by this comparison, and rightly
+    // so: an estimate confirmed without recording the inputs it came from
+    // cannot be shown to still match them, and the honest answer to "does this
+    // still describe your details?" is then "ask again".
     const stale =
         source === 'estimated' &&
         preferencesRow !== null &&
-        preferencesRow.targets_input_revision !== preferencesRow.revision;
+        preferencesRow.targets_input_revision !== preferencesRow.estimate_inputs_revision;
 
     return {
         targets: values,

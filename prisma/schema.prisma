@@ -652,44 +652,57 @@ model recipe_ingredients {
 // values as they stood at confirmation, which is how the canonical read tells a
 // confirmed target from one a legacy PUT /user/targets changed afterwards.
 model meal_plan_preferences {
-  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id                String    @unique
-  time_zone              String? // IANA name from the device, refreshed on every step save
-  setup_status           String // 'not_started' | 'in_progress' | 'ready_for_review' | 'completed'
-  setup_step             String? // 'goal' | 'body' | 'activity' | 'diet' | 'dislikes' | 'schedule' | 'cooking' | 'review' | 'targets_manual'
-  review_start_date      DateTime? @db.Date
-  target_route           String? // 'estimated' | 'manual'
-  goal                   String? // 'lose' | 'maintain' | 'gain'
-  goal_weight_kg         Float?
-  pace_lb_per_week       Float? // 0.5 | 1 | 1.5
-  age                    Int?
-  height_cm              Float?
-  weight_kg              Float?
-  weight_source          String?
-  sex_for_estimate       String? // 'female' | 'male' | 'prefer_not_to_say' — the last one takes the manual-target route
-  height_unit_pref       String? // 'ft_in' | 'cm'
-  weight_unit_pref       String? // 'lb' | 'kg'
-  activity_level         String? // 'not_very_active' | 'lightly_active' | 'active' | 'very_active'
-  diet                   String? // 'none' | 'vegetarian' | 'vegan' | 'pescatarian'
-  allergens              String[]  @default([]) // 'none' is mutually exclusive with the nine named allergens
+  id                       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id                  String    @unique
+  time_zone                String? // IANA name from the device, refreshed on every step save
+  setup_status             String // 'not_started' | 'in_progress' | 'ready_for_review' | 'completed'
+  setup_step               String? // 'goal' | 'body' | 'activity' | 'diet' | 'dislikes' | 'schedule' | 'cooking' | 'review' | 'targets_manual'
+  review_start_date        DateTime? @db.Date
+  target_route             String? // 'estimated' | 'manual'
+  goal                     String? // 'lose' | 'maintain' | 'gain'
+  goal_weight_kg           Float?
+  pace_lb_per_week         Float? // 0.5 | 1 | 1.5
+  age                      Int?
+  height_cm                Float?
+  weight_kg                Float?
+  weight_source            String?
+  sex_for_estimate         String? // 'female' | 'male' | 'prefer_not_to_say' — the last one takes the manual-target route
+  height_unit_pref         String? // 'ft_in' | 'cm'
+  weight_unit_pref         String? // 'lb' | 'kg'
+  activity_level           String? // 'not_very_active' | 'lightly_active' | 'active' | 'very_active'
+  diet                     String? // 'none' | 'vegetarian' | 'vegan' | 'pescatarian'
+  allergens                String[]  @default([]) // 'none' is mutually exclusive with the nine named allergens
   // catalog_foods ids held as a plain uuid[]: Postgres cannot foreign-key an
   // array, so membership is validated in preferences.logic.ts instead.
-  disliked_food_ids      String[]  @default([]) @db.Uuid
-  disliked_food_groups   String[]  @default([])
-  meal_schedule          String? // 'three' | 'three_plus_snack'
-  meal_times             Json? // one {slot, time} entry per slot of the chosen schedule, in wire order
-  cooking_time_limit_min Int? // 15 | 30 | 45 | 60, total prep + cook per meal
-  budget_amount          Int? // whole units of budget_currency
-  budget_currency        String? // 'USD' only in this version
-  no_budget_preference   Boolean   @default(false)
-  budget_tier            Int?      @db.SmallInt
-  target_source          String? // 'estimated' | 'manual'
-  targets_revision       Int       @default(0)
-  confirmed_targets      Json?
-  targets_input_revision Int? // the revision whose goal/body/activity/pace produced the confirmed estimate
-  estimated_targets      Json?
-  revision               Int       @default(0)
-  users                  users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  disliked_food_ids        String[]  @default([]) @db.Uuid
+  disliked_food_groups     String[]  @default([])
+  meal_schedule            String? // 'three' | 'three_plus_snack'
+  meal_times               Json? // one {slot, time} entry per slot of the chosen schedule, in wire order
+  cooking_time_limit_min   Int? // 15 | 30 | 45 | 60, total prep + cook per meal
+  budget_amount            Int? // whole units of budget_currency
+  budget_currency          String? // 'USD' only in this version
+  no_budget_preference     Boolean   @default(false)
+  budget_tier              Int?      @db.SmallInt
+  target_source            String? // 'estimated' | 'manual'
+  targets_revision         Int       @default(0)
+  confirmed_targets        Json?
+  targets_input_revision   Int? // the estimate_inputs_revision whose goal/body/activity/pace produced the confirmed estimate
+  estimated_targets        Json?
+  revision                 Int       @default(0)
+  // Two counters, two jobs, and they must not be conflated. `revision` advances
+  // on EVERY preference save - diet, allergens, dislikes, schedule, budget,
+  // review date, unit preferences, time zone included - and is what a client
+  // pins to detect a lost update. `estimate_inputs_revision` advances only when
+  // one of the seven answers the energy equation actually reads changes value
+  // (goal, pace_lb_per_week, age, height_cm, weight_kg, sex_for_estimate,
+  // activity_level - never goal_weight_kg, which the equation never reads), so
+  // comparing it with targets_input_revision is what makes
+  // TargetsResponse.stale mean "your estimate no longer matches your details"
+  // rather than "you edited something". Written only by preferences.service.ts
+  // through the pure rule targets.logic.ts::estimateInputsChanged;
+  // targets_input_revision is written only by targets.service.ts.
+  estimate_inputs_revision Int       @default(0)
+  users                    users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 }
 
 // One published week per user. status and revision drive the write-safety

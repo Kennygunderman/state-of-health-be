@@ -119,6 +119,7 @@ jest.mock('../../prisma/client', () => {
 
 import { prisma } from '../../prisma/client';
 import { makeCatalogFood } from '../../__tests__/setup/factories';
+import { CatalogFoodRow, CatalogMappingError, mapCatalogFood } from '../catalog.mapper';
 import { getStatus, getSuggestions, searchPublishedFoods } from '../catalog.service';
 
 const BACKEND_ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -338,6 +339,82 @@ describe('catalog read ordering across databases', () => {
             expect(status.rejectedCount).toBe(0);
             expect(status.recipeCount).toBe(0);
             expect(status.lastLoadedAt).toBe('2026-09-01T10:05:00.000Z');
+        });
+    });
+
+    // The read boundary every food above passed through, asserted directly for
+    // the one input the database cannot be made to produce.
+    //
+    // `catalog_foods.allergen_tags` is `TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]`
+    // (`prisma/migrations/20260908000000_meal_planning/migration.sql`), so no
+    // statement against the migrated database above can store an absent value —
+    // which is exactly why the mapper is called directly here. The value can
+    // still ARRIVE absent: `catalog.service.ts` reads its search page through
+    // `$queryRaw<CatalogFoodRow[]>`, a type assertion over whatever the
+    // statement returns, so a column dropped from that projection, a view, or a
+    // row written around the migration reaches `mapCatalogFood` as `null`.
+    //
+    // What it must not do then is answer with `[]`. Allergen tags are what the
+    // client shows a user checking whether a food is safe for them and what
+    // planning eligibility is decided against (§0.7.3), so `[]` is the positive
+    // claim "contains none of the nine named allergens" rather than "unknown" —
+    // whether the data is unknown is stated separately, by `allergen_status`.
+    // Placed in this suite for the reason `getStatus` is: it is the catalog read
+    // boundary's own file, and the assertions cost nothing here.
+    describe('mapCatalogFood safety mapping', () => {
+        const FOOD_ID = 'd3b07384-d9a4-4f1b-8b9d-2b0b6e4f0a11';
+
+        const portions = [
+            { description: '1 cup', amount: 1, unit: 'cup', gram_weight: 180, is_default: true },
+        ];
+
+        const foodRow = (overrides: Readonly<Record<string, unknown>> = {}): CatalogFoodRow =>
+            ({
+                id: FOOD_ID,
+                display_name: 'Fixture Food 1',
+                category: 'protein_plant',
+                food_state: 'cooked',
+                identity_source: 'usda',
+                nutrition_provenance: 'source_backed',
+                nutrition_basis: 'per_100g',
+                basis_amount: 100,
+                calories: 120,
+                protein_g: 9,
+                carbs_g: 21,
+                fat_g: 1,
+                fiber_g: 7,
+                allergen_tags: ['milk'],
+                allergen_status: 'known',
+                food_group: 'legume',
+                ...overrides,
+            }) as unknown as CatalogFoodRow;
+
+        it('emits the stored allergen tags for a row that satisfies the contract', () => {
+            expect(mapCatalogFood(foodRow(), portions).allergenTags).toEqual(['milk']);
+        });
+
+        it('emits an empty list for a food genuinely stored with no allergen tags', () => {
+            expect(mapCatalogFood(foodRow({ allergen_tags: [] }), portions).allergenTags).toEqual([]);
+        });
+
+        it('fails closed rather than claiming the food contains no allergens', () => {
+            expect(() => mapCatalogFood(foodRow({ allergen_tags: null }), portions)).toThrow(CatalogMappingError);
+            expect(() => mapCatalogFood(foodRow({ allergen_tags: undefined }), portions)).toThrow(
+                CatalogMappingError,
+            );
+            expect(() => mapCatalogFood(foodRow({ allergen_tags: 'milk' }), portions)).toThrow(CatalogMappingError);
+        });
+
+        it('names the column and the row so an operator knows what to repair', () => {
+            expect(() => mapCatalogFood(foodRow({ allergen_tags: null }), portions)).toThrow(
+                new RegExp(`catalog_foods\\.allergen_tags[\\s\\S]*${FOOD_ID}`),
+            );
+        });
+
+        it('fails closed on a tag that is not a string, naming the index', () => {
+            expect(() => mapCatalogFood(foodRow({ allergen_tags: ['milk', 7] }), portions)).toThrow(
+                /catalog_foods\.allergen_tags\[1\]/,
+            );
         });
     });
 });

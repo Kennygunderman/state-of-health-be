@@ -7,9 +7,14 @@ import {
     logMealEntry,
     updateMealEntry,
     updateTargets,
-    InvalidServingError,
 } from '../services/nutrition.service';
-import { LogEntryErrorVerdict, parseLogEntryBody } from '../services/nutrition.logic';
+import {
+    InvalidServingError,
+    LogEntryErrorVerdict,
+    parseEntryPath,
+    parseLogEntryBody,
+    parseMealEntryPath,
+} from '../services/nutrition.logic';
 import { estimateMeal, scanLabel, EstimateFailedError } from '../services/estimate.service';
 import {
     assertAndConsumeAiCall,
@@ -37,14 +42,15 @@ export const getDailyMacrosController = async (req: Request, res: Response) => {
     }
 };
 
-// The three 400 bodies this endpoint answers with, chosen from the parser's
+// The three 400 bodies these endpoints answer with, chosen from the parser's
 // verdict rather than from the request, which the parser has already read. Only
 // the legacy guard's verdict gets a message and no code: that string is what
 // every client sending a malformed legacy body has always been shown. A catalog
-// or shapeless body gets the machine code and the per-field details instead, so
-// the caller learns which field to fix. Exhaustive by construction — a fourth
-// verdict code makes this function fall off its end and fail the build, rather
-// than silently inheriting the legacy body.
+// body, a shapeless body and a malformed path id get the machine code and the
+// per-field details instead, so the caller learns which field to fix.
+// Exhaustive by construction — a fourth verdict code makes this function fall
+// off its end and fail the build, rather than silently inheriting the legacy
+// body.
 const logEntryErrorBody = (verdict: LogEntryErrorVerdict): Record<string, unknown> => {
     switch (verdict.code) {
         case 'legacy_fields_required':
@@ -62,10 +68,28 @@ export const logMealEntryController = async (req: Request, res: Response) => {
         if (parsed.kind === 'error') {
             return res.status(400).json(logEntryErrorBody(parsed));
         }
+
+        // The path is judged BEFORE either writer, because `:mealId` reaches a
+        // `@db.Uuid` predicate in both of them and an unparsable id would come
+        // back from PostgreSQL as a 500 for a request only the caller can fix.
+        // It is judged AFTER the body deliberately: a malformed body must keep
+        // earning the frozen 400 that shipped clients read, so this check only
+        // speaks where the request would otherwise have reached the database.
+        // The path is judged BEFORE either writer, because `:mealId` reaches a
+        // `@db.Uuid` predicate in both of them and an unparsable id would come
+        // back from PostgreSQL as a 500 for a request only the caller can fix.
+        // It is judged AFTER the body deliberately: a malformed body must keep
+        // earning the frozen 400 that shipped clients read, so this check only
+        // speaks where the request would otherwise have reached the database.
+        const path = parseMealEntryPath(req.params);
+        if (path.kind === 'error') {
+            return res.status(400).json(logEntryErrorBody(path));
+        }
+
         const entry =
             parsed.kind === 'catalog'
-                ? await logCatalogMealEntry(userId, req.params.mealId, parsed.payload)
-                : await logMealEntry(userId, req.params.mealId, parsed.payload);
+                ? await logCatalogMealEntry(userId, path.mealId, parsed.payload)
+                : await logMealEntry(userId, path.mealId, parsed.payload);
         if (!entry) {
             return res.status(404).json({ error: 'Meal not found' });
         }
@@ -85,7 +109,17 @@ export const logMealEntryController = async (req: Request, res: Response) => {
 export const updateMealEntryController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
-        const entry = await updateMealEntry(userId, req.params.id, req.body);
+
+        // Same reason as the log route: `:id` is the `meal_entries` primary key,
+        // so a malformed one is a PostgreSQL syntax error rather than a missing
+        // row. A well-formed id that is absent or someone else's still answers
+        // 404, and the two cases stay indistinguishable.
+        const path = parseEntryPath(req.params);
+        if (path.kind === 'error') {
+            return res.status(400).json(logEntryErrorBody(path));
+        }
+
+        const entry = await updateMealEntry(userId, path.entryId, req.body);
         if (!entry) {
             return res.status(404).json({ error: 'Entry not found' });
         }
@@ -99,7 +133,13 @@ export const updateMealEntryController = async (req: Request, res: Response) => 
 export const deleteMealEntryController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
-        const deleted = await deleteMealEntry(userId, req.params.id);
+
+        const path = parseEntryPath(req.params);
+        if (path.kind === 'error') {
+            return res.status(400).json(logEntryErrorBody(path));
+        }
+
+        const deleted = await deleteMealEntry(userId, path.entryId);
         if (!deleted) {
             return res.status(404).json({ error: 'Entry not found' });
         }

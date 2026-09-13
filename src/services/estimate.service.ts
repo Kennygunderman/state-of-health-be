@@ -1,9 +1,68 @@
 import { EstimateItem, EstimateResponse, LabelScanResponse } from '../types/nutrition';
-import { GenericFoodCandidate, searchGenericFoods } from './usda.service';
-import { MessageContent, OpenRouterError, callOpenRouter, getOpenRouterConfig } from './openrouter.service';
+import { GenericFoodCandidate, USDA_REQUEST_CALL_BUDGET_MS, searchGenericFoods } from './usda.service';
+import {
+    MessageContent,
+    OPENROUTER_REQUEST_TIMEOUT_MS,
+    OpenRouterError,
+    callOpenRouter,
+    getOpenRouterConfig,
+} from './openrouter.service';
 
 // Access control (kill switch, daily quota) lives in entitlement.service —
 // controllers call assertAndConsumeAiCall before invoking this service.
+
+// ---------------------------------------------------------------------------
+// The request's vendor budget.
+//
+// One estimate is up to three vendor steps — the model call, the USDA
+// candidate searches, and the grounding judge call — and each of them used to
+// carry its own deadline. Separate deadlines add up: a request could spend 30 s
+// on the estimate, then wait on USDA, then spend another 30 s on the judge,
+// while the mobile client abandoned it at 25 s and the user retried, paying for
+// a second estimate. Bounding one call is therefore not enough; what has to be
+// bounded is the request.
+//
+// So the budget below is started once per estimate and every vendor step draws
+// from the remainder: two model calls inside one budget cannot outlast one.
+// The size is the vendor boundary's own per-call ceiling, which is already
+// derived from the client's 25 s deadline (see
+// OPENROUTER_REQUEST_TIMEOUT_MS) — a single call may legitimately use the
+// whole request, and nothing may use more.
+// ---------------------------------------------------------------------------
+
+const VENDOR_BUDGET_MS = OPENROUTER_REQUEST_TIMEOUT_MS;
+
+/**
+ * The least the judge call is worth attempting with.
+ *
+ * Below this the classification would abort mid-flight, which costs a paid call
+ * and returns the ungrounded estimate anyway.
+ */
+const JUDGE_MIN_BUDGET_MS = 1_500;
+
+/**
+ * What grounding needs before it is worth starting: the USDA boundary's own
+ * worst case for one call (its attempts and backoff are bounded by that number,
+ * and the searches run in parallel, so it is the wall time of the whole
+ * candidate lookup) plus a judge call.
+ *
+ * Imported rather than restated, so the reserve cannot drift from the deadline
+ * the USDA boundary actually enforces.
+ */
+const GROUNDING_MIN_BUDGET_MS = USDA_REQUEST_CALL_BUDGET_MS + JUDGE_MIN_BUDGET_MS;
+
+interface VendorBudget {
+    /** Milliseconds left of the request's budget; never negative. */
+    remainingMs(): number;
+}
+
+const startVendorBudget = (totalMs: number = VENDOR_BUDGET_MS): VendorBudget => {
+    const startedAt = Date.now();
+
+    return {
+        remainingMs: (): number => Math.max(0, totalMs - (Date.now() - startedAt)),
+    };
+};
 
 export class EstimateFailedError extends Error {
     constructor(message: string) {
@@ -127,15 +186,20 @@ const buildUserContent = (text?: string, imageBase64?: string): MessageContent =
 // failure becomes the same EstimateFailedError as every other vendor failure.
 // `fetchImpl` is the transport seam callOpenRouter already declares;
 // `undefined` leaves it using the global `fetch`.
+//
+// `timeoutMs` is what is left of the request's budget. Passing it — rather than
+// letting each call take the vendor default — is what makes the budget a
+// property of the request instead of a property of one call.
 const callModel = async (
     systemPrompt: string,
     userContent: MessageContent,
     jsonSchema: object,
     resolveModel?: () => string,
     fetchImpl?: typeof fetch,
+    timeoutMs?: number,
 ): Promise<unknown> => {
     try {
-        return await callOpenRouter(systemPrompt, userContent, jsonSchema, resolveModel?.(), fetchImpl);
+        return await callOpenRouter(systemPrompt, userContent, jsonSchema, resolveModel?.(), fetchImpl, timeoutMs);
     } catch (error) {
         if (error instanceof OpenRouterError) {
             throw new EstimateFailedError(error.message);
@@ -213,6 +277,7 @@ export interface EstimateDependencies {
 const groundItemsInUsda = async (
     items: EstimateItemWithGrams[],
     deps: EstimateDependencies,
+    budget: VendorBudget,
 ): Promise<EstimateItem[]> => {
     const searchCandidates = deps.searchGenericFoods ?? searchGenericFoods;
     const candidateLists = await Promise.all(
@@ -227,6 +292,15 @@ const groundItemsInUsda = async (
         }),
     );
     if (candidateLists.every((candidates) => candidates.length === 0)) return items;
+
+    // The searches have spent part of the budget. Starting a judge call with
+    // less than it needs would pay for a classification that aborts before it
+    // answers, and the outcome either way is the model's own numbers.
+    const judgeBudgetMs = budget.remainingMs();
+    if (judgeBudgetMs < JUDGE_MIN_BUDGET_MS) {
+        console.warn(`Grounding judge skipped: ${judgeBudgetMs}ms of the request budget left`);
+        return items;
+    }
 
     const judgeInput = items.map((item, index) => ({
         item: `${item.name} (${item.quantityText}, ~${item.grams}g)`,
@@ -251,6 +325,7 @@ const groundItemsInUsda = async (
         JUDGE_JSON_SCHEMA,
         () => getOpenRouterConfig().judgeModel,
         deps.fetchImpl,
+        judgeBudgetMs,
     );
     const judgedMatches = asRecord(judged)?.matches;
     const matches: unknown[] = Array.isArray(judgedMatches) ? judgedMatches : [];
@@ -325,6 +400,7 @@ export const estimateMeal = async (
     imageBase64?: string,
     deps: EstimateDependencies = {},
 ): Promise<EstimateResponse> => {
+    const budget = startVendorBudget();
     const parsed = asRecord(
         await callModel(
             ESTIMATE_SYSTEM_PROMPT,
@@ -332,6 +408,7 @@ export const estimateMeal = async (
             ESTIMATE_JSON_SCHEMA,
             undefined,
             deps.fetchImpl,
+            budget.remainingMs(),
         ),
     );
 
@@ -345,9 +422,20 @@ export const estimateMeal = async (
     }
 
     // Ground in USDA unless disabled; never let grounding break the estimate.
-    if (process.env.ESTIMATE_GROUNDING !== 'off') {
+    //
+    // The budget check is a third reason to skip, alongside the kill switch and
+    // a failure: grounding is a refinement the client is waiting on, so once
+    // the estimate itself has consumed the request's budget the honest answer
+    // is the estimate the model already produced, delivered in time, rather
+    // than a better one the client will never see.
+    const groundingBudgetMs = budget.remainingMs();
+    if (process.env.ESTIMATE_GROUNDING === 'off') {
+        // Disabled: nothing to report.
+    } else if (groundingBudgetMs < GROUNDING_MIN_BUDGET_MS) {
+        console.warn(`USDA grounding skipped: ${groundingBudgetMs}ms of the request budget left`);
+    } else {
         try {
-            items = await groundItemsInUsda(items as EstimateItemWithGrams[], deps);
+            items = await groundItemsInUsda(items as EstimateItemWithGrams[], deps, budget);
         } catch (error) {
             console.error('USDA grounding failed, using raw LLM estimate:', (error as Error).message);
         }
@@ -369,6 +457,9 @@ export const estimateMeal = async (
     };
 };
 
+// One model call and no grounding, so the vendor default is already this
+// request's whole budget and there is nothing to share it with — the deadline
+// the client is promised holds without any arithmetic here.
 export const scanLabel = async (imageBase64: string): Promise<LabelScanResponse> => {
     const parsed = asRecord(
         await callModel(LABEL_SCAN_SYSTEM_PROMPT, buildUserContent(undefined, imageBase64), LABEL_SCAN_JSON_SCHEMA),

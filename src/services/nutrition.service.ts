@@ -10,34 +10,29 @@ import {
     MacroTotals,
     MealEntryResponse,
     MealResponse,
-    NutritionProvenance,
     UpdateMealEntryPayload,
 } from '../types/nutrition';
 import { CatalogFoodNotFoundError } from './mealPlanning.errors';
-import { PLANNED_INPUT_METHOD, resolveLegacyInputMethod } from './nutrition.logic';
+import {
+    CATALOG_INPUT_METHOD,
+    CLIENT_SNAPSHOT_PROVENANCE,
+    DETACHED_ENTRY_SNAPSHOT,
+    PLANNED_INPUT_METHOD,
+    PLANNED_SNAPSHOT_PROVENANCE,
+    planMealEntryEdit,
+    resolveCatalogEntrySnapshot,
+    resolveLegacyInputMethod,
+    toNutritionProvenance,
+} from './nutrition.logic';
 
 const DEFAULT_MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
 
-const NUTRITION_PROVENANCES: NutritionProvenance[] = [
-    'source_backed',
-    'ingredient_derived',
-    'ai_estimated',
-    'user_entered',
-];
+// Prisma's "no record matched the where clause" code, raised by `update` when
+// its predicate — id, owner AND not-yet-deleted — selects nothing.
+const RECORD_NOT_FOUND = 'P2025';
 
-// The portion a catalog entry names must be one this food actually stores, and
-// only the catalog row can say which those are — so the check cannot live in
-// nutrition.logic.ts with the rest of the body validation, and this is the
-// failure it reports instead. Declared here rather than in mealPlanning.errors
-// for the reason that file states: a failure belongs to the module that raises
-// it, the way estimate.service owns EstimateFailedError. The controller maps it
-// to 400 invalid_serving; nothing here knows that status (§8).
-export class InvalidServingError extends Error {
-    constructor(public readonly servingText: string) {
-        super('servingText does not name a stored portion of this food');
-        this.name = 'InvalidServingError';
-    }
-}
+const isRecordNotFound = (error: unknown): boolean =>
+    error instanceof Prisma.PrismaClientKnownRequestError && error.code === RECORD_NOT_FOUND;
 
 interface MealEntryRow {
     id: string;
@@ -77,14 +72,10 @@ const toDayKey = (date: Date): string => date.toISOString().slice(0, 10);
 
 const asEaten = (perServing: number, servings: number): number => Math.round(perServing * servings);
 
-// A stored value outside the known set is reported as null — "unknown /
-// user-entered", the same class a NULL column carries — so an unrecognised
-// string can never be presented to a client as verified provenance.
-const toNutritionProvenance = (value: string | null): NutritionProvenance | null =>
-    value !== null && NUTRITION_PROVENANCES.includes(value as NutritionProvenance)
-        ? (value as NutritionProvenance)
-        : null;
-
+// `toNutritionProvenance` is nutrition.logic.ts's: a stored value outside the
+// known set reads as null — "unknown / user-entered", the same class a NULL
+// column carries — so an unrecognised string can never be presented to a client
+// as verified provenance.
 const mapEntry = (entry: MealEntryRow): MealEntryResponse => ({
     id: entry.id,
     foodId: entry.food_id,
@@ -220,118 +211,23 @@ export const logMealEntry = async (
             // call them source-backed however they were obtained. Rows written
             // before this column existed keep NULL and read as the same
             // "unknown" class; neither earns a provenance label.
-            nutrition_provenance: 'user_entered',
+            nutrition_provenance: CLIENT_SNAPSHOT_PROVENANCE,
             raw_input: payload.rawInput ?? null,
         },
     });
     return mapEntry(entry);
 };
 
-interface CatalogPortionRow {
-    description: string;
-    gram_weight: number;
-    is_default: boolean;
-}
-
-interface CatalogFoodRow {
-    id: string;
-    display_name: string;
-    nutrition_provenance: string;
-    nutrition_basis: string;
-    basis_amount: number;
-    calories: number | null;
-    protein_g: number | null;
-    carbs_g: number | null;
-    fat_g: number | null;
-    density_g_per_ml: number | null;
-    catalog_food_portions: CatalogPortionRow[];
-}
-
-// A published food is guaranteed to carry all four macros and a default portion
-// with a known gram weight, so anything missing here is a data fault rather
-// than a bad request: inventing a weight or reading a NULL nutrient as zero
-// would log numbers nobody measured under a source-backed label.
-const requireCatalogValue = (value: number | null, foodId: string, what: string): number => {
-    if (value === null || !Number.isFinite(value) || value <= 0) {
-        throw new Error(`Published catalog food ${foodId} has no usable ${what}`);
-    }
-    return value;
-};
-
-const requireNutrient = (value: number | null, foodId: string, nutrient: string): number => {
-    if (value === null || !Number.isFinite(value)) {
-        throw new Error(`Published catalog food ${foodId} has no ${nutrient} value`);
-    }
-    return value;
-};
-
-// The mass a food's stated nutrient values describe, so one per-gram rate can
-// be scaled to any stored portion. 'per_100g' states them against a mass
-// already; 'per_100ml' needs the density to become one; 'per_serving' states
-// them against basis_amount of the food's own default portion.
-const basisGrams = (food: CatalogFoodRow, defaultPortion: CatalogPortionRow): number => {
-    const basisAmount = requireCatalogValue(food.basis_amount, food.id, 'nutrition basis amount');
-
-    switch (food.nutrition_basis) {
-        case 'per_100g':
-            return basisAmount;
-        case 'per_100ml':
-            return basisAmount * requireCatalogValue(food.density_g_per_ml, food.id, 'density');
-        case 'per_serving':
-            return basisAmount * requireCatalogValue(defaultPortion.gram_weight, food.id, 'default portion weight');
-        default:
-            throw new Error(`Published catalog food ${food.id} has an unsupported nutrition basis`);
-    }
-};
-
-// Resolves the portion the entry is logged against, and derives that portion's
-// per-serving macros from it.
-//
-// The portion drives the stored label AND the stored numbers together. An
-// omitted servingText takes the default portion; a named one must match a
-// portion this food actually stores, because the text is what the saved macros
-// claim to describe — labelling one portion's numbers with another portion's
-// name, or storing a string the catalog never measured, is the unverifiable
-// claim the servingText check exists to prevent.
-const catalogPortionSnapshot = (
-    food: CatalogFoodRow,
-    servingText: string | undefined,
-): { description: string; perServing: MacroTotals } => {
-    const defaultPortion = food.catalog_food_portions.find((portion) => portion.is_default);
-    if (!defaultPortion) {
-        throw new Error(`Published catalog food ${food.id} has no default portion`);
-    }
-
-    let portion = defaultPortion;
-    if (servingText !== undefined) {
-        const named = food.catalog_food_portions.find((candidate) => candidate.description === servingText);
-        if (!named) {
-            throw new InvalidServingError(servingText);
-        }
-        portion = named;
-    }
-
-    const scale =
-        requireCatalogValue(portion.gram_weight, food.id, 'portion weight') / basisGrams(food, defaultPortion);
-
-    // Rounded to integers because meal_entries stores per-serving macros as
-    // Int, and rounded here only: the read path multiplies this snapshot by
-    // servings, so scaling it first would round twice and drift.
-    return {
-        description: portion.description,
-        perServing: {
-            calories: Math.round(requireNutrient(food.calories, food.id, 'calories') * scale),
-            protein: Math.round(requireNutrient(food.protein_g, food.id, 'protein') * scale),
-            carbs: Math.round(requireNutrient(food.carbs_g, food.id, 'carbs') * scale),
-            fat: Math.round(requireNutrient(food.fat_g, food.id, 'fat') * scale),
-        },
-    };
-};
-
 // The catalog counterpart of logMealEntry: the client names a published catalog
-// food and a portion, and every number and label is derived here from that
-// row — any macros the body carried were already discarded by the parser, and
-// this function would ignore them regardless.
+// food and a portion, and every number and label is derived from that row by
+// nutrition.logic.ts's `resolveCatalogEntrySnapshot` — any macros the body
+// carried were already discarded by the parser, and this function would ignore
+// them regardless.
+//
+// Which portion, how its macros are scaled, how they are rounded and which
+// provenance class they belong to are all rules and all live in the logic
+// module, where they are tested without a database; what is left here is the
+// read, the insert, and the 404 for a food that is not publishable.
 export const logCatalogMealEntry = async (
     userId: string,
     mealId: string,
@@ -351,7 +247,7 @@ export const logCatalogMealEntry = async (
         throw new CatalogFoodNotFoundError();
     }
 
-    const snapshot = catalogPortionSnapshot(food, payload.servingText);
+    const snapshot = resolveCatalogEntrySnapshot(food, payload.servingText);
     const entry = await prisma.meal_entries.create({
         data: {
             meal_id: mealId,
@@ -363,17 +259,23 @@ export const logCatalogMealEntry = async (
             food_id: null,
             catalog_food_id: food.id,
             name: food.display_name,
-            serving_text: snapshot.description,
+            serving_text: snapshot.servingText,
             servings: payload.servings,
             calories: snapshot.perServing.calories,
             protein_g: snapshot.perServing.protein,
             carbs_g: snapshot.perServing.carbs,
             fat_g: snapshot.perServing.fat,
             // Stamped server-side whatever the body claimed, and paired with the
-            // catalog row's own provenance so the caption the diary renders and
-            // the numbers it labels come from the same snapshot.
-            input_method: 'search',
-            nutrition_provenance: food.nutrition_provenance,
+            // provenance the snapshot NARROWED from the catalog row, so the
+            // caption the diary renders and the numbers it labels come from the
+            // same snapshot. Narrowed and not copied: the column is unrestricted
+            // TEXT, and a value outside the closed set would be stored here and
+            // then read back as `null` by `toNutritionProvenance` — stripping the
+            // estimate label §0.1.4(i) requires an AI-estimated or
+            // ingredient-derived food to carry. The snapshot refuses instead, so
+            // no entry is written with a label nobody can read.
+            input_method: CATALOG_INPUT_METHOD,
+            nutrition_provenance: snapshot.nutritionProvenance,
         },
     });
     return mapEntry(entry);
@@ -429,48 +331,19 @@ export const insertPlannedMealEntry = async (
             input_method: PLANNED_INPUT_METHOD,
             // Planning admits only source-backed ingredients, so a planned meal
             // is never an estimate.
-            nutrition_provenance: 'source_backed',
+            nutrition_provenance: PLANNED_SNAPSHOT_PROVENANCE,
         },
     });
     return mapEntry(entry);
 };
 
-// What an entry keeps once its numbers are no longer the plan's or the
-// catalog's: every link is cleared, so the plan card returns to unlogged and
-// both captions — "From meal plan" and any source label — go with them.
-// 'library' is this column's own schema default and the value logMealEntry
-// already falls back to for an unrecognised method, so no new input method
-// enters the wire and an older client decodes a detached entry unchanged.
-const DETACHED_SNAPSHOT = {
-    meal_plan_meal_id: null,
-    catalog_food_id: null,
-    recipe_version_id: null,
-    input_method: 'library',
-    nutrition_provenance: 'user_entered',
-} as const;
-
-// A servings edit only says how much was eaten, which the linked plan meal or
-// catalog food still describes, so the links stand and the plan stays logged.
-// Rewriting the name or any macro replaces what the entry claims the food IS —
-// the plan did not produce those numbers, so nothing may keep vouching for them.
-const detachesFromSource = (
-    existing: Pick<MealEntryRow, 'meal_plan_meal_id' | 'catalog_food_id' | 'recipe_version_id'>,
-    payload: UpdateMealEntryPayload,
-): boolean => {
-    const isLinked =
-        existing.meal_plan_meal_id !== null ||
-        existing.catalog_food_id !== null ||
-        existing.recipe_version_id !== null;
-    const rewritesSnapshot =
-        payload.name !== undefined ||
-        payload.calories !== undefined ||
-        payload.protein !== undefined ||
-        payload.carbs !== undefined ||
-        payload.fat !== undefined;
-
-    return isLinked && rewritesSnapshot;
-};
-
+// Which values the edit writes, and whether writing them detaches the entry
+// from the plan meal, recipe version or catalog food it was logged from, are
+// nutrition.logic.ts's `planMealEntryEdit`: it normalizes each provided value
+// the way this writer stores it and detaches only when a normalized value
+// actually differs from the stored one, so a resubmission or a retry that
+// changes nothing keeps the links, the "From meal plan" caption and the source
+// label it arrived with.
 export const updateMealEntry = async (
     userId: string,
     entryId: string,
@@ -480,19 +353,31 @@ export const updateMealEntry = async (
         where: { id: entryId, user_id: userId, deleted_at: null },
     });
     if (!existing) return null;
-    const entry = await prisma.meal_entries.update({
-        where: { id: entryId, user_id: userId },
-        data: {
-            ...(payload.servings !== undefined ? { servings: payload.servings } : {}),
-            ...(payload.name !== undefined ? { name: payload.name.trim() } : {}),
-            ...(payload.calories !== undefined ? { calories: Math.round(payload.calories) } : {}),
-            ...(payload.protein !== undefined ? { protein_g: Math.round(payload.protein) } : {}),
-            ...(payload.carbs !== undefined ? { carbs_g: Math.round(payload.carbs) } : {}),
-            ...(payload.fat !== undefined ? { fat_g: Math.round(payload.fat) } : {}),
-            ...(detachesFromSource(existing, payload) ? DETACHED_SNAPSHOT : {}),
-        },
-    });
-    return mapEntry(entry);
+
+    const plan = planMealEntryEdit(existing, payload);
+
+    try {
+        // `deleted_at: null` belongs in the WRITE predicate and not only in the
+        // read above: the two statements run in separate READ COMMITTED
+        // snapshots, so a delete that commits between them would otherwise be
+        // followed by a successful update of a row the user has already removed —
+        // and a 200 describing it. With the condition here the UPDATE matches
+        // nothing, Prisma raises P2025, and the caller gets the same 404 the
+        // authorization read gives for an entry that is missing or not theirs.
+        const entry = await prisma.meal_entries.update({
+            where: { id: entryId, user_id: userId, deleted_at: null },
+            data: {
+                ...plan.fields,
+                ...(plan.detachesFromSource ? DETACHED_ENTRY_SNAPSHOT : {}),
+            },
+        });
+
+        return mapEntry(entry);
+    } catch (error) {
+        if (isRecordNotFound(error)) return null;
+
+        throw error;
+    }
 };
 
 export const deleteMealEntry = async (userId: string, entryId: string): Promise<boolean> => {

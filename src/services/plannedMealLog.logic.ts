@@ -63,6 +63,7 @@
 // choosing a status code (the controller).
 
 import { PlanNotFoundError } from './mealPlanning.errors';
+import { MAX_REVISION } from './preferences.logic';
 import { scalePlannedNutrition } from './recipe.logic';
 import { InvalidRequestDetail, LogPlannedMealPayload } from '../types/mealPlanning';
 import { MacroTotals, NutritionProvenance } from '../types/nutrition';
@@ -537,8 +538,9 @@ export const deriveConsumedTotals = (snapshot: PlannedEntryMacros, eatenServings
  *  - `invalid_id` — a string that is not a v4 UUID.
  *  - `invalid_date` — a string that is not a `YYYY-MM-DD` calendar day.
  *  - `invalid_servings` — a number outside the servings contract.
- *  - `not_an_integer` / `below_minimum` — `expectedPlanRevision` is fractional,
- *    or below the first revision a plan can have.
+ *  - `not_an_integer` / `below_minimum` / `above_maximum` —
+ *    `expectedPlanRevision` is fractional, below the first revision a plan can
+ *    have, or above the largest one a revision column can hold.
  *  - `unknown_field` — a key this endpoint does not accept, `mealName` above
  *    all: the diary bucket is named by id, and honouring a name would let a
  *    client target — or invent — a bucket of its own choosing.
@@ -555,6 +557,7 @@ export const LOG_PLANNED_MEAL_FIELD_CODES = {
     INVALID_SERVINGS: 'invalid_servings',
     NOT_AN_INTEGER: 'not_an_integer',
     BELOW_MINIMUM: 'below_minimum',
+    ABOVE_MAXIMUM: 'above_maximum',
     UNKNOWN_FIELD: 'unknown_field',
 } as const;
 
@@ -566,6 +569,9 @@ const DIARY_MEAL_ID_FIELD = 'diaryMealId';
 const EXPECTED_PLAN_REVISION_FIELD = 'expectedPlanRevision';
 const IDEMPOTENCY_KEY_FIELD = 'idempotencyKey';
 const BODY_FIELD = 'body';
+/** The two path segments of `POST …/plans/:planId/meals/:mealId/log`. */
+const PLAN_ID_FIELD = 'planId';
+const MEAL_ID_FIELD = 'mealId';
 
 /**
  * Every key this endpoint accepts — and therefore, by omission, the definition
@@ -579,16 +585,36 @@ const ACCEPTED_FIELDS: readonly string[] = [
     IDEMPOTENCY_KEY_FIELD,
 ];
 
+/** The refusal shape both parsers on this endpoint carry. */
+type LogPlannedMealErrorVerdict = {
+    kind: 'error';
+    code: 'invalid_request';
+    message: string;
+    details: InvalidRequestDetail[];
+};
+
 export type ParsedLogPlannedMealRequest =
     | { kind: 'ok'; payload: LogPlannedMealPayload }
-    | { kind: 'error'; code: 'invalid_request'; message: string; details: InvalidRequestDetail[] };
+    | LogPlannedMealErrorVerdict;
+
+export type ParsedLogPlannedMealPath =
+    | { kind: 'ok'; planId: string; mealId: string }
+    | LogPlannedMealErrorVerdict;
+
+/**
+ * The whole request — both path ids and the body — as one verdict. See
+ * {@link parseLogPlannedMealCall}.
+ */
+export type ParsedLogPlannedMealCall =
+    | { kind: 'ok'; planId: string; mealId: string; payload: LogPlannedMealPayload }
+    | LogPlannedMealErrorVerdict;
 
 const asRecord = (body: unknown): Record<string, unknown> | null =>
     typeof body === 'object' && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
 
 const isPresent = (value: unknown): boolean => value !== undefined && value !== null;
 
-const invalidRequest = (message: string, details: InvalidRequestDetail[]): ParsedLogPlannedMealRequest => ({
+const invalidRequest = (message: string, details: InvalidRequestDetail[]): LogPlannedMealErrorVerdict => ({
     kind: 'error',
     code: 'invalid_request',
     message,
@@ -638,6 +664,10 @@ const uuidFieldCode = (value: unknown): LogPlannedMealFieldCode | null => {
  * `expectedPlanRevision` is required and never defaulted: it is the stale-plan
  * guard, and a request that omitted it would silently overwrite whatever the
  * plan had become since the screen was drawn.
+ *
+ * Both ends of the window are judged, and the upper one has its own code: a
+ * value too large to be a revision is a different thing to tell the client
+ * than a value below the first revision a plan can have.
  */
 const planRevisionFieldCode = (value: unknown): LogPlannedMealFieldCode | null => {
     if (!isPresent(value)) {
@@ -652,7 +682,80 @@ const planRevisionFieldCode = (value: unknown): LogPlannedMealFieldCode | null =
         return LOG_PLANNED_MEAL_FIELD_CODES.NOT_AN_INTEGER;
     }
 
-    return value < MIN_PLAN_REVISION ? LOG_PLANNED_MEAL_FIELD_CODES.BELOW_MINIMUM : null;
+    if (value < MIN_PLAN_REVISION) {
+        return LOG_PLANNED_MEAL_FIELD_CODES.BELOW_MINIMUM;
+    }
+
+    // The integer check above is not sufficient on its own: `Number.isInteger`
+    // is true for `1e30`, a whole number that is neither exactly representable
+    // nor storable in the PostgreSQL `integer` column `meal_plans.revision`
+    // is. Both halves are one bound, spelt as `preferences.logic.ts` spells it
+    // — above `MAX_REVISION` no column can hold the value, and above
+    // `Number.MAX_SAFE_INTEGER` the comparison against the stored revision
+    // would itself be unsound. Left unchecked, such a value reaches
+    // `mealPlanningAction.logic.ts::buildRequestFingerprint`, which refuses it
+    // with a TypeError — a 500 for what is plainly a malformed request — or
+    // Prisma, which refuses it as an out-of-range `Int`.
+    return !Number.isSafeInteger(value) || value > MAX_REVISION
+        ? LOG_PLANNED_MEAL_FIELD_CODES.ABOVE_MAXIMUM
+        : null;
+};
+
+/**
+ * One path segment that must be a v4 UUID.
+ *
+ * Deliberately narrower than {@link uuidFieldCode}, which the BODY uses. A body
+ * field distinguishes the two mistakes a client can make with it — `required`
+ * when a field was never sent, `invalid_type`/`invalid_id` when it was sent
+ * wrong — because both are requests a client can actually issue. A PATH segment
+ * cannot be absent in a request that reached the handler at all: a route does
+ * not match without its parameters. So every state other than a well-formed id
+ * is one answer, `invalid_id`, which is the call `grocery.logic.ts`'s path
+ * parsers, `mealPlan.logic.ts::parseMealPlanDayPath`,
+ * `recipe.logic.ts::parseRecipeVersionPath` and `swap.logic.ts`'s three parsers
+ * all make. One rule across the layer, so the client maps one vocabulary for a
+ * path id rather than one per endpoint.
+ */
+const pathIdFieldCode = (value: unknown): LogPlannedMealFieldCode | null =>
+    isUuidV4(value) ? null : LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID;
+
+/**
+ * Validates `:planId` and `:mealId` for `POST …/plans/:planId/meals/:mealId/log`.
+ *
+ * BOTH IDS ARE JUDGED BEFORE ANY I/O, which is the point of the parser: a
+ * malformed id would otherwise reach a PostgreSQL `uuid` predicate and surface
+ * as a generic 500 where §0.5.2 promises a `400 invalid_request` naming the
+ * field — and it would do so on a WRITE path, where the reservation and the
+ * ledger are already in motion. Both are reported in one verdict, so a request
+ * with two malformed segments does not send the caller back twice.
+ *
+ * The body stays {@link parseLogPlannedMealRequest}'s: one parser per part of
+ * the request, so neither has to know the other's fields.
+ */
+export const parseLogPlannedMealPath = (params: {
+    planId?: unknown;
+    mealId?: unknown;
+}): ParsedLogPlannedMealPath => {
+    const details: InvalidRequestDetail[] = [];
+
+    const planIdCode = pathIdFieldCode(params.planId);
+    if (planIdCode) {
+        details.push({ field: PLAN_ID_FIELD, code: planIdCode });
+    }
+
+    const mealIdCode = pathIdFieldCode(params.mealId);
+    if (mealIdCode) {
+        details.push({ field: MEAL_ID_FIELD, code: mealIdCode });
+    }
+
+    if (details.length > 0) {
+        return invalidRequest(
+            `invalid or missing path ids: ${details.map((detail) => detail.field).join(', ')}`,
+            details,
+        );
+    }
+
+    return { kind: 'ok', planId: params.planId as string, mealId: params.mealId as string };
 };
 
 /**
@@ -711,6 +814,53 @@ export const parseLogPlannedMealRequest = (body: unknown): ParsedLogPlannedMealR
             idempotencyKey: record[IDEMPOTENCY_KEY_FIELD] as string,
         },
     };
+};
+
+/**
+ * Validates the WHOLE of `POST …/plans/:planId/meals/:mealId/log` — both path
+ * ids and the body — as ONE verdict for one request.
+ *
+ * This is the parser the route-facing entry point
+ * (`plannedMealLog.service.ts::logPlannedMeal`) calls, and it exists because
+ * this route is a WRITE whose request has two halves. Answering them separately
+ * would send a client with a malformed id and three bad body fields back twice,
+ * which is exactly what `mealPlan.logic.ts::parseRegeneratePlanRequest` and
+ * `swap.logic.ts`'s commit parser already refuse to do: path and body are judged
+ * TOGETHER, and every offending field appears in one answer.
+ *
+ * NO NEW RULE IS DECIDED HERE. It is the composition of
+ * {@link parseLogPlannedMealPath} and {@link parseLogPlannedMealRequest},
+ * which stay exported and unchanged — a third set of field rules would be a
+ * third thing to keep in step with §0.5.2. BOTH are always run, never
+ * short-circuited on the first refusal, because the point of the composition is
+ * the complete detail list; the cost is two synchronous passes over a
+ * five-field object.
+ *
+ * The details are CONCATENATED path-first, then body, so the order the client
+ * renders them in follows the order the request is read in, and the message
+ * names every offending field — `planId`, `mealId` and the body's own fields
+ * alike — in that same order.
+ */
+export const parseLogPlannedMealCall = (
+    params: { planId?: unknown; mealId?: unknown },
+    body: unknown,
+): ParsedLogPlannedMealCall => {
+    const path = parseLogPlannedMealPath(params);
+    const request = parseLogPlannedMealRequest(body);
+
+    if (path.kind === 'ok' && request.kind === 'ok') {
+        return { kind: 'ok', planId: path.planId, mealId: path.mealId, payload: request.payload };
+    }
+
+    const details: InvalidRequestDetail[] = [
+        ...(path.kind === 'ok' ? [] : path.details),
+        ...(request.kind === 'ok' ? [] : request.details),
+    ];
+
+    return invalidRequest(
+        `invalid or missing request values: ${details.map((detail) => detail.field).join(', ')}`,
+        details,
+    );
 };
 
 /* ---------------------------------------------------------------------------
