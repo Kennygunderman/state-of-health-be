@@ -348,21 +348,24 @@ describe('applyTargetBounds', () => {
                 clampReason: null,
             });
         });
-
-        it('does not report a clamp for a difference too small to be visible', () => {
-            // Rounds to 1200, which is the floor: the presented number is not
-            // visibly adjusted, so the caption must not appear.
-            expect(applyTargetBounds(1199.6, 1000, 'female')).toEqual({
-                calories: 1200,
-                clamped: false,
-                clampReason: null,
-            });
-        });
     });
 
     describe('the sex floor', () => {
         it('raises a figure one kcal below it and reports floor', () => {
             expect(applyTargetBounds(1199, 1000, 'female')).toEqual({
+                calories: 1200,
+                clamped: true,
+                clampReason: 'floor',
+            });
+        });
+
+        it('raises a figure a fraction of a kcal below it and reports floor', () => {
+            // The bound is applied to the adjusted value and the rounding is
+            // the last step, so a 1199.6 kcal result is below the 1200 kcal
+            // floor and the floor is what decides the 1200 the user sees —
+            // the caption belongs on it. Comparing the rounded figure instead
+            // would present the floor's own number as the user's own.
+            expect(applyTargetBounds(1199.6, 1000, 'female')).toEqual({
                 calories: 1200,
                 clamped: true,
                 clampReason: 'floor',
@@ -415,9 +418,20 @@ describe('applyTargetBounds', () => {
             });
         });
 
-        it('rounds the basal bound so the result is always a whole kcal', () => {
+        it('rounds the figure the basal bound produced, so the result is always a whole kcal', () => {
             expect(applyTargetBounds(1000, 1799.6, 'male')).toEqual({
                 calories: 1800,
+                clamped: true,
+                clampReason: 'below_bmr',
+            });
+        });
+
+        it('reports below_bmr for a shortfall of a fraction of a kcal, the same rule the floor gets', () => {
+            // The mirror of the 1199.6 floor case: the 1606.25 kcal basal rate
+            // decides the 1606 kcal presented, so it is the reported bound. No
+            // bound carries a visibility threshold the other two do not.
+            expect(applyTargetBounds(1606, 1606.25, 'female')).toEqual({
+                calories: 1606,
                 clamped: true,
                 clampReason: 'below_bmr',
             });

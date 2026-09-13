@@ -270,7 +270,9 @@
     "volumeBasisRequiresDensity": true,
     "requiredDefaultPortionCount": 1,
     "defaultPortionRequiresSourcedGramWeight": true,
+    "retainedPortionsRequireSourcedGramWeight": true,
     "perServingOnlyWithoutGramWeightCheck": "missing_gram_weight",
+    "defaultPortionCountCheck": "default_portion_count",
     "requiredNutrients": [
       "calories",
       "protein_g",
@@ -284,6 +286,7 @@
     "missing_density",
     "missing_core_nutrient",
     "unsupported_portion",
+    "default_portion_count",
     "unsourced",
     "duplicate_identity"
   ],

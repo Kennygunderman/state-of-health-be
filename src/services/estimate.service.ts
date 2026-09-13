@@ -1,6 +1,6 @@
 import { EstimateItem, EstimateResponse, LabelScanResponse } from '../types/nutrition';
 import { GenericFoodCandidate, searchGenericFoods } from './usda.service';
-import { MessageContent, OpenRouterError, callOpenRouter } from './openrouter.service';
+import { MessageContent, OpenRouterError, callOpenRouter, getOpenRouterConfig } from './openrouter.service';
 
 // Access control (kill switch, daily quota) lives in entitlement.service —
 // controllers call assertAndConsumeAiCall before invoking this service.
@@ -117,14 +117,25 @@ const buildUserContent = (text?: string, imageBase64?: string): MessageContent =
 // The model output is returned as `unknown`: the vendor boundary validates the
 // transport and the JSON syntax, never the shape, so each call site below
 // narrows the fields it reads instead of trusting model-controlled data.
+//
+// `resolveModel` is a thunk and not a resolved string because reading the
+// vendor configuration can itself fail: an argument expression is evaluated
+// BEFORE this function is entered, so a call site that passed
+// `getOpenRouterConfig().judgeModel` directly would let an unconfigured key
+// raise a raw OpenRouterError outside the try below — past the one translation
+// point and out of this service untranslated. Invoked inside the try, that
+// failure becomes the same EstimateFailedError as every other vendor failure.
+// `fetchImpl` is the transport seam callOpenRouter already declares;
+// `undefined` leaves it using the global `fetch`.
 const callModel = async (
     systemPrompt: string,
     userContent: MessageContent,
     jsonSchema: object,
-    modelOverride?: string,
+    resolveModel?: () => string,
+    fetchImpl?: typeof fetch,
 ): Promise<unknown> => {
     try {
-        return await callOpenRouter(systemPrompt, userContent, jsonSchema, modelOverride);
+        return await callOpenRouter(systemPrompt, userContent, jsonSchema, resolveModel?.(), fetchImpl);
     } catch (error) {
         if (error instanceof OpenRouterError) {
             throw new EstimateFailedError(error.message);
@@ -175,16 +186,40 @@ interface EstimateItemWithGrams extends EstimateItem {
     grams: number;
 }
 
+/**
+ * The collaborators an estimate may be given instead of the production ones.
+ *
+ * Declared for the same reason `callOpenRouter` declares its own `fetchImpl`
+ * parameter: the seam is part of the signature, so a unit test reaches the
+ * grounding path — including the judge round trip — without a database or a
+ * network, and without this module knowing it is under test. Both fields are
+ * optional and default to the real collaborator, so the request path
+ * (`nutrition.controller`) passes nothing and behaves exactly as before.
+ *
+ * `searchGenericFoods` is here rather than stubbed at the transport level
+ * because it reaches `usdaGet`, which reads the `usda_api_cache` table through
+ * Prisma before it ever looks at the USDA API key — a database connection no
+ * unit test may open (backend-architecture §11).
+ */
+export interface EstimateDependencies {
+    searchGenericFoods?: typeof searchGenericFoods;
+    fetchImpl?: typeof fetch;
+}
+
 // Ground LLM items in USDA generic-food data: search candidates per item, let
 // a judge call pick genuine matches, then scale per-100g values by the LLM's
 // gram estimate. Any failure falls back to the raw LLM values — grounding can
 // only replace numbers, never lose items or fail the estimate.
-const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<EstimateItem[]> => {
+const groundItemsInUsda = async (
+    items: EstimateItemWithGrams[],
+    deps: EstimateDependencies,
+): Promise<EstimateItem[]> => {
+    const searchCandidates = deps.searchGenericFoods ?? searchGenericFoods;
     const candidateLists = await Promise.all(
         items.map(async (item) => {
             if (item.grams <= 0) return [];
             try {
-                return await searchGenericFoods(item.name);
+                return await searchCandidates(item.name);
             } catch (error) {
                 console.warn(`USDA candidate search failed for "${item.name}":`, (error as Error).message);
                 return [];
@@ -204,12 +239,18 @@ const groundItemsInUsda = async (items: EstimateItemWithGrams[]): Promise<Estima
     }));
     // The judge is a classification task — it gets its own model tuned for
     // consistency (gemini-flash via OpenRouter routes across providers and
-    // flip-flops on borderline matches even at temperature 0).
+    // flip-flops on borderline matches even at temperature 0). Which model that
+    // is belongs to the vendor boundary and is asked for here rather than
+    // decided here: `getOpenRouterConfig().judgeModel` resolves
+    // ESTIMATE_JUDGE_MODEL once at module load for every consumer of it
+    // (backend-architecture §9), so this service never branches on the
+    // environment.
     const judged = await callModel(
         JUDGE_SYSTEM_PROMPT,
         JSON.stringify(judgeInput, null, 2),
         JUDGE_JSON_SCHEMA,
-        process.env.ESTIMATE_JUDGE_MODEL || 'openai/gpt-4o-mini',
+        () => getOpenRouterConfig().judgeModel,
+        deps.fetchImpl,
     );
     const judgedMatches = asRecord(judged)?.matches;
     const matches: unknown[] = Array.isArray(judgedMatches) ? judgedMatches : [];
@@ -279,9 +320,19 @@ const toEstimateItem = (value: unknown): EstimateItemWithGrams | null => {
     };
 };
 
-export const estimateMeal = async (text?: string, imageBase64?: string): Promise<EstimateResponse> => {
+export const estimateMeal = async (
+    text?: string,
+    imageBase64?: string,
+    deps: EstimateDependencies = {},
+): Promise<EstimateResponse> => {
     const parsed = asRecord(
-        await callModel(ESTIMATE_SYSTEM_PROMPT, buildUserContent(text, imageBase64), ESTIMATE_JSON_SCHEMA),
+        await callModel(
+            ESTIMATE_SYSTEM_PROMPT,
+            buildUserContent(text, imageBase64),
+            ESTIMATE_JSON_SCHEMA,
+            undefined,
+            deps.fetchImpl,
+        ),
     );
 
     const parsedItems = parsed?.items;
@@ -296,7 +347,7 @@ export const estimateMeal = async (text?: string, imageBase64?: string): Promise
     // Ground in USDA unless disabled; never let grounding break the estimate.
     if (process.env.ESTIMATE_GROUNDING !== 'off') {
         try {
-            items = await groundItemsInUsda(items as EstimateItemWithGrams[]);
+            items = await groundItemsInUsda(items as EstimateItemWithGrams[], deps);
         } catch (error) {
             console.error('USDA grounding failed, using raw LLM estimate:', (error as Error).message);
         }

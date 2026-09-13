@@ -35,7 +35,13 @@
 //    the status and the resume marker, so re-saving the diet step from the plan
 //    settings screen cannot send a user who already has a plan back into
 //    onboarding, and stepping back in the wizard to change a goal cannot make a
-//    force-quit resume at an earlier screen than the user reached.
+//    force-quit resume at an earlier screen than the user reached. The single
+//    exception is a required answer the row PROVES is missing, which only a
+//    route change can create — the manual route never asks for an activity
+//    level and the estimated route requires one — and which pulls the marker
+//    back to that answer and withholds `ready_for_review` until it is given.
+//    Readiness that survived a change in what is required would be a plan built
+//    from a row whose answers were never given.
 //
 //  * METRIC IS WHAT IS STORED. Heights and weights are normalised through the
 //    exact conversion factors below and range-checked here, so an
@@ -63,6 +69,8 @@
 import {
     ActivityLevel,
     ActivityStepPayload,
+    BodyMeasuredStepPayload,
+    BodySkippedStepPayload,
     BodyStepPayload,
     BudgetPreference,
     BudgetTier,
@@ -85,6 +93,7 @@ import {
     ScheduleStepPayload,
     SetupStatus,
     SetupStep,
+    SetupStepEnvelope,
     SexForEstimate,
     TargetRoute,
     WeightUnitPref,
@@ -941,9 +950,13 @@ export type ParsedBudgetAnswer = { kind: 'ok'; answer: BudgetAnswer } | Preferen
  *  * Neither of them is refused too: the screen requires the user to check the
  *    box or type an amount, so an empty pair is an unanswered step rather than
  *    a permissive one.
- *  * The currency is accepted case-insensitively and stored as `USD`. A second
- *    currency is a product decision, so anything else is refused rather than
- *    converted at an invented rate.
+ *  * The currency must be EXACTLY {@link BUDGET_CURRENCY}. The wire contract
+ *    declares one spelling, so `' usd '` is a malformed request rather than a
+ *    near miss to be tidied up: normalising it here would accept a body no
+ *    client of this contract sends and leave the one real currency check
+ *    weaker than the contract it enforces. A second currency is a product
+ *    decision, so anything else is refused rather than converted at an
+ *    invented rate.
  */
 export const parseBudgetAnswer = (budget: unknown, noBudgetPreference: unknown): ParsedBudgetAnswer => {
     if (isAbsent(noBudgetPreference)) {
@@ -981,7 +994,7 @@ export const parseBudgetAnswer = (budget: unknown, noBudgetPreference: unknown):
         details.push(detail('budget.currency', PREFERENCE_FIELD_CODES.REQUIRED));
     } else if (typeof record.currency !== 'string') {
         details.push(detail('budget.currency', PREFERENCE_FIELD_CODES.INVALID_TYPE));
-    } else if (record.currency.trim().toUpperCase() !== BUDGET_CURRENCY) {
+    } else if (record.currency !== BUDGET_CURRENCY) {
         details.push(detail('budget.currency', PREFERENCE_FIELD_CODES.UNSUPPORTED_CURRENCY));
     }
 
@@ -1123,6 +1136,18 @@ export const deriveDislikedFoodGroups = (
 /** `PreferencesResponse.revision` for a user who has no preferences row at all. */
 export const NO_PREFERENCES_REVISION = 0;
 
+/**
+ * The largest revision a pinned token may name: the maximum value of the
+ * PostgreSQL `integer` column the counters live in.
+ *
+ * A token above it — or any value outside JavaScript's exact-integer range,
+ * such as `1e30` — cannot denote a stored revision at all, so it is a
+ * MALFORMED request rather than a lost race. Classifying it as stale would
+ * tell the client to re-read and retry a value that can never match, and would
+ * hand the service a number it cannot compare against the column.
+ */
+export const MAX_REVISION = 2_147_483_647;
+
 type ResolvedRevision =
     | { kind: 'ok'; expectedRevision: number | null }
     | { kind: 'invalid'; detail: InvalidRequestDetail }
@@ -1131,17 +1156,23 @@ type ResolvedRevision =
 /**
  * The expected-revision rule, whose asymmetry is deliberate.
  *
- * `expectedRevision` is optional ONLY while no preferences row exists — the very
- * first `goal` save has no revision to pin — and is required and exact from then
- * on. A missing value after creation is therefore a stale revision rather than a
- * malformed body: a client that does not pin one cannot be allowed to overwrite
- * whatever another device just wrote, and treating the omission as "no opinion"
- * is precisely how two clients editing at once would both appear to succeed
- * while one update vanished. Exactly one of them loses, and it is told so.
+ * `expectedRevision` is optional ONLY while no preferences row exists AND the
+ * caller is the very first `goal` save, which has no revision to pin (the
+ * caller passes that as `optionalBeforeCreation`; see
+ * {@link parseSetupStep}). It is required and exact from then on. A missing
+ * value after creation is therefore a stale revision rather than a malformed
+ * body: a client that does not pin one cannot be allowed to overwrite whatever
+ * another device just wrote, and treating the omission as "no opinion" is
+ * precisely how two clients editing at once would both appear to succeed while
+ * one update vanished. Exactly one of them loses, and it is told so.
  *
  * A row that exists reads back revision 0 nowhere, and a user with no row reads
  * back {@link NO_PREFERENCES_REVISION} — which is why an absent row and an
  * expected 0 are the same comparison.
+ *
+ * A token that cannot denote a stored revision at all is a 400 before any
+ * comparison is attempted: not a number, not finite, not a whole number,
+ * negative, or outside the exact range the {@link MAX_REVISION} column holds.
  */
 const resolveExpectedRevision = (
     value: unknown,
@@ -1174,9 +1205,73 @@ const resolveExpectedRevision = (
         };
     }
 
+    // `Number.isInteger(1e30)` is true, so the integer check above lets through
+    // values that are whole but not exactly representable and cannot be a
+    // stored revision. Both halves are one bound: above `MAX_REVISION` the
+    // column cannot hold it, and above `Number.MAX_SAFE_INTEGER` the comparison
+    // itself would be unsound.
+    if (!Number.isSafeInteger(value) || value > MAX_REVISION) {
+        return {
+            kind: 'invalid',
+            detail: detail('expectedRevision', PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM),
+        };
+    }
+
     return value === effectiveCurrent
         ? { kind: 'ok', expectedRevision: value }
         : { kind: 'stale', currentRevision: effectiveCurrent };
+};
+
+/* ---------------------------------------------------------------------------
+ * Goal coherence — one rule, one implementation
+ *
+ * Three answers form one tuple: the goal's DIRECTION, the current weight, and
+ * the target weight. Each is edited on a different screen and through a
+ * different endpoint, so the tuple can be broken by a request that never
+ * mentions the member it invalidates — which is why the check below is shared
+ * by the goal step, the body step and the full save rather than written once
+ * beside the goal field.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Why a target weight does not sit on the goal's side of the current weight, or
+ * null when the three answers are coherent (or not yet comparable).
+ *
+ * Returns null rather than a refusal when either weight is unknown: the goal is
+ * answered BEFORE the body step on first entry, so there is genuinely nothing
+ * to compare against yet, and inventing a weight would refuse a target the
+ * screen allows. The comparison becomes possible later, and every write that
+ * touches a member of the tuple re-runs it — that is what stops a target
+ * accepted at question two from surviving a current weight entered at question
+ * three that contradicts it.
+ *
+ * Never silently clears the target: a goal weight is the user's own answer, and
+ * dropping it to make a row coherent would be the same class of mistake as
+ * resolving a contradictory allergy selection by guessing.
+ */
+const goalWeightConflict = (
+    goal: Goal | null,
+    currentWeightKg: number | null | undefined,
+    goalWeightKg: number | null | undefined,
+): PreferenceFieldCode | null => {
+    if (
+        typeof currentWeightKg !== 'number' ||
+        !Number.isFinite(currentWeightKg) ||
+        typeof goalWeightKg !== 'number' ||
+        !Number.isFinite(goalWeightKg)
+    ) {
+        return null;
+    }
+
+    if (goal === 'lose' && goalWeightKg >= currentWeightKg) {
+        return PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT;
+    }
+
+    if (goal === 'gain' && goalWeightKg <= currentWeightKg) {
+        return PREFERENCE_FIELD_CODES.NOT_ABOVE_CURRENT_WEIGHT;
+    }
+
+    return null;
 };
 
 /* ---------------------------------------------------------------------------
@@ -1207,6 +1302,119 @@ const PAYLOAD_BEARING_STEPS: Readonly<Record<PayloadBearingSetupStep, true>> = {
 export const isPayloadBearingSetupStep = (value: unknown): value is PayloadBearingSetupStep =>
     isMemberOf(PAYLOAD_BEARING_STEPS, value);
 
+/** The payload type each `:step` path segment declares. */
+interface StepPayloadByStep {
+    goal: GoalStepPayload;
+    // Both variants, because the step accepts either the measured answer or Skip.
+    body: BodyMeasuredStepPayload | BodySkippedStepPayload;
+    activity: ActivityStepPayload;
+    diet: DietStepPayload;
+    dislikes: DislikesStepPayload;
+    schedule: ScheduleStepPayload;
+    cooking: CookingStepPayload;
+    review: ReviewStepPayload;
+}
+
+/**
+ * A payload's own keys — everything it declares beyond the shared envelope.
+ *
+ * DISTRIBUTIVE on purpose: `keyof (A | B)` is the INTERSECTION of the two key
+ * sets, which for the body step would silently reduce to `skipped` alone and
+ * leave every measurement refused as an unknown key. Distributing over the
+ * union yields the union of their keys, which is what the step accepts.
+ */
+type OwnPayloadKeys<T> = T extends unknown ? Exclude<keyof T, keyof SetupStepEnvelope> : never;
+
+/** The two keys every per-step body carries whatever the step is. */
+const ENVELOPE_KEYS: Readonly<Record<keyof SetupStepEnvelope, true>> = {
+    timeZone: true,
+    expectedRevision: true,
+};
+
+/**
+ * Every key each step's body may carry, beside {@link ENVELOPE_KEYS}.
+ *
+ * Typed against the payload interfaces themselves — `Record<OwnPayloadKeys<…>,
+ * true>` per step — so the compiler rejects both halves of the drift this table
+ * exists to prevent: a key listed here that the step's payload does not
+ * declare, and a key added to a payload that nobody taught this table about.
+ * The six server-owned members of `PreferencesResponse` (`setupStatus`,
+ * `setupStep`, `revision`, `budgetTier`, `hasActivePlan`, `targetRoute`) appear
+ * in no entry, which is what makes them refusals rather than silent no-ops.
+ */
+const STEP_PAYLOAD_KEYS: {
+    readonly [S in PayloadBearingSetupStep]: Readonly<
+        Record<OwnPayloadKeys<StepPayloadByStep[S]>, true>
+    >;
+} = {
+    goal: { goal: true, goalWeightKg: true, paceLbPerWeek: true },
+    body: {
+        skipped: true,
+        age: true,
+        heightCm: true,
+        weightKg: true,
+        sexForEstimate: true,
+        heightUnitPref: true,
+        weightUnitPref: true,
+    },
+    activity: { activityLevel: true },
+    diet: { diet: true, allergens: true },
+    dislikes: { dislikedFoodIds: true },
+    schedule: { mealSchedule: true, mealTimes: true },
+    cooking: { cookingTimeLimitMin: true, budget: true, noBudgetPreference: true },
+    review: { startDate: true },
+};
+
+/**
+ * Skip's own keys — the discriminant and nothing else.
+ *
+ * The body step is the one step whose payload is a DISCRIMINATED UNION, so the
+ * single entry above cannot be its closed key set: it holds the union of both
+ * branches' keys, which is right for the measured answer and far too wide for
+ * Skip. Skip declares no measurements at all, and `parseBodyStep` returns the
+ * moment it sees `skipped: true`, so measurements sent alongside it would be
+ * accepted under a 200 and then dropped on the floor — a client that filled the
+ * form, tapped Skip, and read its own values back as unanswered. Selecting the
+ * key set by the discriminant refuses them instead, with the same
+ * `read_only_field` code every other unaccepted own key gets.
+ *
+ * Typed against `BodySkippedStepPayload` for the same reason the table above is
+ * typed against the payload interfaces: neither half of the drift is possible.
+ */
+const BODY_SKIPPED_KEYS: Readonly<Record<OwnPayloadKeys<BodySkippedStepPayload>, true>> = {
+    skipped: true,
+};
+
+/**
+ * The closed key set a body carries, which for the body step depends on the
+ * branch of the union the body selected.
+ *
+ * `skipped: true` selects Skip. Anything else — absent, `false`, or a value
+ * that is not a boolean at all — selects the measured branch, whose own parser
+ * then refuses a malformed discriminant on `skipped` rather than here, so a
+ * caller sending `skipped: 'yes'` is told its type is wrong instead of being
+ * told the field is unacceptable.
+ */
+const acceptedStepKeys = (
+    step: PayloadBearingSetupStep,
+    record: Record<string, unknown>,
+): Readonly<Record<string, true>> =>
+    step === 'body' && record.skipped === true ? BODY_SKIPPED_KEYS : STEP_PAYLOAD_KEYS[step];
+
+/** Every own key of a step body that the step does not accept, in body order. */
+const unacceptedStepKeys = (
+    step: PayloadBearingSetupStep,
+    record: Record<string, unknown>,
+): string[] => {
+    const accepted = acceptedStepKeys(step, record);
+
+    return Object.keys(record).filter(
+        (key) =>
+            !Object.prototype.hasOwnProperty.call(accepted, key) &&
+            !Object.prototype.hasOwnProperty.call(ENVELOPE_KEYS, key),
+    );
+};
+
 /** What the parser must know about the stored row to judge a step payload. */
 export interface SetupStepContext {
     /** The row's revision, or null when the user has no preferences row yet. */
@@ -1218,6 +1426,18 @@ export interface SetupStepContext {
      * on first entry and there is genuinely nothing to compare against yet.
      */
     currentWeightKg?: number | null;
+    /**
+     * The stored goal, for judging the body step's new current weight against a
+     * target weight saved earlier. Absent or null means the goal step has not
+     * been answered yet, so there is no direction to judge.
+     */
+    currentGoal?: Goal | null;
+    /**
+     * The stored target weight, for the same check. A target accepted at the
+     * goal step while no current weight was known is revalidated the moment the
+     * body step supplies one (see {@link goalWeightConflict}).
+     */
+    currentGoalWeightKg?: number | null;
 }
 
 /** The payload each step accepts, discriminated by the step it belongs to. */
@@ -1288,17 +1508,14 @@ const parseGoalStep = (
             if (typeof bounded !== 'number') {
                 details.push(detail('goalWeightKg', bounded));
             } else {
-                const current = context.currentWeightKg;
-                const comparable = typeof current === 'number' && Number.isFinite(current);
+                const conflict = goalWeightConflict(
+                    knownGoal ? (goal as Goal) : null,
+                    context.currentWeightKg,
+                    bounded,
+                );
 
-                if (comparable && goal === 'lose' && bounded >= (current as number)) {
-                    details.push(
-                        detail('goalWeightKg', PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT),
-                    );
-                } else if (comparable && goal === 'gain' && bounded <= (current as number)) {
-                    details.push(
-                        detail('goalWeightKg', PREFERENCE_FIELD_CODES.NOT_ABOVE_CURRENT_WEIGHT),
-                    );
+                if (conflict !== null) {
+                    details.push(detail('goalWeightKg', conflict));
                 } else {
                     goalWeightKg = bounded;
                 }
@@ -1313,9 +1530,25 @@ const parseGoalStep = (
     return { ...envelope, goal: goal as Goal, goalWeightKg, paceLbPerWeek };
 };
 
+/**
+ * The body step, which is also where a target weight saved earlier becomes
+ * judgeable for the first time.
+ *
+ * The goal screen comes first and may be answered before any current weight is
+ * known, so its side check is skipped there. This step supplies that weight,
+ * and re-runs the check against the stored target: without it, "lose weight,
+ * target 77 kg" followed by "I currently weigh 70 kg" would be stored as a
+ * coherent answer and then drive a plan. The refusal names `goalWeightKg`
+ * because that is the answer that has to change (or be cleared) — the same
+ * field and the same codes the goal screen itself reports, so the client maps
+ * one message for both.
+ *
+ * Skip revalidates nothing: it carries no weight, so nothing became comparable.
+ */
 const parseBodyStep = (
     record: Record<string, unknown>,
     envelope: StepEnvelope,
+    context: SetupStepContext,
 ): BodyStepPayload | PreferenceErrorVerdict => {
     if (record.skipped === true) {
         // Skip carries no measurements by design: it is the answer that routes
@@ -1354,6 +1587,18 @@ const parseBodyStep = (
         details.push(detail('weightUnitPref', PREFERENCE_FIELD_CODES.REQUIRED));
     } else if (!isMemberOf(WEIGHT_UNIT_PREFS, record.weightUnitPref)) {
         details.push(detail('weightUnitPref', PREFERENCE_FIELD_CODES.UNKNOWN_VALUE));
+    }
+
+    if (measurements.kind === 'ok') {
+        const conflict = goalWeightConflict(
+            context.currentGoal ?? null,
+            measurements.measurements.weightKg,
+            context.currentGoalWeightKg,
+        );
+
+        if (conflict !== null) {
+            details.push(detail('goalWeightKg', conflict));
+        }
     }
 
     if (details.length > 0 || measurements.kind !== 'ok') {
@@ -1551,11 +1796,22 @@ const parseReviewStep = (
  * for a well-formed request that simply lost the race, which is the only case
  * the client's re-read-and-compare recovery can resolve.
  *
- * Extra keys are ignored rather than refused here: the closed-key contract
- * belongs to the full save (see {@link parsePreferencesUpdate}), and a step body
- * that echoes a response field is a client harmlessly over-sending, not an
- * attempt to write a server-owned value — a step parser reads only the fields
- * its own step declares.
+ * THE KEY SET IS CLOSED, exactly as it is for the full save: each step declares
+ * one typed payload, and an own key outside it plus the envelope is refused
+ * with `read_only_field` rather than ignored. Ignoring it hides two different
+ * client bugs behind a 200 — an attempt to write a server-owned value such as
+ * `setupStatus`, which would leave the caller believing it had fabricated
+ * onboarding progress, and a misspelled answer (`activityLevl`), which would be
+ * silently dropped and read back as unanswered by a screen that thinks it saved.
+ *
+ * THE FIRST WRITE MUST BE THE `goal` STEP. That save is the one that creates
+ * the row, and it is therefore also the only one that may omit
+ * `expectedRevision` — there is no revision to pin yet. Every other step
+ * against a user who has no row is out of order: the wizard cannot reach it, a
+ * resume always re-enters at the stored marker, and accepting it would create
+ * setup state from the middle of the flow (with or without a pinned zero
+ * revision), leaving earlier answers permanently absent while the row claims
+ * progress.
  */
 export const parseSetupStep = (
     step: unknown,
@@ -1573,6 +1829,11 @@ export const parseSetupStep = (
     }
 
     const details: InvalidRequestDetail[] = [];
+
+    for (const key of unacceptedStepKeys(step, record)) {
+        details.push(detail(key, PREFERENCE_FIELD_CODES.READ_ONLY_FIELD));
+    }
+
     const timeZone = normalizeTimeZone(record.timeZone);
 
     if (timeZone === null) {
@@ -1586,8 +1847,16 @@ export const parseSetupStep = (
         );
     }
 
+    // A legitimate step, but not as the first write this user makes: `goal`
+    // creates the row. Reported as a 400 on `step` rather than as a stale
+    // revision, because no revision the client could have pinned would make it
+    // acceptable.
+    if (context.currentRevision === null && step !== 'goal') {
+        details.push(detail('step', PREFERENCE_FIELD_CODES.NOT_ALLOWED));
+    }
+
     const revision = resolveExpectedRevision(record.expectedRevision, context.currentRevision, {
-        optionalBeforeCreation: true,
+        optionalBeforeCreation: step === 'goal',
     });
 
     if (revision.kind === 'invalid') {
@@ -1608,7 +1877,7 @@ export const parseSetupStep = (
         step === 'goal'
             ? parseGoalStep(record, envelope, context)
             : step === 'body'
-              ? parseBodyStep(record, envelope)
+              ? parseBodyStep(record, envelope, context)
               : step === 'activity'
                 ? parseActivityStep(record, envelope)
                 : step === 'diet'
@@ -1699,6 +1968,19 @@ export interface PreferencesUpdateContext {
     currentWeightKg?: number | null;
     /** For the goal-weight side check when the body changes only the weight. */
     currentGoal?: Goal | null;
+    /**
+     * The stored target weight, for the side check when the body changes only
+     * the goal or only the current weight — either of which can invalidate a
+     * target the request never mentions.
+     */
+    currentGoalWeightKg?: number | null;
+    /**
+     * The stored pace, for the goal/pace pair check when the body changes only
+     * the goal. A direction with no pace cannot be estimated from at all
+     * (`targets.logic.ts::resolveEstimateInputs` answers `missing_inputs`), so
+     * a partial that creates that pair is refused here rather than stored.
+     */
+    currentPaceLbPerWeek?: PaceLbPerWeek | null;
     /** For judging meal times when the body changes only the times. */
     currentMealSchedule?: MealSchedule | null;
     /** For judging the budget pair when the body changes only one half of it. */
@@ -1747,22 +2029,33 @@ const parseFoodGroupList = (value: unknown, field: string): string[] | Preferenc
 /**
  * Validates the full preferences save.
  *
- * Two things separate this from the per-step saves:
+ * THE KEY SET IS CLOSED, and a key outside it is REFUSED rather than ignored —
+ * the same contract the per-step saves enforce through
+ * {@link STEP_PAYLOAD_KEYS}. Silently dropping an attempt to set `setupStatus`
+ * would hide a client bug and leave a caller believing it had fabricated
+ * onboarding progress; one `read_only_field` detail per offending key says
+ * otherwise. Unknown names get the same code, because "this key is not yours to
+ * write" is the same answer whether the key exists on the response or nowhere
+ * at all.
  *
- *  * THE KEY SET IS CLOSED, and a key outside it is REFUSED rather than
- *    ignored. Silently dropping an attempt to set `setupStatus` would hide a
- *    client bug and leave a caller believing it had fabricated onboarding
- *    progress; one `read_only_field` detail per offending key says otherwise.
- *    Unknown names get the same code, because "this key is not yours to write"
- *    is the same answer whether the key exists on the response or nowhere at
- *    all.
+ * Three things separate this from a per-step save:
+ *
+ *  * IT REQUIRES AN EXISTING ROW. Creation belongs to the first `goal` step, so
+ *    `expectedRevision` is mandatory here and a user with no row is refused
+ *    however they pin it (see the end of this function).
  *  * THE BODY IS A PARTIAL, so omitted and null are not the same thing. An
  *    omitted key leaves the stored value alone; an explicit null CLEARS it,
  *    which is how switching to the 'maintain' goal drops a target weight and a
- *    pace. Two coherence rules are therefore judged against the stored row
- *    supplied in `context` rather than against the body alone: meal times must
- *    match whichever schedule ends up in force, and a budget amount must exist
- *    unless "no budget preference" is the answer.
+ *    pace.
+ *  * COHERENCE IS JUDGED AGAINST THE STORED ROW supplied in `context`, not
+ *    against the body alone, because a partial can break an answer it never
+ *    mentions. Four rules read it: meal times must match whichever schedule
+ *    ends up in force; a budget amount must exist unless "no budget preference"
+ *    is the answer; a directional goal must have a pace; and the target weight
+ *    must sit on the goal's side of the current weight. The last two are
+ *    re-judged whenever ANY member of their tuple changes — which is the
+ *    difference between storing a coherent row and storing one that only looked
+ *    coherent to the request that wrote it.
  *
  * Setting the 'maintain' goal NORMALISES the pair away — the returned payload
  * carries explicit nulls for the goal weight and the pace — so no stored row can
@@ -1822,17 +2115,22 @@ export const parsePreferencesUpdate = (
         }
     }
 
+    const goalRejected = has('goal') && payload.goal === undefined;
     const effectiveGoal: Goal | null =
         (payload.goal as Goal | undefined) ?? context.currentGoal ?? null;
     const maintains = effectiveGoal === 'maintain';
+
+    let paceRejected = false;
 
     if (has('paceLbPerWeek')) {
         if (isAbsent(record.paceLbPerWeek)) {
             payload.paceLbPerWeek = null;
         } else if (maintains) {
             details.push(detail('paceLbPerWeek', PREFERENCE_FIELD_CODES.NOT_ALLOWED));
+            paceRejected = true;
         } else if (!isNumericMemberOf(PACES, record.paceLbPerWeek)) {
             details.push(detail('paceLbPerWeek', PREFERENCE_FIELD_CODES.UNKNOWN_VALUE));
+            paceRejected = true;
         } else {
             payload.paceLbPerWeek = record.paceLbPerWeek;
         }
@@ -1840,7 +2138,30 @@ export const parsePreferencesUpdate = (
         payload.paceLbPerWeek = null;
     }
 
-    let editedWeightKg: number | null = null;
+    // A direction needs a pace, and either half of that pair may arrive without
+    // the other: switching `maintain` -> `lose` while the stored pace is null
+    // (maintenance never has one) would otherwise store a goal no estimate can
+    // be computed from, which surfaces later as an unexplained
+    // `estimate_unavailable` on the review screen rather than as a rejected
+    // save. Judged on the EFFECTIVE pair, and only while both halves are
+    // well-formed — a pace already refused above does not also get reported as
+    // missing.
+    const effectivePace: PaceLbPerWeek | null = has('paceLbPerWeek')
+        ? ((payload.paceLbPerWeek as PaceLbPerWeek | null | undefined) ?? null)
+        : (context.currentPaceLbPerWeek ?? null);
+
+    if (
+        !goalRejected &&
+        !paceRejected &&
+        (has('goal') || has('paceLbPerWeek')) &&
+        effectiveGoal !== null &&
+        !maintains &&
+        effectivePace === null
+    ) {
+        details.push(detail('paceLbPerWeek', PREFERENCE_FIELD_CODES.REQUIRED));
+    }
+
+    let weightRejected = false;
 
     if (has('weightKg')) {
         const bounded = parseBoundedNumber(record.weightKg, BODY_INPUT_RANGES.weightKg, {
@@ -1849,17 +2170,20 @@ export const parsePreferencesUpdate = (
 
         if (typeof bounded !== 'number') {
             details.push(detail('weightKg', bounded));
+            weightRejected = true;
         } else {
             payload.weightKg = bounded;
-            editedWeightKg = bounded;
         }
     }
+
+    let goalWeightRejected = false;
 
     if (has('goalWeightKg')) {
         if (isAbsent(record.goalWeightKg)) {
             payload.goalWeightKg = null;
         } else if (maintains) {
             details.push(detail('goalWeightKg', PREFERENCE_FIELD_CODES.NOT_ALLOWED));
+            goalWeightRejected = true;
         } else {
             const bounded = parseBoundedNumber(record.goalWeightKg, BODY_INPUT_RANGES.weightKg, {
                 integer: false,
@@ -1867,25 +2191,39 @@ export const parsePreferencesUpdate = (
 
             if (typeof bounded !== 'number') {
                 details.push(detail('goalWeightKg', bounded));
+                goalWeightRejected = true;
             } else {
-                const current = editedWeightKg ?? context.currentWeightKg ?? null;
-                const comparable = typeof current === 'number' && Number.isFinite(current);
-
-                if (comparable && effectiveGoal === 'lose' && bounded >= (current as number)) {
-                    details.push(
-                        detail('goalWeightKg', PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT),
-                    );
-                } else if (comparable && effectiveGoal === 'gain' && bounded <= (current as number)) {
-                    details.push(
-                        detail('goalWeightKg', PREFERENCE_FIELD_CODES.NOT_ABOVE_CURRENT_WEIGHT),
-                    );
-                } else {
-                    payload.goalWeightKg = bounded;
-                }
+                payload.goalWeightKg = bounded;
             }
         }
     } else if (maintains && has('goal')) {
         payload.goalWeightKg = null;
+    }
+
+    // The goal/weight/target tuple, judged ONCE against whichever values end up
+    // in force. It is re-judged whenever this body changes any member — not
+    // only when it carries the target — because changing the direction
+    // (`lose` -> `gain`) or the current weight is exactly how a target accepted
+    // earlier stops sitting on the goal's side of it. A body that touches no
+    // member is left alone, so an incoherent legacy row does not block an
+    // unrelated edit; and a member this request already refused is not
+    // compared, so one mistake produces one detail.
+    if (
+        !goalRejected &&
+        !weightRejected &&
+        !goalWeightRejected &&
+        (has('goal') || has('weightKg') || has('goalWeightKg'))
+    ) {
+        const effectiveWeight =
+            (payload.weightKg as number | undefined) ?? context.currentWeightKg ?? null;
+        const effectiveGoalWeight = has('goalWeightKg')
+            ? ((payload.goalWeightKg as number | null | undefined) ?? null)
+            : (context.currentGoalWeightKg ?? null);
+        const conflict = goalWeightConflict(effectiveGoal, effectiveWeight, effectiveGoalWeight);
+
+        if (conflict !== null) {
+            details.push(detail('goalWeightKg', conflict));
+        }
     }
 
     if (has('age')) {
@@ -2104,8 +2442,17 @@ export const parsePreferencesUpdate = (
         return invalidRequest(details);
     }
 
-    if (revision.kind === 'stale') {
-        return staleRevision(revision.currentRevision);
+    // This endpoint EDITS; it never creates. A user with no row has answered
+    // nothing, so there is no partial to apply to anything, and the pinned
+    // revision is beside the point: `expectedRevision: 0` compares equal to the
+    // absent row's read-back value and would otherwise let a full save
+    // materialise setup state that belongs to the first `goal` step. The client
+    // recovery is the same one it already has for a lost race — re-read, see
+    // `revision: 0` and `setupStatus: 'not_started'`, and go through setup.
+    if (context.currentRevision === null || revision.kind === 'stale') {
+        return staleRevision(
+            revision.kind === 'stale' ? revision.currentRevision : NO_PREFERENCES_REVISION,
+        );
     }
 
     return {
@@ -2194,12 +2541,103 @@ export const resolveTargetRouteForBodyStep = (payload: BodyStepPayload): TargetR
     return payload.sexForEstimate === 'prefer_not_to_say' ? 'manual' : 'estimated';
 };
 
+/**
+ * The stored answers that PROVE a required step was answered, read straight off
+ * the preferences row.
+ *
+ * Only the columns whose emptiness is unambiguous are here, and that is the
+ * whole design: a column may stand in for "this step was answered" only where
+ * there is no legitimate answer that leaves it null. `goal`, `activity_level`,
+ * `diet`, `meal_schedule` and `cooking_time_limit_min` each qualify — every one
+ * is required by its own step parser and none of them has an "answered as
+ * nothing" case. The body step is proved by `targetRoute` instead of by the
+ * measurements, because `target_route` is server-owned, absent from the update
+ * DTO, and written by exactly one thing: a body-step save resolving it (Skip,
+ * "prefer not to say", or a measured answer). So a non-null route means the body
+ * step was answered whichever branch it took, including Skip, which stores no
+ * measurements at all.
+ *
+ * `dislikes` is DELIBERATELY ABSENT and cannot be added: an empty
+ * `disliked_food_ids` is a legitimate answer — the food-preferences screen's
+ * Continue is enabled with nothing selected — so no column distinguishes "I
+ * dislike nothing" from "never asked". Sequential progress
+ * ({@link nextSetupState}) is what covers it, which is why readiness needs both
+ * rules and neither alone.
+ *
+ * The service fills this from the row it already loaded; the members are
+ * REQUIRED rather than optional so a caller cannot leave readiness to chance by
+ * forgetting one.
+ */
+export interface SetupAnswerFacts {
+    goal: Goal | null;
+    activityLevel: ActivityLevel | null;
+    diet: Diet | null;
+    mealSchedule: MealSchedule | null;
+    cookingTimeLimitMin: CookingTimeLimitMin | null;
+}
+
 export interface SetupStateSnapshot {
     setupStatus: SetupStatus;
     /** The stored resume marker, or null before the first save. */
     setupStep: SetupStep | null;
     targetRoute: TargetRoute | null;
+    /** The row's answers, for the readiness check in {@link nextSetupState}. */
+    answers: SetupAnswerFacts;
 }
+
+/**
+ * Which stored column proves each required step was answered.
+ *
+ * A step absent from this table is one no column can prove — `dislikes`, for
+ * the reason {@link SetupAnswerFacts} gives — and is therefore left to
+ * sequential progress rather than checked here. Partial by design, so adding a
+ * route stop does not silently acquire a bogus proof.
+ */
+const PROVABLE_STEP_ANSWERS: Readonly<
+    Partial<Record<SetupStep, (answers: SetupAnswerFacts, route: TargetRoute | null) => boolean>>
+> = {
+    goal: (answers) => answers.goal !== null,
+    body: (_answers, route) => route !== null,
+    activity: (answers) => answers.activityLevel !== null,
+    diet: (answers) => answers.diet !== null,
+    schedule: (answers) => answers.mealSchedule !== null,
+    cooking: (answers) => answers.cookingTimeLimitMin !== null,
+};
+
+/**
+ * The first required step of a route that the stored row proves is UNANSWERED,
+ * or null when nothing provable is missing.
+ *
+ * `answeredNow` is the step being saved, counted as answered because it is: the
+ * snapshot is the row as it stands BEFORE this write, so checking the incoming
+ * step against it would find its own column still null and pin the marker to
+ * the screen the user just completed — the activity save would answer activity
+ * and then be told to go answer activity.
+ *
+ * This is what makes a ROUTE CHANGE safe. The two routes require different
+ * steps — `activity` belongs to the estimated route and not to the manual one —
+ * so re-answering the body step with a measured sex moves a manual-route user
+ * onto the estimated route and newly requires a step they were never asked.
+ * Sequential progress alone cannot see that: the marker sits on a stop both
+ * routes share (`diet`), the body save reads as an edit of an earlier answer,
+ * and the marker walks on to `review` with `activity_level` never written.
+ * Asking the row directly does see it.
+ */
+const outstandingRequiredStep = (
+    route: TargetRoute | null,
+    answers: SetupAnswerFacts,
+    answeredNow: SetupStep,
+): SetupStep | null => {
+    for (const step of requiredSetupSteps(route)) {
+        const proves = PROVABLE_STEP_ANSWERS[step];
+
+        if (step !== answeredNow && proves !== undefined && !proves(answers, route)) {
+            return step;
+        }
+    }
+
+    return null;
+};
 
 export interface SetupStateTransition {
     setupStatus: SetupStatus;
@@ -2224,6 +2662,48 @@ const stepAfter = (
     return index + 1 < order.length ? order[index + 1] : order[order.length - 1];
 };
 
+/**
+ * Whether a saved step is the stop the user is actually on, and may therefore
+ * move the resume marker forward.
+ *
+ * The stop they are on is the stored marker, or — when the marker names a stop
+ * no step save can answer — the first one after it that can. `targets_manual`
+ * is exactly that case: it is a stop of the manual route but saves through
+ * `PUT /meal-planning/targets` rather than as a step, so both the targets save
+ * itself and the following `diet` save count as progress from it. Without that,
+ * the manual route would stall at the target screen forever.
+ *
+ * A marker the active route does not contain answers true: that is a route
+ * switch (a user who reached `activity` on the estimated route and then
+ * answered the body step with Skip), where the marker no longer means anything
+ * and the step just answered is by construction one the new route includes.
+ *
+ * Everything else answers false — an edit of an earlier answer, and a jump
+ * ahead to a later screen — which is what keeps progress sequential.
+ */
+const isCurrentStop = (
+    marker: SetupStep | null,
+    step: SetupStep,
+    order: readonly SetupStep[],
+): boolean => {
+    if (marker === null) {
+        return step === order[0];
+    }
+
+    const index = order.indexOf(marker);
+
+    if (index < 0 || step === marker) {
+        return true;
+    }
+
+    // The first stop from the marker onwards that a step save can answer. Every
+    // route order ends with `review`, which is one, so the scan finds a stop
+    // whenever the marker is in the order at all — and comparing against
+    // `undefined` would answer false anyway, which is the right answer for a
+    // marker nothing can advance from.
+    return step === order.slice(index).find(isPayloadBearingSetupStep);
+};
+
 const laterStep = (
     current: SetupStep | null,
     candidate: SetupStep,
@@ -2246,7 +2726,7 @@ const laterStep = (
 /**
  * Where setup stands after a step was saved.
  *
- * MONOTONIC in both outputs, which is the whole rule:
+ * MONOTONIC in both outputs, which is half the rule:
  *
  *  * The STATUS never moves backwards. Re-saving the diet step from the plan
  *    settings screen must not send a user who already has a plan back into
@@ -2254,16 +2734,56 @@ const laterStep = (
  *    consequence is a user with a working week being asked to answer seven
  *    questions again. `completed` is reached by publishing a plan and is
  *    preserved here; nothing in this function awards it.
- *  * The RESUME MARKER never moves backwards either. Stepping back in the
- *    wizard to change a goal leaves the marker where the user actually reached,
- *    so a force-quit resumes at the furthest point rather than replaying
- *    answered screens.
+ *  * The RESUME MARKER never moves backwards either, with ONE exception, below.
+ *    Stepping back in the wizard to change a goal leaves the marker where the
+ *    user actually reached, so a force-quit resumes at the furthest point
+ *    rather than replaying answered screens.
  *
- * Promotion to `ready_for_review` happens exactly when the marker reaches the
- * review screen, so it follows the route's own step list: the manual route gets
- * there without ever answering `activity`. A `review` save NEVER promotes — it
- * only persists a start date chosen ON the review screen, so treating it as
- * progress would let an out-of-order request declare setup finished.
+ * PROGRESS IS SEQUENTIAL, which is the other half, and it is what makes
+ * `ready_for_review` mean something. The marker advances by exactly one stop,
+ * and only when the saved step IS the stop the user is on
+ * ({@link isCurrentStop}); any other save — an edit of an earlier answer, or a
+ * jump ahead to a later screen — is accepted and STORED but moves the marker
+ * nowhere. So the marker can only reach `review` by every stop before it having
+ * been saved in order, and promotion can stay the simple "the marker reached
+ * the review screen" it reads as below.
+ *
+ * Without that, one request naming the last step would be enough: a client
+ * posting `cooking` first would advance the marker straight to `review` and be
+ * declared ready for review with no goal, no body details and no diet on
+ * record — a plan generated from a row whose answers were never given. A
+ * forward jump is not refused, because the answer it carries is genuine and
+ * this module does not discard user values; it simply earns no progress.
+ *
+ * Promotion follows the route's own step list, so the manual route gets there
+ * without ever answering `activity`. A `review` save NEVER promotes — it only
+ * persists a start date chosen ON the review screen, so treating it as progress
+ * would let an out-of-order request declare setup finished.
+ *
+ * A PROVABLY MISSING ANSWER OVERRIDES BOTH, and is the one exception to the two
+ * monotonic rules above. Sequential progress is a statement about the order
+ * screens were answered in, and it is only equivalent to "every required answer
+ * is on record" while the set of required answers holds still. A route change
+ * moves that set under the user: answering the body step with a measured sex
+ * takes a manual-route user onto the estimated route, which requires `activity`
+ * — a step the manual route never asks. The marker is then sitting on a stop
+ * both routes share, the body save reads as an edit of an earlier answer, and
+ * the walk continues to `review` with no activity level ever written. So the
+ * row is asked directly ({@link outstandingRequiredStep}): where it proves a
+ * required step is unanswered, the marker is pulled BACK to that step and the
+ * status cannot be `ready_for_review`. Two consequences worth stating:
+ *
+ *  * A `completed` user is never regressed by this. They have a plan, their
+ *    edits arrive from the plan settings screen rather than the wizard, and
+ *    sending them back into onboarding is the failure the status rule exists to
+ *    prevent; a `ready_for_review` user, who has no plan yet, is un-readied.
+ *  * Where a route switch happens LATE, the pull-back costs the user a walk
+ *    back over screens they had already answered, because one marker cannot
+ *    record both where they reached and which stops they answered. Every one of
+ *    those screens re-opens filled in from the stored row, so it is a
+ *    re-confirmation after changing a route-defining answer and not lost work.
+ *    The alternative — promoting with a required answer absent — produces a
+ *    plan built from a row whose answers were never given.
  */
 export const nextSetupState = (
     current: SetupStateSnapshot,
@@ -2272,17 +2792,32 @@ export const nextSetupState = (
 ): SetupStateTransition => {
     const route = targetRoute ?? current.targetRoute;
     const order = routeStepOrder(route);
+    const advances = isCurrentStop(current.setupStep, step, order);
 
-    const setupStep =
-        step === 'review'
+    const reached =
+        step === 'review' || !advances
             ? (current.setupStep ?? order[0])
             : laterStep(current.setupStep, stepAfter(step, order, current.setupStep), order);
 
+    // A marker the route does not contain (index -1) is treated as past
+    // everything, so a stale off-route marker left by a route switch is
+    // reconciled too rather than surviving as a stop nobody can answer.
+    const outstanding = outstandingRequiredStep(route, current.answers, step);
+    const reachedIndex = order.indexOf(reached);
+    const setupStep =
+        outstanding !== null && (reachedIndex < 0 || order.indexOf(outstanding) < reachedIndex)
+            ? outstanding
+            : reached;
+
     const candidateStatus: SetupStatus = setupStep === 'review' ? 'ready_for_review' : 'in_progress';
     const setupStatus =
-        STATUS_RANK[candidateStatus] > STATUS_RANK[current.setupStatus]
-            ? candidateStatus
-            : current.setupStatus;
+        current.setupStatus === 'completed'
+            ? 'completed'
+            : outstanding !== null
+              ? 'in_progress'
+              : STATUS_RANK[candidateStatus] > STATUS_RANK[current.setupStatus]
+                ? candidateStatus
+                : current.setupStatus;
 
     return { setupStatus, setupStep, targetRoute: route };
 };
@@ -2316,6 +2851,15 @@ export interface PlannedMealForFlagging {
  * everything the user has saved, and the settings banner and its "Review
  * affected meals" action stay up while ANY meal returns a non-empty one, so
  * resolving one meal never hides the rest.
+ *
+ * THE ORDER IS STABLE and is the projection's contract, not an accident of the
+ * loop: `evaluatePlanningEligibility` reports its reasons in
+ * `PlanningEligibilityCode` declaration order, so the four preference codes
+ * always come back as `allergen`, `diet`, `dislike`, `cooking_time` —
+ * independent of ingredient order, of how many details a code carries, and of
+ * the order a row's arrays happen to arrive in. The settings screen renders
+ * these in sequence, so an unstable order would reshuffle a user's warnings
+ * between two reads of an unchanged plan.
  */
 export const evaluateMealAgainstPreferences = (
     meal: PlannedMealForFlagging,

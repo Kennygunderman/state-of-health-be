@@ -26,6 +26,9 @@
 // approximately. Tests that exercise the tolerance bands themselves do not use
 // it, and assert each band directly.
 
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
 import {
     BUDGET_TIER_1_MAX_PER_MEAL,
     BUDGET_TIER_2_MAX_PER_MEAL,
@@ -35,6 +38,8 @@ import {
     GeneratedPlan,
     MACRO_TOLERANCE_ABSOLUTE_G,
     MAIN_SLOT_PORTION_MULTIPLIERS,
+    MAX_EVALUATIONS_PER_DAY,
+    MAX_EVALUATIONS_PER_PLAN,
     MAX_RECIPE_USES_PER_WEEK,
     MEAL_PLAN_FIELD_CODES,
     MIN_ELIGIBLE_RECIPES_PER_SLOT,
@@ -45,12 +50,15 @@ import {
     PlanCandidate,
     PlanGenerationPreferences,
     PlanRecipeCandidate,
+    PlanSearchBudget,
+    PlanSearchOutcome,
     PlanSeedInputs,
     REUSE_BONUS_CAP,
     SNACK_PORTION_MULTIPLIERS,
     ScoredCandidate,
     addDaysToDayKey,
     analyzeLimitingConstraints,
+    baselineCandidateRanks,
     budgetPenalty,
     buildPlanCandidates,
     candidatesForSlot,
@@ -68,13 +76,16 @@ import {
     isPlanActiveStatus,
     isPlanEnded,
     isPlanWritable,
+    localDayKey,
     nextCookingTimeTier,
     parseGeneratePlanRequest,
     parseRegeneratePlanRequest,
     parseRegenerateRequest,
+    planCandidateIdentity,
     planDatesFrom,
     planEndDate,
     plansOverlap,
+    portableCandidateIdentity,
     portionMultipliersForSlot,
     requireNonConflictingWeek,
     requireWritablePlan,
@@ -85,10 +96,14 @@ import {
     scoreCandidate,
     scheduleCumulativeShares,
     scheduleSlots,
+    searchPlanWeek,
     startDateWindow,
     targetProximity,
     violatesRepetitionRule,
 } from '../mealPlan.logic';
+// The grocery side of the plan -> grocery gram hop asserted at the end of this
+// file. Both modules are pure, so nothing is mocked.
+import { plannedIngredientGrams } from '../grocery.logic';
 import {
     NoMatchingMealsError,
     PlanGenerationError,
@@ -98,6 +113,177 @@ import {
 } from '../mealPlanning.errors';
 import type { MealPlanMacroTotals, MealTimeEntry } from '../../types/mealPlanning';
 import type { MealSlot } from '../../types/recipe';
+
+/* ---------------------------------------------------------------------------
+ * The shared fixture graph
+ *
+ * `data/meal-planning/fixtures/catalog-foods.fixture.json` and
+ * `recipes.fixture.json` are the referentially closed pair the Agent Action
+ * Plan §0.3.3 commits — fixed uuid keys, fixed timestamps, snake_case rows —
+ * and they are the same rows the recipe, grocery and planned-log suites read.
+ * `planCandidateOf` below turns one committed `recipe_versions` row into the
+ * planner's own candidate shape without inventing a value, so version,
+ * catalog-state, metadata and ingredient identity continue unbroken from the
+ * recipe domain into this one.
+ *
+ * Read off disk rather than transcribed (the convention
+ * `evidence.logic.test.ts` uses), and re-parsed per accessor so a case that
+ * mutates a row cannot leak into the next.
+ * ------------------------------------------------------------------------- */
+
+const FIXTURE_DIRECTORY = join(__dirname, '..', '..', '..', 'data', 'meal-planning', 'fixtures');
+
+const CATALOG_FOODS_JSON = readFileSync(join(FIXTURE_DIRECTORY, 'catalog-foods.fixture.json'), 'utf8');
+const RECIPES_JSON = readFileSync(join(FIXTURE_DIRECTORY, 'recipes.fixture.json'), 'utf8');
+
+/** The `catalog_foods` columns this suite reads back off the fixture. */
+interface FixtureCatalogFood {
+    id: string;
+    source_key: string;
+    display_name: string;
+    food_group: string;
+    publication_status: string;
+}
+
+/** The `recipe_versions` columns a planner candidate is built from. */
+interface FixtureRecipeVersion {
+    id: string;
+    recipe_id: string;
+    recipe_slug: string;
+    version: number;
+    yield_servings: number;
+    total_minutes: number;
+    meal_slots: MealSlot[];
+    allergen_status: 'known' | 'unknown';
+    budget_tier: number;
+    nutrition_provenance: PlanRecipeCandidate['nutrition_provenance'];
+    per_serving_calories: number;
+    per_serving_protein_g: number;
+    per_serving_carbs_g: number;
+    per_serving_fat_g: number;
+    status: 'current' | 'retired';
+}
+
+/**
+ * A `recipe_ingredients` row. `resolved_catalog_facts` is the fixture's
+ * documented non-column field: the `catalog_foods` facts the table does not
+ * snapshot, which is where the planner's `food_group` and the eligibility
+ * check's `allergen_status` come from.
+ */
+interface FixtureRecipeIngredient {
+    recipe_version_id: string;
+    food_source_key: string;
+    catalog_food_id: string;
+    snapshot_name: string;
+    snapshot_provenance: Ingredient['snapshot_provenance'];
+    snapshot_allergen_tags: string[];
+    snapshot_diet_tags: string[];
+    gram_weight: number;
+    sort_order: number;
+    is_optional: boolean;
+    resolved_catalog_facts: {
+        allergen_status: 'known' | 'unknown';
+        food_group: string;
+        publication_status: string;
+    };
+}
+
+interface CatalogFixtureDocument {
+    foods: FixtureCatalogFood[];
+}
+
+interface RecipeFixtureDocument {
+    counts: { recipe_versions: number; plannable_versions: number };
+    recipe_versions: FixtureRecipeVersion[];
+    recipe_ingredients: FixtureRecipeIngredient[];
+}
+
+const readCatalogFixture = (): CatalogFixtureDocument => JSON.parse(CATALOG_FOODS_JSON) as CatalogFixtureDocument;
+
+const readRecipeFixture = (): RecipeFixtureDocument => JSON.parse(RECIPES_JSON) as RecipeFixtureDocument;
+
+/** The catalog food with this `source_key`, or a failure naming the key. */
+const catalogFood = (sourceKey: string): FixtureCatalogFood => {
+    const food = readCatalogFixture().foods.find((row) => row.source_key === sourceKey);
+    if (!food) {
+        throw new Error(`catalog-foods.fixture.json carries no food with source_key ${sourceKey}`);
+    }
+
+    return food;
+};
+
+/** The `(slug, version)` recipe version, or a failure naming the pair. */
+const recipeVersionRow = (slug: string, version: number): FixtureRecipeVersion => {
+    const row = readRecipeFixture().recipe_versions.find(
+        (candidate) => candidate.recipe_slug === slug && candidate.version === version,
+    );
+    if (!row) {
+        throw new Error(`recipes.fixture.json carries no ${slug} v${version}`);
+    }
+
+    return row;
+};
+
+/** The ingredient rows of one fixture version, in the fixture's own row order. */
+const fixtureIngredientRows = (slug: string, version: number): FixtureRecipeIngredient[] => {
+    const versionId = recipeVersionRow(slug, version).id;
+    const rows = readRecipeFixture().recipe_ingredients.filter((row) => row.recipe_version_id === versionId);
+    if (rows.length === 0) {
+        throw new Error(`recipes.fixture.json carries no ingredients for ${slug} v${version}`);
+    }
+
+    return rows;
+};
+
+/**
+ * One committed version as a planner candidate. Every field is the fixture's;
+ * `overrides` exists for the focused deltas a planner scenario needs — widening
+ * `meal_slots` so one slot can be fed entirely by committed recipes is the only
+ * use below, and it is stated at the call site.
+ */
+const planCandidateOf = (
+    slug: string,
+    version: number,
+    overrides: Partial<PlanRecipeCandidate> = {},
+): PlanRecipeCandidate => {
+    const row = recipeVersionRow(slug, version);
+
+    return {
+        recipe_version_id: row.id,
+        recipe_id: row.recipe_id,
+        slug: row.recipe_slug,
+        version: row.version,
+        status: row.status,
+        nutrition_provenance: row.nutrition_provenance,
+        allergen_status: row.allergen_status,
+        total_minutes: row.total_minutes,
+        meal_slots: row.meal_slots,
+        budget_tier: row.budget_tier,
+        per_serving: {
+            calories: row.per_serving_calories,
+            protein: row.per_serving_protein_g,
+            carbs: row.per_serving_carbs_g,
+            fat: row.per_serving_fat_g,
+        },
+        ingredients: fixtureIngredientRows(slug, version).map(
+            (ingredient): Ingredient => ({
+                catalog_food_id: ingredient.catalog_food_id,
+                snapshot_name: ingredient.snapshot_name,
+                snapshot_provenance: ingredient.snapshot_provenance,
+                snapshot_allergen_tags: ingredient.snapshot_allergen_tags,
+                snapshot_diet_tags: ingredient.snapshot_diet_tags,
+                is_optional: ingredient.is_optional,
+                food_group: ingredient.resolved_catalog_facts.food_group,
+                allergen_status: ingredient.resolved_catalog_facts.allergen_status,
+            }),
+        ),
+        ...overrides,
+    };
+};
+
+/** Every committed version as a planner candidate, retired one included. */
+const fixtureCatalog = (): PlanRecipeCandidate[] =>
+    readRecipeFixture().recipe_versions.map((row) => planCandidateOf(row.recipe_slug, row.version));
 
 /* ---------------------------------------------------------------------------
  * Fixtures
@@ -139,6 +325,25 @@ interface RecipeSpec {
     foodGroups?: string[];
 }
 
+/**
+ * The focused-delta builder for the search mechanics: a slot's worth of
+ * interchangeable recipes at chosen calories, which is what the tie, dead-end,
+ * week-level and budget fixtures are made of.
+ *
+ * Its ingredient identities stay synthetic ON PURPOSE, and this is the one
+ * place in the four domain suites where that is true. `reuseBonus` scores a
+ * candidate by how many of its `catalog_food_id`s the day has already planned,
+ * and the search applies it while choosing — so two mechanics recipes sharing a
+ * food id would quietly change which candidate wins. These fixtures need
+ * dozens of mutually disjoint ingredient sets; the shared catalog fixture
+ * publishes twenty-four foods, so drawing from it would force collisions and
+ * make a scoring fixture depend on which two recipes happened to collide.
+ *
+ * Everything about identity, version, catalog state and ingredient continuity
+ * is therefore asserted against the committed graph instead, in "the committed
+ * catalog and recipe graph" at the end of this file, where `planCandidateOf`
+ * supplies real rows.
+ */
 const makeRecipe = (spec: RecipeSpec): PlanRecipeCandidate => {
     const ingredientIds = spec.ingredientIds ?? [`${spec.slug}-food`];
     const provenance = spec.provenance ?? 'source_backed';
@@ -237,6 +442,40 @@ const plan = (
     shouldAbort?: () => boolean,
 ): GeneratedPlan =>
     generateWeeklyPlan({ seedInputs, preferences, targets: TARGETS, recipes, shouldAbort });
+
+/**
+ * The same week `generateWeeklyPlan` runs, exposed as the search's own outcome.
+ *
+ * Assembled from the module's exported pieces exactly as generation assembles
+ * them, so a fixture driven through here is the fixture generation would have
+ * run — the only difference is that the evaluation guards, the frontier and the
+ * evaluation count are readable instead of collapsed into a thrown error.
+ */
+const searchFor = (
+    recipes: PlanRecipeCandidate[],
+    budget?: PlanSearchBudget,
+    preferences: PlanGenerationPreferences = makePreferences(),
+): PlanSearchOutcome => {
+    const seedInputs = makeSeedInputs();
+    const slots = resolveSlotSchedule(preferences.meal_schedule, preferences.meal_times);
+    const candidates = buildPlanCandidates(recipes, preferences, derivePlanSeed(seedInputs));
+    const candidatesBySlot = new Map(
+        slots.map((slot) => [slot.slot, candidatesForSlot(candidates, preferences, slot.slot)] as const),
+    );
+
+    return searchPlanWeek({
+        dates: planDatesFrom(seedInputs.startDate),
+        slots,
+        candidatesBySlot,
+        targets: TARGETS,
+        userBudgetTier: resolveUserBudgetTier(
+            preferences.budget,
+            preferences.no_budget_preference,
+            preferences.meal_schedule,
+        ),
+        budget,
+    });
+};
 
 /* ---------------------------------------------------------------------------
  * derivePlanSeed — the reduction, and what may not reach it
@@ -395,6 +634,129 @@ describe('buildPlanCandidates', () => {
         };
 
         expect(rankByIdentity(reversed)).toEqual(rankByIdentity(forward));
+    });
+
+    describe('baseline ranks — what a counterfactual probe may not move', () => {
+        // One recipe the user's 30-minute limit refuses, so the relaxed set is
+        // the baseline plus exactly one recipe's worth of candidates. Every
+        // shared candidate must come out on the rank it already had: a probe
+        // whose shared candidates were reshuffled can succeed on the
+        // baseline's own candidates in a new move order, and the analysis would
+        // then blame the relaxed preference for a week it had no part in.
+        const catalog = (): PlanRecipeCandidate[] => [
+            ...feasibleCatalog(),
+            makeRecipe({ slug: 'slow-dinner', slots: ['dinner'], calories: 800, totalMinutes: 45 }),
+        ];
+
+        const restricted = makePreferences({ cooking_time_limit_min: 30 });
+        const relaxed = makePreferences({ cooking_time_limit_min: 45 });
+
+        it('keeps every shared identity on its exact baseline rank', () => {
+            const baseline = buildPlanCandidates(catalog(), restricted, seed);
+            const baselineRanks = baselineCandidateRanks(baseline);
+            const widened = buildPlanCandidates(
+                catalog(),
+                relaxed,
+                seed,
+                DEFAULT_PORTION_POLICY,
+                baselineRanks,
+            );
+
+            const shared = widened.filter((candidate) =>
+                baselineRanks.has(planCandidateIdentity(candidate)),
+            );
+
+            expect(shared).toHaveLength(baseline.length);
+
+            for (const candidate of shared) {
+                expect(candidate.shuffleRank).toBe(baselineRanks.get(planCandidateIdentity(candidate)));
+            }
+        });
+
+        it('ranks the newcomers, and only the newcomers, above every baseline rank', () => {
+            const baseline = buildPlanCandidates(catalog(), restricted, seed);
+            const baselineRanks = baselineCandidateRanks(baseline);
+            const highestBaselineRank = Math.max(
+                ...baseline.map((candidate) => candidate.shuffleRank),
+            );
+            const widened = buildPlanCandidates(
+                catalog(),
+                relaxed,
+                seed,
+                DEFAULT_PORTION_POLICY,
+                baselineRanks,
+            );
+
+            const newcomerRanks = widened
+                .filter((candidate) => !baselineRanks.has(planCandidateIdentity(candidate)))
+                .map((candidate) => candidate.shuffleRank);
+
+            // The one recipe the limit refused, at every main-slot multiplier.
+            expect(newcomerRanks).toHaveLength(MAIN_SLOT_PORTION_MULTIPLIERS.length);
+            expect(new Set(newcomerRanks).size).toBe(newcomerRanks.length);
+
+            for (const rank of newcomerRanks) {
+                expect(rank).toBeGreaterThan(highestBaselineRank);
+            }
+        });
+
+        it('keeps the extended portion set stable on the multipliers it shares', () => {
+            const baseline = buildPlanCandidates(feasibleCatalog(), makePreferences(), seed);
+            const baselineRanks = baselineCandidateRanks(baseline);
+            const extended = buildPlanCandidates(
+                feasibleCatalog(),
+                makePreferences(),
+                seed,
+                EXTENDED_PORTION_POLICY,
+                baselineRanks,
+            );
+
+            for (const candidate of extended) {
+                const identity = planCandidateIdentity(candidate);
+
+                if (baselineRanks.has(identity)) {
+                    expect(candidate.shuffleRank).toBe(baselineRanks.get(identity));
+                } else {
+                    expect(MAIN_SLOT_PORTION_MULTIPLIERS).not.toContain(candidate.portionMultiplier);
+                    expect(candidate.shuffleRank).toBeGreaterThan(baseline.length - 1);
+                }
+            }
+        });
+
+        it('assigns the ranks generation assigns when there is no baseline to keep', () => {
+            // The generation path is the no-baseline path, and an empty map is
+            // the same thing said explicitly — so neither may drift from the
+            // single seeded walk that defines a plan.
+            const withoutBaseline = buildPlanCandidates(feasibleCatalog(), makePreferences(), seed);
+            const withEmptyBaseline = buildPlanCandidates(
+                feasibleCatalog(),
+                makePreferences(),
+                seed,
+                DEFAULT_PORTION_POLICY,
+                new Map<string, number>(),
+            );
+
+            expect(withEmptyBaseline.map((candidate) => candidate.shuffleRank)).toEqual(
+                withoutBaseline.map((candidate) => candidate.shuffleRank),
+            );
+        });
+
+        it('spells one identity for a candidate and for a meal the search placed', () => {
+            const [candidate] = buildPlanCandidates(
+                [makeRecipe({ slug: 'b1', slots: ['breakfast'], calories: 500 })],
+                makePreferences(),
+                seed,
+            );
+
+            expect(planCandidateIdentity(candidate)).toBe(
+                portableCandidateIdentity(
+                    candidate.recipe.slug,
+                    candidate.recipe.version,
+                    candidate.portionMultiplier,
+                ),
+            );
+            expect(planCandidateIdentity(candidate)).toBe('b1|1|0.5');
+        });
     });
 
     it('widens the candidate set when asked for the extended portion policy', () => {
@@ -805,6 +1167,223 @@ describe('planDatesFrom', () => {
 describe('planEndDate', () => {
     it('is six days after the start', () => {
         expect(planEndDate(START_DATE)).toBe('2026-07-11');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * localDayKey — the user's calendar day, derived in the user's own zone
+ *
+ * Every rule below takes "today" as a day key, and this is where that key comes
+ * from. The cases feed one INSTANT rather than a precomputed string, because a
+ * precomputed string is exactly what a server-time implementation would also
+ * pass: the only way to prove the zone is doing the work is to hand two zones
+ * the same moment and require two different answers.
+ * ------------------------------------------------------------------------- */
+
+describe('localDayKey', () => {
+    const AUCKLAND = 'Pacific/Auckland';
+    const LOS_ANGELES = 'America/Los_Angeles';
+
+    /**
+     * 20:00 UTC on the last day of June: already 08:00 the next morning in
+     * Auckland and still 13:00 the same afternoon in Los Angeles — so the two
+     * users are on different calendar days, in different months, at the same
+     * instant.
+     */
+    const JUNE_EVENING_UTC = new Date('2026-06-30T20:00:00Z');
+
+    const dailyInstants = (firstIso: string): Date[] =>
+        Array.from(
+            { length: PLAN_DAY_COUNT },
+            (_unused, dayIndex) => new Date(Date.parse(firstIso) + dayIndex * 86400000),
+        );
+
+    const localTimeOfDay = (instant: Date, timeZone: string): string =>
+        new Intl.DateTimeFormat('en-GB', {
+            timeZone,
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: false,
+        }).format(instant);
+
+    it('resolves one instant to two different days in two stored zones', () => {
+        expect(localDayKey(JUNE_EVENING_UTC, AUCKLAND)).toBe('2026-07-01');
+        expect(localDayKey(JUNE_EVENING_UTC, LOS_ANGELES)).toBe('2026-06-30');
+        // Asserted against each other as well as against literals, so the case
+        // cannot pass on a server that happens to sit in one of the two zones.
+        expect(localDayKey(JUNE_EVENING_UTC, AUCKLAND)).not.toBe(
+            localDayKey(JUNE_EVENING_UTC, LOS_ANGELES),
+        );
+    });
+
+    it('takes the instant as epoch milliseconds too', () => {
+        expect(localDayKey(JUNE_EVENING_UTC.getTime(), AUCKLAND)).toBe('2026-07-01');
+    });
+
+    it('returns a key the rest of the module accepts as a calendar day', () => {
+        expect(isDayKey(localDayKey(JUNE_EVENING_UTC, LOS_ANGELES))).toBe(true);
+    });
+
+    it.each(['America/Atlantis', 'Not/AZone', ''])('refuses the zone %p', (timeZone) => {
+        expect(() => localDayKey(JUNE_EVENING_UTC, timeZone)).toThrow(MealPlanInputError);
+    });
+
+    it.each([Number.NaN, Number.POSITIVE_INFINITY, new Date('nonsense')])(
+        'refuses the instant %p',
+        (instant) => {
+            expect(() => localDayKey(instant, AUCKLAND)).toThrow(MealPlanInputError);
+        },
+    );
+
+    it('rethrows an engine fault instead of reporting it as an unknown zone', () => {
+        // A runtime without time-zone data is an environment fault, not a zone
+        // the user chose badly. Collapsing the catch to one branch would pass
+        // every case above and break exactly this one.
+        const realDateTimeFormat = Intl.DateTimeFormat;
+
+        try {
+            (Intl as { DateTimeFormat: unknown }).DateTimeFormat = () => {
+                throw new TypeError('ICU data unavailable');
+            };
+
+            expect(() => localDayKey(JUNE_EVENING_UTC, AUCKLAND)).toThrow(TypeError);
+            expect(() => localDayKey(JUNE_EVENING_UTC, AUCKLAND)).not.toThrow(MealPlanInputError);
+        } finally {
+            (Intl as { DateTimeFormat: unknown }).DateTimeFormat = realDateTimeFormat;
+        }
+
+        expect(localDayKey(JUNE_EVENING_UTC, AUCKLAND)).toBe('2026-07-01');
+    });
+
+    describe('the lifecycle rules follow the derived day', () => {
+        const ending = {
+            id: 'plan-ending',
+            status: 'active',
+            start_date: '2026-06-24',
+            end_date: '2026-06-30',
+            replacement_plan_id: null,
+        };
+        const following = {
+            id: 'plan-following',
+            status: 'active',
+            start_date: '2026-07-01',
+            end_date: '2026-07-07',
+            replacement_plan_id: null,
+        };
+
+        const aucklandToday = (): string => localDayKey(JUNE_EVENING_UTC, AUCKLAND);
+        const angelesToday = (): string => localDayKey(JUNE_EVENING_UTC, LOS_ANGELES);
+
+        it('ends a plan for the Auckland user while it is still live in Los Angeles', () => {
+            expect(isPlanEnded(ending, aucklandToday())).toBe(true);
+            expect(isPlanEnded(ending, angelesToday())).toBe(false);
+        });
+
+        it('splits current from upcoming differently in the two zones', () => {
+            const auckland = resolveCurrentAndUpcoming([ending, following], aucklandToday());
+            const angeles = resolveCurrentAndUpcoming([ending, following], angelesToday());
+
+            expect(auckland.current?.id).toBe('plan-following');
+            expect(auckland.upcoming).toBeNull();
+            expect(angeles.current?.id).toBe('plan-ending');
+            expect(angeles.upcoming?.id).toBe('plan-following');
+        });
+
+        it('opens the start-date window on the day each user is actually on', () => {
+            expect(startDateWindow(aucklandToday(), null)).toEqual({
+                earliest: '2026-07-01',
+                latest: '2026-07-31',
+            });
+            expect(startDateWindow(angelesToday(), null)).toEqual({
+                earliest: '2026-06-30',
+                latest: '2026-07-30',
+            });
+        });
+
+        it('accepts a start date for one zone and refuses it for the other', () => {
+            const body = {
+                startDate: '2026-06-30',
+                idempotencyKey: '8f1f4d7e-0d2c-4a0b-9f3e-2b6a1c5d4e7f',
+                expectedPreferencesRevision: 3,
+                expectedTargetsRevision: 2,
+            };
+
+            expect(
+                parseGeneratePlanRequest(body, startDateWindow(angelesToday(), null)).kind,
+            ).toBe('ok');
+            expect(parseGeneratePlanRequest(body, startDateWindow(aucklandToday(), null))).toMatchObject({
+                kind: 'error',
+                details: [{ field: 'startDate', code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE }],
+            });
+        });
+    });
+
+    describe('seven local days across a daylight-saving transition', () => {
+        // Los Angeles springs forward on 2026-03-08 and Auckland leaves summer
+        // time on 2026-04-05, so each week below contains a day that is not 24
+        // hours long. Day keys must still advance by exactly one, with none
+        // dropped and none repeated — the failure mode of 24-hour arithmetic on
+        // a local clock.
+        const weeks: [string, string, string][] = [
+            [LOS_ANGELES, '2026-03-05T20:00:00Z', '2026-03-05'],
+            [AUCKLAND, '2026-04-02T00:00:00Z', '2026-04-02'],
+        ];
+
+        it.each(weeks)('advances one local day per daily instant in %s', (timeZone, firstIso, firstDay) => {
+            const instants = dailyInstants(firstIso);
+            const derived = instants.map((instant) => localDayKey(instant, timeZone));
+
+            expect(derived[0]).toBe(firstDay);
+            expect(new Set(derived).size).toBe(PLAN_DAY_COUNT);
+
+            for (let dayIndex = 1; dayIndex < derived.length; dayIndex += 1) {
+                expect(derived[dayIndex]).toBe(addDaysToDayKey(derived[dayIndex - 1], 1));
+            }
+
+            // The plan's own week, composed from the derived first day, is the
+            // same seven days — so nothing is dropped between the zone-aware
+            // derivation and the calendar arithmetic that follows it.
+            expect(planDatesFrom(derived[0]).map((date) => date.date)).toEqual(derived);
+        });
+
+        it.each(weeks)('really straddles the transition in %s', (timeZone, firstIso) => {
+            const instants = dailyInstants(firstIso);
+
+            // Same UTC time of day at both ends of the week, a different local
+            // clock time: the zone's offset moved inside these seven days.
+            expect(localTimeOfDay(instants[0], timeZone)).not.toBe(
+                localTimeOfDay(instants[PLAN_DAY_COUNT - 1], timeZone),
+            );
+        });
+    });
+
+    it('crosses a month boundary through the same composition', () => {
+        expect(planDatesFrom(localDayKey(JUNE_EVENING_UTC, AUCKLAND)).map((date) => date.date)).toEqual([
+            '2026-07-01',
+            '2026-07-02',
+            '2026-07-03',
+            '2026-07-04',
+            '2026-07-05',
+            '2026-07-06',
+            '2026-07-07',
+        ]);
+    });
+
+    it('crosses a year boundary through the same composition', () => {
+        const newYearEveUtc = new Date('2026-12-31T20:00:00Z');
+
+        expect(localDayKey(newYearEveUtc, AUCKLAND)).toBe('2027-01-01');
+        expect(localDayKey(newYearEveUtc, LOS_ANGELES)).toBe('2026-12-31');
+        expect(planDatesFrom(localDayKey(newYearEveUtc, LOS_ANGELES)).map((date) => date.date)).toEqual([
+            '2026-12-31',
+            '2027-01-01',
+            '2027-01-02',
+            '2027-01-03',
+            '2027-01-04',
+            '2027-01-05',
+            '2027-01-06',
+        ]);
+        expect(planEndDate(localDayKey(newYearEveUtc, LOS_ANGELES))).toBe('2027-01-06');
     });
 });
 
@@ -1483,6 +2062,153 @@ describe('generateWeeklyPlan', () => {
         });
     });
 
+    describe('the thin-slot exhaustion fixture', () => {
+        // Twenty breakfasts and twenty lunches that can never reach the day
+        // target, plus only THREE dinners — one short of
+        // MIN_ELIGIBLE_RECIPES_PER_SLOT. Both things are true at once, which is
+        // the whole point: the catalog is thin AND the search ran out of
+        // evaluations, so a verdict built from the counts alone would blame the
+        // dinner shelf for a week whose numbers were never settled.
+        const catalog = (): PlanRecipeCandidate[] => [
+            ...Array.from({ length: 20 }, (_unused, index) =>
+                makeRecipe({
+                    slug: `breakfast-${String(index).padStart(2, '0')}`,
+                    slots: ['breakfast'],
+                    calories: 60 + index,
+                }),
+            ),
+            ...Array.from({ length: 20 }, (_unused, index) =>
+                makeRecipe({
+                    slug: `lunch-${String(index).padStart(2, '0')}`,
+                    slots: ['lunch'],
+                    calories: 60 + index,
+                }),
+            ),
+            ...['dinner-0', 'dinner-1', 'dinner-2'].map((slug) =>
+                makeRecipe({ slug, slots: ['dinner'], calories: 100 }),
+            ),
+        ];
+
+        const failure = (): NoMatchingMealsError => {
+            try {
+                plan(catalog());
+            } catch (error) {
+                expect(error).toBeInstanceOf(NoMatchingMealsError);
+
+                return error as NoMatchingMealsError;
+            }
+
+            throw new Error('expected NoMatchingMealsError');
+        };
+
+        it('is genuinely thin in one slot and genuinely exhausted', () => {
+            const preferences = makePreferences();
+            const candidates = buildPlanCandidates(catalog(), preferences, derivePlanSeed(makeSeedInputs()));
+
+            expect(eligibleRecipeCountForSlot(candidates, preferences, 'dinner')).toBe(3);
+            expect(eligibleRecipeCountForSlot(candidates, preferences, 'dinner')).toBeLessThan(
+                MIN_ELIGIBLE_RECIPES_PER_SLOT,
+            );
+            expect(searchFor(catalog()).exhausted).toBe(true);
+        });
+
+        it('reports the thin shelf AND the tolerance, not the shelf alone', () => {
+            const keys = failure().limitingConstraints.map((constraint) => constraint.constraintKey);
+
+            // Order is the documented one: coverage is the more limiting row and
+            // comes first, but it is no longer the only row.
+            expect(keys).toEqual(['catalog_coverage', 'nutrition_tolerance']);
+            expect(failure().limitingConstraints).toEqual(
+                expect.arrayContaining([
+                    {
+                        constraintKey: 'nutrition_tolerance',
+                        value: CALORIE_TOLERANCE_RATIO * 100,
+                        unit: 'percent',
+                        slots: [],
+                        editStep: 'goal',
+                    },
+                ]),
+            );
+        });
+
+        it('carries the search frontier on the error, where the wire cannot', () => {
+            const thrown = failure();
+
+            expect(thrown.searchDiagnostics).toEqual({
+                exhausted: true,
+                exhaustedBy: 'day',
+                frontierDayIndex: 0,
+                frontierDate: START_DATE,
+                evaluations: MAX_EVALUATIONS_PER_DAY,
+            });
+            expect(thrown.allergiesKept).toBe(true);
+            // Diagnostic and optional: a caller that never ran a search still
+            // raises the same error, which is what keeps the field off the
+            // wire contract rather than a member of it.
+            expect(new NoMatchingMealsError([]).searchDiagnostics).toBeUndefined();
+        });
+    });
+
+    describe('the empty-slot exhaustion fixture', () => {
+        // The sibling case of the fixture above, and the boundary of what
+        // exhaustion reopens: dinner has NO recipes, so the week is impossible
+        // whatever the targets say — yet breakfast and lunch have enough
+        // candidates to spend the whole per-day allowance being placed and
+        // unplaced before the search gives up. Exhaustion is therefore true
+        // here too, and the tolerance row must still stay away: a band cannot
+        // be the open question for a slot nothing can fill, and offering it
+        // would send the user to edit a target that was never the problem.
+        const catalog = (): PlanRecipeCandidate[] => [
+            ...Array.from({ length: 20 }, (_unused, index) =>
+                makeRecipe({
+                    slug: `breakfast-${String(index).padStart(2, '0')}`,
+                    slots: ['breakfast'],
+                    calories: 60 + index,
+                }),
+            ),
+            ...Array.from({ length: 20 }, (_unused, index) =>
+                makeRecipe({
+                    slug: `lunch-${String(index).padStart(2, '0')}`,
+                    slots: ['lunch'],
+                    calories: 60 + index,
+                }),
+            ),
+        ];
+
+        it('exhausts the budget even with nothing to put in the slot', () => {
+            const outcome = searchFor(catalog());
+
+            expect(outcome.days).toBeNull();
+            expect(outcome.exhausted).toBe(true);
+            expect(outcome.exhaustedBy).toBe('day');
+        });
+
+        it('reports the uncovered slot alone, never the tolerance band', () => {
+            let thrown: unknown;
+
+            try {
+                plan(catalog());
+            } catch (error) {
+                thrown = error;
+            }
+
+            const failure = thrown as NoMatchingMealsError;
+
+            expect(failure.limitingConstraints).toEqual([
+                {
+                    constraintKey: 'slot_coverage',
+                    value: 0,
+                    unit: 'recipes',
+                    slots: ['dinner'],
+                    editStep: 'schedule',
+                },
+            ]);
+            // The diagnostics still travel — the search did run out, and a log
+            // reading "exhausted" beside a slot at zero is the true story.
+            expect(failure.searchDiagnostics?.exhausted).toBe(true);
+        });
+    });
+
     describe('the infeasible-retry fixture', () => {
         // Every recipe takes 45 minutes and the user allowed 30, so nothing is
         // eligible. Retrying cannot help: the key is not an input to anything.
@@ -1544,6 +2270,156 @@ describe('generateWeeklyPlan', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * searchPlanWeek — the two evaluation guards, told apart
+ *
+ * Under the shipped policy the per-plan cap is exactly seven per-day caps, so a
+ * week that trips one would trip the other at the same moment and no fixture
+ * could say which rule ended the search. The injected budget is what separates
+ * them: give the days more than they can spend and the plan little, and only
+ * the plan guard can fire — and the other way round.
+ * ------------------------------------------------------------------------- */
+
+describe('searchPlanWeek', () => {
+    /** Twenty recipes per slot, none of which can reach the day target. */
+    const unreachableCatalog = (): PlanRecipeCandidate[] =>
+        (['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) =>
+            Array.from({ length: 20 }, (_unused, index) =>
+                makeRecipe({
+                    slug: `${slot}-${String(index).padStart(2, '0')}`,
+                    slots: [slot],
+                    calories: 60 + index,
+                }),
+            ),
+        );
+
+    /**
+     * Four breakfasts, four lunches and only THREE dinners. Three recipes used
+     * twice each cover six days, so days 0 to 5 close and the seventh cannot —
+     * the search therefore spends evaluations across several days before it
+     * fails, which is what a plan-wide guard needs in order to be the guard
+     * that fires.
+     */
+    const sixCoverableDays = (): PlanRecipeCandidate[] => [
+        ...['b1', 'b2', 'b3', 'b4'].map((slug) =>
+            makeRecipe({ slug, slots: ['breakfast'], calories: 500 }),
+        ),
+        ...['l1', 'l2', 'l3', 'l4'].map((slug) => makeRecipe({ slug, slots: ['lunch'], calories: 700 })),
+        ...['d1', 'd2', 'd3'].map((slug) => makeRecipe({ slug, slots: ['dinner'], calories: 800 })),
+    ];
+
+    /**
+     * One dinner recipe, so day 1 can never place one: the recipe is on day 0
+     * and the repetition rule forbids it on the next day. Day 1 therefore
+     * dead-ends on every visit while day 0 keeps offering new assignments, and
+     * day 1 is re-entered again and again — the fixture the accumulating
+     * per-day counter is about.
+     */
+    const singleDinnerRecipe = (): PlanRecipeCandidate[] => [
+        ...['b1', 'b2'].map((slug) => makeRecipe({ slug, slots: ['breakfast'], calories: 500 })),
+        ...['l1', 'l2'].map((slug) => makeRecipe({ slug, slots: ['lunch'], calories: 700 })),
+        makeRecipe({ slug: 'd1', slots: ['dinner'], calories: 800 }),
+    ];
+
+    it('spends exactly the per-day allowance on a day that cannot close', () => {
+        const outcome = searchFor(unreachableCatalog());
+
+        expect(outcome.days).toBeNull();
+        expect(outcome.exhausted).toBe(true);
+        expect(outcome.exhaustedBy).toBe('day');
+        expect(outcome.evaluations).toBe(MAX_EVALUATIONS_PER_DAY);
+        expect(outcome.frontierDayIndex).toBe(0);
+        expect(outcome.aborted).toBe(false);
+    });
+
+    it('reports no exhaustion when the week closes inside the budget', () => {
+        const outcome = searchFor(feasibleCatalog());
+
+        expect(outcome.days).toHaveLength(PLAN_DAY_COUNT);
+        expect(outcome.exhausted).toBe(false);
+        expect(outcome.exhaustedBy).toBeNull();
+        expect(outcome.evaluations).toBeLessThan(MAX_EVALUATIONS_PER_PLAN);
+    });
+
+    it('names the plan guard when the spend crossed day boundaries', () => {
+        const perPlan = 200;
+        const outcome = searchFor(sixCoverableDays(), { perDay: 1000000, perPlan });
+
+        expect(outcome.days).toBeNull();
+        expect(outcome.exhausted).toBe(true);
+        expect(outcome.exhaustedBy).toBe('plan');
+        expect(outcome.evaluations).toBe(perPlan);
+        // Days before the frontier closed, so the 200 evaluations were spent
+        // over several days rather than inside one.
+        expect(outcome.frontierDayIndex).toBeGreaterThanOrEqual(1);
+    });
+
+    it('is the plan guard and not seven day guards, at the same number', () => {
+        const cap = 200;
+        const asPlanBudget = searchFor(sixCoverableDays(), { perDay: 1000000, perPlan: cap });
+        const asDayBudget = searchFor(sixCoverableDays(), { perDay: cap, perPlan: 1000000 });
+
+        // The same catalog, the same number, two different rules: the plan cap
+        // stops the search at 200 placements in total, while giving every day
+        // 200 of its own lets the week spend more than that before any single
+        // day runs out. A per-plan counter that reset per day could not
+        // produce the first answer.
+        expect(asPlanBudget.exhaustedBy).toBe('plan');
+        expect(asPlanBudget.evaluations).toBe(cap);
+        expect(asDayBudget.exhaustedBy).toBe('day');
+        expect(asDayBudget.evaluations).toBeGreaterThan(cap);
+    });
+
+    it('keeps one day spending the same allowance however often it is re-entered', () => {
+        const preferences = makePreferences();
+        const candidates = buildPlanCandidates(
+            singleDinnerRecipe(),
+            preferences,
+            derivePlanSeed(makeSeedInputs()),
+        );
+        const breakfasts = candidatesForSlot(candidates, preferences, 'breakfast').length;
+        const lunches = candidatesForSlot(candidates, preferences, 'lunch').length;
+
+        // What ONE visit to day 1 can possibly spend: one evaluation per legal
+        // breakfast, then one per (breakfast, lunch) pair, and nothing at
+        // dinner because the only dinner recipe was used yesterday. A budget
+        // one above that ceiling is unreachable within a single visit.
+        const singleVisitCeiling = breakfasts + breakfasts * lunches;
+        const outcome = searchFor(singleDinnerRecipe(), {
+            perDay: singleVisitCeiling + 1,
+            perPlan: 1000000,
+        });
+
+        expect(outcome.exhaustedBy).toBe('day');
+        expect(outcome.frontierDayIndex).toBe(1);
+        expect(outcome.evaluations).toBeGreaterThan(singleVisitCeiling);
+
+        // And the fixture itself is finite: given room, the search explores the
+        // whole tree and reports a settled infeasibility rather than a budget.
+        const unbounded = searchFor(singleDinnerRecipe(), { perDay: 1000000, perPlan: 1000000 });
+
+        expect(unbounded.exhausted).toBe(false);
+        expect(unbounded.evaluations).toBeGreaterThan(singleVisitCeiling);
+    });
+
+    it.each([0, -1, 1.5, Number.NaN])('refuses the per-day budget %p', (perDay) => {
+        expect(() => searchFor(feasibleCatalog(), { perDay })).toThrow(MealPlanInputError);
+    });
+
+    it.each([0, -1, 1.5, Number.NaN])('refuses the per-plan budget %p', (perPlan) => {
+        expect(() => searchFor(feasibleCatalog(), { perPlan })).toThrow(MealPlanInputError);
+    });
+
+    it('falls back to the shipped policy for a budget it was not given', () => {
+        // An empty budget object is the production case spelled out: neither
+        // cap is supplied, so both constants apply and the week still plans.
+        expect(searchFor(feasibleCatalog(), {}).days).toHaveLength(PLAN_DAY_COUNT);
+        expect(searchFor(unreachableCatalog(), { perPlan: MAX_EVALUATIONS_PER_PLAN }).evaluations).toBe(
+            MAX_EVALUATIONS_PER_DAY,
+        );
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * Limiting-constraint analysis
  * ------------------------------------------------------------------------- */
 
@@ -1590,6 +2466,83 @@ describe('analyzeLimitingConstraints', () => {
                 editStep: 'schedule',
             },
         ]);
+    });
+
+    describe('the coverage threshold — three reports, four does not', () => {
+        // MIN_ELIGIBLE_RECIPES_PER_SLOT is arithmetic: seven days, two uses per
+        // recipe, never on consecutive days. Three recipes cannot cover a week
+        // and four can, so the row turns on exactly that boundary — and the
+        // count is taken on the user's REAL intersection, which is why this
+        // dinner shelf carries three extra recipes that look available and are
+        // not: one the diet refuses, one the allergy refuses, one the dislike
+        // refuses. A check that measured the raw catalog would see six.
+        const preferences = makePreferences({
+            diet: 'vegan',
+            allergens: ['Milk'],
+            disliked_food_ids: ['blocked-food'],
+        });
+
+        const eligibleDinner = (slug: string): PlanRecipeCandidate =>
+            makeRecipe({ slug, slots: ['dinner'], calories: 800 });
+
+        const dinnerShelf = (eligibleSlugs: string[]): PlanRecipeCandidate[] => [
+            ...eligibleSlugs.map(eligibleDinner),
+            makeRecipe({ slug: 'd-not-vegan', slots: ['dinner'], calories: 800, dietTags: ['pescatarian'] }),
+            makeRecipe({ slug: 'd-milk', slots: ['dinner'], calories: 800, allergenTags: ['milk'] }),
+            makeRecipe({
+                slug: 'd-disliked',
+                slots: ['dinner'],
+                calories: 800,
+                ingredientIds: ['blocked-food'],
+            }),
+        ];
+
+        const catalogWith = (eligibleSlugs: string[]): PlanRecipeCandidate[] => [
+            ...feasibleCatalog().filter((recipe) => !recipe.slug.startsWith('d')),
+            ...dinnerShelf(eligibleSlugs),
+        ];
+
+        const dinnerCount = (recipes: PlanRecipeCandidate[]): number =>
+            eligibleRecipeCountForSlot(
+                buildPlanCandidates(recipes, preferences, derivePlanSeed(makeSeedInputs())),
+                preferences,
+                'dinner',
+            );
+
+        it('measures the intersection rather than the shelf', () => {
+            expect(dinnerShelf(['d1', 'd2', 'd3'])).toHaveLength(6);
+            expect(dinnerCount(catalogWith(['d1', 'd2', 'd3']))).toBe(3);
+            expect(dinnerCount(catalogWith(['d1', 'd2', 'd3', 'd4']))).toBe(4);
+        });
+
+        it('reports exactly one coverage row at three eligible recipes', () => {
+            const catalog = catalogWith(['d1', 'd2', 'd3']);
+            const constraints = analyze(catalog, preferences);
+            const coverage = constraints.filter(
+                (constraint) =>
+                    constraint.constraintKey === 'catalog_coverage' ||
+                    constraint.constraintKey === 'slot_coverage',
+            );
+
+            expect(dinnerCount(catalog)).toBe(MIN_ELIGIBLE_RECIPES_PER_SLOT - 1);
+            expect(coverage).toEqual([
+                {
+                    constraintKey: 'catalog_coverage',
+                    value: 3,
+                    unit: 'recipes',
+                    slots: ['dinner'],
+                    editStep: 'dislikes',
+                },
+            ]);
+        });
+
+        it('reports no coverage row at four, one recipe later', () => {
+            const catalog = catalogWith(['d1', 'd2', 'd3', 'd4']);
+
+            expect(dinnerCount(catalog)).toBe(MIN_ELIGIBLE_RECIPES_PER_SLOT);
+            expect(keys(catalog, preferences)).not.toContain('catalog_coverage');
+            expect(keys(catalog, preferences)).not.toContain('slot_coverage');
+        });
     });
 
     it('does not blame the numbers when coverage is the problem', () => {
@@ -1738,6 +2691,75 @@ describe('analyzeLimitingConstraints', () => {
         expect(analyze(feasibleCatalog()).length).toBeGreaterThan(0);
     });
 
+    describe('attribution — a row is a claim about its own preference', () => {
+        // Every case here sets a preference that blocks NOTHING in the catalog:
+        // the week closes with the preference in force, so relaxing it admits
+        // no recipe the baseline lacked. A probe that succeeded on the
+        // baseline's own candidates in a shuffled move order would report these
+        // preferences as what is holding the week back, which is the false
+        // attribution the witness rule exists to refuse.
+        it('does not blame a dislike that removes nothing', () => {
+            expect(keys(feasibleCatalog(), makePreferences({ disliked_food_ids: ['never-used'] }))).not.toContain(
+                'dislikes',
+            );
+        });
+
+        it('does not blame the portions when the offered multipliers close the week', () => {
+            expect(keys(feasibleCatalog())).not.toContain('portion_limits');
+        });
+
+        it('does not blame a diet every recipe already satisfies', () => {
+            expect(keys(feasibleCatalog(), makePreferences({ diet: 'vegan' }))).not.toContain('diet');
+        });
+
+        it('does not blame a cooking limit every recipe already meets', () => {
+            expect(
+                keys(feasibleCatalog(), makePreferences({ cooking_time_limit_min: 30 })),
+            ).not.toContain('cooking_time');
+        });
+
+        it('still blames the dislike that a relaxation genuinely needs', () => {
+            // The positive half of the same rule, and the reason the four cases
+            // above are not simply "never report anything": here the relaxed
+            // week can only be built from the recipes the dislike removed, so
+            // the witness holds and the row is earned.
+            const catalog = feasibleCatalog().map((recipe) =>
+                recipe.slug.startsWith('d')
+                    ? makeRecipe({
+                          slug: recipe.slug,
+                          slots: ['dinner'],
+                          calories: 800,
+                          ingredientIds: ['blocked-food'],
+                      })
+                    : recipe,
+            );
+
+            expect(keys(catalog, makePreferences({ disliked_food_ids: ['blocked-food'] }))).toContain(
+                'dislikes',
+            );
+        });
+
+        it('reaches an identical list on repeated runs', () => {
+            const catalog = feasibleCatalog().map((recipe) =>
+                recipe.slug.startsWith('d')
+                    ? makeRecipe({
+                          slug: recipe.slug,
+                          slots: ['dinner'],
+                          calories: 800,
+                          dietTags: ['pescatarian'],
+                      })
+                    : recipe,
+            );
+            const preferences = makePreferences({
+                diet: 'vegan',
+                disliked_food_ids: ['blocked-food'],
+                cooking_time_limit_min: 30,
+            });
+
+            expect(analyze(catalog, preferences)).toEqual(analyze(catalog, preferences));
+        });
+    });
+
     it('keeps relaxation probes quiet once the deadline has passed', () => {
         const constraints = analyzeLimitingConstraints({
             seedInputs: makeSeedInputs(),
@@ -1836,21 +2858,19 @@ describe('plan lifecycle', () => {
                 throw new Error('expected PlanNotActiveError');
             } catch (error) {
                 expect(error).toBeInstanceOf(PlanNotActiveError);
-                expect((error as PlanNotActiveError).replacementPlanId).toBe('plan-next');
-                expect((error as PlanNotActiveError).reason).toBeUndefined();
+                expect((error as PlanNotActiveError).data).toEqual({ replacementPlanId: 'plan-next' });
             }
         });
 
-        it('still refuses a superseded plan that records no replacement', () => {
-            // The column is nullable, so "superseded" must not depend on knowing
-            // what replaced it — the write is refused either way.
-            try {
-                requireWritablePlan(planState({ status: 'superseded' }), TODAY);
-                throw new Error('expected PlanNotActiveError');
-            } catch (error) {
-                expect(error).toBeInstanceOf(PlanNotActiveError);
-                expect((error as PlanNotActiveError).replacementPlanId).toBeUndefined();
-            }
+        it('treats a superseded plan with no resolvable replacement as a data fault, not a 409', () => {
+            // Regeneration links the successor in the same transaction that
+            // supersedes the old plan, so this state contradicts itself. The
+            // superseded variant promises the replacement id, so it is never
+            // answered without one: the alternatives would be a 409 whose body
+            // omits what it promises, or a false claim that the week ended.
+            expect(() => requireWritablePlan(planState({ status: 'superseded' }), TODAY)).toThrow(
+                MealPlanInputError,
+            );
         });
 
         it('reports an ended plan as ended, even though it is still stored active', () => {
@@ -1861,8 +2881,7 @@ describe('plan lifecycle', () => {
                 );
                 throw new Error('expected PlanNotActiveError');
             } catch (error) {
-                expect((error as PlanNotActiveError).reason).toBe('ended');
-                expect((error as PlanNotActiveError).replacementPlanId).toBeUndefined();
+                expect((error as PlanNotActiveError).data).toEqual({ reason: 'ended' });
             }
         });
     });
@@ -2306,6 +3325,21 @@ describe('policy constants', () => {
         expect(MIN_ELIGIBLE_RECIPES_PER_SLOT).toBe(4);
     });
 
+    it('bounds the search at 2,000 evaluations a day and 14,000 a plan', () => {
+        expect(MAX_EVALUATIONS_PER_DAY).toBe(2000);
+        expect(MAX_EVALUATIONS_PER_PLAN).toBe(14000);
+    });
+
+    it('sets the plan budget at exactly seven day budgets, which is why the guards need separating', () => {
+        // 14,000 = 7 × 2,000, so under the shipped policy a week that spends
+        // every day's allowance trips both guards at the same placement and no
+        // fixture could say which rule ended the search. That is the honest
+        // reason `searchPlanWeek` takes an injected budget, and stating the
+        // relation here is what makes a future change to either number — one
+        // that would quietly break the other's fixture — visible.
+        expect(MAX_EVALUATIONS_PER_PLAN).toBe(PLAN_DAY_COUNT * MAX_EVALUATIONS_PER_DAY);
+    });
+
     it('offers the documented portion multipliers, with the snack set a subset', () => {
         expect(MAIN_SLOT_PORTION_MULTIPLIERS).toEqual([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]);
         expect(SNACK_PORTION_MULTIPLIERS).toEqual([0.5, 0.75, 1, 1.25, 1.5]);
@@ -2317,6 +3351,362 @@ describe('policy constants', () => {
         expect(DEFAULT_PORTION_POLICY).toEqual({
             mainSlot: MAIN_SLOT_PORTION_MULTIPLIERS,
             snack: SNACK_PORTION_MULTIPLIERS,
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The committed catalog and recipe graph
+ *
+ * The fixtures above are focused deltas: interchangeable recipes at chosen
+ * calories, built to make one search property visible. This section runs the
+ * planner over the COMMITTED graph instead — real `recipe_versions` rows with
+ * real `recipe_ingredients` and real `catalog_foods` identities — and asserts
+ * the continuity a synthetic catalog cannot: that the candidate the planner
+ * scores still carries the version, the catalog state, the ingredient identity
+ * and the per-serving numbers the recipe domain published, and that the grams
+ * it plans are the grams the grocery list will shop.
+ * ------------------------------------------------------------------------- */
+
+describe('the committed catalog and recipe graph', () => {
+    const seed = derivePlanSeed(makeSeedInputs());
+
+    describe('candidate continuity', () => {
+        it('carries every committed identity through to the candidate, unaltered', () => {
+            const candidates = buildPlanCandidates(fixtureCatalog(), makePreferences(), seed);
+            const committed = new Map(
+                readRecipeFixture().recipe_versions.map((version) => [version.id, version]),
+            );
+
+            expect(candidates).not.toHaveLength(0);
+
+            for (const candidate of candidates) {
+                const version = committed.get(candidate.recipe.recipe_version_id);
+
+                expect(version).toBeDefined();
+                expect(candidate.recipe.recipe_id).toBe(version?.recipe_id);
+                expect(candidate.recipe.slug).toBe(version?.recipe_slug);
+                expect(candidate.recipe.version).toBe(version?.version);
+                expect(candidate.recipe.budget_tier).toBe(version?.budget_tier);
+                expect(candidate.recipe.total_minutes).toBe(version?.total_minutes);
+                expect(candidate.recipe.per_serving.calories).toBe(version?.per_serving_calories);
+            }
+        });
+
+        it('scales the per-serving set by the multiplier and nothing else', () => {
+            const candidates = buildPlanCandidates(
+                [planCandidateOf('lemon-herb-chicken-and-rice', 2)],
+                makePreferences(),
+                seed,
+            );
+            const version = recipeVersionRow('lemon-herb-chicken-and-rice', 2);
+
+            for (const candidate of candidates) {
+                expect(candidate.nutrition.calories).toBeCloseTo(
+                    version.per_serving_calories * candidate.portionMultiplier,
+                    9,
+                );
+                expect(candidate.nutrition.protein).toBeCloseTo(
+                    version.per_serving_protein_g * candidate.portionMultiplier,
+                    9,
+                );
+            }
+        });
+
+        it('keeps each candidate ingredient a catalog fixture row, by id and by group', () => {
+            const foodsById = new Map(readCatalogFixture().foods.map((food) => [food.id, food]));
+            const candidates = buildPlanCandidates(fixtureCatalog(), makePreferences(), seed);
+
+            for (const candidate of candidates) {
+                expect(candidate.recipe.ingredients).not.toHaveLength(0);
+
+                for (const ingredient of candidate.recipe.ingredients) {
+                    const food = foodsById.get(ingredient.catalog_food_id);
+
+                    // The planner matches a disliked group against LIVE
+                    // identity metadata, so the group travelling with the
+                    // candidate has to be the catalog's own.
+                    expect(food).toBeDefined();
+                    expect(ingredient.food_group).toBe(food?.food_group);
+                }
+            }
+        });
+
+        it('admits only the six versions the fixture records as plannable', () => {
+            const candidates = buildPlanCandidates(fixtureCatalog(), makePreferences(), seed);
+            const admitted = new Set(candidates.map((candidate) => candidate.recipe.recipe_version_id));
+
+            expect(admitted.size).toBe(readRecipeFixture().counts.plannable_versions);
+            expect(admitted.size).toBe(6);
+            expect(candidates).toHaveLength(admitted.size * MAIN_SLOT_PORTION_MULTIPLIERS.length);
+        });
+
+        it.each([
+            ['the retired version', 'lemon-herb-chicken-and-rice', 1],
+            ['the ai_estimated version', 'roasted-carrot-and-lentil-salad', 1],
+            ['the ingredient_derived version', 'lemon-dressed-spinach-salad', 1],
+            ['the unreviewed-allergen version', 'cracker-and-yogurt-snack-plate', 1],
+        ])('never offers %s as a candidate', (_label, slug, versionNumber: number) => {
+            const candidates = buildPlanCandidates(fixtureCatalog(), makePreferences(), seed);
+            const excludedId = recipeVersionRow(slug, versionNumber).id;
+
+            expect(candidates.map((candidate) => candidate.recipe.recipe_version_id)).not.toContain(excludedId);
+        });
+
+        it('still offers the current version of the recipe whose first version is retired', () => {
+            const candidates = buildPlanCandidates(fixtureCatalog(), makePreferences(), seed);
+            const current = recipeVersionRow('lemon-herb-chicken-and-rice', 2);
+
+            expect(candidates.map((candidate) => candidate.recipe.recipe_version_id)).toContain(current.id);
+        });
+    });
+
+    describe('what the committed graph can and cannot fill', () => {
+        it.each<[MealSlot, number, string[]]>([
+            ['breakfast', 1, ['spinach-egg-white-scramble:1']],
+            ['lunch', 2, ['lemon-herb-chicken-and-rice:2', 'lentil-and-kale-stew:1']],
+            [
+                'dinner',
+                4,
+                [
+                    'lemon-herb-chicken-and-rice:2',
+                    'lentil-and-kale-stew:1',
+                    'salmon-and-kale-plate:1',
+                    'soy-glazed-chicken-and-rice-bowl:1',
+                ],
+            ],
+            ['snack', 1, ['herbed-yogurt-and-kale-dip-plate:1']],
+        ])('offers %s exactly %i committed recipes', (slot, count, identities) => {
+            const candidates = buildPlanCandidates(fixtureCatalog(), makePreferences(), seed);
+
+            expect(eligibleRecipeCountForSlot(candidates, makePreferences(), slot)).toBe(count);
+            expect(
+                [
+                    ...new Set(
+                        candidatesForSlot(candidates, makePreferences(), slot).map(
+                            (candidate) => `${candidate.recipe.slug}:${candidate.recipe.version}`,
+                        ),
+                    ),
+                ].sort(),
+            ).toEqual(identities);
+        });
+
+        it('refuses a week from the graph alone and names the thin slots, rather than failing', () => {
+            const act = () =>
+                generateWeeklyPlan({
+                    seedInputs: makeSeedInputs(),
+                    preferences: makePreferences(),
+                    targets: TARGETS,
+                    recipes: fixtureCatalog(),
+                });
+
+            // Only dinner reaches MIN_ELIGIBLE_RECIPES_PER_SLOT, so this is a
+            // feasibility verdict about the catalog and not a server error.
+            expect(act).toThrow(NoMatchingMealsError);
+            expect(
+                analyzeLimitingConstraints({
+                    seedInputs: makeSeedInputs(),
+                    preferences: makePreferences(),
+                    targets: TARGETS,
+                    recipes: fixtureCatalog(),
+                }),
+            ).toEqual([
+                {
+                    constraintKey: 'catalog_coverage',
+                    value: 1,
+                    unit: 'recipes',
+                    slots: ['breakfast', 'lunch'],
+                    editStep: 'schedule',
+                },
+            ]);
+        });
+    });
+
+    describe('a week whose breakfasts are committed recipes', () => {
+        /**
+         * The four plannable committed versions that are not already breakfast,
+         * widened to that slot and nothing else. `meal_slots` is the one
+         * focused delta: four recipes at the weekly cap of two uses cover seven
+         * days, which is what lets every breakfast the planner places be a
+         * committed row. Lunch and dinner stay synthetic, because the graph
+         * publishes too few recipes to fill three slots for seven days — the
+         * property asserted just above.
+         */
+        const COMMITTED_BREAKFASTS: [string, number][] = [
+            ['lemon-herb-chicken-and-rice', 2],
+            ['lentil-and-kale-stew', 1],
+            ['soy-glazed-chicken-and-rice-bowl', 1],
+            ['salmon-and-kale-plate', 1],
+        ];
+
+        const mixedCatalog = (): PlanRecipeCandidate[] => [
+            ...COMMITTED_BREAKFASTS.map(([slug, versionNumber]) =>
+                planCandidateOf(slug, versionNumber, { meal_slots: ['breakfast'] }),
+            ),
+            ...['l1', 'l2', 'l3', 'l4'].map((slug) => makeRecipe({ slug, slots: ['lunch'], calories: 700 })),
+            ...['d1', 'd2', 'd3', 'd4'].map((slug) => makeRecipe({ slug, slots: ['dinner'], calories: 800 })),
+        ];
+
+        const committedIds = (): Set<string> =>
+            new Set(COMMITTED_BREAKFASTS.map(([slug, versionNumber]) => recipeVersionRow(slug, versionNumber).id));
+
+        it('places a committed version, with its committed identity, in every breakfast slot', () => {
+            const result = plan(mixedCatalog());
+            const expected = committedIds();
+
+            expect(result.days).toHaveLength(PLAN_DAY_COUNT);
+
+            for (const day of result.days) {
+                const [breakfast] = day.meals;
+
+                expect(breakfast.slot).toBe('breakfast');
+                expect(expected.has(breakfast.recipeVersionId)).toBe(true);
+
+                const version = recipeVersionRow(breakfast.slug, breakfast.version);
+
+                expect(breakfast.recipeVersionId).toBe(version.id);
+                expect(breakfast.recipeId).toBe(version.recipe_id);
+                expect(breakfast.planned.calories).toBeCloseTo(
+                    version.per_serving_calories * breakfast.portionMultiplier,
+                    9,
+                );
+                expect(isDayWithinTolerance(day.plannedTotals, TARGETS)).toBe(true);
+            }
+        });
+
+        it('respects the weekly repetition cap across the committed four', () => {
+            const uses = new Map<string, number>();
+
+            for (const day of plan(mixedCatalog()).days) {
+                const [breakfast] = day.meals;
+                uses.set(breakfast.recipeId, (uses.get(breakfast.recipeId) ?? 0) + 1);
+            }
+
+            expect([...uses.values()].every((count) => count <= MAX_RECIPE_USES_PER_WEEK)).toBe(true);
+            expect([...uses.keys()]).toHaveLength(COMMITTED_BREAKFASTS.length);
+        });
+
+        it('is byte-identical for identical inputs, committed rows included', () => {
+            expect(plan(mixedCatalog())).toEqual(plan(mixedCatalog()));
+        });
+
+        it('plans each breakfast ingredient at the grams the grocery list will aggregate', () => {
+            const [firstDay] = plan(mixedCatalog()).days;
+            const [breakfast] = firstDay.meals;
+            const version = recipeVersionRow(breakfast.slug, breakfast.version);
+            const rows = fixtureIngredientRows(breakfast.slug, breakfast.version);
+
+            expect(rows).not.toHaveLength(0);
+
+            for (const row of rows) {
+                // The grocery module's own arithmetic on this placement, not a
+                // restatement of it: `plannedIngredientGrams` is what the
+                // shopping list sums, and it has to agree with the version's
+                // yield and the multiplier the planner chose.
+                expect(
+                    plannedIngredientGrams(row.gram_weight, version.yield_servings, breakfast.portionMultiplier),
+                ).toBeCloseTo((row.gram_weight * breakfast.portionMultiplier) / version.yield_servings, 9);
+            }
+
+            // And the whole placement: one portion of this meal takes the
+            // recipe's total mass through the same divisor.
+            const totalGrams = rows.reduce((sum, row) => sum + row.gram_weight, 0);
+            const plannedTotal = rows.reduce(
+                (sum, row) =>
+                    sum + plannedIngredientGrams(row.gram_weight, version.yield_servings, breakfast.portionMultiplier),
+                0,
+            );
+
+            expect(plannedTotal).toBeCloseTo((totalGrams / version.yield_servings) * breakfast.portionMultiplier, 9);
+            expect(plannedTotal).toBeLessThan(totalGrams);
+        });
+
+        it('follows the chicken from the recipe row into the planned portion', () => {
+            const result = plan(mixedCatalog());
+            const chicken = catalogFood('usda:9200101');
+            const chickenDays = result.days.filter((day) =>
+                fixtureIngredientRows(day.meals[0].slug, day.meals[0].version).some(
+                    (row) => row.catalog_food_id === chicken.id,
+                ),
+            );
+
+            expect(chickenDays).not.toHaveLength(0);
+
+            for (const day of chickenDays) {
+                const [breakfast] = day.meals;
+                const version = recipeVersionRow(breakfast.slug, breakfast.version);
+                const row = fixtureIngredientRows(breakfast.slug, breakfast.version).find(
+                    (candidate) => candidate.catalog_food_id === chicken.id,
+                );
+
+                expect(row?.food_source_key).toBe('usda:9200101');
+                expect([450, 600]).toContain((row as FixtureRecipeIngredient).gram_weight);
+                expect(
+                    plannedIngredientGrams(
+                        (row as FixtureRecipeIngredient).gram_weight,
+                        version.yield_servings,
+                        breakfast.portionMultiplier,
+                    ),
+                ).toBe(
+                    ((row as FixtureRecipeIngredient).gram_weight / version.yield_servings) *
+                        breakfast.portionMultiplier,
+                );
+                expect(breakfast.planned.calories).toBeCloseTo(
+                    version.per_serving_calories * breakfast.portionMultiplier,
+                    9,
+                );
+            }
+        });
+    });
+
+    describe('preferences against committed rows', () => {
+        it('excludes the milk-bearing committed recipes for a milk allergy, and no others', () => {
+            const preferences = makePreferences({ allergens: ['milk'] });
+            const candidates = buildPlanCandidates(fixtureCatalog(), preferences, seed);
+            const admitted = new Set(candidates.map((candidate) => candidate.recipe.slug));
+
+            // spinach-egg-white-scramble carries whole milk and
+            // herbed-yogurt-and-kale-dip-plate carries Greek yogurt; the other
+            // four plannable versions carry neither.
+            expect(admitted.has('spinach-egg-white-scramble')).toBe(false);
+            expect(admitted.has('herbed-yogurt-and-kale-dip-plate')).toBe(false);
+            expect([...admitted].sort()).toEqual([
+                'lemon-herb-chicken-and-rice',
+                'lentil-and-kale-stew',
+                'salmon-and-kale-plate',
+                'soy-glazed-chicken-and-rice-bowl',
+            ]);
+        });
+
+        it('keeps the pescatarian salmon plate, which the release spelling would have dropped', () => {
+            const preferences = makePreferences({ diet: 'pescatarian' });
+            const candidates = buildPlanCandidates([planCandidateOf('salmon-and-kale-plate', 1)], preferences, seed);
+
+            expect(candidates).not.toHaveLength(0);
+            expect(candidates[0].recipe.ingredients.map((ingredient) => ingredient.snapshot_diet_tags[0])).toContain(
+                'pescatarian',
+            );
+        });
+
+        it('excludes a committed recipe by the food group its own catalog row declares', () => {
+            const salmon = catalogFood('usda:9200121');
+            const preferences = makePreferences({ disliked_food_groups: [salmon.food_group] });
+            const candidates = buildPlanCandidates(fixtureCatalog(), preferences, seed);
+            const admitted = new Set(candidates.map((candidate) => candidate.recipe.slug));
+
+            expect(salmon.food_group).toBe('salmon');
+            expect(admitted.has('salmon-and-kale-plate')).toBe(false);
+            expect(admitted.has('lentil-and-kale-stew')).toBe(true);
+        });
+
+        it('excludes a committed recipe by a disliked catalog food id', () => {
+            const yogurt = catalogFood('usda:9200115');
+            const preferences = makePreferences({ disliked_food_ids: [yogurt.id] });
+            const candidates = buildPlanCandidates(fixtureCatalog(), preferences, seed);
+            const admitted = new Set(candidates.map((candidate) => candidate.recipe.slug));
+
+            expect(admitted.has('herbed-yogurt-and-kale-dip-plate')).toBe(false);
+            expect(admitted.has('spinach-egg-white-scramble')).toBe(true);
         });
     });
 });

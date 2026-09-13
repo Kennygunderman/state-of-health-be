@@ -9,7 +9,7 @@
  * `src/prisma/client.ts` constructs its client on the second line of the file,
  * at import time, so importing it here would put a live client in the module
  * graph before `jestSetup.ts` had checked a single condition. The Prisma client
- * is therefore required LAZILY, inside the two functions that need it, after
+ * is therefore required LAZILY, inside the one function that needs it, after
  * the guard has passed. `testDb.test.ts` proves that from outside the process,
  * where it is provable: it spawns a child with an unsafe `DATABASE_URL` and a
  * `Module._load` / `net.Socket.prototype.connect` hook, and asserts the child
@@ -283,7 +283,7 @@ const quoteIdentifier = (identifier: string): string => {
 };
 
 /**
- * The two Prisma members this module uses, declared structurally so no type or
+ * The one Prisma member this module uses, declared structurally so no type or
  * value from the generated client enters this module's import graph. Keeping
  * the surface this small is also why the harness works on a checkout where
  * `prisma generate` has not been run until a suite actually touches the
@@ -291,7 +291,6 @@ const quoteIdentifier = (identifier: string): string => {
  */
 interface TestPrismaClient {
     $executeRawUnsafe(query: string, ...values: unknown[]): Promise<number>;
-    $disconnect(): Promise<void>;
 }
 
 /**
@@ -329,14 +328,4 @@ export const truncateFeatureTables = async (): Promise<void> => {
     const prisma = requirePrismaClient();
 
     await prisma.$executeRawUnsafe(`TRUNCATE TABLE ${identifiers} CASCADE`);
-};
-
-/**
- * Closes the shared client's pool so Jest's process can exit. Non-destructive,
- * so it does not re-run the guard: an `afterAll` must be able to clean up even
- * on the path where an assertion about the environment has already failed.
- */
-export const disconnectTestDatabase = async (): Promise<void> => {
-    const prisma = requirePrismaClient();
-    await prisma.$disconnect();
 };

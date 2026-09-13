@@ -36,6 +36,215 @@ export interface ScriptLogger {
 const REDACTED = '***';
 const UNSERIALIZABLE = '[unserializable]';
 
+// The three delimiters that end a URL authority (RFC 3986 §3.2) and the
+// userinfo delimiter inside it, as code points so the authority scan below is a
+// comparison per character rather than a regex call per character.
+const CHAR_SLASH = 0x2f;
+const CHAR_QUESTION_MARK = 0x3f;
+const CHAR_NUMBER_SIGN = 0x23;
+const CHAR_AT_SIGN = 0x40;
+
+// The non-alphanumeric characters an RFC 3986 scheme may contain after its
+// leading letter: `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`.
+const CHAR_PLUS = 0x2b;
+const CHAR_HYPHEN = 0x2d;
+const CHAR_PERIOD = 0x2e;
+
+const CHAR_DIGIT_ZERO = 0x30;
+const CHAR_DIGIT_NINE = 0x39;
+const CHAR_UPPERCASE_A = 0x41;
+const CHAR_UPPERCASE_Z = 0x5a;
+const CHAR_LOWERCASE_A = 0x61;
+const CHAR_LOWERCASE_Z = 0x7a;
+
+// The boundary between the ASCII fast path and the Unicode whitespace check.
+const CHAR_ASCII_LIMIT = 0x80;
+const CHAR_SPACE = 0x20;
+const CHAR_TAB = 0x09;
+const CHAR_CARRIAGE_RETURN = 0x0d;
+
+const isAsciiLetter = (code: number): boolean =>
+    (code >= CHAR_UPPERCASE_A && code <= CHAR_UPPERCASE_Z) || (code >= CHAR_LOWERCASE_A && code <= CHAR_LOWERCASE_Z);
+
+const isSchemeCharacter = (code: number): boolean =>
+    isAsciiLetter(code) ||
+    (code >= CHAR_DIGIT_ZERO && code <= CHAR_DIGIT_NINE) ||
+    code === CHAR_PLUS ||
+    code === CHAR_HYPHEN ||
+    code === CHAR_PERIOD;
+
+// Exactly the set JavaScript's `\s` matches, which is the set a regex form of
+// this rule delegates the question to. The membership matters: a log line is
+// prose, and a non-breaking space or a line separator arriving inside a vendor
+// error body is what separates one URL from the next in it. Treating such a
+// character as part of an authority would let the scan run past the end of one
+// URL and miss the credential in the one after it.
+const isUrlWhitespace = (code: number): boolean => {
+    if (code < CHAR_ASCII_LIMIT) {
+        return code === CHAR_SPACE || (code >= CHAR_TAB && code <= CHAR_CARRIAGE_RETURN);
+    }
+    return (
+        code === 0x00a0 ||
+        code === 0x1680 ||
+        (code >= 0x2000 && code <= 0x200a) ||
+        code === 0x2028 ||
+        code === 0x2029 ||
+        code === 0x202f ||
+        code === 0x205f ||
+        code === 0x3000 ||
+        code === 0xfeff
+    );
+};
+
+const isAuthorityTerminator = (code: number): boolean =>
+    code === CHAR_SLASH || code === CHAR_QUESTION_MARK || code === CHAR_NUMBER_SIGN || isUrlWhitespace(code);
+
+const SCHEME_SEPARATOR = '://';
+
+// One leading letter plus the 40-character scheme body this rule bounds, so the
+// walk-back below inspects at most 41 characters per `://` it finds. The
+// longest registered URI scheme is about 20 characters, which leaves room for
+// an unregistered one and still refuses to walk the length of a vendor error
+// body looking for the start of a scheme that is not there.
+const MAX_SCHEME_LENGTH = 41;
+
+// Whether the characters immediately to the LEFT of a `://` form a scheme.
+//
+// Walks left from the separator over scheme-legal characters, stopping at the
+// first character that is not one or at the 41-character bound, and reports
+// whether the run it covered contains a letter — a scheme must start with one,
+// so a run of only digits, `+`, `-` and `.` is not a scheme and the `://` after
+// it is not a URL.
+const hasSchemeBefore = (value: string, separatorIndex: number): boolean => {
+    const limit = separatorIndex > MAX_SCHEME_LENGTH ? separatorIndex - MAX_SCHEME_LENGTH : 0;
+    let sawLetter = false;
+
+    for (let index = separatorIndex; index > limit; index -= 1) {
+        const code = value.charCodeAt(index - 1);
+        if (!isSchemeCharacter(code)) {
+            break;
+        }
+        if (isAsciiLetter(code)) {
+            sawLetter = true;
+        }
+    }
+
+    return sawLetter;
+};
+
+/**
+ * Replaces the userinfo of every URL in a string with `***`, leaving the scheme,
+ * host, port, path, query and fragment exactly as they were.
+ *
+ * `redactUrlUserinfo('postgresql://user:pa@ss@localhost:5433/db')` is
+ * `'postgresql://***@localhost:5433/db'`, and a URL whose authority carries no
+ * `@` at all comes back byte-identical — a bare host is not a credential and
+ * redacting it would cost an operator the one field that says which database a
+ * run was pointed at. The result is a fixed point of this function, which is
+ * part of SCRUB_RULES' idempotence contract below.
+ *
+ * WHERE THE USERINFO ENDS, AND WHY IT IS THE LAST `@`.
+ *
+ * DATABASE_URL is the credential this pipeline is most likely to print, and its
+ * password sits in the URL userinfo, so this rule has to be right about where
+ * that userinfo stops. RFC 3986 §3.2 ends the authority at the first `/`, `?`,
+ * `#` or the end of the string, and within that authority the userinfo is
+ * everything before the LAST `@`. An unescaped `@` is legal in a Postgres
+ * password and common in generated ones, so `postgresql://user:pa@ss@localhost`
+ * has the password `pa@ss` and the host `localhost` — reading the first `@` as
+ * the delimiter instead yields the password `pa` and the "host" `ss@localhost`,
+ * and emits the password's suffix to an operator's terminal, to a CI log and,
+ * through checkpoint.ts's `sanitizeRunLogEntry`, into the
+ * `catalog_import_runs.log` column (CWE-532).
+ *
+ * WHY THIS IS SCANNED AND NOT MATCHED.
+ *
+ * A regex can express the rule, and both spellings of it are worse than a scan.
+ * Measured on this runtime:
+ *
+ *  - An unbounded scheme body — `([a-z][a-z0-9+.-]*:\/\/)` — is quadratic in the
+ *    length of a scheme-legal run: 51 ms at 10,000 characters of `A-KEY-`,
+ *    211 ms at 20,000 and 840 ms at 40,000, and 19,758 ms at 200,000. A vendor
+ *    error body is caller-supplied input this module is expected to survive, so
+ *    the bound is a security property. That is why `hasSchemeBefore` above is
+ *    bounded too.
+ *  - A bounded greedy authority — `[^\/\s?#]*@` — is correct on the sample and
+ *    costs 60 ms on `a://` followed by 200,000 delimiter-free characters,
+ *    because a global regex retries the bounded scheme quantifier at every one
+ *    of those offsets. The scan below is 8 ms on the same input and 0.1 ms on
+ *    200,000 characters of prose carrying one DSN.
+ *  - A bounded authority — `[^\/\s?#]{0,N}@` — fails to match at all once the
+ *    authority is longer than N, which does not shorten the leak but widens it:
+ *    a 600-character password would go from partially redacted to printed whole.
+ *
+ * The scan is linear because `indexOf` finds each `://` in one pass, the
+ * walk-back for a scheme is capped at 41 characters, and the authority is read
+ * once — the resume point after each URL is the end of its authority, and an
+ * authority cannot contain a `://` because it cannot contain a `/`.
+ */
+export const redactUrlUserinfo = (value: string): string => {
+    // Guarded rather than trusted, exactly as scrubSecrets is and for the same
+    // reason: this runs on error messages and decoded vendor JSON, where the
+    // runtime value can disagree with its declared type.
+    if (typeof value !== 'string') {
+        return '';
+    }
+
+    let searchFrom = 0;
+    // The prefix of `value` already copied into `redacted`. Left at 0 while
+    // nothing has matched, which is how an untouched string is returned as
+    // itself rather than rebuilt.
+    let copiedUpTo = 0;
+    let redacted = '';
+
+    for (;;) {
+        const separatorIndex = value.indexOf(SCHEME_SEPARATOR, searchFrom);
+        if (separatorIndex < 0) {
+            break;
+        }
+        if (!hasSchemeBefore(value, separatorIndex)) {
+            // Not a URL — a bare `://`, or one whose left-hand run holds no
+            // letter (`1://`). One character is enough to advance the search:
+            // `://` cannot overlap another occurrence of itself.
+            searchFrom = separatorIndex + 1;
+            continue;
+        }
+
+        const authorityStart = separatorIndex + SCHEME_SEPARATOR.length;
+        let authorityEnd = value.length;
+        let lastAtSignIndex = -1;
+
+        for (let index = authorityStart; index < value.length; index += 1) {
+            const code = value.charCodeAt(index);
+            if (isAuthorityTerminator(code)) {
+                authorityEnd = index;
+                break;
+            }
+            if (code === CHAR_AT_SIGN) {
+                lastAtSignIndex = index;
+            }
+        }
+
+        // Past the authority either way, and strictly past the separator, so the
+        // loop always advances. An `@` after this point belongs to a path, a
+        // query or a fragment — `https://example.com/path?a=b@c` carries no
+        // userinfo and must come back whole.
+        searchFrom = authorityEnd;
+
+        if (lastAtSignIndex < 0) {
+            continue;
+        }
+
+        redacted += `${value.slice(copiedUpTo, authorityStart)}${REDACTED}@`;
+        copiedUpTo = lastAtSignIndex + 1;
+    }
+
+    if (copiedUpTo === 0) {
+        return value;
+    }
+    return redacted + value.slice(copiedUpTo);
+};
+
 // THE SECURITY CONTRACT OF THIS MODULE.
 //
 // These rules are applied in order to every caller-supplied string that
@@ -46,28 +255,33 @@ const UNSERIALIZABLE = '[unserializable]';
 //
 // Two properties every rule must keep. Order matters, so a new rule goes where
 // its input still exists (the PEM rule must precede the base64 rule, or a
-// private key is reduced to its markers plus a redacted body). And every
-// replacement is a fixed point of its own pattern, which is what makes
-// `scrubSecrets` idempotent — callers legitimately pass strings that have
-// already been scrubbed once.
+// private key is reduced to its markers plus a redacted body). And every rule's
+// output is a fixed point of that rule, which is what makes `scrubSecrets`
+// idempotent — callers legitimately pass strings that have already been
+// scrubbed once.
 //
 // One consequence worth knowing: the last rule redacts any long opaque run, so
 // it also hides a full SHA-256 digest. A caller that needs to show a checksum
 // logs a short prefix (12 characters is well under the threshold) instead of
 // widening the pattern.
-const SCRUB_RULES: Array<{ pattern: RegExp; replacement: string }> = [
+//
+// A rule is either a pattern and its replacement or a named transform. The
+// second form exists because one of the five rules below cannot be a regex
+// without either leaking or stalling — see `redactUrlUserinfo` above, which
+// documents both measurements. The list stays an ORDERED list of transforms
+// whichever form each entry takes, and `scrubSecrets` applies them in order.
+type ScrubRule = { pattern: RegExp; replacement: string } | { scrub: (value: string) => string };
+
+const SCRUB_RULES: Array<ScrubRule> = [
     { pattern: /-----BEGIN[\s\S]*?-----END[^-\n]*-----/g, replacement: REDACTED },
-    // The scheme body is BOUNDED, and that bound is a security property rather
-    // than a tidiness choice. Written `*`, this pattern rescans to the end of
-    // the string from every offset inside a long run of scheme-legal characters
-    // looking for a `://` that never arrives: measured here, a 200,000-character
-    // run of `A-KEY-` took 19,758 ms and one of `A-KEY` 23,420 ms, so a vendor
-    // error body — caller-supplied input this module is expected to survive —
-    // could stall the pipeline inside its own logger. The longest registered URI
-    // scheme is about 20 characters, so 40 leaves room for an unregistered one
-    // and still measures 34 ms on the same input with `postgresql://user:pass@`
-    // and a 300-character URL password both still redacted. Do not unbound it.
-    { pattern: /([a-z][a-z0-9+.-]{0,40}:\/\/)[^/\s@]+@/gi, replacement: `$1${REDACTED}@` },
+    // URL userinfo, scanned rather than matched, and third rather than first or
+    // last: a private key must already have been collapsed by the rule above,
+    // and this must run before the Bearer rule so a credential written as a URL
+    // is gone before anything else can claim part of it. `redactUrlUserinfo`
+    // carries the reasoning — the authority is read to its RFC 3986 end and the
+    // LAST `@` in it is the userinfo delimiter, because an unescaped `@` is
+    // legal in a URL password and stopping at the first one prints its suffix.
+    { scrub: redactUrlUserinfo },
     { pattern: /bearer\s+[^\s"',;)\]}]+/gi, replacement: `Bearer ${REDACTED}` },
     // The parameter name is kept (it is useful in a log) and only its value is
     // lost. Longest alternatives come first so `access_token` is not split by
@@ -101,7 +315,10 @@ export const scrubSecrets = (value: string): string => {
     if (typeof value !== 'string') {
         return '';
     }
-    return SCRUB_RULES.reduce((scrubbed, rule) => scrubbed.replace(rule.pattern, rule.replacement), value);
+    return SCRUB_RULES.reduce(
+        (scrubbed, rule) => ('scrub' in rule ? rule.scrub(scrubbed) : scrubbed.replace(rule.pattern, rule.replacement)),
+        value,
+    );
 };
 
 // THE KEY-NAME HALF OF THE SECURITY CONTRACT.

@@ -1,8 +1,9 @@
 // The row -> DTO boundary for recipe versions: the one place a `recipe_versions`
 // row and its `recipe_ingredients` rows become the camelCase wire shapes
-// `src/types/recipe.ts` declares and the mobile io-ts codecs decode
-// (`convertRecipeVersion.ts`). One shape, one mapper — a second builder for any
-// of these responses is drift, and drift here is a client that stops decoding.
+// `src/types/recipe.ts` and `src/types/mealPlanning.ts` declare and the mobile
+// io-ts codecs decode (`convertRecipeVersion.ts`). One shape, one mapper — a
+// second builder for any of these responses is drift, and drift here is a
+// client that stops decoding.
 //
 // A file of its own rather than a private const in `recipe.service.ts` because
 // THREE services need it (Rule backend-architecture §6):
@@ -68,13 +69,8 @@
 // §11 covers mappers by integration — `src/__tests__/api/recipes.test.ts`,
 // `api/plans.test.ts` and `api/swaps.test.ts` assert these shapes end to end.
 
-import {
-    RecipeBadge,
-    RecipeIconKey,
-    RecipeIngredientResponse,
-    RecipePerServingNutrition,
-    RecipeVersionResponse,
-} from '../types/recipe';
+import { MealPlanMealRecipeSummary, SwapAlternative } from '../types/mealPlanning';
+import { RecipeIngredientResponse, RecipePerServingNutrition, RecipeVersionResponse } from '../types/recipe';
 import { mapIngredientSnapshot, RecipeIngredientSnapshotRow } from './catalog.mapper';
 import { isMealSlot, isRecipeBadge, isRecipeIconKey } from './recipe.logic';
 
@@ -182,59 +178,25 @@ export interface RecipeVersionRow {
 }
 
 /* ---------------------------------------------------------------------------
- * The two shared projections
+ * The two shared projections — declared in `src/types`, not restated here
  * ------------------------------------------------------------------------- */
 
-/**
- * The recipe projection carried on a planned meal: what a plan card renders,
- * not the full recipe.
- *
- * Structurally identical to `MealPlanMealRecipeSummary` in
- * `types/mealPlanning.ts` and restated here so this mapper's dependencies stay
- * the files its shapes actually need — the same call `recipe.logic.ts` makes
- * for `RecipeDietPreference`. `mealPlan.mapper.ts` assigns the result straight
- * into that DTO, so a change to either declaration surfaces as a compile error
- * at the assignment rather than as a wire mismatch.
- */
-export interface PlannedRecipeSummary {
-    versionId: string;
-    recipeId: string;
-    name: string;
-    iconKey: RecipeIconKey;
-    /** prep plus cook minutes, the figure the user's cooking-time limit is applied to. */
-    totalMinutes: number;
-    badges: RecipeBadge[];
-    /**
-     * The single literal, not the provenance union. Planning admits only
-     * recipes whose every ingredient is source-backed, so a planned meal is
-     * never an estimate and the type says so. Widening this would erase the
-     * guarantee the client relies on to label planned meals with no source
-     * qualifier — and wanting to widen it means the eligibility rule broke
-     * upstream, which is why `mapPlannedRecipeSummary` asserts rather than
-     * assumes.
-     */
-    nutritionProvenance: 'source_backed';
-}
-
-/**
- * One row of the swap alternatives list.
- *
- * Deliberately minimal, and structurally identical to `SwapAlternative` in
- * `types/mealPlanning.ts`: the screen shows a name, a meta line and a chevron.
- * There are no per-row deltas here on purpose — the day's delta is the
- * preview's job, computed against the day the candidate would produce, and
- * duplicating a weaker version of it per row would invite the two to disagree.
- */
-export interface SwapAlternativeSummary {
-    recipeVersionId: string;
-    name: string;
-    iconKey: RecipeIconKey;
-    calories: number;
-    protein: number;
-    totalMinutes: number;
-    /** The portion that best fits the day with this candidate in place, as `swap.logic.ts` chose it. */
-    portionMultiplier: number;
-}
+// The planned-meal recipe projection and the swap alternatives row are
+// `MealPlanMealRecipeSummary` and `SwapAlternative`, imported above from
+// `types/mealPlanning.ts` and returned by `mapPlannedRecipeSummary` and
+// `mapSwapAlternative` below. They live there rather than here because the wire
+// shape itself belongs to `src/types/<domain>.ts` (Rule backend-architecture
+// §2), and because they are members of the plan-day and alternatives responses
+// `mealPlan.mapper.ts` and `swap.service.ts` assemble — a structurally
+// identical local copy would be a second declaration of one contract that
+// nothing compares, free to drift the moment either side gains a field, which
+// is the exact failure §6's "one shape, one mapper" exists to prevent.
+//
+// Both DTOs carry their own field-level rationale —
+// `MealPlanMealRecipeSummary` documents why `nutritionProvenance` is the single
+// `'source_backed'` literal rather than the provenance union, and
+// `SwapAlternative` why a candidate with no admissible portion is not listed at
+// all. This file documents only what the MAPPING decides, on the two functions.
 
 /* ---------------------------------------------------------------------------
  * Reading a stored column into the type the contract promises
@@ -423,7 +385,12 @@ export const mapRecipeVersion = (
     version: version.version,
     status: narrowColumn(version.status, isVersionStatus, 'status', version.id),
     name: version.name,
-    description: version.description,
+    // The nullable column meets the non-null contract here: an empty description
+    // asserts nothing and renders exactly what null rendered, which puts it on the
+    // `reps ?? 0` side of the distinction `RecipeMappingError` draws rather than the
+    // `allergenStatus ?? 'known'` side. Throwing instead would turn a legitimately
+    // description-less recipe into a 500.
+    description: version.description ?? '',
     iconKey: narrowColumn(version.icon_key, isRecipeIconKey, 'icon_key', version.id),
     instructions: readInstructions(version.instructions, version.id),
     yieldServings: version.yield_servings,
@@ -470,7 +437,7 @@ export const mapRecipeVersion = (
  * ------------------------------------------------------------------------- */
 
 /** The provenance every planned recipe has, by eligibility rather than by coincidence. */
-const PLANNED_RECIPE_PROVENANCE: PlannedRecipeSummary['nutritionProvenance'] = 'source_backed';
+const PLANNED_RECIPE_PROVENANCE: MealPlanMealRecipeSummary['nutritionProvenance'] = 'source_backed';
 
 /**
  * The recipe fields a plan card and a swap row render.
@@ -489,7 +456,7 @@ const PLANNED_RECIPE_PROVENANCE: PlannedRecipeSummary['nutritionProvenance'] = '
  * claim this product never makes. If this throws, the eligibility rule was
  * broken upstream, and that is worth a 500 rather than a quiet mislabel.
  */
-export const mapPlannedRecipeSummary = (version: RecipeVersionRow): PlannedRecipeSummary => {
+export const mapPlannedRecipeSummary = (version: RecipeVersionRow): MealPlanMealRecipeSummary => {
     if (version.nutrition_provenance !== PLANNED_RECIPE_PROVENANCE) {
         throw new RecipeMappingError(
             `planned recipe version ${version.id} has nutrition_provenance ` +
@@ -532,7 +499,7 @@ export const mapSwapAlternative = (
     version: RecipeVersionRow,
     portionMultiplier: number,
     nutrition: RecipePerServingNutrition,
-): SwapAlternativeSummary => ({
+): SwapAlternative => ({
     recipeVersionId: version.id,
     name: version.name,
     iconKey: narrowColumn(version.icon_key, isRecipeIconKey, 'icon_key', version.id),
@@ -541,4 +508,3 @@ export const mapSwapAlternative = (
     totalMinutes: version.total_minutes,
     portionMultiplier,
 });
-

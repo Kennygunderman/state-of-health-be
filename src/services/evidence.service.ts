@@ -44,9 +44,11 @@ import {
  *   6. redirects are never followed automatically, at most two are followed by
  *      hand, each re-validated and re-pinned in full, and any cross-host hop
  *      ends the fetch;
- *   7. one total deadline, a cap on the *decompressed* body enforced while
- *      streaming, an allowlisted content type checked before the body is read,
- *      and no outbound credentials of any kind.
+ *   7. one total deadline over **every** wait the retrieval performs — the name
+ *      lookups as well as the exchanges, since a deadline that bounds only the
+ *      HTTPS half is not a bound — a cap on the *decompressed* body enforced
+ *      while streaming, an allowlisted content type checked before the body is
+ *      read, and no outbound credentials of any kind.
  *
  * Remove any one of those and a known bypass class reopens.
  *
@@ -169,8 +171,21 @@ export interface EvidenceResolvedAddress {
  * Every address matters, so this returns the whole set: a name that resolves to
  * one public and one private address is a rebinding attempt, and a
  * single-address lookup would hide the private half.
+ *
+ * `signal` is the retrieval's **shared deadline signal** — the same one every
+ * request of the same retrieval is handed. It is part of the seam because name
+ * resolution is I/O like any other: a resolver that never answers would
+ * otherwise hold the operation past the total timeout with no bound at all,
+ * which is the one failure mode a deadline exists to prevent (Agent Action Plan
+ * §0.3.2, "10 s total timeout"). The service additionally *races* every lookup
+ * against that deadline (see `lookupWithinDeadline`), so the bound holds even
+ * for a resolver that ignores the signal — which the real one does, because
+ * Node's `getaddrinfo` path takes no signal at all.
  */
-export type EvidenceHostLookup = (host: string) => Promise<readonly EvidenceResolvedAddress[]>;
+export type EvidenceHostLookup = (
+    host: string,
+    signal: AbortSignal,
+) => Promise<readonly EvidenceResolvedAddress[]>;
 
 /** Response headers as a transport reports them, shaped like `IncomingHttpHeaders`. */
 export type EvidenceResponseHeaders = Readonly<Record<string, string | readonly string[] | undefined>>;
@@ -255,7 +270,27 @@ export type EvidenceFetchResult =
 // The real implementations of the three seams.
 // ---------------------------------------------------------------------------
 
-/** `dns.promises.lookup` with `all: true`, which is the only form allowed here. */
+/**
+ * `dns.promises.lookup` with `all: true`, which is the only form allowed here.
+ *
+ * It takes the host and **nothing else**: `dns.promises.lookup` accepts no
+ * `AbortSignal`, because it is a thin wrapper over libuv's threadpool
+ * `getaddrinfo`, and a `getaddrinfo` already in flight cannot be cancelled. The
+ * seam's signal is therefore deliberately not forwarded — forwarding it would
+ * imply a cancellation this resolver cannot perform. For the real resolver the
+ * bound is the *race* in `lookupWithinDeadline`: the retrieval stops waiting
+ * when the deadline elapses and refuses, while the abandoned `getaddrinfo`
+ * finishes in the threadpool on its own and its answer is discarded. That is
+ * the honest statement of the guarantee — the operation is bounded, the syscall
+ * is not.
+ *
+ * `dns.Resolver` *would* accept a cancel, and is still not used: it queries
+ * configured nameservers directly, skipping the hosts file and the system's
+ * address-ordering rules (including the `ipv4first` order `server.ts` sets for
+ * this VPS), so it would change which addresses are classified and dialled.
+ * Changing resolution semantics to buy a cancel is a worse trade than an
+ * abandoned lookup, and the address policy is what this module protects.
+ */
 export const defaultEvidenceLookup: EvidenceHostLookup = (host: string) => dnsPromises.lookup(host, { all: true });
 
 export const defaultEvidenceClock: EvidenceClock = {
@@ -644,6 +679,85 @@ type PinOutcome =
           readonly error: EvidenceError | null;
       };
 
+/**
+ * What one bounded lookup produced: an answer, a failure, or nothing at all
+ * because the budget ran out first.
+ *
+ * Three outcomes rather than a promise that may reject, because "the resolver
+ * failed" and "we stopped waiting for the resolver" are different verdicts —
+ * `unresolvable_host` against the candidate versus `fetch_timeout` against the
+ * retrieval — and a caller that cannot tell them apart reports the wrong one.
+ */
+type LookupOutcome =
+    | { readonly kind: 'answered'; readonly answers: readonly EvidenceResolvedAddress[] }
+    | { readonly kind: 'failed'; readonly error: unknown }
+    | { readonly kind: 'deadline_elapsed' };
+
+/**
+ * Resolves a host **under the shared deadline**, by racing the resolver against
+ * the deadline's abort.
+ *
+ * The deadline is the bound on the whole retrieval, and a bound that only
+ * covers the HTTPS exchange is not one: a name lookup is the first I/O of every
+ * hop, so a resolver that never settles — a black-holed nameserver, a resolver
+ * process wedged in the threadpool — would hold the operation open forever
+ * while the timeout that was supposed to stop it sat armed and ineffective
+ * (§0.3.2's "10 s total timeout"; CWE-400). The signal is passed to the seam as
+ * well as raced, so a resolver that *can* be cancelled is, and one that cannot
+ * is still abandoned on time.
+ *
+ * Three details are load-bearing:
+ *
+ *  1. The abort listener is **removed** when the lookup wins the race. One
+ *     retrieval may resolve up to three times against one signal, and a
+ *     listener left attached per hop holds its promise's resolve function until
+ *     the signal itself is collected.
+ *  2. The resolver's promise is observed **exactly once**, by a handler that
+ *     converts both settlements into values. It can therefore never reject, so
+ *     the timeout path below can abandon it with no possibility of a late
+ *     failure surfacing as an unhandled rejection — which in an offline catalog
+ *     script is a process exit mid-run, not a logged warning.
+ *  3. An already-elapsed budget short-circuits **before** the resolver is
+ *     called, so a spent retrieval issues no DNS query at all.
+ */
+const lookupWithinDeadline = (
+    host: string,
+    lookup: EvidenceHostLookup,
+    deadline: Deadline,
+): Promise<LookupOutcome> => {
+    if (deadline.signal.aborted) {
+        return Promise.resolve<LookupOutcome>({ kind: 'deadline_elapsed' });
+    }
+
+    const settlement: Promise<LookupOutcome> = (async (): Promise<LookupOutcome> => {
+        try {
+            return { kind: 'answered', answers: await lookup(host, deadline.signal) };
+        } catch (error) {
+            return { kind: 'failed', error };
+        }
+    })();
+
+    let onAbort: (() => void) | null = null;
+
+    const elapsed = new Promise<LookupOutcome>((resolve) => {
+        onAbort = (): void => resolve({ kind: 'deadline_elapsed' });
+
+        if (deadline.signal.aborted) {
+            onAbort();
+            return;
+        }
+
+        deadline.signal.addEventListener('abort', onAbort, { once: true });
+    });
+
+    return Promise.race([settlement, elapsed]).then((outcome) => {
+        if (onAbort !== null) {
+            deadline.signal.removeEventListener('abort', onAbort);
+        }
+        return outcome;
+    });
+};
+
 /** One answer's address, or `null` when the answer is not an address at all. */
 const readResolvedAddress = (entry: unknown): string | null => {
     if (entry === null || typeof entry !== 'object') {
@@ -655,16 +769,38 @@ const readResolvedAddress = (entry: unknown): string | null => {
 };
 
 /**
- * Resolves the host, classifies the **whole** answer set, and pins one address.
+ * The refusal for a retrieval whose budget is gone, taken through the same
+ * `transportFailure` machinery the HTTPS path uses.
  *
- * Three properties, in order, and all three fail closed. An answer that is not an
- * address is refused rather than skipped, because skipping it would classify a
- * subset and call that a pass. The set is judged by `evidence.logic.ts`, where an
- * empty answer is a rejection and one bad member fails every member. The pinned
- * address is the resolver's own string, never a re-rendered one — classifying one
- * spelling and dialling another is the confusion this whole module exists to
- * avoid — and its family comes from the policy module's parser rather than from
- * the resolver's own claim about it.
+ * Deliberately not a reason code or a message of its own: a caller counting
+ * causes must see one `fetch_timeout` whether the budget expired waiting on a
+ * resolver or waiting on a socket, because it is one bound being enforced. The
+ * signal's own abort reason is handed in as the cause, so the wrapped error
+ * names what stopped the wait rather than inventing a description of it.
+ */
+const deadlineElapsedPin = (deadline: Deadline): PinOutcome => {
+    const failure = transportFailure(deadline.signal.reason, deadline);
+    return { ok: false, reason: failure.reason, detail: failure.detail, error: failure.error };
+};
+
+/**
+ * Resolves the host **within the deadline**, classifies the **whole** answer
+ * set, and pins one address.
+ *
+ * Four properties, in order, and all four fail closed. Resolution is bounded by
+ * the shared deadline rather than merely attempted under it, and the budget is
+ * checked **again** once the resolver has answered: a lookup that consumed the
+ * entire ten seconds and then succeeded must not be followed by a connection,
+ * because the retrieval it belongs to is already over — and every address
+ * verdict it just produced was taken from an answer that has had the whole
+ * budget to go stale. An answer that is not an address is refused rather than
+ * skipped, because skipping it would classify a subset and call that a pass.
+ * The set is judged by `evidence.logic.ts`, where an empty answer is a rejection
+ * and one bad member fails every member. The pinned address is the resolver's
+ * own string, never a re-rendered one — classifying one spelling and dialling
+ * another is the confusion this whole module exists to avoid — and its family
+ * comes from the policy module's parser rather than from the resolver's own
+ * claim about it.
  */
 const resolveAndPin = async (
     host: string,
@@ -672,17 +808,31 @@ const resolveAndPin = async (
     lookup: EvidenceHostLookup,
     deadline: Deadline,
 ): Promise<PinOutcome> => {
-    let answers: readonly EvidenceResolvedAddress[];
-    try {
-        answers = await lookup(host);
-    } catch (error) {
-        if (deadline.expired() || isAbortError(error)) {
-            const failure = transportFailure(error, deadline);
+    const resolved = await lookupWithinDeadline(host, lookup, deadline);
+
+    if (resolved.kind === 'deadline_elapsed') {
+        return deadlineElapsedPin(deadline);
+    }
+
+    if (resolved.kind === 'failed') {
+        if (deadline.expired() || isAbortError(resolved.error)) {
+            const failure = transportFailure(resolved.error, deadline);
             return { ok: false, reason: failure.reason, detail: failure.detail, error: failure.error };
         }
-        const detail = `the evidence host could not be resolved: ${errorMessage(error)}`;
+        const detail = `the evidence host could not be resolved: ${errorMessage(resolved.error)}`;
         return { ok: false, reason: 'unresolvable_host', detail, error: new EvidenceError('unresolvable_host', detail) };
     }
+
+    // The resolver answered, but answering is not the same as answering in
+    // time: the race above only ends a wait, and a lookup that settled on the
+    // very tick the deadline fired settles legitimately. Re-checking here is
+    // what stops a spent retrieval from opening a socket it no longer has a
+    // budget for, and it is the last check before one is opened.
+    if (deadline.expired()) {
+        return deadlineElapsedPin(deadline);
+    }
+
+    const answers: readonly EvidenceResolvedAddress[] = resolved.answers;
 
     if (!Array.isArray(answers)) {
         return {
@@ -923,10 +1073,24 @@ export const fetchEvidence = async (
             return {
                 ok: true,
                 record: {
-                    // The URL is the normalized one the candidate proposed, which
-                    // stays the retrieval's identity across a same-host redirect;
-                    // `finalHost` is the host that actually served these bytes.
-                    url: approved.url,
+                    // The URL that SERVED these bytes, which after a same-host
+                    // redirect is the hop's target and not the string the model
+                    // proposed. The record is audit evidence: its hash, its
+                    // snippet and its status all came from this response, so
+                    // naming any other URL beside them would attribute them to
+                    // a location that did not produce them — and a reviewer
+                    // re-fetching the recorded URL to check the hash would be
+                    // re-fetching a redirect. With no redirect the two strings
+                    // are identical (`target` starts as `approved`), so nothing
+                    // about the common case changes.
+                    //
+                    // There is no second field for the proposed URL, and the
+                    // record keeps exactly the six fields §0.3.2 lists (URL,
+                    // final host, status, body SHA-256, matched snippet,
+                    // fetched-at). The proposal is already held upstream by the
+                    // generation candidate that made it, so adding it here
+                    // would duplicate it into the stored contract for nothing.
+                    url: target.url,
                     finalHost: target.host,
                     status: response.status,
                     bodySha256: createHash('sha256').update(body.bytes).digest('hex'),

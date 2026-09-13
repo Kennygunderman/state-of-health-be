@@ -1,5 +1,6 @@
 import { BrandedFoodResponse } from '../types/nutrition';
 import { prisma } from '../prisma/client';
+import { parseCanonicalFdcId } from './catalog.logic';
 
 // USDA FoodData Central (public domain — no retention restrictions, so the
 // snapshot-at-log-time model is fully legal for this data source).
@@ -110,20 +111,14 @@ export const cacheKeyFor = (path: string, params: Record<string, string>): strin
 // An FDC id names one specific USDA record, so only a canonical representation
 // of it is accepted: `Number()` coercion would read '0x10' as 16, '1e3' as
 // 1000 and '9007199254740993' as ...992, each of which fetches and caches a
-// different food than the manifest text names. A number must already be a safe
-// positive integer; a string must be decimal digits with no leading zero, sign,
-// exponent or fraction. Everything else — including a nested array whose
-// String() happens to look numeric — is rejected.
-const parseFdcId = (value: unknown): number | null => {
-    if (typeof value === 'number') {
-        return Number.isSafeInteger(value) && value > 0 ? value : null;
-    }
-    if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value.trim())) {
-        return null;
-    }
-    const parsed = Number(value.trim());
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
-};
+// different food than the manifest text names.
+//
+// The rule itself is `parseCanonicalFdcId` in the pure catalog decision layer,
+// imported rather than restated here. This module's cache key and
+// `catalog_foods.source_key` are two views of one identity — the catalog keys
+// every imported row on `usda:<fdcId>` — so a second parser that drifted from
+// this one by a single accepted form would file a fetched food under the wrong
+// key. One function, one contract, asserted from both sides.
 
 // FDC ids are positive integers, so the same set in any order — or carrying a
 // duplicate — must address one cached row and send one request, while a
@@ -133,7 +128,7 @@ const parseFdcId = (value: unknown): number | null => {
 export const normalizeFdcIds = (fdcIds: ReadonlyArray<string | number>): number[] => {
     const unique = new Set<number>();
     for (const fdcId of fdcIds) {
-        const parsed = parseFdcId(fdcId);
+        const parsed = parseCanonicalFdcId(fdcId);
         if (parsed === null) {
             throw new UsdaError(`Invalid USDA FDC id: ${String(fdcId)}`);
         }
@@ -502,7 +497,7 @@ const toIdentifiedRecord = <T extends UsdaFoodSummary>(row: unknown, context: st
         throw new UsdaError(`USDA ${context} returned a record that is not an object`);
     }
     const record = row as Record<string, unknown>;
-    const fdcId = parseFdcId(record.fdcId);
+    const fdcId = parseCanonicalFdcId(record.fdcId);
     if (fdcId === null) {
         throw new UsdaError(`USDA ${context} returned a record with an invalid fdcId: ${String(record.fdcId)}`);
     }

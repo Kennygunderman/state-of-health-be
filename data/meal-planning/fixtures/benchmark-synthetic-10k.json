@@ -1,0 +1,1625 @@
+{
+  "fixtureVersion": "v1",
+  "description": "A deterministic specification of a 10,000-food synthetic catalog corpus for the search-mechanics suite named in consumedBy (Agent Action Plan sections 0.3.3 and 0.9.2). This file is a corpus SPECIFICATION, not 10,000 literal rows: it declares three short part lists and the rules that turn a zero-based row index into one catalog_foods row, and the suite expands them in memory into exactly expectedCorpusSize distinct foods. Those rows are about 8.7 MB of compact JSON and 11 MB formatted, which no reviewer could read for determinism and no diff could show a meaningful change in, and strict JSON gives such an array nowhere to carry the reasoning; three word lists whose lengths multiply to 10,000 can be checked in a minute and hand-expanded for any row. KEY STYLE IS DELIBERATELY SPLIT AND MUST NOT BE UNIFIED: this document's own configuration keys are camelCase, matching every other document under data/meal-planning/ and letting one test helper read a query entry from either this file or search-benchmark.v1.json, while the per-row field names inside generation.rowDerivation, generation.workedExamples, aliases, portions and unpublishedRows are the snake_case catalog_foods, catalog_food_aliases and catalog_food_portions COLUMN names, because those are the columns the expansion writes. A key in one of those blocks is a column; a key outside them is configuration.",
+  "consumedBy": "src/__tests__/api/benchmark.test.ts",
+  "expansionOwner": "The expander lives in the consuming suite, not in scripts/search-benchmark.ts. That script is the ACCEPTANCE runner: it measures the loaded v1 release and must stay unable to pass, fail or warn on account of this fixture, so it neither reads nor mentions this path.",
+  "acceptanceStatus": "NON-ACCEPTANCE EVIDENCE. Nothing measured over this corpus is a statement about search quality, and a green mechanics run must never be reported as one. What such a run proves is that the harness computes ranks, page sequences, totals and zero-result outcomes correctly over a corpus whose right answers are known by construction; it cannot prove that a person looking for a real food finds it, because every food here is invented. Search-quality acceptance is the operator-run npm run search:benchmark against the loaded v1 catalog release under the protocol in Agent Action Plan section 0.9.3, and the thresholds in data/meal-planning/search-benchmark.v1.json are asserted by that run alone. This file consequently states no hit-rate threshold and no latency threshold: a hit rate over invented foods measures nothing, and latency is a property of the host, the PostgreSQL build and the cache state, which section 0.9.3 assigns to the operator run and its reported conditions. The only expectations recorded here are the structural ones in mechanicsExpectations, and they are exact because they are derived from the composition rules rather than measured.",
+  "nonAcceptanceCrossReference": "data/meal-planning/search-benchmark.v1.json -> nonAcceptanceSuite names this file, its consuming suite and its standing; this acceptanceStatus is the other half of that cross-reference. The two files must keep agreeing: if one is edited to claim this corpus carries acceptance weight, the other contradicts it.",
+  "syntheticDataNotice": "Every food, name, alias, number and portion in this corpus is invented. No token in the part lists is a real food name, and not one of them occurs anywhere in the accepted catalog's own names, search texts or aliases — which is deliberate twice over: the corpus can never be mistaken for catalog data, and a query written against it cannot accidentally match a real food if the two sets were ever loaded into one database. The nutrient values are arithmetically self-consistent but describe no food that exists, so they are not nutrition evidence and must never be loaded into a release, a development database or a production database. These rows also never pass through scripts/catalog-validate.ts, and validation would quarantine them on sight — identity_status is unsourced and no identity evidence exists for an invented food — which is precisely why this corpus cannot become catalog data by accident.",
+  "determinism": "No value in this file or in its expansion depends on the clock, a random source, an environment variable, the database or the order in which rows are inserted. Every field of row i is a pure function of i and the part lists below: names by string concatenation, nutrients by integer arithmetic on tenths followed by one division by 10 (an exactly-rounded IEEE-754 operation, so the same double everywhere), imported_at by a fixed timestamp, and source_key by zero-padded decimal formatting of i. Database-assigned ids appear nowhere: every expectation names a food by its derived source_key, as expectationResolution records. Two independent expansions are therefore byte-identical, which is what makes an exact page sequence assertable at all.",
+  "secretsPolicy": "This file holds no credential of any kind — no API key, no token, no authorization header value, no database connection string and no URL carrying credentials — and no real email address, personal name or other personal datum. It must never gain one. There is nothing to authenticate here: the corpus is generated in process by the suite and reaches no vendor, so not even an environment-variable name appears.",
+  "readingGuide": {
+    "howToVerifyTheSize": "Multiply the three part-list lengths: generation.bases has 25 entries, generation.preparations 20 and generation.descriptors 20, and 25 x 20 x 20 = 10000 = expectedCorpusSize. generation.partListProduct states the same product so a reviewer and the expander check each other; the expander asserts it before expanding anything.",
+    "howToHandDeriveARow": "Take the row index, split it with generation.indexDecomposition, read the three tokens off the part lists, then apply generation.rowDerivation field by field. generation.workedExamples does exactly that for row 0 and row 9999 and prints the resulting columns, so a reviewer can check the rules against two known answers without running anything.",
+    "columnNaming": "snake_case keys are database columns and camelCase keys are configuration; see description. Nothing in this file is a wire DTO, so no camelCase response shape appears — the mapper that produces those is the code under test, not fixture data.",
+    "tokenVocabulary": "Five disjoint token vocabularies do five different jobs. A base word, a preparation and a descriptor build the canonical name. A searchWord is appended to search_text and appears in no name, so it is reachable only through the food's own search_vector. An aliasWord heads the generated alias row and appears in no search_text, so it is reachable only through the alias contribution. vocabularyRules states the disjointness the expander asserts, and why each of its clauses is load-bearing.",
+    "whyEveryRankTies": "Every row carries exactly four distinct lexemes at frequency one — three name tokens plus the searchWord — and every generated alias exactly three. Because the vocabularies are disjoint after stemming, a query term can occur at most once per document, so ts_rank returns the same value for every member of a single-term match set and the ordering is decided entirely by display_name ASC then source_key ASC. That is the property that makes a page sequence hand-derivable, and it is also the sharpest test available for the tiebreakers: a ranking that silently fell back to a database id would reorder these pages immediately.",
+    "expectedSemantics": "expected lists the COMPLETE ordered match set when the set holds 20 rows or fewer, and otherwise the first 5 source keys of the ordered match set — which are the first 5 ids of page 1 at limit 25. In both cases the order is the documented one (rank, then display_name ASC, then source_key ASC), so expected is an ordering assertion and not only a membership one. An empty expected means the query must return no rows at all, which this fixture states for three different causes; unlike the acceptance query set, where a zero-result query would be unscoreable, the zero-result path is itself a mechanic here and is pinned deliberately. matchSetSizes carries the exact size of every match set, including the ones expected truncates.",
+    "publishedFilterRows": "unpublishedRows are the only rows in this file that are not part of the generated corpus. They exist so the publication filter is exercised rather than assumed, and they carry no portion row on purpose: search filters them out before the portion lookup, so if the filter ever regressed the mapper would raise CatalogMappingError for a food with no default portion and the regression would be loud instead of silent."
+  },
+  "expectedCorpusSize": 10000,
+  "expectedUnpublishedRowCount": 4,
+  "expectedTableRowCount": 10004,
+  "expectedAliasRowCount": 10004,
+  "expectedPortionRowCount": 10000,
+  "expectationResolution": "sourceKey",
+  "sourceKeyFormat": {
+    "generated": "synthetic-bench10k:<rowIndex zero-padded to 5 digits>",
+    "range": [
+      "synthetic-bench10k:00000",
+      "synthetic-bench10k:09999"
+    ],
+    "unpublished": "synthetic-bench10k:u<4-digit ordinal>, starting at u0001",
+    "collisionPolicy": "The prefix is synthetic-bench10k: and nothing else in the system mints that prefix. A real release key is usda:<fdcId> or ai:<category>:<normalized canonical name>:<food_state>, so no generated key here can collide with one or be mistaken for one, in a database or in a report. The word synthetic is in the key itself because a source_key is the identifier that travels into reports, grocery rows and diary entries, where the file it came from is no longer visible.",
+    "paddingRationale": "The five digits are fixed width so that lexicographic order equals numeric order. The final ordering key of catalog search is source_key ASC, so without the padding the tiebreaker would put row 10 before row 2 and no page sequence could be hand-derived."
+  },
+  "generation": {
+    "rule": "The corpus is the full cross product of the three part lists: every base word, in every preparation, in every descriptor. One row per combination, no combination omitted and none repeated, which is why the product of the list lengths is exactly the corpus size.",
+    "partListProduct": "25 bases x 20 preparations x 20 descriptors = 10000",
+    "rowIndexRange": [
+      0,
+      9999
+    ],
+    "indexDecomposition": {
+      "baseIndex": "floor(rowIndex / 400)",
+      "preparationIndex": "floor((rowIndex mod 400) / 20)",
+      "descriptorIndex": "rowIndex mod 20",
+      "inverse": "rowIndex = 400 x baseIndex + 20 x preparationIndex + descriptorIndex",
+      "note": "Mixed radix, most significant digit first: 400 = 20 x 20 is the number of rows one base contributes. The descriptor is the fastest-moving part, so rows 0 to 19 are one base and one preparation across all twenty descriptors."
+    },
+    "rowDerivation": {
+      "source_key": "'synthetic-bench10k:' followed by rowIndex zero-padded to 5 digits",
+      "canonical_name": "bases[baseIndex].word, preparations[preparationIndex] and descriptors[descriptorIndex] joined by single spaces. Every token is already lowercase, so the canonical form needs no normalisation.",
+      "display_name": "canonical_name with its first character uppercased and nothing else changed, which is the release's own convention (canonical pretzels, display Pretzels).",
+      "category": "bases[baseIndex].category",
+      "food_state": "bases[baseIndex].food_state",
+      "food_group": "bases[baseIndex].food_group",
+      "publication_status": "'published' for every generated row; see unpublishedRows for the rest",
+      "nutrition_basis": "bases[baseIndex].nutrition_basis",
+      "basis_amount": "100, for both per_100g and per_100ml",
+      "density_g_per_ml": "bases[baseIndex].density_g_per_ml — null on a per_100g base and a number on a per_100ml one, because a volume basis without a density cannot be converted to grams",
+      "protein_g": "(bases[baseIndex].proteinTenths + descriptorIndex) / 10",
+      "carbs_g": "(bases[baseIndex].carbsTenths + preparationIndex) / 10",
+      "fat_g": "bases[baseIndex].fatTenths / 10",
+      "calories": "(4 x (proteinTenths + descriptorIndex) + 4 x (carbsTenths + preparationIndex) + 9 x fatTenths) / 10",
+      "fiber_g": "bases[baseIndex].fiberTenths / 10, or null where the base declares null. Fibre is the one nutrient the response allows to be unknown, so some bases declare it unknown and the null path is exercised rather than assumed.",
+      "search_text": "canonical_name followed by a space and bases[baseIndex].searchWord. Four tokens: the three the name carries plus one it does not.",
+      "allergen_tags": "bases[baseIndex].allergen_tags",
+      "diet_tags": "bases[baseIndex].diet_tags",
+      "is_common_dislike": "bases[baseIndex].is_common_dislike",
+      "cost_class": "bases[baseIndex].cost_class"
+    },
+    "nutrientArithmetic": "Nutrients are declared as integer TENTHS of a gram and divided by 10 once, at the end. Two reasons, both load-bearing. Determinism: integer addition and multiplication are exact and a single IEEE-754 division is exactly rounded, so two expanders in two languages produce the same doubles and the same JSON, while accumulating 0.1 nineteen times would not. Consistency: calories are COMPUTED from the macros at 4/4/9 rather than declared beside them, so no row can fail an energy-macro cross-check and no reviewer has to check 10,000 of them. The per-row modifiers move protein by descriptorIndex tenths and carbohydrate by preparationIndex tenths, so the 400 rows of one base are nutritionally distinct and every value stays inside the bounds constraints.nutritionBounds names.",
+    "fixedColumns": {
+      "identity_source": "ai_generated",
+      "identity_status": "unsourced",
+      "nutrition_provenance": "ai_estimated",
+      "allergen_status": "unknown",
+      "nutrition_version": 1,
+      "metadata_version": 1,
+      "imported_at": "2026-09-12T00:00:00.000Z",
+      "rationale": "The four text constants are the weakest claim the closed sets in src/types/catalog.ts allow, which is the honest choice for invented data: unsourced identity, estimated nutrition, unknown allergens. identity_source has only two legal values, usda and ai_generated, and the mapper narrows the column and raises CatalogMappingError on anything else, so an invented value such as 'synthetic' is not available however well it would describe these rows — the synthetic-bench10k source_key prefix and this file carry that meaning instead. imported_at is a fixed timestamp because a clock read would break determinism, and the two version integers are 1 because nothing in a corpus generated from a specification has ever been revised."
+    },
+    "nullColumns": {
+      "columns": [
+        "usda_fdc_id",
+        "usda_data_type",
+        "usda_description",
+        "source_version",
+        "source_cache_key",
+        "generation_batch_id"
+      ],
+      "rationale": "Every generated row leaves these null. usda_fdc_id must be null because it carries a UNIQUE index and no invented id may look like an FDC id; the other four would each be a false provenance claim; and generation_batch_id is a foreign key to catalog_generation_batches, so leaving it null keeps the expansion insertable without a batch row."
+    },
+    "bases": [
+      {
+        "baseIndex": 0,
+        "word": "zentil",
+        "searchWord": "bofka",
+        "aliasWord": "murnix",
+        "food_state": "dry",
+        "category": "legume",
+        "food_group": "lentil",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 240,
+        "carbsTenths": 600,
+        "fatTenths": 11,
+        "fiberTenths": 108,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 50,
+        "portionUnit": "g",
+        "portionGramWeight": 50
+      },
+      {
+        "baseIndex": 1,
+        "word": "marnip",
+        "searchWord": "tulvex",
+        "aliasWord": "pendric",
+        "food_state": "raw",
+        "category": "produce_vegetable",
+        "food_group": "root_vegetable",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 12,
+        "carbsTenths": 65,
+        "fatTenths": 2,
+        "fiberTenths": 25,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": true,
+        "portionAmount": 85,
+        "portionUnit": "g",
+        "portionGramWeight": 85
+      },
+      {
+        "baseIndex": 2,
+        "word": "quibbin",
+        "searchWord": "lorvax",
+        "aliasWord": "settimo",
+        "food_state": "raw",
+        "category": "produce_fruit",
+        "food_group": "berry",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 7,
+        "carbsTenths": 120,
+        "fatTenths": 3,
+        "fiberTenths": 20,
+        "cost_class": 2,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 72,
+        "portionUnit": "g",
+        "portionGramWeight": 72
+      },
+      {
+        "baseIndex": 3,
+        "word": "vorlan",
+        "searchWord": "jindek",
+        "aliasWord": "kabrose",
+        "food_state": "raw",
+        "category": "protein_meat",
+        "food_group": "beef",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 205,
+        "carbsTenths": 0,
+        "fatTenths": 100,
+        "fiberTenths": null,
+        "cost_class": 3,
+        "allergen_tags": [],
+        "diet_tags": [],
+        "is_common_dislike": false,
+        "portionAmount": 113,
+        "portionUnit": "g",
+        "portionGramWeight": 113
+      },
+      {
+        "baseIndex": 4,
+        "word": "druskin",
+        "searchWord": "weltoq",
+        "aliasWord": "nabriel",
+        "food_state": "raw",
+        "category": "protein_poultry",
+        "food_group": "chicken",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 220,
+        "carbsTenths": 0,
+        "fatTenths": 36,
+        "fiberTenths": null,
+        "cost_class": 2,
+        "allergen_tags": [],
+        "diet_tags": [],
+        "is_common_dislike": false,
+        "portionAmount": 120,
+        "portionUnit": "g",
+        "portionGramWeight": 120
+      },
+      {
+        "baseIndex": 5,
+        "word": "talvish",
+        "searchWord": "ordumek",
+        "aliasWord": "phellin",
+        "food_state": "raw",
+        "category": "protein_seafood",
+        "food_group": "white_fish",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 200,
+        "carbsTenths": 0,
+        "fatTenths": 45,
+        "fiberTenths": null,
+        "cost_class": 3,
+        "allergen_tags": [
+          "fish"
+        ],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 140,
+        "portionUnit": "g",
+        "portionGramWeight": 140
+      },
+      {
+        "baseIndex": 6,
+        "word": "emberoot",
+        "searchWord": "yafquin",
+        "aliasWord": "clindor",
+        "food_state": "cooked",
+        "category": "produce_vegetable",
+        "food_group": "squash",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 15,
+        "carbsTenths": 90,
+        "fatTenths": 2,
+        "fiberTenths": 28,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 145,
+        "portionUnit": "g",
+        "portionGramWeight": 145
+      },
+      {
+        "baseIndex": 7,
+        "word": "kalvorn",
+        "searchWord": "zibrado",
+        "aliasWord": "tesmuno",
+        "food_state": "dry",
+        "category": "grain",
+        "food_group": "rice",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 70,
+        "carbsTenths": 780,
+        "fatTenths": 6,
+        "fiberTenths": 14,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 45,
+        "portionUnit": "g",
+        "portionGramWeight": 45
+      },
+      {
+        "baseIndex": 8,
+        "word": "pindrel",
+        "searchWord": "ufmarel",
+        "aliasWord": "gholvit",
+        "food_state": "as_purchased",
+        "category": "bread_bakery",
+        "food_group": "bread_leavened",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 90,
+        "carbsTenths": 490,
+        "fatTenths": 32,
+        "fiberTenths": 27,
+        "cost_class": 1,
+        "allergen_tags": [
+          "wheat"
+        ],
+        "diet_tags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 40,
+        "portionUnit": "g",
+        "portionGramWeight": 40
+      },
+      {
+        "baseIndex": 9,
+        "word": "sorbeth",
+        "searchWord": "lacquin",
+        "aliasWord": "vundrel",
+        "food_state": "as_purchased",
+        "category": "dairy",
+        "food_group": "cheese",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 250,
+        "carbsTenths": 13,
+        "fatTenths": 330,
+        "fiberTenths": null,
+        "cost_class": 2,
+        "allergen_tags": [
+          "milk"
+        ],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 28,
+        "portionUnit": "g",
+        "portionGramWeight": 28
+      },
+      {
+        "baseIndex": 10,
+        "word": "nuvelle",
+        "searchWord": "tirfado",
+        "aliasWord": "oskalem",
+        "food_state": "as_purchased",
+        "category": "dairy_alternative",
+        "food_group": "soy_milk",
+        "nutrition_basis": "per_100ml",
+        "density_g_per_ml": 1,
+        "proteinTenths": 30,
+        "carbsTenths": 60,
+        "fatTenths": 20,
+        "fiberTenths": 4,
+        "cost_class": 2,
+        "allergen_tags": [
+          "soy"
+        ],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 240,
+        "portionUnit": "ml",
+        "portionGramWeight": 240
+      },
+      {
+        "baseIndex": 11,
+        "word": "grindal",
+        "searchWord": "mepsoru",
+        "aliasWord": "wafnile",
+        "food_state": "raw",
+        "category": "nut_seed",
+        "food_group": "almond",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 210,
+        "carbsTenths": 216,
+        "fatTenths": 500,
+        "fiberTenths": 125,
+        "cost_class": 3,
+        "allergen_tags": [
+          "tree_nuts"
+        ],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 28,
+        "portionUnit": "g",
+        "portionGramWeight": 28
+      },
+      {
+        "baseIndex": 12,
+        "word": "lomberry",
+        "searchWord": "xanduke",
+        "aliasWord": "jotrelm",
+        "food_state": "raw",
+        "category": "produce_fruit",
+        "food_group": "stone_fruit",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 9,
+        "carbsTenths": 98,
+        "fatTenths": 5,
+        "fiberTenths": 24,
+        "cost_class": 2,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 95,
+        "portionUnit": "g",
+        "portionGramWeight": 95
+      },
+      {
+        "baseIndex": 13,
+        "word": "vaspran",
+        "searchWord": "cufmoli",
+        "aliasWord": "relvatu",
+        "food_state": "cooked",
+        "category": "protein_egg",
+        "food_group": "chicken_egg",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 126,
+        "carbsTenths": 11,
+        "fatTenths": 106,
+        "fiberTenths": null,
+        "cost_class": 1,
+        "allergen_tags": [
+          "eggs"
+        ],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 50,
+        "portionUnit": "g",
+        "portionGramWeight": 50
+      },
+      {
+        "baseIndex": 14,
+        "word": "turmeld",
+        "searchWord": "povrike",
+        "aliasWord": "yandrel",
+        "food_state": "dry",
+        "category": "spice_herb",
+        "food_group": "spice_other",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 95,
+        "carbsTenths": 600,
+        "fatTenths": 100,
+        "fiberTenths": 210,
+        "cost_class": 2,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": true,
+        "portionAmount": 2,
+        "portionUnit": "g",
+        "portionGramWeight": 2
+      },
+      {
+        "baseIndex": 15,
+        "word": "chalvet",
+        "searchWord": "nesquil",
+        "aliasWord": "dromvek",
+        "food_state": "as_purchased",
+        "category": "condiment_sauce",
+        "food_group": "condiment_other",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 10,
+        "carbsTenths": 150,
+        "fatTenths": 5,
+        "fiberTenths": 8,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 15,
+        "portionUnit": "g",
+        "portionGramWeight": 15
+      },
+      {
+        "baseIndex": 16,
+        "word": "brindow",
+        "searchWord": "kuvaros",
+        "aliasWord": "felmirt",
+        "food_state": "as_purchased",
+        "category": "beverage",
+        "food_group": "juice",
+        "nutrition_basis": "per_100ml",
+        "density_g_per_ml": 1,
+        "proteinTenths": 5,
+        "carbsTenths": 110,
+        "fatTenths": 1,
+        "fiberTenths": 2,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 250,
+        "portionUnit": "ml",
+        "portionGramWeight": 250
+      },
+      {
+        "baseIndex": 17,
+        "word": "snarlet",
+        "searchWord": "ovmurek",
+        "aliasWord": "batildo",
+        "food_state": "as_purchased",
+        "category": "snack",
+        "food_group": "potato_chip",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 65,
+        "carbsTenths": 530,
+        "fatTenths": 300,
+        "fiberTenths": 42,
+        "cost_class": 2,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 28,
+        "portionUnit": "g",
+        "portionGramWeight": 28
+      },
+      {
+        "baseIndex": 18,
+        "word": "dovrel",
+        "searchWord": "yelstro",
+        "aliasWord": "nomparic",
+        "food_state": "as_purchased",
+        "category": "sweet",
+        "food_group": "candy",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 20,
+        "carbsTenths": 830,
+        "fatTenths": 10,
+        "fiberTenths": 0,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 40,
+        "portionUnit": "g",
+        "portionGramWeight": 40
+      },
+      {
+        "baseIndex": 19,
+        "word": "palmence",
+        "searchWord": "zorluda",
+        "aliasWord": "hectiva",
+        "food_state": "as_purchased",
+        "category": "oil_fat",
+        "food_group": "vegetable_oil",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 0,
+        "carbsTenths": 0,
+        "fatTenths": 880,
+        "fiberTenths": null,
+        "cost_class": 2,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 14,
+        "portionUnit": "g",
+        "portionGramWeight": 14
+      },
+      {
+        "baseIndex": 20,
+        "word": "kestrand",
+        "searchWord": "dilquano",
+        "aliasWord": "poshtrel",
+        "food_state": "prepared",
+        "category": "prepared_meal",
+        "food_group": "soup",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 80,
+        "carbsTenths": 200,
+        "fatTenths": 60,
+        "fiberTenths": 20,
+        "cost_class": 2,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 245,
+        "portionUnit": "g",
+        "portionGramWeight": 245
+      },
+      {
+        "baseIndex": 21,
+        "word": "yorbell",
+        "searchWord": "efmandu",
+        "aliasWord": "trulveck",
+        "food_state": "as_purchased",
+        "category": "other",
+        "food_group": "meal_replacement",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 150,
+        "carbsTenths": 400,
+        "fatTenths": 80,
+        "fiberTenths": 60,
+        "cost_class": 3,
+        "allergen_tags": [
+          "milk"
+        ],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 60,
+        "portionUnit": "g",
+        "portionGramWeight": 60
+      },
+      {
+        "baseIndex": 22,
+        "word": "flindar",
+        "searchWord": "gozmani",
+        "aliasWord": "vekturo",
+        "food_state": "dry",
+        "category": "protein_plant",
+        "food_group": "tofu",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 300,
+        "carbsTenths": 150,
+        "fatTenths": 120,
+        "fiberTenths": 30,
+        "cost_class": 2,
+        "allergen_tags": [
+          "soy"
+        ],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 85,
+        "portionUnit": "g",
+        "portionGramWeight": 85
+      },
+      {
+        "baseIndex": 23,
+        "word": "wendril",
+        "searchWord": "hastoqu",
+        "aliasWord": "jurnalix",
+        "food_state": "dry",
+        "category": "legume",
+        "food_group": "chickpea",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 230,
+        "carbsTenths": 610,
+        "fatTenths": 12,
+        "fiberTenths": 110,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 50,
+        "portionUnit": "g",
+        "portionGramWeight": 50
+      },
+      {
+        "baseIndex": 24,
+        "word": "wendril",
+        "searchWord": "hastoqu",
+        "aliasWord": "jurnalix",
+        "food_state": "cooked",
+        "category": "legume",
+        "food_group": "chickpea",
+        "nutrition_basis": "per_100g",
+        "density_g_per_ml": null,
+        "proteinTenths": 90,
+        "carbsTenths": 200,
+        "fatTenths": 4,
+        "fiberTenths": 39,
+        "cost_class": 1,
+        "allergen_tags": [],
+        "diet_tags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ],
+        "is_common_dislike": false,
+        "portionAmount": 200,
+        "portionUnit": "g",
+        "portionGramWeight": 200
+      }
+    ],
+    "preparations": [
+      "vanded",
+      "kelbed",
+      "tirsed",
+      "morvaned",
+      "delsted",
+      "quarned",
+      "fimbled",
+      "rasqued",
+      "tolvered",
+      "nusped",
+      "crimbled",
+      "dorvent",
+      "lansped",
+      "veskled",
+      "pimbred",
+      "harnoted",
+      "sulvered",
+      "obrined",
+      "wemtled",
+      "zarphed"
+    ],
+    "descriptors": [
+      "gilvic",
+      "ombral",
+      "tesken",
+      "purdane",
+      "lavrint",
+      "embisk",
+      "norvalt",
+      "sprindal",
+      "thalmic",
+      "urbeck",
+      "vantril",
+      "wrimble",
+      "xolden",
+      "yarnith",
+      "zemlic",
+      "clofted",
+      "dranvil",
+      "eskoral",
+      "folmick",
+      "grendic"
+    ],
+    "sharedWordPair": {
+      "baseIndexes": [
+        23,
+        24
+      ],
+      "word": "wendril",
+      "note": "bases[23] and bases[24] deliberately carry the same word, searchWord and aliasWord in two different food states, dry and cooked. The 400 row pairs they produce therefore share canonical_name, display_name and search_text and differ only in food_state, nutrition and source_key. That is a real catalog shape, not a trick — a dry legume and its cooked form are two foods with one name — and it buys two mechanics nothing else covers: the partial unique index on (canonical_name, food_state) WHERE published is exercised by rows that would collide without the food_state, and a pair that ties on both ts_rank and display_name forces source_key ASC, the final portable key, to be the decider."
+    },
+    "workedExamples": [
+      {
+        "rowIndex": 0,
+        "derivation": "baseIndex = floor(0 / 400) = 0; preparationIndex = floor((0 mod 400) / 20) = 0; descriptorIndex = 0 mod 20 = 0. bases[0].word = 'zentil', preparations[0] = 'vanded', descriptors[0] = 'gilvic'.",
+        "nutrientArithmetic": "proteinTenths = 240 + 0 = 240; carbsTenths = 600 + 0 = 600; fatTenths = 11; caloriesTenths = 4 x 240 + 4 x 600 + 9 x 11 = 3459.",
+        "catalog_foods": {
+          "source_key": "synthetic-bench10k:00000",
+          "canonical_name": "zentil vanded gilvic",
+          "display_name": "Zentil vanded gilvic",
+          "category": "legume",
+          "food_state": "dry",
+          "food_group": "lentil",
+          "identity_source": "ai_generated",
+          "identity_status": "unsourced",
+          "nutrition_provenance": "ai_estimated",
+          "publication_status": "published",
+          "nutrition_basis": "per_100g",
+          "basis_amount": 100,
+          "calories": 345.9,
+          "protein_g": 24,
+          "carbs_g": 60,
+          "fat_g": 1.1,
+          "fiber_g": 10.8,
+          "density_g_per_ml": null,
+          "allergen_tags": [],
+          "diet_tags": [
+            "gluten_free",
+            "pescatarian_ok",
+            "vegan",
+            "vegetarian"
+          ],
+          "is_common_dislike": false,
+          "cost_class": 1,
+          "nutrition_version": 1,
+          "metadata_version": 1,
+          "usda_fdc_id": null,
+          "usda_data_type": null,
+          "usda_description": null,
+          "source_version": null,
+          "source_cache_key": null,
+          "generation_batch_id": null,
+          "search_text": "zentil vanded gilvic bofka",
+          "imported_at": "2026-09-12T00:00:00.000Z"
+        },
+        "catalog_food_aliases": [
+          {
+            "food_source_key": "synthetic-bench10k:00000",
+            "alias": "murnix vanded gilvic"
+          }
+        ],
+        "catalog_food_portions": [
+          {
+            "food_source_key": "synthetic-bench10k:00000",
+            "description": "50 g",
+            "amount": 50,
+            "unit": "g",
+            "gram_weight": 50,
+            "is_default": true,
+            "source": "synthetic_fixture"
+          }
+        ]
+      },
+      {
+        "rowIndex": 9999,
+        "derivation": "baseIndex = floor(9999 / 400) = 24; preparationIndex = floor((9999 mod 400) / 20) = 19; descriptorIndex = 9999 mod 20 = 19. bases[24].word = 'wendril', preparations[19] = 'zarphed', descriptors[19] = 'grendic'.",
+        "nutrientArithmetic": "proteinTenths = 90 + 19 = 109; carbsTenths = 200 + 19 = 219; fatTenths = 4; caloriesTenths = 4 x 109 + 4 x 219 + 9 x 4 = 1348.",
+        "catalog_foods": {
+          "source_key": "synthetic-bench10k:09999",
+          "canonical_name": "wendril zarphed grendic",
+          "display_name": "Wendril zarphed grendic",
+          "category": "legume",
+          "food_state": "cooked",
+          "food_group": "chickpea",
+          "identity_source": "ai_generated",
+          "identity_status": "unsourced",
+          "nutrition_provenance": "ai_estimated",
+          "publication_status": "published",
+          "nutrition_basis": "per_100g",
+          "basis_amount": 100,
+          "calories": 134.8,
+          "protein_g": 10.9,
+          "carbs_g": 21.9,
+          "fat_g": 0.4,
+          "fiber_g": 3.9,
+          "density_g_per_ml": null,
+          "allergen_tags": [],
+          "diet_tags": [
+            "gluten_free",
+            "pescatarian_ok",
+            "vegan",
+            "vegetarian"
+          ],
+          "is_common_dislike": false,
+          "cost_class": 1,
+          "nutrition_version": 1,
+          "metadata_version": 1,
+          "usda_fdc_id": null,
+          "usda_data_type": null,
+          "usda_description": null,
+          "source_version": null,
+          "source_cache_key": null,
+          "generation_batch_id": null,
+          "search_text": "wendril zarphed grendic hastoqu",
+          "imported_at": "2026-09-12T00:00:00.000Z"
+        },
+        "catalog_food_aliases": [
+          {
+            "food_source_key": "synthetic-bench10k:09999",
+            "alias": "jurnalix zarphed grendic"
+          }
+        ],
+        "catalog_food_portions": [
+          {
+            "food_source_key": "synthetic-bench10k:09999",
+            "description": "200 g",
+            "amount": 200,
+            "unit": "g",
+            "gram_weight": 200,
+            "is_default": true,
+            "source": "synthetic_fixture"
+          }
+        ]
+      }
+    ]
+  },
+  "aliases": {
+    "shape": "{food_source_key, alias} — the shape catalog/releases/v1/aliases.jsonl carries",
+    "generatedRule": "One alias per generated row: bases[baseIndex].aliasWord, preparations[preparationIndex] and descriptors[descriptorIndex] joined by single spaces, keyed by that row's source_key. 10,000 alias rows in total.",
+    "generatedRuleRationale": "The alias word appears in no search_text anywhere in the corpus, so these rows are the only way their first token can be reached. That makes the alias contribution testable on its own rather than shadowed by a name match, and it puts the alias branch under the same volume as the rest of the corpus, which matters because that branch scores every published alias for every query.",
+    "curatedRule": "The rows below are additional and explicit, each keyed by the derived source_key of its target, because a misspelling is retrievable only when it has been curated into an alias. They are what the misspelling queries resolve through.",
+    "curated": [
+      {
+        "food_source_key": "synthetic-bench10k:00000",
+        "alias": "zentyl vanded gilvic"
+      },
+      {
+        "food_source_key": "synthetic-bench10k:09599",
+        "alias": "wendrul zarphed grendic"
+      },
+      {
+        "food_source_key": "synthetic-bench10k:09999",
+        "alias": "wendrul zarphed grendic"
+      },
+      {
+        "food_source_key": "synthetic-bench10k:00800",
+        "alias": "kwibbin vanded gilvic"
+      }
+    ],
+    "uniqueness": "catalog_food_aliases carries UNIQUE (catalog_food_id, alias). No generated alias repeats for one food, and the curated aliases differ from the generated ones, so the insert cannot violate it. Two DIFFERENT foods may share an alias text and two do: the same curated misspelling is attached to both members of the shared-word pair, which is how the misspelling path also reaches the source_key tiebreaker."
+  },
+  "portions": {
+    "shape": "{food_source_key, description, amount, unit, gram_weight, is_default, source} — the shape catalog/releases/v1/portions.jsonl carries",
+    "generatedRule": "Exactly one portion per generated row, is_default true, taken from the base: amount = bases[baseIndex].portionAmount, unit = bases[baseIndex].portionUnit, gram_weight = bases[baseIndex].portionGramWeight, description = the amount and unit as written (for example \"50 g\"), source = \"synthetic_fixture\".",
+    "whyItIsMandatory": "This block is not decoration. mapCatalogFood raises CatalogMappingError for a food with no default portion, and again for a default portion whose gram weight is not positive, because a published food without a sourced gram weight is quarantined rather than published. An expansion that skipped portions would make every search over this corpus throw instead of returning a page, so the portion rows are part of the corpus, not an optional extra.",
+    "consistencyRule": "description, amount and unit state the same quantity, and gram_weight agrees with it: the unit is g, where mass is its own gram weight, or ml on a per_100ml base whose density is 1 g/ml. Nothing here needs a household-to-gram conversion, so the fixture cannot smuggle in an invented one.",
+    "uniqueness": "catalog_food_portions carries UNIQUE (catalog_food_id, description) and a partial UNIQUE (catalog_food_id) WHERE is_default. One portion per food satisfies both."
+  },
+  "unpublishedRows": {
+    "note": "Four explicit rows that are NOT part of the generated corpus and are not counted by expectedCorpusSize. Each is inserted with the fixedColumns and nullColumns above, the columns it states here, basis per_100g with basis_amount 100, allergen_tags [], diet_tags [] and is_common_dislike false. No alias and no portion row is created for them, deliberately: see readingGuide.publishedFilterRows.",
+    "rows": [
+      {
+        "source_key": "synthetic-bench10k:u0001",
+        "publication_status": "candidate",
+        "canonical_name": "quarrow vanded gilvic",
+        "display_name": "Quarrow vanded gilvic",
+        "search_text": "quarrow vanded gilvic",
+        "category": "other",
+        "food_state": "raw",
+        "food_group": "food_ingredient_other",
+        "calories": 170,
+        "protein_g": 10,
+        "carbs_g": 10,
+        "fat_g": 10,
+        "fiber_g": null,
+        "cost_class": 2,
+        "note": "A candidate has never been published, so search must not see it. Its base word 'quarrow' belongs to no generated row, which is what makes the zero-result expectation on that word a statement about the publication filter rather than about the text search."
+      },
+      {
+        "source_key": "synthetic-bench10k:u0002",
+        "publication_status": "quarantined",
+        "canonical_name": "quarrow kelbed ombral",
+        "display_name": "Quarrow kelbed ombral",
+        "search_text": "quarrow kelbed ombral",
+        "category": "other",
+        "food_state": "raw",
+        "food_group": "food_ingredient_other",
+        "calories": 170,
+        "protein_g": 10,
+        "carbs_g": 10,
+        "fat_g": 10,
+        "fiber_g": null,
+        "cost_class": 2,
+        "note": "A quarantined row failed a deterministic validation check. It is excluded by the same predicate as a candidate, and it is here so the predicate is exercised by more than one status."
+      },
+      {
+        "source_key": "synthetic-bench10k:u0003",
+        "publication_status": "rejected",
+        "canonical_name": "quarrow tirsed tesken",
+        "display_name": "Quarrow tirsed tesken",
+        "search_text": "quarrow tirsed tesken",
+        "category": "other",
+        "food_state": "raw",
+        "food_group": "food_ingredient_other",
+        "calories": 170,
+        "protein_g": 10,
+        "carbs_g": 10,
+        "fat_g": 10,
+        "fiber_g": null,
+        "cost_class": 2,
+        "note": "A rejected row is physically impossible data. Same exclusion, third status."
+      },
+      {
+        "source_key": "synthetic-bench10k:u0004",
+        "publication_status": "retired",
+        "canonical_name": "zentil vanded gilvic",
+        "display_name": "Zentil vanded gilvic",
+        "search_text": "zentil vanded gilvic",
+        "category": "legume",
+        "food_state": "dry",
+        "food_group": "lentil",
+        "calories": 345.9,
+        "protein_g": 24,
+        "carbs_g": 60,
+        "fat_g": 1.1,
+        "fiber_g": null,
+        "cost_class": 1,
+        "note": "A retired row WAS published once and a newer release no longer carries it: it keeps its primary key so historical recipe and diary references still resolve, and it leaves search. It deliberately repeats row 0 of the generated corpus verbatim — same canonical_name, same food_state, same search_text — because that is the pair that proves two things at once: the partial unique index on (canonical_name, food_state) constrains published rows only, and a query for that exact name must still return exactly one row."
+      }
+    ]
+  },
+  "constraints": {
+    "insertability": "What follows is what makes the expansion insertable into catalog_foods and its child tables rather than merely well-formed. Each clause names the constraint that enforces it, because a generator that breaks one of these fails the LOAD with a database error rather than an assertion, and a load error is much harder to read than a failed expectation.",
+    "uniqueSourceKey": "source_key is UNIQUE (catalog_foods_source_key_key). The zero-padded row index makes every generated key distinct by construction, and the unpublished rows use the disjoint u<ordinal> form.",
+    "uniquePublishedIdentity": "A partial UNIQUE index, unique_published_catalog_food_identity on (canonical_name, food_state) WHERE publication_status = published, enforces published identity. The cross product makes each (base entry, preparation, descriptor) triple unique, and the two base entries that share a word differ in food_state, so every published pair is distinct. The retired row in unpublishedRows repeats row 0 exactly and is legal because the index constrains published rows only.",
+    "uniqueUsdaFdcId": "usda_fdc_id is UNIQUE and every row leaves it null; PostgreSQL permits repeated nulls in a unique index, so 10,004 null rows coexist.",
+    "notNullColumns": "Every NOT NULL column of catalog_foods is populated: source_key, canonical_name, display_name, category, food_state, identity_source, identity_status, nutrition_provenance, nutrition_version, metadata_version, nutrition_basis, basis_amount, publication_status, allergen_status, food_group and cost_class. allergen_tags, diet_tags and is_common_dislike have column defaults and are written explicitly anyway, so the row does not depend on them.",
+    "searchTextOnEveryRow": "search_text is populated on every row, including the non-published ones. The searchable column is search_vector, a STORED generated column defined as to_tsvector('english', coalesce(search_text, '')), so it cannot be written directly and a row with a null search_text is silently unfindable rather than wrong — the failure mode this clause exists to prevent.",
+    "columnsNeverEmitted": "The expansion emits no search_vector, because it is generated and PostgreSQL rejects an insert that targets it, and no user_id, because catalog_foods has no user_id at all: the catalog is server-owned reference data and nothing in it is scoped to a person. It also emits no id, leaving gen_random_uuid() to assign one, which is why every expectation in this file is a source_key.",
+    "coreNutrientsNotNull": "calories, protein_g, carbs_g and fat_g are nullable columns but are never null here: mapCatalogFood treats a missing core nutrient on a published row as a mapping error. Only fiber_g is allowed to be unknown, and only where a base declares it so.",
+    "nutritionBounds": "Every generated row stays inside the bounds coverage-plan.v1.json declares: calories at most 900 per 100 g (the reject tier), protein + carbohydrate + fat at most 1.02 x basis_amount grams (the macro-mass factor), and within the per-category kcalReviewRange of the row's own category. The base anchors were chosen so this holds after the largest per-row modifier, +1.9 g of protein and +1.9 g of carbohydrate, and the expander asserts all three for all 10,000 rows. The corpus does not have to satisfy validation — it never runs through it — but a corpus that violated the bounds would teach a reader the wrong thing about what a catalog row may look like.",
+    "controlledVocabularies": "category is one of the 21 values in coverage-plan.v1.json, food_group is one of its 123 values and belongs to that same category, cost_class is 1 to 3, allergen_tags are drawn from the nine named allergens, diet_tags from the four the release uses, and food_state, identity_source, identity_status, nutrition_provenance, nutrition_basis, allergen_status and publication_status from the closed sets in src/types/catalog.ts. All 21 categories appear, so the corpus is not one category repeated 10,000 times.",
+    "referentialClosure": "Every alias row and every portion row names a food by a source_key this file generates, and every expected source_key in queries resolves to a row in the expanded corpus. No row, alias, portion or expectation points outside this file: not at a catalog release, not at another fixture, not at a database id. The corpus is therefore expandable into an empty schema on its own, and the only mentions of other files anywhere in this document are the two citations that say which table shape the alias and portion blocks copy."
+  },
+  "vocabularyRules": {
+    "disjointness": "The five vocabularies — base words, preparations, descriptors, searchWords and aliasWords — are pairwise disjoint after English stemming, with the single declared exception of the shared-word pair, where two base entries carry the same three tokens on purpose.",
+    "disjointnessRationale": "It is what makes every match set countable. If a descriptor stemmed to the same lexeme as a preparation, a one-word query would match rows the arithmetic in matchSetArithmetic does not describe, and a term appearing twice in one document would raise that row above its neighbours and break the uniform rank the page assertions rely on.",
+    "noPrefixRelation": "No token is a left-anchored prefix of a different token. The prefix fallback compares lower(display_name), lower(canonical_name) and lower(alias) with the query followed by %, so overlapping tokens would silently pull extra foods into a partial query at rank 0.",
+    "partialQueriesAreNotLexemes": "Every partial query string is a prefix that is NOT a lexeme of any document — checked against to_tsvector, not by eye, because a stem is not obvious: 'vanded' stems to 'vand', so the four characters 'vand' would reach the corpus through the full-text branch and not through the prefix fallback at all, which is the opposite of what a partial query is supposed to exercise.",
+    "stemmingConfiguration": "english, which is what the generated column uses: search_vector is to_tsvector('english', coalesce(search_text, '')). Plural queries rely on it: the stemmer is rule-based, so an invented word folds like a real one and 'zentils' and 'zentil' share the lexeme 'zentil'.",
+    "noStopwords": "No token is an English stopword. A stopword is dropped from both the vector and the query, so a row built from one would be unfindable by its own name."
+  },
+  "matchSetArithmetic": {
+    "basis": "Every size below follows from the cross product alone, so a reviewer can check any entry of matchSetSizes without a database. One base contributes 400 rows, one preparation 500 (25 bases x 20 descriptors), one descriptor 500.",
+    "byQueryShape": {
+      "baseWord": "400 rows, or 800 for the shared word carried by two base entries",
+      "searchWord": "400 rows, or 800 for the shared word; matched through the search_vector only",
+      "aliasWord": "400 rows, or 800 for the shared word; matched through the alias contribution only",
+      "preparationWord": "500 rows",
+      "descriptorWord": "500 rows",
+      "baseWord + preparationWord": "20 rows, or 40 for the shared word",
+      "baseWord + descriptorWord": "20 rows, or 40 for the shared word",
+      "preparationWord + descriptorWord": "25 rows, one per base entry",
+      "aliasWord + preparationWord": "20 rows, or 40 for the shared word",
+      "full triple": "1 row, or 2 for the shared word",
+      "aliasWord + preparationWord + descriptorWord": "1 row, or 2 for the shared word",
+      "name token + alias token": "0 rows, always. plainto_tsquery ANDs the terms and every contribution scores ONE document, so a name token and an alias token can never be satisfied together however plainly both belong to the same food.",
+      "name prefix": "the same rows as the base word it prefixes, at rank 0 instead of a ts_rank value, because names begin with their base word",
+      "alias prefix": "the same rows as the alias word it prefixes, at rank 0; nothing but the alias rows begins with an alias word",
+      "two preparations or two descriptors": "0 rows. plainto_tsquery ANDs the tokens and every row carries exactly one of each part.",
+      "unpublished word": "0 rows, whatever the form, because the filter runs first"
+    },
+    "orderingWithinAMatchSet": "Ranks tie, so the order is display_name ASC then source_key ASC — alphabetical by name, NOT row-index order. The first page of a base-word query is therefore the alphabetically first preparations of that base, not preparations[0] to preparations[3], and an implementation that returned insertion order would fail on the first page."
+  },
+  "kinds": {
+    "closedSet": "The six kinds are the ones data/meal-planning/search-benchmark.v1.json defines, unchanged, so one helper can read a query entry from either file. What follows is only how each maps onto this corpus.",
+    "mapping": {
+      "exact": "A canonical name, or a base word, typed as it is stored.",
+      "plural": "A plural of a stored token, folded by the english stemmer ('zentils').",
+      "misspelling": "A misspelled token that exists only in a curated alias. An uncurated misspelling is unretrievable, and one query states that outcome explicitly.",
+      "alias": "A name the food answers to but does not store in its own name. Two paths carry that here and both are covered: an aliasWord, which lives in catalog_food_aliases and in no search_text, and a searchWord, which lives in the food's own search_text and in no name.",
+      "multi_word": "Two or more tokens, every one of which the tsquery ANDs.",
+      "partial": "A prefix that is no lexeme, so it resolves through the ILIKE prefix fallback at rank 0 rather than through the full-text branch."
+    }
+  },
+  "queries": [
+    {
+      "id": "q001",
+      "q": "zentil vanded gilvic",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:00000"
+      ]
+    },
+    {
+      "id": "q002",
+      "q": "wendril zarphed grendic",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:09599",
+        "synthetic-bench10k:09999"
+      ]
+    },
+    {
+      "id": "q003",
+      "q": "quibbin",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:01015",
+        "synthetic-bench10k:01016",
+        "synthetic-bench10k:01005",
+        "synthetic-bench10k:01017",
+        "synthetic-bench10k:01018"
+      ]
+    },
+    {
+      "id": "q004",
+      "q": "marnip",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:00615",
+        "synthetic-bench10k:00616",
+        "synthetic-bench10k:00605",
+        "synthetic-bench10k:00617",
+        "synthetic-bench10k:00618"
+      ]
+    },
+    {
+      "id": "q005",
+      "q": "wendril",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:09415",
+        "synthetic-bench10k:09815",
+        "synthetic-bench10k:09416",
+        "synthetic-bench10k:09816",
+        "synthetic-bench10k:09405"
+      ]
+    },
+    {
+      "id": "q006",
+      "q": "vanded",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:06415",
+        "synthetic-bench10k:06416",
+        "synthetic-bench10k:06405",
+        "synthetic-bench10k:06417",
+        "synthetic-bench10k:06418"
+      ]
+    },
+    {
+      "id": "q007",
+      "q": "gilvic",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:06600",
+        "synthetic-bench10k:06480",
+        "synthetic-bench10k:06620",
+        "synthetic-bench10k:06520",
+        "synthetic-bench10k:06700"
+      ]
+    },
+    {
+      "id": "q008",
+      "q": "palmence obrined xolden",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:07952"
+      ]
+    },
+    {
+      "id": "q009",
+      "q": "brindow crimbled urbeck",
+      "kind": "exact",
+      "expected": [
+        "synthetic-bench10k:06609"
+      ]
+    },
+    {
+      "id": "q010",
+      "q": "quarrow vanded gilvic",
+      "kind": "exact",
+      "expected": []
+    },
+    {
+      "id": "q011",
+      "q": "quarrow",
+      "kind": "exact",
+      "expected": []
+    },
+    {
+      "id": "q012",
+      "q": "zentils",
+      "kind": "plural",
+      "expected": [
+        "synthetic-bench10k:00215",
+        "synthetic-bench10k:00216",
+        "synthetic-bench10k:00205",
+        "synthetic-bench10k:00217",
+        "synthetic-bench10k:00218"
+      ]
+    },
+    {
+      "id": "q013",
+      "q": "wendrils",
+      "kind": "plural",
+      "expected": [
+        "synthetic-bench10k:09415",
+        "synthetic-bench10k:09815",
+        "synthetic-bench10k:09416",
+        "synthetic-bench10k:09816",
+        "synthetic-bench10k:09405"
+      ]
+    },
+    {
+      "id": "q014",
+      "q": "quibbins tirsed",
+      "kind": "plural",
+      "expected": [
+        "synthetic-bench10k:00855",
+        "synthetic-bench10k:00856",
+        "synthetic-bench10k:00845",
+        "synthetic-bench10k:00857",
+        "synthetic-bench10k:00858",
+        "synthetic-bench10k:00840",
+        "synthetic-bench10k:00859",
+        "synthetic-bench10k:00844",
+        "synthetic-bench10k:00846",
+        "synthetic-bench10k:00841",
+        "synthetic-bench10k:00843",
+        "synthetic-bench10k:00847",
+        "synthetic-bench10k:00842",
+        "synthetic-bench10k:00848",
+        "synthetic-bench10k:00849",
+        "synthetic-bench10k:00850",
+        "synthetic-bench10k:00851",
+        "synthetic-bench10k:00852",
+        "synthetic-bench10k:00853",
+        "synthetic-bench10k:00854"
+      ]
+    },
+    {
+      "id": "q015",
+      "q": "marnips gilvic",
+      "kind": "plural",
+      "expected": [
+        "synthetic-bench10k:00600",
+        "synthetic-bench10k:00480",
+        "synthetic-bench10k:00620",
+        "synthetic-bench10k:00520",
+        "synthetic-bench10k:00700",
+        "synthetic-bench10k:00420",
+        "synthetic-bench10k:00640",
+        "synthetic-bench10k:00460",
+        "synthetic-bench10k:00580",
+        "synthetic-bench10k:00740",
+        "synthetic-bench10k:00680",
+        "synthetic-bench10k:00500",
+        "synthetic-bench10k:00540",
+        "synthetic-bench10k:00720",
+        "synthetic-bench10k:00440",
+        "synthetic-bench10k:00560",
+        "synthetic-bench10k:00400",
+        "synthetic-bench10k:00660",
+        "synthetic-bench10k:00760",
+        "synthetic-bench10k:00780"
+      ]
+    },
+    {
+      "id": "q016",
+      "q": "zentil vanded",
+      "kind": "multi_word",
+      "expected": [
+        "synthetic-bench10k:00015",
+        "synthetic-bench10k:00016",
+        "synthetic-bench10k:00005",
+        "synthetic-bench10k:00017",
+        "synthetic-bench10k:00018",
+        "synthetic-bench10k:00000",
+        "synthetic-bench10k:00019",
+        "synthetic-bench10k:00004",
+        "synthetic-bench10k:00006",
+        "synthetic-bench10k:00001",
+        "synthetic-bench10k:00003",
+        "synthetic-bench10k:00007",
+        "synthetic-bench10k:00002",
+        "synthetic-bench10k:00008",
+        "synthetic-bench10k:00009",
+        "synthetic-bench10k:00010",
+        "synthetic-bench10k:00011",
+        "synthetic-bench10k:00012",
+        "synthetic-bench10k:00013",
+        "synthetic-bench10k:00014"
+      ]
+    },
+    {
+      "id": "q017",
+      "q": "wendril zarphed",
+      "kind": "multi_word",
+      "expected": [
+        "synthetic-bench10k:09595",
+        "synthetic-bench10k:09995",
+        "synthetic-bench10k:09596",
+        "synthetic-bench10k:09996",
+        "synthetic-bench10k:09585"
+      ]
+    },
+    {
+      "id": "q018",
+      "q": "crimbled urbeck",
+      "kind": "multi_word",
+      "expected": [
+        "synthetic-bench10k:06609",
+        "synthetic-bench10k:06209",
+        "synthetic-bench10k:07409",
+        "synthetic-bench10k:01809",
+        "synthetic-bench10k:02609"
+      ]
+    },
+    {
+      "id": "q019",
+      "q": "vanded kelbed",
+      "kind": "multi_word",
+      "expected": []
+    },
+    {
+      "id": "q020",
+      "q": "gilvic ombral",
+      "kind": "multi_word",
+      "expected": []
+    },
+    {
+      "id": "q021",
+      "q": "murnix",
+      "kind": "alias",
+      "expected": [
+        "synthetic-bench10k:00215",
+        "synthetic-bench10k:00216",
+        "synthetic-bench10k:00205",
+        "synthetic-bench10k:00217",
+        "synthetic-bench10k:00218"
+      ]
+    },
+    {
+      "id": "q022",
+      "q": "murnix vanded gilvic",
+      "kind": "alias",
+      "expected": [
+        "synthetic-bench10k:00000"
+      ]
+    },
+    {
+      "id": "q023",
+      "q": "jurnalix",
+      "kind": "alias",
+      "expected": [
+        "synthetic-bench10k:09415",
+        "synthetic-bench10k:09815",
+        "synthetic-bench10k:09416",
+        "synthetic-bench10k:09816",
+        "synthetic-bench10k:09405"
+      ]
+    },
+    {
+      "id": "q024",
+      "q": "bofka",
+      "kind": "alias",
+      "expected": [
+        "synthetic-bench10k:00215",
+        "synthetic-bench10k:00216",
+        "synthetic-bench10k:00205",
+        "synthetic-bench10k:00217",
+        "synthetic-bench10k:00218"
+      ]
+    },
+    {
+      "id": "q025",
+      "q": "hastoqu",
+      "kind": "alias",
+      "expected": [
+        "synthetic-bench10k:09415",
+        "synthetic-bench10k:09815",
+        "synthetic-bench10k:09416",
+        "synthetic-bench10k:09816",
+        "synthetic-bench10k:09405"
+      ]
+    },
+    {
+      "id": "q026",
+      "q": "felmirt crimbled",
+      "kind": "alias",
+      "expected": [
+        "synthetic-bench10k:06615",
+        "synthetic-bench10k:06616",
+        "synthetic-bench10k:06605",
+        "synthetic-bench10k:06617",
+        "synthetic-bench10k:06618",
+        "synthetic-bench10k:06600",
+        "synthetic-bench10k:06619",
+        "synthetic-bench10k:06604",
+        "synthetic-bench10k:06606",
+        "synthetic-bench10k:06601",
+        "synthetic-bench10k:06603",
+        "synthetic-bench10k:06607",
+        "synthetic-bench10k:06602",
+        "synthetic-bench10k:06608",
+        "synthetic-bench10k:06609",
+        "synthetic-bench10k:06610",
+        "synthetic-bench10k:06611",
+        "synthetic-bench10k:06612",
+        "synthetic-bench10k:06613",
+        "synthetic-bench10k:06614"
+      ]
+    },
+    {
+      "id": "q027",
+      "q": "zentyl",
+      "kind": "misspelling",
+      "expected": [
+        "synthetic-bench10k:00000"
+      ]
+    },
+    {
+      "id": "q028",
+      "q": "wendrul",
+      "kind": "misspelling",
+      "expected": [
+        "synthetic-bench10k:09599",
+        "synthetic-bench10k:09999"
+      ]
+    },
+    {
+      "id": "q029",
+      "q": "kwibbin vanded gilvic",
+      "kind": "misspelling",
+      "expected": [
+        "synthetic-bench10k:00800"
+      ]
+    },
+    {
+      "id": "q030",
+      "q": "zantil",
+      "kind": "misspelling",
+      "expected": []
+    },
+    {
+      "id": "q031",
+      "q": "wendr",
+      "kind": "partial",
+      "expected": [
+        "synthetic-bench10k:09415",
+        "synthetic-bench10k:09815",
+        "synthetic-bench10k:09416",
+        "synthetic-bench10k:09816",
+        "synthetic-bench10k:09405"
+      ]
+    },
+    {
+      "id": "q032",
+      "q": "quibb",
+      "kind": "partial",
+      "expected": [
+        "synthetic-bench10k:01015",
+        "synthetic-bench10k:01016",
+        "synthetic-bench10k:01005",
+        "synthetic-bench10k:01017",
+        "synthetic-bench10k:01018"
+      ]
+    },
+    {
+      "id": "q033",
+      "q": "murni",
+      "kind": "partial",
+      "expected": [
+        "synthetic-bench10k:00215",
+        "synthetic-bench10k:00216",
+        "synthetic-bench10k:00205",
+        "synthetic-bench10k:00217",
+        "synthetic-bench10k:00218"
+      ]
+    },
+    {
+      "id": "q034",
+      "q": "jurnal",
+      "kind": "partial",
+      "expected": [
+        "synthetic-bench10k:09415",
+        "synthetic-bench10k:09815",
+        "synthetic-bench10k:09416",
+        "synthetic-bench10k:09816",
+        "synthetic-bench10k:09405"
+      ]
+    },
+    {
+      "id": "q035",
+      "q": "palmen",
+      "kind": "partial",
+      "expected": [
+        "synthetic-bench10k:07815",
+        "synthetic-bench10k:07816",
+        "synthetic-bench10k:07805",
+        "synthetic-bench10k:07817",
+        "synthetic-bench10k:07818"
+      ]
+    }
+  ],
+  "matchSetSizes": {
+    "note": "The exact size of each query's match set — the number COUNT(DISTINCT id) must return, which is also the total the pagination block reports. Declared rather than only derived so the suite asserts a number a reviewer can check against matchSetArithmetic, and so a change in the corpus that silently widens a match set fails here instead of passing quietly.",
+    "sizes": {
+      "q001": 1,
+      "q002": 2,
+      "q003": 400,
+      "q004": 400,
+      "q005": 800,
+      "q006": 500,
+      "q007": 500,
+      "q008": 1,
+      "q009": 1,
+      "q010": 0,
+      "q011": 0,
+      "q012": 400,
+      "q013": 800,
+      "q014": 20,
+      "q015": 20,
+      "q016": 20,
+      "q017": 40,
+      "q018": 25,
+      "q019": 0,
+      "q020": 0,
+      "q021": 400,
+      "q022": 1,
+      "q023": 800,
+      "q024": 400,
+      "q025": 800,
+      "q026": 20,
+      "q027": 1,
+      "q028": 2,
+      "q029": 1,
+      "q030": 0,
+      "q031": 800,
+      "q032": 400,
+      "q033": 400,
+      "q034": 800,
+      "q035": 400
+    }
+  },
+  "queryNotes": {
+    "q001": "The whole canonical name of row 0: three tokens ANDed, one row.",
+    "q002": "The rank-tie pair. bases[23] and bases[24] carry the same word in two food states, so rows 9599 and 9999 have the same canonical_name, the same display_name and the same four-lexeme search_text. They tie on ts_rank and tie again on display_name, so source_key ASC is what orders them: synthetic-bench10k:09599 first.",
+    "q006": "One preparation word across every base entry: the widest shape that is not a base word, 500 rows, and the only one whose first page mixes bases — so it is where an ordering that grouped by insertion or by base would show up first.",
+    "q007": "One descriptor word across every base entry, the same 500-row shape on the other axis.",
+    "q010": "Zero results from the publication filter, not from the text: this is the verbatim name of unpublishedRows[0], whose publication_status is candidate.",
+    "q011": "Zero results, second form: the base word of every non-published row and of no generated row. It also proves the prefix fallback respects the filter, because a non-published display_name starting with 'quarrow' must not surface either.",
+    "q018": "A preparation and a descriptor with no base word: one row per base entry, so the match set is as wide as the base list and no wider.",
+    "q019": "Zero results from tsquery AND semantics: plainto_tsquery ANDs both tokens and every row carries exactly one preparation word, so no row can hold two.",
+    "q020": "Zero results, same AND reason, on the descriptor axis.",
+    "q021": "bases[0].aliasWord. It appears in no search_text at all, so it is matched only through the alias contribution — the branch that lets a food be found by a word none of its own columns hold.",
+    "q024": "bases[0].searchWord. It appears in every row of that base's search_text and in no canonical_name, no display_name and no alias, so it is matched only through the food's own search_vector — the contribution that exists because search_text may carry words the name does not.",
+    "q026": "Two tokens of one generated alias. Both must be found in the SAME document, which is why no query in this file mixes a name token with an alias token: plainto_tsquery ANDs the terms and each contribution is scored against one document, so a food's own search_text and its alias never satisfy an AND together.",
+    "q030": "Zero results from an UNCURATED misspelling. The kind definition is deliberate: a misspelling is retrievable only when it has been curated into an alias, and this one has not been, while its near neighbour 'zentyl' has. It is also a different LEXEME from both the stored word and the curated misspelling, which had to be checked against plainto_tsquery rather than assumed: 'zentyll' would have been wrong here, because the english stemmer folds it onto 'zentyl' and the curated alias would have answered it.",
+    "q031": "A prefix of a canonical name, matched through the name prefix fallback at rank 0. Every row of the match set therefore ties at rank 0 and the whole page order is decided by the two name tiebreakers.",
+    "q033": "A prefix of an alias word and of nothing else, and not a lexeme of any document, so it reaches the corpus only through the alias prefix fallback, at rank 0."
+  },
+  "paginationCheck": {
+    "queryIds": [
+      "q003",
+      "q004",
+      "q005",
+      "q006",
+      "q007",
+      "q012",
+      "q013",
+      "q021",
+      "q023",
+      "q024",
+      "q025",
+      "q031",
+      "q032",
+      "q033",
+      "q034",
+      "q035"
+    ],
+    "limit": 25,
+    "pages": 3,
+    "singlePageLimit": 75,
+    "referenceMode": "in_process",
+    "invariant": "For each id in queryIds, pages 1, 2 and 3 fetched at limit (offsets 0, 25 and 50) concatenated must equal the first min(singlePageLimit, total) food ids of one singlePageLimit fetch of the same query, in the same order, with no id repeated and none missing.",
+    "referenceModeReason": "GET /catalog/foods validates limit as 1 to 50, so a 75-item fetch over HTTP answers 400 invalid_request. The reference is therefore read in process through catalog.service.searchPublishedFoods, which deliberately does not clamp limit for exactly this reason. Do not lower singlePageLimit to 50 to make it routable and do not put the reference through the endpoint: the first weakens the invariant, the second cannot express it.",
+    "queryIdSelection": "Every query in this file whose match set holds at least singlePageLimit rows, so all three pages are full and the concatenation is a real traversal. The widest sets are 800 rows and the narrowest of these 400, against a release-data pagination check whose widest query matches 8 published foods and fills no page at all: covering multi-page traversal is the one thing the synthetic corpus can do that the loaded release cannot yet, and it is the reason this fixture exists rather than a second copy of the acceptance set.",
+    "derivability": "The reference order is hand-derivable, which is what makes a failure diagnosable rather than merely red: ranks tie across each of these sets, so the first 75 ids are the first 75 rows of the match set sorted by display_name ASC then source_key ASC."
+  },
+  "mechanicsExpectations": {
+    "standing": "Structural expectations only, and every one of them exact. None is a quality threshold and none may be reported as acceptance evidence; see acceptanceStatus.",
+    "corpusSize": "The expansion produces exactly expectedCorpusSize published foods plus expectedUnpublishedRowCount non-published rows, and the part-list product is asserted before expansion so a mis-edited part list fails immediately rather than producing a corpus of the wrong size.",
+    "matchSetSizes": "Every query returns exactly the total in matchSetSizes.",
+    "ordering": "Every query returns its expected source keys in the declared order, which is rank DESC then display_name ASC then source_key ASC.",
+    "pagination": "The paginationCheck invariant holds for every id it names.",
+    "paginationBlock": "For a match set of total rows at limit 25, the block reports that total and ceil(total / 25) pages: 16 pages for a 400-row set, 32 for an 800-row set, 20 for a 500-row set. A page beyond the last returns an empty item list with the same total, not an error.",
+    "zeroResults": "Each query whose expected list is empty returns no rows, for the three distinct causes queryNotes records: a name that exists only on a non-published row, an uncurated misspelling, and two tokens of the same part ANDed.",
+    "publicationFilter": "No row in unpublishedRows is ever returned, by name, by prefix or by alias, including the retired row that repeats a published identity verbatim.",
+    "determinismCheck": "Expanding twice in one process, or in two processes, yields identical rows in identical order; and a search repeated after the corpus is re-expanded returns the same page sequence. Nothing about the expansion depends on insertion order, which is what the source_key tiebreaker is there to guarantee.",
+    "latency": "Not asserted here. Latency is a property of the host, the PostgreSQL build and the cache state; Agent Action Plan section 0.9.3 assigns it to the operator run, which reports its conditions alongside it. A synthetic corpus can time its own queries for information, but any threshold over it would be a threshold over the machine that ran it."
+  }
+}

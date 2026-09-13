@@ -29,8 +29,17 @@
 -- "correct" them against prisma/schema.prisma: the STORED generated expression
 -- on catalog_foods.search_vector, the block of expression and partial indexes
 -- before the foreign keys, and NOT NULL on the twelve required TEXT[]/UUID[]
--- columns. Prisma cannot express any of them; all three are recorded in
--- docs/meal-planning/expected-schema-diff.sql and checked by CI.
+-- columns. Prisma cannot express any of them, which is why the authoritative
+-- migration writes them by hand and this copy repeats them verbatim. Of the
+-- three, the generated expression is the one `prisma migrate diff` reports:
+-- docs/meal-planning/expected-schema-diff.sql is that command's committed
+-- output and CI compares it on every run. The expression index, the partial
+-- indexes and the array NOT NULLs are invisible to that command - a shortfall
+-- against what the Agent Action Plan expects of that file, recorded there as an
+-- open conflict rather than settled - so for now what holds this copy to the
+-- authoritative migration for them is the ledger-equivalence gate in
+-- src/__tests__/api/compat.test.ts, which applies both and compares the
+-- resulting columns, indexes and constraints.
 --
 -- README.md in this folder explains when an operator would run this file and how
 -- to prove it still matches the authoritative ledger;
@@ -493,9 +502,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS "meal_entries_id_user_id_key" ON "meal_entries
 
 -- CreateIndex
 -- Hand-written from here to the foreign keys: constructs the Prisma datamodel
--- cannot express. `prisma migrate diff` is blind to expression and partial
--- indexes, so docs/meal-planning/expected-schema-diff.sql reads them back out of
--- the database instead and the CI schema-evidence gate compares them.
+-- cannot express. `prisma migrate diff` reports none of them and does not
+-- notice their loss either - measured, and recorded in
+-- docs/meal-planning/expected-schema-diff.sql - so the check that holds this
+-- block to the authoritative migration is the ledger-equivalence gate in
+-- src/__tests__/api/compat.test.ts, which compares the two schemas index for
+-- index.
 CREATE INDEX IF NOT EXISTS "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("search_vector");
 
 -- CreateIndex

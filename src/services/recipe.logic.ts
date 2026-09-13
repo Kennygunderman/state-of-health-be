@@ -761,6 +761,57 @@ const renderTags = (byKey: ReadonlyMap<string, string>): string[] =>
         .map(([, original]) => original);
 
 /**
+ * ONE ingredient's diet tags, closed under {@link DIET_TAG_IMPLICATIONS}.
+ *
+ * The closure belongs HERE — per ingredient, before any comparison — and not
+ * after an intersection, because the two orders give different answers and only
+ * this one is true. Take brown rice tagged `vegan` and halloumi tagged
+ * `vegetarian`: intersecting the raw sets leaves nothing, so the dish claims no
+ * diet at all and a vegetarian is told no meal matches, when in fact every
+ * ingredient is vegetarian — rice by implication, halloumi by declaration. The
+ * same loss hits `vegan` + a `pescatarian`-only fish, which is genuinely a
+ * pescatarian dish. Expanding first and intersecting the CLOSED sets answers
+ * both correctly, and it cannot over-claim: nothing implies `vegan`, so a
+ * single non-vegan ingredient still drops the vegan tag.
+ *
+ * The walk is transitive (a worklist, not a single pass) so a longer chain
+ * added to the implication map later cannot silently under-expand. A raw
+ * spelling already present is kept over the implication's canonical one, which
+ * is why the map is read before it is written.
+ */
+const expandedDietTags = (ingredient: RecipeIngredientIdentity): Map<string, string> => {
+    const byKey = collectTags([ingredient.snapshot_diet_tags]);
+
+    // A cursor over a growing queue: every key added is itself visited, so a
+    // chain of implications is followed to its end, and the `has` guard makes
+    // the walk terminate even if the map ever contained a cycle.
+    const pending = [...byKey.keys()];
+    for (let cursor = 0; cursor < pending.length; cursor += 1) {
+        for (const implied of DIET_TAG_IMPLICATIONS.get(pending[cursor]) ?? []) {
+            const impliedKey = tagKey(implied);
+            if (!byKey.has(impliedKey)) {
+                byKey.set(impliedKey, implied);
+                pending.push(impliedKey);
+            }
+        }
+    }
+
+    return byKey;
+};
+
+/**
+ * Whether an ingredient satisfies a diet claim, hierarchy included.
+ *
+ * THE per-ingredient diet predicate, shared by {@link deriveDietTags} and by
+ * the blocker lists that explain a refused declaration. A second reading that
+ * consulted the raw tags would name rice as "lacking vegetarian" while the
+ * derivation counted it as vegetarian — a verdict and an explanation that
+ * contradict each other.
+ */
+const carriesDietTag = (ingredient: RecipeIngredientIdentity, tag: string): boolean =>
+    expandedDietTags(ingredient).has(tagKey(tag));
+
+/**
  * The recipe's allergen tags: the UNION of every ingredient's snapshot allergen
  * tags, optional ingredients INCLUDED.
  *
@@ -789,14 +840,21 @@ export const deriveAllergenStatus = (
         : 'unknown';
 
 /**
- * The recipe's diet tags: the INTERSECTION of every ingredient's snapshot diet
- * tags, closed under {@link DIET_TAG_IMPLICATIONS}.
+ * The recipe's diet tags: the INTERSECTION of every ingredient's diet tags,
+ * each ingredient's set closed under {@link DIET_TAG_IMPLICATIONS} FIRST.
  *
  * Intersection, not union, and that is the whole rule: a restrictive claim
  * holds for a dish only when it holds for every part of it. One ingredient
  * without the `vegan` tag makes the dish not vegan, however vegan the rest of
  * it is. Optional ingredients count here too, for the same reason they count
  * for allergens.
+ *
+ * ORDER MATTERS BETWEEN THE TWO STEPS, and expansion comes first (see
+ * {@link expandedDietTags}). Intersecting raw tags and closing the survivors
+ * drops a claim every ingredient actually satisfies — `vegan` rice with
+ * `vegetarian` halloumi yields nothing instead of vegetarian and pescatarian —
+ * which excludes valid recipes and can make a guaranteed diet profile report
+ * no matching meals.
  *
  * An empty ingredient set yields no tags rather than every tag — "every
  * ingredient carries it" is vacuously true of nothing, and a vacuous claim is
@@ -808,23 +866,22 @@ export const deriveDietTags = (ingredients: readonly RecipeIngredientIdentity[])
     }
 
     const [first, ...rest] = ingredients;
-    const shared = collectTags([first.snapshot_diet_tags]);
+    const shared = expandedDietTags(first);
 
     for (const ingredient of rest) {
-        const present = new Set([...collectTags([ingredient.snapshot_diet_tags]).keys()]);
+        const present = expandedDietTags(ingredient);
 
-        for (const key of [...shared.keys()]) {
-            if (!present.has(key)) {
+        for (const [key, spelling] of [...shared.entries()]) {
+            const match = present.get(key);
+
+            if (match === undefined) {
                 shared.delete(key);
-            }
-        }
-    }
-
-    for (const key of [...shared.keys()]) {
-        for (const implied of DIET_TAG_IMPLICATIONS.get(key) ?? []) {
-            const impliedKey = tagKey(implied);
-            if (!shared.has(impliedKey)) {
-                shared.set(impliedKey, implied);
+            } else if (match < spelling) {
+                // The smallest spelling across every CONTRIBUTOR, not the first
+                // ingredient's: a surviving key is carried by all of them, so
+                // taking the minimum is what makes the stored array independent
+                // of the order the rows arrived in.
+                shared.set(key, match);
             }
         }
     }
@@ -1343,9 +1400,11 @@ const ingredientNames = (ingredients: readonly RecipeIngredientIdentity[]): stri
  *    needs a qualifier. This is the prompt's nutrition-integrity requirement
  *    made structural.
  *  * `allergen_status = 'known'` for every ingredient, optional ones included,
- *    REGARDLESS of what the user selected. Not "eligible unless the user
- *    selected that allergen": a food we cannot describe cannot be certified
- *    safe for anyone.
+ *    REGARDLESS of what the user selected, and an ingredient that states no
+ *    review at all counts as unreviewed. Not "eligible unless the user
+ *    selected that allergen", and not "eligible if the recipe's rollup says
+ *    known": a food we cannot describe cannot be certified safe for anyone, and
+ *    a summary cannot vouch for evidence nobody supplied.
  *  * No overlap between the user's allergens and the union of every
  *    ingredient's snapshot allergen tags.
  *  * Diet compatibility derived from the ingredient snapshots — never from the
@@ -1385,13 +1444,18 @@ export const evaluatePlanningEligibility = (
         });
     }
 
-    // Only ingredients whose review status the caller actually supplied can be
-    // judged individually; where it is absent the recipe-level rollup is the
-    // check, which is why that clause stands on its own.
-    const unreviewed = recipe.ingredients.filter(
-        (ingredient) => ingredient.allergen_status !== undefined && ingredient.allergen_status !== 'known',
-    );
-    if (recipe.allergen_status !== 'known' || unreviewed.length > 0) {
+    // ANYTHING other than an explicit `known` is unreviewed, and that includes
+    // an ingredient arriving with no `allergen_status` at all: the column is not
+    // snapshotted on `recipe_ingredients`, so its absence means the caller
+    // supplied no review — which is the absence of safety evidence, never a
+    // clean review. The recipe-level rollup is an ADDITIONAL clause and never a
+    // substitute: a rollup reading `known` while an ingredient carries no review
+    // would otherwise turn missing evidence into permission to plan, and the
+    // first user to learn of it would learn from a plate. An empty ingredient
+    // set is refused for the same reason — nothing has been reviewed — which is
+    // also what `deriveAllergenStatus` answers for one.
+    const unreviewed = recipe.ingredients.filter((ingredient) => ingredient.allergen_status !== 'known');
+    if (recipe.allergen_status !== 'known' || unreviewed.length > 0 || recipe.ingredients.length === 0) {
         reasons.push({
             code: 'allergen_status',
             detail: unreviewed.length > 0 ? ingredientNames(unreviewed) : [recipe.allergen_status],
@@ -1574,11 +1638,19 @@ const carryingAllergen = (
 ): RecipeIngredientIdentity[] =>
     ingredients.filter((ingredient) => hasTag(ingredient.snapshot_allergen_tags, allergen));
 
+/**
+ * The ingredients that do not satisfy a diet claim — through
+ * {@link carriesDietTag}, so the hierarchy is read exactly as
+ * {@link deriveDietTags} reads it.
+ *
+ * Raw-tag matching here would name a `vegan`-tagged ingredient as lacking
+ * `vegetarian` and send the seed's operator after an ingredient that is not the
+ * problem.
+ */
 const lackingDietTag = (
     ingredients: readonly RecipeIngredientIdentity[],
     tag: string,
-): RecipeIngredientIdentity[] =>
-    ingredients.filter((ingredient) => !hasTag(ingredient.snapshot_diet_tags, tag));
+): RecipeIngredientIdentity[] => ingredients.filter((ingredient) => !carriesDietTag(ingredient, tag));
 
 const unreviewedIngredients = (
     ingredients: readonly RecipeIngredientIdentity[],
@@ -1602,7 +1674,11 @@ const badgeBlockers = (
         return ingredients.filter(
             (ingredient) =>
                 ingredient.allergen_status !== 'known' ||
-                !hasTag(ingredient.snapshot_diet_tags, GLUTEN_FREE_DIET_TAG) ||
+                // Through the shared diet predicate, like every other diet-tag
+                // reading in this module. `gluten_free` implies nothing today,
+                // so this is the same answer as the raw tag — and it stays the
+                // same answer if the implication map ever grows.
+                !carriesDietTag(ingredient, GLUTEN_FREE_DIET_TAG) ||
                 ingredient.snapshot_allergen_tags.some((tag) => GLUTEN_CONTRADICTING_TAG_KEYS.has(tagKey(tag))),
         );
     }

@@ -26,8 +26,10 @@
 //    quietly lie about what the shopper actually bought.
 //
 //  * THE SAME-DISPLAY EXCEPTION. An increase that does not move the rendered
-//    text (2.51 -> 2.53 lb) updates the grams and does NOT flag. A flag the
-//    user cannot see on the row is noise.
+//    text (2.51 -> 2.53 lb) updates the grams and raises no flag. A flag the
+//    user cannot see on the row is noise — and that holds however far the
+//    amount has drifted from the acknowledged one, so an invisible increase
+//    onto a row a decrease has already unflagged raises nothing either.
 //
 //  * THE UNIT-FAMILY LOCK. A row's unit family is chosen once, at plan
 //    generation, from the food's default portion, and every later update reads
@@ -37,8 +39,10 @@
 //    eventually break it.
 //
 // A decrease is deliberately SILENT: the number changes, the check stays, and
-// nothing is flagged, sub-lined or announced. Nothing disappears from the
-// shopper's list and nothing shouts at them about less shopping.
+// nothing is flagged, sub-lined or announced — a flag the row was already
+// carrying is cleared rather than left standing over an amount that has come
+// back down. Nothing disappears from the shopper's list and nothing shouts at
+// them about less shopping.
 //
 // Division of responsibility, stated once because both boundaries are easy to
 // drift across:
@@ -115,6 +119,18 @@ const STORED_GRAM_SCALE = 10 ** STORED_GRAM_DECIMALS;
 const TENTHS_SCALE = 10;
 
 /**
+ * Quarters for cups and tablespoons — the display precision of the volume
+ * family, and the step `formatQuarters` renders at.
+ *
+ * The delta pill is this module's text, so it needs the delta as a ROUNDED
+ * NUMBER and not only as a glyph: whether a delta has vanished at its own
+ * precision, and whether "cup" or "cups" describes it, are both decisions about
+ * the rounded value. `utils/units.ts` still owns the rendering — the number
+ * goes back through `formatQuarters` to become "1¾".
+ */
+const QUARTERS_SCALE = 4;
+
+/**
  * The `display_unit` stored for a count row.
  *
  * It is NOT the word the row renders. `formatCount` returns the pluralised
@@ -183,6 +199,8 @@ const requirePositiveFinite = (value: number, label: string): number => {
 const toStoredGrams = (grams: number): number => Math.round(grams * STORED_GRAM_SCALE) / STORED_GRAM_SCALE;
 
 const roundToTenth = (value: number): number => Math.round(value * TENTHS_SCALE) / TENTHS_SCALE;
+
+const roundToQuarter = (value: number): number => Math.round(value * QUARTERS_SCALE) / QUARTERS_SCALE;
 
 /* ---------------------------------------------------------------------------
  * Aggregation — grams, and only grams
@@ -684,6 +702,15 @@ interface DeltaTextInputs {
     facts: GroceryConversionFacts;
 }
 
+/** A delta that has rounded away at the row unit's own precision. */
+const VANISHED_DELTA = 0;
+
+/**
+ * The floor on a count delta: a flag that stands is worth at least one whole
+ * item, because you buy an egg rather than a fifth of one.
+ */
+const MIN_COUNT_DELTA_ITEMS = 1;
+
 /**
  * The delta pill's text, in the row's OWN unit rather than a freshly tiered one.
  *
@@ -695,6 +722,27 @@ interface DeltaTextInputs {
  * is made here, because that module exposes no "render this value in this unit"
  * entry point. The sign is always "+": a flag is only ever raised by an
  * increase over the acknowledged amount.
+ *
+ * Two invariants hold whatever the numbers do, because the pill is read beside
+ * the row's own "was Y" and "Now X" and has to agree with both:
+ *
+ *  * A FLAGGED INCREASE NEVER RENDERS ZERO. An increase that crosses a
+ *    promotion boundary is, by definition, smaller than one step of the unit it
+ *    promoted INTO: 447.9 g reads "15.8 oz" and 452.5 g reads "1 lb", so the
+ *    gap between the two strings is a fraction of a pound and the row's own
+ *    unit can only call it "+0 lb" — three strings that contradict each other.
+ *    The SAME difference is then re-rendered from the family's BASE units
+ *    (grams, millilitres) by `utils/units.ts`'s own tiered formatter, which
+ *    picks a unit small enough to show it and clamps a positive amount away
+ *    from zero. It is the same difference the line above computes — the row's
+ *    RENDERED amount ("1 lb", 453.6 g) less the acknowledged amount (447.9 g),
+ *    so the pill keeps reconciling the two strings it is read beside — which
+ *    here reads "+6 g". The count family has no smaller unit to fall back to,
+ *    so it is floored at one whole item instead.
+ *  * THE DELTA STAYS INSIDE THE ROW'S UNIT FAMILY. The fallback re-renders the
+ *    same difference through that family's formatter and no other, so a mass
+ *    row's delta is always a mass and a volume row's always a volume — the
+ *    unit-family lock the header states, applied to the pill.
  */
 const deltaTextFor = ({
     baselineGrams,
@@ -705,9 +753,12 @@ const deltaTextFor = ({
 }: DeltaTextInputs): string => {
     if (family === 'count') {
         const portion = requireCountPortion(facts.default_portion);
-        const delta = Math.round(displayQuantity - baselineGrams / portion.gram_weight);
+        const items = Math.max(
+            Math.round(displayQuantity - baselineGrams / portion.gram_weight),
+            MIN_COUNT_DELTA_ITEMS,
+        );
 
-        return `+${delta} ${pluralizeCount(delta, portion.description)}`;
+        return `+${items} ${pluralizeCount(items, portion.description)}`;
     }
 
     const perUnit = toBaseQuantity(1, displayUnit).amount;
@@ -715,13 +766,23 @@ const deltaTextFor = ({
     if (family === 'volume') {
         const baselineInUnit = gramsToMilliliters(baselineGrams, facts.density_g_per_ml) / perUnit;
         const delta = displayQuantity - baselineInUnit;
+        const quarters = roundToQuarter(delta);
 
-        return `+${formatQuarters(delta)} ${deltaUnitWord(displayUnit, delta)}`;
+        if (quarters === VANISHED_DELTA) {
+            return `+${formatVolume(Math.abs(delta) * perUnit).text}`;
+        }
+
+        return `+${formatQuarters(quarters)} ${deltaUnitWord(displayUnit, quarters)}`;
     }
 
-    const delta = roundToTenth(displayQuantity - baselineGrams / perUnit);
+    const delta = displayQuantity - baselineGrams / perUnit;
+    const tenths = roundToTenth(delta);
 
-    return `+${String(delta)} ${deltaUnitWord(displayUnit, delta)}`;
+    if (tenths === VANISHED_DELTA) {
+        return `+${formatMass(Math.abs(delta) * perUnit).text}`;
+    }
+
+    return `+${String(tenths)} ${deltaUnitWord(displayUnit, tenths)}`;
 };
 
 /**
@@ -813,9 +874,17 @@ const sameInstant = (a: Date | null, b: Date | null): boolean => {
  *    reading.
  *  - INCREASED on a CHECKED row keeps the check — nothing may disappear from
  *    the list — and flags instead, against the acknowledged baseline.
- *  - An increase whose rendered text does not move is stored but NOT flagged.
+ *  - An increase whose rendered text does not move is stored but RAISES no
+ *    flag — including once a decrease has cleared one and left the row reading
+ *    more than was acknowledged. A flag that already stands survives such an
+ *    increase, because retracting a warning the user is looking at over a
+ *    change they cannot see would be the same noise in reverse.
  *  - INCREASED on an unchecked row is just a new amount.
- *  - DECREASED updates the text and stays silent: check kept, no flag.
+ *  - DECREASED updates the text and stays silent: check kept, and any standing
+ *    flag CLEARED — the amount the shopper was warned about has gone away, so
+ *    the warning goes with it, even when the new amount is still above what
+ *    they acknowledged. The acknowledged baseline itself is kept, so a later
+ *    increase is still measured from the amount they actually saw.
  *  - NEW arrives unchecked; REMOVED is deleted and counted, checked or not.
  *
  * `is_checked` is never part of an update: a recomputation of the week is not a
@@ -875,13 +944,38 @@ export const diffGroceryList = (
                 : buildGroceryDisplay(quantityGrams, family, fact);
 
         const baselineGrams = acknowledgedBaselineGrams(row);
-        const flagged =
-            row.is_checked &&
-            classifyQuantityChange(baselineGrams, quantityGrams) === 'increased' &&
+        // A flag the user cannot see on the row is noise, and the two texts it
+        // has to be visible against are different questions. It must differ
+        // from the ACKNOWLEDGED amount, or the pill would read "was 2.5 lb,
+        // Now 2.5 lb"; and RAISING a new one additionally requires this diff to
+        // have moved the row's OWN text, because an increase that leaves "2.9
+        // lb" reading "2.9 lb" is the same-display exception however far the
+        // amount has drifted from what was acknowledged. The second test is
+        // skipped for a flag that already stands: a later invisible increase
+        // must not retract a warning the user is already looking at.
+        const aboveAcknowledged = classifyQuantityChange(baselineGrams, quantityGrams) === 'increased';
+        const visibleAgainstAcknowledged =
             display.text !== buildGroceryDisplay(baselineGrams, family, fact).text;
+        const raisesOrKeepsAFlag = row.flagged_at !== null || display.text !== row.display_text;
+
+        const flagged =
+            change === 'increased' &&
+            row.is_checked &&
+            aboveAcknowledged &&
+            visibleAgainstAcknowledged &&
+            raisesOrKeepsAFlag;
 
         const previousQuantityGrams = row.is_checked ? baselineGrams : null;
-        const flaggedAt = flagged ? (row.flagged_at ?? now) : null;
+        // Only the change that actually arrived may re-judge the flag, which is
+        // why the direction is consulted and not just the baseline comparison.
+        // An INCREASE raises one, or keeps the instant an earlier one carries. A
+        // DECREASE clears it, because a smaller amount is nothing to warn about
+        // even while it stays above the acknowledged baseline. An UNCHANGED row
+        // keeps whatever it already had, deliberately WITHOUT re-deriving the
+        // predicate: the baseline is still below the current amount after a
+        // decrease has cleared a flag, so re-deriving it would raise a brand-new
+        // flag on an inert re-aggregation that told the shopper nothing.
+        const flaggedAt = change === 'unchanged' ? row.flagged_at : flagged ? (row.flagged_at ?? now) : null;
 
         const needsWrite =
             row.name !== draft.name ||
@@ -1231,13 +1325,25 @@ export const requireGroceryWritablePlan = (plan: GroceryPlanState | null, today:
     }
 
     if (plan.status !== ACTIVE_PLAN_STATUS) {
-        throw new PlanNotActiveError(plan.replacement_plan_id ?? undefined);
+        // The superseded variant exists so a stale screen can open the plan that
+        // replaced this one, so it is answered only when that id is actually
+        // known. A regeneration links the successor in the same transaction that
+        // supersedes the old plan, so a missing one here means the caller did
+        // not resolve the reverse link or the data contradicts itself — a fault
+        // to surface, not a 409 whose body omits what the variant promises.
+        if (!plan.replacement_plan_id) {
+            throw new GroceryDataError(
+                `plan ${plan.id} is stored '${plan.status}' but no replacement plan was resolved; ` +
+                    'a superseded plan always has a successor',
+            );
+        }
+
+        throw new PlanNotActiveError({ replacementPlanId: plan.replacement_plan_id });
     }
 
     if (requireDayKey(plan.end_date, 'end_date') < requireDayKey(today, 'today')) {
-        throw new PlanNotActiveError(undefined, ENDED_REASON);
+        throw new PlanNotActiveError({ reason: ENDED_REASON });
     }
 
     return plan;
 };
-

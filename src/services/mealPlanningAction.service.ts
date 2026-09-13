@@ -13,7 +13,9 @@
  *                 or is a conflict; BOTH decided before any plan check
  *   4. check    — only now the caller's plan status and revision checks
  *   5. work     — the caller's write, then its revision bump
- *   6. complete — freeze the response into the reserved row
+ *   6. complete — freeze the response into the reserved row, ONCE: the
+ *                 completion matches only a row that is still pending, so a
+ *                 duplicate can never rewrite a stored response
  *
  * Steps 1, 2, 5 and 6 are I/O and live here. Steps 3 and 4 turn on RULES, so
  * they live in `mealPlanningAction.logic.ts` and this module only sequences
@@ -33,6 +35,12 @@
  *
  * Who calls what:
  *
+ *   withMealPlanningTransaction — every service that writes through this
+ *     ledger, to OPEN the transaction. It is the sanctioned source of the
+ *     client the functions below accept: their parameter type refuses the
+ *     global Prisma client, because on an autocommit client the lock and the
+ *     reservation would each commit alone and none of the guarantees above
+ *     would hold.
  *   runKeyedAction — exactly three services: `mealPlan.service.ts` (generate,
  *     regenerate), `swap.service.ts` (commit), `plannedMealLog.service.ts`
  *     (log). There are deliberately no per-action wrappers: four thin wrappers
@@ -50,22 +58,32 @@
  * database work. Nothing in this file performs network I/O.
  */
 
-// Type-only use of the generated namespace, for the transaction-client and JSON
-// column types. `nutrition.service.ts` imports it the same way; the alternative
-// — hand-rolling Prisma's interactive-transaction deny list — would duplicate a
-// type Prisma owns and drift from it.
+// The generated namespace, for the transaction-client and JSON column types and
+// for `Prisma.DbNull` — the value that spells "IS NULL" for a nullable `jsonb`
+// column in a `where`. `nutrition.service.ts` imports it the same way; the
+// alternative — hand-rolling Prisma's interactive-transaction deny list — would
+// duplicate a type Prisma owns and drift from it.
 import { Prisma } from '../generated/prisma';
+// The shared singleton, so the one place that opens a meal-planning
+// transaction is this module rather than each calling service.
+import { prisma } from '../prisma/client';
 
 import { IdempotencyConflictError } from './mealPlanning.errors';
 import {
     ACTION_TYPES,
+    ActionLedgerIntegrityError,
+    KeyedActionCreatedIds,
     KeyedActionResponseBodies,
     KeyedActionResponseBody,
     KeyedActionType,
     MealPlanningActionRecord,
     StoredActionResponse,
+    assertInteractiveTransactionClient,
+    classifyActionCompletion,
     decideReplay,
+    findMissingCompletionFields,
     readStoredResponse,
+    resolveCreatedIdColumns,
     shapeStoredResponse,
 } from './mealPlanningAction.logic';
 
@@ -76,21 +94,79 @@ import {
 /**
  * An open interactive transaction — never the global client.
  *
- * The type is the guard. `pg_advisory_xact_lock` is released at the end of the
- * transaction that took it, so on an autocommit client the lock would be gone
- * by the time the next statement ran and every guarantee below would silently
- * evaporate. Prisma's transaction client is also the type that cannot open a
- * nested transaction, which is the other half of "one transaction per keyed
- * write".
+ * `Prisma.TransactionClient` alone does not say that. It is
+ * `Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" |
+ * "$use" | "$extends">`, which is structurally WIDER than `PrismaClient`, so
+ * the global client satisfies it and `runKeyedAction(prisma, …)` used to
+ * compile. It must not: `pg_advisory_xact_lock` is released at the end of the
+ * transaction that took it, so on the autocommit client the lock would be gone
+ * the moment its own statement returned, the reservation would commit by
+ * itself, and a failure part-way through would leave a permanently pending row
+ * that no later request can complete or replay. Every guarantee in this file
+ * would evaporate in silence.
+ *
+ * Intersecting the six deny-list members as `never` is what closes it. A
+ * genuine transaction client HAS none of them, so it still satisfies this type
+ * with no cast and no wrapper at the call site; the global client HAS all of
+ * them, so it is now a compile error wherever it is passed. Prisma's transaction
+ * client is also the one that cannot open a nested transaction, which is the
+ * other half of "one transaction per keyed write".
+ *
+ * The type is the first guard, not the only one:
+ * {@link assertInteractiveTransactionClient} repeats the check at run time for
+ * a caller that arrives through a cast, from JavaScript or from a test double,
+ * and {@link withMealPlanningTransaction} is the sanctioned way to obtain one.
  */
-export type MealPlanningTransactionClient = Prisma.TransactionClient;
+export type MealPlanningTransactionClient = Prisma.TransactionClient & {
+    readonly $connect?: never;
+    readonly $disconnect?: never;
+    readonly $on?: never;
+    readonly $transaction?: never;
+    readonly $use?: never;
+    readonly $extends?: never;
+};
+
+/** The Prisma transaction options this module simply forwards. */
+export interface MealPlanningTransactionOptions {
+    readonly maxWait?: number;
+    readonly timeout?: number;
+    readonly isolationLevel?: Prisma.TransactionIsolationLevel;
+}
+
+/**
+ * Opens one interactive transaction and hands `work` a client the ledger
+ * accepts.
+ *
+ * This exists so no caller has to reason about where its client came from: a
+ * service that needs the lock or the ledger calls this, writes its statements
+ * against the client it is given, and gets the whole sequence — lock,
+ * reservation, write, completion — inside a single transaction that rolls back
+ * as one unit. The client is validated before `work` sees it, so a future
+ * change to Prisma's transaction client cannot quietly turn this into an
+ * autocommit path.
+ *
+ * Options are forwarded rather than defaulted: the timeout a plan publish needs
+ * is a property of that write, and the service issuing it is the only thing
+ * that knows. What this module does require is that the transaction stay
+ * short-lived — no vendor call, no model call, nothing but database work
+ * between BEGIN and COMMIT (§0.5.1).
+ */
+export const withMealPlanningTransaction = async <TResult>(
+    work: (tx: MealPlanningTransactionClient) => Promise<TResult>,
+    options?: MealPlanningTransactionOptions,
+): Promise<TResult> =>
+    prisma.$transaction(async (tx) => {
+        assertInteractiveTransactionClient(tx, 'withMealPlanningTransaction');
+
+        return work(tx);
+    }, options);
 
 /* ---------------------------------------------------------------------------
  * What a caller hands in, and what it gets back
  * ------------------------------------------------------------------------- */
 
 /** A reserved — not yet completed — ledger row. */
-export interface ActionReservation {
+export interface ActionReservation<TAction extends KeyedActionType = KeyedActionType> {
     readonly actionId: string;
     /**
      * Carried beside the id so {@link completeAction} cannot be called with a
@@ -98,6 +174,12 @@ export interface ActionReservation {
      * the cross-user write Rule 7 §5.1 forbids.
      */
     readonly userId: string;
+    /**
+     * The action this row was reserved for, carried so the completion knows
+     * which ids it must record without being told a second time — and so it
+     * cannot be told a different action's ids than the row was reserved for.
+     */
+    readonly actionType: TAction;
 }
 
 /**
@@ -118,33 +200,34 @@ export interface KeyedActionParams<TAction extends KeyedActionType = KeyedAction
 }
 
 /**
- * The ids a keyed write creates, recorded on the ledger row.
+ * The ids a keyed write records, per action.
  *
- * All optional: generate records only a plan, swap a plan and a planned meal,
- * log all three. An explicit `null` is written as `null`; an absent member
- * leaves the column untouched.
+ * Re-exported from the pure layer, which owns both the table of which ids
+ * belong to which action and the runtime check that enforces it, so this
+ * module's public surface still names the type its callers use. A generate and
+ * a regenerate each record the plan they published; a swap records the plan and
+ * the planned meal it replaced; a log records the plan, the meal and the diary
+ * entry it created — each REQUIRED and non-null for its action, and an id
+ * belonging to no other.
  */
-export interface KeyedActionCreatedIds {
-    readonly mealPlanId?: string | null;
-    readonly mealPlanMealId?: string | null;
-    readonly mealEntryId?: string | null;
-}
+export type { KeyedActionCreatedIds };
 
 /**
  * What `work` returns: the response body, the revision the action produced, and
- * any ids it created.
+ * the ids its action records.
  *
- * The body is tied to the action type, so a swap cannot be completed with a
- * generate's response shape — that is a compile error rather than a replay that
- * returns the wrong thing. Returning the ids here is why no caller needs to
- * reach for {@link completeAction} itself: an id discovered anywhere inside
- * `work` simply rides out on the completion.
+ * Both halves are tied to the action type. A swap cannot be completed with a
+ * generate's response shape, and a generate cannot be completed without the
+ * plan id it published or with a diary entry id it never created — compile
+ * errors, rather than a replay that returns the wrong thing or a ledger row
+ * that misdescribes its own write. Returning the ids here is why no caller
+ * needs to reach for {@link completeAction} itself: an id discovered anywhere
+ * inside `work` simply rides out on the completion.
  */
-export interface KeyedActionCompletion<TAction extends KeyedActionType = KeyedActionType>
-    extends KeyedActionCreatedIds {
+export type KeyedActionCompletion<TAction extends KeyedActionType = KeyedActionType> = KeyedActionCreatedIds<TAction> & {
     readonly body: KeyedActionResponseBodies[TAction];
     readonly planRevisionAfter: number;
-}
+};
 
 /**
  * Exactly what the controller sends, whether this was the first attempt or the
@@ -156,11 +239,17 @@ export interface KeyedActionCompletion<TAction extends KeyedActionType = KeyedAc
  * a replay it comes back out of a `jsonb` column, so the pure layer types it
  * `unknown` and this module propagates that rather than asserting a shape it
  * did not verify. The controller only forwards it.
+ *
+ * `planRevisionAfter` is a plain `number` in both directions. A fresh action
+ * knows the revision it produced, and a replay is only ever answered from a row
+ * whose three completion columns are all filled — a half-completed row is
+ * reported, never answered — so there is no case in which a keyed response
+ * exists without the revision it is required to carry.
  */
 export interface KeyedActionResult {
     readonly status: number;
     readonly body: unknown;
-    readonly planRevisionAfter: number | null;
+    readonly planRevisionAfter: number;
 }
 
 /* ---------------------------------------------------------------------------
@@ -277,6 +366,13 @@ export const withUserLock = async <TResult>(
     userId: string,
     work: (tx: MealPlanningTransactionClient) => Promise<TResult>,
 ): Promise<TResult> => {
+    // Before the lock, not after: a lock taken on the autocommit client is
+    // released as its own statement returns, so everything after it would run
+    // unserialised while looking exactly like this code path. Checked here
+    // rather than only at `runKeyedAction` because the preference, target and
+    // grocery writes take the lock through this function alone.
+    assertInteractiveTransactionClient(tx, 'withUserLock');
+
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext('meal-planning:' || ${userId}))`;
 
     return work(tx);
@@ -303,10 +399,10 @@ export const withUserLock = async <TResult>(
  * lock-serialised same-key request always finds either no row (proceed) or a
  * completed one (replay), and never has to guess about a half-finished action.
  */
-const reserveAction = async (
+const reserveAction = async <TAction extends KeyedActionType>(
     tx: MealPlanningTransactionClient,
-    params: KeyedActionParams,
-): Promise<ActionReservation | null> => {
+    params: KeyedActionParams<TAction>,
+): Promise<ActionReservation<TAction> | null> => {
     const reserved = await tx.$queryRaw<ReservedActionRow[]>`
         INSERT INTO meal_plan_actions (user_id, idempotency_key, action_type, request_fingerprint)
         VALUES (${params.userId}, ${params.idempotencyKey}, ${params.actionType}, ${params.fingerprint})
@@ -318,7 +414,7 @@ const reserveAction = async (
         return null;
     }
 
-    return { actionId: reserved[0].id, userId: params.userId };
+    return { actionId: reserved[0].id, userId: params.userId, actionType: params.actionType };
 };
 
 /**
@@ -339,6 +435,25 @@ const readAction = async (
 };
 
 /**
+ * Re-reads a reservation by its id, owner-scoped (Rule 7 §5.1).
+ *
+ * Called on exactly one path: a completion that matched no row, where the only
+ * useful next thing is to say why. `findFirst` rather than `findUnique` because
+ * the predicate is the id AND the owner — the pair is what makes one user's id
+ * unable to address another user's row.
+ */
+const readReservedAction = async (
+    tx: MealPlanningTransactionClient,
+    reservation: ActionReservation,
+): Promise<MealPlanningActionRecord | null> => {
+    const row = await tx.meal_plan_actions.findFirst({
+        where: { id: reservation.actionId, user_id: reservation.userId },
+    });
+
+    return row === null ? null : toActionRecord(row);
+};
+
+/**
  * The reservation conflicted, so this key has been used before: replay it or
  * reject it.
  *
@@ -353,7 +468,15 @@ const readAction = async (
  * The stored status and body are returned unchanged — never re-derived from the
  * action type — so every replay of a committed action is identical to every
  * other. (`jsonb` normalises key order at rest, so assert on the value rather
- * than on the serialized text.)
+ * than on the serialized text.) A row's age is never consulted: rows are kept
+ * indefinitely and a committed action replays for as long as its row exists.
+ *
+ * Two abnormal shapes are reported rather than answered. A PENDING row is
+ * handled below; a HALF-COMPLETED one raises `ActionLedgerIntegrityError` out
+ * of `readStoredResponse`, because a row holding a status and a body but no
+ * revision records an outcome no completion in this ledger could have written,
+ * and answering the client from it would report a result the ledger cannot
+ * vouch for.
  */
 const replayReservedAction = async (
     tx: MealPlanningTransactionClient,
@@ -395,43 +518,120 @@ const replayReservedAction = async (
  * ------------------------------------------------------------------------- */
 
 /**
- * Freezes a finished action's response into its reserved row.
+ * Says why a completion matched no row, having read the row back.
+ *
+ * Separated from {@link completeAction} so the write path stays one statement
+ * and one check: everything here runs only when the compare-and-set has
+ * already failed. Reading is safe at that point — `updateMany` matching nothing
+ * is not an error, so the transaction is still usable — and it is what turns
+ * "0 rows" into the one thing an operator needs to know.
+ */
+const failedCompletion = async (
+    tx: MealPlanningTransactionClient,
+    reservation: ActionReservation,
+    matched: number,
+): Promise<Error> => {
+    if (matched > 1) {
+        return new Error(
+            `Completing meal_plan_actions row ${reservation.actionId} matched ${String(matched)} rows. The ` +
+                'primary key cannot match more than one row, so the ledger is not the table this ledger thinks ' +
+                'it is.',
+        );
+    }
+
+    const row = await readReservedAction(tx, reservation);
+
+    if (row === null) {
+        return new Error(
+            `Completing meal_plan_actions row ${reservation.actionId} matched no row: the reservation this ` +
+                `transaction created for user ${reservation.userId} is gone, so the action cannot be recorded.`,
+        );
+    }
+
+    const state = classifyActionCompletion(row);
+
+    if (state === 'completed') {
+        // The point of the compare-and-set. The first response stands: it is
+        // what the client has already been told, or will be told on its next
+        // retry, and overwriting it here would make two retries of one action
+        // disagree about what happened.
+        return new Error(
+            `meal_plan_actions row ${row.id} is already completed with status ${String(row.responseStatus)} at ` +
+                `plan revision ${String(row.planRevisionAfter)}, so this completion updated no row. A completed ` +
+                'action is frozen — its stored response is what every replay returns — and this ' +
+                `${reservation.actionType} attempted to record a second outcome over it. The transaction is ` +
+                'rolled back rather than allowing the first response to be rewritten.',
+        );
+    }
+
+    if (state === 'corrupt') {
+        return new ActionLedgerIntegrityError(findMissingCompletionFields(row), row.id);
+    }
+
+    return new Error(
+        `meal_plan_actions row ${row.id} is still pending, yet completing it updated no row. The compare-and-set ` +
+            'predicate and the pending state disagree, which means one of them no longer describes the ledger.',
+    );
+};
+
+/**
+ * Freezes a finished action's response into its reserved row — once, and only
+ * while that row is still pending.
  *
  * {@link runKeyedAction} already does this from the completion `work` returns,
  * which is the normal path; this is exported for a caller that genuinely has to
  * write the row itself, and such a caller must not also return a completion, or
  * the row would be written twice.
  *
- * The `where` carries the owner key beside the id (Rule 7 §5.1). That is not
- * ceremony here: an id-only predicate would let one user's retry overwrite the
- * stored response of another user's action. The affected-row count is checked
- * rather than assumed, because a reservation that has vanished mid-transaction
- * means the invariant above is broken and the response would otherwise be
- * dropped in silence.
+ * The `where` is a COMPARE-AND-SET, and that is the whole safety of it:
+ *
+ *  - the owner key sits beside the id (Rule 7 §5.1) — an id-only predicate
+ *    would let one user's retry overwrite another user's stored response;
+ *  - the three completion columns must still be NULL, which is exactly the
+ *    pending state §0.5.1 defines. A row that has already completed therefore
+ *    matches nothing, so a duplicate or misordered completion updates ZERO
+ *    rows and fails instead of silently replacing the stored status, body,
+ *    revision or created ids. Verbatim first-response replay depends on the
+ *    stored response never changing after it is written, and nothing but this
+ *    predicate enforces that: the columns are nullable by design, so the
+ *    database will happily accept a second write.
+ *
+ * The created ids are resolved through the pure per-action rule first, so a
+ * completion that does not describe its own action aborts the transaction
+ * before any of it is recorded — and all three id columns are written
+ * explicitly, so a completed row never inherits a value this ledger did not
+ * choose.
  */
-export const completeAction = async (
+export const completeAction = async <TAction extends KeyedActionType>(
     tx: MealPlanningTransactionClient,
-    reservation: ActionReservation,
+    reservation: ActionReservation<TAction>,
     response: StoredActionResponse,
-    createdIds: KeyedActionCreatedIds = {},
+    createdIds: KeyedActionCreatedIds<TAction>,
 ): Promise<void> => {
+    assertInteractiveTransactionClient(tx, 'completeAction');
+
+    const columns = resolveCreatedIdColumns(reservation.actionType, createdIds);
+
     const completed = await tx.meal_plan_actions.updateMany({
-        where: { id: reservation.actionId, user_id: reservation.userId },
+        where: {
+            id: reservation.actionId,
+            user_id: reservation.userId,
+            response_status: null,
+            response_snapshot: { equals: Prisma.DbNull },
+            plan_revision_after: null,
+        },
         data: {
             response_status: response.responseStatus,
             response_snapshot: asJsonColumnValue(response.responseSnapshot),
             plan_revision_after: response.planRevisionAfter,
-            ...(createdIds.mealPlanId !== undefined ? { meal_plan_id: createdIds.mealPlanId } : {}),
-            ...(createdIds.mealPlanMealId !== undefined ? { meal_plan_meal_id: createdIds.mealPlanMealId } : {}),
-            ...(createdIds.mealEntryId !== undefined ? { meal_entry_id: createdIds.mealEntryId } : {}),
+            meal_plan_id: columns.mealPlanId,
+            meal_plan_meal_id: columns.mealPlanMealId,
+            meal_entry_id: columns.mealEntryId,
         },
     });
 
     if (completed.count !== 1) {
-        throw new Error(
-            `Completing meal_plan_actions row ${reservation.actionId} updated ${String(completed.count)} rows ` +
-                'instead of 1. The reservation this transaction created is gone, so the action cannot be recorded.',
-        );
+        throw await failedCompletion(tx, reservation, completed.count);
     }
 };
 
@@ -446,6 +646,11 @@ export const completeAction = async (
  * If the key is not new, replay the stored response verbatim or answer
  * `IdempotencyConflictError` (409), before `work` or any plan check is reached.
  *
+ * `tx` must be an open interactive transaction — obtain it from
+ * {@link withMealPlanningTransaction}. The type refuses the global client and
+ * the lock re-checks it at run time, because on the autocommit client the lock
+ * and the reservation would each commit alone and nothing below would hold.
+ *
  * `work` receives this transaction and the reservation, and must use that
  * client: opening its own transaction or reaching for the global Prisma client
  * would put its writes outside the lock and outside the rollback that protects
@@ -454,6 +659,12 @@ export const completeAction = async (
  * `StalePlanError` for a revision that has moved — belong at the top of `work`,
  * where they cannot pre-empt a replay. Those checks live with the caller
  * because it is the service that knows its own plan shape.
+ *
+ * What `work` returns is the whole record of the action: the response body, the
+ * revision it produced, and the ids its action records (a plan for a generate
+ * or regenerate, a plan and a planned meal for a swap, those and the diary
+ * entry for a log). Each is required for its action, so an action cannot be
+ * completed without the ids that make its ledger row traceable.
  *
  * Anything `work` throws propagates untouched: the transaction rolls back, the
  * reservation disappears with it, no plan or meal is left half-written, and the
@@ -466,7 +677,7 @@ export const runKeyedAction = async <TAction extends KeyedActionType>(
     params: KeyedActionParams<TAction>,
     work: (
         tx: MealPlanningTransactionClient,
-        reservation: ActionReservation,
+        reservation: ActionReservation<TAction>,
     ) => Promise<KeyedActionCompletion<TAction>>,
 ): Promise<KeyedActionResult> =>
     withUserLock(tx, params.userId, async (lockedTx) => {

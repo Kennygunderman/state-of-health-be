@@ -2,6 +2,11 @@
   "allowlistVersion": "v1",
   "registrySnapshot": "2026-09-08",
   "rowCount": 52,
+  "registryRowCount": 51,
+  "supplementalRowCount": 1,
+  "supplementalCidrs": [
+    "::/96"
+  ],
   "fetchLimits": {
     "schemes": [
       "https"

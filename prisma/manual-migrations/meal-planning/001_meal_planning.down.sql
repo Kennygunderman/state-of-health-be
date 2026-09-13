@@ -14,32 +14,66 @@
 -- THIS IS NOT PART OF ANY DEPLOY, AND NOT PART OF ROLLBACK. Redeploying an
 -- earlier backend commit needs no schema change at all: every object here is
 -- additive and inert once the two feature gates are closed, so a rollback simply
--- leaves it in place (docs/meal-planning/release-and-recovery.md). No npm
--- script, CI step or Prisma command executes THIS file - nothing in the
--- repository references it, and Prisma only ever reads prisma/migrations - and
+-- leaves it in place (docs/meal-planning/release-and-recovery.md). Nothing
+-- executes THIS file: no npm script, no CI step, no Prisma command and no
+-- source file invokes it, Prisma only ever reads prisma/migrations, and
 -- `prisma/manual-migrations` is listed in .dockerignore, so the runtime image
--- does not contain it. The one automated reader of this folder is the schema
--- equivalence gate in src/__tests__/api/compat.test.ts, which applies the up
--- script beside this one to a disposable database to prove the two ledgers
--- agree; it never runs this file. It exists so that removal, if it is ever
--- genuinely required, is a reviewed procedure rather than DDL improvised under
--- pressure.
+-- does not contain it. Two documents do point at it, deliberately - README.md
+-- in this folder and docs/meal-planning/release-and-recovery.md - and that
+-- documentation is the whole of its presence in the repository. The one
+-- automated reader of this folder is the ledger-equivalence gate in
+-- src/__tests__/api/compat.test.ts, which applies the up script beside this one
+-- to a disposable database to prove the two ledgers agree; it never reads this
+-- file. This file exists so that removal, if it is ever genuinely required, is a
+-- reviewed procedure rather than DDL improvised under pressure.
 -- These are the first DROP statements anywhere under prisma/, which is why the
 -- warning is this long.
 --
 -- BEFORE RUNNING IT
---   1. Take a fresh backup and confirm it restores. It is the only way back:
---        pg_dump --format=custom "$DATABASE_URL" > pre-removal.dump
---   2. Point it only at a database you are prepared to lose. Never at production,
---      and never at a database holding user data you have not just backed up.
---   3. Run it in a reviewed maintenance window, with the API stopped or both
---      feature gates closed, so nothing is mid-write:
---        psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 001_meal_planning.down.sql
---   4. Reconcile the Prisma migration history afterwards. That step is an
---      operator decision rather than DDL, so it is documented in README.md in
---      this folder and in docs/meal-planning/release-and-recovery.md, not here.
+--   1. Name the target yourself, and do not let any command below read an
+--      ambient DATABASE_URL. In this project's development environment that
+--      variable arrives holding the PRODUCTION URL unless the shell overrides
+--      it, so a destructive command that defaults to it is one forgotten export
+--      away from the wrong database. Type the database name out - it is the
+--      affirmation that both this procedure and the guard in section 0 check -
+--      and build the URL beside it:
+--        REMOVAL_TARGET_DB='<the disposable database you intend to strip>'
+--        REMOVAL_TARGET_URL="postgresql://<user>@<host>:<port>/$REMOVAL_TARGET_DB"
+--   2. Prove that URL is that database, before anything else touches it. Put
+--      steps 2 to 4 in a file and run it with `bash -euo pipefail` rather than
+--      pasting them loose: the check below has to END the run, not print a
+--      warning that scrolls past into the backup and the removal. Under
+--      errexit, an unreachable host or a refused login aborts here too, because
+--      the failing psql takes the script down with it.
+--        ACTUAL_DB=$(psql "$REMOVAL_TARGET_URL" -tAc 'SELECT current_database()')
+--        if [ "$ACTUAL_DB" != "$REMOVAL_TARGET_DB" ]; then
+--          echo "STOP: that URL is $ACTUAL_DB, not $REMOVAL_TARGET_DB" >&2
+--          exit 1
+--        fi
+--        psql "$REMOVAL_TARGET_URL" -tAc \
+--          'SELECT current_database(), current_user, inet_server_addr(), inet_server_port()'
+--      Read that last line before continuing: only a database you are prepared
+--      to lose belongs here. Never production, and never one holding user data
+--      you have not just backed up. Nothing in this file can tell those apart
+--      for you - see section 0.
+--   3. Take a fresh backup of that same database and confirm it restores. It is
+--      the only way back:
+--        pg_dump --format=custom "$REMOVAL_TARGET_URL" \
+--          > "$REMOVAL_TARGET_DB-pre-removal.dump"
+--   4. Run it from the backend/ directory - the path below is relative to it -
+--      in a reviewed maintenance window, with the API stopped or both feature
+--      gates closed, so nothing is mid-write. The SET is not optional: section 0
+--      refuses to drop anything without it, and refuses again if the name and
+--      the connection disagree.
+--        psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 \
+--          -c "SET meal_planning.removal_target = '$REMOVAL_TARGET_DB'" \
+--          -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
+--   5. Reconcile the Prisma migration history afterwards, against that same
+--      $REMOVAL_TARGET_URL. That step is an operator decision rather than DDL,
+--      so it is documented in README.md in this folder and in
+--      docs/meal-planning/release-and-recovery.md, not here.
 --
--- WHAT IS DESTROYED - permanently, absent the backup from step 1
+-- WHAT IS DESTROYED - permanently, absent the backup from step 3
 --   - every user's weekly plans, plan days and planned meals, including swap
 --     history ("previous_recipe_version_id") and incompatibility flags;
 --   - every grocery list, with the check state and the increase flags a user
@@ -59,9 +93,19 @@
 --   Retained vendor-derived data goes with those tables: the USDA identity and
 --   description fields on "catalog_foods", the ingredient snapshots on
 --   "recipe_ingredients", "meal_plans"."targets_snapshot" and
---   "meal_plan_actions"."response_snapshot". Re-populating a catalog afterwards
---   is a `catalog:load` of a committed release plus `recipes:seed`, not a
---   restore - the identifiers will not be the ones these rows used.
+--   "meal_plan_actions"."response_snapshot". Putting a catalog back afterwards
+--   is never a restore of these rows: it is a fresh load, and the identifiers
+--   will not be the ones they used. The route for it is
+--   `npm run catalog:load -- --release <v>` of a reviewed, checksummed release
+--   followed by `npm run recipes:seed` - but that pipeline is still landing on
+--   this branch (Agent Action Plan section 0.7.1, groups 3 and 4), so it is not
+--   a recovery path to count on yet: as this file is committed, both scripts
+--   stop at their input contract and report `stage_pipeline_pending`, and
+--   data/meal-planning/catalog/releases/v1/ carries no manifest.json for the
+--   loader to verify against. Check the state before relying on it - the status
+--   table in docs/meal-planning/release-and-recovery.md tracks it, and
+--   `npm run catalog:load -- --release v1` reports its own unmet inputs - and
+--   until it is wired, the backup from step 3 is the only way back to this data.
 --
 -- WHAT SURVIVES
 --   Diary history is left intact, which is the point of the ordering below. The
@@ -81,12 +125,62 @@
 --   personal foods, workouts, templates, runs, weigh-ins, records, AI usage and
 --   the USDA response cache.
 --
--- Every statement is guarded with IF EXISTS, so re-running the file is a no-op,
--- and an interrupted run can be re-run to completion. It is not a repair tool
+-- Every DROP is guarded with IF EXISTS, so re-running the file is a no-op once
+-- the guard in section 0 is satisfied again, and an interrupted run can be
+-- re-run to completion. It is not a repair tool
 -- for a partially applied schema in the other direction: it will not add
 -- anything back. README.md in this folder explains when an operator would reach
 -- for this file; docs/meal-planning/release-and-recovery.md carries the release
 -- and rollback procedure. Neither is repeated here.
+
+-- ---------------------------------------------------------------------------
+-- 0. Removal-target guard. Nothing below this runs unless it passes.
+--
+-- The operator states, in the same session, which database the removal is for;
+-- this block raises unless that name is the database the connection is actually
+-- on. That is what makes the procedure fail closed rather than prose-closed: a
+-- session that declares nothing drops nothing at all - which is what an
+-- invocation that just hands psql an ambient connection string does, whatever
+-- that string happens to hold - and a session that declares one database while
+-- connected to another drops nothing either.
+--
+-- What it proves is intent, not safety. It cannot tell a production database
+-- from a scratch copy, and it will accept any name that matches the connection,
+-- so it is no substitute for steps 1 to 3 above: it establishes that this
+-- removal was aimed at a named database on purpose, and nothing more.
+--
+--   SET meal_planning.removal_target = '<the name typed in step 1 above>';
+--
+-- Pass it with `-c` before `-f`, as step 4 does, or run it as the first
+-- statement of the same session in a SQL console. The setting is session
+-- scoped: it is never written to the database and cannot be left behind as a
+-- standing permission. Run the file with -v ON_ERROR_STOP=1 (or inside a single
+-- transaction) so the raise stops the script rather than being logged and
+-- stepped over.
+-- ---------------------------------------------------------------------------
+
+DO $$
+DECLARE
+    declared_target text := btrim(coalesce(current_setting('meal_planning.removal_target', true), ''));
+BEGIN
+    IF declared_target = '' THEN
+        RAISE EXCEPTION
+            'meal-planning removal refused: this session declared no removal target, and the database to strip is not guessed from the connection (currently %)',
+            current_database()
+            USING HINT =
+                'Run SET meal_planning.removal_target = ''<database name>''; in this same session, naming the disposable database you have just backed up. See BEFORE RUNNING IT at the top of this file.';
+    END IF;
+
+    IF declared_target <> current_database() THEN
+        RAISE EXCEPTION
+            'meal-planning removal refused: this session declared % but is connected to %',
+            declared_target, current_database()
+            USING HINT =
+                'The declared name and the connection URL have to be the same database. Check which URL was passed to psql before changing either of them.';
+    END IF;
+
+    RAISE NOTICE 'meal-planning removal proceeding against database % as %', current_database(), current_user;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- 1. Detach "meal_entries" first.

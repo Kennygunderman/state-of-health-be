@@ -11,19 +11,47 @@
 //    it would own the rule twice. `q` arrives already trimmed and bounded.
 //  * `catalog.mapper.ts` owns the row -> DTO boundary, including the closed-set
 //    narrowing of every TEXT code column. No response shape is assembled here.
-//  * `utils/pagination.ts` owns the pagination block and the `limit` cap, both
-//    at the controller boundary. This file returns `{items, total}` and never
-//    the `{page, limit, total, totalPages}` envelope (§4).
+//  * `utils/pagination.ts` owns the offset scheme end to end: the
+//    `{page, limit, total, totalPages}` envelope and the per-route `limit` cap
+//    at the controller boundary, and `rowWindowFor` — the bounded `LIMIT` and
+//    `OFFSET` a paged statement runs with — here, so request input is turned
+//    into query arithmetic in one audited place rather than per service. This
+//    file returns `{items, total}` and never the envelope (§4).
 //
-// THE ONE SANCTIONED EXCEPTION TO §5.1. Rule backend-architecture §5.1 requires
+// A SANCTIONED EXCEPTION TO §5.1. Rule backend-architecture §5.1 requires
 // `user_id` in every `where`; the reads below carry no tenant predicate,
 // deliberately, because `catalog_foods` and its child tables hold no `user_id`
-// at all. The catalog is shared reference data — the same ten thousand foods
-// for every user — so there is no owner to scope to and no cross-user row to
-// leak. These are the only authenticated reads in the backend without a tenant
-// predicate; a synthetic user scope here would be fiction, not safety. Every
-// other query in this folder carries the owner key, and a per-user catalog
-// concept (a personal food) already has its own owned table, `foods`.
+// at all. The catalog is shared reference data — the same rows for every user,
+// loaded from a reviewed release — so there is no owner to scope to and no
+// cross-user row to leak. A synthetic user scope here would be fiction, not
+// safety. A per-user catalog concept (a personal food) already has its own
+// owned table, `foods`, and every meal-planning query that touches a
+// user-owned table does carry the owner key — but that is a statement about
+// meal planning and nothing wider. This file makes no claim about
+// `src/services` as a whole, because two queries there would contradict it; see
+// the accounting immediately below.
+//
+// Within meal planning these catalog reads, and the recipe reads that belong to
+// `recipe.service.ts`, are the only authenticated reads without a tenant
+// predicate. They are NOT the only untenanted queries in the backend, and the
+// difference matters to anyone auditing §5.1. Two pre-existing ones are
+// legitimate and are recorded here so this comment cannot be read as erasing
+// them:
+//
+//  * `usda.service.ts` reads `usda_api_cache` by `cache_key` alone while
+//    serving the authenticated `GET /api/macros/search-branded-foods` and
+//    `GET /api/macros/branded-food/:foodId`, because a cached vendor response
+//    has no owner either. Same shape of exception as this file's, same
+//    justification.
+//  * `food.service.ts::updateFood` resolves the row with an owner-scoped
+//    `findFirst` and then issues its `update` by `id` alone. The authorization
+//    is real — a foreign id never reaches the update — but the WRITE predicate
+//    itself carries no `user_id`, so it is not an example of the rule being
+//    met, and citing it as one would be wrong. It is shipped behaviour this
+//    feature does not touch.
+//
+// Any further untenanted query is a new exception and needs its own
+// justification.
 //
 // The same exception is why no function below takes `userId` first, as §5's
 // signature convention otherwise requires: that parameter exists to scope the
@@ -40,16 +68,25 @@
 //    "search never mutates the catalog" a property of the architecture rather
 //    than a convention.
 //  * NO VENDOR CALL. Neither `usda.service.ts` nor `openrouter.service.ts` is
-//    imported. After seeding, catalog search makes no live USDA or model call —
-//    an explicit product guarantee, pinned by `src/__tests__/api/offline.test.ts`
-//    with both API keys unset and the network mocked to throw.
-//  * NO RECIPE READS. `recipe.service.ts::getRecipeVersionForUser` is the single
-//    owner of recipe reads; `GET /api/recipes/:recipeVersionId` reaches it
-//    through `catalog.controller.ts`. The only recipe column touched here is a
-//    `COUNT` for the operator status report.
+//    imported, so after seeding catalog search cannot make a live USDA or model
+//    call — an explicit product guarantee, and at this checkpoint a structural
+//    one: the import list below is the whole of the proof. The end-to-end proof
+//    planned for it, `src/__tests__/api/offline.test.ts` with both API keys
+//    unset and the network mocked to throw (AAP §0.9.2), is not in this
+//    checkout, so nothing here may be read as measured offline behaviour.
+//  * NO RECIPE READS. The only recipe column touched here is a `COUNT` for the
+//    operator status report. Recipe reads belong to
+//    `recipe.service.ts::getRecipeVersionForUser` as their single owner, which
+//    `GET /api/recipes/:recipeVersionId` is to reach through
+//    `catalog.controller.ts` — planned wiring (AAP §0.7.1 Groups 3 and 4), not
+//    present wiring: neither of those modules exists in this checkout, `app.ts`
+//    mounts no catalog router, and nothing calls the three functions below yet.
+//    This file is written to that contract so the chain reads
+//    `catalog.routes → catalog.controller → recipe.service` the moment the two
+//    land, and so no recipe query is ever added or re-exported here.
 //  * NO FEATURE FLAG. `/catalog/*` is never gated — Add Food's catalog section
-//    does not depend on meal planning — and the gate for `/recipes/*` is applied
-//    by the controller through `utils/featureFlags.ts`.
+//    does not depend on meal planning — and the gate for `/recipes/*` belongs to
+//    that same controller, through `utils/featureFlags.ts`, once it exists.
 //  * NO TYPED ERROR OF ITS OWN. None of the three use cases has a failure the
 //    client must distinguish: an unmatched search is an empty page, an empty
 //    suggestion set is an empty list, and a catalog with no release loaded
@@ -57,11 +94,24 @@
 //    the response contract, which is `catalog.mapper.ts`'s `CatalogMappingError`
 //    and belongs to that boundary.
 //
-// THIS SERVICE IS A MEASURED UNIT. `scripts/search-benchmark.ts` times
-// `searchPublishedFoods` IN PROCESS, so the p50/p95 it reports is the search
-// itself with no HTTP round trip. Nothing here may add per-call work that is not
-// part of answering the query: no warm-up, no memoisation, no cache, and no
-// logging in the hot path.
+// THIS SERVICE IS THE MEASURED UNIT OF THE SEARCH BENCHMARK — BY CONTRACT, NOT
+// YET BY MEASUREMENT. `data/meal-planning/search-benchmark.v1.json` names
+// `catalog.service.searchPublishedFoods` as its `measuredUnit` and declares the
+// protocol around it: one untimed warm-up pass, three timed passes, sequential,
+// a single connection, timed in process so no HTTP round trip is included (AAP
+// §0.9.3). `scripts/search-benchmark.ts` is the runner that contract belongs to,
+// and at this checkpoint it validates its inputs and refuses with
+// `stage_pipeline_pending` — it does not import this module, time anything or
+// write a report — so NO p50/p95 figure for this service exists anywhere yet.
+//
+// The constraint that contract places on this file holds regardless of when the
+// runner's measurement body lands, because it is what makes a later measurement
+// mean anything: nothing here may add per-call work that is not part of
+// answering the query — no warm-up, no memoisation, no cache, and no logging in
+// the hot path. The one exception is deliberate and is the protocol's own: each
+// use case opens a single transaction so its statements read one snapshot on one
+// connection, which is both a correctness requirement (below) and the
+// `sequential`/`connections: 1` execution the benchmark declares it measures.
 
 import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
@@ -71,15 +121,62 @@ import {
     CatalogStatusResponse,
     CatalogSuggestionsResponse,
 } from '../types/catalog';
+import { rowWindowFor } from '../utils/pagination';
 import {
     CatalogFoodPortionRow,
     CatalogFoodRow,
     CatalogReleaseRunRow,
     CatalogStatusCounts,
+    CatalogSuggestionRow,
     mapCatalogFood,
     mapCatalogStatus,
     mapCatalogSuggestion,
 } from './catalog.mapper';
+
+/* ---------------------------------------------------------------------------
+ * How a use case reads
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The client the statements of one use case run on.
+ *
+ * Always a transaction client, never the pool: the reads that make up a single
+ * response have to agree with each other, and Prisma hands each independent
+ * statement whatever connection is free, each with its own snapshot. A catalog
+ * load publishing and retiring rows between two of them is not hypothetical —
+ * `catalog-load.ts` is an ordinary operator command that can run while the API
+ * serves traffic — and the result would be a page of twenty-five rows beside a
+ * total taken from a different catalog: a `totalPages` that lies, a client that
+ * pages into a gap, and an operator status report whose published count and
+ * release pointer describe different moments.
+ *
+ * `Prisma.TransactionClient` is the pool client minus the methods a transaction
+ * cannot offer (`$transaction`, `$connect`, `$disconnect`, …); `$queryRaw` and
+ * the model delegates are all retained, so every read below is written exactly
+ * as it would be against the pool.
+ */
+type SnapshotClient = Prisma.TransactionClient;
+
+/**
+ * How each use case opens that snapshot.
+ *
+ * REPEATABLE READ rather than the default READ COMMITTED because that is the
+ * whole point: under READ COMMITTED every statement takes a fresh snapshot even
+ * inside one transaction, so grouping them would buy the single connection and
+ * none of the coherence. Under REPEATABLE READ the first statement fixes the
+ * snapshot and the rest read it.
+ *
+ * These transactions are read-only and short — three indexed statements for a
+ * search, five for the status report — so they take no locks a writer can queue
+ * behind, and Prisma's default `timeout` applies unchanged. Statements inside
+ * one are awaited SEQUENTIALLY: an interactive transaction is one connection, so
+ * issuing them together would not parallelise anything, and it is also the
+ * execution the benchmark protocol declares (`sequential: true`,
+ * `connections: 1`).
+ */
+const SNAPSHOT_OPTIONS = {
+    isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+} as const;
 
 /* ---------------------------------------------------------------------------
  * What the catalog considers visible
@@ -248,17 +345,40 @@ const catalogMatchSet = (q: string): Prisma.Sql => {
  * the total would count it four times.
  *
  * THE ORDER IS TOTAL AND PORTABLE: `rank DESC, display_name ASC, source_key
- * ASC`. The `source_key` tiebreaker is load-bearing rather than decorative —
- * primary keys are `gen_random_uuid()` and therefore differ between two
- * independently loaded databases, so an order that fell back to `id` would
- * produce different page sequences on two machines holding the same release, and
- * a row could be both skipped and repeated across pages. `source_key` is
- * deterministic (`usda:<fdcId>` / `ai:<category>:<name>:<state>`), which is what
- * makes pagination stable and lets the benchmark evidence release determinism by
- * comparing two freshly loaded databases.
+ * ASC`, with both text keys sorted under an explicit collation. Two independent
+ * things make it portable, and the order needs both:
+ *
+ *  1. `source_key` as the final key. Primary keys are `gen_random_uuid()` and
+ *     therefore differ between two independently loaded databases, so an order
+ *     that fell back to `id` would produce different page sequences on two
+ *     machines holding the same release, and a row could be both skipped and
+ *     repeated across pages. `source_key` is deterministic
+ *     (`usda:<fdcId>` / `ai:<category>:<name>:<state>`), so it settles every tie
+ *     the same way everywhere.
+ *  2. `COLLATE "C"` on both text keys. Without it the comparison is the
+ *     DATABASE's default collation, which is a property of how the database was
+ *     created rather than of this release — and the orders genuinely differ.
+ *     Measured on PostgreSQL 16 over five catalog-shaped names ('Beans, black',
+ *     'Beans black', 'beans, green', 'Beans-lima', 'BEANS, navy'), `C` yields
+ *     `BEANS, navy | Beans black | Beans, black | Beans-lima | beans, green`
+ *     while `und-x-icu` — the default a database created with the ICU locale
+ *     provider gets — yields
+ *     `Beans black | Beans-lima | Beans, black | beans, green | BEANS, navy`.
+ *     That is a different page sequence for the same catalog, which AAP §0.9.3
+ *     forbids ("identical ranks and page sequences" on a second independently
+ *     loaded database), and the `source_key` tiebreaker cannot rescue it because
+ *     it is consulted only after `display_name` has already compared unequal —
+ *     and would itself be collation-dependent for the same reason.
+ *
+ * `C` is byte order over the stored UTF-8, built into every PostgreSQL server
+ * and needing no extension or locale to be installed, so it is available and
+ * identical in every environment. Sorting by bytes rather than by language does
+ * mean 'Zucchini' precedes 'apple'; that is the price of an order two machines
+ * agree on, and the ordering contract in
+ * `data/meal-planning/search-benchmark.v1.json` records it as the pinned choice.
  */
-const selectSearchPage = (matchSet: Prisma.Sql, limit: number, offset: number) =>
-    prisma.$queryRaw<CatalogFoodRow[]>`
+const selectSearchPage = (db: SnapshotClient, matchSet: Prisma.Sql, limit: number, offset: number) =>
+    db.$queryRaw<CatalogFoodRow[]>`
         ${matchSet},
         ranked AS (
             SELECT id, MAX(rank) AS rank
@@ -284,7 +404,7 @@ const selectSearchPage = (matchSet: Prisma.Sql, limit: number, offset: number) =
             f.food_group
         FROM ranked r
         JOIN catalog_foods f ON f.id = r.id
-        ORDER BY r.rank DESC, f.display_name ASC, f.source_key ASC
+        ORDER BY r.rank DESC, f.display_name COLLATE "C" ASC, f.source_key COLLATE "C" ASC
         LIMIT ${limit} OFFSET ${offset}
     `;
 
@@ -293,10 +413,11 @@ const selectSearchPage = (matchSet: Prisma.Sql, limit: number, offset: number) =
  *
  * `COUNT(DISTINCT id)` over the same contributions the page is built from, so it
  * counts the DE-DUPLICATED set the client will actually be paged through and not
- * the pre-aggregation join rows.
+ * the pre-aggregation join rows. Run on the caller's snapshot client, so the
+ * count describes the same catalog the page came from.
  */
-const countSearchMatches = (matchSet: Prisma.Sql) =>
-    prisma.$queryRaw<{ count: bigint }[]>`
+const countSearchMatches = (db: SnapshotClient, matchSet: Prisma.Sql) =>
+    db.$queryRaw<{ count: bigint }[]>`
         ${matchSet}
         SELECT COUNT(DISTINCT id) AS count FROM contributions
     `;
@@ -317,9 +438,10 @@ const countSearchMatches = (matchSet: Prisma.Sql) =>
  * every recipe and grocery quantity would then be computed from.
  */
 const defaultPortionsByFood = async (
+    db: SnapshotClient,
     foodIds: readonly string[],
 ): Promise<Map<string, CatalogFoodPortionRow[]>> => {
-    const portions = await prisma.catalog_food_portions.findMany({
+    const portions = await db.catalog_food_portions.findMany({
         where: { catalog_food_id: { in: [...foodIds] }, is_default: true },
         select: {
             catalog_food_id: true,
@@ -351,13 +473,30 @@ const defaultPortionsByFood = async (
  * the match-all `%` and returning the entire catalog is the one answer that
  * would be wrong in every case.
  *
- * `limit` IS ACCEPTED AS GIVEN AND DELIBERATELY NOT CLAMPED. `MAX_LIMIT` lives
- * in `utils/pagination.ts` and is applied by the controller, so the HTTP route
- * caps a page at 50 while this function does not: `scripts/search-benchmark.ts`
- * reads a single `limit=75` reference page in process to prove that pages 1 to 3
- * at `limit=25` concatenate to it with no duplicate and no missing id. A clamp
- * here would silently truncate that reference and make the pagination check pass
- * vacuously.
+ * `page` AND `limit` ARE BOUNDED, NOT CAPPED AT THE ROUTE'S NUMBERS.
+ * `rowWindowFor` in `utils/pagination.ts` turns the pair into the `LIMIT` and
+ * `OFFSET` this query runs with, and it is what keeps request input out of the
+ * statement: `page` and `limit` arrive as text through Express, and
+ * `(page - 1) * limit` on a twenty-digit page is a number PostgreSQL rejects for
+ * `OFFSET` — a 500 from a query parameter. Deriving the window in the shared
+ * helper rather than here means the bound holds for the HTTP path and for the
+ * direct callers that never meet `parsePagination` alike.
+ *
+ * What it does NOT do is apply `MAX_LIMIT`. That cap is the HTTP contract (a
+ * page of `GET /catalog/foods` is at most 50) and is applied by the controller,
+ * because `scripts/search-benchmark.ts` reads a single `limit=75` reference page
+ * in process to prove that pages 1 to 3 at `limit=25` concatenate to it with no
+ * duplicate and no missing id. Capping at 50 here would silently truncate that
+ * reference and make the pagination check pass vacuously, which is why
+ * `rowWindowFor`'s own guard (`MAX_ROWS`) sits far above the route's cap.
+ *
+ * THE THREE STATEMENTS READ ONE SNAPSHOT. Page, total and default portions are a
+ * single answer: the total describes the set the page came from, and every
+ * returned food must have the portion that food actually has. Read through
+ * separate pool connections they can straddle a catalog load, so they run
+ * sequentially inside one REPEATABLE READ transaction — see {@link
+ * SnapshotClient} for what that prevents and {@link SNAPSHOT_OPTIONS} for why
+ * that isolation level.
  */
 export const searchPublishedFoods = async (
     q: string,
@@ -369,26 +508,24 @@ export const searchPublishedFoods = async (
     }
 
     const matchSet = catalogMatchSet(q.trim());
-    // The offset belongs to whoever runs the query, which `utils/pagination.ts`
-    // states explicitly. Floored at zero because PostgreSQL rejects a negative
-    // OFFSET outright: `parsePagination` already guarantees `page >= 1`, so this
-    // only keeps a direct caller's bad page from becoming a 500. It is a floor
-    // on the offset, NOT a cap on `limit` — see the note above.
-    const offset = Math.max(0, (page - 1) * limit);
+    const { limit: rowLimit, offset } = rowWindowFor(page, limit);
 
-    const [rows, totals] = await Promise.all([
-        selectSearchPage(matchSet, limit, offset),
-        countSearchMatches(matchSet),
-    ]);
+    return prisma.$transaction(async (db) => {
+        const rows = await selectSearchPage(db, matchSet, rowLimit, offset);
+        const totals = await countSearchMatches(db, matchSet);
+        const portions = await defaultPortionsByFood(
+            db,
+            rows.map((row) => row.id),
+        );
 
-    const portions = await defaultPortionsByFood(rows.map((row) => row.id));
-
-    return {
-        // Mapped in the order the statement returned, so the ranking survives:
-        // the portion lookup is keyed by id and must not reorder the page.
-        items: rows.map((row) => mapCatalogFood(row, portions.get(row.id) ?? [])),
-        total: Number(totals[0]?.count ?? 0),
-    };
+        return {
+            // Mapped in the order the statement returned, so the ranking
+            // survives: the portion lookup is keyed by id and must not reorder
+            // the page.
+            items: rows.map((row) => mapCatalogFood(row, portions.get(row.id) ?? [])),
+            total: Number(totals[0]?.count ?? 0),
+        };
+    }, SNAPSHOT_OPTIONS);
 };
 
 /* ---------------------------------------------------------------------------
@@ -404,40 +541,61 @@ export const searchPublishedFoods = async (
 export type CatalogSuggestionKind = 'dislike';
 
 /**
- * Which published foods each kind draws from.
+ * Which published foods each kind draws from, as the predicate its statement
+ * carries.
  *
  * `is_common_dislike` is a curated hint carried by the coverage plan and loaded
  * with the release, not a computed property, so selecting a kind is a lookup
  * rather than a rule — and the `(is_common_dislike, publication_status)` index
  * exists for exactly this predicate, which is why the flag leads it.
+ *
+ * A `Prisma.Sql` fragment rather than a `catalog_foodsWhereInput` because the
+ * statement below has to be raw (see {@link getSuggestions}); it is a
+ * parameterised fragment, so composing it keeps every value a bound parameter.
  */
-const SUGGESTION_FILTERS: Record<CatalogSuggestionKind, Prisma.catalog_foodsWhereInput> = {
-    dislike: { is_common_dislike: true },
+const SUGGESTION_FILTERS: Record<CatalogSuggestionKind, Prisma.Sql> = {
+    dislike: Prisma.sql`f.is_common_dislike = true`,
 };
 
 /**
  * `GET /api/catalog/foods/suggestions` — the chips shown beside the food-search
  * field, so a user can decline a common ingredient without searching for it.
  *
- * The order is stable and portable for the same reason the search page's is:
- * `display_name` then `source_key`, never the `gen_random_uuid()` primary key,
- * so two databases holding the same release offer the same chips in the same
- * order. Without a total order a re-render could reshuffle the chips under the
- * user's finger.
+ * The order is stable and portable for the same reasons the search page's is,
+ * and needs the same two devices: `display_name` then `source_key` rather than
+ * the `gen_random_uuid()` primary key, and `COLLATE "C"` on both so the sequence
+ * is a property of the release and not of the collation the database happened to
+ * be created with. Without a total order a re-render could reshuffle the chips
+ * under the user's finger; without the explicit collation two databases holding
+ * one release could offer the same chips in different orders.
  *
- * `limit` is accepted as given, as in {@link searchPublishedFoods}: the cap
- * belongs to `parsePagination` at the controller.
+ * WRITTEN RAW FOR THAT COLLATION, and for nothing else. Prisma's `orderBy`
+ * cannot express `COLLATE`, and there is no argument by which it could, so the
+ * only way to pin the comparison is the statement itself. The shape is otherwise
+ * exactly the `findMany` it replaces — same predicate, same three selected
+ * columns ({@link CatalogSuggestionRow}), same `LIMIT` — and it is a single
+ * statement, so it needs no snapshot transaction: one statement is already one
+ * snapshot.
+ *
+ * `limit` is bounded by {@link rowWindowFor}'s row guard rather than by the
+ * route's cap, as in {@link searchPublishedFoods}, so a direct caller cannot put
+ * a non-finite value into `LIMIT`; the per-route maximum belongs to
+ * `parsePagination` at the controller.
  */
 export const getSuggestions = async (
     kind: CatalogSuggestionKind,
     limit: number,
 ): Promise<CatalogSuggestionsResponse> => {
-    const foods = await prisma.catalog_foods.findMany({
-        where: { publication_status: PUBLISHED, ...SUGGESTION_FILTERS[kind] },
-        orderBy: [{ display_name: 'asc' }, { source_key: 'asc' }],
-        take: limit,
-        select: { id: true, display_name: true, food_group: true },
-    });
+    const { limit: rows } = rowWindowFor(1, limit);
+
+    const foods = await prisma.$queryRaw<CatalogSuggestionRow[]>`
+        SELECT f.id, f.display_name, f.food_group
+        FROM catalog_foods f
+        WHERE f.publication_status = ${PUBLISHED}
+            AND ${SUGGESTION_FILTERS[kind]}
+        ORDER BY f.display_name COLLATE "C" ASC, f.source_key COLLATE "C" ASC
+        LIMIT ${rows}
+    `;
 
     return { items: foods.map(mapCatalogSuggestion) };
 };
@@ -486,37 +644,48 @@ const CURRENT_RECIPE_VERSION_STATUS = 'current';
  * catalog breaks down.
  *
  * OPERATOR AND ACCEPTANCE EVIDENCE ONLY: this endpoint has no mobile consumer.
- * It is what the release checklist queries to confirm
- * `publishedCount >= 10,000` and `recipeCount >= 40` BEFORE
- * `MEAL_PLANNING_ENABLED` is switched on, and what a post-deploy verification
- * reads to confirm the expected release is live. It is therefore deliberately
- * cheap — five aggregates and one indexed row, never a row dump — because a
- * diagnostic that is expensive to run is one nobody runs at the moment it
- * matters.
+ * It is what the release checklist queries to confirm the published-food and
+ * recipe counts the release gate requires BEFORE `MEAL_PLANNING_ENABLED` is
+ * switched on (AAP §0.7.5 sets those numbers; this endpoint only reports what is
+ * there), and what a post-deploy verification reads to confirm the expected
+ * release is live. It is therefore deliberately cheap — four aggregates and one
+ * indexed row, five reads in total, never a row dump — because a diagnostic that
+ * is expensive to run is one nobody runs at the moment it matters.
  *
  * Every count is a separate aggregate rather than a grouped scan so that each
- * one is independently readable, and all six reads are issued concurrently.
+ * one is independently readable, and the five reads run SEQUENTIALLY INSIDE ONE
+ * REPEATABLE READ SNAPSHOT rather than concurrently. That is the point of the
+ * endpoint: a report whose release pointer came from before a load and whose
+ * published count came from after it describes no state the catalog was ever in,
+ * and it is exactly the report an operator reads while a load is running. Five
+ * indexed reads on one connection are cheap enough that coherence costs nothing
+ * worth having.
  */
 export const getStatus = async (): Promise<CatalogStatusResponse> => {
-    const [releaseLoad, publishedCount, quarantinedCount, rejectedCount, recipeCount] =
-        await Promise.all([
-            prisma.catalog_import_runs.findFirst({
-                where: { kind: RELEASE_LOAD_RUN_KIND, status: RUN_STATUS_SUCCEEDED },
-                orderBy: { started_at: 'desc' },
-                select: { manifest_version: true, finished_at: true, started_at: true },
-            }),
-            prisma.catalog_foods.count({ where: { publication_status: PUBLISHED } }),
-            prisma.catalog_foods.count({ where: { publication_status: QUARANTINED } }),
-            prisma.catalog_foods.count({ where: { publication_status: REJECTED } }),
-            prisma.recipe_versions.count({ where: { status: CURRENT_RECIPE_VERSION_STATUS } }),
-        ]);
+    const { releaseLoad, counts } = await prisma.$transaction(async (db) => {
+        const activeLoad = await db.catalog_import_runs.findFirst({
+            where: { kind: RELEASE_LOAD_RUN_KIND, status: RUN_STATUS_SUCCEEDED },
+            orderBy: { started_at: 'desc' },
+            select: { manifest_version: true, finished_at: true, started_at: true },
+        });
 
-    const counts: CatalogStatusCounts = {
-        publishedCount,
-        quarantinedCount,
-        rejectedCount,
-        recipeCount,
-    };
+        const snapshotCounts: CatalogStatusCounts = {
+            publishedCount: await db.catalog_foods.count({
+                where: { publication_status: PUBLISHED },
+            }),
+            quarantinedCount: await db.catalog_foods.count({
+                where: { publication_status: QUARANTINED },
+            }),
+            rejectedCount: await db.catalog_foods.count({
+                where: { publication_status: REJECTED },
+            }),
+            recipeCount: await db.recipe_versions.count({
+                where: { status: CURRENT_RECIPE_VERSION_STATUS },
+            }),
+        };
+
+        return { releaseLoad: activeLoad, counts: snapshotCounts };
+    }, SNAPSHOT_OPTIONS);
 
     // `manifest_version` carries the release id for a release_load run ('v1' for
     // data/meal-planning/catalog/releases/v1) and is what `catalogRelease`

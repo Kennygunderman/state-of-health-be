@@ -1,14 +1,37 @@
 {
   "benchmarkVersion": "v1",
   "catalogRelease": "v1",
-  "description": "Fixed query set and measurement contract for internal catalog search (Agent Action Plan sections 0.7.3 and 0.9.3). scripts/search-benchmark.ts runs it against a loaded catalog release and writes benchmark-report.json; that report is the acceptance evidence for search quality. Running it against a second, independently loaded database must reproduce identical ranks and page sequences, with only latencies free to differ.",
+  "description": "Fixed query set and measurement contract for internal catalog search (Agent Action Plan sections 0.7.3 and 0.9.3). It defines what a benchmark run is to do, not what any run has done: scripts/search-benchmark.ts is to execute this query set against a loaded catalog release and write benchmark-report.json, and that report is to be the acceptance evidence for search quality. Running it against a second, independently loaded database must reproduce identical ranks and page sequences, with only latencies free to differ. Read implementationStatus before treating any statement here as descriptive.",
+  "implementationStatus": {
+    "state": "contract_only",
+    "measuredUnitExists": true,
+    "querySetExists": true,
+    "runnerMeasurementBodyExists": false,
+    "acceptanceReportExists": false,
+    "nonAcceptanceSuiteExists": false,
+    "statement": "NOTHING IN THIS FILE HAS BEEN MEASURED. Both inputs are present — catalog.service.searchPublishedFoods exists and the query set below is complete — but the runner named in acceptanceRunner carries no measurement body: it validates its inputs and exits stage_pipeline_pending without importing the service, timing a query or writing a report. The file at acceptanceReport does not exist, and neither does the suite named in nonAcceptanceSuite. No p50, p95, hit rate or zero-result rate for catalog search therefore exists anywhere in this repository, and no absent or future report may be cited as acceptance evidence. Every prose field below is the contract a run must satisfy once the body lands (Agent Action Plan 0.7.1 Group 3, 0.9.3); the numeric thresholds and protocol values are final and are what that body is to consume.",
+    "whatIsProvenToday": "The determinism half of the ordering contract is enforced by an automated test rather than by this file: src/services/__tests__/catalog.service.test.ts loads the same rows into two disposable databases created with different default collations and asserts the service's pinned order is identical in both while the unpinned order differs. That covers cross-database rank and page-sequence identity. Latency and relevance remain unmeasured until the runner's body exists."
+  },
   "acceptanceRunner": "scripts/search-benchmark.ts",
   "acceptanceReport": "data/meal-planning/reports/latest/benchmark-report.json",
   "nonAcceptanceSuite": {
     "path": "src/__tests__/api/benchmark.test.ts",
+    "exists": false,
     "fixture": "data/meal-planning/fixtures/benchmark-synthetic-10k.json",
+    "fixtureKind": "corpus specification, expanded in memory by the suite",
+    "fixtureDescription": "That file is not a recorded corpus but a deterministic SPECIFICATION of one: three part lists — 25 base entries, 20 preparations, 20 descriptors, whose lengths multiply to exactly 10,000 — and the rules that turn a zero-based row index into one catalog_foods row, which the suite expands into 10,000 published synthetic foods, each with one default portion and one alias, plus four non-published rows. Every value is a pure function of the row index, so two independent expansions are byte-identical and an exact page sequence can be asserted rather than sampled. No token in it is a real food name and its keys are prefixed synthetic-bench10k:, so no row of it can be read as release data or collide with a usda: or ai: key.",
+    "fixtureCovers": [
+      "the exact size of every match set, per query",
+      "the full ordering rule, including a pair that ties on ts_rank and again on display_name so the source_key tiebreaker is what decides",
+      "three-page traversal at limit 25 against an in-process limit 75 reference, over match sets of 400 to 800 rows — the one thing release v1 cannot exercise today, because its widest query matches 8 foods",
+      "the zero-result path, from three separate causes: a name carried only by a non-published row, an uncurated misspelling, and two tokens of the same part ANDed",
+      "the published-only filter, against candidate, quarantined, rejected and retired rows",
+      "each retrieval contribution in isolation: a word held only in search_text, a word held only in an alias, and prefixes of both"
+    ],
+    "fixtureExpansion": "The expander belongs to the suite named in path. acceptanceRunner neither reads nor mentions the fixture, which is deliberate: a non-acceptance corpus must not be able to make the acceptance run pass, fail or warn by being present, absent or malformed.",
+    "fixtureAcceptanceStatus": "The fixture states the same standing in its own acceptanceStatus field and in its own words — non-acceptance evidence, no hit-rate threshold, no latency threshold, structural expectations only. The two files are each other's cross-reference: if either is edited to claim the synthetic corpus measures search quality, the other contradicts it.",
     "coversAcceptanceThresholds": false,
-    "reason": "That suite exercises the benchmark mechanics against a synthetic fixture, so it can pass while real search quality is unmeasured. The thresholds below are asserted only by acceptanceRunner against the loaded release named in catalogRelease; a green Jest run is never acceptance evidence."
+    "reason": "Planned, and absent from this checkout. When it lands it is to exercise the benchmark mechanics against a synthetic fixture, so it will be able to pass while real search quality is unmeasured. The thresholds below are to be asserted only by acceptanceRunner against the loaded release named in catalogRelease; a green Jest run is never acceptance evidence."
   },
   "thresholds": {
     "topThreeHitRate": 0.9,
@@ -17,13 +40,13 @@
     "p95LatencyMs": 150,
     "latencyLimit": 25
   },
-  "thresholdPolicy": "Fail closed: the runner exits non-zero when any threshold is missed, and writes no report on any path where nothing was measured, so neither an absent nor a stale report can read as a pass. These five values are the plan's and are not tuning knobs — lowering one turns a failing benchmark green, which is why they are reviewed here rather than written as literals in the runner.",
+  "thresholdPolicy": "Fail closed, as the runner's body is required to behave once it exists: exit non-zero when any threshold is missed, and write no report on any path where nothing was measured, so neither an absent nor a stale report can read as a pass. The present revision satisfies the second half only — it measures nothing and writes nothing (see implementationStatus). These five values are the plan's and are not tuning knobs — lowering one turns a failing benchmark green, which is why they are reviewed here rather than written as literals in the runner.",
   "ordering": [
     "ts_rank DESC",
-    "display_name ASC",
-    "source_key ASC"
+    "display_name COLLATE \"C\" ASC",
+    "source_key COLLATE \"C\" ASC"
   ],
-  "orderingRationale": "The service's ORDER BY, most significant first. source_key is the final key because it is portable: the same release loaded into a second database yields the same order, which a database-generated id could not, and that identity of ranks and page sequences is how release determinism is evidenced.",
+  "orderingRationale": "The service's ORDER BY, most significant first. source_key is the final key because it is portable: the same release loaded into a second database yields the same order, which a database-generated id could not, and that identity of ranks and page sequences is how release determinism is evidenced. Both text keys carry COLLATE \"C\" for the same portability reason, one level deeper: an unqualified comparison uses the database's default collation, which is a property of how that database was created rather than of this release, and the orders genuinely differ — measured on PostgreSQL 16, the names 'Beans, black', 'Beans black', 'beans, green', 'Beans-lima' and 'BEANS, navy' sort as BEANS, navy | Beans black | Beans, black | Beans-lima | beans, green under C and as Beans black | Beans-lima | Beans, black | beans, green | BEANS, navy under und-x-icu, the default a database created with the ICU locale provider gets. The source_key tiebreaker cannot compensate, because it is reached only after display_name has already compared unequal and is collation-dependent itself. C is byte order over the stored UTF-8, built into every server and needing no extension or locale, so it is available and identical everywhere; it sorts 'Zucchini' before 'apple', which is the accepted price of an order two machines agree on.",
   "protocol": {
     "warmupPasses": 1,
     "timedPasses": 3,
@@ -31,8 +54,8 @@
     "connections": 1,
     "timing": "in_process",
     "measuredUnit": "catalog.service.searchPublishedFoods",
-    "warmupRationale": "The first pass is untimed: it settles the shared buffers and the GIN index into cache, so the three timed passes measure the steady state the report claims rather than a cold read.",
-    "measuredUnitRationale": "The stopwatch sits on the service function rather than an HTTP round trip, so the latency figures exclude network, Express and JSON-serialisation time and stay comparable across machines. One connection and no concurrency, so a percentile describes the query and not queueing behind other queries."
+    "warmupRationale": "The first pass is to be untimed: it settles the shared buffers and the GIN index into cache, so the three timed passes are to measure the steady state the report claims rather than a cold read.",
+    "measuredUnitRationale": "The stopwatch is to sit on the service function rather than on an HTTP round trip, so the latency figures exclude network, Express and JSON-serialisation time and stay comparable across machines. One connection and no concurrency, so a percentile describes the query and not queueing behind other queries. No stopwatch exists yet — see implementationStatus."
   },
   "reportedConditions": [
     "catalogReleaseChecksum",
@@ -40,9 +63,12 @@
     "hostCpu",
     "hostMemory",
     "sharedBuffers",
-    "warmCacheCondition"
+    "warmCacheCondition",
+    "orderingCollation",
+    "databaseDefaultCollation"
   ],
   "reportedConditionsRule": "Field names the run must fill into the report, not values. No environment fact — host, database origin, credential or installed version — belongs in this file: it is loaded identically in every environment, and a value recorded here would be wrong in all but one of them.",
+  "collationEvidenceRule": "The two collation conditions are what make a cross-database comparison readable, so a run records both: orderingCollation is the collation the statements pin (C, read back from the service's ORDER BY rather than assumed) and databaseDefaultCollation is the datcollate of the database the run read (SELECT datcollate FROM pg_database WHERE datname = current_database()). Two runs whose ranks and page sequences match while their default collations differ is the evidence that the order belongs to the release; two runs that agree only because both databases were created the same way evidence nothing, and without these fields the reports cannot be told apart.",
   "expectationResolution": "sourceKey",
   "expectationResolutionRule": "Every expectation names a food by the stable catalog_foods.source_key the release carries, which the runner resolves to the local catalog_foods.id after the release is loaded. A key that does not resolve is a hard failure of the whole run: it is never skipped and never scored as a miss, because an unresolvable expectation means this file and the loaded release disagree about what is published, and no hit rate can describe that.",
   "expectedSemantics": "Acceptable answers, best-placed member counting for the rank metrics. One entry per canonical food and never one per alias: search aggregates MAX(ts_rank) over a food's name and all of its aliases into a single row, so an alias hit produces no second row. Several entries mean the term is genuinely ambiguous across published foods — two states of one food, or a category word — not that the answer is uncertain. No entry expects zero results: maxZeroResultRate is a measured outcome over this set, not a declared one.",

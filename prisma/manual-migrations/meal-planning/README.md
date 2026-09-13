@@ -34,25 +34,34 @@ Normal operation therefore needs no manual step in this folder at all.
 
 ## What runs this folder
 
-Nothing that builds, deploys or migrates. No npm script, CI step, Prisma command
-or source file applies these files; Prisma only ever reads `prisma/migrations`,
-and `prisma/manual-migrations` is listed in `.dockerignore`, so the runtime image
-does not even contain them.
+Nothing that builds, deploys or migrates: no npm script, no CI step, no Prisma
+command and no runtime code applies these files. Prisma only ever reads
+`prisma/migrations`, and `prisma/manual-migrations` is listed in `.dockerignore`,
+so the runtime image does not even contain them.
 
-The one automated reader is the ledger-equivalence gate —
-`describe('migration ledgers')` in `src/__tests__/api/compat.test.ts`. It applies
-the up script to disposable databases it creates and drops itself, purely to
-prove that both ledgers produce the same schema and that legacy rows survive
-either order. The equivalence claim above is therefore tested, not asserted. That
-gate never runs the down script.
+One test is the exception to that sentence, and it reads the up script only: the
+ledger-equivalence gate — `describe('migration ledgers')` in
+`src/__tests__/api/compat.test.ts` — applies `001_meal_planning.sql` to
+disposable databases it creates and drops itself, purely to prove that both
+ledgers produce the same schema and that legacy rows survive either order. The
+equivalence claim above is therefore tested, not asserted. Nothing, that gate
+included, ever runs the down script.
 
 ## If you apply the copy by hand
 
 Do this only when Prisma cannot be used — applying the schema through a
-DBA-operated SQL console, for example. Immediately afterwards, run:
+DBA-operated SQL console, for example. Immediately afterwards, run the command
+below **from the `backend/` directory** — Prisma resolves `prisma/schema.prisma`
+relative to the working directory and `package.json` declares no `prisma.schema`
+path, so it fails from anywhere else, including this folder — and against the
+database you just applied the copy to:
 
 ```bash
-npx prisma migrate resolve --applied 20260908000000_meal_planning
+# Name the target explicitly. This project's development environment exports a
+# production DATABASE_URL into every new shell unless that shell overrides it,
+# and this command writes a row to whichever database it is handed.
+TARGET_DATABASE_URL='postgresql://<user>@<host>:<port>/<database you just applied it to>'
+DATABASE_URL="$TARGET_DATABASE_URL" npx prisma migrate resolve --applied 20260908000000_meal_planning
 ```
 
 The copy applies the DDL without writing a row to Prisma's `_prisma_migrations`
@@ -82,23 +91,48 @@ rather than DDL improvised under pressure. Run it only after a fresh `pg_dump`
 you have confirmed restores, and only against a disposable database you are
 prepared to lose.
 
+Whether a database is disposable is your judgement, and nothing in the script can
+make it: it cannot tell production from a scratch copy. What it does enforce is
+that the removal was aimed deliberately — its first section refuses to drop
+anything unless the session running it names the target database, and refuses
+again unless that name is the database the connection is actually on. A command
+that relies on whatever `DATABASE_URL` happens to hold — in this project's
+development environment, the production URL unless the shell overrides it —
+therefore removes nothing:
+
+```bash
+# From backend/. Both the name and the URL are yours to type; the script raises
+# if they are not the same database, and raises if the SET is missing entirely.
+REMOVAL_TARGET_DB='<the disposable database you intend to strip>'
+REMOVAL_TARGET_URL="postgresql://<user>@<host>:<port>/$REMOVAL_TARGET_DB"
+psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 \
+  -c "SET meal_planning.removal_target = '$REMOVAL_TARGET_DB'" \
+  -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
+```
+
+The script's own header carries the full procedure — the read-back that proves
+the URL is that database, the backup, the maintenance window — and the complete
+inventory of what is destroyed. Read it before running any of this.
+
 Everything the dropped tables hold goes with them: plans, grocery state,
 preferences, recipes and the whole catalog, including the retained USDA-derived
 snapshot data. Diary history survives, by design — the links this feature added
 to `meal_entries` are nullable, so dropping them **detaches** planned and
 catalog-logged entries rather than deleting them, each row keeping its name,
-servings and macro snapshot and losing only its provenance caption. The script's
-own header carries the full warning and the complete inventory.
+servings and macro snapshot and losing only its provenance caption. Loading a
+catalog back afterwards is a fresh load rather than a restore, and the pipeline
+that does it is still landing on this branch — `docs/meal-planning/release-and-recovery.md`
+tracks what is wired — so the backup is the only way back to that data today.
 
 The Prisma ledger then needs reconciling, because `_prisma_migrations` still
 records the migration as applied: `migrate deploy` would report nothing pending
 while the schema is gone. Delete that one row, and re-apply normally whenever the
-feature is wanted back:
+feature is wanted back — same `REMOVAL_TARGET_URL`, same `backend/` directory:
 
 ```bash
-# $DISPOSABLE_DATABASE_URL is the database you just backed up — never production
-psql "$DISPOSABLE_DATABASE_URL" -c "DELETE FROM _prisma_migrations WHERE migration_name = '20260908000000_meal_planning';"
-DATABASE_URL="$DISPOSABLE_DATABASE_URL" npx prisma migrate deploy
+psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 \
+  -c "DELETE FROM _prisma_migrations WHERE migration_name = '20260908000000_meal_planning';"
+DATABASE_URL="$REMOVAL_TARGET_URL" npx prisma migrate deploy
 ```
 
 `prisma migrate resolve --rolled-back` is not the step here: Prisma 6 accepts it

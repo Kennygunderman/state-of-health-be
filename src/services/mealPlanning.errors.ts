@@ -7,11 +7,17 @@
 //
 // Each class carries the DATA the client acts on rather than a message it would
 // have to parse, and the payload types come from types/mealPlanning.ts so the
-// error and the response body it serializes into cannot drift apart. The eight
-// classes whose payload has a declared wire shape say `implements` for exactly
-// that reason: it is a compile-time-only check, so a change to the wire data
-// breaks the build here instead of silently shipping a body the client cannot
-// decode.
+// error and the response body it serializes into cannot drift apart. The rule:
+// a class whose payload is a single declared interface says `implements` that
+// interface and exposes its members directly, because `implements` is a
+// compile-time-only check and a change to the wire data then breaks the build
+// here instead of silently shipping a body the client cannot decode. A class
+// whose payload is a UNION of wire shapes cannot say `implements` — a class may
+// only implement an object type with statically known members — so it carries
+// the payload as a typed `readonly data` member instead, which gives the same
+// drift protection and, because the union is exclusive, additionally forces the
+// throw site to choose exactly one variant. StaleRevisionError and
+// PlanNotActiveError are the two union-payload classes.
 //
 // Two things deliberately live elsewhere. Vendor and utility failures belong to
 // the module that raises them — EstimateFailedError (estimate.service),
@@ -30,11 +36,10 @@ import type {
     EstimateUnavailableErrorData,
     LimitingConstraint,
     NoMatchingMealsErrorData,
-    PlanEndedErrorData,
+    PlanNotActiveErrorData,
     PlanOverlapErrorData,
-    PlanSupersededErrorData,
     StalePlanErrorData,
-    StaleRevisionErrorData,
+    StaleRevisionErrorPayload,
     StaleTargetsErrorData,
     TargetsMissingErrorData,
 } from '../types/mealPlanning';
@@ -53,16 +58,14 @@ export class PreferencesIncompleteError extends Error {
     }
 }
 
-// Both inputs a plan is pinned to are reported, because either may have moved
-// and the client re-runs from whichever is fresh. The preference routes pin one
-// counter instead and answer StaleRevisionCounterErrorData; their controller
-// derives that body from `preferencesRevision`, so one class covers both forms
-// of the single stale_revision code rather than a near-duplicate class.
-export class StaleRevisionError extends Error implements StaleRevisionErrorData {
-    constructor(
-        public readonly preferencesRevision: number,
-        public readonly targetsRevision: number,
-    ) {
+// One class covers both forms of the single stale_revision code, and the route
+// that throws decides which body travels: the plan routes pin two counters and
+// report both, because either may have moved and the client re-runs from
+// whichever is fresh, while the preference routes pin one and report just that
+// counter. StaleRevisionErrorPayload is exclusive, so the thrower supplies
+// exactly one form and a mixed or empty body does not compile.
+export class StaleRevisionError extends Error {
+    constructor(public readonly data: StaleRevisionErrorPayload) {
         super('Preferences or targets changed since this request was prepared');
         this.name = 'StaleRevisionError';
     }
@@ -163,19 +166,17 @@ export class StalePlanError extends Error implements StalePlanErrorData {
     }
 }
 
-// The two ways a plan stops accepting writes supply different halves of the
-// answer, so both members are optional and exactly one is passed:
-//   superseded by a regeneration -> new PlanNotActiveError(replacementPlanId)
-//   its last date has passed     -> new PlanNotActiveError(undefined, 'ended')
-// `implements PlanNotActiveErrorData` is impossible because that type is a
-// union and a class may only implement an object type with statically known
-// members; indexing the two halves keeps both members tied to the wire shape
-// anyway, which is the drift protection that mattered.
+// The two ways a plan stops accepting writes are different answers, not two
+// halves of one, so the payload is the exclusive PlanNotActiveErrorData union
+// and the throw site names exactly one variant:
+//   superseded by a regeneration -> new PlanNotActiveError({ replacementPlanId })
+//   its last date has passed     -> new PlanNotActiveError({ reason: 'ended' })
+// A payload carrying both members, or neither, is a compile error rather than a
+// body the client cannot interpret. `implements PlanNotActiveErrorData` is
+// impossible for a union type, so the wire shape travels as a typed `data`
+// member, which keeps the same drift protection.
 export class PlanNotActiveError extends Error {
-    constructor(
-        public readonly replacementPlanId?: PlanSupersededErrorData['replacementPlanId'],
-        public readonly reason?: PlanEndedErrorData['reason'],
-    ) {
+    constructor(public readonly data: PlanNotActiveErrorData) {
         super('Plan is no longer active');
         this.name = 'PlanNotActiveError';
     }
@@ -191,6 +192,29 @@ export class IdempotencyConflictError extends Error {
     }
 }
 
+// How the search that produced a NoMatchingMealsError ran out, for logs and for
+// an operator reading them — never for the client.
+//
+// DECLARED HERE, not in types/mealPlanning.ts, precisely because it is NOT a
+// wire shape: that file holds the DTOs the mobile codecs decode, and the 422
+// body is `{limitingConstraints, allergiesKept}` with no frontier member
+// (§0.5.2). Declaring it beside the class it belongs to also keeps the import
+// direction intact — mealPlan.logic.ts imports this file, never the reverse.
+export interface NoMatchingMealsDiagnostics {
+    // An evaluation budget ran out, so the search stopped before settling
+    // feasibility — as opposed to finishing and finding nothing.
+    exhausted: boolean;
+    // Which budget: the day's own allowance or the plan's. Null when neither.
+    exhaustedBy: 'day' | 'plan' | null;
+    // The first day the search could not close, as an index into the week…
+    frontierDayIndex: number;
+    // …and as the calendar date that index resolves to, so a log line reads
+    // without the plan's start date beside it.
+    frontierDate: string;
+    // Placements attempted before the search gave up.
+    evaluations: number;
+}
+
 // A feasibility verdict, not a server failure: the search finished and no week
 // satisfies these preferences. The constraints are ordered most-limiting first
 // and each names the setup step that would open the week up again.
@@ -200,7 +224,14 @@ export class NoMatchingMealsError extends Error implements NoMatchingMealsErrorD
     // failure itself and no response can be shaped without it.
     public readonly allergiesKept: true = true;
 
-    constructor(public readonly limitingConstraints: LimitingConstraint[]) {
+    // DIAGNOSTIC ONLY, and optional for that reason: it is never serialised
+    // into the 422 body, which carries the two members above and nothing else.
+    // Optional also keeps single-argument construction compiling for the
+    // callers and suites that raise this error without having run a search.
+    constructor(
+        public readonly limitingConstraints: LimitingConstraint[],
+        public readonly searchDiagnostics?: NoMatchingMealsDiagnostics,
+    ) {
         super('No meals match these preferences');
         this.name = 'NoMatchingMealsError';
     }

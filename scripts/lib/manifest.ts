@@ -601,6 +601,21 @@ export interface CoveragePlan {
      */
     readonly modelCallsPerBatch: number;
     readonly defaultBatchSize: number;
+    /** The model names generation and review would use; recorded, not invoked here. */
+    readonly generationModel?: string;
+    readonly reviewModel?: string;
+    /**
+     * The sum of every category's `publishedTarget` — 11,010, which carries
+     * 1,010 of slack over the 10,000 the feature requires, so late
+     * quarantines do not put the requirement at risk. Stated in the document
+     * rather than summed in code, so a reviewer can see the intended total and
+     * a report can name the shortfall against it exactly.
+     */
+    readonly publishedTargetTotal: number;
+    /** `ceil(1.25 × publishedTargetTotal)` — what import and generation aim for. */
+    readonly candidateVolumeTotal?: number;
+    /** Asserted against `foodGroups.length`, so a truncated document is caught. */
+    readonly foodGroupCount?: number;
     /**
      * An ordered list rather than a keyed object: batch keys are
      * `<coveragePlanVersion>:<category>:<batchIndex>`, so a rerun must address
@@ -640,6 +655,12 @@ export interface UsdaManifestFood {
     readonly fdcId?: number;
     readonly resolveBy?: UsdaFoodResolveBy;
     readonly usdaDataType: UsdaDataType;
+    /**
+     * The description the record carried when its id was verified. The importer
+     * compares it with the live record and downgrades `identity_status` to
+     * `ambiguous` on a mismatch rather than importing under a stale identity.
+     */
+    readonly expectedUsdaDescription?: string;
     readonly category: CoverageCategory;
     readonly foodState: CatalogFoodState;
     readonly canonicalName: string;
@@ -649,14 +670,159 @@ export interface UsdaManifestFood {
     readonly defaultPortion: UsdaDefaultPortionSelector;
     readonly costClass: CostClass;
     readonly isCommonDislike: boolean;
+    /**
+     * The reviewed allergen and diet determination for this food, and the ONLY
+     * source of a curated food's safety metadata — see the document's
+     * `curatedSafetyContract`. Optional in the type because an older manifest
+     * predates it, and an entry without one is treated as `unknown`: an empty
+     * `allergenTags` list is the claim "reviewed, and this food contains none
+     * of the nine", so it may only ever be written from a block that actually
+     * says `known`.
+     */
+    readonly reviewedSafety?: UsdaReviewedSafety;
+}
+
+/**
+ * A reviewed safety determination. `allergenStatus` is what the planner reads
+ * to decide whether a food may be put in front of someone with an allergy
+ * (AAP 0.7.3 requires `known` for every planned ingredient), so it is never
+ * inferred: derivation from a description or food group is exactly what
+ * `sweepAllergenDietRules.allergenStatusRule` refuses to call review.
+ */
+export interface UsdaReviewedSafety {
+    readonly allergenStatus: 'known' | 'unknown';
+    readonly allergenTags: readonly string[];
+    readonly dietTags: readonly string[];
+    /** Why no determination exists, on an entry that carries none. */
+    readonly note?: string;
+}
+
+/**
+ * One classification rule of `sweepClassificationRules`. Exactly one of the two
+ * match fields is present, and rules are evaluated in array order with the
+ * first match winning — so the array's order is part of the policy, and the
+ * document's own `appendOnlyContract` is what makes adding a rule safe.
+ */
+export interface UsdaSweepClassificationRule {
+    readonly descriptionStartsWith?: readonly string[];
+    readonly descriptionContains?: readonly string[];
+    readonly category: CoverageCategory;
+    readonly foodGroup: string;
+    /**
+     * `true` marks a description that is recognised and deliberately out of
+     * scope — restaurant menu items, infant and baby foods. The record is
+     * skipped rather than imported under a guessed identity.
+     */
+    readonly excludeFromPublication?: boolean;
+    /** Records which review pass appended the rule; absent on the original set. */
+    readonly appendedBy?: string;
+}
+
+/** Where an unmatched description lands: a candidate a curator still owns. */
+export interface UsdaSweepClassificationFallback {
+    readonly category: CoverageCategory;
+    readonly foodGroup: string;
+    readonly requiresCuratorReview: boolean;
+    readonly reason: string;
+}
+
+export interface UsdaSweepClassificationRules {
+    readonly rules: readonly UsdaSweepClassificationRule[];
+    readonly fallback: UsdaSweepClassificationFallback;
+}
+
+export interface UsdaSweepFoodStateRule {
+    readonly descriptionContains?: readonly string[];
+    readonly descriptionStartsWith?: readonly string[];
+    readonly foodState: CatalogFoodState;
+}
+
+export interface UsdaSweepFoodStateRules {
+    readonly rules: readonly UsdaSweepFoodStateRule[];
+    /** The state an unmatched description takes, decided by its dataset. */
+    readonly datasetFallback: readonly { readonly dataType: UsdaDataType; readonly foodState: CatalogFoodState }[];
+}
+
+/**
+ * The sweeps' brand screen. It enforces the manifest's own
+ * `brandedDataTypePolicy` — a manufacturer identity enters the catalog only
+ * through a curated entry — and is deliberately not
+ * `findBrandPatternMatch`, whose proper-noun heuristic is scoped to
+ * AI-generated candidates and false-positives on USDA's comma-inverted
+ * descriptions.
+ */
+export interface UsdaSweepBrandExclusionRules {
+    readonly signals: {
+        readonly trademarkSymbols: readonly string[];
+        readonly brandWordContains: readonly string[];
+        readonly allCapsRun: {
+            readonly minimumLetters: number;
+            readonly allowedAllCaps: readonly string[];
+        };
+    };
+}
+
+/** Relative cost policy for swept records, which carry no curated `costClass`. */
+export interface UsdaSweepCostClassRules {
+    readonly byCategory: Readonly<Record<string, CostClass>>;
+    readonly foodGroupOverrides: Readonly<Record<string, CostClass>>;
+}
+
+/**
+ * How a swept record's allergen and diet tags are derived. The derivation only
+ * narrows — it can add an allergen and remove a diet tag, never the reverse —
+ * and `allergen_status` is `unknown` for every swept record, because inference
+ * is not review.
+ */
+export interface UsdaSweepAllergenDietRules {
+    readonly allergenVocabulary: readonly string[];
+    readonly byFoodGroup: Readonly<Record<string, readonly string[]>>;
+    readonly descriptionAllergenMarkers: Readonly<Record<string, readonly string[]>>;
+    readonly dietTagVocabulary: readonly string[];
+    readonly dietDerivation: {
+        readonly animalCategories: readonly string[];
+        readonly animalMarkers: readonly string[];
+        readonly seafoodMarkers: readonly string[];
+        readonly dairyEggMarkers: readonly string[];
+    };
+    readonly compositeMarkers: { readonly markers: readonly string[] };
+}
+
+/** The `100 g` row every published per-100 g record carries: the stated basis. */
+export interface UsdaSweepBasisPortion {
+    readonly description: string;
+    readonly amount: number;
+    readonly unit: string;
+    readonly gramWeight: number;
+    readonly source: string;
+    readonly isDefaultWhenNoHouseholdPortion: boolean;
+}
+
+export interface UsdaSweepPortionPolicy {
+    readonly basisPortion: UsdaSweepBasisPortion;
 }
 
 /** Bulk passes over a whole USDA dataset, beside the curated `foods` entries. */
 export interface UsdaDatasetSweep {
+    /** Stable across reruns: it is what a checkpoint and a report name. */
+    readonly sweepKey: string;
     readonly dataType: UsdaDataType;
     readonly category?: CoverageCategory;
+    readonly listEndpoint: string;
     readonly pageSize: number;
     readonly maxPages: number;
+    /** Measured, so a sweep stops one page past the data instead of guessing. */
+    readonly observedLastNonEmptyPage?: number;
+    readonly observedApproximateRecordCount?: number;
+    readonly observedOn?: string;
+    readonly detailFetch: {
+        readonly endpoint: string;
+        readonly method: string;
+        readonly batchSize: number;
+    };
+    /** A curated entry is authoritative, so the sweep never re-imports its id. */
+    readonly skipFdcIdsPresentInFoods?: boolean;
+    readonly stopWhenCategoryCandidateVolumeReached?: boolean;
 }
 
 /** Nutrient numbers from USDA's data dictionary, as the strings the API uses. */
@@ -685,9 +851,31 @@ export interface UsdaManifest {
     /** `usda:<fdcId>` — the stable identity every rerun upserts against. */
     readonly sourceKeyFormat: string;
     readonly nutrientNumbers: UsdaNutrientNumbers;
+    /**
+     * `4*protein + 4*carbs + 9*fat` — the documented derivation for a record
+     * that states macros but no energy value, which is common in Foundation.
+     * Applied by the importer and recorded as a nutrition assumption on the
+     * food's validation record, never silently.
+     */
+    readonly caloriesFallback: string;
     readonly importLimits: UsdaImportLimits;
     readonly datasetSweeps: readonly UsdaDatasetSweep[];
     readonly foods: readonly UsdaManifestFood[];
+    readonly sweepClassificationRules: UsdaSweepClassificationRules;
+    readonly sweepFoodStateRules: UsdaSweepFoodStateRules;
+    readonly sweepBrandExclusionRules: UsdaSweepBrandExclusionRules;
+    readonly sweepCostClassRules: UsdaSweepCostClassRules;
+    readonly sweepAllergenDietRules: UsdaSweepAllergenDietRules;
+    readonly sweepPortionPolicy: UsdaSweepPortionPolicy;
+    /**
+     * The written rule that {@link UsdaManifestFood.reviewedSafety} is the only
+     * source of a curated food's allergen and diet metadata, and that an empty
+     * `allergenTags` list under `allergenStatus: 'known'` is itself a reviewed
+     * claim rather than an absence of one. Declared here because a reader of
+     * the manifest has to be able to find it, and a reviewer has to be able to
+     * see it change.
+     */
+    readonly curatedSafetyContract?: string;
 }
 
 export interface SearchBenchmarkThresholds {
@@ -946,11 +1134,21 @@ export const assertEvidenceAllowlistShape = (value: unknown, relativePath: strin
         );
     });
 
-    // `rowCount` is the document's own statement of how many registry rows it
+    // `rowCount` is the document's own statement of how many address rows it
     // carries, and the pair is what a truncated or half-merged table shows up
-    // as. Comparing them here means the table cannot lose rows quietly; the
-    // sibling evidence test additionally pins both numbers against the values
-    // recorded in `docs/meal-planning/catalog-policy.md`.
+    // as. This check is deliberately document-internal — the declared count
+    // against the rows actually carried — because this loader holds no reviewed
+    // values of its own to compare against, and one that invented some would be
+    // a second policy nobody reviewed.
+    //
+    // The numbers are pinned against something the document cannot edit
+    // elsewhere: `src/services/__tests__/evidence.logic.test.ts` reads this same
+    // file off disk and asserts the snapshot date, this total, the
+    // registry-derived count, the supplemental count and the supplemental block
+    // set agree three ways — the document, the reviewed attestation in
+    // `src/services/evidence.logic.ts`, and the values transcribed into
+    // `docs/meal-planning/catalog-policy.md` — so a refresh of any one of the
+    // three alone turns that suite red.
     if (ranges.length !== declaredRowCount) {
         throw shapeError(
             relativePath,
@@ -985,7 +1183,15 @@ export const assertEvidenceAllowlistShape = (value: unknown, relativePath: strin
  * compares a digest — verifying a release's files is that script's job.
  */
 export interface CatalogReleaseFile {
+    /**
+     * The file's bare name inside the release directory. `path` is what
+     * `catalog-load.ts` reads and rejects if it is not a single segment;
+     * `name` is the same string under the name the release's own format
+     * contract uses. Both are written so neither reader has to know about the
+     * other's spelling.
+     */
     readonly path: string;
+    readonly name?: string;
     readonly sha256: string;
     readonly row_count: number;
     readonly bytes: number;
@@ -1001,15 +1207,42 @@ export interface CatalogReleaseCounts {
 
 export interface CatalogReleaseSourceDataset {
     readonly name: string;
+    /**
+     * The LATEST dataset release present among this release's records — the
+     * version the catalog is current to. USDA publishes Foundation in periodic
+     * releases and every record carries its own, so a single value has to be
+     * chosen deterministically rather than taken from whichever row happened
+     * to be read last; `versions_present` carries the rest.
+     */
     readonly version: string;
+    /**
+     * Every distinct dataset release the records of this dataset carry, sorted.
+     * One entry for a single-release dataset such as SR Legacy; fourteen for
+     * Foundation. Optional: only a manifest written after this field existed
+     * carries it.
+     */
+    readonly versions_present?: readonly string[];
     readonly retrieved_at?: string;
+    /**
+     * Whether the dataset may be redistributed in this repository. USDA
+     * FoodData Central is public domain, which is the basis on which a release
+     * ships its descriptions, aliases and nutrient values at all.
+     */
+    readonly public_domain?: boolean;
+    readonly notes?: string;
 }
 
+/**
+ * Nullable throughout: a release built entirely from sourced records made no
+ * model call, and `null` is the honest value for a model that was never
+ * invoked. Writing a model name a release did not use would misattribute
+ * every row in it.
+ */
 export interface CatalogReleaseModelVersions {
-    readonly generation_model: string;
-    readonly review_model: string;
-    readonly prompt_version: string;
-    readonly review_prompt_version: string;
+    readonly generation_model: string | null;
+    readonly review_model: string | null;
+    readonly prompt_version: string | null;
+    readonly review_prompt_version: string | null;
 }
 
 export interface CatalogReleaseCoverageRow {
@@ -1021,9 +1254,33 @@ export interface CatalogReleaseCoverageRow {
 }
 
 export interface CatalogReleaseCoverage {
+    /**
+     * The coverage plan the totals below are measured against. It repeats the
+     * manifest's top-level `coverage_plan_version` on purpose: a reader holding
+     * only this block can still say which policy produced the numbers, and
+     * `loadReleaseManifest` gates on the top-level field.
+     */
+    readonly coverage_plan_version?: string;
+    readonly published_target_total?: number;
+    readonly published_actual_total?: number;
     readonly published_total: number;
+    /**
+     * The SUM of the per-category shortfalls — not the gap between the two
+     * totals, which is a different number whenever one category overshoots
+     * its target while another falls short, and which would claim
+     * per-category coverage a release may not have.
+     */
     readonly shortfall_total: number;
+    /**
+     * How far the published total itself falls below the plan total, reported
+     * separately so neither the per-category nor the aggregate reading is
+     * lost. Optional: only a manifest written after this field existed
+     * carries it.
+     */
+    readonly published_gap_to_total?: number;
     readonly categories: readonly CatalogReleaseCoverageRow[];
+    /** `categories` under the name the release format contract uses. */
+    readonly by_category?: readonly CatalogReleaseCoverageRow[];
 }
 
 /** Generated output, so snake_case throughout — see the note above. */

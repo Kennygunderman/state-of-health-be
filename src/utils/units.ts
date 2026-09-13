@@ -125,6 +125,23 @@ const assertFiniteQuantity = (value: number, label: string): void => {
     }
 };
 
+// A finite quantity times a finite factor is not necessarily finite: 1e308 g is
+// a valid double and 1e308 kg is not. Every conversion below therefore checks
+// its RESULT as well as its inputs, because a silent Infinity would travel on
+// as a quantity — dividing to a plausible-looking zero in an aggregation, or
+// being stored as a number no comparison behaves sensibly against. The loud
+// failure is this module's existing contract: recipe seeding and catalog
+// validation both surface UnitConversionError as a fault a human fixes in the
+// data, which is the right outcome for a quantity this large.
+const requireFiniteResult = (value: number, conversion: string): number => {
+    if (!Number.isFinite(value)) {
+        throw new UnitConversionError(
+            `Converting ${conversion} produced ${String(value)}, which is not a finite quantity`,
+        );
+    }
+    return value;
+};
+
 // A positive quantity must never display as zero — you buy one egg, not none.
 // Only a family's base unit can round down to zero, and only a true zero
 // prints as 0.
@@ -156,7 +173,10 @@ export const toBaseQuantity = (amount: number, unit: string): BaseQuantity => {
         throw new UnitConversionError(`Unrecognised unit "${unit}"`);
     }
 
-    return { family: definition.family, amount: amount * definition.perBase };
+    return {
+        family: definition.family,
+        amount: requireFiniteResult(amount * definition.perBase, `${String(amount)} ${unit} to base units`),
+    };
 };
 
 // Millilitres never equal grams. A food without a stored density cannot cross
@@ -173,12 +193,24 @@ const requireDensity = (densityGPerMl: number | null | undefined, conversion: st
 
 export const millilitersToGrams = (milliliters: number, densityGPerMl: number | null | undefined): number => {
     assertFiniteQuantity(milliliters, 'millilitres');
-    return milliliters * requireDensity(densityGPerMl, 'millilitres to grams');
+
+    const density = requireDensity(densityGPerMl, 'millilitres to grams');
+
+    return requireFiniteResult(
+        milliliters * density,
+        `${String(milliliters)} ml at ${String(density)} g/ml to grams`,
+    );
 };
 
 export const gramsToMilliliters = (grams: number, densityGPerMl: number | null | undefined): number => {
     assertFiniteQuantity(grams, 'grams');
-    return grams / requireDensity(densityGPerMl, 'grams to millilitres');
+
+    const density = requireDensity(densityGPerMl, 'grams to millilitres');
+
+    return requireFiniteResult(
+        grams / density,
+        `${String(grams)} g at ${String(density)} g/ml to millilitres`,
+    );
 };
 
 const roundToInteger = (value: number): number => Math.round(value);

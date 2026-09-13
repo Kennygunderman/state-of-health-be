@@ -5,6 +5,21 @@
 // server cannot verify.
 export type NutritionProvenance = 'source_backed' | 'ingredient_derived' | 'ai_estimated' | 'user_entered';
 
+// Every value `meal_entries.input_method` may hold. 'meal_plan' belongs to the
+// set because the column stores it, never because a request may ask for it: the
+// server alone writes it, from `insertPlannedMealEntry`, and it is what earns a
+// diary row the "From meal plan" origin caption.
+export type EntryInputMethod = 'library' | 'search' | 'ai_text' | 'ai_photo' | 'meal_plan';
+
+// The subset a request body may ask for on the legacy entries path. 'meal_plan'
+// is excluded because the caption it drives claims the entry came from a plan
+// built out of source-backed ingredients, and a legacy body carries none of
+// that — no plan link, no recipe version, and macros the server cannot verify.
+// A body naming it is not rejected, it is simply not honoured:
+// `resolveLegacyInputMethod` (nutrition.logic.ts) resolves it, like every other
+// unrecognised value, to 'library'.
+export type ClientInputMethod = Exclude<EntryInputMethod, 'meal_plan'>;
+
 export interface MacroTotals {
     calories: number;
     protein: number;
@@ -67,7 +82,10 @@ export interface LogMealEntryPayload {
     protein: number;
     carbs: number;
     fat: number;
-    inputMethod?: string; // 'library' | 'search' | 'ai_text' | 'ai_photo'
+    // Typed as the wire's loose string because this is an unvalidated request
+    // value: a `ClientInputMethod` is honoured and anything else — including
+    // the server-written 'meal_plan' — resolves to 'library'.
+    inputMethod?: string;
     rawInput?: string;
 }
 

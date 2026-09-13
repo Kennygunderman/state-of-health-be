@@ -48,7 +48,7 @@
   },
   "portionResolution": {
     "selectorNotWeight": "defaultPortion names a portion; it never carries a gram weight. The importer reads it from the gram weight on the record's own foodPortions entry, and an entry whose selector resolves to nothing is quarantined with check \"missing_gram_weight\" rather than published, because an invented gram weight is a fabricated number.",
-    "labelByDataset": "The portion label is `modifier` for SR Legacy; `measureUnit` plus any `portionDescription` qualifier, joined with a comma, for Foundation; and `portionDescription` for Survey (FNDDS), where the amount is embedded at the start of the string and must be parsed off first — an FNDDS `modifier` is a numeric measure code and is never a label. For SR Legacy and Foundation the amount is the separate `amount` field.",
+    "labelByDataset": "The portion label is `modifier` for SR Legacy; `measureUnit` plus any `portionDescription` qualifier, joined with a comma, for Foundation; and `portionDescription` for Survey (FNDDS), where the amount is embedded at the start of the string and must be parsed off first \u2014 an FNDDS `modifier` is a numeric measure code and is never a label. For SR Legacy and Foundation the amount is the separate `amount` field.",
     "selectorFields": "defaultPortion carries the label in the field the record's own dataset uses, matching UsdaDefaultPortionSelector in scripts/lib/manifest.ts: `modifier` for SR Legacy and `portionDescription` for Survey (FNDDS) and Foundation. Exactly one of the two is present on every entry, so the importer reads the field for the dataset it is already dispatching on and never has to guess which one carries the label.",
     "matching": "Consider only portions whose amount equals defaultPortion.amount and whose gram weight is greater than zero. Prefer a portion whose label equals the selector label (modifier or portionDescription) after case-insensitive whitespace normalization; fall back to portions whose label contains it. Where more than one remains, the lowest gram weight wins, so resolution is deterministic. Equality is preferred because a containment-only rule resolves \"medium\" against both a medium carrot and a medium carrot slice, and the amount must be compared separately because SR Legacy keeps it in its own `amount` field rather than in the label.",
     "verified": "Every amount and label pair below resolved against the live record when its fdcId was verified: 143 of the 145 entries resolve to exactly one gram weight, and the two that remain multi-valued (potato chips at 28 and 28.35 g for \"oz\", granola bar at 21 and 25 g for \"bar\") are two genuine USDA rows for the same label, where the lowest-weight rule decides."
@@ -77,7 +77,17 @@
         "modifier": "cup, pieces or slices"
       },
       "costClass": 2,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170000,
@@ -102,7 +112,17 @@
         "modifier": "cup, chopped"
       },
       "costClass": 1,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169230,
@@ -125,7 +145,17 @@
         "modifier": "clove"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170457,
@@ -149,7 +179,17 @@
         "modifier": "medium whole"
       },
       "costClass": 1,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170108,
@@ -173,7 +213,17 @@
         "modifier": "cup, chopped"
       },
       "costClass": 2,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170497,
@@ -197,7 +247,17 @@
         "modifier": "pepper"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170379,
@@ -221,7 +281,17 @@
         "modifier": "cup, chopped or diced"
       },
       "costClass": 1,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169986,
@@ -244,7 +314,17 @@
         "modifier": "cup chopped"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169975,
@@ -267,7 +347,17 @@
         "modifier": "cup, chopped"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168462,
@@ -291,7 +381,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170393,
@@ -314,7 +414,17 @@
         "modifier": "medium"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168482,
@@ -338,7 +448,17 @@
         "modifier": "cup, cubes"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170027,
@@ -362,7 +482,17 @@
         "modifier": "Potato medium"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169291,
@@ -385,7 +515,17 @@
         "modifier": "cup, chopped"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169988,
@@ -407,7 +547,17 @@
         "modifier": "stalk, medium"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169228,
@@ -430,7 +580,17 @@
         "modifier": "cup, cubes"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169094,
@@ -454,7 +614,17 @@
         "modifier": "large"
       },
       "costClass": 2,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168409,
@@ -477,7 +647,17 @@
         "modifier": "cup slices"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168202,
@@ -501,7 +681,17 @@
         "modifier": "medium"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173944,
@@ -524,7 +714,17 @@
         "modifier": "medium (7"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168155,
@@ -547,7 +747,17 @@
         "modifier": "fruit (2\" dia)"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 167746,
@@ -570,7 +780,17 @@
         "modifier": "fruit (2-3/8\" dia)"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 167762,
@@ -593,7 +813,17 @@
         "modifier": "cup, halves"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169928,
@@ -615,7 +845,17 @@
         "modifier": "medium (2-2/3"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169910,
@@ -638,7 +878,17 @@
         "modifier": "cup pieces"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 171705,
@@ -662,7 +912,17 @@
         "modifier": "avocado, NS as to"
       },
       "costClass": 2,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168165,
@@ -685,7 +945,17 @@
         "modifier": "cup (not packed)"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174683,
@@ -709,7 +979,17 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173110,
@@ -733,7 +1013,14 @@
         "modifier": "oz"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 168249,
@@ -756,7 +1043,14 @@
         "modifier": "oz"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 174370,
@@ -779,7 +1073,14 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 174421,
@@ -802,7 +1103,14 @@
         "modifier": "patty"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 168277,
@@ -825,7 +1133,12 @@
         "modifier": "slice raw"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 169451,
@@ -848,7 +1161,14 @@
         "modifier": "oz"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 171077,
@@ -872,7 +1192,14 @@
         "modifier": "oz"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 171477,
@@ -895,7 +1222,14 @@
         "modifier": "cup, chopped or diced"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 171098,
@@ -918,7 +1252,14 @@
         "modifier": "oz"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 172941,
@@ -942,7 +1283,12 @@
         "modifier": "slice"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 172410,
@@ -965,7 +1311,14 @@
         "modifier": "unit (yield from 1 lb"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free"
+        ]
+      }
     },
     {
       "fdcId": 2706135,
@@ -987,7 +1340,12 @@
         "portionDescription": "slice, NFS"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 175167,
@@ -1011,7 +1369,17 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "fish"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ]
+      }
     },
     {
       "fdcId": 171986,
@@ -1035,7 +1403,17 @@
         "modifier": "oz"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "fish"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ]
+      }
     },
     {
       "fdcId": 171955,
@@ -1059,7 +1437,17 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "fish"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ]
+      }
     },
     {
       "fdcId": 174183,
@@ -1083,7 +1471,17 @@
         "modifier": "oz, boneless"
       },
       "costClass": 2,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "fish"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ]
+      }
     },
     {
       "fdcId": 174210,
@@ -1107,7 +1505,17 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "shellfish"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ]
+      }
     },
     {
       "fdcId": 174216,
@@ -1129,7 +1537,17 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "shellfish"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ]
+      }
     },
     {
       "fdcId": 175176,
@@ -1151,7 +1569,17 @@
         "modifier": "fillet"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "fish"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok"
+        ]
+      }
     },
     {
       "fdcId": 171287,
@@ -1175,7 +1603,18 @@
         "modifier": "large"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "eggs"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172183,
@@ -1197,7 +1636,18 @@
         "modifier": "large"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "eggs"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172184,
@@ -1219,7 +1669,18 @@
         "modifier": "large"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "eggs"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173462,
@@ -1242,7 +1703,17 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "eggs"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172448,
@@ -1266,7 +1737,19 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "soy"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174272,
@@ -1288,7 +1771,18 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "soy"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2709163,
@@ -1310,7 +1804,19 @@
         "portionDescription": "cup, cubes"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "soy",
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2707473,
@@ -1333,7 +1839,13 @@
         "portionDescription": "patty"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [],
+        "dietTags": [],
+        "note": "No reviewed allergen or diet determination exists for this entry yet, so its status is unknown and it is never planned as an ingredient until one is recorded."
+      }
     },
     {
       "fdcId": 171267,
@@ -1357,7 +1869,18 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170859,
@@ -1380,7 +1903,18 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173410,
@@ -1402,7 +1936,18 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2705424,
@@ -1427,7 +1972,18 @@
         "portionDescription": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 328637,
@@ -1450,7 +2006,18 @@
         "portionDescription": "slice"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173420,
@@ -1473,7 +2040,18 @@
         "modifier": "oz"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172175,
@@ -1496,7 +2074,17 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 175215,
@@ -1519,7 +2107,19 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "soy"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174832,
@@ -1542,7 +2142,19 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170173,
@@ -1564,7 +2176,19 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2705412,
@@ -1587,7 +2211,16 @@
         "portionDescription": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169756,
@@ -1611,7 +2244,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169757,
@@ -1634,7 +2277,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169703,
@@ -1657,7 +2310,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169704,
@@ -1679,7 +2342,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170688,
@@ -1702,7 +2375,18 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168894,
@@ -1726,7 +2410,18 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173904,
@@ -1750,7 +2445,16 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168874,
@@ -1773,7 +2477,17 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 168917,
@@ -1794,7 +2508,17 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169736,
@@ -1818,7 +2542,18 @@
         "modifier": "oz"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169737,
@@ -1841,7 +2576,18 @@
         "modifier": "cup spaghetti not packed"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170284,
@@ -1863,7 +2609,16 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172688,
@@ -1887,7 +2642,17 @@
         "modifier": "slice"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174916,
@@ -1911,7 +2676,17 @@
         "modifier": "pita, large"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2707825,
@@ -1935,7 +2710,17 @@
         "portionDescription": "medium"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172749,
@@ -1958,7 +2743,17 @@
         "modifier": "serving"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174987,
@@ -1981,7 +2776,18 @@
         "modifier": "croissant, medium"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "milk",
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172420,
@@ -2005,7 +2811,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172421,
@@ -2027,7 +2843,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173756,
@@ -2050,7 +2876,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173800,
@@ -2073,7 +2909,17 @@
         "modifier": "can drained"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173734,
@@ -2095,7 +2941,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 175238,
@@ -2118,7 +2974,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169282,
@@ -2141,7 +3007,19 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "soy"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174285,
@@ -2164,7 +3042,17 @@
         "modifier": "can drained solids"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173806,
@@ -2187,7 +3075,19 @@
         "modifier": "oz"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "peanuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172470,
@@ -2210,7 +3110,19 @@
         "modifier": "tbsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "peanuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170567,
@@ -2233,7 +3145,19 @@
         "modifier": "oz (23 whole kernels)"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170162,
@@ -2256,7 +3180,19 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170187,
@@ -2278,7 +3214,19 @@
         "modifier": "oz (14 halves)"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170170,
@@ -2302,7 +3250,19 @@
         "modifier": "oz"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170189,
@@ -2325,7 +3285,19 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "sesame"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170562,
@@ -2347,7 +3319,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170184,
@@ -2369,7 +3351,19 @@
         "modifier": "oz (49 kernels)"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 171413,
@@ -2392,7 +3386,17 @@
         "modifier": "tablespoon"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172336,
@@ -2415,7 +3419,17 @@
         "modifier": "tbsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 171412,
@@ -2437,7 +3451,19 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "tree_nuts"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 171401,
@@ -2459,7 +3485,13 @@
         "modifier": "tbsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [],
+        "dietTags": [],
+        "note": "No reviewed allergen or diet determination exists for this entry yet, so its status is unknown and it is never planned as an ingredient until one is recorded."
+      }
     },
     {
       "fdcId": 171009,
@@ -2482,7 +3514,17 @@
         "modifier": "tbsp"
       },
       "costClass": 1,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "eggs"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172234,
@@ -2505,7 +3547,17 @@
         "modifier": "tsp or 1 packet"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 171186,
@@ -2529,7 +3581,17 @@
         "modifier": "tsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174277,
@@ -2552,7 +3614,19 @@
         "modifier": "tbsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "soy",
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172241,
@@ -2574,7 +3648,17 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173592,
@@ -2596,7 +3680,18 @@
         "modifier": "tablespoon"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "eggs",
+          "milk"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174289,
@@ -2620,7 +3715,19 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "sesame"
+        ],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 174524,
@@ -2643,7 +3750,17 @@
         "modifier": "tbsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169997,
@@ -2667,7 +3784,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": true
+      "isCommonDislike": true,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172232,
@@ -2690,7 +3817,17 @@
         "modifier": "cup leaves, whole"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173475,
@@ -2713,7 +3850,17 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172233,
@@ -2735,7 +3882,17 @@
         "modifier": "sprigs"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 171319,
@@ -2757,7 +3914,17 @@
         "modifier": "tsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170923,
@@ -2780,7 +3947,17 @@
         "modifier": "tsp, whole"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173468,
@@ -2803,7 +3980,17 @@
         "modifier": "tsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170931,
@@ -2826,7 +4013,17 @@
         "modifier": "tsp, ground"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 171890,
@@ -2849,7 +4046,17 @@
         "modifier": "cup (8 fl oz)"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173227,
@@ -2872,7 +4079,17 @@
         "modifier": "cup (8 fl oz)"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169098,
@@ -2895,7 +4112,17 @@
         "modifier": "cup"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173647,
@@ -2918,7 +4145,17 @@
         "modifier": "serving 8 fl oz"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169677,
@@ -2941,7 +4178,17 @@
         "modifier": "oz"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 167959,
@@ -2963,7 +4210,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 167542,
@@ -2986,7 +4243,13 @@
         "modifier": "bar"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [],
+        "dietTags": [],
+        "note": "No reviewed allergen or diet determination exists for this entry yet, so its status is unknown and it is never planned as an ingredient until one is recorded."
+      }
     },
     {
       "fdcId": 167555,
@@ -3008,7 +4271,17 @@
         "modifier": "oz"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 170273,
@@ -3031,7 +4304,13 @@
         "modifier": "oz"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [],
+        "dietTags": [],
+        "note": "No reviewed allergen or diet determination exists for this entry yet, so its status is unknown and it is never planned as an ingredient until one is recorded."
+      }
     },
     {
       "fdcId": 167989,
@@ -3054,7 +4333,15 @@
         "modifier": "cup gumdrops"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169655,
@@ -3078,7 +4365,17 @@
         "modifier": "tsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169640,
@@ -3100,7 +4397,16 @@
         "modifier": "tbsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 169661,
@@ -3122,7 +4428,17 @@
         "modifier": "tbsp"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2706967,
@@ -3144,7 +4460,15 @@
         "portionDescription": "regular"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "milk",
+          "wheat"
+        ],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 2708549,
@@ -3167,7 +4491,15 @@
         "portionDescription": "small/regular"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "milk",
+          "wheat"
+        ],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 2708618,
@@ -3190,7 +4522,15 @@
         "portionDescription": "piece, medium pizza"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "milk",
+          "wheat"
+        ],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 2708831,
@@ -3213,7 +4553,14 @@
         "portionDescription": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 172909,
@@ -3235,7 +4582,14 @@
         "modifier": "serving 1 cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "wheat"
+        ],
+        "dietTags": []
+      }
     },
     {
       "fdcId": 2709823,
@@ -3258,7 +4612,17 @@
         "portionDescription": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2708811,
@@ -3280,7 +4644,18 @@
         "portionDescription": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [
+          "milk",
+          "wheat"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2710725,
@@ -3302,7 +4677,17 @@
         "portionDescription": "cup"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 2710742,
@@ -3325,7 +4710,17 @@
         "portionDescription": "scoop, NFS"
       },
       "costClass": 3,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [
+          "milk"
+        ],
+        "dietTags": [
+          "pescatarian_ok",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 172804,
@@ -3347,7 +4742,13 @@
         "modifier": "tsp"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [],
+        "dietTags": [],
+        "note": "No reviewed allergen or diet determination exists for this entry yet, so its status is unknown and it is never planned as an ingredient until one is recorded."
+      }
     },
     {
       "fdcId": 169698,
@@ -3369,7 +4770,17 @@
         "modifier": "cup"
       },
       "costClass": 1,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "known",
+        "allergenTags": [],
+        "dietTags": [
+          "gluten_free",
+          "pescatarian_ok",
+          "vegan",
+          "vegetarian"
+        ]
+      }
     },
     {
       "fdcId": 173471,
@@ -3391,7 +4802,13 @@
         "modifier": "tsp"
       },
       "costClass": 2,
-      "isCommonDislike": false
+      "isCommonDislike": false,
+      "reviewedSafety": {
+        "allergenStatus": "unknown",
+        "allergenTags": [],
+        "dietTags": [],
+        "note": "No reviewed allergen or diet determination exists for this entry yet, so its status is unknown and it is never planned as an ingredient until one is recorded."
+      }
     }
   ],
   "sweepClassificationRules": {
@@ -4642,6 +6059,876 @@
         ],
         "category": "other",
         "foodGroup": "food_ingredient_other"
+      },
+      {
+        "descriptionContains": [
+          "mcdonald",
+          "burger king",
+          "kfc",
+          "popeyes",
+          "wendy's",
+          "denny's",
+          "cracker barrel",
+          "t.g.i. friday",
+          "chick-fil-a",
+          "taco bell",
+          "subway",
+          "dunkin",
+          "starbucks",
+          "pizza hut",
+          "domino",
+          "little caesars",
+          "papa john",
+          "applebee",
+          "olive garden",
+          "red lobster",
+          "carl's jr",
+          "hardee",
+          "jack in the box",
+          "sonic,",
+          "whataburger",
+          "five guys",
+          "panera",
+          "chipotle",
+          "arby",
+          "dairy queen",
+          "white castle",
+          "in-n-out",
+          "shake shack",
+          "restaurant,",
+          "fast foods",
+          "on the border",
+          "boston market"
+        ],
+        "category": "other",
+        "foodGroup": "food_ingredient_other",
+        "excludeFromPublication": true,
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "infant formula",
+          "toddler formula",
+          "babyfood",
+          "baby food",
+          "baby toddler",
+          "children's formula"
+        ],
+        "category": "other",
+        "foodGroup": "food_ingredient_other",
+        "excludeFromPublication": true,
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "chicken breast",
+          "chicken thigh",
+          "chicken drumstick",
+          "chicken leg",
+          "chicken wing",
+          "chicken tender",
+          "chicken nugget",
+          "chicken patty",
+          "chicken skin",
+          "chicken fillet",
+          "chicken strip",
+          "fried chicken",
+          "rotisserie chicken",
+          "chicken, "
+        ],
+        "category": "protein_poultry",
+        "foodGroup": "chicken",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "turkey breast",
+          "turkey thigh",
+          "turkey leg",
+          "turkey wing",
+          "turkey drumstick",
+          "ground turkey",
+          "turkey, "
+        ],
+        "category": "protein_poultry",
+        "foodGroup": "turkey",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "cornish game hen",
+          "capon",
+          "poultry,"
+        ],
+        "category": "protein_poultry",
+        "foodGroup": "processed_poultry",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "caribou",
+          "whale",
+          "seal,",
+          "sea lion",
+          "walrus",
+          "moose",
+          "elk",
+          "bison",
+          "buffalo,",
+          "venison",
+          "wild pig",
+          "boar",
+          "muskrat",
+          "beaver",
+          "reindeer",
+          "antelope",
+          "rabbit",
+          "squirrel",
+          "opossum",
+          "raccoon",
+          "ostrich",
+          "emu,",
+          "quail",
+          "pheasant",
+          "goat,",
+          "horse,",
+          "deer,",
+          "bear,",
+          "dove,",
+          "goose,",
+          "partridge",
+          "woodchuck",
+          "alligator"
+        ],
+        "category": "protein_meat",
+        "foodGroup": "game_meat",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "wasabi peas"
+        ],
+        "category": "snack",
+        "foodGroup": "snack_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "pretzel"
+        ],
+        "category": "snack",
+        "foodGroup": "snack_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "rice cake",
+          "pork rind",
+          "corn nuts",
+          "cheese puff",
+          "snack mix",
+          "trail mix",
+          "party mix",
+          "plantain chip",
+          "veggie chip",
+          "puffed snack"
+        ],
+        "category": "snack",
+        "foodGroup": "snack_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "beans and rice",
+          "rice and vermicelli",
+          "rice and pasta",
+          "macaroni and cheese",
+          "nachos",
+          "tamale",
+          "empanada",
+          "meatball",
+          "stuffed grape leaves",
+          "stuffed cabbage",
+          "chili,",
+          "chili con",
+          "ceviche",
+          "fajita",
+          "burrito",
+          "egg roll",
+          "spring roll",
+          "falafel",
+          "poutine",
+          "gyoza",
+          "pierogi",
+          "knish",
+          "samosa",
+          "croquette",
+          "jambalaya",
+          "gumbo",
+          "cioppino",
+          "goulash",
+          "moussaka",
+          "pilaf",
+          "biryani",
+          "pad thai",
+          "lo mein",
+          "chow mein",
+          "chop suey",
+          "tempura",
+          "hot dog",
+          "corn dog",
+          "sloppy joe",
+          "shepherd's pie",
+          "pot roast",
+          "beef stroganoff",
+          "chicken and noodles",
+          "chicken and dumplings",
+          "turkey and noodles",
+          "ham and",
+          "beans, baked",
+          "baked beans"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "prepared_dish_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "hamburger",
+          "cheeseburger",
+          "double hamburger",
+          "double cheeseburger",
+          "triple hamburger",
+          "steak sandwich"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "sandwich",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "yogurt parfait",
+          "fruit and yogurt parfait"
+        ],
+        "category": "prepared_meal",
+        "foodGroup": "prepared_dish_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "cookie",
+          "brownie",
+          "doughnut",
+          "donut",
+          "muffin",
+          "cake or cupcake",
+          "cake,",
+          "cupcake",
+          "danish",
+          "strudel",
+          "cream puff",
+          "eclair",
+          "pan dulce",
+          "churro",
+          "cobbler",
+          "turnover",
+          "sweet roll",
+          "cinnamon roll",
+          "coffee cake",
+          "shortcake",
+          "pastry",
+          "sweet bread",
+          "fruit crisp",
+          "pie,",
+          "pie crust",
+          "fry bread",
+          "funnel cake",
+          "gingerbread",
+          "fritter"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "pastry",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "pancake",
+          "waffle",
+          "french toast",
+          "crepe",
+          "popover",
+          "scone",
+          "biscuit",
+          "breadstick",
+          "bread stick",
+          "croutons",
+          "stuffing",
+          "bread pudding"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "pastry",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "roll,",
+          "rolls,",
+          "bun,",
+          "buns,",
+          "dinner roll",
+          "hamburger roll",
+          "hot dog roll",
+          "hoagie roll",
+          "kaiser roll",
+          "bagel",
+          "english muffin",
+          "cornbread",
+          "banana bread",
+          "zucchini bread",
+          "focaccia",
+          "baguette",
+          "challah",
+          "brioche",
+          "pumpernickel",
+          "rye bread",
+          "white bread",
+          "wheat bread",
+          "whole wheat bread",
+          "multigrain bread",
+          "sourdough",
+          "bread,"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "bread_leavened",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "cracker",
+          "graham cracker",
+          "matzo",
+          "melba toast",
+          "rusk",
+          "zwieback",
+          "wafer"
+        ],
+        "category": "bread_bakery",
+        "foodGroup": "cracker",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "cereal",
+          "granola",
+          "muesli",
+          "oatmeal",
+          "grits",
+          "hominy",
+          "wheat bran",
+          "wheat germ",
+          "bran,",
+          "oat bran",
+          "couscous",
+          "bulgur",
+          "millet",
+          "barley",
+          "buckwheat",
+          "farro",
+          "semolina",
+          "cornmeal",
+          "corn flour",
+          "tapioca",
+          "amaranth",
+          "sorghum",
+          "teff",
+          "triticale",
+          "spelt",
+          "rye,",
+          "wild rice",
+          "rice,",
+          "rice flour",
+          "flour,",
+          "dough,",
+          "wheat, "
+        ],
+        "category": "grain",
+        "foodGroup": "grain_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "noodle",
+          "macaroni",
+          "spaghetti",
+          "vermicelli",
+          "lasagna noodle",
+          "egg noodle",
+          "ramen",
+          "soba",
+          "udon"
+        ],
+        "category": "grain",
+        "foodGroup": "pasta",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "black beans"
+        ],
+        "category": "legume",
+        "foodGroup": "black_bean",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "lima beans",
+          "mung beans",
+          "white beans",
+          "winged beans",
+          "yellow beans",
+          "pink beans",
+          "pinto beans",
+          "kidney beans",
+          "navy beans",
+          "great northern beans",
+          "cranberry beans",
+          "adzuki beans",
+          "fava beans",
+          "broad beans",
+          "refried beans",
+          "beans, ",
+          "cowpeas",
+          "black-eyed peas",
+          "blackeye peas",
+          "split peas",
+          "pigeon peas",
+          "hyacinth beans",
+          "moth beans",
+          "yardlong beans",
+          "lupins",
+          "peas, split",
+          "peas, mature",
+          "peas, dry"
+        ],
+        "category": "legume",
+        "foodGroup": "bean_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "green peas",
+          "peas and carrots",
+          "peas and onions",
+          "snowpeas",
+          "snow peas",
+          "sugar snap peas",
+          "peas, green",
+          "peas, edible",
+          "peas, frozen",
+          "peas, canned",
+          "peas, cooked",
+          "peas, raw",
+          "peas, nfs",
+          "peas,"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "vegetable_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "corn,",
+          "corn on the cob",
+          "sweet corn",
+          "succotash",
+          "baby corn",
+          "hominy,",
+          "bamboo shoot",
+          "taro",
+          "kohlrabi",
+          "gourd",
+          "balsam-pear",
+          "bitter gourd",
+          "bitter melon",
+          "water chestnut",
+          "water chesnut",
+          "artichoke",
+          "asparagus",
+          "beet,",
+          "beets,",
+          "brussels sprout",
+          "okra",
+          "parsnip",
+          "pumpkin",
+          "rutabaga",
+          "turnip,",
+          "turnips,",
+          "zucchini",
+          "yam,",
+          "yams,",
+          "cassava",
+          "jicama",
+          "radish",
+          "fennel",
+          "leek",
+          "shallot",
+          "sprouts,",
+          "seaweed",
+          "vegetables,",
+          "vegetable juice",
+          "mixed vegetables",
+          "vegetable mixture",
+          "classic mixed vegetables",
+          "nopales",
+          "chayote",
+          "salsify",
+          "burdock",
+          "lotus root",
+          "yautia",
+          "plantain",
+          "breadfruit",
+          "jute",
+          "fiddlehead",
+          "cactus",
+          "hearts of palm",
+          "pickle",
+          "sauerkraut",
+          "kimchi",
+          "corn pudding"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "vegetable_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "beet greens",
+          "dandelion greens",
+          "lambsquarter",
+          "cress",
+          "greens,",
+          "chard",
+          "collards",
+          "kale",
+          "mustard greens",
+          "turnip greens",
+          "arugula",
+          "endive",
+          "escarole",
+          "chicory",
+          "watercress",
+          "purslane",
+          "poke",
+          "grape leaves",
+          "vine spinach",
+          "amaranth leaves",
+          "borage",
+          "chrysanthemum",
+          "epazote",
+          "pokeberry",
+          "radicchio",
+          "sorrel"
+        ],
+        "category": "produce_vegetable",
+        "foodGroup": "leafy_green",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "pear",
+          "pawpaw",
+          "fruit cocktail",
+          "fruit salad",
+          "fruit mixture",
+          "mixed fruit",
+          "persimmon",
+          "pomegranate",
+          "quince",
+          "rhubarb",
+          "currants",
+          "elderberries",
+          "gooseberries",
+          "mulberries",
+          "loganberries",
+          "jackfruit",
+          "durian",
+          "feijoa",
+          "guava",
+          "litchi",
+          "lychee",
+          "longans",
+          "loquat",
+          "medlar",
+          "nance",
+          "prickly pear",
+          "rose-apple",
+          "sapodilla",
+          "sapote",
+          "soursop",
+          "sugar-apples",
+          "tamarind",
+          "carissa",
+          "carambola",
+          "crabapples",
+          "groundcherries",
+          "java-plum",
+          "jujube",
+          "melon",
+          "cantaloupe",
+          "honeydew",
+          "watermelon",
+          "kiwi",
+          "fruit, "
+        ],
+        "category": "produce_fruit",
+        "foodGroup": "fruit_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "mixed nuts",
+          "nuts,",
+          "nut, ",
+          "chestnut",
+          "pistachio",
+          "pecan",
+          "macadamia",
+          "hazelnut",
+          "filbert",
+          "brazilnut",
+          "pine nut",
+          "pumpkin and squash seed",
+          "flaxseed",
+          "chia seed",
+          "hemp seed",
+          "poppy seed",
+          "watermelon seed",
+          "breadnut",
+          "ginkgo",
+          "acorn"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "nut_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "candy",
+          "candies",
+          "gum,",
+          "chewing gum",
+          "licorice",
+          "marshmallow",
+          "fudge",
+          "toffee",
+          "caramel",
+          "nougat",
+          "halvah",
+          "jelly bean",
+          "hard candy",
+          "taffy"
+        ],
+        "category": "sweet",
+        "foodGroup": "candy",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "sugar",
+          "syrup",
+          "molasses",
+          "agave",
+          "sweetener",
+          "saccharin",
+          "aspartame",
+          "stevia",
+          "sucralose",
+          "fructose",
+          "dextrose",
+          "maltose",
+          "corn syrup"
+        ],
+        "category": "sweet",
+        "foodGroup": "sweetener",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "frozen novelt",
+          "gelatin dessert",
+          "pudding",
+          "custard",
+          "flan",
+          "yokan",
+          "sherbet",
+          "sorbet",
+          "popsicle",
+          "ice pop",
+          "topping,",
+          "frosting",
+          "icing",
+          "pie filling",
+          "dessert",
+          "mousse",
+          "tiramisu",
+          "cannoli",
+          "baklava",
+          "rice pudding",
+          "tapioca pudding",
+          "trifle",
+          "whipped dessert"
+        ],
+        "category": "sweet",
+        "foodGroup": "sweet_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "soft drink",
+          "energy drink",
+          "sports drink",
+          "wine",
+          "beer",
+          "whiskey",
+          "vodka",
+          "rum,",
+          "gin,",
+          "tequila",
+          "cocktail",
+          "liqueur",
+          "spritzer",
+          "malt beverage",
+          "drink mix",
+          "fruit flavored drink",
+          "fruit punch",
+          "lemonade",
+          "limeade",
+          "horchata",
+          "kombucha",
+          "kvass",
+          "cider",
+          "mead",
+          "sake",
+          "brandy",
+          "bourbon",
+          "scotch",
+          "vermouth",
+          "champagne",
+          "margarita",
+          "mojito",
+          "daiquiri",
+          "pina colada",
+          "bloody mary",
+          "screwdriver",
+          "gin and tonic",
+          "jagerbomb",
+          "long island",
+          "mai tai",
+          "martini",
+          "mimosa",
+          "sangria",
+          "tom collins",
+          "white russian",
+          "water, ",
+          "carbonated water",
+          "tonic water",
+          "mineral water",
+          "seltzer",
+          "club soda",
+          "beverage"
+        ],
+        "category": "beverage",
+        "foodGroup": "beverage_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "smoothie",
+          "fruit smoothie",
+          "fruit and vegetable smoothie",
+          "nectar"
+        ],
+        "category": "beverage",
+        "foodGroup": "juice",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "cream substitute",
+          "whipped topping",
+          "half and half",
+          "creamer",
+          "whey",
+          "milk substitute"
+        ],
+        "category": "dairy",
+        "foodGroup": "cream",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "worcestershire sauce",
+          "cocktail sauce",
+          "white sauce",
+          "gravy",
+          "tartar sauce",
+          "relish",
+          "horseradish",
+          "pesto",
+          "chutney",
+          "marinade",
+          "fish sauce",
+          "oyster sauce",
+          "teriyaki",
+          "barbecue sauce",
+          "tomato sauce",
+          "pasta sauce",
+          "spaghetti sauce",
+          "alfredo sauce",
+          "cheese sauce",
+          "enchilada sauce",
+          "taco sauce",
+          "curry sauce",
+          "sauce,",
+          "sauce "
+        ],
+        "category": "condiment_sauce",
+        "foodGroup": "condiment_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "tahini",
+          "sesame butter",
+          "sesame paste"
+        ],
+        "category": "nut_seed",
+        "foodGroup": "sesame",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
+      },
+      {
+        "descriptionStartsWith": [
+          "yeast",
+          "baking powder",
+          "baking soda",
+          "cornstarch",
+          "leavening",
+          "gelatin,",
+          "salt substitute",
+          "cocoa,",
+          "carob",
+          "vinegar",
+          "meat extender",
+          "protein powder",
+          "protein supplement",
+          "nutritional drink",
+          "meal replacement",
+          "nutrition bar",
+          "supplement"
+        ],
+        "category": "other",
+        "foodGroup": "food_ingredient_other",
+        "appendedBy": "sweep-coverage-extension-2026-09-13"
       }
     ],
     "fallback": {
@@ -4649,7 +6936,9 @@
       "foodGroup": "food_ingredient_other",
       "requiresCuratorReview": true,
       "reason": "A record that matches no rule is imported as a candidate and left unpublished pending a curator, rather than being published under a guessed category. Publishing an unclassified food would put it in the wrong grocery aisle and make it invisible to the dislike exclusions."
-    }
+    },
+    "appendOnlyContract": "Rules are appended, never reordered or edited. The first-match-wins evaluation order therefore guarantees that an appended rule can only classify a description no earlier rule matched, so adding rules can raise coverage but can never change an existing classification. Rules carrying appendedBy were added after the first 127 were reviewed, and their block records which pass added them.",
+    "excludeFromPublicationContract": "A rule may carry excludeFromPublication: true. It means the description was recognised and is deliberately outside this catalog's scope - restaurant and fast-food menu items, and infant, toddler and baby foods - rather than unclassified. The importer skips such a record entirely: no catalog_foods row is written, and the skip is counted under skippedExcludedClass so the report shows how many records were recognised-and-declined rather than silently dropped. Restaurant items are branded identities (brandedDataTypePolicy), and infant nutrition is out of the feature's scope."
   },
   "sweepFoodStateRules": {
     "appliesTo": "the USDA description, lower-cased",
@@ -4715,7 +7004,7 @@
     ],
     "fallbackReason": "Survey (FNDDS) descriptions are as-eaten, so an unmatched FNDDS record is prepared; the reference datasets describe the food as bought, so an unmatched record there is as_purchased. The state is never guessed from nutrition, and raw, dry and cooked forms stay separate rows because grocery aggregation keys on (catalog_food_id, food_state) and must never merge them."
   },
-  "sweepAliasPolicy": "A swept record's aliases are derived from its own description only: the comma-separated qualifiers reordered into natural order (\"Rice, brown, long-grain, raw\" yields \"brown rice\"), plus the plural of the head noun. The sweep invents no synonym, regional name or misspelling — those are curation decisions and exist only on the foods entries above.",
+  "sweepAliasPolicy": "A swept record's aliases are derived from its own description only: the comma-separated qualifiers reordered into natural order (\"Rice, brown, long-grain, raw\" yields \"brown rice\"), plus the plural of the head noun. The sweep invents no synonym, regional name or misspelling \u2014 those are curation decisions and exist only on the foods entries above.",
   "sweepPageBounds": "Each sweep's observedLastNonEmptyPage and observedApproximateRecordCount were measured against GET /foods/list at pageSize 200 on observedOn, by binary-searching the last page that still returned a non-empty array. maxPages is a backstop bound and not that measurement: it sits above the observed count so a dataset that grows between authoring and import is not silently truncated, while an enumeration that never returns an empty page still terminates. The real stopping conditions are an empty page and stopWhenCategoryCandidateVolumeReached; maxPages only caps a runaway.",
   "genericDatasetVolume": {
     "measuredOn": "2026-09-12",
@@ -4724,7 +7013,7 @@
     "survey": 5432,
     "total": 13619,
     "coveragePlanCandidateVolumeTotal": 13765,
-    "consequence": "The three generic datasets hold about 13,619 records in total, which is below the coverage plan's candidateVolumeTotal, so this import cannot by itself reach the candidate volume however completely it sweeps — and a per-category ceiling binds sooner still, because these records are not distributed the way the plan's categories are. The gap is what catalog-generate-ai.ts fills (aiCandidates = max(0, candidateVolume - usdaCandidates) per category), and any remaining shortfall is reported exactly by catalog-report.ts rather than padded. Recorded as a measurement so the arithmetic downstream starts from an observed number instead of an assumed one."
+    "consequence": "The three generic datasets hold about 13,619 records in total, which is below the coverage plan's candidateVolumeTotal, so this import cannot by itself reach the candidate volume however completely it sweeps \u2014 and a per-category ceiling binds sooner still, because these records are not distributed the way the plan's categories are. The gap is what catalog-generate-ai.ts fills (aiCandidates = max(0, candidateVolume - usdaCandidates) per category), and any remaining shortfall is reported exactly by catalog-report.ts rather than padded. Recorded as a measurement so the arithmetic downstream starts from an observed number instead of an assumed one."
   },
   "datasetSweeps": [
     {
@@ -4788,5 +7077,650 @@
       "note": "Survey (FNDDS) supplies the as-eaten preparations and composite dishes that the prepared_meal category needs and that the reference datasets do not carry."
     }
   ],
-  "workListOrder": "The importer walks foods in array order and then datasetSweeps in array order, checkpointing by index across both sections, so entries are only ever appended and never reordered or removed: reordering would make an interrupted run resume at the wrong food. skipFdcIdsPresentInFoods keeps a sweep from overwriting a curated entry, so curation always wins over pattern classification."
+  "workListOrder": "The importer walks foods in array order and then datasetSweeps in array order, checkpointing by index across both sections, so entries are only ever appended and never reordered or removed: reordering would make an interrupted run resume at the wrong food. skipFdcIdsPresentInFoods keeps a sweep from overwriting a curated entry, so curation always wins over pattern classification.",
+  "sweepBrandExclusionRules": {
+    "appliesTo": "the USDA description as written, before lower-casing",
+    "purpose": "Enforces brandedDataTypePolicy on the sweeps: a manufacturer or product identity enters the catalog only through a curated foods entry, never through a bulk import. A swept record matching any signal below is skipped - no catalog_foods row - and counted under skippedBrandPattern.",
+    "whyNotFindBrandPatternMatch": "src/services/catalog.logic.ts exports findBrandPatternMatch, but its own contract scopes it to AI-generated candidates, where it is a reject-tier check. Its proper-noun heuristic false-positives on USDA's own comma-inverted descriptions - \"Beef, New Zealand, imported, chuck eye roll\" reads as a proper noun followed by a product form - so the sweeps use the three precise signals below and findBrandPatternMatch stays what it says it is.",
+    "signals": {
+      "trademarkSymbols": [
+        "\u00ae",
+        "\u2122"
+      ],
+      "brandWordContains": [
+        "mcdonald",
+        "burger king",
+        "kfc",
+        "popeyes",
+        "wendy's",
+        "denny's",
+        "cracker barrel",
+        "t.g.i. friday",
+        "chick-fil-a",
+        "taco bell",
+        "subway,",
+        "dunkin",
+        "starbucks",
+        "pizza hut",
+        "domino's",
+        "little caesars",
+        "papa john",
+        "applebee",
+        "olive garden",
+        "red lobster",
+        "carl's jr",
+        "hardee",
+        "jack in the box",
+        "whataburger",
+        "five guys",
+        "panera",
+        "chipotle",
+        "arby",
+        "dairy queen",
+        "white castle",
+        "in-n-out",
+        "shake shack",
+        "kellogg",
+        "general mills",
+        "post foods",
+        "quaker",
+        "kraft",
+        "nestle",
+        "nestl\u00e9",
+        "unilever",
+        "danone",
+        "chobani",
+        "yoplait",
+        "oscar mayer",
+        "hormel",
+        "tyson",
+        "perdue",
+        "smithfield",
+        "campbell",
+        "progresso",
+        "hunt's",
+        "heinz",
+        "hellmann",
+        "kikkoman",
+        "tabasco",
+        "coca-cola",
+        "pepsi",
+        "dr pepper",
+        "mountain dew",
+        "gatorade",
+        "powerade",
+        "red bull",
+        "monster energy",
+        "budweiser",
+        "coors",
+        "miller lite",
+        "corona extra",
+        "heineken",
+        "guinness",
+        "ben & jerry",
+        "h\u00e4agen-dazs",
+        "haagen-dazs",
+        "breyers",
+        "hershey",
+        "mars,",
+        "snickers",
+        "m&m",
+        "reese's",
+        "oreo",
+        "ritz",
+        "cheez-it",
+        "doritos",
+        "cheetos",
+        "fritos",
+        "pringles",
+        "lay's",
+        "tostitos",
+        "sun chips",
+        "goldfish",
+        "triscuit",
+        "wheat thins",
+        "pop-secret",
+        "orville redenbacher",
+        "jif,",
+        "skippy",
+        "smucker",
+        "welch's",
+        "ocean spray",
+        "minute maid",
+        "tropicana",
+        "simply orange",
+        "silk,",
+        "so delicious",
+        "earth balance",
+        "smart balance",
+        "land o'lakes",
+        "philadelphia,",
+        "sargento",
+        "tillamook",
+        "horizon organic",
+        "morningstar",
+        "gardein",
+        "beyond meat",
+        "impossible",
+        "boca,",
+        "amy's",
+        "annie's",
+        "clif bar",
+        "kind bar",
+        "luna bar",
+        "power bar",
+        "atkins",
+        "slim fast",
+        "ensure,",
+        "boost,",
+        "pediasure",
+        "muscle milk",
+        "premier protein",
+        "shakeology",
+        "herbalife",
+        "usana",
+        "special k",
+        "cheerios",
+        "wheaties",
+        "raisin bran",
+        "froot loops",
+        "frosted flakes",
+        "lucky charms",
+        "cinnamon toast crunch",
+        "cap'n crunch",
+        "honey nut",
+        "rice krispies",
+        "grape-nuts",
+        "shredded wheat",
+        "chex,",
+        "eggo",
+        "aunt jemima",
+        "bisquick",
+        "betty crocker",
+        "duncan hines",
+        "pillsbury",
+        "sara lee",
+        "entenmann",
+        "hostess",
+        "little debbie",
+        "tastykake",
+        "krispy kreme",
+        "cinnabon",
+        "wonder bread",
+        "nature's own",
+        "pepperidge farm",
+        "thomas'",
+        "dave's killer",
+        "ezekiel",
+        "la tortilla",
+        "mission,",
+        "old el paso",
+        "goya",
+        "bush's",
+        "van camp",
+        "chef boyardee",
+        "spaghettios",
+        "ramen noodle soup, chicken flavor",
+        "top ramen",
+        "maruchan",
+        "nissin",
+        "knorr",
+        "lipton",
+        "swanson",
+        "college inn",
+        "better than bouillon"
+      ],
+      "allCapsRun": {
+        "rule": "A whitespace-delimited token of three or more letters that is entirely upper-case and is not in allowedAllCaps. USDA writes manufacturer names in upper case in its own descriptions, so an unexplained all-caps token is the single most reliable brand signal in this corpus.",
+        "minimumLetters": 3,
+        "allowedAllCaps": [
+          "USDA",
+          "NFS",
+          "NS",
+          "RTD",
+          "UHT",
+          "NSA",
+          "WIC",
+          "II",
+          "III",
+          "IV",
+          "TV",
+          "HDL",
+          "LDL",
+          "PST",
+          "DHA",
+          "ARA",
+          "GMO",
+          "FDA",
+          "SR",
+          "FNDDS",
+          "AND",
+          "OR",
+          "WITH",
+          "LOW",
+          "FAT"
+        ]
+      }
+    },
+    "measuredOn": "2026-09-13",
+    "measuredOutcome": "719 of 12,177 classified generic records flagged (549 by allCapsRun, 170 by brandWordContains), leaving 11,458 for the detail pass.",
+    "curatedEntriesExempt": "foods entries are never screened: their identity was reviewed by hand and their fdcId verified against a live response."
+  },
+  "sweepCostClassRules": {
+    "purpose": "A swept record has no curated costClass, and cost_class is NOT NULL. These are relative-cost policy per coverage category, on the coverage plan's 1-3 costClassScale: 1 inexpensive staple, 2 moderately priced, 3 premium or specialty. The value feeds recipe budget tiers only (AAP 0.7.3); it is never shown to a user and is never a price.",
+    "matching": "The record's classified category. Every one of the 21 categories has a row, so the rule is total.",
+    "foodGroupOverridesFirst": "A foodGroup listed in foodGroupOverrides wins over its category's default.",
+    "byCategory": {
+      "produce_vegetable": 1,
+      "produce_fruit": 1,
+      "protein_meat": 2,
+      "protein_poultry": 2,
+      "protein_seafood": 3,
+      "protein_egg": 1,
+      "protein_plant": 2,
+      "dairy": 2,
+      "dairy_alternative": 2,
+      "grain": 1,
+      "bread_bakery": 1,
+      "legume": 1,
+      "nut_seed": 3,
+      "oil_fat": 2,
+      "condiment_sauce": 2,
+      "spice_herb": 3,
+      "beverage": 1,
+      "snack": 2,
+      "sweet": 2,
+      "prepared_meal": 2,
+      "other": 2
+    },
+    "foodGroupOverrides": {
+      "game_meat": 3,
+      "shellfish": 3,
+      "finfish": 3,
+      "cheese": 3,
+      "nut": 3,
+      "seed": 2,
+      "spice": 2,
+      "fresh_herb": 3,
+      "rice": 1,
+      "pasta": 1,
+      "potato": 1,
+      "onion": 1,
+      "carrot": 1,
+      "cabbage": 1,
+      "banana": 1,
+      "apple": 1,
+      "wheat_flour": 1,
+      "vegetable_oil": 1,
+      "sugar": 1,
+      "water": 1,
+      "coffee": 1,
+      "tea": 1
+    }
+  },
+  "sweepAllergenDietRules": {
+    "purpose": "A swept record carries no curated allergen or diet review, so these rules derive allergen_tags and diet_tags from its classified food group and its own description. The derivation only ever narrows: it can add an allergen and it can remove a diet tag, never the reverse.",
+    "allergenStatusRule": "allergen_status is 'unknown' for every swept record without exception. A single-ingredient reference food's allergens are inferable, but inference is not review, and allergen_status is the column the planner reads to decide whether a food is safe to put in front of someone with an allergy (AAP 0.7.3 requires allergen_status = 'known' for every planned ingredient). Recording 'unknown' means a swept food publishes - resolveCatalogDisposition publishes a usda-source record carrying the review-tier allergens_unknown flag - is searchable in Add Food, and is excluded from recipe eligibility until a curator reviews it. The 145 curated entries are the reviewed set and keep allergen_status 'known'.",
+    "allergenVocabulary": [
+      "milk",
+      "eggs",
+      "peanuts",
+      "tree_nuts",
+      "soy",
+      "wheat",
+      "fish",
+      "shellfish",
+      "sesame"
+    ],
+    "byFoodGroup": {
+      "cheese": [
+        "milk"
+      ],
+      "milk": [
+        "milk"
+      ],
+      "yogurt": [
+        "milk"
+      ],
+      "butter": [
+        "milk"
+      ],
+      "cream": [
+        "milk"
+      ],
+      "dairy_other": [
+        "milk"
+      ],
+      "ice_cream": [
+        "milk"
+      ],
+      "egg": [
+        "eggs"
+      ],
+      "egg_other": [
+        "eggs"
+      ],
+      "peanut": [
+        "peanuts"
+      ],
+      "peanut_butter": [
+        "peanuts"
+      ],
+      "nut": [
+        "tree_nuts"
+      ],
+      "nut_butter": [
+        "tree_nuts"
+      ],
+      "soy_product": [
+        "soy"
+      ],
+      "tofu": [
+        "soy"
+      ],
+      "tempeh": [
+        "soy"
+      ],
+      "soy_milk": [
+        "soy"
+      ],
+      "wheat_flour": [
+        "wheat"
+      ],
+      "pasta": [
+        "wheat"
+      ],
+      "bread": [
+        "wheat"
+      ],
+      "roll_bun": [
+        "wheat"
+      ],
+      "tortilla": [
+        "wheat"
+      ],
+      "cracker": [
+        "wheat"
+      ],
+      "cereal": [
+        "wheat"
+      ],
+      "pastry": [
+        "wheat"
+      ],
+      "cookie": [
+        "wheat"
+      ],
+      "cake": [
+        "wheat"
+      ],
+      "pie": [
+        "wheat"
+      ],
+      "pizza": [
+        "wheat"
+      ],
+      "sandwich": [
+        "wheat"
+      ],
+      "wrap": [
+        "wheat"
+      ],
+      "pancake_waffle": [
+        "wheat"
+      ],
+      "finfish": [
+        "fish"
+      ],
+      "canned_fish": [
+        "fish"
+      ],
+      "shellfish": [
+        "shellfish"
+      ],
+      "sesame_seed": [
+        "sesame"
+      ],
+      "tahini": [
+        "sesame"
+      ]
+    },
+    "descriptionAllergenMarkers": {
+      "milk": [
+        "milk",
+        "cheese",
+        "butter",
+        "cream",
+        "yogurt",
+        "whey",
+        "casein",
+        "dairy",
+        "custard",
+        "ghee"
+      ],
+      "eggs": [
+        "egg",
+        "mayonnaise",
+        "meringue",
+        "albumen"
+      ],
+      "peanuts": [
+        "peanut",
+        "groundnut"
+      ],
+      "tree_nuts": [
+        "almond",
+        "walnut",
+        "pecan",
+        "cashew",
+        "pistachio",
+        "hazelnut",
+        "macadamia",
+        "brazil nut",
+        "pine nut",
+        "chestnut",
+        "coconut, ",
+        "nut butter",
+        "marzipan"
+      ],
+      "soy": [
+        "soy",
+        "soybean",
+        "tofu",
+        "tempeh",
+        "edamame",
+        "miso",
+        "tamari"
+      ],
+      "wheat": [
+        "wheat",
+        "flour",
+        "bread",
+        "pasta",
+        "noodle",
+        "cracker",
+        "cereal",
+        "cookie",
+        "cake",
+        "pastry",
+        "tortilla",
+        "bun",
+        "roll,",
+        "biscuit",
+        "couscous",
+        "semolina",
+        "seitan",
+        "barley",
+        "rye",
+        "malt",
+        "crouton",
+        "breaded",
+        "batter"
+      ],
+      "fish": [
+        "fish",
+        "salmon",
+        "tuna",
+        "cod",
+        "tilapia",
+        "halibut",
+        "sardine",
+        "anchov",
+        "trout",
+        "mackerel",
+        "herring",
+        "bass",
+        "catfish",
+        "haddock",
+        "pollock",
+        "snapper",
+        "worcestershire"
+      ],
+      "shellfish": [
+        "shrimp",
+        "prawn",
+        "crab",
+        "lobster",
+        "clam",
+        "mussel",
+        "oyster",
+        "scallop",
+        "squid",
+        "octopus",
+        "crayfish",
+        "calamari"
+      ],
+      "sesame": [
+        "sesame",
+        "tahini",
+        "hummus"
+      ]
+    },
+    "dietTagVocabulary": [
+      "vegan",
+      "vegetarian",
+      "pescatarian_ok",
+      "gluten_free"
+    ],
+    "dietDerivation": {
+      "hierarchy": "vegan implies vegetarian implies pescatarian_ok, matching the 139 reviewed rows, where every vegan food also carries vegetarian and pescatarian_ok. gluten_free is orthogonal.",
+      "animalCategories": [
+        "protein_meat",
+        "protein_poultry",
+        "protein_seafood",
+        "protein_egg",
+        "dairy"
+      ],
+      "animalMarkers": [
+        "beef",
+        "pork",
+        "chicken",
+        "turkey",
+        "lamb",
+        "veal",
+        "bacon",
+        "ham,",
+        "sausage",
+        "gelatin",
+        "lard",
+        "tallow",
+        "broth",
+        "stock,",
+        "gravy",
+        "meat",
+        "poultry",
+        "duck",
+        "goose",
+        "venison",
+        "bison",
+        "game",
+        "liver",
+        "anchov",
+        "lard"
+      ],
+      "seafoodMarkers": [
+        "fish",
+        "salmon",
+        "tuna",
+        "cod",
+        "shrimp",
+        "crab",
+        "lobster",
+        "clam",
+        "mussel",
+        "oyster",
+        "scallop",
+        "squid",
+        "tilapia",
+        "halibut",
+        "sardine",
+        "trout",
+        "mackerel",
+        "herring",
+        "seafood"
+      ],
+      "dairyEggMarkers": [
+        "milk",
+        "cheese",
+        "butter",
+        "cream",
+        "yogurt",
+        "whey",
+        "casein",
+        "egg",
+        "honey",
+        "mayonnaise",
+        "custard",
+        "ghee"
+      ],
+      "rule": "Start from all four tags. Remove vegan, vegetarian and pescatarian_ok when the category is an animalCategory other than protein_seafood, or an animalMarker appears. Remove vegan, vegetarian and keep pescatarian_ok when only a seafoodMarker appears or the category is protein_seafood. Remove vegan but keep vegetarian and pescatarian_ok when a dairyEggMarker appears. Remove gluten_free when a wheat allergen was derived. Honey removes vegan only."
+    },
+    "compositeMarkers": {
+      "purpose": "A description naming a composite preparation has ingredients its food group does not predict, so its derived allergen set is a floor rather than a set. Recorded in the validation record's nutrition_assumptions so a curator can see why review is still required.",
+      "markers": [
+        "with ",
+        " and ",
+        "sauce",
+        "casserole",
+        "breaded",
+        "stuffed",
+        "creamed",
+        "gravy",
+        "salad",
+        "soup",
+        "stew",
+        "mixed",
+        "seasoned",
+        "marinated",
+        "glazed",
+        "battered",
+        "topping",
+        "filled",
+        "frosted",
+        "prepared with"
+      ]
+    }
+  },
+  "sweepNamingPolicy": {
+    "canonicalName": "The USDA description, lower-cased and whitespace-normalised, verbatim otherwise. USDA descriptions are comma-inverted and highly specific, which is exactly what the partial unique index on (canonical_name, food_state) WHERE published needs: 7,793 SR Legacy descriptions stay distinct without any invented disambiguator. Curated entries keep their hand-authored canonicalName.",
+    "displayName": "The USDA description verbatim. USDA already writes sentence case (\"Mushrooms, white, raw\"), which matches the curated entries' own displayName convention, so re-casing it would lose fidelity and risk mangling abbreviations. Distinct display names also keep the search ordering contract (ts_rank DESC, display_name ASC, source_key ASC) deterministic.",
+    "sourceVersion": "\"<usdaDataType> <publicationDate as YYYY-MM>\", reproducing the reviewed rows' \"SR Legacy 2019-04\" and \"Survey (FNDDS) 2024-10\". publicationDate is M/D/YYYY on a detail record and ISO on a list record, so both forms are parsed.",
+    "sourceCacheKey": "\"/food/<fdcId>?format=full\" - the canonical detail path, which is the key the reviewed rows carry, whether the record was fetched singly or in a POST /foods batch.",
+    "identityCollisionWithCuratedEntries": "A sweep skips any record whose normalised (canonical_name, food_state) matches a curated entry's, on top of skipFdcIdsPresentInFoods, counted under skippedCuratedIdentity. dedupeIdentity's survivor tiebreak is the lexicographically smaller source_key and knows nothing about curation, so without this skip a swept record could unseat a curated identity that search-benchmark.v1.json pins by sourceKey. Swept-versus-swept collisions are left to dedupeIdentity as designed."
+  },
+  "sweepPortionPolicy": {
+    "householdUnitsAreNotWeights": "A portion row records the household measure the source states - description, amount and unit - and the gram weight separately. Substituting the gram weight into amount and unit destroys the unit family grocery display depends on (\"1 cup, halves\" is not \"152 g\") and contradicts the row's own description. amount and unit come from the portion label; gram_weight comes from gramWeight.",
+    "unitVocabulary": "A unit token is kept when src/utils/units.ts recognises it. A household noun it does not recognise (apple, patty, fillet, pita, sprig, stalk) becomes unit 'each' - the count family, which is what formatCount and pluralizeCount consume - and the noun stays in description, where it is what the user reads.",
+    "sweptRecordSelection": "A swept record has no curated selector, so portions are taken from the record's own foodPortions: entries with gramWeight > 0 and a parseable household label, ordered by sequenceNumber then gramWeight then id, deduplicated by description, at most three. A label of \"Quantity not specified\" carries no measure and is skipped.",
+    "basisPortion": {
+      "description": "100 g",
+      "amount": 100,
+      "unit": "g",
+      "gramWeight": 100,
+      "source": "usda_per_100g_basis",
+      "isDefaultWhenNoHouseholdPortion": true,
+      "reason": "Every published record states its nutrition per 100 g, so a 100 g portion is the source's own basis restated, not an invented weight. It is written for every published food and is the default only when the record states no household portion at all - which is what lets a Foundation record with no foodPortions publish without fabricating a household measure. A household portion always wins the default when one exists."
+    }
+  },
+  "curatedSafetyContract": "Every foods[] entry carries reviewedSafety, and it is the ONLY source of a curated food's allergen_status, allergen_tags and diet_tags. The importer never derives them for a curated entry and never substitutes an empty set: an empty allergenTags list means 'reviewed, and this food contains none of the nine', which is a safety claim, so it is only ever written from a reviewedSafety block whose allergenStatus is 'known'. An entry with no reviewed determination carries allergenStatus 'unknown' and is therefore searchable but never planned as an ingredient (AAP 0.7.3 requires allergen_status = 'known' for every planned ingredient). These values were recovered from the reviewed release at backend 189d348 and are the reviewed determinations themselves, not a re-derivation of them."
 }

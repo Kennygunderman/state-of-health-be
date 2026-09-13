@@ -125,8 +125,16 @@ export class PlannedMealLogDataError extends Error {
  * ------------------------------------------------------------------------- */
 
 /**
- * The portion-eaten bounds and precision, exported so tests assert against the
- * same numbers the rule uses.
+ * The portion-eaten bounds and precision.
+ *
+ * `[0.25, 10]` is the WIRE CONTRACT the API validates and the shipped client
+ * validates against, not a local choice this module is free to widen: it is
+ * fixed by the plan (0.5.2's request validation, restated for this endpoint in
+ * 0.7.3) and the mobile stepper enforces the same two numbers, so changing
+ * either here would accept portions no client can produce or refuse ones it
+ * still sends. Exported so a caller can restate the rule rather than
+ * reimplement it — `plannedMealLog.logic.test.ts` additionally pins both to
+ * their literal values, which is what stops a drift from passing unnoticed.
  *
  * Two decimals is not a rounding preference — it is the representation the
  * shipped app already stores. `FoodDetail`'s fraction chips hold `⅓` as `0.33`
@@ -924,4 +932,3 @@ export const deriveLoggedStatus = (
 
     return { status, isLogged, previousRecipeVersionIds };
 };
-

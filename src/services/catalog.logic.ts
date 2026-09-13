@@ -73,7 +73,8 @@ import { millilitersToGrams, UnitConversionError, unitFamily } from '../utils/un
 
 /**
  * Thrown only by {@link buildSourceKey}, and only for input that cannot yield a
- * usable key: a blank canonical name, a blank category, or a non-integer FDC id.
+ * usable key: a blank canonical name, a blank category, or a non-canonical FDC
+ * id.
  *
  * This is deliberately louder than a verdict. `source_key` is the UNIQUE column
  * every import, generation run and release load upserts on, so a key derived
@@ -86,6 +87,26 @@ export class CatalogIdentityError extends Error {
     constructor(message: string) {
         super(message);
         this.name = 'CatalogIdentityError';
+    }
+}
+
+/**
+ * The validation policy itself is unusable — a bound that is not a finite
+ * positive number, one whose arithmetic overflows, or a portion rule that does
+ * not match the invariants the database enforces.
+ *
+ * A distinct class from {@link CatalogIdentityError} because it blames a
+ * different thing: the operator's `coverage-plan.v1.json`, not the candidate.
+ * That distinction decides the disposition. A candidate judged against a broken
+ * policy must not become a `rejected` row — `rejected` means "physically
+ * impossible, never publishable", and re-running with a corrected plan would
+ * have published it — so the run stops at the first candidate instead of
+ * writing a terminal verdict for thousands of salvageable ones.
+ */
+export class CatalogPolicyError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'CatalogPolicyError';
     }
 }
 
@@ -223,15 +244,76 @@ export interface CatalogGlobalValidationBounds {
 }
 
 /**
+ * The portion half of the coverage plan's `nutritionBasisRule`, as this module
+ * enforces it.
+ *
+ * Every field is a rule the DATABASE also holds, which is why validation has to
+ * state it: `catalog_food_portions.gram_weight` is `NOT NULL` and a partial
+ * unique index allows one default per food, so a candidate that breaks either
+ * rule is not a row that gets published badly — it is a row that cannot be
+ * written at all. Validated here, it becomes an auditable quarantine an
+ * operator can group and fix; unvalidated, it is a candidate reported
+ * publishable that aborts the run's transaction on insert.
+ *
+ * The plan's other `nutritionBasisRule` members need no field here because they
+ * are honoured by construction: `publishableBases` (`per_100g`, `per_100ml`)
+ * holds because {@link normalizeToPer100g} publishes nothing on any other
+ * basis, `volumeBasisRequiresDensity` is `millilitersToGrams`' own rule,
+ * `perServingOnlyWithoutGramWeightCheck` names the check that branch already
+ * returns, `requiredNutrients` is {@link CORE_NUTRIENT_FIELDS}, and
+ * `nullNutrientMeansUnknown` is this module's null policy throughout.
+ */
+export interface CatalogNutritionBasisRule {
+    /** How many portions may carry `is_default` — one, per the partial unique index. */
+    readonly requiredDefaultPortionCount: number;
+    /** That the default portion must state a sourced gram weight. Only `true` is supported. */
+    readonly defaultPortionRequiresSourcedGramWeight: boolean;
+    /**
+     * That EVERY retained portion must state one. Only `true` is supported. The
+     * source may legitimately state no weight for a portion — the importer never
+     * invents one — but such a portion cannot be kept, because the column it
+     * would be written to is `NOT NULL`.
+     */
+    readonly retainedPortionsRequireSourcedGramWeight: boolean;
+}
+
+/**
+ * The one supported rule, and the shipped `coverage-plan.v1.json` values.
+ *
+ * These are NOT tunable. Each field restates a constraint the database already
+ * enforces, so a rule that relaxed one would only move the failure later: the
+ * candidate would be reported publishable and then abort the insert against
+ * `NOT NULL` or the partial unique index — the exact defect this validation
+ * exists to prevent. {@link assertUsableValidationPolicy} therefore rejects any
+ * other rule rather than honouring it, and the enforcement below does not
+ * consult the booleans at all, so no future edit can reintroduce a switch.
+ *
+ * The fields remain in the type because the coverage plan carries them: they let
+ * a plan that has drifted from the invariants fail loudly instead of being
+ * silently ignored, which is the traceability between plan and validator that
+ * having the rule in data is for.
+ */
+export const DEFAULT_CATALOG_NUTRITION_BASIS_RULE: CatalogNutritionBasisRule = {
+    requiredDefaultPortionCount: 1,
+    defaultPortionRequiresSourcedGramWeight: true,
+    retainedPortionsRequireSourcedGramWeight: true,
+};
+
+/**
  * Everything {@link validateCatalogCandidate} decides with. `brandWords` and
  * `productFormWords` are optional because this module ships curated defaults
  * for them ({@link DEFAULT_BRAND_WORDS}, {@link DEFAULT_PRODUCT_FORM_WORDS}) —
  * they are domain vocabulary rather than tunable thresholds, and the coverage
- * plan carries no list of them.
+ * plan carries no list of them. `nutritionBasisRule` is optional for the same
+ * reason in reverse: the plan does carry it, and
+ * {@link DEFAULT_CATALOG_NUTRITION_BASIS_RULE} mirrors those values so a
+ * caller that has not yet threaded the plan through still validates against
+ * the policy.
  */
 export interface CatalogValidationPolicy {
     readonly categories: readonly CatalogCategoryBounds[];
     readonly validationBounds: CatalogGlobalValidationBounds;
+    readonly nutritionBasisRule?: CatalogNutritionBasisRule;
     readonly brandWords?: readonly string[];
     readonly productFormWords?: readonly string[];
 }
@@ -285,10 +367,12 @@ export const resolveCategoryBounds = (
 /**
  * Every deterministic check this module can record, by stable name.
  *
- * The six QUARANTINE-tier names are exactly the `quarantineChecks` vocabulary
- * in `coverage-plan.v1.json`, and {@link CATALOG_QUARANTINE_CHECK_NAMES} is
+ * The QUARANTINE-tier names are exactly the `quarantineChecks` vocabulary in
+ * `coverage-plan.v1.json`, and {@link CATALOG_QUARANTINE_CHECK_NAMES} is
  * derived from the tier map below so a script can assert code and data agree
- * rather than trusting that they still do.
+ * rather than trusting that they still do. No count is stated here on purpose:
+ * the derived constant and the data are the two authorities, and a number in
+ * prose is a third that goes stale the next time a check is added.
  *
  * `out_of_category_range` is a REVIEW-tier name even though it is what holds an
  * AI-generated candidate in quarantine: the tier describes the check's own
@@ -319,6 +403,22 @@ export const CATALOG_CHECK_NAMES = {
     EMPTY_COMPONENT_SET: 'empty_component_set',
     /** A component quantity or yield factor that is not a positive, finite number. */
     INVALID_COMPONENT_QUANTITY: 'invalid_component_quantity',
+    /**
+     * A COMPUTED value — a basis mass, a rescale factor, a scaled nutrient, an
+     * aggregate component mass or a derived total — that arithmetic on finite
+     * inputs turned into `Infinity` or `NaN`.
+     *
+     * Its own name rather than one of the stated-value checks above, because
+     * the fault is different in kind and in remedy: the record's numbers are
+     * each individually finite and it is their product or sum that is not, so
+     * an operator reading `nutrient_not_finite` would go looking for a nutrient
+     * that is not there. Reject tier, because the alternative is worse than a
+     * rejection: an unguarded overflow stores a false zero (a total divided by
+     * an infinite mass) or writes `Infinity` into a validation observation,
+     * which JSONB cannot hold — `JSON.stringify` turns both into `null`, so the
+     * audit record would claim the check observed nothing.
+     */
+    NON_FINITE_COMPUTED_VALUE: 'non_finite_computed_value',
 
     /** A per-serving record whose serving has no sourced gram weight. */
     MISSING_GRAM_WEIGHT: 'missing_gram_weight',
@@ -328,6 +428,17 @@ export const CATALOG_CHECK_NAMES = {
     MISSING_CORE_NUTRIENT: 'missing_core_nutrient',
     /** A portion with a non-positive amount or gram weight, or an unconvertible unit. */
     UNSUPPORTED_PORTION: 'unsupported_portion',
+    /**
+     * A number of default portions other than the one the nutrition-basis rule
+     * requires.
+     *
+     * Recorded rather than left to the database: `catalog_food_portions` carries
+     * a partial unique index on `(catalog_food_id) WHERE is_default`, so a
+     * second default is a write that FAILS, and a candidate the validator
+     * called publishable would abort the run's transaction instead of receiving
+     * an auditable verdict an operator can group and fix.
+     */
+    DEFAULT_PORTION_COUNT: 'default_portion_count',
     /** No identity evidence corroborates the candidate. */
     UNSOURCED: 'unsourced',
     /** Another candidate or row already holds this canonical name and food state. */
@@ -358,11 +469,13 @@ const CHECK_TIERS: Readonly<Record<CatalogCheckName, CatalogCheckTier>> = {
     brand_pattern_name: 'reject',
     empty_component_set: 'reject',
     invalid_component_quantity: 'reject',
+    non_finite_computed_value: 'reject',
 
     missing_gram_weight: 'quarantine',
     missing_density: 'quarantine',
     missing_core_nutrient: 'quarantine',
     unsupported_portion: 'quarantine',
+    default_portion_count: 'quarantine',
     unsourced: 'quarantine',
     duplicate_identity: 'quarantine',
 
@@ -379,7 +492,8 @@ const checkNamesInTier = (tier: CatalogCheckTier): readonly CatalogCheckName[] =
  * The quarantine-tier names, sorted — derived from the tier map rather than
  * listed, so `catalog-validate.ts` can assert this equals the coverage plan's
  * `quarantineChecks` and a drift between the code and the data fails loudly
- * instead of producing records nobody can group.
+ * instead of producing records nobody can group. Adding a quarantine-tier
+ * check here is therefore also a coverage-plan data change.
  */
 export const CATALOG_QUARANTINE_CHECK_NAMES: readonly CatalogCheckName[] = checkNamesInTier('quarantine');
 
@@ -457,12 +571,53 @@ export type CatalogSourceKeyInput =
           foodState: CatalogFoodState;
       };
 
-const requireIntegerFdcId = (fdcId: number | string): number => {
-    const parsed = typeof fdcId === 'number' ? fdcId : Number(String(fdcId).trim());
+// Decimal digits with no sign, no exponent, no fraction and no leading zero.
+// The shape is half of the canonical rule; `Number.isSafeInteger` below is the
+// other half.
+const CANONICAL_FDC_ID_PATTERN = /^[1-9][0-9]*$/;
 
-    if (!Number.isInteger(parsed) || parsed <= 0) {
+/**
+ * The canonical numeric form of a USDA FoodData Central id, or `null` when the
+ * value is not one.
+ *
+ * ONE parser for the whole codebase. `usda.service.ts` imports this function
+ * for its cache keys and its record checks, because the two must agree on which
+ * record an id names: that module's cache key, this module's `source_key` and
+ * the fetch that filled both are three views of a single identity, and a parser
+ * that differed between them would fetch one food and file it under another.
+ * It lives here rather than in the vendor boundary because the canonical form
+ * of an identity is a decision, and because the pure layer is importable from
+ * anywhere — `usda.service.ts` reaches Prisma and `process.env`, so the
+ * dependency only runs this way round.
+ *
+ * `Number()` coercion is the thing being avoided, and every rejected form below
+ * is one it would have accepted with a different value: `'0x10'` reads as 16,
+ * `'1e3'` as 1000, `'0171077'` as 171077 (a second text for one id, so two
+ * `source_key` strings and two rows for one food), `'9007199254740993'` as
+ * …992 — an id that rounds onto a DIFFERENT legitimate record. A number must
+ * already be a positive safe integer; a string must be canonical decimal
+ * digits, optionally surrounded by whitespace. Everything else — including a
+ * nested array whose `String()` happens to look numeric — is not an id.
+ */
+export const parseCanonicalFdcId = (value: unknown): number | null => {
+    if (typeof value === 'number') {
+        return Number.isSafeInteger(value) && value > 0 ? value : null;
+    }
+    if (typeof value !== 'string' || !CANONICAL_FDC_ID_PATTERN.test(value.trim())) {
+        return null;
+    }
+
+    const parsed = Number(value.trim());
+
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
+const requireCanonicalFdcId = (fdcId: number | string): number => {
+    const parsed = parseCanonicalFdcId(fdcId);
+
+    if (parsed === null) {
         throw new CatalogIdentityError(
-            `A positive integer FDC id is required to build a source key, received ${String(fdcId)}`,
+            `A canonical positive FDC id is required to build a source key, received ${String(fdcId)}`,
         );
     }
 
@@ -478,13 +633,14 @@ const requireIntegerFdcId = (fdcId: number | string): number => {
  * reference their ingredients by it (never by a database id, so the same files
  * seed identically into any database), and `search-benchmark.v1.json` names its
  * expectations by it. Same inputs must always produce the same string, so the
- * FDC id is normalised to its decimal integer form (`'0171077'`, `171077` and
- * `'171077'` are one key) and the name through
- * {@link normalizeCanonicalName}.
+ * FDC id goes through {@link parseCanonicalFdcId} — `171077` and `'171077'`
+ * are one key, and a non-canonical spelling (`'0171077'`, `'1e3'`, `'0x10'`,
+ * an unsafe integer) is refused rather than silently coerced into a key for
+ * some other record — and the name through {@link normalizeCanonicalName}.
  */
 export const buildSourceKey = (input: CatalogSourceKeyInput): string => {
     if (input.identitySource === 'usda') {
-        return `${SOURCE_KEY_USDA_PREFIX}${SOURCE_KEY_SEPARATOR}${requireIntegerFdcId(input.fdcId)}`;
+        return `${SOURCE_KEY_USDA_PREFIX}${SOURCE_KEY_SEPARATOR}${requireCanonicalFdcId(input.fdcId)}`;
     }
 
     // The category keeps its code spelling — `produce_vegetable`, not the
@@ -827,10 +983,14 @@ export const DEFAULT_PRODUCT_FORM_WORDS: readonly string[] = [
 
 // ® and ™ (and their ASCII spellings) are a trademark claim on their face.
 const TRADEMARK_PATTERN = /[®™]|\((?:r|tm)\)/i;
-// A capitalised word that is not the first word, followed by a product form:
-// "Chicken Broth" is a preparation, "Kettle Crunch chips" is a product. The
-// leading boundary keeps mid-word capitals out.
-const PROPER_NOUN_PATTERN = /(?:^|[\s,(-])([A-Z][a-z]{2,})/g;
+// The words of a name, in order, with their original casing kept — the casing
+// is half the signal, so the normalised form alone cannot decide this check.
+const NAME_WORD_PATTERN = /[A-Za-z0-9]+/g;
+// A capitalised word: one capital followed by at least two lowercase letters,
+// which is the shape of a name ("Acme", "Kettle", "Chicken") rather than of a
+// unit or an abbreviation ("Oz", "II", "A").
+const PROPER_NOUN_WORD_PATTERN = /^[A-Z][a-z]{2,}$/;
+const CAPITALISED_WORD_PATTERN = /^[A-Z]/;
 
 export interface BrandPatternMatch {
     /** The value the pattern fired on — the name or one of the aliases. */
@@ -848,6 +1008,38 @@ export interface BrandPatternOptions {
 
 const wordsOf = (value: string): string[] => normalizeCanonicalName(value).split(' ').filter(Boolean);
 
+/** One word of a name: its original text, its normalised form, and its position. */
+interface NameWord {
+    readonly text: string;
+    readonly normalized: string;
+    readonly position: number;
+}
+
+/**
+ * The words of a name with their casing and order intact.
+ *
+ * `wordsOf` cannot serve here: it normalises to lowercase, and the whole
+ * discrimination below turns on which words a name capitalises. Each word is
+ * normalised individually so a vocabulary lookup still matches accents and
+ * punctuation the way every other rule in this module does.
+ */
+const nameWordsOf = (value: string): NameWord[] => {
+    const words: NameWord[] = [];
+    const pattern = new RegExp(NAME_WORD_PATTERN.source, NAME_WORD_PATTERN.flags);
+    let match = pattern.exec(value);
+
+    while (match !== null) {
+        words.push({
+            text: match[0],
+            normalized: normalizeCanonicalName(match[0]),
+            position: words.length,
+        });
+        match = pattern.exec(value);
+    }
+
+    return words;
+};
+
 /**
  * Finds the first brand signal in a name or alias, or `null`.
  *
@@ -857,6 +1049,34 @@ const wordsOf = (value: string): string[] => normalizeCanonicalName(value).split
  * exclusively from USDA Branded records and the live branded search, so a
  * generated candidate that names a product is rejected at parse time rather
  * than published with evidence nobody can check.
+ *
+ * THE PROPER-NOUN RULE, because it is the one that has to discriminate rather
+ * than merely match. A product name and a generic preparation both pair a
+ * capitalised word with a product form; what separates them is which OTHER
+ * words the name capitalises:
+ *
+ *  * a proper noun that is not the first word is a brand wherever a product
+ *    form follows it — "granola Kettle crunch" names a product, and no generic
+ *    preparation capitalises a word mid-name;
+ *  * a proper noun that IS the first word only signals a brand when the product
+ *    form that follows is itself capitalised — "Acme Bar" and "Nova Drink" are
+ *    written as products, while "Protein bar", "Orange juice" and "Chicken
+ *    broth" are ordinary sentence-case food names whose first capital carries no
+ *    information at all.
+ *
+ * So the test is "capitalisation beyond sentence case, plus a product form",
+ * which is exactly the casing a manufactured product is written in and exactly
+ * the casing this pipeline's generic names are not: the generator states a
+ * sentence-case display name and a lowercase canonical name. A title-cased
+ * generic ("Rice Cereal") is therefore treated as a product name and rejected —
+ * deliberately, with the matched token recorded, because in this corpus the
+ * casing is the anomaly worth a human's attention.
+ *
+ * What this cannot catch, stated so nobody reads more into it: a fabricated
+ * brand written in sentence case ("Acme bar") is indistinguishable from a
+ * generic preparation without a food vocabulary this module does not have. The
+ * curated brand-word list and the `unsourced` quarantine — no allowlisted
+ * evidence names the product — are what stand behind it.
  */
 export const findBrandPatternMatch = (
     values: readonly string[],
@@ -883,26 +1103,32 @@ export const findBrandPatternMatch = (
             return { value, reason: 'brand_word', token: brandWord };
         }
 
-        // exec() in a loop needs a fresh lastIndex per value; a new RegExp per
-        // call is cheaper to reason about than resetting shared state.
-        const properNouns = new RegExp(PROPER_NOUN_PATTERN.source, PROPER_NOUN_PATTERN.flags);
-        let properNoun = properNouns.exec(value);
+        const nameWords = nameWordsOf(value);
 
-        while (properNoun !== null) {
-            const nounEnd = properNoun.index + properNoun[0].length;
-            const isLeading = properNoun.index === 0;
-            const trailing = wordsOf(value.slice(nounEnd));
-            const form = trailing.find((word) => productForms.has(word));
+        for (const properNoun of nameWords) {
+            if (!PROPER_NOUN_WORD_PATTERN.test(properNoun.text)) {
+                continue;
+            }
 
-            if (!isLeading && form) {
+            // The leading word of any sentence-case name is capitalised, so at
+            // position 0 the capital is only evidence when a product form after
+            // it is capitalised too; anywhere else the mid-name capital is the
+            // evidence and the form's own casing is immaterial.
+            const form = nameWords
+                .slice(properNoun.position + 1)
+                .find(
+                    (word) =>
+                        productForms.has(word.normalized) &&
+                        (properNoun.position > 0 || CAPITALISED_WORD_PATTERN.test(word.text)),
+                );
+
+            if (form) {
                 return {
                     value,
                     reason: 'proper_noun_product_form',
-                    token: `${properNoun[1]} ${form}`,
+                    token: `${properNoun.text} ${form.normalized}`,
                 };
             }
-
-            properNoun = properNouns.exec(value);
         }
     }
 
@@ -962,10 +1188,28 @@ const readNutrient = (values: CatalogNutrientInput, field: keyof CatalogNutrient
     return value === undefined ? null : value;
 };
 
+/**
+ * A real number strictly greater than zero — the shape every mass, weight,
+ * density, amount and factor in this module must have before it is multiplied
+ * by anything, and the shape every computed one must still have afterwards.
+ */
+const isPositiveFinite = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0;
+
 /** Row-shaped nutrition as `catalog_foods` stores it, plus what a conversion needs. */
 export interface CatalogNutritionSource {
     nutrition_basis: CatalogNutritionBasis;
-    /** The amount of the food the stated values describe: 100 g, 100 ml, or one serving. */
+    /**
+     * How much of the food the stated values describe, IN THE BASIS'S OWN UNIT:
+     * grams for `per_100g`, millilitres for `per_100ml`, and SERVINGS for
+     * `per_serving` — so `2` on a per-serving record whose serving weighs 40 g
+     * means the values describe 80 g of food, and treating it as one serving
+     * would double every per-100 g nutrient.
+     *
+     * Usually 100, 100 and 1 respectively, but never assumed: a label that
+     * states two servings' worth is a real record, and the multiplication is
+     * what keeps it truthful.
+     */
     basis_amount: number;
     calories: number | null;
     protein_g: number | null;
@@ -1014,6 +1258,34 @@ const scaleNutrients = (values: CatalogNutrientInput, factor: number): CatalogNu
 };
 
 /**
+ * The fields of a computed nutrient set whose value is not a real number.
+ *
+ * A stated nutrient and a rescale factor can both be finite while their product
+ * is not, and the result of that multiplication must never reach a stored row:
+ * `Infinity` would be written to a `DOUBLE PRECISION` column as a value no
+ * comparison behaves sensibly against, and recorded in an observation JSONB
+ * turns into `null`, which reads as "unknown" — the one thing it is not.
+ */
+const nonFiniteNutrientFields = (values: CatalogNutrientValues): string[] =>
+    NUTRIENT_FIELDS.filter((field) => values[field] !== null && !Number.isFinite(values[field])).map(
+        (field) => `${field}=${String(values[field])}`,
+    );
+
+/**
+ * A computed value as a validation record may carry it.
+ *
+ * JSONB has no `Infinity` and no `NaN` — `JSON.stringify` writes `null` for
+ * both — so a non-finite observation is recorded as its TEXT form. The check
+ * that produced it has already failed; this is only about the audit trail
+ * saying what was actually observed rather than claiming nothing was.
+ */
+const observedNumber = (value: number): number | string =>
+    Number.isFinite(value) ? value : String(value);
+
+const nonFiniteComputedValueCheck = (observed: string, bound: string): CatalogValidationCheck =>
+    buildCheck(CATALOG_CHECK_NAMES.NON_FINITE_COMPUTED_VALUE, false, observed, bound);
+
+/**
  * Brings a source record onto the per-100 g basis, or reports the one check
  * that stops it.
  *
@@ -1057,13 +1329,31 @@ export const normalizeToPer100g = (source: CatalogNutritionSource): NormalizeToP
                 basisGrams = millilitersToGrams(source.basis_amount, source.density_g_per_ml);
             } catch (error) {
                 if (error instanceof UnitConversionError) {
+                    // `millilitersToGrams` raises one error type for two
+                    // different faults — a density it cannot use, and a
+                    // conversion that overflowed — so the density it was handed
+                    // is what classifies them. Labelling an overflow
+                    // `missing_density` would send an operator looking for a
+                    // density that is present and correct.
+                    if (!isPositiveFinite(source.density_g_per_ml)) {
+                        return {
+                            kind: 'error',
+                            check: buildCheck(
+                                CATALOG_CHECK_NAMES.MISSING_DENSITY,
+                                false,
+                                source.density_g_per_ml ?? null,
+                                'a positive density_g_per_ml',
+                            ),
+                        };
+                    }
+
                     return {
                         kind: 'error',
-                        check: buildCheck(
-                            CATALOG_CHECK_NAMES.MISSING_DENSITY,
-                            false,
-                            source.density_g_per_ml ?? null,
-                            'a positive density_g_per_ml',
+                        check: nonFiniteComputedValueCheck(
+                            `basis mass from ${String(source.basis_amount)} ml at ${String(
+                                source.density_g_per_ml,
+                            )} g/ml: ${(error as UnitConversionError).message}`,
+                            'a finite basis mass in grams',
                         ),
                     };
                 }
@@ -1086,7 +1376,11 @@ export const normalizeToPer100g = (source: CatalogNutritionSource): NormalizeToP
                 };
             }
 
-            basisGrams = servingGrams;
+            // `basis_amount` counts SERVINGS on this basis, so the stated values
+            // describe `basis_amount × servingGrams` of food. Using one
+            // serving's weight regardless would read a two-serving label as a
+            // one-serving one and double every per-100 g nutrient.
+            basisGrams = source.basis_amount * servingGrams;
             break;
         }
 
@@ -1100,14 +1394,56 @@ export const normalizeToPer100g = (source: CatalogNutritionSource): NormalizeToP
         }
     }
 
+    // Every branch above multiplied or divided finite inputs, and finite inputs
+    // can still overflow: 1e308 ml at 10 g/ml, or 1e308 servings of 40 g. A
+    // basis mass that is not a positive real number makes the factor and every
+    // value scaled by it meaningless, so it stops here rather than propagating
+    // as an `Infinity` nutrient or — worse — as a division that lands on 0.
+    if (!isPositiveFinite(basisGrams)) {
+        return {
+            kind: 'error',
+            check: nonFiniteComputedValueCheck(
+                `basisGrams=${String(basisGrams)} from a ${source.nutrition_basis} basis of ${String(
+                    source.basis_amount,
+                )}`,
+                'a finite basis mass in grams greater than 0',
+            ),
+        };
+    }
+
     const factor = PER_100G_BASIS_AMOUNT / basisGrams;
+
+    // A denormal basis mass (5e-324 g) divides into an infinite factor, which
+    // would scale every stated nutrient to Infinity.
+    if (!isPositiveFinite(factor)) {
+        return {
+            kind: 'error',
+            check: nonFiniteComputedValueCheck(
+                `factor=${String(factor)} from basisGrams=${String(basisGrams)}`,
+                `a finite ${PER_100G_BASIS_AMOUNT}/basisGrams factor greater than 0`,
+            ),
+        };
+    }
+
+    const nutrition = scaleNutrients(source, factor);
+    const nonFinite = nonFiniteNutrientFields(nutrition);
+
+    if (nonFinite.length > 0) {
+        return {
+            kind: 'error',
+            check: nonFiniteComputedValueCheck(
+                `${nonFinite.join(', ')} at factor ${String(factor)}`,
+                'finite per-100g values',
+            ),
+        };
+    }
 
     return {
         kind: 'ok',
         normalized: {
             nutrition_basis: 'per_100g',
             basis_amount: PER_100G_BASIS_AMOUNT,
-            nutrition: scaleNutrients(source, factor),
+            nutrition,
             basisGrams,
             factor,
         },
@@ -1153,9 +1489,6 @@ export interface DerivedCatalogNutrition {
 export type DeriveComponentNutritionResult =
     | { kind: 'ok'; derived: DerivedCatalogNutrition }
     | { kind: 'error'; check: CatalogValidationCheck };
-
-const isPositiveFinite = (value: unknown): value is number =>
-    typeof value === 'number' && Number.isFinite(value) && value > 0;
 
 /**
  * Recomputes an ingredient-derived food's per-100 g nutrition from its
@@ -1235,6 +1568,21 @@ export const deriveComponentNutrition = (
         yieldedGrams += component.quantity_grams * component.yield_factor;
     }
 
+    // Each quantity and yield factor was checked above; their products and sums
+    // were not, and a set of finite masses can still add up past the range of a
+    // double. An infinite yielded mass is the dangerous one: it would divide
+    // every nutrient total to exactly 0 and publish a food whose stored
+    // nutrition says "contains nothing" — a false claim rather than an error.
+    if (!isPositiveFinite(inputGrams) || !isPositiveFinite(yieldedGrams)) {
+        return {
+            kind: 'error',
+            check: nonFiniteComputedValueCheck(
+                `inputGrams=${String(inputGrams)} yieldedGrams=${String(yieldedGrams)}`,
+                'finite aggregate component masses greater than 0',
+            ),
+        };
+    }
+
     const nutrition: CatalogNutrientValues = {
         calories: null,
         protein_g: null,
@@ -1258,7 +1606,30 @@ export const deriveComponentNutrition = (
             total += (component.quantity_grams / PER_100G_BASIS_AMOUNT) * value;
         }
 
-        nutrition[field] = known ? (total / yieldedGrams) * PER_100G_BASIS_AMOUNT : null;
+        if (!known) {
+            nutrition[field] = null;
+            continue;
+        }
+
+        const perHundredGrams = (total / yieldedGrams) * PER_100G_BASIS_AMOUNT;
+
+        // A known-but-not-finite total is neither a value nor an unknown, and
+        // recording it as either would be a false statement: `null` here would
+        // claim the source never said, when in fact it said something the
+        // arithmetic could not hold. The whole derivation fails instead.
+        if (!Number.isFinite(total) || !Number.isFinite(perHundredGrams)) {
+            return {
+                kind: 'error',
+                check: nonFiniteComputedValueCheck(
+                    `${field}: total=${String(total)} per100g=${String(perHundredGrams)} over yieldedGrams=${String(
+                        yieldedGrams,
+                    )}`,
+                    'a finite derived per-100g value',
+                ),
+            };
+        }
+
+        nutrition[field] = perHundredGrams;
     }
 
     return {
@@ -1615,13 +1986,22 @@ const energyChecks = (
         checks.push(
             buildCheck(
                 CATALOG_CHECK_NAMES.MACRO_MASS_CEILING,
-                macroMass <= allowedMass,
-                macroMass,
+                // A sum of three finite values can still overflow, and
+                // `Infinity <= allowedMass` is already false — so the verdict is
+                // right either way and only the observation needs care: the
+                // number goes into the record as text, because JSONB would store
+                // it as `null` and the audit trail would read as though nothing
+                // had been observed.
+                Number.isFinite(macroMass) && macroMass <= allowedMass,
+                observedNumber(macroMass),
                 allowedMass,
             ),
         );
 
-        if (isFiniteNumber(calories) && bounds) {
+        // An unusable macro mass makes the energy comparison unusable too, and a
+        // check that could not be EVALUATED is absent from the record rather
+        // than recorded as a failure of its own rule.
+        if (Number.isFinite(macroMass) && isFiniteNumber(calories) && bounds) {
             // The 30 kcal floor in max(30, T%) is what keeps a 20 kcal food from
             // failing on rounding alone, and the per-category percentage is why
             // produce (fibre, organic acids) is judged at 30 % while oil is
@@ -1642,9 +2022,13 @@ const energyChecks = (
             checks.push(
                 buildCheck(
                     CATALOG_CHECK_NAMES.ENERGY_MACRO_MISMATCH,
-                    difference <= allowed,
-                    difference,
-                    allowed,
+                    // Both sides are computed, so both are guarded: an infinite
+                    // allowance would otherwise pass an infinite difference
+                    // (`Infinity <= Infinity`) and publish a record whose energy
+                    // nothing was actually compared against.
+                    Number.isFinite(difference) && Number.isFinite(allowed) && difference <= allowed,
+                    observedNumber(difference),
+                    observedNumber(allowed),
                 ),
             );
         }
@@ -1669,6 +2053,7 @@ const portionDriftCheck = (
     let worstField: string | null = null;
     let failed = false;
     let compared = false;
+    const notFinite: string[] = [];
 
     for (const field of NUTRIENT_FIELDS) {
         const per100 = nutrition[field];
@@ -1683,6 +2068,17 @@ const portionDriftCheck = (
         const expected = (per100 * servingGrams) / PER_100G_BASIS_AMOUNT;
         const difference = Math.abs(statedValue - expected);
         const allowed = (Math.abs(expected) * tolerancePercent) / PERCENT;
+
+        // The expectation is a product of two finite values and can overflow;
+        // an unguarded `Infinity` would make `difference > allowed` read
+        // `Infinity > Infinity` — false — and pass a record whose portion
+        // arithmetic never resolved. The field is named in the observation
+        // instead of a percentage JSONB could not hold.
+        if (!Number.isFinite(expected) || !Number.isFinite(difference) || !Number.isFinite(allowed)) {
+            notFinite.push(`${field}=${String(expected)}`);
+            failed = true;
+            continue;
+        }
         // A zero expectation admits only a zero statement: there is no ratio to
         // take, so the drift is reported as a whole 100 % rather than as
         // Infinity, which JSONB would store as null.
@@ -1702,13 +2098,33 @@ const portionDriftCheck = (
         return null;
     }
 
+    const observed =
+        notFinite.length > 0
+            ? `not finite: ${notFinite.join(', ')}`
+            : worstField === null
+              ? 0
+              : `${worstField} ${worstDriftPercent.toFixed(2)}%`;
+
     return buildCheck(
         CATALOG_CHECK_NAMES.PORTION_CONVERSION_DRIFT,
         !failed,
-        worstField === null ? 0 : `${worstField} ${worstDriftPercent.toFixed(2)}%`,
+        observed,
         `within ${tolerancePercent}% of the per-100g values at ${servingGrams} g`,
     );
 };
+
+/**
+ * Whether a portion's gram weight disqualifies it.
+ *
+ * `null` is the source stating no weight, which is honest and is never invented
+ * — but a portion the pipeline keeps must have one, because
+ * `catalog_food_portions.gram_weight` is `NOT NULL`. So `null`, zero, negative
+ * and non-finite are one answer here, and there is no policy input that could
+ * make any of them acceptable: a weight the column cannot hold is unusable
+ * whatever a plan says.
+ */
+const hasUnusableGramWeight = (portion: CatalogFoodPortionCandidate): boolean =>
+    !isPositiveFinite(portion.gram_weight);
 
 const presenceChecks = (
     candidate: CatalogFoodCandidate,
@@ -1716,6 +2132,7 @@ const presenceChecks = (
     defaultPortion: CatalogFoodPortionCandidate | null,
     normalizationFailure: CatalogValidationCheck | null,
     context: CatalogValidationContext,
+    rule: CatalogNutritionBasisRule,
 ): CatalogValidationCheck[] => {
     const checks: CatalogValidationCheck[] = [];
     const values: CatalogNutrientInput = nutrition ?? candidate;
@@ -1738,7 +2155,10 @@ const presenceChecks = (
         checks.push(
             buildCheck(
                 CATALOG_CHECK_NAMES.MISSING_GRAM_WEIGHT,
-                isPositiveFinite(gramWeight),
+                // Unconditional: a default portion the pipeline can write must
+                // exist and must carry a usable weight. No policy input relaxes
+                // it, because the column is `NOT NULL` either way.
+                defaultPortion !== null && isPositiveFinite(gramWeight),
                 defaultPortion === null ? 'no default portion' : gramWeight,
                 'one default portion with a sourced gram weight greater than 0',
             ),
@@ -1747,21 +2167,45 @@ const presenceChecks = (
 
     const portions = candidate.portions ?? [];
     if (portions.length > 0) {
+        // Counted rather than found: `portions.find(is_default)` answers which
+        // portion the serving weight comes from, and says nothing about a second
+        // one waiting to fail the insert. The count itself is the observation an
+        // operator needs.
+        const defaultCount = portions.filter((portion) => portion.is_default).length;
+
+        checks.push(
+            buildCheck(
+                CATALOG_CHECK_NAMES.DEFAULT_PORTION_COUNT,
+                defaultCount === rule.requiredDefaultPortionCount,
+                defaultCount,
+                rule.requiredDefaultPortionCount,
+            ),
+        );
+
         const unsupported = portions
             .filter(
                 (portion) =>
                     !isPositiveFinite(portion.amount) ||
-                    (portion.gram_weight !== null && !isPositiveFinite(portion.gram_weight)) ||
+                    // The DEFAULT portion's own weight is `missing_gram_weight`'s
+                    // fact, recorded there with the bound that names it, so this
+                    // check judges the others — one missing weight stays one
+                    // record rather than two spellings of it.
+                    (!portion.is_default && hasUnusableGramWeight(portion)) ||
                     unitFamily(portion.unit) === null,
             )
-            .map((portion) => `${portion.description || '(no description)'}: ${portion.amount} ${portion.unit}`);
+            .map(
+                (portion) =>
+                    `${portion.description || '(no description)'}: ${portion.amount} ${portion.unit} at ${
+                        portion.gram_weight === null ? 'no gram weight' : `${String(portion.gram_weight)} g`
+                    }`,
+            );
 
         checks.push(
             buildCheck(
                 CATALOG_CHECK_NAMES.UNSUPPORTED_PORTION,
                 unsupported.length === 0,
                 unsupported.length === 0 ? null : unsupported.join('; '),
-                'positive amounts and gram weights, in a convertible unit',
+                'positive amounts and sourced gram weights, in a convertible unit',
             ),
         );
     }
@@ -1827,6 +2271,116 @@ const reviewChecks = (
 };
 
 /**
+ * Every numeric bound the policy supplies, with the path an operator would fix
+ * and whether zero is a legal value for it.
+ *
+ * Ceilings and tolerances must be greater than zero — a ceiling of 0 rejects
+ * every food and a tolerance factor of 0 makes the macro-mass allowance 0, so
+ * neither can decide anything. A review band's floor may legitimately BE zero:
+ * `beverage`, `condiment_sauce`, `spice_herb` and `other` all ship with
+ * `kcalReviewRange.min: 0`, because a zero-calorie drink is a real food and not
+ * an atypical one.
+ */
+const numericPolicyBounds = (
+    policy: CatalogValidationPolicy,
+): { path: string; value: number; zeroAllowed: boolean }[] => {
+    const { validationBounds: global } = policy;
+    const positive = (path: string, value: number) => ({ path, value, zeroAllowed: false });
+    const nonNegative = (path: string, value: number) => ({ path, value, zeroAllowed: true });
+
+    const entries = [
+        positive('validationBounds.maxKcalPer100g', global.maxKcalPer100g),
+        positive('validationBounds.macroMassToleranceFactor', global.macroMassToleranceFactor),
+        positive('validationBounds.energyMacroAbsoluteToleranceKcal', global.energyMacroAbsoluteToleranceKcal),
+        positive('validationBounds.portionConversionTolerancePercent', global.portionConversionTolerancePercent),
+    ];
+
+    for (const category of policy.categories) {
+        const at = `categories[${category.category}]`;
+        entries.push(
+            nonNegative(`${at}.kcalReviewRange.min`, category.kcalReviewRange.min),
+            positive(`${at}.kcalReviewRange.max`, category.kcalReviewRange.max),
+            positive(`${at}.energyMacroTolerancePercent`, category.energyMacroTolerancePercent),
+        );
+
+        for (const [state, range] of Object.entries(category.kcalReviewRangeByFoodState ?? {})) {
+            if (range) {
+                entries.push(
+                    nonNegative(`${at}.kcalReviewRangeByFoodState.${state}.min`, range.min),
+                    positive(`${at}.kcalReviewRangeByFoodState.${state}.max`, range.max),
+                );
+            }
+        }
+    }
+
+    return entries;
+};
+
+/**
+ * Proves the policy can decide anything before a single check runs, and returns
+ * the portion rule to enforce.
+ *
+ * Two distinct failures are caught here for one reason: a candidate must never
+ * receive a verdict from a policy that cannot produce a correct one.
+ *
+ * 1. A bound that is not a finite positive number, or whose arithmetic
+ *    overflows. Checking the supplied numbers is not sufficient, and the
+ *    macro-mass ceiling is why: `macroMassToleranceFactor = Number.MAX_VALUE`
+ *    is finite and positive, yet `100 × MAX_VALUE` is `Infinity`, and a ceiling
+ *    of `Infinity` passes every candidate and then stores as `null` in JSONB —
+ *    a check that reads as satisfied against a bound nobody can see. So the
+ *    DERIVED bound is asserted too, at the one place it is derived from.
+ * 2. A portion rule that differs from {@link DEFAULT_CATALOG_NUTRITION_BASIS_RULE}.
+ *    Those values are database invariants, not thresholds; honouring a relaxed
+ *    one would report a candidate publishable and abort the insert instead.
+ *    Failing here means a drifted plan is loud rather than quietly disregarded.
+ *
+ * Throwing rather than recording a check is deliberate: `checks[]` describes a
+ * candidate, and neither failure is the candidate's. Recording one would write a
+ * terminal `rejected` verdict for a row a corrected plan would publish.
+ */
+export const assertUsableValidationPolicy = (
+    policy: CatalogValidationPolicy,
+): CatalogNutritionBasisRule => {
+    for (const { path, value, zeroAllowed } of numericPolicyBounds(policy)) {
+        const usable = zeroAllowed ? Number.isFinite(value) && value >= 0 : isPositiveFinite(value);
+
+        if (!usable) {
+            throw new CatalogPolicyError(
+                `${path} must be a finite number ${
+                    zeroAllowed ? 'of 0 or more' : 'greater than 0'
+                }, received ${String(value)}`,
+            );
+        }
+    }
+
+    const allowedMass = PER_100G_BASIS_AMOUNT * policy.validationBounds.macroMassToleranceFactor;
+    if (!isPositiveFinite(allowedMass)) {
+        throw new CatalogPolicyError(
+            `validationBounds.macroMassToleranceFactor ${String(
+                policy.validationBounds.macroMassToleranceFactor,
+            )} yields a macro-mass ceiling of ${String(allowedMass)}, which is not a usable bound`,
+        );
+    }
+
+    const rule = policy.nutritionBasisRule ?? DEFAULT_CATALOG_NUTRITION_BASIS_RULE;
+    const expected = DEFAULT_CATALOG_NUTRITION_BASIS_RULE;
+    if (
+        rule.requiredDefaultPortionCount !== expected.requiredDefaultPortionCount ||
+        rule.defaultPortionRequiresSourcedGramWeight !== expected.defaultPortionRequiresSourcedGramWeight ||
+        rule.retainedPortionsRequireSourcedGramWeight !== expected.retainedPortionsRequireSourcedGramWeight
+    ) {
+        throw new CatalogPolicyError(
+            `nutritionBasisRule must match the database invariants ${JSON.stringify(
+                expected,
+            )}, received ${JSON.stringify(rule)}`,
+        );
+    }
+
+    return expected;
+};
+
+/**
  * Runs every deterministic check the coverage plan defines against one
  * candidate and resolves its publication status.
  *
@@ -1846,6 +2400,10 @@ export const validateCatalogCandidate = (
     policy: CatalogValidationPolicy,
     context: CatalogValidationContext = {},
 ): CatalogValidationVerdict => {
+    // Before any check: a policy that cannot decide correctly must not produce a
+    // verdict at all. Throws rather than returning one, and returns the portion
+    // rule to enforce.
+    const rule = assertUsableValidationPolicy(policy);
     const checks: CatalogValidationCheck[] = [];
 
     // Only a generated candidate is judged on its name: a USDA Branded record
@@ -1896,7 +2454,7 @@ export const validateCatalogCandidate = (
     }
 
     checks.push(
-        ...presenceChecks(candidate, normalizedNutrition, defaultPortion, normalizationFailure, context),
+        ...presenceChecks(candidate, normalizedNutrition, defaultPortion, normalizationFailure, context, rule),
     );
     checks.push(...reviewChecks(candidate, normalizedNutrition, bounds));
 
@@ -2048,4 +2606,3 @@ export const computeCoverageShortfall = (
         unknownCategories,
     };
 };
-

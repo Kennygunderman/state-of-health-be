@@ -154,11 +154,21 @@ export interface EvidenceFetchLimits {
  * image, so a file under `data/` can be neither compiled into nor read by the
  * running API.
  *
- * `registrySnapshot` and `rowCount` are carried so a refresh of the address
- * table is a reviewed data change: {@link validateEvidencePolicy} compares both
- * against the reviewed attestation in this module, and the sibling test asserts
- * them against the values recorded in `docs/meal-planning/catalog-policy.md`.
- * A document that does not carry the reviewed pair is not read.
+ * `registrySnapshot` and the three row members are carried so a refresh of the
+ * address table is a reviewed data change:
+ * {@link validateEvidencePolicy} compares every one of them against the
+ * reviewed attestation in this module, and
+ * `src/services/__tests__/evidence.logic.test.ts` asserts them three ways —
+ * document, JSON and module — against the values recorded in
+ * `docs/meal-planning/catalog-policy.md`. A document that does not carry the
+ * reviewed set is not read.
+ *
+ * The split is stated in the document rather than inferred from it because
+ * `rowCount` alone cannot say which rows came from a registry: one reviewed row
+ * (`::/96`, see {@link REVIEWED_SUPPLEMENTAL_CIDRS}) is carried for hardening
+ * and is not a registry entry, so a document reclassifying it — in either
+ * direction — changes what a reviewer is being asked to counter-sign, and
+ * {@link validateEvidencePolicy} refuses it.
  *
  * Nothing accepts this type on trust. Every entry point validates the document
  * first, reading each member as `unknown`, because a value that parsed as JSON
@@ -167,7 +177,14 @@ export interface EvidenceFetchLimits {
 export interface EvidencePolicy {
     readonly allowlistVersion: string;
     readonly registrySnapshot: string;
+    /** Every address row the document carries: registry-derived plus supplemental. */
     readonly rowCount: number;
+    /** The rows transcribed from the two IANA registries at `registrySnapshot`. */
+    readonly registryRowCount: number;
+    /** The rows carried for hardening rather than transcribed from a registry. */
+    readonly supplementalRowCount: number;
+    /** Which blocks those supplemental rows are, so the classification is reviewable per block. */
+    readonly supplementalCidrs: readonly string[];
     readonly hostClasses: readonly EvidenceHostClass[];
     readonly specialPurposeRanges: readonly SpecialPurposeRange[];
     readonly fetchLimits: EvidenceFetchLimits;
@@ -189,7 +206,15 @@ export interface EvidencePolicy {
  * back into a prompt as instructions.
  */
 export interface EvidenceRetrievalRecord {
+    /**
+     * The URL that **served** the recorded bytes — after a same-host redirect
+     * the hop's target, not the URL the model proposed. The status, hash and
+     * snippet all came from that response, so this is the location a reviewer
+     * re-fetches to check them, and attributing them to a URL that only
+     * redirected would make the record unverifiable.
+     */
     readonly url: string;
+    /** The host of that same URL: the host the bytes actually came from. */
     readonly finalHost: string;
     readonly status: number;
     readonly bodySha256: string;
@@ -361,7 +386,13 @@ export interface ReviewedRange {
 /**
  * The **complete** IPv4 and IPv6 special-purpose registries as transcribed at
  * {@link REVIEWED_REGISTRY_SNAPSHOT} — every row, in registry order, with the
- * reachability each states.
+ * reachability each states — plus the small supplemental set named in
+ * {@link REVIEWED_SUPPLEMENTAL_CIDRS}, which is carried for hardening rather
+ * than transcribed from a registry. The two are counted separately
+ * ({@link REVIEWED_REGISTRY_ROW_COUNT}, {@link REVIEWED_SUPPLEMENTAL_ROW_COUNT})
+ * so neither is ever presented as the other: the registry-derived count is what
+ * a reviewer diffs against the registry pages at a refresh, and it would be
+ * wrong by one if the supplemental row were counted into it.
  *
  * It is the whole table and not a selected floor on purpose. A subset attests
  * only the rows someone thought to list, and a document can then drop an
@@ -450,7 +481,52 @@ export const REVIEWED_RANGE_TABLE: readonly ReviewedRange[] = [
     { cidr: 'fe80::/10', globallyReachable: false }, // Link-Local Unicast
 ];
 
-/** The number of registry rows reviewed at that snapshot: 26 IPv4 and 26 IPv6. */
+/**
+ * The blocks {@link REVIEWED_RANGE_TABLE} carries **for hardening rather than
+ * because a registry lists them**, written as the table writes them.
+ *
+ * Today that is exactly one block, and it is data rather than a number so that
+ * the split below is derived from the two lists instead of remembered: `::/96`
+ * is RFC 4291's deprecated IPv4-Compatible prefix, which the current IANA IPv6
+ * Special-Purpose Address Registry does not list. It is carried because
+ * {@link unwrapEmbeddedIpv4} unwraps that form, so an attacker writing
+ * `::a9fe:a9fe` must not outflank `169.254.0.0/16`, and because a block the
+ * table does not carry matches nothing and reads as ordinary global unicast.
+ *
+ * Keeping it in the same table as the registry rows is what makes the
+ * classifier's longest-prefix match see it at all; keeping it out of the
+ * registry-derived count is what keeps the attestation honest. A block added
+ * here must also be added to the table: {@link REVIEWED_ATTESTATION} records a
+ * defect otherwise and every address classification then refuses, because a
+ * supplemental block the table does not carry is a hardening rule that silently
+ * stopped applying.
+ */
+export const REVIEWED_SUPPLEMENTAL_CIDRS: readonly string[] = ['::/96'];
+
+/** Whether a reviewed row is carried for hardening rather than transcribed from a registry. */
+const isSupplementalCidr = (cidr: string): boolean => REVIEWED_SUPPLEMENTAL_CIDRS.indexOf(cidr) !== -1;
+
+/**
+ * The reviewed rows that are transcribed registry entries: 26 IPv4 and 25 IPv6.
+ *
+ * Derived by subtracting the supplemental set from the table rather than
+ * written down, so the two cannot disagree — the count a reviewer checks
+ * against the registry pages is computed from the rows they are checking.
+ */
+export const REVIEWED_REGISTRY_ROW_COUNT = REVIEWED_RANGE_TABLE.filter(
+    (row) => !isSupplementalCidr(row.cidr),
+).length;
+
+/** The reviewed rows carried for hardening: the table's members of {@link REVIEWED_SUPPLEMENTAL_CIDRS}. */
+export const REVIEWED_SUPPLEMENTAL_ROW_COUNT = REVIEWED_RANGE_TABLE.length - REVIEWED_REGISTRY_ROW_COUNT;
+
+/**
+ * Every row reviewed at that snapshot, registry-derived and supplemental
+ * together. It is the number of rows the document must carry, and it is
+ * deliberately **not** described as a registry-row count anywhere: the
+ * registry-derived figure is {@link REVIEWED_REGISTRY_ROW_COUNT}, and the two
+ * differ by {@link REVIEWED_SUPPLEMENTAL_ROW_COUNT}.
+ */
 export const REVIEWED_RANGE_ROW_COUNT = REVIEWED_RANGE_TABLE.length;
 
 const WILDCARD_PREFIX = '*.';
@@ -1582,24 +1658,40 @@ interface AttestedRange {
 interface ReviewedAttestation {
     readonly rows: readonly AttestedRange[];
     readonly keys: ReadonlySet<string>;
+    /**
+     * {@link REVIEWED_SUPPLEMENTAL_CIDRS} resolved to block identity, keyed by
+     * that identity and carrying the reviewed text as its value. Keyed for the
+     * same reason the rows are — a document may write a block in any equivalent
+     * text, and the comparison is about the block — and the text is kept so a
+     * refusal can name the missing block as the review writes it.
+     */
+    readonly supplementalBlocks: ReadonlyMap<string, string>;
     readonly defects: readonly string[];
 }
 
 /**
  * The reviewed table, resolved to block identities once at module load.
  *
- * Resolving it per classified address would repeat 52 CIDR parses on every
- * candidate URL for a value that cannot change at runtime. A defect in the
- * attestation — an entry that does not parse, or one block written twice, which
- * would make it cover fewer blocks than its row count claims — is recorded
- * rather than thrown: it would be a typing mistake in this file, and the honest
- * response is for every table to stop validating, loudly and through the
- * ordinary verdict, rather than for the attestation to silently attest less
- * than it appears to.
+ * Resolving it per classified address would repeat one CIDR parse per reviewed
+ * row on every candidate URL, for a value that cannot change at runtime. A
+ * defect in the attestation — an entry that does not parse, or one block
+ * written twice, which would make it cover fewer blocks than its row count
+ * claims — is recorded rather than thrown: it would be a typing mistake in this
+ * file, and the honest response is for every table to stop validating, loudly
+ * and through the ordinary verdict, rather than for the attestation to silently
+ * attest less than it appears to.
+ *
+ * The supplemental set is checked the same way and for the same reason. Its
+ * counts are derived by subtracting it from the table, so an entry the table
+ * does not carry **as written** would leave
+ * {@link REVIEWED_REGISTRY_ROW_COUNT} overstated by one while the hardening
+ * rule it names quietly stopped applying — the two drifting apart is exactly
+ * what the reviewed split exists to prevent, so it is a defect, not a warning.
  */
 const REVIEWED_ATTESTATION: ReviewedAttestation = (() => {
     const rows: AttestedRange[] = [];
     const keys = new Set<string>();
+    const supplementalBlocks = new Map<string, string>();
     const defects: string[] = [];
 
     for (const reviewed of REVIEWED_RANGE_TABLE) {
@@ -1619,7 +1711,35 @@ const REVIEWED_ATTESTATION: ReviewedAttestation = (() => {
         keys.add(key);
     }
 
-    return { rows, keys, defects };
+    const carriedByTable = new Set<string>(REVIEWED_RANGE_TABLE.map((reviewed) => reviewed.cidr));
+
+    for (const supplemental of REVIEWED_SUPPLEMENTAL_CIDRS) {
+        const cidr = parseCidr(supplemental);
+        if (cidr === null) {
+            defects.push(`the reviewed supplemental entry "${supplemental}" is not a valid CIDR`);
+            continue;
+        }
+
+        // Text identity, not block identity, because both lists are literals in
+        // this file transcribed side by side, and it is the text match the two
+        // row counts above are derived from.
+        if (!carriedByTable.has(supplemental)) {
+            defects.push(
+                `the reviewed supplemental entry "${supplemental}" is not carried by the reviewed table as written`,
+            );
+            continue;
+        }
+
+        const key = cidrKey(cidr);
+        if (supplementalBlocks.has(key)) {
+            defects.push(`the reviewed supplemental entry "${supplemental}" names a block already supplemental`);
+            continue;
+        }
+
+        supplementalBlocks.set(key, supplemental);
+    }
+
+    return { rows, keys, supplementalBlocks, defects };
 })();
 
 /**
@@ -2151,6 +2271,199 @@ const checkDeclaredFetchLimits = (raw: unknown): Checked<EvidenceFetchLimits> =>
     };
 };
 
+/** The reviewed split of the address table, as a validated document states it. */
+interface ReviewedRowSplit {
+    readonly registryRowCount: number;
+    readonly supplementalRowCount: number;
+    readonly supplementalCidrs: readonly string[];
+}
+
+/** A declared row's CIDR text, or `null` for anything that is not a row carrying one. */
+const declaredBlockText = (row: unknown): string | null =>
+    isRecord(row) && typeof row.cidr === 'string' ? row.cidr : null;
+
+/**
+ * Whether the declared table carries a block.
+ *
+ * Read from the *declared* rows rather than the validated ones, because this
+ * runs before {@link validateEvidenceRangeTable}: it answers "did the hardening
+ * row survive this edit", and it has to answer that for a table which may be
+ * about to be refused for some other reason as well. Nothing here trusts the
+ * rows — each is read as `unknown` and a row that carries no CIDR text simply
+ * does not match.
+ *
+ * Text first, block identity second: the committed document writes each block
+ * in the canonical registry text, so the string comparison answers without
+ * parsing anything, and the parse pass only runs for a document that wrote an
+ * equivalent-but-different text — which is worth a look, not worth refusing a
+ * semantically identical table over.
+ */
+const tableCarriesBlock = (ranges: readonly unknown[], cidr: string, key: string): boolean => {
+    for (const row of ranges) {
+        if (declaredBlockText(row) === cidr) {
+            return true;
+        }
+    }
+
+    for (const row of ranges) {
+        const text = declaredBlockText(row);
+        const parsed = text === null ? null : parseCidr(text);
+        if (parsed !== null && cidrKey(parsed) === key) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
+/**
+ * The reviewed row split, checked and rebuilt.
+ *
+ * `rowCount` alone is not an attestation of the registries, because one row of
+ * the reviewed table is not a registry entry: `::/96`
+ * ({@link REVIEWED_SUPPLEMENTAL_CIDRS}) is carried so that `::a9fe:a9fe` cannot
+ * outflank `169.254.0.0/16`. So the document states the two sets separately and
+ * every one of those statements is checked, in this order:
+ *
+ * 1. **Each count is a positive integer.** A zero, a fraction or a string is a
+ *    document that was edited by something other than a reviewer.
+ * 2. **They add up to the rows carried.** This is the internal consistency a
+ *    half-merged document fails: bump one count and the sum stops matching.
+ * 3. **Each equals the reviewed count**, which the document cannot edit — the
+ *    same reason `rowCount` is compared with {@link REVIEWED_RANGE_ROW_COUNT}
+ *    and not only with the rows carried. Steps 2 and 3 together are what refuse
+ *    a document that moved a real registry row into the supplemental set, or
+ *    `::/96` out of it: the sum still holds, but the halves no longer match the
+ *    review.
+ * 4. **The supplemental list is exactly the reviewed supplemental set**, block
+ *    for block, because the counts alone cannot tell a reclassification from a
+ *    substitution — one block out, another in, and both counts are intact.
+ *    Equality is established as a set: the list is as long as the declared
+ *    supplemental count, every member is a block the review classes as
+ *    supplemental, and no block appears twice. This is what makes the
+ *    *identity* of the hardening rows reviewable rather than just their number.
+ * 5. **Every supplemental block is actually in the table.** A supplemental row
+ *    the table does not carry is a hardening rule that stopped applying:
+ *    nothing would match `::/96`, and an embedded link-local address would read
+ *    as ordinary global unicast. Blocks are matched by identity and not by the
+ *    text they happen to be written in, the way the table's own set equality
+ *    matches them.
+ */
+const checkReviewedRowSplit = (
+    policy: Record<string, unknown>,
+    rowCount: number,
+    ranges: readonly unknown[],
+): Checked<ReviewedRowSplit> => {
+    const registryRowCount = policy.registryRowCount;
+    if (!isPositiveInteger(registryRowCount)) {
+        return {
+            ok: false,
+            detail: `the policy document declares the registry row count ${describeValue(registryRowCount)}`,
+        };
+    }
+
+    const supplementalRowCount = policy.supplementalRowCount;
+    if (!isPositiveInteger(supplementalRowCount)) {
+        return {
+            ok: false,
+            detail: `the policy document declares the supplemental row count ${describeValue(supplementalRowCount)}`,
+        };
+    }
+
+    if (registryRowCount + supplementalRowCount !== rowCount) {
+        return {
+            ok: false,
+            detail:
+                `the policy document declares ${registryRowCount} registry rows and ` +
+                `${supplementalRowCount} supplemental rows, which do not add up to the ${rowCount} rows it carries`,
+        };
+    }
+
+    if (registryRowCount !== REVIEWED_REGISTRY_ROW_COUNT) {
+        return {
+            ok: false,
+            detail:
+                `the policy document declares ${registryRowCount} registry-derived rows, not the ` +
+                `${REVIEWED_REGISTRY_ROW_COUNT} reviewed at ${REVIEWED_REGISTRY_SNAPSHOT}`,
+        };
+    }
+
+    if (supplementalRowCount !== REVIEWED_SUPPLEMENTAL_ROW_COUNT) {
+        return {
+            ok: false,
+            detail:
+                `the policy document declares ${supplementalRowCount} supplemental rows, not the ` +
+                `${REVIEWED_SUPPLEMENTAL_ROW_COUNT} reviewed at ${REVIEWED_REGISTRY_SNAPSHOT}`,
+        };
+    }
+
+    const declared = policy.supplementalCidrs;
+    if (!Array.isArray(declared) || declared.length === 0) {
+        return { ok: false, detail: `supplementalCidrs is ${describeValue(declared)}, not a non-empty list` };
+    }
+
+    const supplementalCidrs: string[] = [];
+    const declaredKeys = new Set<string>();
+
+    for (const entry of declared) {
+        if (typeof entry !== 'string' || entry.trim() === '') {
+            return { ok: false, detail: `supplementalCidrs declares ${describeValue(entry)}, not a CIDR` };
+        }
+
+        const cidr = parseCidr(entry);
+        if (cidr === null) {
+            return { ok: false, detail: `supplementalCidrs declares "${entry}", which is not a valid CIDR` };
+        }
+
+        const key = cidrKey(cidr);
+        if (declaredKeys.has(key)) {
+            return { ok: false, detail: `supplementalCidrs declares the block "${entry}" twice` };
+        }
+        declaredKeys.add(key);
+
+        if (!REVIEWED_ATTESTATION.supplementalBlocks.has(key)) {
+            return {
+                ok: false,
+                detail:
+                    `supplementalCidrs declares "${entry}", which the ${REVIEWED_REGISTRY_SNAPSHOT} review ` +
+                    'does not class as a supplemental block',
+            };
+        }
+
+        if (!tableCarriesBlock(ranges, entry, key)) {
+            return {
+                ok: false,
+                detail: `the supplemental block "${entry}" is not carried by the address table`,
+            };
+        }
+
+        supplementalCidrs.push(entry);
+    }
+
+    // The closing leg of the set-equality argument, and the only one that can
+    // catch an *omission*: every member above is a distinct reviewed
+    // supplemental block, so a list of `supplementalRowCount` of them can only
+    // be the whole reviewed set. With a single supplemental block reviewed the
+    // two lengths cannot differ once the checks above have passed — this is
+    // what keeps the reasoning sound when a second block is added rather than
+    // something that fires today. The reviewed set's own size is trustworthy
+    // here because a duplicate or unparsable entry in it, or one the reviewed
+    // table does not carry, is a load-time defect over which
+    // {@link validateEvidenceRangeTable} refuses every table — and no document
+    // is accepted without passing it — so a defective reviewed set cannot
+    // approve anything, whichever of the two checks runs first.
+    if (supplementalCidrs.length !== supplementalRowCount) {
+        return {
+            ok: false,
+            detail:
+                `supplementalCidrs names ${supplementalCidrs.length} of the ${supplementalRowCount} ` +
+                'supplemental blocks the document declares',
+        };
+    }
+
+    return { ok: true, value: { registryRowCount, supplementalRowCount, supplementalCidrs } };
+};
+
 /**
  * Validates a loaded policy document and returns it rebuilt, or says why it
  * cannot be used. **Nothing is judged against an unvalidated document**: both
@@ -2165,6 +2478,13 @@ const checkDeclaredFetchLimits = (raw: unknown): Checked<EvidenceFetchLimits> =>
  *   document is then a refusal rather than a quiet change of policy, and a
  *   truncation that also rewrote `rowCount` is caught by the reviewed count that
  *   the document cannot edit.
+ * - **The reviewed row split**, through {@link checkReviewedRowSplit}:
+ *   `registryRowCount`, `supplementalRowCount` and `supplementalCidrs` must add
+ *   up to the rows carried, equal the reviewed counts, and name exactly the
+ *   reviewed supplemental blocks — each of which must be present in the table.
+ *   `rowCount` on its own would let `::/96`, which is not a registry entry, be
+ *   counted as one, and it is the registry-derived figure that a reviewer diffs
+ *   against the registry pages at a refresh.
  * - **The address table**, through {@link validateEvidenceRangeTable}: per-row
  *   integrity plus set equality with the complete reviewed snapshot, which is
  *   what makes "matches no row" a safe reading. Set equality is the check that
@@ -2226,6 +2546,15 @@ export const validateEvidencePolicy = (policy: unknown): EvidencePolicyVerdict =
         );
     }
 
+    // Before the table walk, because it is the document's own statement about
+    // that table: a substitution that kept the row count intact is reported as
+    // the hardening row it lost rather than as a table that failed set
+    // equality for some reason the operator then has to work out.
+    const split = checkReviewedRowSplit(policy, rowCount, ranges);
+    if (!split.ok) {
+        return invalidPolicy(split.detail);
+    }
+
     const table = validateEvidenceRangeTable(ranges);
     if (!table.ok) {
         return { ok: false, reason: 'range_table_unclassifiable', detail: table.detail };
@@ -2274,6 +2603,9 @@ export const validateEvidencePolicy = (policy: unknown): EvidencePolicyVerdict =
             allowlistVersion,
             registrySnapshot,
             rowCount,
+            registryRowCount: split.value.registryRowCount,
+            supplementalRowCount: split.value.supplementalRowCount,
+            supplementalCidrs: split.value.supplementalCidrs,
             hostClasses,
             specialPurposeRanges: table.rows,
             fetchLimits: fetchLimits.value,

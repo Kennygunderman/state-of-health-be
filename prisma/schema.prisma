@@ -432,7 +432,9 @@ model catalog_foods {
   // suggestions and new recipe eligibility.
   publication_status         String // 'candidate' | 'published' | 'quarantined' | 'rejected' | 'retired'
   // Required lists. Prisma cannot emit NOT NULL for a scalar list, so the
-  // migration SQL adds it by hand and the schema-diff evidence records it;
+  // migration SQL adds it by hand - and `prisma migrate diff` does not report
+  // it, so what holds the operator copy of the migration to it is the
+  // ledger-equivalence gate rather than the committed schema-diff evidence;
   // @default([]) keeps the datamodel and the database agreed on the default, so
   // an omitted list is stored as the empty set it means and never as SQL NULL.
   allergen_tags              String[]                    @default([])

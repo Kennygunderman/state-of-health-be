@@ -67,8 +67,10 @@ export interface RecipeVersionResponse {
     version: number;
     status: 'current' | 'retired';
     name: string;
-    // null when the recipe was published without a description — render nothing.
-    description: string | null;
+    // The recipe_versions.description column is nullable; this wire member is not.
+    // A recipe published without a description travels as an empty string, so the
+    // client renders nothing without branching on null.
+    description: string;
     iconKey: RecipeIconKey;
     instructions: string[];
     yieldServings: number;

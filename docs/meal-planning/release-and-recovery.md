@@ -128,29 +128,54 @@ table in dependency order. Diary history is kept — the columns are nullable
 links, so planned and catalog-logged entries are detached rather than deleted —
 while everything the dropped tables held is destroyed.
 
+That script names no database and reads no ambient variable. It refuses to drop
+anything unless the session running it declares the target on purpose
+(`SET meal_planning.removal_target = '<database name>';`) and that name is the
+database the connection is actually on — deliberate, because the development
+environment here exports a production `DATABASE_URL` into every new shell. The
+procedure in its header, and in that folder's README, uses one explicitly named
+URL for the read-back, the backup, the guarded run and the ledger step below.
+Re-populating the catalog afterwards is a fresh `catalog:load` plus
+`recipes:seed` rather than a restore of those rows, and per the status table
+above that pipeline lands with this branch's catalog commits — so until it does,
+the backup is the only way back to the data the removal destroys.
+
 Afterwards, `_prisma_migrations` still records `20260908000000_meal_planning` as
 applied, so `migrate deploy` would report nothing pending and leave the database
 without the schema. Delete that single ledger row
 (`DELETE FROM _prisma_migrations WHERE migration_name =
-'20260908000000_meal_planning';`) and `npx prisma migrate deploy` re-applies the
-migration whenever the feature is wanted back. `prisma migrate resolve
---rolled-back` is not the step here: Prisma 6 accepts it only for a migration in
-a failed state and returns `P3012` for one that applied cleanly. That folder's
-README carries the full procedure.
+'20260908000000_meal_planning';`) against that same URL, and `npx prisma migrate
+deploy` re-applies the migration whenever the feature is wanted back. `prisma
+migrate resolve --rolled-back` is not the step here: Prisma 6 accepts it only for
+a migration in a failed state and returns `P3012` for one that applied cleanly.
+That folder's README carries the full procedure.
 
 ## Schema drift
 
-`docs/meal-planning/expected-schema-diff.sql` is the committed record of every
-construct in the migration that `prisma/schema.prisma` cannot express: the
-`STORED` generated `search_vector` expression, the `lower(alias)` expression
-index, the five partial indexes, and `NOT NULL` on the twelve required array
-columns. `prisma migrate diff` is blind to the last three groups — measured, with
-the tamper matrix, in that file's header — which is why the file has a second
-section read straight back out of the database.
+`docs/meal-planning/expected-schema-diff.sql` is the reviewed output of one
+`prisma migrate diff --script` run between the migration ledger and
+`prisma/schema.prisma`, committed so the two cannot drift apart unnoticed. Its
+single statement is what that command reports for the `STORED` generated
+`search_vector` expression, which the datamodel can only carry as
+`Unsupported("tsvector")?`.
 
-CI re-derives both sections against the freshly migrated service database in its
-`Schema-drift evidence gate` step and fails on any difference in either
-direction. The same two commands are in the evidence file's header for local
-use. To prove the ledger and its operator copy still agree, follow the
-equivalence procedure in
+The migration also writes three things by hand that the command does not report
+at all — the `lower(alias)` expression index, the five partial indexes, and
+`NOT NULL` on the twelve required array columns. The plan expects this file to
+carry the first two of those alongside the generated column; Prisma 6.9 emits
+only the generated column, and the evidence file's header records that as an
+open plan-versus-tool conflict, with the measurements behind it, rather than as
+a settled narrower contract. Until it is settled, what holds the operator copy
+of the migration to those constructs is the ledger-equivalence gate
+(`describe('migration ledgers')` in `src/__tests__/api/compat.test.ts`), which
+applies both ledgers and compares the resulting columns, indexes and
+constraints. Dropping one of them from *both* ledgers at once is a review
+responsibility, not an automated one.
+
+CI runs the same command against a throwaway shadow database in its
+`Schema-drift evidence gate` step, requires its exit code 2, and compares the
+output with the committed file after stripping comment and blank lines from both
+sides — failing on any difference in either direction. The command is in the
+evidence file's header for local use. To prove the ledger and its operator copy
+still agree, follow the equivalence procedure in
 `prisma/manual-migrations/meal-planning/README.md`.

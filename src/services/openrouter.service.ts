@@ -7,6 +7,17 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_MODEL = 'google/gemini-2.5-flash';
 
+// The classification model, for callers whose task is "pick the matching row"
+// rather than "write the answer": the estimate service's USDA grounding judge
+// and the catalog pipeline's advisory review pass. It is vendor configuration
+// and not an estimate-domain constant because more than one consumer shares the
+// value — AAP §0.4.3 gives the review pass CATALOG_REVIEW_MODEL, which inherits
+// ESTIMATE_JUDGE_MODEL when left blank (.env.example) — and because
+// backend-architecture §9 requires an integration's configuration to be read
+// once here, behind the loud accessor below, rather than branched on deep
+// inside business code.
+const DEFAULT_JUDGE_MODEL = 'openai/gpt-4o-mini';
+
 export type OpenRouterErrorKind =
     | 'not_configured'
     | 'http'
@@ -34,6 +45,10 @@ export type MessageContent = string | Array<{ type: string; text?: string; image
 export interface OpenRouterConfig {
     apiKey: string;
     model: string;
+    // The model for classification calls (ESTIMATE_JUDGE_MODEL): the estimate
+    // service's grounding judge and the catalog review pass both read it from
+    // here, so neither resolves the precedence for itself.
+    judgeModel: string;
 }
 
 // Config is read once, when this module is first required, and never again —
@@ -43,18 +58,23 @@ export interface OpenRouterConfig {
 // dotenv.config() above `import app from './app'` (CommonJS emits that import
 // as a require *after* the dotenv call), and scripts/lib/bootstrap.ts does the
 // same for the CLI scripts. The consequence of capturing at import time is that
-// mutating OPENROUTER_API_KEY/OPENROUTER_MODEL after the first require has no
-// effect, so a test that varies them must re-import this module
-// (jest.resetModules()) rather than assign to process.env in place.
+// mutating OPENROUTER_API_KEY/OPENROUTER_MODEL/ESTIMATE_JUDGE_MODEL after the
+// first require has no effect, so a test that varies them must re-import this
+// module (jest.resetModules()) rather than assign to process.env in place.
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL;
+const ESTIMATE_JUDGE_MODEL = process.env.ESTIMATE_JUDGE_MODEL;
 
 // Absent key → no config at all, so the accessor below is the only place that
 // decides what a missing key means. Frozen because every caller shares this one
-// instance; the model is resolved here so the precedence lives in one place
+// instance; both models are resolved here so each precedence lives in one place
 // (an explicit per-call override still wins, in callOpenRouter).
 const OPENROUTER_CONFIG: Readonly<OpenRouterConfig> | null = OPENROUTER_API_KEY
-    ? Object.freeze({ apiKey: OPENROUTER_API_KEY, model: OPENROUTER_MODEL || DEFAULT_MODEL })
+    ? Object.freeze({
+          apiKey: OPENROUTER_API_KEY,
+          model: OPENROUTER_MODEL || DEFAULT_MODEL,
+          judgeModel: ESTIMATE_JUDGE_MODEL || DEFAULT_JUDGE_MODEL,
+      })
     : null;
 
 export const getOpenRouterConfig = (): OpenRouterConfig => {

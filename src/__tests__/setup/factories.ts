@@ -13,9 +13,19 @@
  * to build its input. Truncation belongs to `testDb.ts` and appears nowhere
  * here, so creating a fixture is never destructive.
  *
- * DETERMINISM. Nothing below reads the clock or a random source. Dates derive
- * from a day-key parameter with a fixed default, identities from a monotonic
- * module counter. One consequence the code cannot state itself:
+ * DETERMINISM. Every factory is a function of its arguments: no random source,
+ * and exactly ONE reading of the clock, `utcTodayDayKey()`, which resolves a
+ * single default — the week `makePlan` covers when the caller names neither
+ * `startDate` nor `today`. That default cannot be a fixed calendar week,
+ * because a plan's lifecycle is defined RELATIVE to today: §0.5.1 treats an
+ * `active` plan whose `end_date` has passed as ended for every rule, so a
+ * pinned week silently becomes an ended plan that `GET /plans/current` omits
+ * and every write answers `409 plan_not_active` on. A suite that asserts on
+ * dates therefore states them — pass `startDate` for an exact week, or `today`
+ * to fix what "now" means and let the current week follow from it, and the
+ * fixture is clock-free again. Every other date derives from a day-key
+ * parameter with a fixed default, and identities from a monotonic module
+ * counter. One consequence the code cannot state itself:
  * `truncateFeatureTables()` empties the database but does NOT reset that
  * counter, so calls made after a truncation keep producing fresh identities. A
  * suite that needs a particular identity — or the same fixture twice over —
@@ -50,14 +60,24 @@ import { prisma } from '../../prisma/client';
 const FIXTURE_EMAIL_DOMAIN = 'test.invalid';
 
 /**
- * The week every plan fixture covers unless a suite names another start. A
- * fixed day key rather than "today": the server resolves today in the user's
- * stored zone, and a fixture that moved with the clock would make a
- * date-boundary assertion pass or fail on the day it happened to run.
+ * A week that has permanently ended, for the fixtures that need one: a plan
+ * stored `active` whose `end_date` is in the past, which §0.5.1 excludes from
+ * current/upcoming resolution and refuses every write against with
+ * `409 plan_not_active {reason: 'ended'}`.
+ *
+ * Fixed rather than derived, and safely so — unlike a current week, an ended
+ * one stays ended however long from now the suite runs. Reach it explicitly:
+ * `makePlan(userId, { startDate: FIXTURE_ENDED_PLAN_START_DAY_KEY })`.
+ * `makePlan`'s own default is the CURRENT week (`currentPlanStartDayKey`), so
+ * the two states are asked for by name and neither is reached by accident.
  */
-export const FIXTURE_PLAN_START_DAY_KEY = '2026-07-05';
+export const FIXTURE_ENDED_PLAN_START_DAY_KEY = '2026-07-05';
 
-/** What `published_at` / `imported_at` carry, for the same reason. */
+/**
+ * What `published_at` / `imported_at` carry. Fixed, and nothing about a
+ * lifecycle turns on it: a publication date is history, so it is never compared
+ * against today the way a plan's week is.
+ */
 const FIXTURE_PUBLISHED_DAY_KEY = '2026-06-01';
 
 /** A published week is seven days; also `makePlan`'s default day count. */
@@ -193,6 +213,9 @@ const resolveSequence = (sequence: number | undefined): number => sequence ?? ne
 
 const DAY_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
+/** Characters of an ISO timestamp that make up its `yyyy-MM-dd` day key. */
+const DAY_KEY_LENGTH = 10;
+
 /**
  * A `@db.Date` column value. Parsed at UTC midnight so day arithmetic is exact
  * (no zone, so no DST step), and rejected loudly rather than handed to Postgres
@@ -217,6 +240,54 @@ const toUtcMidnight = (dayKey: string): Date => {
 
 const addUtcDays = (date: Date, days: number): Date =>
     new Date(date.getTime() + days * MILLISECONDS_PER_DAY);
+
+/** The `yyyy-MM-dd` key of a UTC instant — the inverse of `toUtcMidnight`. */
+const toDayKey = (date: Date): string => date.toISOString().slice(0, DAY_KEY_LENGTH);
+
+/**
+ * Today in UTC, as a day key. The module's ONE clock read (see the header), and
+ * exported so a suite deriving a neighbouring week — an upcoming plan, a plan
+ * that ends tomorrow — anchors it to the same "now" the default plan used
+ * instead of reading the clock a second time and straddling UTC midnight.
+ */
+export const utcTodayDayKey = (): string => toDayKey(new Date());
+
+/**
+ * Day-key arithmetic, validated: the key goes through `toUtcMidnight`, so a
+ * malformed or non-existent date is refused here rather than producing a
+ * plausible-looking neighbour. `days` may be negative.
+ */
+export const addDaysToDayKey = (dayKey: string, days: number): string =>
+    toDayKey(addUtcDays(toUtcMidnight(dayKey), days));
+
+/**
+ * How far before today a default plan week starts, so that the week contains
+ * the OWNER'S today rather than UTC's.
+ *
+ * The server resolves today in the user's stored IANA zone and never in server
+ * time (§0.5.2), and zone offsets run from UTC−12 to UTC+14 — the fixture
+ * users `makePreferences` writes sit in `America/New_York`, four or five hours
+ * behind. So a user's local day key is always UTC's, one before it, or one
+ * after it, and a week beginning the day before UTC today spans
+ * `[utcToday − 1, utcToday + 5]`: it contains every one of those three days,
+ * whatever zone the fixture's user is in.
+ */
+const DEFAULT_PLAN_START_DAYS_BEFORE_TODAY = 1;
+
+/**
+ * The first day of a plan week that is CURRENT: `GET /plans/current` returns
+ * it, and swaps, logs, regenerations and grocery writes are accepted against
+ * it. `makePlan`'s default, and the value to build on when a suite wants a
+ * neighbouring week — `addDaysToDayKey(currentPlanStartDayKey(), 7)` starts the
+ * successor week, which is `upcoming` rather than `current`.
+ *
+ * Pass `todayDayKey` to fix what "now" means and the result stops depending on
+ * the clock. The week returned is current for any `dayCount` of three or more;
+ * below that the window is too narrow to hold every zone's today, so a short
+ * fixture that cares about lifecycle should name `startDate` outright.
+ */
+export const currentPlanStartDayKey = (todayDayKey: string = utcTodayDayKey()): string =>
+    addDaysToDayKey(todayDayKey, -DEFAULT_PLAN_START_DAYS_BEFORE_TODAY);
 
 export interface MakeUserOptions extends Partial<Prisma.usersUncheckedCreateInput> {
     /** Pins the identity sequence, so an identical call reproduces an identical row. */
@@ -791,8 +862,20 @@ export interface MakePlanOptions
         'user_id' | 'start_date' | 'end_date' | 'meal_plan_days' | 'meal_plan_meals'
     > {
     sequence?: number;
-    /** The plan's first day, as `yyyy-MM-dd`. `end_date` follows from it and `dayCount`. */
+    /**
+     * The plan's first day, as `yyyy-MM-dd`, stated absolutely. `end_date`
+     * follows from it and `dayCount`. This is how a suite reaches a week that
+     * is not the current one — `FIXTURE_ENDED_PLAN_START_DAY_KEY` for an ended
+     * plan, `addDaysToDayKey(currentPlanStartDayKey(), 7)` for an upcoming one.
+     */
     startDate?: string;
+    /**
+     * What "today" is, as `yyyy-MM-dd`, when the default current week is wanted
+     * without a clock read: the plan then covers the week around this day
+     * instead of the week around the real today. Mutually exclusive with
+     * `startDate`, which already fixes the week outright.
+     */
+    today?: string;
     /** Fewer than seven days makes a cheaper fixture; `end_date` shrinks with it. */
     dayCount?: number;
     /** The recipe every slot plans. Omitted, one is created. */
@@ -864,11 +947,21 @@ const toPerServingMacros = (version: recipe_versions): FixtureMacros => ({
  * `meal_plans(id, user_id)` as a composite key (§0.5.1) — which is what makes
  * the cross-user 404 matrix meaningful.
  *
- * The states the concurrency and stale-plan suites need are overrides:
- * `{ status: 'superseded', replaced_plan_id }` for a replaced plan,
- * `{ revision }` for a stale-revision write, `{ dayCount }` for a cheap
- * fixture, and a past `startDate` for a plan that is stored `active` but has
- * ended (its `end_date` follows the start, so the fixture stays coherent).
+ * LIFECYCLE. The default plan is the CURRENT one: it covers the week around
+ * today (`currentPlanStartDayKey`), so `GET /plans/current` returns it and a
+ * swap, a log, a regeneration or a grocery write is accepted against it. That
+ * is the state most suites need, and it is why the default is derived rather
+ * than pinned — §0.5.1 reads an `active` plan whose `end_date` has passed as
+ * ended, so a fixed week would quietly turn every such fixture into a
+ * `409 plan_not_active` the day it went by. The other states are named
+ * explicitly: `{ startDate: FIXTURE_ENDED_PLAN_START_DAY_KEY }` for a plan
+ * stored `active` that has ended, `{ startDate: addDaysToDayKey(
+ * currentPlanStartDayKey(), 7) }` for an upcoming one, `{ status:
+ * 'superseded', replaced_plan_id }` for a replaced plan, `{ revision }` for a
+ * stale-revision write, `{ dayCount }` for a cheap fixture, and `{ today }` to
+ * pin what "now" means without naming the week. `end_date` always follows the
+ * start and the day count, so every one of them stays coherent.
+ *
  * Two active plans for one user must differ in `startDate`: the partial unique
  * index on `(user_id, start_date) WHERE status = 'active'` rejects the second
  * otherwise, and suites rely on it doing so.
@@ -877,7 +970,7 @@ export const makePlan = async (
     userId: string,
     options: MakePlanOptions = {},
 ): Promise<FixtureMealPlan> => {
-    const { sequence, startDate, dayCount, recipeVersionId, slots, ...overrides } = options;
+    const { sequence, startDate, today, dayCount, recipeVersionId, slots, ...overrides } = options;
     const ordinal = resolveSequence(sequence);
     const plannedDayCount = dayCount ?? DAYS_PER_PLAN;
 
@@ -887,7 +980,19 @@ export const makePlan = async (
         );
     }
 
-    const startDayKey = startDate ?? FIXTURE_PLAN_START_DAY_KEY;
+    // Refused rather than resolved by precedence: `startDate` fixes the week
+    // outright and `today` only shapes the default, so a caller passing both
+    // means one of the two to take effect and would otherwise never learn
+    // which. Naming the conflict costs a line and saves a mystified fixture.
+    if (startDate !== undefined && today !== undefined) {
+        throw new Error(
+            `Fixture plan received both startDate ("${startDate}") and today ("${today}"). startDate ` +
+                'already fixes the week, so pass startDate alone for an exact week, or today alone for ' +
+                'the current week around that day.',
+        );
+    }
+
+    const startDayKey = startDate ?? currentPlanStartDayKey(today);
     const start = toUtcMidnight(startDayKey);
     const end = addUtcDays(start, plannedDayCount - 1);
     const slotOptions = slots ?? FIXTURE_PLAN_SLOTS;

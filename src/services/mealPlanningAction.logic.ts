@@ -21,10 +21,17 @@
  * Rule 7 §11 is explicit that "if you find yourself needing a database to test
  * a *rule*, the rule is in the wrong layer — extract it". Everything in this
  * file is therefore deterministic and synchronous, with no Prisma, no I/O, no
- * `process.env` and no clock: {@link isActionExpired} takes "now" as an
- * argument. The lock-and-reserve behaviour is covered against real PostgreSQL
- * by `src/__tests__/api/concurrency.test.ts`; every rule below is covered with
- * no database at all by `__tests__/mealPlanningAction.logic.test.ts`.
+ * `process.env` — and no clock AT ALL. That last one is a policy, not an
+ * omission: a `meal_plan_actions` row NEVER expires. §0.5.1 retains rows
+ * indefinitely (they are small, user-scoped and cascade on user deletion), so a
+ * committed action stays replayable however old it is, and nothing here may
+ * make a replay conditional on age. The seven-day guard of §0.7.2 belongs to
+ * the CLIENT's persisted `pendingIntents` and is implemented in the mobile
+ * store; putting a copy of it here would invite a future caller to expire a row
+ * the server has promised to replay. The lock-and-reserve behaviour is covered
+ * against real PostgreSQL by `src/__tests__/api/concurrency.test.ts`; every
+ * rule below is covered with no database at all by
+ * `__tests__/mealPlanningAction.logic.test.ts`.
  *
  * The bugs this file exists to prevent are as bad as they get (Rule 7 §7.1):
  * a fingerprint that varies with key order makes a legitimate retry look like a
@@ -97,6 +104,13 @@ export interface ActionFingerprintRecord {
  * are typed `| null` to mirror the database exactly rather than to invite
  * optional handling — {@link readStoredResponse} is the one place that reads
  * them.
+ *
+ * They are also ALL-OR-NOTHING. §0.5.1 fills `response_status`,
+ * `response_snapshot` and `plan_revision_after` in the single statement that
+ * completes a reserved row, so a row has either none of them (pending) or all
+ * three (completed). A row carrying some but not others is corruption, and
+ * {@link classifyActionCompletion} names that third state rather than letting
+ * it pass for either of the two legitimate ones.
  */
 export interface StoredResponseRecord {
     readonly responseStatus: number | null;
@@ -105,20 +119,39 @@ export interface StoredResponseRecord {
 }
 
 /**
- * Just the age of a ledger row or a client-held intent. `createdAt` accepts the
- * three forms it legitimately arrives in: a `Date` from Prisma, an ISO string
- * from the client's persisted `pendingIntents`, or epoch milliseconds.
+ * A row that has completed: the same three columns with nothing missing.
+ *
+ * Declared as its own shape so {@link readStoredResponse} can narrow to it
+ * through a type predicate and read the values without a cast — a cast is how
+ * "checked for null" and "used as a number" drift apart.
  */
-export interface ActionAgeRecord {
-    readonly createdAt: Date | string | number;
+export interface CompletedActionResponseRecord {
+    readonly responseStatus: number;
+    readonly responseSnapshot: unknown;
+    readonly planRevisionAfter: number;
+}
+
+/**
+ * Row identity, optional because most rules here take a narrowed shape that has
+ * none. It is carried for ONE purpose: so a ledger-integrity failure can name
+ * the row an operator has to go and look at.
+ */
+export interface IdentifiableRecord {
+    readonly id?: string;
 }
 
 /**
  * A whole `meal_plan_actions` row as the pure layer sees it, composed from the
  * narrow shapes above. Declared so the service has one type to map its raw row
  * into; the functions below never ask for this much.
+ *
+ * `createdAt` is here because the column exists and the mapper fills it, NOT
+ * because anything in this file reads it: no rule may turn on a row's age (see
+ * the file header). It is `Date` alone — the one form Prisma returns — rather
+ * than a union that also admitted the client's ISO strings, because the
+ * client's intents are the mobile store's business and never reach this module.
  */
-export interface MealPlanningActionRecord extends ActionFingerprintRecord, StoredResponseRecord, ActionAgeRecord {
+export interface MealPlanningActionRecord extends ActionFingerprintRecord, StoredResponseRecord {
     readonly id: string;
     readonly userId: string;
     readonly idempotencyKey: string;
@@ -126,6 +159,7 @@ export interface MealPlanningActionRecord extends ActionFingerprintRecord, Store
     readonly mealPlanId: string | null;
     readonly mealPlanMealId: string | null;
     readonly mealEntryId: string | null;
+    readonly createdAt: Date;
 }
 
 /* ---------------------------------------------------------------------------
@@ -529,12 +563,128 @@ export interface StoredActionResponse {
     readonly planRevisionAfter: number;
 }
 
-/** A stored response, ready to be sent again exactly as it was sent the first time. */
+/**
+ * A stored response, ready to be sent again exactly as it was sent the first
+ * time.
+ *
+ * `planRevisionAfter` is a plain `number`, not `number | null`: a response is
+ * only replayable once all three completion columns are filled (see
+ * {@link classifyActionCompletion}), so by the time this shape exists the
+ * revision the action produced is known. Defaulting a missing revision to
+ * `null` here would hand the client a reply that says "your action succeeded"
+ * while withholding the revision every keyed response is required to carry.
+ */
 export interface ReplayableActionResponse {
     readonly status: number;
     readonly body: unknown;
-    readonly planRevisionAfter: number | null;
+    readonly planRevisionAfter: number;
 }
+
+/* ---------------------------------------------------------------------------
+ * The completion invariant
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The columns a completion fills, in one statement, together.
+ *
+ * Listed once and consumed by every rule below, so "which columns make a row
+ * completed" has a single answer. The service's compare-and-set predicate is
+ * the snake_case image of this list — `response_status`, `response_snapshot`,
+ * `plan_revision_after`.
+ */
+export const ACTION_COMPLETION_FIELDS = ['responseStatus', 'responseSnapshot', 'planRevisionAfter'] as const;
+
+/** One of the three completion columns, by its camelCase record name. */
+export type ActionCompletionField = (typeof ACTION_COMPLETION_FIELDS)[number];
+
+/**
+ * What state a reserved row is in:
+ *
+ *  - `pending`   — none of the completion columns is filled. The action has not
+ *                  finished (and under the per-user lock this is only ever
+ *                  observable inside the transaction that reserved it).
+ *  - `completed` — all three are filled; the row is replayable.
+ *  - `corrupt`   — some are filled and some are not, which §0.5.1 never
+ *                  produces. Something outside this ledger wrote the row, or a
+ *                  completion was interrupted in a way the transaction was
+ *                  supposed to make impossible.
+ */
+export type ActionCompletionState = 'pending' | 'completed' | 'corrupt';
+
+/** A column counts as filled when it holds a value — `null` and `undefined` do not. */
+const isColumnFilled = (value: unknown): boolean => value !== null && value !== undefined;
+
+/**
+ * Which completion columns a row is still missing, in {@link
+ * ACTION_COMPLETION_FIELDS} order.
+ *
+ * Returned as data rather than reported, because both callers need the names:
+ * one to decide what the row is, the other to say which column is absent in an
+ * error an operator will read.
+ */
+export const findMissingCompletionFields = (row: StoredResponseRecord): readonly ActionCompletionField[] =>
+    ACTION_COMPLETION_FIELDS.filter((field) => !isColumnFilled(row[field]));
+
+/**
+ * The three-way classification the ledger actually needs.
+ *
+ * A half-filled row is NOT treated as completed. Doing so would replay a
+ * response whose provenance nothing can vouch for — the earlier reading of this
+ * rule defaulted a missing revision to `null` and returned the row as
+ * replayable, which reports success for a write whose recorded outcome is
+ * incomplete. It is not treated as pending either: pretending an interrupted
+ * completion never happened invites the work to be done a second time, which is
+ * the one thing this ledger exists to prevent. It is its own state, so the
+ * caller can fail loudly and leave the row for inspection.
+ */
+export const classifyActionCompletion = (row: StoredResponseRecord): ActionCompletionState => {
+    const missing = findMissingCompletionFields(row);
+
+    if (missing.length === ACTION_COMPLETION_FIELDS.length) {
+        return 'pending';
+    }
+
+    return missing.length === 0 ? 'completed' : 'corrupt';
+};
+
+/**
+ * A `meal_plan_actions` row that is neither pending nor completed.
+ *
+ * Its own class rather than a bare `Error` because it is a distinguishable
+ * condition a caller may want to catch, and because the fields it names are
+ * data the message should not be parsed for. It stays in this module, beside
+ * the rule that raises it, for the reason `mealPlanning.errors.ts` states about
+ * itself: that file holds the client-facing vocabulary the controllers map to
+ * status codes, while a module's own integrity failures belong to the module
+ * (as `UnitConversionError` and `FeatureFlagError` do). Nothing maps this to a
+ * status: a corrupt ledger row is a 500 the controller's fallback already
+ * covers.
+ */
+export class ActionLedgerIntegrityError extends Error {
+    /** The completion columns that were absent, in {@link ACTION_COMPLETION_FIELDS} order. */
+    readonly missingFields: readonly ActionCompletionField[];
+
+    /** The row, when the caller had its id to give. */
+    readonly actionId: string | null;
+
+    constructor(missingFields: readonly ActionCompletionField[], actionId?: string) {
+        super(
+            `meal_plan_actions row ${actionId ?? '(id unknown)'} is half-completed: ` +
+                `${missingFields.join(', ')} ${missingFields.length === 1 ? 'is' : 'are'} missing while the ` +
+                'other completion columns are set. A completion writes all of response_status, ' +
+                'response_snapshot and plan_revision_after in one statement, so this row cannot be replayed ' +
+                'and must not be repeated. Refusing to guess the outcome of the write it records.',
+        );
+        this.name = 'ActionLedgerIntegrityError';
+        this.missingFields = missingFields;
+        this.actionId = actionId ?? null;
+    }
+}
+
+/** Narrows a row to {@link CompletedActionResponseRecord} without a cast. */
+const isCompletedActionRow = (
+    row: StoredResponseRecord,
+): row is StoredResponseRecord & CompletedActionResponseRecord => findMissingCompletionFields(row).length === 0;
 
 /**
  * Freezes a completed action's response into the row.
@@ -573,86 +723,332 @@ export const shapeStoredResponse = <TAction extends KeyedActionType>(
  * never distinguish a replay from the original response precisely because both
  * the status and the body come back byte-for-byte as they were first sent.
  *
- * `null` means the row is still pending — an unreachable state under the
- * per-user lock (see {@link decideReplay}) that is reported rather than
- * papered over with an invented status.
+ * Age is not consulted, and there is nothing to consult it with: a committed
+ * action replays for as long as its row exists (see the file header).
+ *
+ * The three outcomes are exactly {@link classifyActionCompletion}'s:
+ *
+ *  - `null` for a pending row — an unreachable state under the per-user lock
+ *    (see {@link decideReplay}) that the service reports rather than papering
+ *    over with an invented status;
+ *  - the stored response for a completed row;
+ *  - {@link ActionLedgerIntegrityError} for a half-completed one. A row holding
+ *    a status and a body but no revision is NOT a replayable response with an
+ *    unknown revision; it is a row no completion in this ledger could have
+ *    written, and answering a client from it would report an outcome the ledger
+ *    did not record.
  */
 export const readStoredResponse = (
-    row: StoredResponseRecord | null | undefined,
+    row: (StoredResponseRecord & IdentifiableRecord) | null | undefined,
 ): ReplayableActionResponse | null => {
     if (row === null || row === undefined) {
         return null;
     }
 
-    if (row.responseStatus === null || row.responseStatus === undefined) {
+    if (isCompletedActionRow(row)) {
+        return {
+            status: row.responseStatus,
+            body: row.responseSnapshot,
+            planRevisionAfter: row.planRevisionAfter,
+        };
+    }
+
+    const missing = findMissingCompletionFields(row);
+
+    if (missing.length === ACTION_COMPLETION_FIELDS.length) {
         return null;
     }
 
-    if (row.responseSnapshot === null || row.responseSnapshot === undefined) {
-        return null;
-    }
-
-    return {
-        status: row.responseStatus,
-        body: row.responseSnapshot,
-        planRevisionAfter: row.planRevisionAfter ?? null,
-    };
+    throw new ActionLedgerIntegrityError(missing, row.id);
 };
 
 /* ---------------------------------------------------------------------------
- * Intent age
+ * The ids a completion records
  * ------------------------------------------------------------------------- */
 
 /**
- * How long an unresolved intent may be retried under its original key: seven
- * days, matching the client's `pendingIntents` age guard.
+ * The three id columns of `meal_plan_actions`, by their camelCase record names.
  */
-export const ACTION_INTENT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+export const CREATED_ID_FIELDS = ['mealPlanId', 'mealPlanMealId', 'mealEntryId'] as const;
 
-/** Epoch milliseconds from any of the three forms a timestamp arrives in. */
-const toEpochMs = (value: Date | string | number, label: string): number => {
-    const epochMs = value instanceof Date ? value.getTime() : typeof value === 'number' ? value : Date.parse(value);
+/** One of the three id columns a completion can fill. */
+export type CreatedIdField = (typeof CREATED_ID_FIELDS)[number];
 
-    if (!Number.isFinite(epochMs)) {
-        throw new TypeError(
-            `Cannot age a meal-planning action: ${label} is not a usable timestamp (${String(value)}).`,
-        );
-    }
+/**
+ * Which ids each action records — the whole per-action rule, in one table.
+ *
+ * §0.5.1 completes a reserved row with "the created ids", and which ids exist
+ * depends entirely on the action: a generate and a regenerate each publish a
+ * plan; a swap addresses a plan and the one planned meal it replaced; a log
+ * additionally creates the diary entry. So the requirement is per action, and
+ * an id that has no meaning for an action is as wrong as a missing one — the
+ * schema's tenant guards pair each id with `user_id`, so a stray id is not an
+ * unused column but a claim about a row this action never touched.
+ *
+ * `as const` is load-bearing: {@link KeyedActionCreatedIds} is DERIVED from
+ * this table, so the compile-time requirement and the runtime check cannot
+ * drift apart — the same reason {@link KeyedActionType} is derived from
+ * {@link ACTION_TYPES}.
+ */
+export const KEYED_ACTION_CREATED_ID_FIELDS = {
+    generate: ['mealPlanId'],
+    regenerate: ['mealPlanId'],
+    swap: ['mealPlanId', 'mealPlanMealId'],
+    log: ['mealPlanId', 'mealPlanMealId', 'mealEntryId'],
+} as const;
 
-    return epochMs;
+/** The ids one named action must record, each required and non-null. */
+type CreatedIdsForAction<TAction extends KeyedActionType> = {
+    readonly [Field in (typeof KEYED_ACTION_CREATED_ID_FIELDS)[TAction][number]]: string;
 };
 
 /**
- * Whether an intent is too old to keep retrying under its original key.
+ * The ids a keyed write records, as the action's own closed shape.
  *
- * `now` is a PARAMETER, never `Date.now()`: Rule 7 §7 forbids reading the clock
- * inside a pure function, and a rule that samples the clock cannot be pinned by
- * a test.
+ * A `swap` completion must carry `mealPlanId` and `mealPlanMealId`, both
+ * strings, and may carry no `mealEntryId`; a `log` must carry all three. The
+ * earlier reading of this contract made every id independently optional and
+ * nullable for every action, which let a completion succeed with no ids at all
+ * — a ledger row that cannot say what it created — or with an id from another
+ * action's shape. Both are compile errors now, and
+ * {@link resolveCreatedIdColumns} refuses them at runtime for callers that
+ * reach this ledger without those types.
  *
- * The role is narrow and worth stating. `meal_plan_actions` rows are retained
- * indefinitely on the server — they are small, user-scoped and cascade on user
- * deletion — so nothing in the replay path expires a row, and this predicate is
- * NOT consulted there. It exists so the seven-day guard the client applies to
- * its persisted `pendingIntents` is expressed once, in a testable place, and so
- * its boundary is pinned rather than assumed.
- *
- * The boundary is INCLUSIVE: an intent exactly `maxAgeMs` old is not yet
- * expired, so a retry landing on the limit still replays under its own key
- * instead of silently minting a new one. A `now` earlier than `createdAt`
- * (clock skew) yields a negative age and is likewise not expired.
+ * The conditional is distributive on purpose: the default parameter then means
+ * "one of the four shapes", not "all three ids at once".
  */
-export const isActionExpired = (
-    row: ActionAgeRecord,
-    now: Date | string | number,
-    maxAgeMs: number = ACTION_INTENT_MAX_AGE_MS,
-): boolean => {
-    if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+export type KeyedActionCreatedIds<TAction extends KeyedActionType = KeyedActionType> =
+    TAction extends KeyedActionType ? CreatedIdsForAction<TAction> : never;
+
+/**
+ * The exact column values a completion writes: the ids the action records, and
+ * an explicit `null` for every column it does not.
+ *
+ * Explicit rather than omitted, so completing a row always leaves all three
+ * columns in a state this ledger chose. An omitted column would inherit
+ * whatever was there before, which on a reused row is another action's id.
+ */
+export interface KeyedActionCreatedIdColumns {
+    readonly mealPlanId: string | null;
+    readonly mealPlanMealId: string | null;
+    readonly mealEntryId: string | null;
+}
+
+/**
+ * The ids are `uuid` columns filled from `gen_random_uuid()`, so anything that
+ * is not a v4 UUID cannot be a row id this ledger may reference. The pattern is
+ * local to this module by the same convention every other `*.logic.ts` here
+ * follows.
+ */
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const isUuidV4 = (value: unknown): value is string => typeof value === 'string' && UUID_V4_PATTERN.test(value);
+
+/** A value as it should read inside an error message. */
+const describeValue = (value: unknown): string => {
+    if (value === undefined) {
+        return 'absent';
+    }
+
+    return typeof value === 'string' ? `"${value}"` : String(value);
+};
+
+/**
+ * Turns a completion's ids into the three column values, or reports why it
+ * cannot.
+ *
+ * Two rules, both from §0.5.1's "fill the reserved action row … and the created
+ * ids":
+ *
+ *  1. every id the action records must be present and be a row id. A completed
+ *     row that names no plan cannot be traced to what it wrote, and the
+ *     `@@index([meal_plan_id])` lookups and tenant guards that hang off these
+ *     columns silently stop covering it.
+ *  2. an id the action does NOT record must be absent or null. A generate that
+ *     reported a `mealEntryId` would assert a diary entry it never created,
+ *     and the tenant guard would tie the row to a meal_entries row of
+ *     unrelated provenance.
+ *
+ * It reports rather than returns a verdict — unlike {@link decideReplay}, which
+ * is a genuine three-way domain decision. Every caller of this one has already
+ * done the write; there is no branch to take, and the only honest response to
+ * "this completion does not describe its own action" is to abort the
+ * transaction so nothing is recorded.
+ *
+ * `createdIds` is `unknown` because that is what it is: the compile-time
+ * requirement lives in {@link KeyedActionCreatedIds}, and this function is the
+ * guard for everything that reaches the ledger without it — a cast, a
+ * JavaScript caller, a test double. Accepting the typed shape here would let
+ * the guard trust the very declaration it exists to verify.
+ */
+export const resolveCreatedIdColumns = (
+    actionType: KeyedActionType,
+    createdIds: unknown,
+): KeyedActionCreatedIdColumns => {
+    const required = KEYED_ACTION_CREATED_ID_FIELDS[actionType] as readonly string[] | undefined;
+
+    if (required === undefined) {
         throw new TypeError(
-            `Cannot age a meal-planning action: maxAgeMs is ${String(maxAgeMs)}, which is not a non-negative ` +
-                'duration. A non-numeric window would silently disable the guard.',
+            `Cannot record the created ids of a meal-planning action: "${String(actionType)}" is not one of ` +
+                `${ACTION_TYPES.join(', ')}, so which ids it records is undefined.`,
         );
     }
 
-    return toEpochMs(now, 'now') - toEpochMs(row.createdAt, 'createdAt') > maxAgeMs;
+    if (createdIds === null || typeof createdIds !== 'object') {
+        throw new TypeError(
+            `Cannot record the created ids of a ${actionType} action: the completion is ` +
+                `${describeValue(createdIds)}, not an object carrying ${required.join(' and ')}.`,
+        );
+    }
+
+    const candidates = createdIds as Readonly<Record<string, unknown>>;
+
+    const columns: Record<CreatedIdField, string | null> = {
+        mealPlanId: null,
+        mealPlanMealId: null,
+        mealEntryId: null,
+    };
+
+    for (const field of CREATED_ID_FIELDS) {
+        const value = candidates[field];
+
+        if (required.includes(field)) {
+            if (!isUuidV4(value)) {
+                throw new TypeError(
+                    `Cannot complete a ${actionType} action: ${field} is ${describeValue(value)}, but a ` +
+                        `${actionType} records ${required.join(' and ')}. Completing without it would leave a ` +
+                        'ledger row that cannot say what the action wrote.',
+                );
+            }
+
+            columns[field] = value;
+            continue;
+        }
+
+        if (value !== undefined && value !== null) {
+            throw new TypeError(
+                `Cannot complete a ${actionType} action: it carries ${field} ${describeValue(value)}, which a ` +
+                    `${actionType} does not create — it records ${required.join(' and ')} only. Recording it ` +
+                    'would claim a row this action never touched.',
+            );
+        }
+    }
+
+    return columns;
 };
 
+/* ---------------------------------------------------------------------------
+ * The transaction-client shape rule
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The members an interactive transaction client does NOT have, and the global
+ * client does.
+ *
+ * This is Prisma's own deny list — `Prisma.TransactionClient` is
+ * `Omit<PrismaClient, "$connect" | "$disconnect" | "$on" | "$transaction" |
+ * "$use" | "$extends">` — and the runtime agrees with the types: a client
+ * obtained from `$transaction(…)` exposes none of these six, while the global
+ * client exposes all of them. So finding any one of them on a candidate is
+ * proof that it is the autocommit client rather than an open transaction.
+ */
+export const AUTOCOMMIT_CLIENT_MEMBERS = [
+    '$connect',
+    '$disconnect',
+    '$on',
+    '$transaction',
+    '$use',
+    '$extends',
+] as const;
+
+/**
+ * The members every statement the ledger issues goes through: the advisory
+ * lock (`$executeRaw`) and the reservation (`$queryRaw`). A candidate without
+ * them is not a Prisma client at all.
+ */
+export const TRANSACTION_CLIENT_MEMBERS = ['$queryRaw', '$executeRaw'] as const;
+
+/** What a candidate database client turned out to be. */
+export interface TransactionClientDiagnosis {
+    readonly verdict: 'interactive' | 'autocommit' | 'unusable';
+    /** The deny-list members found on it — non-empty exactly when `autocommit`. */
+    readonly autocommitMembers: readonly string[];
+    /** The required members it lacks — non-empty exactly when `unusable`. */
+    readonly missingMembers: readonly string[];
+}
+
+/** Whether `member` is a callable own-or-inherited property of `candidate`. */
+const hasFunctionMember = (candidate: unknown, member: string): boolean => {
+    if (candidate === null || (typeof candidate !== 'object' && typeof candidate !== 'function')) {
+        return false;
+    }
+
+    return typeof (candidate as Record<string, unknown>)[member] === 'function';
+};
+
+/**
+ * Classifies the client a caller is about to run the ledger on.
+ *
+ * The check is a RULE, not I/O — it reads the shape of an object and nothing
+ * else — which is why it lives here and is tested with no database, while the
+ * statements it protects are integration-tested.
+ *
+ * Why it has to exist at all: `pg_advisory_xact_lock` is released at the end of
+ * the transaction that took it. Run the sequence on the autocommit client and
+ * the lock is gone the moment its own statement returns, the reservation
+ * commits by itself, and a failure half-way through leaves a permanently
+ * pending row that no later request can complete or replay — the ledger's
+ * central guarantee, silently absent. The type in
+ * `mealPlanningAction.service.ts` refuses the global client at compile time;
+ * this refuses it at run time, for a caller that reached the ledger through a
+ * cast, from JavaScript, or from a test double.
+ *
+ * The deny list is consulted FIRST: the global client also has `$queryRaw` and
+ * `$executeRaw`, so it would otherwise pass as interactive.
+ */
+export const diagnoseTransactionClient = (candidate: unknown): TransactionClientDiagnosis => {
+    const autocommitMembers = AUTOCOMMIT_CLIENT_MEMBERS.filter((member) => hasFunctionMember(candidate, member));
+
+    if (autocommitMembers.length > 0) {
+        return { verdict: 'autocommit', autocommitMembers, missingMembers: [] };
+    }
+
+    const missingMembers = TRANSACTION_CLIENT_MEMBERS.filter((member) => !hasFunctionMember(candidate, member));
+
+    if (missingMembers.length > 0) {
+        return { verdict: 'unusable', autocommitMembers: [], missingMembers };
+    }
+
+    return { verdict: 'interactive', autocommitMembers: [], missingMembers: [] };
+};
+
+/**
+ * Refuses anything but an open interactive transaction, naming what gave the
+ * candidate away.
+ *
+ * `usage` is the entry point being protected, so the message says which call
+ * has to be fixed rather than only what was wrong.
+ */
+export const assertInteractiveTransactionClient = (candidate: unknown, usage: string): void => {
+    const diagnosis = diagnoseTransactionClient(candidate);
+
+    if (diagnosis.verdict === 'interactive') {
+        return;
+    }
+
+    if (diagnosis.verdict === 'autocommit') {
+        throw new TypeError(
+            `${usage} was given the global Prisma client, not an open interactive transaction — it exposes ` +
+                `${diagnosis.autocommitMembers.join(', ')}, which a transaction client never does. The per-user ` +
+                'advisory lock would be released at the end of its own statement and the reservation would ' +
+                'commit on its own, so the write could not be rolled back as one unit. Open the transaction ' +
+                'with withMealPlanningTransaction (or prisma.$transaction) and pass the client it provides.',
+        );
+    }
+
+    throw new TypeError(
+        `${usage} was given a value that is not a Prisma client: it lacks ${diagnosis.missingMembers.join(', ')}. ` +
+            'The ledger issues its advisory lock and its reservation through those, so it cannot run on this ' +
+            'value.',
+    );
+};

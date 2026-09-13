@@ -11,6 +11,9 @@
 // rather than as decimal literals, so a test can never disagree with the module
 // it exercises about how many grams a pound is.
 
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
 import {
     GROCERY_EPSILON_G,
     COUNT_DISPLAY_UNIT,
@@ -44,6 +47,11 @@ import {
     storedRowFamily,
 } from '../grocery.logic';
 import { PlanNotActiveError, PlanNotFoundError } from '../mealPlanning.errors';
+// The other three domains of the cross-domain traversal at the end of this
+// file. All four modules are pure, so the traversal calls the real functions.
+import { PlanRecipeCandidate, buildPlanCandidates } from '../mealPlan.logic';
+import { derivePlannedSnapshot } from '../plannedMealLog.logic';
+import { RecipeIngredientSnapshot, scaleIngredients } from '../recipe.logic';
 import {
     GRAMS_PER_OUNCE,
     GRAMS_PER_POUND,
@@ -54,20 +62,192 @@ import {
 } from '../../utils/units';
 
 /* ---------------------------------------------------------------------------
+ * The shared fixture graph
+ *
+ * `data/meal-planning/fixtures/catalog-foods.fixture.json` and
+ * `recipes.fixture.json` are the referentially closed pair the Agent Action
+ * Plan §0.3.3 commits — fixed uuid keys, fixed timestamps, snake_case rows —
+ * and they are the same rows the recipe, planner and planned-log suites read.
+ * Every food identity below is one of theirs, which is what lets the traversal
+ * at the end of this file follow a single food out of a `recipe_ingredients`
+ * row, through the planner's portion arithmetic, into a shopping line, and on
+ * into a diary snapshot, asserting the same identity and the same grams at
+ * every hop.
+ *
+ * Read off disk rather than transcribed (the convention
+ * `evidence.logic.test.ts` uses), and re-parsed per accessor so a case that
+ * mutates a row cannot leak into the next.
+ * ------------------------------------------------------------------------- */
+
+const FIXTURE_DIRECTORY = join(__dirname, '..', '..', '..', 'data', 'meal-planning', 'fixtures');
+
+const CATALOG_FOODS_JSON = readFileSync(join(FIXTURE_DIRECTORY, 'catalog-foods.fixture.json'), 'utf8');
+const RECIPES_JSON = readFileSync(join(FIXTURE_DIRECTORY, 'recipes.fixture.json'), 'utf8');
+
+/** The `catalog_foods` columns a shopping line is built from. */
+interface FixtureCatalogFood {
+    id: string;
+    source_key: string;
+    display_name: string;
+    food_state: string;
+    category: string;
+    density_g_per_ml: number | null;
+}
+
+/** A `catalog_food_portions` row; the `is_default` one decides the row's family. */
+interface FixtureCatalogPortion {
+    food_source_key: string;
+    description: string;
+    amount: number;
+    unit: string;
+    gram_weight: number;
+    is_default: boolean;
+}
+
+/** The `recipe_versions` columns the portion arithmetic needs. */
+interface FixtureRecipeVersion {
+    id: string;
+    recipe_id: string;
+    recipe_slug: string;
+    version: number;
+    name: string;
+    serving_description: string;
+    yield_servings: number;
+    per_serving_calories: number;
+    per_serving_protein_g: number;
+    per_serving_carbs_g: number;
+    per_serving_fat_g: number;
+}
+
+/**
+ * A `recipe_ingredients` row. `gram_weight` is the grams of this food in the
+ * WHOLE recipe, which is what the portion arithmetic divides by the yield.
+ * `resolved_catalog_facts` is the fixture's documented non-column field: the
+ * `catalog_foods` facts the table does not snapshot.
+ */
+interface FixtureRecipeIngredient {
+    recipe_version_id: string;
+    food_source_key: string;
+    catalog_food_id: string;
+    catalog_nutrition_version: number;
+    catalog_metadata_version: number;
+    snapshot_name: string;
+    snapshot_provenance: RecipeIngredientSnapshot['snapshot_provenance'];
+    snapshot_allergen_tags: string[];
+    snapshot_diet_tags: string[];
+    snapshot_per_100g: RecipeIngredientSnapshot['snapshot_per_100g'];
+    quantity: number;
+    unit: string;
+    gram_weight: number;
+    display_text: string;
+    sort_order: number;
+    is_optional: boolean;
+    resolved_catalog_facts: {
+        nutrition_basis: 'per_100g' | 'per_100ml';
+        density_g_per_ml: number | null;
+    };
+}
+
+interface CatalogFixtureDocument {
+    foods: FixtureCatalogFood[];
+    portions: FixtureCatalogPortion[];
+}
+
+interface RecipeFixtureDocument {
+    recipe_versions: FixtureRecipeVersion[];
+    recipe_ingredients: FixtureRecipeIngredient[];
+}
+
+const readCatalogFixture = (): CatalogFixtureDocument => JSON.parse(CATALOG_FOODS_JSON) as CatalogFixtureDocument;
+
+const readRecipeFixture = (): RecipeFixtureDocument => JSON.parse(RECIPES_JSON) as RecipeFixtureDocument;
+
+/** The catalog food with this `source_key`, or a failure naming the key. */
+const catalogFood = (sourceKey: string): FixtureCatalogFood => {
+    const food = readCatalogFixture().foods.find((row) => row.source_key === sourceKey);
+    if (!food) {
+        throw new Error(`catalog-foods.fixture.json carries no food with source_key ${sourceKey}`);
+    }
+
+    return food;
+};
+
+/**
+ * That food's `is_default` portion as the grocery shape. Every fixture food has
+ * exactly one, which the partial unique index enforces, so a missing one is a
+ * broken fixture rather than a case to tolerate.
+ */
+const defaultPortionOf = (sourceKey: string): GroceryDefaultPortion => {
+    const row = readCatalogFixture().portions.find(
+        (candidate) => candidate.food_source_key === sourceKey && candidate.is_default,
+    );
+    if (!row) {
+        throw new Error(`catalog-foods.fixture.json carries no default portion for ${sourceKey}`);
+    }
+
+    return { description: row.description, unit: row.unit, gram_weight: row.gram_weight };
+};
+
+/** One committed catalog food as the facts a shopping line reads. */
+const groceryFacts = (sourceKey: string, overrides: Partial<GroceryFoodFacts> = {}): GroceryFoodFacts => {
+    const food = catalogFood(sourceKey);
+
+    return {
+        catalog_food_id: food.id,
+        food_state: food.food_state,
+        name: food.display_name,
+        category: food.category,
+        density_g_per_ml: food.density_g_per_ml,
+        default_portion: defaultPortionOf(sourceKey),
+        ...overrides,
+    };
+};
+
+/** The `(slug, version)` recipe version, or a failure naming the pair. */
+const recipeVersionRow = (slug: string, version: number): FixtureRecipeVersion => {
+    const row = readRecipeFixture().recipe_versions.find(
+        (candidate) => candidate.recipe_slug === slug && candidate.version === version,
+    );
+    if (!row) {
+        throw new Error(`recipes.fixture.json carries no ${slug} v${version}`);
+    }
+
+    return row;
+};
+
+/** The ingredient rows of one fixture version, in the fixture's own row order. */
+const fixtureIngredientRows = (slug: string, version: number): FixtureRecipeIngredient[] => {
+    const versionId = recipeVersionRow(slug, version).id;
+    const rows = readRecipeFixture().recipe_ingredients.filter((row) => row.recipe_version_id === versionId);
+    if (rows.length === 0) {
+        throw new Error(`recipes.fixture.json carries no ingredients for ${slug} v${version}`);
+    }
+
+    return rows;
+};
+
+/* ---------------------------------------------------------------------------
  * Fixtures
  * ------------------------------------------------------------------------- */
 
-const CHICKEN = 'chicken-breast';
-const OLIVE_OIL = 'olive-oil';
-const EGG = 'egg';
-const RICE = 'rice';
+const CHICKEN = catalogFood('usda:9200101').id;
+const OLIVE_OIL = catalogFood('usda:9200109').id;
+const EGG = catalogFood('usda:9200107').id;
+const RICE = catalogFood('usda:9200103').id;
 const RAW = 'raw';
 const COOKED = 'cooked';
 const DRY = 'dry';
+const AS_PURCHASED = 'as_purchased';
 
 const NOW = new Date('2026-07-05T12:00:00.000Z');
 const EARLIER = new Date('2026-07-04T09:30:00.000Z');
 
+/**
+ * A portion whose unit is the only thing most cases care about — it is what
+ * `displayFamilyForPortion` reads the family off. Left synthetic because these
+ * are unit-family probes rather than foods: several pass a unit no catalog food
+ * carries (`bottle`), which is exactly the fallback being pinned.
+ */
 const portion = (overrides: Partial<GroceryDefaultPortion> = {}): GroceryDefaultPortion => ({
     description: 'breast',
     unit: 'oz',
@@ -75,33 +255,38 @@ const portion = (overrides: Partial<GroceryDefaultPortion> = {}): GroceryDefault
     ...overrides,
 });
 
-const facts = (overrides: Partial<GroceryFoodFacts> = {}): GroceryFoodFacts => ({
-    catalog_food_id: CHICKEN,
-    food_state: RAW,
-    name: 'Chicken breast',
-    category: 'protein_poultry',
-    density_g_per_ml: null,
-    default_portion: portion(),
-    ...overrides,
-});
+/** `usda:9200101` — chicken breast, raw, protein_poultry, with its own 100 g default portion. */
+const facts = (overrides: Partial<GroceryFoodFacts> = {}): GroceryFoodFacts =>
+    groceryFacts('usda:9200101', overrides);
 
-/** Water-like, so a millilitre of it weighs a gram and the arithmetic stays readable. */
+/**
+ * `usda:9200109` — olive oil, the committed volume-family food.
+ *
+ * Its density is overridden to 1: the catalog states 0.918, and every volume
+ * assertion below is written so a millilitre weighs a gram, which keeps "1 cup"
+ * readable as `MILLILITERS_PER_CUP` grams instead of a six-decimal figure. The
+ * real 0.918 is exercised where it belongs — in the traversal at the end of
+ * this file and in the recipe suite's per_100 ml conversion.
+ */
 const oilFacts = (overrides: Partial<GroceryFoodFacts> = {}): GroceryFoodFacts =>
-    facts({
-        catalog_food_id: OLIVE_OIL,
-        name: 'Olive oil',
-        category: 'oil_fat',
+    groceryFacts('usda:9200109', {
         density_g_per_ml: 1,
         default_portion: portion({ description: 'tbsp', unit: 'tbsp', gram_weight: MILLILITERS_PER_TABLESPOON }),
         ...overrides,
     });
 
+/**
+ * `usda:9200107` — egg white, the committed count-family food (`each`).
+ *
+ * Two local overrides, both so the counting arithmetic reads as a boundary: the
+ * portion weighs 50 g rather than the catalog's 33 g, which makes 600 g exactly
+ * twelve items, and the name and portion description are the plural-facing
+ * 'Eggs'/'egg' rather than 'Egg white'/'1 large egg white', which is what the
+ * irregular-plural assertions are about.
+ */
 const eggFacts = (overrides: Partial<GroceryFoodFacts> = {}): GroceryFoodFacts =>
-    facts({
-        catalog_food_id: EGG,
+    groceryFacts('usda:9200107', {
         name: 'Eggs',
-        category: 'protein_egg',
-        density_g_per_ml: null,
         default_portion: portion({ description: 'egg', unit: 'each', gram_weight: 50 }),
         ...overrides,
     });
@@ -497,21 +682,28 @@ describe('buildGroceryName', () => {
  * ------------------------------------------------------------------------- */
 
 describe('buildGroceryRows', () => {
+    /**
+     * One committed food per aisle, written in an order that matches none of
+     * them, so the aisle order below can only come from the rule: soy sauce
+     * (condiment_sauce) to the pantry, brown rice (grain) to grains & bread,
+     * Greek yogurt (dairy) to dairy & alternatives, chicken breast
+     * (protein_poultry) to protein, spinach (produce_vegetable) to produce.
+     */
     const aisleFoods: GroceryFoodFacts[] = [
-        facts({ catalog_food_id: 'soy-sauce', name: 'Soy sauce', category: 'condiment_sauce' }),
-        facts({ catalog_food_id: RICE, name: 'Brown rice', category: 'grain', food_state: DRY }),
-        facts({ catalog_food_id: 'yogurt', name: 'Greek yogurt', category: 'dairy' }),
-        facts({ catalog_food_id: CHICKEN, name: 'Chicken breast', category: 'protein_poultry' }),
-        facts({ catalog_food_id: 'spinach', name: 'Spinach', category: 'produce_vegetable' }),
+        groceryFacts('usda:9200113'),
+        groceryFacts('usda:9200103'),
+        groceryFacts('usda:9200115'),
+        groceryFacts('usda:9200101'),
+        groceryFacts('usda:9200111'),
     ];
 
-    const aisleMeal = meal([
-        { catalog_food_id: 'soy-sauce', gram_weight: 100 },
-        { catalog_food_id: RICE, food_state: DRY, gram_weight: 100 },
-        { catalog_food_id: 'yogurt', gram_weight: 100 },
-        { catalog_food_id: CHICKEN, gram_weight: 100 },
-        { catalog_food_id: 'spinach', gram_weight: 100 },
-    ]);
+    const aisleMeal = meal(
+        aisleFoods.map((food) => ({
+            catalog_food_id: food.catalog_food_id,
+            food_state: food.food_state,
+            gram_weight: 100,
+        })),
+    );
 
     it('files each line in its aisle and closes the list with pantry_other', () => {
         const rows = buildGroceryRows([aisleMeal], aisleFoods);
@@ -602,15 +794,17 @@ describe('buildGroceryRows', () => {
             [
                 meal([
                     { catalog_food_id: EGG, gram_weight: 600 },
-                    { catalog_food_id: OLIVE_OIL, gram_weight: MILLILITERS_PER_CUP },
+                    { catalog_food_id: OLIVE_OIL, food_state: AS_PURCHASED, gram_weight: MILLILITERS_PER_CUP },
                 ]),
             ],
             [eggFacts(), oilFacts()],
         );
 
+        // The oil's name carries its state because the catalog food really is
+        // `as_purchased` and it is the only non-raw line on this list.
         expect(rows.map((line) => [line.name, line.display_text, line.display_unit])).toEqual([
             ['Eggs', '12 eggs', COUNT_DISPLAY_UNIT],
-            ['Olive oil', '1 cup', 'cup'],
+            ['Olive oil, as purchased', '1 cup', 'cup'],
         ]);
     });
 
@@ -717,6 +911,31 @@ describe('diffGroceryList', () => {
         expect(plan.summary.increased).toBe(1);
     });
 
+    // The visibility test governs RAISING a flag, not keeping one: a warning the
+    // shopper is already looking at must not be retracted over a gram.
+    it('keeps a standing flag through an increase that moves nothing on the row', () => {
+        const flaggedRow = acknowledgedRow({
+            quantity_grams: 3.1 * GRAMS_PER_POUND,
+            display_quantity: 3.1,
+            display_text: '3.1 lb',
+            flagged_at: EARLIER,
+        });
+        const plan = diffGroceryList([flaggedRow], [massDraft(3.1 * GRAMS_PER_POUND + 1.1)], chickenFacts, NOW);
+
+        expect(plan.updates[0]).toMatchObject({
+            quantity_grams: 3.1 * GRAMS_PER_POUND + 1.1,
+            display_text: '3.1 lb',
+            flagged_at: EARLIER,
+            previous_quantity_grams: TWO_AND_A_HALF_LB,
+        });
+        expect(buildGroceryFlag(applyUpdate(flaggedRow, plan.updates[0]), facts())).toMatchObject({
+            previousDisplayText: '2.5 lb',
+            newDisplayText: '3.1 lb',
+            deltaDisplayText: '+0.6 lb',
+            flaggedAt: EARLIER.toISOString(),
+        });
+    });
+
     it('leaves a sub-epsilon drift entirely alone', () => {
         const plan = diffGroceryList(
             [acknowledgedRow()],
@@ -767,26 +986,122 @@ describe('diffGroceryList', () => {
             expect(plan.summary.increased).toBe(0);
         });
 
-        it('keeps the flag, and its original time, while the amount is still above what was acknowledged', () => {
-            const plan = diffGroceryList(
-                [
-                    acknowledgedRow({
-                        quantity_grams: 3.1 * GRAMS_PER_POUND,
-                        display_quantity: 3.1,
-                        display_text: '3.1 lb',
-                        flagged_at: EARLIER,
-                    }),
-                ],
-                [massDraft(2.9 * GRAMS_PER_POUND)],
+        /**
+         * A row flagged at 3.1 lb and re-aggregated to 2.9 lb is still above the
+         * 2.5 lb the shopper acknowledged, and the flag goes anyway: the amount
+         * they were warned about has come back down, so there is nothing left to
+         * warn about. The baseline stays put, which is what the next increase is
+         * measured from.
+         */
+        it('clears a standing flag even while the amount is still above what was acknowledged', () => {
+            const flaggedRow = acknowledgedRow({
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                flagged_at: EARLIER,
+            });
+            const plan = diffGroceryList([flaggedRow], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, NOW);
+            const decreased = applyUpdate(flaggedRow, plan.updates[0]);
+
+            expect(plan.updates[0]).toMatchObject({
+                display_text: '2.9 lb',
+                flagged_at: null,
+                previous_quantity_grams: TWO_AND_A_HALF_LB,
+            });
+            expect(plan.summary.increased).toBe(0);
+            expect(decreased.is_checked).toBe(true);
+            expect(buildGroceryFlag(decreased, facts())).toBeNull();
+            expect(bannerFor([decreased], { mealSlot: 'lunch', changedList: true })).toEqual({
+                code: 'updated_after_swap',
+                mealSlot: 'lunch',
+            });
+        });
+
+        it('flags a later increase afresh, from the amount the shopper acknowledged', () => {
+            const flaggedRow = acknowledgedRow({
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                flagged_at: EARLIER,
+            });
+            const cleared = applyUpdate(
+                flaggedRow,
+                diffGroceryList([flaggedRow], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, EARLIER).updates[0],
+            );
+            const raised = diffGroceryList([cleared], [massDraft(3.1 * GRAMS_PER_POUND)], chickenFacts, NOW);
+            const reflagged = applyUpdate(cleared, raised.updates[0]);
+
+            expect(raised.updates[0]).toMatchObject({
+                display_text: '3.1 lb',
+                flagged_at: NOW,
+                previous_quantity_grams: TWO_AND_A_HALF_LB,
+            });
+            expect(buildGroceryFlag(reflagged, facts())).toEqual({
+                previousDisplayText: '2.5 lb',
+                newDisplayText: '3.1 lb',
+                deltaDisplayText: '+0.6 lb',
+                flaggedAt: NOW.toISOString(),
+            });
+        });
+
+        /**
+         * The state a decrease leaves behind — checked, unflagged, and reading
+         * more than was acknowledged — is where the same-display exception is
+         * easiest to lose: the new amount differs from the 2.5 lb the shopper
+         * accepted, so a rule that only compared against the baseline would
+         * raise a flag over a gram that moves nothing on the row.
+         */
+        it('raises no flag for a later increase that does not move the row\u2019s own text', () => {
+            const flaggedRow = acknowledgedRow({
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                flagged_at: EARLIER,
+            });
+            const cleared = applyUpdate(
+                flaggedRow,
+                diffGroceryList([flaggedRow], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, EARLIER).updates[0],
+            );
+            const invisible = diffGroceryList(
+                [cleared],
+                [massDraft(2.9 * GRAMS_PER_POUND + 1)],
+                chickenFacts,
+                NOW,
+            );
+            const unflagged = applyUpdate(cleared, invisible.updates[0]);
+
+            expect(invisible.updates[0]).toMatchObject({
+                quantity_grams: 2.9 * GRAMS_PER_POUND + 1,
+                display_text: '2.9 lb',
+                flagged_at: null,
+                previous_quantity_grams: TWO_AND_A_HALF_LB,
+            });
+            expect(invisible.summary.increased).toBe(1);
+            expect(buildGroceryFlag(unflagged, facts())).toBeNull();
+            expect(bannerFor([unflagged], null)).toBeNull();
+        });
+
+        it('does not resurrect the cleared flag on a sub-epsilon re-aggregation', () => {
+            const flaggedRow = acknowledgedRow({
+                quantity_grams: 3.1 * GRAMS_PER_POUND,
+                display_quantity: 3.1,
+                display_text: '3.1 lb',
+                flagged_at: EARLIER,
+            });
+            const cleared = applyUpdate(
+                flaggedRow,
+                diffGroceryList([flaggedRow], [massDraft(2.9 * GRAMS_PER_POUND)], chickenFacts, EARLIER).updates[0],
+            );
+            const noise = diffGroceryList(
+                [cleared],
+                [massDraft(2.9 * GRAMS_PER_POUND + 0.2)],
                 chickenFacts,
                 NOW,
             );
 
-            expect(plan.updates[0]).toMatchObject({
-                display_text: '2.9 lb',
-                flagged_at: EARLIER,
-                previous_quantity_grams: TWO_AND_A_HALF_LB,
-            });
+            expect(noise.updates).toEqual([]);
+            expect(noise.unchangedItemIds).toEqual(['r1']);
+            expect(cleared.flagged_at).toBeNull();
         });
     });
 
@@ -1064,6 +1379,102 @@ describe('buildGroceryFlag', () => {
             expect(buildGroceryFlag(flagged, oilFacts())).toMatchObject({ deltaDisplayText: '+1½ cups' });
         });
     });
+
+    /**
+     * An increase that promotes the row to a larger unit is, by definition,
+     * smaller than one step of the unit it promoted INTO, so the row's own unit
+     * can only call it zero — and "was 15.8 oz / Now 1 lb / +0 lb" contradicts
+     * itself. The delta is then re-rendered from the family's base units, which
+     * is why each case below pins the string AND the family of the unit it
+     * lands in: a mass row's delta must still be a mass.
+     */
+    describe('an increase that crosses a unit-promotion boundary', () => {
+        /** The unit word of a delta pill: everything after its last space. */
+        const deltaUnitOf = (deltaDisplayText: string): string =>
+            deltaDisplayText.slice(deltaDisplayText.lastIndexOf(' ') + 1);
+
+        it('renders the grams rather than +0 lb when ounces promote to pounds', () => {
+            const flagged = row({
+                quantity_grams: 15.96 * GRAMS_PER_OUNCE,
+                display_quantity: 1,
+                display_unit: 'lb',
+                display_text: '1 lb',
+                previous_quantity_grams: 15.8 * GRAMS_PER_OUNCE,
+                flagged_at: NOW,
+            });
+
+            const flag = buildGroceryFlag(flagged, facts());
+
+            expect(flag).toEqual({
+                previousDisplayText: '15.8 oz',
+                newDisplayText: '1 lb',
+                deltaDisplayText: '+6 g',
+                flaggedAt: NOW.toISOString(),
+            });
+            expect(unitFamily(deltaUnitOf(flag?.deltaDisplayText ?? ''))).toBe('mass');
+        });
+
+        it('renders the grams rather than +0 oz when grams promote to ounces', () => {
+            const flagged = row({
+                quantity_grams: 29,
+                display_quantity: 1,
+                display_unit: 'oz',
+                display_text: '1 oz',
+                previous_quantity_grams: 27.8,
+                flagged_at: NOW,
+            });
+
+            const flag = buildGroceryFlag(flagged, facts());
+
+            expect(flag).toEqual({
+                previousDisplayText: '28 g',
+                newDisplayText: '1 oz',
+                deltaDisplayText: '+1 g',
+                flaggedAt: NOW.toISOString(),
+            });
+            expect(unitFamily(deltaUnitOf(flag?.deltaDisplayText ?? ''))).toBe('mass');
+        });
+
+        it('renders the millilitres rather than +0 cup when tablespoons promote to cups', () => {
+            /** Real olive oil, so the row's grams and its millilitres differ. */
+            const density = 0.92;
+            const flagged = row({
+                catalog_food_id: OLIVE_OIL,
+                name: 'Olive oil',
+                quantity_grams: 236 * density,
+                display_quantity: 1,
+                display_unit: 'cup',
+                display_text: '1 cup',
+                previous_quantity_grams: 232 * density,
+                flagged_at: NOW,
+            });
+
+            const flag = buildGroceryFlag(flagged, oilFacts({ density_g_per_ml: density }));
+
+            expect(flag).toEqual({
+                previousDisplayText: '15¾ tbsp',
+                newDisplayText: '1 cup',
+                deltaDisplayText: '+5 ml',
+                flaggedAt: NOW.toISOString(),
+            });
+            expect(unitFamily(deltaUnitOf(flag?.deltaDisplayText ?? ''))).toBe('volume');
+        });
+
+        it('names one whole item rather than +0 eggs, the count family having no smaller unit', () => {
+            const flagged = row({
+                catalog_food_id: EGG,
+                name: 'Eggs',
+                quantity_grams: 600,
+                display_quantity: 12,
+                display_unit: COUNT_DISPLAY_UNIT,
+                display_text: '12 eggs',
+                previous_quantity_grams: 590,
+                flagged_at: NOW,
+            });
+
+            expect(buildGroceryFlag(flagged, eggFacts())).toMatchObject({ deltaDisplayText: '+1 egg' });
+        });
+    });
 });
 
 
@@ -1322,7 +1733,7 @@ describe('requireGroceryWritablePlan', () => {
         const error = captureError(() => requireGroceryWritablePlan(activePlan, '2026-07-12'));
 
         expect(error).toBeInstanceOf(PlanNotActiveError);
-        expect(error).toMatchObject({ reason: 'ended', replacementPlanId: undefined });
+        expect((error as PlanNotActiveError).data).toEqual({ reason: 'ended' });
     });
 
     it('refuses a superseded plan and points at the plan that replaced it', () => {
@@ -1334,15 +1745,17 @@ describe('requireGroceryWritablePlan', () => {
         );
 
         expect(error).toBeInstanceOf(PlanNotActiveError);
-        expect(error).toMatchObject({ replacementPlanId: ITEM_ID, reason: undefined });
+        expect((error as PlanNotActiveError).data).toEqual({ replacementPlanId: ITEM_ID });
     });
 
-    it('refuses a superseded plan even when no replacement is known', () => {
-        const error = captureError(() =>
-            requireGroceryWritablePlan({ ...activePlan, status: 'superseded' }, '2026-07-05'),
+    it('treats a superseded plan with no resolvable replacement as a data fault, not a 409', () => {
+        // A superseded plan always has a successor — regeneration links it in the
+        // same transaction — so an unresolved one contradicts itself. The
+        // superseded variant promises that id, so it is never answered without
+        // one, and the alternative claim (`reason: 'ended'`) would be false.
+        expect(() => requireGroceryWritablePlan({ ...activePlan, status: 'superseded' }, '2026-07-05')).toThrow(
+            GroceryDataError,
         );
-
-        expect(error).toMatchObject({ replacementPlanId: undefined });
     });
 
     it('answers a missing plan and a plan that is not the caller\u2019s identically', () => {
@@ -1362,3 +1775,226 @@ describe('requireGroceryWritablePlan', () => {
     });
 });
 
+
+/* ---------------------------------------------------------------------------
+ * One food across four domains
+ *
+ * This is the invariant no suite could state while each of them invented its
+ * own food and recipe identities: a single committed food followed out of a
+ * `recipe_ingredients` row, through the planner's candidate and its portion
+ * multiplier, into the aggregated shopping line, and on into the diary
+ * snapshot — with the SAME identity and the SAME grams asserted at every hop.
+ *
+ * The four modules are imported rather than restated. Each is pure, so nothing
+ * is mocked: the hop is the real function the real service calls.
+ * ------------------------------------------------------------------------- */
+
+describe('one food across recipe, plan, grocery and log', () => {
+    const SLUG = 'lemon-herb-chicken-and-rice';
+    const VERSION = 2;
+    const PORTION_MULTIPLIER = 1.5;
+    const MEAL_ID = '45c48cce-2e2d-4fd8-a0a1-9c8a1b2c3d4e';
+
+    /** The recipe's ingredient rows as `recipe.logic.ts` takes them. */
+    const recipeIngredients = (): RecipeIngredientSnapshot[] =>
+        fixtureIngredientRows(SLUG, VERSION).map((row) => ({
+            catalog_food_id: row.catalog_food_id,
+            snapshot_name: row.snapshot_name,
+            snapshot_provenance: row.snapshot_provenance,
+            snapshot_allergen_tags: row.snapshot_allergen_tags,
+            snapshot_diet_tags: row.snapshot_diet_tags,
+            is_optional: row.is_optional,
+            catalog_nutrition_version: row.catalog_nutrition_version,
+            catalog_metadata_version: row.catalog_metadata_version,
+            snapshot_per_100g: row.snapshot_per_100g,
+            quantity: row.quantity,
+            unit: row.unit,
+            gram_weight: row.gram_weight,
+            display_text: row.display_text,
+            sort_order: row.sort_order,
+            nutrition_basis: row.resolved_catalog_facts.nutrition_basis,
+            density_g_per_ml: row.resolved_catalog_facts.density_g_per_ml,
+        }));
+
+    /** The planned meal a week of this plan hands the grocery aggregation. */
+    const plannedMeal = (): PlannedMealForGroceries => ({
+        yield_servings: recipeVersionRow(SLUG, VERSION).yield_servings,
+        portion_multiplier: PORTION_MULTIPLIER,
+        ingredients: fixtureIngredientRows(SLUG, VERSION).map((row) => ({
+            catalog_food_id: row.catalog_food_id,
+            food_state: catalogFood(row.food_source_key).food_state,
+            gram_weight: row.gram_weight,
+        })),
+    });
+
+    /** The catalog facts for every food this recipe touches. */
+    const recipeFoodFacts = (): GroceryFoodFacts[] =>
+        fixtureIngredientRows(SLUG, VERSION).map((row) => groceryFacts(row.food_source_key));
+
+    it('agrees with recipe.logic about the grams one planned portion takes', () => {
+        const version = recipeVersionRow(SLUG, VERSION);
+        const chickenRow = fixtureIngredientRows(SLUG, VERSION).find(
+            (row) => row.food_source_key === 'usda:9200101',
+        );
+        const scaled = scaleIngredients(recipeIngredients(), PORTION_MULTIPLIER, version.yield_servings);
+        const fromRecipe = scaled.find((entry) => entry.catalogFoodId === CHICKEN);
+
+        expect(chickenRow?.gram_weight).toBe(600);
+        expect(version.yield_servings).toBe(4);
+
+        // Hop 1 -> hop 2. Two modules, two implementations, one number.
+        expect(fromRecipe?.gramWeight).toBe(225);
+        expect(plannedIngredientGrams(chickenRow?.gram_weight as number, version.yield_servings, PORTION_MULTIPLIER))
+            .toBe(fromRecipe?.gramWeight);
+    });
+
+    /**
+     * The committed version as the planner's own candidate shape. Only the
+     * three columns this suite's `FixtureRecipeVersion` does not read are
+     * stated here (the version's minutes, slots and tier, which the planner
+     * suite asserts against the fixture); every identity and every number is
+     * the fixture's.
+     */
+    const planRecipeCandidate = (): PlanRecipeCandidate => {
+        const version = recipeVersionRow(SLUG, VERSION);
+
+        return {
+            recipe_version_id: version.id,
+            recipe_id: version.recipe_id,
+            slug: version.recipe_slug,
+            version: version.version,
+            status: 'current',
+            nutrition_provenance: 'source_backed',
+            allergen_status: 'known',
+            total_minutes: 45,
+            meal_slots: ['lunch', 'dinner'],
+            budget_tier: 2,
+            per_serving: {
+                calories: version.per_serving_calories,
+                protein: version.per_serving_protein_g,
+                carbs: version.per_serving_carbs_g,
+                fat: version.per_serving_fat_g,
+            },
+            ingredients: fixtureIngredientRows(SLUG, VERSION).map((row) => ({
+                catalog_food_id: row.catalog_food_id,
+                snapshot_name: row.snapshot_name,
+                snapshot_provenance: 'source_backed',
+                snapshot_allergen_tags: [],
+                snapshot_diet_tags: [],
+                is_optional: false,
+                allergen_status: 'known',
+            })),
+        };
+    };
+
+    it('carries the same identity and grams into the planner candidate', () => {
+        const version = recipeVersionRow(SLUG, VERSION);
+        const candidates = buildPlanCandidates(
+            [planRecipeCandidate()],
+            { diet: null, allergens: [], disliked_food_ids: [], disliked_food_groups: [], cooking_time_limit_min: null },
+            1,
+        );
+        const candidate = candidates.find((entry) => entry.portionMultiplier === PORTION_MULTIPLIER);
+
+        expect(candidate).toBeDefined();
+        expect(candidate?.recipe.recipe_version_id).toBe(version.id);
+        expect(candidate?.recipe.ingredients.map((ingredient) => ingredient.catalog_food_id)).toContain(CHICKEN);
+        expect(candidate?.nutrition.calories).toBeCloseTo(version.per_serving_calories * PORTION_MULTIPLIER, 9);
+
+        // The grams the planner implies for that candidate are the grams the
+        // grocery aggregation will sum, for the same catalog identity.
+        const chickenRow = fixtureIngredientRows(SLUG, VERSION).find(
+            (row) => row.catalog_food_id === CHICKEN,
+        );
+
+        expect(
+            plannedIngredientGrams(
+                chickenRow?.gram_weight as number,
+                recipeVersionRow(SLUG, VERSION).yield_servings,
+                candidate?.portionMultiplier as number,
+            ),
+        ).toBe(225);
+    });
+
+    it('aggregates that portion into a shopping line under the same identity', () => {
+        const totals = aggregatePlannedGrams([plannedMeal()]);
+        const chickenTotal = totals.find((total) => total.catalog_food_id === CHICKEN);
+
+        expect(chickenTotal).toEqual({ catalog_food_id: CHICKEN, food_state: RAW, quantity_grams: 225 });
+        expect(totals.map((total) => total.catalog_food_id)).toEqual(
+            [...totals].map((total) => total.catalog_food_id).sort(),
+        );
+    });
+
+    it('renders the line from the food\u2019s own catalog facts', () => {
+        const [chickenLine] = buildGroceryRows([plannedMeal()], recipeFoodFacts()).filter(
+            (line) => line.catalog_food_id === CHICKEN,
+        );
+
+        expect(chickenLine).toMatchObject({
+            catalog_food_id: CHICKEN,
+            food_state: RAW,
+            name: 'Chicken breast',
+            category: 'protein',
+            quantity_grams: 225,
+        });
+        // 225 g in the mass family, which is what chicken's own default portion
+        // (100 g) implies.
+        expect(chickenLine.display_unit).toBe('oz');
+        expect(chickenLine.display_text).toBe('7.9 oz');
+    });
+
+    it('sums two planned portions of the same recipe into one line', () => {
+        const totals = aggregatePlannedGrams([plannedMeal(), plannedMeal()]);
+        const chickenTotal = totals.find((total) => total.catalog_food_id === CHICKEN);
+
+        expect(chickenTotal?.quantity_grams).toBe(450);
+    });
+
+    it('writes a diary snapshot for the same recipe version the line came from', () => {
+        const version = recipeVersionRow(SLUG, VERSION);
+        const snapshot = derivePlannedSnapshot(
+            { id: MEAL_ID, recipe_version_id: version.id, portion_multiplier: PORTION_MULTIPLIER },
+            {
+                id: version.id,
+                name: version.name,
+                serving_description: version.serving_description,
+                per_serving_calories: version.per_serving_calories,
+                per_serving_protein_g: version.per_serving_protein_g,
+                per_serving_carbs_g: version.per_serving_carbs_g,
+                per_serving_fat_g: version.per_serving_fat_g,
+            },
+        );
+
+        // Hop 4: the entry points back at the same `recipe_versions` row whose
+        // ingredient rows produced the 225 g line, and rounds ONCE off the
+        // unrounded planned portion.
+        expect(snapshot.recipe_version_id).toBe(version.id);
+        expect(snapshot.meal_plan_meal_id).toBe(MEAL_ID);
+        expect(snapshot.name).toBe(version.name);
+        expect(snapshot.calories).toBe(Math.round(version.per_serving_calories * PORTION_MULTIPLIER));
+        expect(snapshot.serving_text).toBe(`${PORTION_MULTIPLIER} \u00d7 ${version.serving_description}`);
+    });
+
+    it('never merges the dry and cooked rice the catalog publishes as two foods', () => {
+        const dry = groceryFacts('usda:9200103');
+        const cooked = groceryFacts('usda:9200104');
+        const rows = buildGroceryRows(
+            [
+                meal([
+                    { catalog_food_id: cooked.catalog_food_id, food_state: cooked.food_state, gram_weight: 300 },
+                    { catalog_food_id: dry.catalog_food_id, food_state: dry.food_state, gram_weight: 100 },
+                ]),
+            ],
+            [dry, cooked],
+        );
+
+        // Both rows are display_name 'Brown rice' in the catalog, which is why
+        // each line has to say which one it is.
+        expect(dry.name).toBe(cooked.name);
+        expect(rows.map((line) => [line.name, line.quantity_grams])).toEqual([
+            ['Brown rice, cooked', 300],
+            ['Brown rice, dry', 100],
+        ]);
+    });
+});

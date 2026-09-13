@@ -9,7 +9,7 @@ import {
     updateTargets,
     InvalidServingError,
 } from '../services/nutrition.service';
-import { parseLogEntryBody } from '../services/nutrition.logic';
+import { LogEntryErrorVerdict, parseLogEntryBody } from '../services/nutrition.logic';
 import { estimateMeal, scanLabel, EstimateFailedError } from '../services/estimate.service';
 import {
     assertAndConsumeAiCall,
@@ -37,15 +37,30 @@ export const getDailyMacrosController = async (req: Request, res: Response) => {
     }
 };
 
+// The three 400 bodies this endpoint answers with, chosen from the parser's
+// verdict rather than from the request, which the parser has already read. Only
+// the legacy guard's verdict gets a message and no code: that string is what
+// every client sending a malformed legacy body has always been shown. A catalog
+// or shapeless body gets the machine code and the per-field details instead, so
+// the caller learns which field to fix. Exhaustive by construction — a fourth
+// verdict code makes this function fall off its end and fail the build, rather
+// than silently inheriting the legacy body.
+const logEntryErrorBody = (verdict: LogEntryErrorVerdict): Record<string, unknown> => {
+    switch (verdict.code) {
+        case 'legacy_fields_required':
+            return { error: verdict.message };
+        case 'invalid_request':
+        case 'invalid_payload':
+            return { error: verdict.code, details: verdict.details };
+    }
+};
+
 export const logMealEntryController = async (req: Request, res: Response) => {
     try {
         const userId = getUserId(req);
         const parsed = parseLogEntryBody(req.body);
         if (parsed.kind === 'error') {
-            if (parsed.code === 'invalid_payload') {
-                return res.status(400).json({ error: 'invalid_payload', details: parsed.details });
-            }
-            return res.status(400).json({ error: parsed.message });
+            return res.status(400).json(logEntryErrorBody(parsed));
         }
         const entry =
             parsed.kind === 'catalog'

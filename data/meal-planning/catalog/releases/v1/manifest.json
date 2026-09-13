@@ -1,0 +1,366 @@
+{
+  "release_id": "v1",
+  "manifest_version": "v1",
+  "coverage_plan_version": "v1",
+  "generated_at": "2026-09-13T11:37:28.970Z",
+  "produced_by": "pipeline",
+  "files": [
+    {
+      "path": "foods.jsonl",
+      "name": "foods.jsonl",
+      "sha256": "81a39f9ebb7f46d6c72d5c1f40ae4606c9fc19837445b66dc8297fd32183f292",
+      "row_count": 11046,
+      "bytes": 13410456
+    },
+    {
+      "path": "aliases.jsonl",
+      "name": "aliases.jsonl",
+      "sha256": "b14909373894e5066ff6555f3fef5859fb2bb0d0a4293d6f2eafd11528e8fc5e",
+      "row_count": 15939,
+      "bytes": 918946
+    },
+    {
+      "path": "portions.jsonl",
+      "name": "portions.jsonl",
+      "sha256": "798b4588e8bfb2dddba8f0663b3cd74785ca02b806699c331d4edb674436de63",
+      "row_count": 31899,
+      "bytes": 4801631
+    },
+    {
+      "path": "components.jsonl",
+      "name": "components.jsonl",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "row_count": 0,
+      "bytes": 0
+    },
+    {
+      "path": "validation-records.jsonl",
+      "name": "validation-records.jsonl",
+      "sha256": "67bbcf1d30705c301d136157db7fbd7b1bcde200fe84c5d49a8da7b9d4d58ce9",
+      "row_count": 11046,
+      "bytes": 50787067
+    }
+  ],
+  "counts": {
+    "foods": 11046,
+    "aliases": 15939,
+    "portions": 31899,
+    "components": 0,
+    "validation_records": 11046
+  },
+  "source_datasets": [
+    {
+      "name": "Foundation",
+      "version": "Foundation 2026-04",
+      "versions_present": [
+        "Foundation 2019-04",
+        "Foundation 2019-12",
+        "Foundation 2020-04",
+        "Foundation 2020-10",
+        "Foundation 2021-10",
+        "Foundation 2022-04",
+        "Foundation 2022-10",
+        "Foundation 2023-04",
+        "Foundation 2023-10",
+        "Foundation 2024-04",
+        "Foundation 2024-10",
+        "Foundation 2025-04",
+        "Foundation 2025-12",
+        "Foundation 2026-04"
+      ],
+      "retrieved_at": "2026-09-13T11:35:18.625Z",
+      "public_domain": true,
+      "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
+    },
+    {
+      "name": "SR Legacy",
+      "version": "SR Legacy 2019-04",
+      "versions_present": [
+        "SR Legacy 2019-04"
+      ],
+      "retrieved_at": "2026-09-13T11:36:16.185Z",
+      "public_domain": true,
+      "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
+    },
+    {
+      "name": "Survey (FNDDS)",
+      "version": "Survey (FNDDS) 2024-10",
+      "versions_present": [
+        "Survey (FNDDS) 2024-10"
+      ],
+      "retrieved_at": "2026-09-13T11:36:49.111Z",
+      "public_domain": true,
+      "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
+    }
+  ],
+  "model_versions": {
+    "generation_model": null,
+    "review_model": null,
+    "prompt_version": null,
+    "review_prompt_version": null
+  },
+  "coverage": {
+    "coverage_plan_version": "v1",
+    "published_target_total": 11010,
+    "published_actual_total": 11046,
+    "published_total": 11046,
+    "shortfall_total": 2344,
+    "published_gap_to_total": 0,
+    "categories": [
+      {
+        "category": "produce_vegetable",
+        "published": 1424,
+        "published_target": 1200,
+        "shortfall": 0
+      },
+      {
+        "category": "produce_fruit",
+        "published": 730,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_meat",
+        "published": 2218,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_poultry",
+        "published": 499,
+        "published_target": 400,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_seafood",
+        "published": 558,
+        "published_target": 600,
+        "shortfall": 42
+      },
+      {
+        "category": "protein_egg",
+        "published": 58,
+        "published_target": 60,
+        "shortfall": 2
+      },
+      {
+        "category": "protein_plant",
+        "published": 38,
+        "published_target": 350,
+        "shortfall": 312
+      },
+      {
+        "category": "dairy",
+        "published": 371,
+        "published_target": 600,
+        "shortfall": 229
+      },
+      {
+        "category": "dairy_alternative",
+        "published": 52,
+        "published_target": 250,
+        "shortfall": 198
+      },
+      {
+        "category": "grain",
+        "published": 537,
+        "published_target": 600,
+        "shortfall": 63
+      },
+      {
+        "category": "bread_bakery",
+        "published": 805,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "legume",
+        "published": 297,
+        "published_target": 250,
+        "shortfall": 0
+      },
+      {
+        "category": "nut_seed",
+        "published": 293,
+        "published_target": 350,
+        "shortfall": 57
+      },
+      {
+        "category": "oil_fat",
+        "published": 152,
+        "published_target": 150,
+        "shortfall": 0
+      },
+      {
+        "category": "condiment_sauce",
+        "published": 198,
+        "published_target": 700,
+        "shortfall": 502
+      },
+      {
+        "category": "spice_herb",
+        "published": 49,
+        "published_target": 300,
+        "shortfall": 251
+      },
+      {
+        "category": "beverage",
+        "published": 432,
+        "published_target": 600,
+        "shortfall": 168
+      },
+      {
+        "category": "snack",
+        "published": 233,
+        "published_target": 600,
+        "shortfall": 367
+      },
+      {
+        "category": "sweet",
+        "published": 556,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "prepared_meal",
+        "published": 1499,
+        "published_target": 1400,
+        "shortfall": 0
+      },
+      {
+        "category": "other",
+        "published": 47,
+        "published_target": 200,
+        "shortfall": 153
+      }
+    ],
+    "by_category": [
+      {
+        "category": "produce_vegetable",
+        "published": 1424,
+        "published_target": 1200,
+        "shortfall": 0
+      },
+      {
+        "category": "produce_fruit",
+        "published": 730,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_meat",
+        "published": 2218,
+        "published_target": 700,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_poultry",
+        "published": 499,
+        "published_target": 400,
+        "shortfall": 0
+      },
+      {
+        "category": "protein_seafood",
+        "published": 558,
+        "published_target": 600,
+        "shortfall": 42
+      },
+      {
+        "category": "protein_egg",
+        "published": 58,
+        "published_target": 60,
+        "shortfall": 2
+      },
+      {
+        "category": "protein_plant",
+        "published": 38,
+        "published_target": 350,
+        "shortfall": 312
+      },
+      {
+        "category": "dairy",
+        "published": 371,
+        "published_target": 600,
+        "shortfall": 229
+      },
+      {
+        "category": "dairy_alternative",
+        "published": 52,
+        "published_target": 250,
+        "shortfall": 198
+      },
+      {
+        "category": "grain",
+        "published": 537,
+        "published_target": 600,
+        "shortfall": 63
+      },
+      {
+        "category": "bread_bakery",
+        "published": 805,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "legume",
+        "published": 297,
+        "published_target": 250,
+        "shortfall": 0
+      },
+      {
+        "category": "nut_seed",
+        "published": 293,
+        "published_target": 350,
+        "shortfall": 57
+      },
+      {
+        "category": "oil_fat",
+        "published": 152,
+        "published_target": 150,
+        "shortfall": 0
+      },
+      {
+        "category": "condiment_sauce",
+        "published": 198,
+        "published_target": 700,
+        "shortfall": 502
+      },
+      {
+        "category": "spice_herb",
+        "published": 49,
+        "published_target": 300,
+        "shortfall": 251
+      },
+      {
+        "category": "beverage",
+        "published": 432,
+        "published_target": 600,
+        "shortfall": 168
+      },
+      {
+        "category": "snack",
+        "published": 233,
+        "published_target": 600,
+        "shortfall": 367
+      },
+      {
+        "category": "sweet",
+        "published": 556,
+        "published_target": 500,
+        "shortfall": 0
+      },
+      {
+        "category": "prepared_meal",
+        "published": 1499,
+        "published_target": 1400,
+        "shortfall": 0
+      },
+      {
+        "category": "other",
+        "published": 47,
+        "published_target": 200,
+        "shortfall": 153
+      }
+    ]
+  }
+}

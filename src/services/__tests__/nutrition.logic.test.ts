@@ -26,12 +26,33 @@
  *  - **The specific `details[].code`, not merely that the verdict failed.** The
  *    codes are the wire vocabulary the client maps to copy, so every failing
  *    case asserts the field/code pairs it produced.
+ *  - **Which of the three 400s each failure earns.** The legacy guard's verdict
+ *    is answered with a frozen message-only body kept for shipped clients; a
+ *    catalog field failure and a shapeless body are answered with a machine code
+ *    and per-field details. One code for two of those is how the catalog shape
+ *    came to lose its `invalid_request` code and details, so the three verdicts
+ *    are asserted as distinct here rather than left to the controller's reading.
  *  - **Totality.** Every input — `null`, `undefined`, a primitive, an array, an
  *    object whose keys only look like properties — returns a verdict and never
  *    throws.
+ *
+ * `resolveLegacyInputMethod` is the module's second export and is tested in its
+ * own suite below. It is here rather than in the writer that uses it for the
+ * reason `backend-architecture` §11 gives: inside `logMealEntry`'s `create`
+ * call the rule needs a database to test, and the rule — that a body may never
+ * ask for a method the server writes on its own authority — is worth pinning,
+ * because the app reads that one field as the diary's "From meal plan" origin.
  */
 
-import { ParsedLogEntryBody, parseLogEntryBody } from '../nutrition.logic';
+import {
+    CLIENT_INPUT_METHODS,
+    DEFAULT_INPUT_METHOD,
+    ENTRY_INPUT_METHODS,
+    PLANNED_INPUT_METHOD,
+    ParsedLogEntryBody,
+    parseLogEntryBody,
+    resolveLegacyInputMethod,
+} from '../nutrition.logic';
 
 /** A syntactically valid v4 UUID: version nibble `4`, variant nibble `9`. */
 const CATALOG_FOOD_ID = '3f2504e0-4f89-41d3-9a0c-0305e82c3301';
@@ -243,12 +264,12 @@ describe('parseLogEntryBody', () => {
             ['fat', { fat: 16 }, ['name:required', 'calories:required', 'protein:required', 'carbs:required']],
         ])('treats %s as a legacy shape signal and then reports the fields still missing', (_field, partial, expected) => {
             // Every one of these selects the legacy branch, which is what makes the
-            // verdict invalid_request (a legacy body with holes) rather than
+            // verdict legacy_fields_required (a legacy body with holes) rather than
             // invalid_payload (no shape at all) — the client is told which fields to
             // add, not that its request made no sense.
             const verdict = parseLogEntryBody(partial);
 
-            expect(asError(verdict).code).toBe('invalid_request');
+            expect(asError(verdict).code).toBe('legacy_fields_required');
             expect(asError(verdict).message).toBe(LEGACY_REQUIRED_MESSAGE);
             expect(fieldCodes(verdict)).toStrictEqual(expected);
         });
@@ -273,7 +294,7 @@ describe('parseLogEntryBody', () => {
         ])('refuses a name that is %s', (_case, name) => {
             const verdict = parseLogEntryBody({ ...validLegacyBody(), name });
 
-            expect(asError(verdict).code).toBe('invalid_request');
+            expect(asError(verdict).code).toBe('legacy_fields_required');
             expect(fieldCodes(verdict)).toStrictEqual(['name:required']);
         });
 
@@ -618,6 +639,143 @@ describe('parseLogEntryBody', () => {
                 catalogFoodId: CATALOG_FOOD_ID,
                 servings: 2,
                 inputMethod: 'search',
+            });
+        });
+    });
+
+    describe('which of the three 400 verdicts a failure earns', () => {
+        // Each verdict is rendered differently: legacy_fields_required keeps the
+        // frozen message-only body shipped clients read, while the other two
+        // carry the machine code and the per-field details. One code shared
+        // across two routes is what let a catalog failure be answered with the
+        // legacy message and lose both, so the partition is asserted here rather
+        // than inferred from the controller.
+        it.each([
+            ['a legacy body with holes', 'legacy_fields_required', { name: 'eggs' }],
+            ['a legacy body with an unusable name', 'legacy_fields_required', { ...validLegacyBody(), name: '  ' }],
+            ['a legacy body with an unusable macro', 'legacy_fields_required', { ...validLegacyBody(), fat: 'lots' }],
+            ['a catalog body with a malformed id', 'invalid_request', { catalogFoodId: 'nope', servings: 1 }],
+            [
+                'a catalog body with out-of-contract servings',
+                'invalid_request',
+                { catalogFoodId: CATALOG_FOOD_ID, servings: 99 },
+            ],
+            [
+                'a catalog body with a non-string servingText',
+                'invalid_request',
+                { catalogFoodId: CATALOG_FOOD_ID, servings: 1, servingText: 7 },
+            ],
+            [
+                'a body naming both a personal and a catalog food',
+                'invalid_payload',
+                { ...validLegacyBody(), foodId: 'personal-food-1', catalogFoodId: CATALOG_FOOD_ID },
+            ],
+            ['a body naming neither shape', 'invalid_payload', { servings: 2 }],
+            ['a body that is not an object at all', 'invalid_payload', null],
+        ])('answers %s with the %s verdict', (_case, expectedCode, body) => {
+            expect(asError(parseLogEntryBody(body)).code).toBe(expectedCode);
+        });
+
+        it('gives the legacy verdict the frozen message it has always returned', () => {
+            const verdict = asError(parseLogEntryBody({ name: 'eggs' }));
+
+            expect(verdict.code).toBe('legacy_fields_required');
+            expect(verdict.message).toBe(LEGACY_REQUIRED_MESSAGE);
+        });
+
+        it('never answers a catalog field failure with the legacy verdict or its message', () => {
+            // The regression the third code prevents. A catalog caller sent no
+            // name and no macros, so "name, calories, protein, carbs, and fat are
+            // required" names nothing it can fix; its contract is the machine code
+            // plus the field details.
+            const verdict = asError(parseLogEntryBody({ catalogFoodId: 'nope', servings: 1 }));
+
+            expect(verdict.code).toBe('invalid_request');
+            expect(verdict.message).not.toBe(LEGACY_REQUIRED_MESSAGE);
+            expect(verdict.details).toStrictEqual([{ field: 'catalogFoodId', code: 'invalid_id' }]);
+        });
+
+        it.each([
+            ['a legacy body with holes', { name: 'eggs' }],
+            ['a catalog body with a malformed id', { catalogFoodId: 'nope', servings: 1 }],
+            ['a body naming neither shape', {}],
+            [
+                'a body naming both foods',
+                { ...validLegacyBody(), foodId: 'personal-food-1', catalogFoodId: CATALOG_FOOD_ID },
+            ],
+        ])('reports %s as machine-readable details rather than prose', (_case, body) => {
+            // `details` is what the client maps to copy; a sentence in either
+            // member would leave it with nothing to map.
+            const { details } = asError(parseLogEntryBody(body));
+
+            expect(details.length).toBeGreaterThan(0);
+            details.forEach((detail) => {
+                expect(detail.field).toMatch(/^[a-zA-Z]+$/);
+                expect(detail.code).toMatch(/^[a-z_]+$/);
+            });
+        });
+    });
+});
+
+describe('resolveLegacyInputMethod', () => {
+    it.each(['library', 'search', 'ai_text', 'ai_photo'])('honours %s, which a client may ask for', (method) => {
+        expect(resolveLegacyInputMethod(method)).toBe(method);
+    });
+
+    it('refuses the planned-meal method however plainly a body asks for it', () => {
+        // The forgery this function exists to refuse. The app captions a diary
+        // row "From meal plan" from this field alone, so honouring a request's
+        // 'meal_plan' would let it claim a planned origin for macros it supplied
+        // itself — no plan, no recipe version, and nutrition the server never
+        // derived. Only `insertPlannedMealEntry` writes this value.
+        expect(resolveLegacyInputMethod(PLANNED_INPUT_METHOD)).toBe(DEFAULT_INPUT_METHOD);
+        expect(resolveLegacyInputMethod('meal_plan')).toBe('library');
+    });
+
+    it.each([
+        ['a method nobody defined', 'telepathy'],
+        ['an empty string', ''],
+        ['the same method in upper case', 'LIBRARY'],
+        ['a padded method', ' library '],
+        ['the planned method in mixed case', 'Meal_Plan'],
+        ['undefined', undefined],
+        ['null', null],
+        ['a number', 7],
+        ['a boolean', true],
+        ['an object', { inputMethod: 'library' }],
+        ['an array of methods', ['library']],
+    ])('resolves %s to the default', (_case, value) => {
+        // Unchanged from the whitelist this replaced: an unusable method is not a
+        // rejected request, it is simply not honoured. Matching is exact, so no
+        // case folding or trimming rescues a value either.
+        expect(resolveLegacyInputMethod(value)).toBe(DEFAULT_INPUT_METHOD);
+    });
+
+    describe('the two vocabularies it resolves between', () => {
+        it('stores five methods, the planned one among them', () => {
+            // The column's vocabulary (Agent Action Plan §0.5.1): `mapEntry` emits
+            // every one of these and `insertPlannedMealEntry` writes the last.
+            expect([...ENTRY_INPUT_METHODS]).toStrictEqual(['library', 'search', 'ai_text', 'ai_photo', 'meal_plan']);
+        });
+
+        it('accepts four of them from a request body, never the planned one', () => {
+            expect([...CLIENT_INPUT_METHODS]).toStrictEqual(['library', 'search', 'ai_text', 'ai_photo']);
+            expect(CLIENT_INPUT_METHODS).not.toContain(PLANNED_INPUT_METHOD);
+        });
+
+        it('falls back to a method a client could have asked for anyway', () => {
+            // 'library' is the column default and the value the legacy writer has
+            // always stored for an unrecognised method, so resolving to it adds no
+            // new wire value for an older client to decode.
+            expect(CLIENT_INPUT_METHODS).toContain(DEFAULT_INPUT_METHOD);
+            expect(DEFAULT_INPUT_METHOD).toBe('library');
+        });
+
+        it('resolves every stored method to itself except the one only the server writes', () => {
+            ENTRY_INPUT_METHODS.forEach((method) => {
+                expect(resolveLegacyInputMethod(method)).toBe(
+                    method === PLANNED_INPUT_METHOD ? DEFAULT_INPUT_METHOD : method,
+                );
             });
         });
     });

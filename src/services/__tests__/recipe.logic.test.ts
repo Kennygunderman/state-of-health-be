@@ -13,10 +13,18 @@
  * mobile "This adds" card disagreeing with the server.
  */
 
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
+// The closed sets come from the contract module that declares them, never from
+// literals repeated here: a suite that restated the nine icon keys, five badges
+// and four slots would keep passing after one of them was dropped or renamed.
+import { MEAL_SLOTS, RECIPE_BADGES, RECIPE_ICON_KEYS } from '../../types/recipe';
 import { UnitConversionError } from '../../utils/units';
 import {
     BUDGET_TIER_1_MAX_COST_SCORE,
     BUDGET_TIER_2_MAX_COST_SCORE,
+    CatalogIngredientVersions,
     deriveAllergenStatus,
     deriveAllergenTags,
     deriveBadges,
@@ -55,33 +63,262 @@ import {
 } from '../recipe.logic';
 
 /* ---------------------------------------------------------------------------
+ * The shared fixture graph
+ *
+ * `data/meal-planning/fixtures/catalog-foods.fixture.json` and
+ * `recipes.fixture.json` are the referentially closed pair the Agent Action
+ * Plan §0.3.3 commits: fixed uuid primary keys, fixed ISO-8601 timestamps, and
+ * snake_case ROWS rather than camelCase wire DTOs, so a row can be handed to
+ * `recipe.logic.ts` unmapped.
+ *
+ * Every food and recipe identity in this file is read from them, which is the
+ * point: the `catalog_food_id` a rule reads here is the same identity the
+ * planner, grocery and planned-log suites read, so an invariant that spans
+ * recipe -> plan -> grocery -> log can be asserted at all. Before this, each
+ * suite invented its own vocabulary and nothing joined them.
+ *
+ * Read off disk rather than transcribed — the convention
+ * `evidence.logic.test.ts` uses for the committed evidence policy — so a
+ * fixture correction changes what this suite asserts. Each accessor re-parses
+ * the document, so a case that mutates a row cannot leak into the next.
+ * ------------------------------------------------------------------------- */
+
+const FIXTURE_DIRECTORY = join(__dirname, '..', '..', '..', 'data', 'meal-planning', 'fixtures');
+
+const CATALOG_FOODS_JSON = readFileSync(join(FIXTURE_DIRECTORY, 'catalog-foods.fixture.json'), 'utf8');
+const RECIPES_JSON = readFileSync(join(FIXTURE_DIRECTORY, 'recipes.fixture.json'), 'utf8');
+
+/**
+ * The `catalog_foods` columns this suite reads. The fixture row carries the
+ * whole table plus a `note`; only what a recipe rule consults is typed, so a
+ * column this suite does not depend on cannot silently become a dependency.
+ */
+interface FixtureCatalogFood {
+    id: string;
+    source_key: string;
+    display_name: string;
+    food_state: string;
+    food_group: string;
+    nutrition_version: number;
+    metadata_version: number;
+    publication_status: string;
+    nutrition_basis: string;
+    density_g_per_ml: number | null;
+    allergen_status: 'known' | 'unknown';
+    cost_class: number;
+}
+
+/** The `recipe_versions` columns, plus the fixture's `derived_reference` block. */
+interface FixtureRecipeVersion {
+    id: string;
+    recipe_id: string;
+    recipe_slug: string;
+    version: number;
+    name: string;
+    icon_key: string;
+    yield_servings: number;
+    serving_description: string;
+    prep_minutes: number;
+    cook_minutes: number;
+    total_minutes: number;
+    meal_slots: string[];
+    diet_tags: string[];
+    allergen_tags: string[];
+    allergen_status: 'known' | 'unknown';
+    budget_tier: number;
+    badges: string[];
+    nutrition_provenance: RecipePublicationIngredient['snapshot_provenance'];
+    per_serving_calories: number;
+    per_serving_protein_g: number;
+    per_serving_carbs_g: number;
+    per_serving_fat_g: number;
+    sourced_calories_note: string | null;
+    status: 'current' | 'retired';
+    derived_reference: {
+        per_serving_fiber_g: number | null;
+        cost_score: number;
+        calorie_divergence: number | null;
+    };
+}
+
+/**
+ * A `recipe_ingredients` row. `resolved_catalog_facts` is the fixture's one
+ * documented non-column field on these rows: the `catalog_foods` facts the
+ * table does not snapshot but `RecipePublicationIngredient` requires.
+ */
+interface FixtureRecipeIngredient {
+    id: string;
+    recipe_version_id: string;
+    food_source_key: string;
+    catalog_food_id: string;
+    catalog_nutrition_version: number;
+    catalog_metadata_version: number;
+    snapshot_per_100g: { calories: number; protein_g: number; carbs_g: number; fat_g: number; fiber_g?: number | null };
+    snapshot_name: string;
+    snapshot_provenance: RecipePublicationIngredient['snapshot_provenance'];
+    snapshot_allergen_tags: string[];
+    snapshot_diet_tags: string[];
+    quantity: number;
+    unit: string;
+    gram_weight: number;
+    display_text: string;
+    sort_order: number;
+    is_optional: boolean;
+    resolved_catalog_facts: {
+        allergen_status: 'known' | 'unknown';
+        cost_class: number;
+        food_group: string;
+        nutrition_basis: 'per_100g' | 'per_100ml';
+        density_g_per_ml: number | null;
+        publication_status: string;
+    };
+}
+
+interface CatalogFixtureDocument {
+    counts: { foods: number; published_foods: number };
+    foods: FixtureCatalogFood[];
+}
+
+interface RecipeFixtureDocument {
+    counts: { recipes: number; recipe_versions: number; recipe_ingredients: number; plannable_versions: number };
+    recipes: { id: string; slug: string; current_version_id: string }[];
+    recipe_versions: FixtureRecipeVersion[];
+    recipe_ingredients: FixtureRecipeIngredient[];
+}
+
+const readCatalogFixture = (): CatalogFixtureDocument => JSON.parse(CATALOG_FOODS_JSON) as CatalogFixtureDocument;
+
+const readRecipeFixture = (): RecipeFixtureDocument => JSON.parse(RECIPES_JSON) as RecipeFixtureDocument;
+
+/** The catalog food with this `source_key`, or a failure naming the key. */
+const catalogFood = (sourceKey: string): FixtureCatalogFood => {
+    const food = readCatalogFixture().foods.find((row) => row.source_key === sourceKey);
+    if (!food) {
+        throw new Error(`catalog-foods.fixture.json carries no food with source_key ${sourceKey}`);
+    }
+
+    return food;
+};
+
+/** The `(slug, version)` recipe version, or a failure naming the pair. */
+const recipeVersionRow = (slug: string, version: number): FixtureRecipeVersion => {
+    const row = readRecipeFixture().recipe_versions.find(
+        (candidate) => candidate.recipe_slug === slug && candidate.version === version,
+    );
+    if (!row) {
+        throw new Error(`recipes.fixture.json carries no ${slug} v${version}`);
+    }
+
+    return row;
+};
+
+/**
+ * One `recipe_ingredients` row as the publication shape: the row's own columns
+ * plus the five resolved `catalog_foods` facts the fixture records beside it.
+ * Nothing is invented here — every value is the fixture's.
+ */
+const toPublicationIngredient = (row: FixtureRecipeIngredient): RecipePublicationIngredient => ({
+    catalog_food_id: row.catalog_food_id,
+    snapshot_name: row.snapshot_name,
+    snapshot_provenance: row.snapshot_provenance,
+    snapshot_allergen_tags: row.snapshot_allergen_tags,
+    snapshot_diet_tags: row.snapshot_diet_tags,
+    is_optional: row.is_optional,
+    food_group: row.resolved_catalog_facts.food_group,
+    allergen_status: row.resolved_catalog_facts.allergen_status,
+    catalog_nutrition_version: row.catalog_nutrition_version,
+    catalog_metadata_version: row.catalog_metadata_version,
+    snapshot_per_100g: row.snapshot_per_100g,
+    quantity: row.quantity,
+    unit: row.unit,
+    gram_weight: row.gram_weight,
+    display_text: row.display_text,
+    sort_order: row.sort_order,
+    nutrition_basis: row.resolved_catalog_facts.nutrition_basis,
+    density_g_per_ml: row.resolved_catalog_facts.density_g_per_ml,
+    cost_class: row.resolved_catalog_facts.cost_class,
+});
+
+/** Every ingredient of one fixture version, in the fixture's own row order. */
+const publicationIngredients = (slug: string, version: number): RecipePublicationIngredient[] => {
+    const versionId = recipeVersionRow(slug, version).id;
+    const rows = readRecipeFixture().recipe_ingredients.filter((row) => row.recipe_version_id === versionId);
+    if (rows.length === 0) {
+        throw new Error(`recipes.fixture.json carries no ingredients for ${slug} v${version}`);
+    }
+
+    return rows.map(toPublicationIngredient);
+};
+
+/** One named ingredient of one fixture version, by the food's stable source key. */
+const publicationIngredient = (
+    slug: string,
+    version: number,
+    foodSourceKey: string,
+): RecipePublicationIngredient => {
+    const versionId = recipeVersionRow(slug, version).id;
+    const row = readRecipeFixture().recipe_ingredients.find(
+        (candidate) => candidate.recipe_version_id === versionId && candidate.food_source_key === foodSourceKey,
+    );
+    if (!row) {
+        throw new Error(`${slug} v${version} has no ingredient for ${foodSourceKey}`);
+    }
+
+    return toPublicationIngredient(row);
+};
+
+/* ---------------------------------------------------------------------------
  * Factories — a reviewed, source-backed, untagged 100 g ingredient whose
  * numbers are round and whose 4/4/9 estimate (98 kcal) sits inside the 5 %
  * disclosure threshold, so the baseline carries no note and earns only the
  * badge its composition genuinely supports (`dairy_free`).
+ *
+ * Its IDENTITY is the fixture's — cooked brown rice, `usda:9200104`, as
+ * `soy-glazed-chicken-and-rice-bowl` v1 carries it — so every probe below runs
+ * against a food the catalog fixture really publishes, and the id it reports in
+ * an error or a mismatch is one the other three domain suites resolve too.
  * ------------------------------------------------------------------------- */
 
-const FOOD_A = '11111111-1111-4111-8111-111111111111';
-const FOOD_B = '22222222-2222-4222-8222-222222222222';
-const FOOD_C = '33333333-3333-4333-8333-333333333333';
+const COOKED_BROWN_RICE = publicationIngredient('soy-glazed-chicken-and-rice-bowl', 1, 'usda:9200104');
+
+/**
+ * The three foods the focused probes need to tell apart, all fixture rows. The
+ * ordering probes below turn on their ids sorting A < B < C, which the fixture's
+ * counter-encoded uuids give: `…0004` (cooked brown rice) < `…000b` (spinach) <
+ * `…000c` (kale).
+ */
+const FOOD_A = COOKED_BROWN_RICE.catalog_food_id;
+const FOOD_B = catalogFood('usda:9200111').id;
+const FOOD_C = catalogFood('usda:9200112').id;
+
+/**
+ * What the baseline overrides on that row, and why each is a deliberate local
+ * override rather than fixture drift:
+ *
+ *  - `snapshot_per_100g` and the quantity trio: 100 g of a 100 kcal /
+ *    5 / 15 / 2 / 1 food, so each arithmetic probe reads as the boundary it was
+ *    written to pin instead of as a rounding accident. Whether the fixture's
+ *    real numbers reproduce is asserted separately, for all ten committed
+ *    versions, under "the committed recipe graph" at the end of this file.
+ *  - `snapshot_diet_tags`: emptied. The diet-intersection and badge probes need
+ *    a baseline that earns no diet tag; the fixture row carries the four tags
+ *    cooked brown rice genuinely has, and the fixture-derived section asserts
+ *    those.
+ *  - `food_group`: dropped, because `recipe_ingredients` does not snapshot it —
+ *    the planner's service resolves it — and one dislike probe asserts exactly
+ *    the unresolved case.
+ */
+const { food_group: _unresolvedGroup, ...COOKED_BROWN_RICE_IDENTITY } = COOKED_BROWN_RICE;
 
 const makeIngredient = (overrides: Partial<RecipePublicationIngredient> = {}): RecipePublicationIngredient => ({
-    catalog_food_id: FOOD_A,
-    snapshot_name: 'Brown rice, cooked',
-    snapshot_provenance: 'source_backed',
-    snapshot_allergen_tags: [],
+    ...COOKED_BROWN_RICE_IDENTITY,
     snapshot_diet_tags: [],
-    is_optional: false,
-    allergen_status: 'known',
-    catalog_nutrition_version: 1,
-    catalog_metadata_version: 1,
     snapshot_per_100g: { calories: 100, protein_g: 5, carbs_g: 15, fat_g: 2, fiber_g: 1 },
     quantity: 1,
     unit: 'cup',
     gram_weight: 100,
     display_text: '1 cup',
     sort_order: 0,
-    cost_class: 1,
     ...overrides,
 });
 
@@ -144,44 +381,136 @@ const reasonFor = (
  * Closed sets
  * ------------------------------------------------------------------------- */
 
+/*
+ * The three families are CLOSED WIRE CONTRACTS and this module is their only
+ * runtime enforcement point: the columns are plain TEXT and the mobile codecs
+ * decode them leniently (an unknown iconKey falls back to a glyph, an unknown
+ * badge is dropped). Sampling a few members would let a dropped or misspelled
+ * value pass here and surface as a wrong glyph or a silently missing badge, so
+ * each family is pinned member by member against the authoritative array, and
+ * the array itself is pinned against the literal contract.
+ */
+const NON_STRING_VALUES: readonly unknown[] = [undefined, null, 7, true, {}, [], () => 'bowl'];
+
+/** Prototype members that would pass a `value in object` style membership test. */
+const INHERITED_KEYS: readonly string[] = ['constructor', '__proto__', 'toString', 'hasOwnProperty'];
+
 describe('closed-set guards', () => {
     describe('isRecipeIconKey', () => {
-        it('accepts every declared key', () => {
-            expect(isRecipeIconKey('bowl')).toBe(true);
-            expect(isRecipeIconKey('cloche')).toBe(true);
-            expect(isRecipeIconKey('bowl_dash')).toBe(true);
+        it('pins the nine icon keys, so dropping or renaming one fails here', () => {
+            expect([...RECIPE_ICON_KEYS]).toEqual([
+                'crosshair',
+                'fork_knife',
+                'bowl',
+                'wrap',
+                'dome',
+                'salad',
+                'bowl_dash',
+                'pot',
+                'cloche',
+            ]);
+            expect(new Set(RECIPE_ICON_KEYS).size).toBe(RECIPE_ICON_KEYS.length);
         });
 
-        it('rejects an unknown key so the seed fails instead of shipping the wrong glyph', () => {
-            expect(isRecipeIconKey('pan')).toBe(false);
-            expect(isRecipeIconKey('Bowl')).toBe(false);
+        it.each([...RECIPE_ICON_KEYS])('accepts the declared key %s', (key) => {
+            expect(isRecipeIconKey(key)).toBe(true);
         });
 
-        it('rejects non-strings and inherited object keys', () => {
-            expect(isRecipeIconKey(undefined)).toBe(false);
-            expect(isRecipeIconKey(null)).toBe(false);
-            expect(isRecipeIconKey(7)).toBe(false);
-            expect(isRecipeIconKey({})).toBe(false);
-            expect(isRecipeIconKey('constructor')).toBe(false);
-            expect(isRecipeIconKey('__proto__')).toBe(false);
+        it.each([
+            'pan',
+            'Bowl',
+            'BOWL',
+            'bowl_dashed',
+            'bowl-dash',
+            'forkknife',
+            'fork-knife',
+            'clochee',
+            'cloch',
+            ' bowl',
+            'bowl ',
+            '',
+        ])('rejects the near miss %p so the seed fails instead of shipping the wrong glyph', (key) => {
+            expect(isRecipeIconKey(key)).toBe(false);
+        });
+
+        it.each([...MEAL_SLOTS, ...RECIPE_BADGES])('rejects %s, which belongs to another family', (value) => {
+            expect(isRecipeIconKey(value)).toBe(false);
+        });
+
+        it.each([...NON_STRING_VALUES, ...INHERITED_KEYS])('rejects the non-member %p', (value) => {
+            expect(isRecipeIconKey(value)).toBe(false);
         });
     });
 
     describe('isMealSlot', () => {
-        it('accepts the four slots and rejects anything else', () => {
-            expect(isMealSlot('breakfast')).toBe(true);
-            expect(isMealSlot('snack')).toBe(true);
-            expect(isMealSlot('brunch')).toBe(false);
-            expect(isMealSlot(null)).toBe(false);
+        it('pins the four slots in schedule order', () => {
+            expect([...MEAL_SLOTS]).toEqual(['breakfast', 'lunch', 'dinner', 'snack']);
+            expect(new Set(MEAL_SLOTS).size).toBe(MEAL_SLOTS.length);
+        });
+
+        it.each([...MEAL_SLOTS])('accepts the declared slot %s', (slot) => {
+            expect(isMealSlot(slot)).toBe(true);
+        });
+
+        it.each([
+            'brunch',
+            'Snack',
+            'SNACK',
+            'snacks',
+            'breakfasts',
+            'break fast',
+            'break_fast',
+            ' lunch',
+            'lunch ',
+            '',
+        ])('rejects the near miss %p', (slot) => {
+            expect(isMealSlot(slot)).toBe(false);
+        });
+
+        it.each([...RECIPE_ICON_KEYS, ...RECIPE_BADGES])('rejects %s, which belongs to another family', (value) => {
+            expect(isMealSlot(value)).toBe(false);
+        });
+
+        it.each([...NON_STRING_VALUES, ...INHERITED_KEYS])('rejects the non-member %p', (value) => {
+            expect(isMealSlot(value)).toBe(false);
         });
     });
 
     describe('isRecipeBadge', () => {
-        it('accepts the five codes and rejects anything else', () => {
-            expect(isRecipeBadge('high_protein')).toBe(true);
-            expect(isRecipeBadge('quick')).toBe(true);
-            expect(isRecipeBadge('keto')).toBe(false);
-            expect(isRecipeBadge(3)).toBe(false);
+        it('pins the five badge codes in the order the badges are rendered', () => {
+            expect([...RECIPE_BADGES]).toEqual(['high_protein', 'gluten_free', 'dairy_free', 'vegan', 'quick']);
+            expect(new Set(RECIPE_BADGES).size).toBe(RECIPE_BADGES.length);
+        });
+
+        it.each([...RECIPE_BADGES])('accepts the declared code %s', (badge) => {
+            expect(isRecipeBadge(badge)).toBe(true);
+        });
+
+        it.each([
+            'keto',
+            'Quick',
+            'QUICK',
+            'high protein',
+            'high-protein',
+            'highprotein',
+            'glutenfree',
+            'gluten-free',
+            'dairyfree',
+            'vegetarian',
+            'pescatarian',
+            ' vegan',
+            'vegan ',
+            '',
+        ])('rejects the near miss %p, which the mobile converter would silently drop', (badge) => {
+            expect(isRecipeBadge(badge)).toBe(false);
+        });
+
+        it.each([...RECIPE_ICON_KEYS, ...MEAL_SLOTS])('rejects %s, which belongs to another family', (value) => {
+            expect(isRecipeBadge(value)).toBe(false);
+        });
+
+        it.each([...NON_STRING_VALUES, ...INHERITED_KEYS])('rejects the non-member %p', (value) => {
+            expect(isRecipeBadge(value)).toBe(false);
         });
     });
 
@@ -263,7 +592,7 @@ describe('findStaleIngredients', () => {
         expect(both[0].changed).toEqual(['nutrition', 'metadata']);
         expect(both[0]).toMatchObject({
             catalogFoodId: FOOD_A,
-            name: 'Brown rice, cooked',
+            name: 'Brown rice',
             snapshotNutritionVersion: 1,
             snapshotMetadataVersion: 1,
             currentNutritionVersion: 2,
@@ -442,7 +771,7 @@ describe('deriveRecipeNutrition', () => {
             );
 
             expect(error.field).toBe('gram_weight');
-            expect(error.ingredient).toBe('Brown rice, cooked');
+            expect(error.ingredient).toBe('Brown rice');
             expect(() => deriveRecipeNutrition([makeIngredient({ gram_weight: -5 })], 1)).toThrow(
                 RecipeDerivationError,
             );
@@ -685,6 +1014,79 @@ describe('deriveDietTags', () => {
 
         expect(tags).toEqual(['pescatarian', 'vegetarian']);
         expect(tags).not.toContain('vegan');
+    });
+
+    /*
+     * The hierarchy has to be applied to EACH ingredient before the sets are
+     * intersected. Closing only the survivors of a raw intersection loses a
+     * claim every ingredient satisfies, which excluded valid recipes and could
+     * make a guaranteed diet profile report no matching meals.
+     */
+    describe('mixed ingredients across the hierarchy', () => {
+        const rice = makeIngredient({ snapshot_name: 'Brown rice, cooked', snapshot_diet_tags: ['vegan'] });
+        const halloumi = makeIngredient({
+            catalog_food_id: FOOD_B,
+            sort_order: 1,
+            snapshot_name: 'Halloumi',
+            snapshot_diet_tags: ['vegetarian'],
+        });
+        const salmon = makeIngredient({
+            catalog_food_id: FOOD_C,
+            sort_order: 2,
+            snapshot_name: 'Salmon fillet',
+            snapshot_diet_tags: ['pescatarian'],
+        });
+
+        it('keeps vegetarian and pescatarian for a vegan ingredient beside a vegetarian one', () => {
+            const tags = deriveDietTags([rice, halloumi]);
+
+            expect(tags).toEqual(['pescatarian', 'vegetarian']);
+            expect(tags).not.toContain('vegan');
+        });
+
+        it('keeps pescatarian for a vegan ingredient beside a pescatarian-only fish', () => {
+            expect(deriveDietTags([rice, salmon])).toEqual(['pescatarian']);
+        });
+
+        it('keeps pescatarian for a vegetarian ingredient beside a pescatarian-only fish', () => {
+            expect(deriveDietTags([halloumi, salmon])).toEqual(['pescatarian']);
+        });
+
+        it('narrows to the weakest claim across all three', () => {
+            expect(deriveDietTags([rice, halloumi, salmon])).toEqual(['pescatarian']);
+        });
+
+        it('does not depend on the order the ingredient rows arrived in', () => {
+            expect(deriveDietTags([halloumi, rice])).toEqual(deriveDietTags([rice, halloumi]));
+            expect(deriveDietTags([salmon, rice, halloumi])).toEqual(deriveDietTags([rice, halloumi, salmon]));
+        });
+
+        it('expands through spelling variants too', () => {
+            const tags = deriveDietTags([
+                makeIngredient({ snapshot_diet_tags: ['Vegan'] }),
+                makeIngredient({ catalog_food_id: FOOD_B, sort_order: 1, snapshot_diet_tags: ['Vegetarian'] }),
+            ]);
+
+            expect(isDietCompatible('vegetarian', tags)).toBe(true);
+            expect(isDietCompatible('pescatarian', tags)).toBe(true);
+            expect(isDietCompatible('vegan', tags)).toBe(false);
+        });
+
+        it('implies nothing for a tag outside the hierarchy', () => {
+            const tags = deriveDietTags([
+                makeIngredient({ snapshot_diet_tags: ['vegan', 'gluten_free'] }),
+                halloumi,
+            ]);
+
+            expect(tags).toEqual(['pescatarian', 'vegetarian']);
+            expect(tags).not.toContain('gluten_free');
+        });
+
+        it('still drops every claim when one ingredient carries none', () => {
+            expect(deriveDietTags([rice, halloumi, makeIngredient({ catalog_food_id: FOOD_C, sort_order: 3 })])).toEqual(
+                [],
+            );
+        });
     });
 
     it('leaves a pescatarian-only dish pescatarian', () => {
@@ -1043,7 +1445,7 @@ describe('scaleIngredients', () => {
         expect(scaleIngredients([makeIngredient()], 'full', 4)).toEqual([
             {
                 catalogFoodId: FOOD_A,
-                name: 'Brown rice, cooked',
+                name: 'Brown rice',
                 quantity: 1,
                 unit: 'cup',
                 gramWeight: 100,
@@ -1271,10 +1673,74 @@ describe('evaluatePlanningEligibility', () => {
             expect(reasonFor(recipe, makePreferences(), 'allergen_status')?.detail).toEqual(['Unlabelled spice mix']);
         });
 
-        it('falls back to the recipe rollup when the caller supplied no per-ingredient review', () => {
+        it('refuses an ingredient carrying NO review, whatever the recipe rollup claims, and names it', () => {
+            // The rollup says `known` and the ingredient says nothing at all.
+            // A summary cannot vouch for evidence nobody supplied, so the
+            // absence is a refusal — never a fallback to the rollup.
             const recipe = makeRecipe({ ingredients: [withoutAllergenStatus(makeIngredient())] });
 
-            expect(codesOf(recipe, makePreferences())).toEqual([]);
+            expect(codesOf(recipe, makePreferences())).toEqual(['allergen_status']);
+            expect(reasonFor(recipe, makePreferences(), 'allergen_status')?.detail).toEqual(['Brown rice']);
+            expect(isEligibleForPlanning(recipe, makePreferences(), 'lunch')).toBe(false);
+        });
+
+        it('refuses an OPTIONAL ingredient carrying no review — optional is still on the plate', () => {
+            const recipe = makeRecipe({
+                ingredients: [
+                    makeIngredient(),
+                    withoutAllergenStatus(
+                        makeIngredient({
+                            catalog_food_id: FOOD_B,
+                            sort_order: 1,
+                            is_optional: true,
+                            snapshot_name: 'Garnish, unreviewed',
+                        }),
+                    ),
+                ],
+            });
+
+            expect(reasonFor(recipe, makePreferences(), 'allergen_status')?.detail).toEqual(['Garnish, unreviewed']);
+        });
+
+        it('names every unreviewed ingredient, whether it said unknown or said nothing', () => {
+            const recipe = makeRecipe({
+                ingredients: [
+                    makeIngredient(),
+                    makeIngredient({
+                        catalog_food_id: FOOD_B,
+                        sort_order: 1,
+                        snapshot_name: 'Mystery stock',
+                        allergen_status: 'unknown',
+                    }),
+                    withoutAllergenStatus(
+                        makeIngredient({ catalog_food_id: FOOD_C, sort_order: 2, snapshot_name: 'Unlabelled paste' }),
+                    ),
+                ],
+            });
+
+            expect(reasonFor(recipe, makePreferences(), 'allergen_status')?.detail).toEqual([
+                'Mystery stock',
+                'Unlabelled paste',
+            ]);
+        });
+
+        it('refuses an empty ingredient set, where nothing has been reviewed at all', () => {
+            const recipe = makeRecipe({ ingredients: [] });
+
+            expect(codesOf(recipe, makePreferences())).toEqual(['allergen_status']);
+            expect(reasonFor(recipe, makePreferences(), 'allergen_status')?.detail).toEqual(['known']);
+        });
+
+        it('admits a recipe only when EVERY ingredient states known explicitly', () => {
+            const recipe = makeRecipe({
+                ingredients: [
+                    makeIngredient(),
+                    makeIngredient({ catalog_food_id: FOOD_B, sort_order: 1, is_optional: true }),
+                    makeIngredient({ catalog_food_id: FOOD_C, sort_order: 2 }),
+                ],
+            });
+
+            expect(codesOf(recipe, makePreferences(), 'lunch')).toEqual([]);
         });
     });
 
@@ -1331,6 +1797,45 @@ describe('evaluatePlanningEligibility', () => {
             expect(codesOf(veganRecipe, makePreferences({ diet: 'pescatarian' }))).toEqual([]);
         });
 
+        it('admits a MIXED vegan-and-vegetarian recipe for a vegetarian and a pescatarian', () => {
+            // Both ingredients are vegetarian — the rice by implication, the
+            // halloumi by declaration — so refusing this recipe would exclude a
+            // valid meal from a vegetarian's week.
+            const mixed = makeRecipe({
+                ingredients: [
+                    makeIngredient({ snapshot_diet_tags: ['vegan'] }),
+                    makeIngredient({
+                        catalog_food_id: FOOD_B,
+                        sort_order: 1,
+                        snapshot_name: 'Halloumi',
+                        snapshot_diet_tags: ['vegetarian'],
+                    }),
+                ],
+            });
+
+            expect(codesOf(mixed, makePreferences({ diet: 'vegetarian' }))).toEqual([]);
+            expect(codesOf(mixed, makePreferences({ diet: 'pescatarian' }))).toEqual([]);
+            expect(codesOf(mixed, makePreferences({ diet: 'vegan' }))).toEqual(['diet']);
+        });
+
+        it('admits a vegan-and-fish recipe for a pescatarian only', () => {
+            const withFish = makeRecipe({
+                ingredients: [
+                    makeIngredient({ snapshot_diet_tags: ['vegan'] }),
+                    makeIngredient({
+                        catalog_food_id: FOOD_B,
+                        sort_order: 1,
+                        snapshot_name: 'Salmon fillet',
+                        snapshot_diet_tags: ['pescatarian'],
+                    }),
+                ],
+            });
+
+            expect(codesOf(withFish, makePreferences({ diet: 'pescatarian' }))).toEqual([]);
+            expect(codesOf(withFish, makePreferences({ diet: 'vegetarian' }))).toEqual(['diet']);
+            expect(codesOf(withFish, makePreferences({ diet: 'vegan' }))).toEqual(['diet']);
+        });
+
         it('admits everything for none or an unanswered diet', () => {
             expect(codesOf(makeRecipe(), makePreferences({ diet: 'none' }))).toEqual([]);
             expect(codesOf(makeRecipe(), makePreferences({ diet: null }))).toEqual([]);
@@ -1341,7 +1846,7 @@ describe('evaluatePlanningEligibility', () => {
         it('refuses a disliked food by id', () => {
             expect(
                 reasonFor(makeRecipe(), makePreferences({ disliked_food_ids: [FOOD_A] }), 'dislike')?.detail,
-            ).toEqual(['Brown rice, cooked']);
+            ).toEqual(['Brown rice']);
         });
 
         it('refuses a disliked FOOD GROUP, which is what makes one mushroom exclude them all', () => {
@@ -1514,8 +2019,8 @@ describe('validateRecipeDeclaration', () => {
             const [mismatch] = mismatchCodes({ badges: ['dairy_free', 'vegan'] });
 
             expect(mismatch).toMatchObject({ field: 'badges', code: 'unsupported', declared: 'vegan' });
-            expect(mismatch.ingredients).toEqual(['Brown rice, cooked']);
-            expect(mismatch.message).toContain('Brown rice, cooked');
+            expect(mismatch.ingredients).toEqual(['Brown rice']);
+            expect(mismatch.message).toContain('Brown rice');
         });
 
         it('reports a derived badge the file omitted', () => {
@@ -1624,7 +2129,24 @@ describe('validateRecipeDeclaration', () => {
             const [mismatch] = mismatchCodes({ diet_tags: ['vegan'] });
 
             expect(mismatch).toMatchObject({ field: 'diet_tags', code: 'unsupported', declared: 'vegan' });
-            expect(mismatch.ingredients).toEqual(['Brown rice, cooked']);
+            expect(mismatch.ingredients).toEqual(['Brown rice']);
+        });
+
+        it('names only the ingredient that genuinely lacks the claim, hierarchy included', () => {
+            // The vegan-tagged rice IS vegetarian by implication, so the
+            // blocker list must name the untagged stock alone — the same
+            // hierarchy the derivation applies, or the verdict and its
+            // explanation would contradict each other.
+            const mismatches = mismatchCodes({ diet_tags: ['vegetarian'] }, [
+                makeIngredient({ snapshot_diet_tags: ['vegan'] }),
+                makeIngredient({ catalog_food_id: FOOD_B, sort_order: 1, snapshot_name: 'Mystery stock' }),
+            ]);
+            const mismatch = mismatches.find(
+                (entry) => entry.field === 'diet_tags' && entry.declared === 'vegetarian',
+            );
+
+            expect(mismatch).toMatchObject({ code: 'unsupported' });
+            expect(mismatch?.ingredients).toEqual(['Mystery stock']);
         });
 
         it('reports derived diet tags the file omitted', () => {
@@ -1694,5 +2216,457 @@ describe('validateRecipeDeclaration', () => {
 
         expect(verdict.valid).toBe(false);
         expect(verdict.derived.totalMinutes).toBe(25);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The committed recipe graph
+ *
+ * Everything above pins one rule at a time with a focused fixture. This section
+ * runs the same rules over the WHOLE committed graph — all ten
+ * `recipe_versions` rows and their forty-two `recipe_ingredients` rows — and
+ * that is a different kind of test: the fixture states what each version's
+ * columns are, and these assertions require the derivation to reproduce them
+ * from the ingredient rows alone.
+ *
+ * That is the invariant a per-rule probe cannot reach, because a probe supplies
+ * its own inputs and its own answer. Here the fixture supplies both, the rows
+ * are shared with the planner, grocery and planned-log suites, and a derivation
+ * that drifted would have to drift in agreement with a document nothing else in
+ * the build can edit.
+ * ------------------------------------------------------------------------- */
+
+/** Every committed version, as the `(slug, version)` pair the accessors take. */
+const COMMITTED_VERSIONS: [string, number][] = readRecipeFixture().recipe_versions.map((version) => [
+    version.recipe_slug,
+    version.version,
+]);
+
+/** The declared columns of one version, as `validateRecipeDeclaration` reads them. */
+const declarationOf = (version: FixtureRecipeVersion): RecipeDeclaration => ({
+    icon_key: version.icon_key,
+    meal_slots: version.meal_slots,
+    badges: version.badges,
+    diet_tags: version.diet_tags,
+    allergen_tags: version.allergen_tags,
+    prep_minutes: version.prep_minutes,
+    cook_minutes: version.cook_minutes,
+    yield_servings: version.yield_servings,
+    total_minutes: version.total_minutes,
+    allergen_status: version.allergen_status,
+    nutrition_provenance: version.nutrition_provenance,
+    budget_tier: version.budget_tier,
+});
+
+/** One version as the planning shape, with its own ingredient rows. */
+const planningVersionOf = (version: FixtureRecipeVersion): PlanningRecipeVersion => ({
+    status: version.status,
+    nutrition_provenance: version.nutrition_provenance,
+    allergen_status: version.allergen_status,
+    total_minutes: version.total_minutes,
+    meal_slots: version.meal_slots,
+    ingredients: publicationIngredients(version.recipe_slug, version.version),
+});
+
+describe('the committed recipe graph', () => {
+    it('is closed: every ingredient resolves to a catalog food, by id and by source key', () => {
+        const foodsBySourceKey = new Map(readCatalogFixture().foods.map((food) => [food.source_key, food]));
+        const recipeFixture = readRecipeFixture();
+
+        expect(recipeFixture.recipe_ingredients).toHaveLength(recipeFixture.counts.recipe_ingredients);
+        expect(recipeFixture.recipe_versions).toHaveLength(recipeFixture.counts.recipe_versions);
+
+        for (const row of recipeFixture.recipe_ingredients) {
+            const food = foodsBySourceKey.get(row.food_source_key);
+
+            // Both directions: the source key the seed resolves must name a
+            // committed food, and the id it cached must be that food's id. A
+            // fixture where the two disagree would let a "closed" graph point a
+            // recipe at one food and a grocery row at another.
+            expect(food).toBeDefined();
+            expect(row.catalog_food_id).toBe(food?.id);
+        }
+    });
+
+    it('holds exactly one current version per recipe, with the retired one still readable', () => {
+        const { recipes, recipe_versions: versions } = readRecipeFixture();
+
+        for (const recipe of recipes) {
+            const own = versions.filter((version) => version.recipe_id === recipe.id);
+            const current = own.filter((version) => version.status === 'current');
+
+            expect(current).toHaveLength(1);
+            expect(recipe.current_version_id).toBe(current[0].id);
+        }
+
+        const retired = versions.filter((version) => version.status === 'retired');
+
+        expect(retired.map((version) => `${version.recipe_slug}:${version.version}`)).toEqual([
+            'lemon-herb-chicken-and-rice:1',
+        ]);
+        expect(publicationIngredients('lemon-herb-chicken-and-rice', 1)).not.toHaveLength(0);
+    });
+
+    describe.each(COMMITTED_VERSIONS)('%s v%i', (slug, versionNumber) => {
+        const version = recipeVersionRow(slug, versionNumber);
+        const ingredients = publicationIngredients(slug, versionNumber);
+
+        it('reproduces its four stored per-serving macros from the ingredient rows', () => {
+            const derived = deriveRecipeNutrition(ingredients, version.yield_servings);
+
+            expect(derived.perServing.calories).toBeCloseTo(version.per_serving_calories, 9);
+            expect(derived.perServing.protein).toBeCloseTo(version.per_serving_protein_g, 9);
+            expect(derived.perServing.carbs).toBeCloseTo(version.per_serving_carbs_g, 9);
+            expect(derived.perServing.fat).toBeCloseTo(version.per_serving_fat_g, 9);
+        });
+
+        it('reproduces its recorded fibre, divergence and disclosure note', () => {
+            const derived = deriveRecipeNutrition(ingredients, version.yield_servings);
+            const { per_serving_fiber_g: fiber, calorie_divergence: divergence } = version.derived_reference;
+
+            if (fiber === null) {
+                expect(derived.perServingFiber).toBeNull();
+            } else {
+                expect(derived.perServingFiber).toBeCloseTo(fiber, 9);
+            }
+
+            if (divergence === null) {
+                expect(derived.calorieDivergence).toBeNull();
+            } else {
+                expect(derived.calorieDivergence).toBeCloseTo(divergence, 9);
+            }
+
+            expect(derived.sourcedCaloriesNote).toBe(version.sourced_calories_note);
+        });
+
+        it('reproduces its recorded cost score and the tier cut from it', () => {
+            const costScore = deriveCostScore(ingredients);
+
+            expect(costScore).toBeCloseTo(version.derived_reference.cost_score, 9);
+            expect(deriveBudgetTier(costScore)).toBe(version.budget_tier);
+        });
+
+        it('declares nothing its composition does not support', () => {
+            const verdict = validateRecipeDeclaration(declarationOf(version), ingredients);
+
+            expect(verdict.mismatches).toEqual([]);
+            expect(verdict.valid).toBe(true);
+        });
+
+        it('derives the tag, status, provenance and badge columns it stores', () => {
+            const derived = deriveRecipeVersionFields(
+                ingredients,
+                version.yield_servings,
+                version.prep_minutes,
+                version.cook_minutes,
+            );
+
+            expect(derived.totalMinutes).toBe(version.total_minutes);
+            expect(derived.dietTags).toEqual(version.diet_tags);
+            expect(derived.allergenTags).toEqual(version.allergen_tags);
+            expect(derived.allergenStatus).toBe(version.allergen_status);
+            expect(derived.nutritionProvenance).toBe(version.nutrition_provenance);
+            expect(derived.badges).toEqual(version.badges);
+        });
+    });
+
+    describe('planning eligibility across the graph', () => {
+        /**
+         * The fixture is built so that exactly three current versions fail one
+         * planning fact each and the retired one fails `status`. Stated as a
+         * table rather than derived from the rows, so a version that quietly
+         * became plannable — or stopped being — fails here.
+         */
+        const EXPECTED_REFUSALS: [string, number, PlanningEligibilityCode[]][] = [
+            ['lemon-herb-chicken-and-rice', 1, ['status']],
+            ['lemon-herb-chicken-and-rice', 2, []],
+            ['spinach-egg-white-scramble', 1, []],
+            ['lentil-and-kale-stew', 1, []],
+            ['soy-glazed-chicken-and-rice-bowl', 1, []],
+            ['herbed-yogurt-and-kale-dip-plate', 1, []],
+            ['roasted-carrot-and-lentil-salad', 1, ['nutrition_provenance']],
+            ['lemon-dressed-spinach-salad', 1, ['nutrition_provenance']],
+            ['cracker-and-yogurt-snack-plate', 1, ['allergen_status']],
+            ['salmon-and-kale-plate', 1, []],
+        ];
+
+        it.each(EXPECTED_REFUSALS)('%s v%i refuses on exactly %j for an unrestricted user', (slug, versionNumber, codes) => {
+            const verdict = evaluatePlanningEligibility(
+                planningVersionOf(recipeVersionRow(slug, versionNumber)),
+                makePreferences(),
+                null,
+            );
+
+            expect(verdict.reasons.map((reason) => reason.code)).toEqual(codes);
+            expect(verdict.eligible).toBe(codes.length === 0);
+        });
+
+        it('leaves six of the ten versions plannable, which is what the fixture records', () => {
+            const plannable = COMMITTED_VERSIONS.filter(([slug, versionNumber]) =>
+                isEligibleForPlanning(planningVersionOf(recipeVersionRow(slug, versionNumber)), makePreferences()),
+            );
+
+            expect(plannable).toHaveLength(readRecipeFixture().counts.plannable_versions);
+            expect(plannable).toHaveLength(6);
+        });
+    });
+
+    describe('the per_100 ml ingredient', () => {
+        const SLUG = 'spinach-egg-white-scramble';
+
+        it('converts through the stored density, because millilitres are not grams', () => {
+            const version = recipeVersionRow(SLUG, 1);
+            const ingredients = publicationIngredients(SLUG, 1);
+            const milk = publicationIngredient(SLUG, 1, 'usda:9200110');
+
+            expect(milk.nutrition_basis).toBe('per_100ml');
+            expect(milk.density_g_per_ml).toBe(1.032);
+
+            const derived = deriveRecipeNutrition(ingredients, version.yield_servings);
+            const asIfGrams = deriveRecipeNutrition(
+                ingredients.map((ingredient) =>
+                    ingredient.catalog_food_id === milk.catalog_food_id
+                        ? { ...ingredient, nutrition_basis: 'per_100g' as const }
+                        : ingredient,
+                ),
+                version.yield_servings,
+            );
+
+            // The stored figure is only reproducible WITH the conversion, and
+            // the difference is exactly the density factor on the milk term —
+            // derived here from the row rather than quoted as a magic number.
+            expect(derived.perServing.calories).toBeCloseTo(version.per_serving_calories, 9);
+            expect(asIfGrams.perServing.calories - derived.perServing.calories).toBeCloseTo(
+                ((milk.snapshot_per_100g.calories * milk.gram_weight) / 100) *
+                    (1 - 1 / (milk.density_g_per_ml as number)) /
+                    version.yield_servings,
+                9,
+            );
+            expect(asIfGrams.perServing.calories).not.toBeCloseTo(version.per_serving_calories, 6);
+        });
+
+        it('refuses the same row with its density removed rather than reading ml as g', () => {
+            const ingredients = publicationIngredients(SLUG, 1).map((ingredient) =>
+                ingredient.nutrition_basis === 'per_100ml'
+                    ? { ...ingredient, density_g_per_ml: null }
+                    : ingredient,
+            );
+
+            expect(() => deriveRecipeNutrition(ingredients, 2)).toThrow(UnitConversionError);
+        });
+    });
+
+    describe('the deliberately stale ingredient snapshot', () => {
+        const SLUG = 'herbed-yogurt-and-kale-dip-plate';
+
+        /** The live catalog versions, read from the catalog fixture itself. */
+        const liveVersions = (): Map<string, CatalogIngredientVersions> =>
+            new Map(
+                readCatalogFixture().foods.map((food) => [
+                    food.id,
+                    {
+                        catalog_nutrition_version: food.nutrition_version,
+                        catalog_metadata_version: food.metadata_version,
+                    },
+                ]),
+            );
+
+        it('reports the yogurt as nutrition-stale against the live catalog row', () => {
+            const stale = findStaleIngredients(publicationIngredients(SLUG, 1), liveVersions());
+            const yogurt = catalogFood('usda:9200115');
+
+            expect(stale).toHaveLength(1);
+            expect(stale[0]).toMatchObject({
+                catalogFoodId: yogurt.id,
+                name: 'Greek yogurt, plain',
+                changed: ['nutrition'],
+                snapshotNutritionVersion: 1,
+                currentNutritionVersion: 2,
+                currentMetadataVersion: 1,
+            });
+            expect(isIngredientSnapshotStale(
+                { catalog_nutrition_version: 1, catalog_metadata_version: 1 },
+                { catalog_nutrition_version: yogurt.nutrition_version, catalog_metadata_version: yogurt.metadata_version },
+            )).toBe(true);
+        });
+
+        it('derives from the frozen snapshot and never from the live row', () => {
+            const version = recipeVersionRow(SLUG, 1);
+            const ingredients = publicationIngredients(SLUG, 1);
+            const yogurtRow = publicationIngredient(SLUG, 1, 'usda:9200115');
+            const live = catalogFood('usda:9200115');
+
+            // The fixture's whole point: the snapshot disagrees with the live
+            // row, so a derivation that joined to the catalog instead of
+            // reading the snapshot would produce a different number.
+            expect(yogurtRow.snapshot_per_100g.calories).not.toBe(live.nutrition_version);
+            expect(yogurtRow.snapshot_per_100g.calories).toBe(61);
+
+            const fromSnapshot = deriveRecipeNutrition(ingredients, version.yield_servings);
+            const asIfJoinedToLive = deriveRecipeNutrition(
+                ingredients.map((ingredient) =>
+                    ingredient.catalog_food_id === yogurtRow.catalog_food_id
+                        ? { ...ingredient, snapshot_per_100g: { ...ingredient.snapshot_per_100g, calories: 59 } }
+                        : ingredient,
+                ),
+                version.yield_servings,
+            );
+
+            expect(fromSnapshot.perServing.calories).toBeCloseTo(version.per_serving_calories, 9);
+            expect(asIfJoinedToLive.perServing.calories).not.toBeCloseTo(version.per_serving_calories, 6);
+        });
+
+        it('reports every other version as matching the live catalog', () => {
+            const matching = COMMITTED_VERSIONS.filter(
+                ([slug, versionNumber]) =>
+                    findStaleIngredients(publicationIngredients(slug, versionNumber), liveVersions()).length === 0,
+            );
+
+            // The two versions that point at the version-2 yogurt with a
+            // version-2 snapshot are current; only the frozen version-1
+            // snapshot is stale.
+            expect(matching).not.toContainEqual([SLUG, 1]);
+            expect(matching).toContainEqual(['roasted-carrot-and-lentil-salad', 1]);
+            expect(matching).toContainEqual(['cracker-and-yogurt-snack-plate', 1]);
+        });
+    });
+
+    describe('the optional ingredient', () => {
+        const SLUG = 'roasted-carrot-and-lentil-salad';
+
+        it('counts for the allergen union and for the diet intersection', () => {
+            const ingredients = publicationIngredients(SLUG, 1);
+            const required = ingredients.filter((ingredient) => !ingredient.is_optional);
+            const optional = ingredients.filter((ingredient) => ingredient.is_optional);
+
+            expect(optional).toHaveLength(1);
+            expect(optional[0].snapshot_name).toBe('Greek yogurt, plain');
+
+            expect(deriveAllergenTags(ingredients)).toContain('milk');
+            expect(deriveAllergenTags(required)).not.toContain('milk');
+            expect(deriveDietTags(ingredients)).not.toContain('vegan');
+            expect(deriveDietTags(required)).toContain('vegan');
+        });
+
+        it('counts for the nutrition totals too, so a plate is not understated', () => {
+            const version = recipeVersionRow(SLUG, 1);
+            const ingredients = publicationIngredients(SLUG, 1);
+            const required = ingredients.filter((ingredient) => !ingredient.is_optional);
+
+            expect(deriveRecipeNutrition(ingredients, version.yield_servings).perServing.calories).toBeCloseTo(
+                version.per_serving_calories,
+                9,
+            );
+            expect(deriveRecipeNutrition(required, version.yield_servings).perServing.calories).toBeLessThan(
+                version.per_serving_calories,
+            );
+        });
+    });
+
+    it('keeps a retired catalog food referenceable by the historical version that used it', () => {
+        const couscous = publicationIngredient('lemon-herb-chicken-and-rice', 1, 'usda:9200119');
+        const version = recipeVersionRow('lemon-herb-chicken-and-rice', 1);
+
+        expect(catalogFood('usda:9200119').publication_status).toBe('retired');
+        expect(couscous.catalog_food_id).toBe(catalogFood('usda:9200119').id);
+
+        // A retired food is out of search and out of new eligibility, but the
+        // plan and diary rows that already point at this version must still
+        // resolve — so its derivation has to keep working.
+        expect(deriveRecipeNutrition(publicationIngredients('lemon-herb-chicken-and-rice', 1), version.yield_servings)
+            .perServing.calories).toBeCloseTo(version.per_serving_calories, 9);
+        expect(publicationIngredients('lemon-herb-chicken-and-rice', 2).map((row) => row.catalog_food_id)).not.toContain(
+            couscous.catalog_food_id,
+        );
+    });
+
+    it('propagates an unknown fibre instead of summing it as zero', () => {
+        const version = recipeVersionRow('soy-glazed-chicken-and-rice-bowl', 1);
+        const ingredients = publicationIngredients('soy-glazed-chicken-and-rice-bowl', 1);
+        const soySauce = publicationIngredient('soy-glazed-chicken-and-rice-bowl', 1, 'usda:9200113');
+
+        expect(soySauce.snapshot_per_100g.fiber_g).toBeNull();
+        expect(version.derived_reference.per_serving_fiber_g).toBeNull();
+        expect(deriveRecipeNutrition(ingredients, version.yield_servings).perServingFiber).toBeNull();
+    });
+
+    it('discloses the one version whose sourced energy diverges by more than 5 %', () => {
+        const version = recipeVersionRow('lemon-dressed-spinach-salad', 1);
+        const derived = deriveRecipeNutrition(
+            publicationIngredients('lemon-dressed-spinach-salad', 1),
+            version.yield_servings,
+        );
+
+        expect(derived.calorieDivergence).toBeGreaterThan(SOURCED_CALORIE_DIVERGENCE_THRESHOLD);
+        expect(derived.sourcedCaloriesNote).toBe(version.sourced_calories_note);
+        expect(derived.sourcedCaloriesNote).toContain('8.0%');
+
+        const noteless = COMMITTED_VERSIONS.filter(
+            ([slug, versionNumber]) => recipeVersionRow(slug, versionNumber).sourced_calories_note === null,
+        );
+
+        expect(noteless).toHaveLength(COMMITTED_VERSIONS.length - 1);
+    });
+
+    it('spells the pescatarian tag the way isDietCompatible matches it', () => {
+        const version = recipeVersionRow('salmon-and-kale-plate', 1);
+        const ingredients = publicationIngredients('salmon-and-kale-plate', 1);
+        const salmon = publicationIngredient('salmon-and-kale-plate', 1, 'usda:9200121');
+
+        // The one recipe that is pescatarian WITHOUT being vegetarian: no
+        // implication closure can rescue it, so the spelling is load-bearing.
+        expect(salmon.snapshot_diet_tags).toContain('pescatarian');
+        expect(salmon.snapshot_diet_tags).not.toContain('pescatarian_ok');
+        expect(deriveDietTags(ingredients)).toEqual(version.diet_tags);
+        expect(version.diet_tags).toEqual(['gluten_free', 'pescatarian']);
+        expect(isDietCompatible('pescatarian', version.diet_tags)).toBe(true);
+        expect(isDietCompatible('vegetarian', version.diet_tags)).toBe(false);
+    });
+
+    describe('one food on its way to a plan', () => {
+        const SLUG = 'lemon-herb-chicken-and-rice';
+        const PORTION_MULTIPLIER = 1.5;
+
+        it('scales the chicken row to the grams the planner will plan and the list will shop', () => {
+            const version = recipeVersionRow(SLUG, 2);
+            const chickenRow = publicationIngredient(SLUG, 2, 'usda:9200101');
+            const scaled = scaleIngredients(
+                publicationIngredients(SLUG, 2),
+                PORTION_MULTIPLIER,
+                version.yield_servings,
+            );
+            const chicken = scaled.find((entry) => entry.catalogFoodId === chickenRow.catalog_food_id);
+
+            expect(chickenRow.catalog_food_id).toBe(catalogFood('usda:9200101').id);
+            expect(chickenRow.gram_weight).toBe(600);
+            expect(version.yield_servings).toBe(4);
+
+            // `gram_weight / yield_servings * portion_multiplier` — the same
+            // arithmetic `grocery.logic.ts`'s `plannedIngredientGrams` applies
+            // to this row, and the number the grocery suite's traversal test
+            // asserts against the aggregated shopping line.
+            expect(chicken?.gramWeight).toBe(225);
+            expect(chicken?.gramWeight).toBe(
+                (chickenRow.gram_weight / version.yield_servings) * PORTION_MULTIPLIER,
+            );
+        });
+
+        it('scales the whole per-serving set by the same multiplier', () => {
+            const version = recipeVersionRow(SLUG, 2);
+            const planned = scalePlannedNutrition(
+                {
+                    calories: version.per_serving_calories,
+                    protein: version.per_serving_protein_g,
+                    carbs: version.per_serving_carbs_g,
+                    fat: version.per_serving_fat_g,
+                },
+                PORTION_MULTIPLIER,
+            );
+
+            expect(planned.calories).toBeCloseTo(version.per_serving_calories * PORTION_MULTIPLIER, 9);
+            expect(roundNutritionForDisplay(planned).calories).toBe(
+                Math.round(version.per_serving_calories * PORTION_MULTIPLIER),
+            );
+        });
     });
 });

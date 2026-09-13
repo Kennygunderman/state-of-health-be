@@ -31,6 +31,13 @@
  *  - **The accessor fails loudly and for free.** A missing key costs neither a
  *    request nor a timer, because `getOpenRouterConfig()` runs before either
  *    exists.
+ *  - **Both models are this boundary's to resolve, once.** `OPENROUTER_MODEL`
+ *    and `ESTIMATE_JUDGE_MODEL` are frozen into the config at module load, so
+ *    no consumer owns a second copy of either precedence (Rule 7 §9). The
+ *    judge model has more than one consumer — the catalog review pass inherits
+ *    it through `CATALOG_REVIEW_MODEL` (AAP §0.4.3) — and it is asserted
+ *    through the accessor and through the request the judge call sends, never
+ *    by reading a source line.
  *  - **This boundary does not meter.** Request-time quota belongs to
  *    `entitlement.service.ts`, which consumes it BEFORE the call so a failed
  *    call is not a free retry; the offline catalog scripts meter at operator
@@ -41,15 +48,20 @@
  *    `SyntaxError`.
  *
  * No `jest.mock` is used. `callOpenRouter` takes a `fetchImpl` parameter, so
- * direct tests inject through that declared seam; `estimate.service.ts` calls
- * it with four arguments and exposes no seam, so those tests stub
- * `globalThis.fetch`. Both are restored after every test, as is `process.env`.
+ * direct tests inject through that declared seam; `estimate.service.ts` takes
+ * an optional `EstimateDependencies` (`searchGenericFoods`, `fetchImpl`) whose
+ * defaults are the production collaborators, so the tests that drive the
+ * grounding judge inject through that seam and the rest exercise the default
+ * path by stubbing `globalThis.fetch`. Every stub is restored after each test,
+ * as is `process.env`.
  */
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
+import type { EstimateDependencies } from '../estimate.service';
 import type { MessageContent, OpenRouterConfig, OpenRouterError, OpenRouterErrorKind } from '../openrouter.service';
+import type { GenericFoodCandidate } from '../usda.service';
 
 /**
  * The module is required per test rather than imported once, because it reads
@@ -66,6 +78,13 @@ type OpenRouterModule = typeof import('../openrouter.service');
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_MODEL = 'google/gemini-2.5-flash';
+/**
+ * The classification model the boundary resolves from `ESTIMATE_JUDGE_MODEL`.
+ * The estimate service's grounding judge asks for it by name
+ * (`getOpenRouterConfig().judgeModel`) instead of reading the environment, so
+ * this default is vendor configuration and is asserted as such below.
+ */
+const DEFAULT_JUDGE_MODEL = 'openai/gpt-4o-mini';
 const REQUEST_TIMEOUT_MS = 30_000;
 
 /** Obviously fake: nothing here may resemble a real provider credential. */
@@ -142,12 +161,20 @@ const restoreEnvironment = (): void => {
 interface VendorEnvironment {
     apiKey?: string;
     model?: string;
+    judgeModel?: string;
 }
 
-/** A fresh module instance whose import-time config is exactly `environment`. */
+/**
+ * A fresh module instance whose import-time config is exactly `environment`.
+ *
+ * All three variables are written on every load, absent ones by deletion, so an
+ * instance can never inherit a value from the ambient environment or from the
+ * test before it.
+ */
 const loadOpenRouter = (environment: VendorEnvironment = {}): OpenRouterModule => {
     setEnvValue('OPENROUTER_API_KEY', environment.apiKey);
     setEnvValue('OPENROUTER_MODEL', environment.model);
+    setEnvValue('ESTIMATE_JUDGE_MODEL', environment.judgeModel);
 
     let loaded!: OpenRouterModule;
     jest.isolateModules(() => {
@@ -185,6 +212,29 @@ const rejectWith = (error: unknown): FetchStub =>
     jest.fn(async (): Promise<Response> => {
         throw error;
     }) as unknown as FetchStub;
+
+/**
+ * Answers the first request itself and delegates every later one to `later`.
+ *
+ * The grounding flow issues two requests, and the second has to be able to fail
+ * in ways a queued `Response` cannot express (a rejection, an abort). Both
+ * requests are still recorded on the returned stub, so `sentRequest(stub, 1)`
+ * reads the second one.
+ */
+const respondThen = (first: Response, later: FetchStub): FetchStub => {
+    let answeredFirst = false;
+    const delegate = later as unknown as (input: unknown, init?: RequestInit) => Promise<Response>;
+
+    return jest.fn(async (input: unknown, init?: RequestInit): Promise<Response> => {
+        if (!answeredFirst) {
+            answeredFirst = true;
+
+            return first;
+        }
+
+        return delegate(input, init);
+    }) as unknown as FetchStub;
+};
 
 /** Rejects only when the request's own signal aborts, as `fetch` itself does. */
 const abortAwareFetch = (): FetchStub =>
@@ -1130,16 +1180,62 @@ describe('getOpenRouterConfig', () => {
     describe('a key that is present', () => {
         it('returns the key with the default model', () => {
             const openRouter = loadOpenRouter({ apiKey: API_KEY });
-            const expected: OpenRouterConfig = { apiKey: API_KEY, model: DEFAULT_MODEL };
+            const expected: OpenRouterConfig = {
+                apiKey: API_KEY,
+                model: DEFAULT_MODEL,
+                judgeModel: DEFAULT_JUDGE_MODEL,
+            };
 
             expect(openRouter.getOpenRouterConfig()).toStrictEqual(expected);
         });
 
         it('returns the key with the model pinned by the environment', () => {
             const openRouter = loadOpenRouter({ apiKey: API_KEY, model: 'vendor/env-model' });
-            const expected: OpenRouterConfig = { apiKey: API_KEY, model: 'vendor/env-model' };
+            const expected: OpenRouterConfig = {
+                apiKey: API_KEY,
+                model: 'vendor/env-model',
+                judgeModel: DEFAULT_JUDGE_MODEL,
+            };
 
             expect(openRouter.getOpenRouterConfig()).toStrictEqual(expected);
+        });
+
+        // The judge model is resolved here, beside the request model, because
+        // the estimate service's grounding judge is not its only consumer: the
+        // catalog pipeline's advisory review pass inherits ESTIMATE_JUDGE_MODEL
+        // through CATALOG_REVIEW_MODEL (AAP §0.4.3). A consumer that read the
+        // variable itself would own a second copy of this precedence, which is
+        // what Rule 7 §9 forbids and what these four assertions pin.
+        it('resolves the judge model from ESTIMATE_JUDGE_MODEL', () => {
+            const openRouter = loadOpenRouter({ apiKey: API_KEY, judgeModel: 'vendor/judge-model' });
+
+            expect(openRouter.getOpenRouterConfig().judgeModel).toBe('vendor/judge-model');
+        });
+
+        it('falls back to openai/gpt-4o-mini when ESTIMATE_JUDGE_MODEL is unset', () => {
+            const openRouter = loadOpenRouter({ apiKey: API_KEY });
+
+            expect(openRouter.getOpenRouterConfig().judgeModel).toBe('openai/gpt-4o-mini');
+        });
+
+        it('treats a blank ESTIMATE_JUDGE_MODEL as unset', () => {
+            const openRouter = loadOpenRouter({ apiKey: API_KEY, judgeModel: '' });
+
+            expect(openRouter.getOpenRouterConfig().judgeModel).toBe(DEFAULT_JUDGE_MODEL);
+        });
+
+        it('keeps the two models independent of each other', () => {
+            const openRouter = loadOpenRouter({
+                apiKey: API_KEY,
+                model: 'vendor/env-model',
+                judgeModel: 'vendor/judge-model',
+            });
+
+            expect(openRouter.getOpenRouterConfig()).toStrictEqual({
+                apiKey: API_KEY,
+                model: 'vendor/env-model',
+                judgeModel: 'vendor/judge-model',
+            });
         });
 
         // The shipped guard is a truthiness check, which the extraction keeps
@@ -1151,7 +1247,11 @@ describe('getOpenRouterConfig', () => {
             const openRouter = loadOpenRouter({ apiKey: '   ' });
             const stub = respondWith(completion('{"items":[]}'));
 
-            expect(openRouter.getOpenRouterConfig()).toStrictEqual({ apiKey: '   ', model: DEFAULT_MODEL });
+            expect(openRouter.getOpenRouterConfig()).toStrictEqual({
+                apiKey: '   ',
+                model: DEFAULT_MODEL,
+                judgeModel: DEFAULT_JUDGE_MODEL,
+            });
 
             await openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub);
 
@@ -1185,7 +1285,11 @@ describe('getOpenRouterConfig', () => {
             const openRouter = loadOpenRouter({ apiKey: API_KEY });
             delete process.env.OPENROUTER_API_KEY;
 
-            expect(openRouter.getOpenRouterConfig()).toStrictEqual({ apiKey: API_KEY, model: DEFAULT_MODEL });
+            expect(openRouter.getOpenRouterConfig()).toStrictEqual({
+                apiKey: API_KEY,
+                model: DEFAULT_MODEL,
+                judgeModel: DEFAULT_JUDGE_MODEL,
+            });
         });
 
         it('ignores a model changed in the environment after the module resolved', async () => {
@@ -1199,12 +1303,49 @@ describe('getOpenRouterConfig', () => {
             expect(sentRequest(stub).body.model).toBe('vendor/env-model');
         });
 
-        it('resolves independently per module instance', () => {
-            const first = loadOpenRouter({ apiKey: 'first-key', model: 'vendor/first' });
-            const second = loadOpenRouter({ apiKey: 'second-key', model: 'vendor/second' });
+        it('ignores a judge model changed in the environment after the module resolved', () => {
+            const openRouter = loadOpenRouter({ apiKey: API_KEY, judgeModel: 'vendor/judge-model' });
+            process.env.ESTIMATE_JUDGE_MODEL = 'vendor/changed-judge-model';
 
-            expect(first.getOpenRouterConfig()).toStrictEqual({ apiKey: 'first-key', model: 'vendor/first' });
-            expect(second.getOpenRouterConfig()).toStrictEqual({ apiKey: 'second-key', model: 'vendor/second' });
+            expect(openRouter.getOpenRouterConfig().judgeModel).toBe('vendor/judge-model');
+        });
+
+        it('ignores a judge model removed from the environment after the module resolved', () => {
+            const openRouter = loadOpenRouter({ apiKey: API_KEY, judgeModel: 'vendor/judge-model' });
+            delete process.env.ESTIMATE_JUDGE_MODEL;
+
+            expect(openRouter.getOpenRouterConfig().judgeModel).toBe('vendor/judge-model');
+        });
+
+        it('ignores a judge model added to the environment after the module resolved', () => {
+            const openRouter = loadOpenRouter({ apiKey: API_KEY });
+            process.env.ESTIMATE_JUDGE_MODEL = 'vendor/late-judge-model';
+
+            expect(openRouter.getOpenRouterConfig().judgeModel).toBe(DEFAULT_JUDGE_MODEL);
+        });
+
+        it('resolves independently per module instance', () => {
+            const first = loadOpenRouter({
+                apiKey: 'first-key',
+                model: 'vendor/first',
+                judgeModel: 'vendor/first-judge',
+            });
+            const second = loadOpenRouter({
+                apiKey: 'second-key',
+                model: 'vendor/second',
+                judgeModel: 'vendor/second-judge',
+            });
+
+            expect(first.getOpenRouterConfig()).toStrictEqual({
+                apiKey: 'first-key',
+                model: 'vendor/first',
+                judgeModel: 'vendor/first-judge',
+            });
+            expect(second.getOpenRouterConfig()).toStrictEqual({
+                apiKey: 'second-key',
+                model: 'vendor/second',
+                judgeModel: 'vendor/second-judge',
+            });
         });
     });
 
@@ -1248,20 +1389,21 @@ describe('getOpenRouterConfig', () => {
  * `OpenRouterError` back into the `EstimateFailedError` its controller already
  * maps, carrying the SAME message text as before. These tests drive the two
  * shipped entry points — `estimateMeal` (POST /api/macros/estimate) and
- * `scanLabel` (POST /api/macros/label-scan) — through the global `fetch`,
- * because `callModel` calls `callOpenRouter` with four arguments and exposes no
- * injection seam of its own.
+ * `scanLabel` (POST /api/macros/label-scan). Most drive them through the global
+ * `fetch`, which is the only seam `scanLabel` has; the grounding and judge
+ * tests instead pass `estimateMeal` its declared `EstimateDependencies`, whose
+ * `fetchImpl` reaches `callOpenRouter`'s own transport parameter.
  *
- * Grounding is deliberately kept away from USDA here. `searchGenericFoods`
+ * Grounding never reaches the real USDA service here. `searchGenericFoods`
  * reaches `usdaGet`, which reads `usda_api_cache` through Prisma BEFORE it
- * checks the API key, so any item with a positive gram weight would open a
- * database connection — which a unit test must not do (Rule 7 §11). The two
- * levers that keep it out are `ESTIMATE_GROUNDING=off` and an item whose gram
- * weight resolves to 0, which short-circuits before any USDA call. The judge
- * round trip and a failing `searchGenericFoods` are reachable only past that
- * read, so they belong to the integration suites; what is provable here is that
- * every call site shares ONE translation point, which is asserted structurally
- * below.
+ * checks the API key, so an item with a positive gram weight would open a
+ * database connection — which a unit test must not do (Rule 7 §11). Three
+ * levers keep it out, and which one a test uses says what that test is about:
+ * `ESTIMATE_GROUNDING=off` and an item whose gram weight resolves to 0 keep
+ * grounding from starting at all, while `estimateMeal`'s declared
+ * `EstimateDependencies` seam supplies the candidates directly — so the judge
+ * round trip IS driven here, behaviourally, with neither Prisma nor the network
+ * in the picture.
  */
 describe('estimate.service regression', () => {
     interface EstimateHarness {
@@ -1273,22 +1415,33 @@ describe('estimate.service regression', () => {
      * One registry for the whole block: `openrouter.service` is required first
      * so that `estimate.service` receives that very instance, which is what
      * makes its `error instanceof OpenRouterError` check meaningful. Memoised
-     * so only one `PrismaClient` is ever constructed behind
-     * `estimate.service` → `usda.service` (construction is lazy; nothing here
-     * connects).
+     * per environment rather than per test, so a `PrismaClient` is constructed
+     * behind `estimate.service` → `usda.service` once per distinct
+     * configuration (construction is lazy; nothing here connects).
+     *
+     * The cache key covers EVERY variable the instance captures at load, not
+     * just the key: both models are frozen into the vendor config at require
+     * time, so a key that ignored them would hand a test built for
+     * `ESTIMATE_JUDGE_MODEL=x` the earlier instance that never saw it, and the
+     * test would pass or fail for a reason unrelated to what it asserts.
      */
     const loadHarness = (() => {
         const cache = new Map<string, EstimateHarness>();
 
-        return (apiKey?: string): EstimateHarness => {
-            const cacheKey = apiKey ?? '<none>';
+        return (environment: VendorEnvironment = {}): EstimateHarness => {
+            const cacheKey = JSON.stringify([
+                environment.apiKey ?? null,
+                environment.model ?? null,
+                environment.judgeModel ?? null,
+            ]);
             const cached = cache.get(cacheKey);
             if (cached !== undefined) {
                 return cached;
             }
 
-            setEnvValue('OPENROUTER_API_KEY', apiKey);
-            setEnvValue('OPENROUTER_MODEL', undefined);
+            setEnvValue('OPENROUTER_API_KEY', environment.apiKey);
+            setEnvValue('OPENROUTER_MODEL', environment.model);
+            setEnvValue('ESTIMATE_JUDGE_MODEL', environment.judgeModel);
 
             let loaded!: EstimateHarness;
             jest.isolateModules(() => {
@@ -1303,7 +1456,7 @@ describe('estimate.service regression', () => {
         };
     })();
 
-    const configuredHarness = (): EstimateHarness => loadHarness(API_KEY);
+    const configuredHarness = (): EstimateHarness => loadHarness({ apiKey: API_KEY });
 
     const modelItem = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
         name: 'Scrambled eggs',
@@ -1369,7 +1522,7 @@ describe('estimate.service regression', () => {
         });
 
         it('reports a missing API key with the shipped message', async () => {
-            const harness = loadHarness(undefined);
+            const harness = loadHarness();
             globalThis.fetch = respondWith(estimateCompletion({ items: [modelItem()] }));
 
             const error = asFailedEstimate(await rejectionOf(harness.estimate.estimateMeal('two eggs')), harness);
@@ -1392,7 +1545,7 @@ describe('estimate.service regression', () => {
         });
 
         it('reports a missing API key with the shipped message', async () => {
-            const harness = loadHarness(undefined);
+            const harness = loadHarness();
             globalThis.fetch = respondWith(completion('{"calories":100}'));
 
             const error = asFailedEstimate(await rejectionOf(harness.estimate.scanLabel('QUJD')), harness);
@@ -1520,25 +1673,252 @@ describe('estimate.service regression', () => {
         });
     });
 
-    // The judge call is the third `callOpenRouter` consumer and the only one
-    // that passes a model override. Reaching it needs USDA candidates, which
-    // needs the Prisma cache read this suite stays away from — so what is
-    // asserted here is the property that makes reaching it unnecessary: there
-    // is exactly ONE place where a vendor error becomes an
-    // `EstimateFailedError`, so the judge site cannot translate differently
-    // from the two sites proven above.
+    /**
+     * The judge call is the third `callOpenRouter` consumer and the only one
+     * that asks for a model other than the configured one. Which model that is
+     * is vendor configuration (`getOpenRouterConfig().judgeModel`, resolved
+     * once from `ESTIMATE_JUDGE_MODEL`), so the property to pin is that the
+     * request the vendor receives carries it — not that some source line
+     * mentions an environment variable.
+     *
+     * Every test here drives the real grounding path through the
+     * `EstimateDependencies` seam: injected candidates stand in for
+     * `searchGenericFoods`, and an injected transport stands in for `fetch`, so
+     * the judge round trip is exercised without Prisma and without the network.
+     *
+     * On the failure test: grounding is deliberately fail-soft — "grounding can
+     * only replace numbers, never lose items or fail the estimate" — so the
+     * `EstimateFailedError` the single translation point raises for a judge
+     * failure is caught by `estimateMeal` and never reaches the client. What
+     * IS observable, and what is asserted, is that the vendor's own message
+     * arrives at that fallback verbatim and un-nested, and that the estimate
+     * survives with the model's own numbers.
+     */
     describe('the judge call site', () => {
-        const estimateCode = codeOf('estimate.service.ts');
+        const groundableItem = modelItem({ grams: 92, calories: 180 });
 
-        it('still defaults to openai/gpt-4o-mini', () => {
-            expect(estimateCode).toContain("process.env.ESTIMATE_JUDGE_MODEL || 'openai/gpt-4o-mini'");
+        /**
+         * The model's own numbers for `groundableItem`, which is what an
+         * ungrounded outcome must leave untouched.
+         */
+        const modelNumbers = {
+            name: 'Scrambled eggs',
+            quantityText: '2',
+            grams: 92,
+            calories: 180,
+            protein: 14,
+            carbs: 2,
+            fat: 16,
+            source: 'estimated',
+            matchedTo: null,
+        };
+
+        /**
+         * Per-100g values chosen to land inside the grounding sanity guard at
+         * 92 g: 200 cal/100g scales to 184, which is 4 kcal from the model's
+         * 180, so the match is applied rather than distrusted.
+         */
+        const CANDIDATE: GenericFoodCandidate = {
+            fdcId: '173424',
+            description: 'Egg, whole, cooked, scrambled',
+            dataType: 'Survey (FNDDS)',
+            caloriesPer100g: 200,
+            proteinPer100g: 13,
+            carbsPer100g: 2,
+            fatPer100g: 15,
+        };
+
+        type SearchStub = jest.MockedFunction<NonNullable<EstimateDependencies['searchGenericFoods']>>;
+
+        const candidateSearch = (...candidates: GenericFoodCandidate[]): SearchStub =>
+            jest.fn(async (): Promise<GenericFoodCandidate[]> => candidates) as unknown as SearchStub;
+
+        const withDependencies = (search: SearchStub, vendor: FetchStub): EstimateDependencies => ({
+            searchGenericFoods: search,
+            fetchImpl: vendor,
         });
 
-        it('reaches the vendor through the single translation point, as every call site does', () => {
-            expect(occurrences(estimateCode, 'callOpenRouter(')).toBe(1);
-            expect(occurrences(estimateCode, 'callModel(')).toBe(3);
-            expect(estimateCode).toContain('new EstimateFailedError(error.message)');
+        /** The judge's own JSON schema, which identifies the second request. */
+        const schemaNameOf = (request: SentRequest): string =>
+            (request.body.response_format.json_schema as { name: string }).name;
+
+        /**
+         * The grounding path reports its decisions on the console, and one of
+         * those reports is the assertion target below. Captured by replacing
+         * the method and restoring it afterwards — the same save/restore this
+         * file uses for `globalThis.fetch`, rather than a jest spy, because the
+         * outer `afterEach` calls `jest.resetAllMocks()` and would leave a spy
+         * installed with its implementation stripped.
+         */
+        const REAL_CONSOLE = { error: console.error, warn: console.warn, log: console.log };
+        let loggedErrors: unknown[][] = [];
+        let loggedWarnings: unknown[][] = [];
+
+        beforeEach(() => {
+            loggedErrors = [];
+            loggedWarnings = [];
+            console.error = (...args: unknown[]): void => {
+                loggedErrors.push(args);
+            };
+            console.warn = (...args: unknown[]): void => {
+                loggedWarnings.push(args);
+            };
+            console.log = (): void => undefined;
+            delete process.env.ESTIMATE_GROUNDING;
         });
+
+        afterEach(() => {
+            console.error = REAL_CONSOLE.error;
+            console.warn = REAL_CONSOLE.warn;
+            console.log = REAL_CONSOLE.log;
+        });
+
+        it('asks the vendor for the judge model while the estimate call keeps the configured one', async () => {
+            const harness = configuredHarness();
+            const vendor = respondWith(
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                completion('{"matches":[0]}'),
+            );
+
+            await harness.estimate.estimateMeal(
+                'two eggs',
+                undefined,
+                withDependencies(candidateSearch(CANDIDATE), vendor),
+            );
+
+            expect(vendor).toHaveBeenCalledTimes(2);
+            expect(sentRequest(vendor, 0).body.model).toBe(DEFAULT_MODEL);
+            expect(sentRequest(vendor, 1).body.model).toBe(DEFAULT_JUDGE_MODEL);
+            expect(jest.mocked(globalThis.fetch)).not.toHaveBeenCalled();
+        });
+
+        it('sends the judge as the second request, carrying the injected candidates', async () => {
+            const harness = configuredHarness();
+            const vendor = respondWith(
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                completion('{"matches":[0]}'),
+            );
+            const search = candidateSearch(CANDIDATE);
+
+            await harness.estimate.estimateMeal('two eggs', undefined, withDependencies(search, vendor));
+
+            expect(search).toHaveBeenCalledTimes(1);
+            expect(search).toHaveBeenCalledWith('Scrambled eggs');
+            expect(schemaNameOf(sentRequest(vendor, 0))).toBe('meal_estimate');
+            expect(schemaNameOf(sentRequest(vendor, 1))).toBe('food_matches');
+            expect(sentRequest(vendor, 1).url).toBe(OPENROUTER_URL);
+            expect(sentRequest(vendor, 1).body.messages[1].content).toContain('Scrambled eggs (2, ~92g)');
+            expect(sentRequest(vendor, 1).body.messages[1].content).toContain('Egg, whole, cooked, scrambled');
+        });
+
+        it('carries an ESTIMATE_JUDGE_MODEL pinned by the environment', async () => {
+            const harness = loadHarness({ apiKey: API_KEY, judgeModel: 'vendor/judge-model' });
+            const vendor = respondWith(
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                completion('{"matches":[0]}'),
+            );
+
+            await harness.estimate.estimateMeal(
+                'two eggs',
+                undefined,
+                withDependencies(candidateSearch(CANDIDATE), vendor),
+            );
+
+            expect(sentRequest(vendor, 0).body.model).toBe(DEFAULT_MODEL);
+            expect(sentRequest(vendor, 1).body.model).toBe('vendor/judge-model');
+        });
+
+        it('rewrites the items numbers from the matched candidates per-100g values', async () => {
+            const harness = configuredHarness();
+            const vendor = respondWith(
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                completion('{"matches":[0]}'),
+            );
+
+            const result = await harness.estimate.estimateMeal(
+                'two eggs',
+                undefined,
+                withDependencies(candidateSearch(CANDIDATE), vendor),
+            );
+
+            expect(result.items).toStrictEqual([
+                {
+                    name: 'Scrambled eggs',
+                    quantityText: '2',
+                    grams: 92,
+                    calories: 184,
+                    protein: 12,
+                    carbs: 2,
+                    fat: 14,
+                    source: 'db_matched',
+                    matchedTo: 'Egg, whole, cooked, scrambled',
+                },
+            ]);
+            expect(result.total).toStrictEqual({ calories: 184, protein: 12, carbs: 2, fat: 14 });
+        });
+
+        it('keeps the models own numbers when the judge matches nothing', async () => {
+            const harness = configuredHarness();
+            const vendor = respondWith(
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                completion('{"matches":[-1]}'),
+            );
+
+            const result = await harness.estimate.estimateMeal(
+                'two eggs',
+                undefined,
+                withDependencies(candidateSearch(CANDIDATE), vendor),
+            );
+
+            expect(vendor).toHaveBeenCalledTimes(2);
+            expect(result.items).toStrictEqual([modelNumbers]);
+        });
+
+        it('keeps the models own numbers when the judge returns a match count the items do not agree with', async () => {
+            const harness = configuredHarness();
+            const vendor = respondWith(
+                estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                completion('{"matches":[0,1]}'),
+            );
+
+            const result = await harness.estimate.estimateMeal(
+                'two eggs',
+                undefined,
+                withDependencies(candidateSearch(CANDIDATE), vendor),
+            );
+
+            expect(result.items).toStrictEqual([modelNumbers]);
+            expect(loggedWarnings).toStrictEqual([['Grounding judge returned 2 matches for 1 items; skipping']]);
+        });
+
+        it.each(vendorFailures)(
+            'reports %s on the judge call with the vendor message verbatim, and still returns the estimate',
+            async (_label, _kind, buildStub, expected) => {
+                const harness = configuredHarness();
+                const vendor = respondThen(
+                    estimateCompletion({ items: [groundableItem], confidence: 'high' }),
+                    buildStub(),
+                );
+
+                const result = await harness.estimate.estimateMeal(
+                    'two eggs',
+                    undefined,
+                    withDependencies(candidateSearch(CANDIDATE), vendor),
+                );
+
+                expect(result.items).toStrictEqual([modelNumbers]);
+                expect(loggedErrors).toHaveLength(1);
+                expect(loggedErrors[0][0]).toBe('USDA grounding failed, using raw LLM estimate:');
+
+                // The message the judge site's translation carried, read back
+                // from what was logged rather than from the expectation, so a
+                // reworded or doubly-wrapped message fails here.
+                const reported = String(loggedErrors[0][1]);
+                expect(reported).toBe(expected);
+                expect(occurrences(reported, VENDOR_FAILURE_PREFIX)).toBeLessThanOrEqual(1);
+                expect(reported).not.toContain(`${VENDOR_FAILURE_PREFIX} ${VENDOR_FAILURE_PREFIX}`);
+            },
+        );
     });
 
     // `toInt` is reached on every numeric field of both responses. `scanLabel`

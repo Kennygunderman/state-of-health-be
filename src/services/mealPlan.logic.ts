@@ -249,6 +249,13 @@ const TIME_OF_DAY_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const MILLISECONDS_PER_DAY = 86400000;
+
+/**
+ * The locale {@link localDayKey} formats through. Canadian English renders a
+ * numeric date as `YYYY-MM-DD`, which is the day-key form this module speaks —
+ * it is a formatting choice, and no user-facing text is produced here.
+ */
+const LOCAL_DAY_KEY_LOCALE = 'en-CA';
 const PERCENT_SCALE = 100;
 const SEED_FIELD_SEPARATOR = '|';
 
@@ -456,6 +463,73 @@ const dayKeyToUtcMillis = (dayKey: string): number =>
     Date.UTC(Number(dayKey.slice(0, 4)), Number(dayKey.slice(5, 7)) - 1, Number(dayKey.slice(8, 10)));
 
 const formatDayKey = (utcMillis: number): string => new Date(utcMillis).toISOString().slice(0, 10);
+
+/**
+ * THE derivation of a user's calendar day from an instant — the one place an
+ * absolute moment becomes a `YYYY-MM-DD` key.
+ *
+ * Every lifecycle rule in this file takes `today` as a day key, and this is
+ * where that key legitimately comes from: the user's stored IANA zone. A rule
+ * that read the server's own clock would answer differently on a server in
+ * Frankfurt and one in Virginia for the same user at the same moment, which is
+ * not a detail — at 20:00 UTC a plan ending today is already over for a user in
+ * Auckland and still current for one in Los Angeles, and the difference decides
+ * whether they can write to it.
+ *
+ * THE INSTANT IS AN ARGUMENT, never `Date.now()`: this module owns no clock, so
+ * the service passes the moment in and every rule here stays reproducible
+ * (Rule backend-architecture §7). Accepts a `Date` or epoch milliseconds
+ * because both are what a caller has to hand.
+ *
+ * `Intl.DateTimeFormat` with the zone does the conversion, and `en-CA` is used
+ * for its numeric form: that locale renders a numeric date as `YYYY-MM-DD`,
+ * which is the key this module already speaks. The result is re-validated as a
+ * real calendar day rather than trusted, so a runtime whose locale data renders
+ * something else fails loudly here instead of writing a malformed key into a
+ * plan.
+ *
+ * Zone VALIDATION on the request path belongs to
+ * `preferences.logic.ts::normalizeTimeZone`, which is what stores the canonical
+ * name; this function re-validates defensively because it is also reachable
+ * with a zone read from a row written before that parser existed, and a wrong
+ * zone here silently plans someone else's week.
+ */
+export const localDayKey = (instant: Date | number, timeZone: string): string => {
+    const epochMillis = instant instanceof Date ? instant.getTime() : instant;
+
+    if (!Number.isFinite(epochMillis)) {
+        throw new MealPlanInputError(
+            `instant must be a finite moment in time, received ${String(instant)}`,
+            'instant',
+        );
+    }
+
+    let formatter: Intl.DateTimeFormat;
+
+    try {
+        formatter = new Intl.DateTimeFormat(LOCAL_DAY_KEY_LOCALE, {
+            timeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+        });
+    } catch (error) {
+        // Only a RangeError means "this runtime does not know that zone".
+        // Anything else is a runtime without full time-zone data, and reporting
+        // that as a bad zone would blame the user's own valid setting for an
+        // environment fault — the same split `normalizeTimeZone` makes.
+        if (error instanceof RangeError) {
+            throw new MealPlanInputError(
+                `timeZone must be an IANA time zone this runtime knows, received ${JSON.stringify(timeZone)}`,
+                'timeZone',
+            );
+        }
+
+        throw error;
+    }
+
+    return requireDayKey(formatter.format(new Date(epochMillis)), 'timeZone');
+};
 
 /**
  * A day key shifted by whole days, staying in the calendar it started in.
@@ -712,6 +786,75 @@ export const derivePlanSeed = (inputs: PlanSeedInputs): number => {
 };
 
 /**
+ * The portable identity `(slug, version, portionMultiplier)` as one string key.
+ *
+ * Spelled ONCE, here, because four readers now compare candidates by it — the
+ * pre-order, the baseline rank map, the analysis witness and the determinism
+ * checks — and four spellings of the same triple is how one of them ends up
+ * joining on the wrong thing. `|` is safe as a separator for the same reason it
+ * is in the seed material: a slug carries no `|`, and the other two members are
+ * numbers.
+ *
+ * Deliberately NOT built from `recipe_version_id`: this key must mean the same
+ * thing in two databases loaded from one catalog release, and their ids differ.
+ */
+export const portableCandidateIdentity = (
+    slug: string,
+    version: number,
+    portionMultiplier: number,
+): string => [slug, String(version), String(portionMultiplier)].join(SEED_FIELD_SEPARATOR);
+
+/** {@link portableCandidateIdentity} for a built candidate. */
+export const planCandidateIdentity = (candidate: PlanCandidate): string =>
+    portableCandidateIdentity(
+        candidate.recipe.slug,
+        candidate.recipe.version,
+        candidate.portionMultiplier,
+    );
+
+/**
+ * The shuffle ranks of an existing candidate set, keyed by portable identity.
+ *
+ * What a counterfactual probe hands back to {@link buildPlanCandidates} so the
+ * candidates it shares with the baseline keep the ranks the baseline gave them.
+ */
+export const baselineCandidateRanks = (
+    candidates: readonly PlanCandidate[],
+): Map<string, number> => {
+    const ranks = new Map<string, number>();
+
+    for (const candidate of candidates) {
+        ranks.set(planCandidateIdentity(candidate), candidate.shuffleRank);
+    }
+
+    return ranks;
+};
+
+/**
+ * One Fisher–Yates walk of `items` under `mulberry32(seed)`, as a new array.
+ *
+ * The walk is stated exactly once even though two callers need it — the whole
+ * candidate set, and the newcomers a relaxation admits — because the direction
+ * and the draw are the contract: from the end (`for i = n-1 … 1`,
+ * `j = floor(rand() × (i+1))`, swap). Walking from the start, or drawing over a
+ * different range, is a different permutation and therefore a different plan
+ * for every user in the system.
+ */
+const seededPermutation = <T>(items: readonly T[], seed: number): T[] => {
+    const shuffled = [...items];
+    const draw = mulberry32(seed);
+
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+        const target = Math.floor(draw() * (index + 1));
+        const held = shuffled[index];
+        shuffled[index] = shuffled[target];
+        shuffled[target] = held;
+    }
+
+    return shuffled;
+};
+
+/**
  * Orders candidates by the portable identity `(slug, version, portionMultiplier)`.
  *
  * Never by `recipe_version_id` or `recipe_id`: those are `gen_random_uuid()`
@@ -754,12 +897,31 @@ const comparePortableIdentity = (left: PlanCandidate, right: PlanCandidate): num
  * only thing that breaks a score tie. The portion set is the main-slot one for
  * every recipe; a snack slot narrows it later, which is sound because the snack
  * multipliers are a strict subset.
+ *
+ * `baselineRanks` — absent for GENERATION, which is the only caller that
+ * defines ranks — pins the ranks of candidates a previous set already ranked,
+ * and exists because step 3 is otherwise re-run over a DIFFERENT set: a
+ * counterfactual probe admits more recipes, the walk draws differently, and
+ * every candidate shared with the baseline lands on another rank. A probe whose
+ * shared candidates were merely reshuffled can then "succeed" on the baseline's
+ * own candidates in a different move order, and the analysis would blame the
+ * relaxed preference for a week the relaxation had nothing to do with. So
+ * shared candidates keep EXACTLY their baseline rank and only the newcomers are
+ * drawn for, ranked after the baseline's highest rank.
+ *
+ * RANKING NEWCOMERS LAST IS SOUND AND CONSERVATIVE. A rank breaks nothing but
+ * an exact score tie, so placing newcomers behind the baseline can only make
+ * them tried later than a shared candidate of equal score — never earlier. It
+ * therefore cannot manufacture a probe success, and a probe that genuinely
+ * needs a newcomer still finds one and says so through the witness the analysis
+ * requires before it emits a row.
  */
 export const buildPlanCandidates = (
     recipes: readonly PlanRecipeCandidate[],
     preferences: PlanningPreferences,
     seed: number,
     portionPolicy: PortionPolicy = DEFAULT_PORTION_POLICY,
+    baselineRanks?: ReadonlyMap<string, number>,
 ): PlanCandidate[] => {
     const candidates: PlanCandidate[] = [];
     const multipliers = allPortionMultipliers(portionPolicy);
@@ -781,18 +943,34 @@ export const buildPlanCandidates = (
 
     candidates.sort(comparePortableIdentity);
 
-    const shuffled = [...candidates];
-    const draw = mulberry32(seed);
+    let highestBaselineRank = -1;
+    const newcomers: PlanCandidate[] = [];
 
-    for (let index = shuffled.length - 1; index > 0; index -= 1) {
-        const target = Math.floor(draw() * (index + 1));
-        const held = shuffled[index];
-        shuffled[index] = shuffled[target];
-        shuffled[target] = held;
+    for (const candidate of candidates) {
+        const baselineRank = baselineRanks?.get(planCandidateIdentity(candidate));
+
+        if (baselineRank === undefined) {
+            newcomers.push(candidate);
+        } else {
+            candidate.shuffleRank = baselineRank;
+        }
     }
 
-    shuffled.forEach((candidate, rank) => {
-        candidate.shuffleRank = rank;
+    if (baselineRanks) {
+        // Over the WHOLE baseline, not just the shared part: a rank the probe's
+        // own set does not reach still belongs to the baseline's permutation,
+        // and newcomers must sit above all of them for the "tried last among
+        // equals" property to hold.
+        for (const rank of baselineRanks.values()) {
+            highestBaselineRank = Math.max(highestBaselineRank, rank);
+        }
+    }
+
+    // With no baseline the newcomers ARE the whole pre-ordered set and the
+    // highest baseline rank is −1, so this is the one walk of step 3 assigning
+    // 0…n−1 — the generation path, unchanged.
+    seededPermutation(newcomers, seed).forEach((candidate, index) => {
+        candidate.shuffleRank = highestBaselineRank + 1 + index;
     });
 
     return candidates;
@@ -1108,8 +1286,26 @@ export const computeDayTotals = (
 
 const EMPTY_RECIPE_IDS: ReadonlySet<string> = new Set<string>();
 
+/**
+ * The two evaluation budgets a run may be held to.
+ *
+ * Present as a parameter for ONE reason: under the shipped policy the per-plan
+ * cap is exactly {@link PLAN_DAY_COUNT} × the per-day cap, so a week that trips
+ * one guard would trip the other at the same moment and no fixture could tell
+ * them apart. Supplying the caps separately makes each guard independently
+ * observable, which is what lets a test prove the per-plan counter spans day
+ * boundaries and the per-day counter accumulates across backtracking
+ * re-entries. Production never passes it — the shipped policy is
+ * {@link MAX_EVALUATIONS_PER_DAY} and {@link MAX_EVALUATIONS_PER_PLAN}, and
+ * both {@link generateWeeklyPlan} and the analysis probes leave this absent.
+ */
+export interface PlanSearchBudget {
+    perDay?: number;
+    perPlan?: number;
+}
+
 /** Everything one search run needs, and nothing it could fetch. */
-interface SearchInput {
+export interface PlanSearchInput {
     dates: readonly PlanDate[];
     slots: readonly SlotSchedule[];
     candidatesBySlot: ReadonlyMap<MealSlot, readonly PlanCandidate[]>;
@@ -1117,7 +1313,12 @@ interface SearchInput {
     userBudgetTier: BudgetTier;
     /** Injected wall-clock check. Absent means the run is unbounded in time. */
     shouldAbort?: () => boolean;
+    /** Absent — the production case — means the two policy constants. */
+    budget?: PlanSearchBudget;
 }
+
+/** Which evaluation budget ran out, or null when neither did. */
+export type PlanSearchExhaustion = 'day' | 'plan';
 
 /**
  * What a run found, and if it found nothing, how it ran out.
@@ -1127,7 +1328,7 @@ interface SearchInput {
  * plain infeasible search are both feasibility verdicts, and `frontierDayIndex`
  * is what the verdict points the user at.
  */
-interface SearchOutcome {
+export interface PlanSearchOutcome {
     days: PlannedMealAssignment[][] | null;
     evaluations: number;
     /**
@@ -1143,9 +1344,57 @@ interface SearchOutcome {
     frontierDayIndex: number;
     /** An evaluation budget ran out. A feasibility verdict, never a 5xx. */
     exhausted: boolean;
+    /**
+     * WHICH budget ran out, evaluated guard by guard rather than inferred.
+     *
+     * `exhausted` alone cannot say whether one day spent its whole allowance or
+     * the week spent the plan's, and the two mean different things: a day guard
+     * says this day is the wall, a plan guard says the week as a whole is. Null
+     * whenever `exhausted` is false.
+     */
+    exhaustedBy: PlanSearchExhaustion | null;
     /** The injected deadline fired. The caller decides what that means. */
     aborted: boolean;
 }
+
+/**
+ * The diagnostics a failed search hands to the failure it becomes.
+ *
+ * Deliberately NOT a wire shape. The 422 body is
+ * `{limitingConstraints, allergiesKept}` (§0.5.2) and has no member for a day
+ * index, so these values travel on {@link NoMatchingMealsError} for logs and
+ * for the analysis, and never into a response.
+ */
+export interface PlanSearchDiagnostics {
+    exhausted: boolean;
+    exhaustedBy: PlanSearchExhaustion | null;
+    /** The first day the search could not close. */
+    frontierDayIndex: number;
+    evaluations: number;
+}
+
+/**
+ * Reads one supplied budget, or falls back to the shipped policy constant.
+ *
+ * A fractional or non-positive cap is a programming fault rather than a
+ * feasibility answer — a cap of 0 would report every week as exhausted before
+ * the first placement, and a fractional one would trip at an amount no policy
+ * states — so it throws for the same reason a non-positive target does.
+ */
+const resolveEvaluationBudget = (supplied: number | undefined, fallback: number, field: string): number => {
+    if (supplied === undefined) {
+        return fallback;
+    }
+
+    if (!Number.isInteger(supplied) || supplied <= 0) {
+        throw new MealPlanInputError(
+            `${field} must be a positive integer number of evaluations, received ${String(supplied)}`,
+            field,
+        );
+    }
+
+    return supplied;
+};
 
 /**
  * Assigns every day of the week, or reports how it failed.
@@ -1176,10 +1425,29 @@ interface SearchOutcome {
  * Budgets are per day AND per plan, and the per-day counter ACCUMULATES across
  * re-entries: a day re-entered by backtracking keeps spending the same 2,000,
  * so a pathological week cannot spend 2,000 per visit and run forever. Running
- * out ends the search and is reported, never thrown.
+ * out ends the search and is reported, never thrown. The two guards are
+ * evaluated SEPARATELY and the outcome names the one that fired, because
+ * "exhausted" on its own cannot distinguish one day hitting its wall from the
+ * week spending everything it had — see {@link PlanSearchBudget} for why the
+ * caps are a parameter at all.
+ *
+ * Exported so the guards, the frontier and the evaluation count are observable
+ * without reaching through {@link generateWeeklyPlan}; the analysis probes call
+ * it too, so there is exactly one search.
  */
-const searchWeek = (input: SearchInput): SearchOutcome => {
+export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
     const { dates, slots, candidatesBySlot, targets, userBudgetTier, shouldAbort } = input;
+
+    const perDayBudget = resolveEvaluationBudget(
+        input.budget?.perDay,
+        MAX_EVALUATIONS_PER_DAY,
+        'budget.perDay',
+    );
+    const perPlanBudget = resolveEvaluationBudget(
+        input.budget?.perPlan,
+        MAX_EVALUATIONS_PER_PLAN,
+        'budget.perPlan',
+    );
 
     const placed: PlannedMealAssignment[][] = dates.map(() => []);
     const dayRecipeIds: Set<string>[] = dates.map(() => new Set<string>());
@@ -1194,6 +1462,7 @@ const searchWeek = (input: SearchInput): SearchOutcome => {
     let evaluations = 0;
     let frontierDayIndex = 0;
     let exhausted = false;
+    let exhaustedBy: PlanSearchExhaustion | null = null;
     let aborted = false;
 
     const addFoods = (candidate: PlanCandidate): void => {
@@ -1322,11 +1591,19 @@ const searchWeek = (input: SearchInput): SearchOutcome => {
                 return false;
             }
 
-            if (
-                evaluationsPerDay[dayIndex] >= MAX_EVALUATIONS_PER_DAY ||
-                evaluations >= MAX_EVALUATIONS_PER_PLAN
-            ) {
+            // The day guard is asked first because it is the narrower claim: a
+            // day that has spent its own allowance is the wall the user hit,
+            // whatever the week has left. Only once this day still has room
+            // does the plan-wide allowance decide.
+            if (evaluationsPerDay[dayIndex] >= perDayBudget) {
                 exhausted = true;
+                exhaustedBy = 'day';
+                return false;
+            }
+
+            if (evaluations >= perPlanBudget) {
+                exhausted = true;
+                exhaustedBy = 'plan';
                 return false;
             }
 
@@ -1380,6 +1657,7 @@ const searchWeek = (input: SearchInput): SearchOutcome => {
         evaluations,
         frontierDayIndex,
         exhausted,
+        exhaustedBy,
         aborted,
     };
 };
@@ -1417,6 +1695,17 @@ export interface LimitingConstraintInput {
      * unexplained 5xx would be a strictly worse answer.
      */
     shouldAbort?: () => boolean;
+    /**
+     * What the failed search itself reported, when the caller ran one.
+     *
+     * OPTIONAL because the analysis is meaningful on its own — a caller asking
+     * "what is limiting this profile?" has no search to report — and a call
+     * without it reaches exactly the verdict it always did. Supplied, it adds
+     * the one fact the catalog counts cannot express: the search ran out of
+     * evaluations, so the numbers ARE implicated even where a slot is thin
+     * (§0.7.3).
+     */
+    diagnostics?: PlanSearchDiagnostics;
 }
 
 /** The next cooking-time tier above a limit, or null when there is no higher tier. */
@@ -1492,7 +1781,13 @@ const dislikeSelectionCount = (preferences: PlanGenerationPreferences): number =
  *      claim about that preference alone — makes the week feasible:
  *      `cooking_time` (next tier up), `dislikes` (ignored), `diet` (none).
  *   4. `nutrition_tolerance` — eligibility held but no combination met the day
- *      bands, including the case where the evaluation budget ran out.
+ *      bands, OR the search ran out of evaluations, which the caller reports
+ *      through {@link LimitingConstraintInput.diagnostics}. Exhaustion is the
+ *      reason this row is not conditional on coverage alone: a slot holding one
+ *      to three recipes AND a budget that ran out is a week whose numbers were
+ *      never settled, and §0.7.3 requires the exhausted case to say so rather
+ *      than blaming the catalog by itself. Exhaustion does NOT reopen the row
+ *      for a slot at ZERO recipes, where no target could have closed the week.
  *   5. `portion_limits` — a wider portion set would have closed the week, so the
  *      offered multipliers were the binding constraint.
  *
@@ -1508,7 +1803,7 @@ const dislikeSelectionCount = (preferences: PlanGenerationPreferences): number =
  * nothing to act on is not an answer.
  */
 export const analyzeLimitingConstraints = (input: LimitingConstraintInput): LimitingConstraint[] => {
-    const { seedInputs, preferences, targets, recipes, shouldAbort } = input;
+    const { seedInputs, preferences, targets, recipes, shouldAbort, diagnostics } = input;
 
     const seed = derivePlanSeed(seedInputs);
     const dates = planDatesFrom(seedInputs.startDate);
@@ -1518,27 +1813,89 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
         preferences.meal_schedule,
     );
 
-    const probeFeasible = (
-        probePreferences: PlanGenerationPreferences,
-        portionPolicy: PortionPolicy,
-    ): boolean => {
-        const slots = resolveSlotSchedule(probePreferences.meal_schedule, probePreferences.meal_times);
-        const candidates = buildPlanCandidates(recipes, probePreferences, seed, portionPolicy);
-
-        return (
-            searchWeek({
-                dates,
-                slots,
-                candidatesBySlot: groupCandidatesBySlot(candidates, probePreferences, slots, portionPolicy),
-                targets,
-                userBudgetTier,
-                shouldAbort,
-            }).days !== null
-        );
-    };
-
     const slots = resolveSlotSchedule(preferences.meal_schedule, preferences.meal_times);
     const candidates = buildPlanCandidates(recipes, preferences, seed);
+
+    // The baseline's ranks and its per-slot admitted sets, resolved once. Every
+    // probe is judged against these two: the ranks so a shared candidate cannot
+    // move, and the admitted sets so a row is only emitted when the relaxation
+    // was actually used.
+    const baselineRanks = baselineCandidateRanks(candidates);
+    const baselineAdmittedBySlot = new Map<MealSlot, Set<string>>(
+        slots.map((slot) => [
+            slot.slot,
+            new Set(
+                candidatesForSlot(candidates, preferences, slot.slot, DEFAULT_PORTION_POLICY).map(
+                    planCandidateIdentity,
+                ),
+            ),
+        ]),
+    );
+
+    /** The week a counterfactual admits, or null when it admits none. */
+    const probeWeek = (
+        probePreferences: PlanGenerationPreferences,
+        portionPolicy: PortionPolicy,
+    ): PlannedMealAssignment[][] | null => {
+        const probeSlots = resolveSlotSchedule(
+            probePreferences.meal_schedule,
+            probePreferences.meal_times,
+        );
+        const probeCandidates = buildPlanCandidates(
+            recipes,
+            probePreferences,
+            seed,
+            portionPolicy,
+            baselineRanks,
+        );
+
+        return searchPlanWeek({
+            dates,
+            slots: probeSlots,
+            candidatesBySlot: groupCandidatesBySlot(
+                probeCandidates,
+                probePreferences,
+                probeSlots,
+                portionPolicy,
+            ),
+            targets,
+            userBudgetTier,
+            shouldAbort,
+        }).days;
+    };
+
+    /**
+     * Whether the probe's week actually USED something only the relaxation
+     * admitted — at least one placed meal whose `(slot, portable identity)` the
+     * baseline could not have offered.
+     *
+     * The reason a probe's success is not evidence on its own: the probe
+     * searches a larger candidate set under a bounded budget, so it can reach a
+     * week built entirely from baseline candidates that the baseline search had
+     * not got to. Emitting a row from that would tell the user their diet, or
+     * their dislikes, is what stands between them and a plan when it is not.
+     * The witness is what makes each row a claim about its own preference.
+     */
+    const placesNewlyAdmittedMeal = (week: readonly PlannedMealAssignment[][]): boolean =>
+        week.some((day) =>
+            day.some((meal) => {
+                const admitted = baselineAdmittedBySlot.get(meal.slot);
+
+                return (
+                    admitted === undefined ||
+                    !admitted.has(
+                        portableCandidateIdentity(meal.slug, meal.version, meal.portionMultiplier),
+                    )
+                );
+            }),
+        );
+
+    /** One relaxed preference, reported only when its week needed the relaxation. */
+    const relaxationOpensTheWeek = (probePreferences: PlanGenerationPreferences): boolean => {
+        const week = probeWeek(probePreferences, DEFAULT_PORTION_POLICY);
+
+        return week !== null && placesNewlyAdmittedMeal(week);
+    };
 
     const emptySlots: MealSlot[] = [];
     const thinSlots: MealSlot[] = [];
@@ -1581,7 +1938,7 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
     if (
         preferences.cooking_time_limit_min !== null &&
         relaxedCookingTime !== null &&
-        probeFeasible({ ...preferences, cooking_time_limit_min: relaxedCookingTime }, DEFAULT_PORTION_POLICY)
+        relaxationOpensTheWeek({ ...preferences, cooking_time_limit_min: relaxedCookingTime })
     ) {
         constraints.push({
             constraintKey: 'cooking_time',
@@ -1594,10 +1951,7 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
 
     if (
         dislikeSelectionCount(preferences) > 0 &&
-        probeFeasible(
-            { ...preferences, disliked_food_ids: [], disliked_food_groups: [] },
-            DEFAULT_PORTION_POLICY,
-        )
+        relaxationOpensTheWeek({ ...preferences, disliked_food_ids: [], disliked_food_groups: [] })
     ) {
         constraints.push({
             constraintKey: 'dislikes',
@@ -1611,7 +1965,7 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
     if (
         preferences.diet !== null &&
         preferences.diet !== 'none' &&
-        probeFeasible({ ...preferences, diet: 'none' }, DEFAULT_PORTION_POLICY)
+        relaxationOpensTheWeek({ ...preferences, diet: 'none' })
     ) {
         constraints.push({
             constraintKey: 'diet',
@@ -1630,24 +1984,59 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
         editStep: 'goal',
     };
 
-    // Reported only when eligibility actually HELD — the condition the row
-    // claims. With a slot empty or thin, the numbers were never the reason the
-    // week failed, and saying they were would send the user to change a target
-    // that would not have helped.
-    if (emptySlots.length === 0 && thinSlots.length === 0) {
+    // Two ways to earn this row, and the second is why the search's diagnostics
+    // travel here at all. Eligibility HOLDING is the condition the row claims,
+    // so with a slot thin the numbers were not the demonstrated reason the week
+    // failed and saying they were would send the user to change a target that
+    // would not have helped. But an EXHAUSTED search never settled that
+    // question: it stopped mid-answer, so the day bands are still an open
+    // reason even where a slot is thin, and §0.7.3 requires the exhausted case
+    // to report the tolerance for the day the search could not close. The
+    // frontier day itself cannot ride in this row — `slots` is a list of slots,
+    // never a day — so it travels on the error beside the rows.
+    //
+    // A SLOT AT ZERO IS THE ONE CASE EXHAUSTION DOES NOT REOPEN, and it is
+    // reachable: a slot with no recipes still lets the other slots spend the
+    // whole per-day allowance being placed and unplaced, so the search reports
+    // exhaustion for a week that no target would ever have closed. The bands
+    // cannot be "an open reason" for a slot nothing can fill, so the honest
+    // answer there is `slot_coverage` alone.
+    if (emptySlots.length === 0 && (thinSlots.length === 0 || diagnostics?.exhausted === true)) {
         constraints.push(nutritionToleranceRow);
     }
 
     // Likewise only meaningful once every slot has recipes: with a slot at zero,
     // no portion of anything closes the week.
-    if (emptySlots.length === 0 && probeFeasible(preferences, EXTENDED_PORTION_POLICY)) {
-        constraints.push({
-            constraintKey: 'portion_limits',
-            value: null,
-            unit: null,
-            slots: [],
-            editStep: 'goal',
-        });
+    if (emptySlots.length === 0) {
+        const widerWeek = probeWeek(preferences, EXTENDED_PORTION_POLICY);
+
+        // TWO witnesses, and the multiplier one is written out rather than
+        // inferred from the identity set, because it is the row's actual claim:
+        // the week closed at a portion the product does not offer. The wider
+        // set also contains every offered multiplier, so a week that closes on
+        // those alone says nothing about the portions — it says the baseline
+        // search had not reached that week yet, which is a different problem
+        // and not one the user can act on by resizing a meal.
+        if (
+            widerWeek !== null &&
+            widerWeek.some((day) =>
+                day.some(
+                    (meal) =>
+                        !portionMultipliersForSlot(meal.slot, DEFAULT_PORTION_POLICY).includes(
+                            meal.portionMultiplier,
+                        ),
+                ),
+            ) &&
+            placesNewlyAdmittedMeal(widerWeek)
+        ) {
+            constraints.push({
+                constraintKey: 'portion_limits',
+                value: null,
+                unit: null,
+                slots: [],
+                editStep: 'goal',
+            });
+        }
     }
 
     // The three cases above are exhaustive — a slot at zero pushes
@@ -1693,7 +2082,9 @@ export interface GeneratePlanRequest {
  *  - {@link NoMatchingMealsError} when it finished and no week exists, carrying
  *    the constraints to act on. An exhausted evaluation budget is THIS case, not
  *    the first: the search completed within the bounds it was given and the
- *    honest report is that these preferences do not admit a week.
+ *    honest report is that these preferences do not admit a week. The error also
+ *    carries the search's own diagnostics — which guard ran out, and the day it
+ *    could not close — for the logs, never for the response body.
  *
  * {@link MealPlanInputError} escapes for input that could not be planned from at
  * all (a non-positive target, a malformed date, a slot with no saved time).
@@ -1716,7 +2107,7 @@ export const generateWeeklyPlan = (request: GeneratePlanRequest): GeneratedPlan 
     );
     const candidates = buildPlanCandidates(recipes, preferences, seed);
 
-    const outcome = searchWeek({
+    const outcome = searchPlanWeek({
         dates,
         slots,
         candidatesBySlot: groupCandidatesBySlot(candidates, preferences, slots, DEFAULT_PORTION_POLICY),
@@ -1730,8 +2121,31 @@ export const generateWeeklyPlan = (request: GeneratePlanRequest): GeneratedPlan 
     }
 
     if (!outcome.days) {
+        // The search's own report of HOW it failed is carried into the
+        // analysis and onto the error rather than discarded. Without it an
+        // exhausted budget is indistinguishable from a settled infeasibility,
+        // and a thin slot would be reported as the whole story while the
+        // numbers were never actually tested (§0.7.3).
+        const diagnostics: PlanSearchDiagnostics = {
+            exhausted: outcome.exhausted,
+            exhaustedBy: outcome.exhaustedBy,
+            frontierDayIndex: outcome.frontierDayIndex,
+            evaluations: outcome.evaluations,
+        };
+
         throw new NoMatchingMealsError(
-            analyzeLimitingConstraints({ seedInputs, preferences, targets, recipes, shouldAbort }),
+            analyzeLimitingConstraints({
+                seedInputs,
+                preferences,
+                targets,
+                recipes,
+                shouldAbort,
+                diagnostics,
+            }),
+            {
+                ...diagnostics,
+                frontierDate: addDaysToDayKey(seedInputs.startDate, diagnostics.frontierDayIndex),
+            },
         );
     }
 
@@ -1809,11 +2223,25 @@ export const isPlanWritable = (plan: PlanLifecycleState, today: string): boolean
  */
 export const requireWritablePlan = <T extends PlanLifecycleState>(plan: T, today: string): T => {
     if (!isPlanActiveStatus(plan)) {
-        throw new PlanNotActiveError(plan.replacement_plan_id ?? undefined, undefined);
+        // Answered only with the successor's id, because following it is the
+        // entire purpose of this variant. Regeneration links the successor in
+        // the same transaction that supersedes the old plan, so an unresolved
+        // one is a caller that did not read the reverse link, or data that
+        // contradicts itself — louder than a 409 that omits the id, and never a
+        // false `reason: 'ended'`.
+        if (!plan.replacement_plan_id) {
+            throw new MealPlanInputError(
+                `plan ${plan.id} is stored '${plan.status}' but no replacement plan was resolved; ` +
+                    'a superseded plan always has a successor',
+                'replacement_plan_id',
+            );
+        }
+
+        throw new PlanNotActiveError({ replacementPlanId: plan.replacement_plan_id });
     }
 
     if (isPlanEnded(plan, today)) {
-        throw new PlanNotActiveError(undefined, ENDED_REASON);
+        throw new PlanNotActiveError({ reason: ENDED_REASON });
     }
 
     return plan;

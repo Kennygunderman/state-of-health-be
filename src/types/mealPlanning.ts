@@ -244,11 +244,28 @@ export interface PreferencesUpdatePayload {
     expectedRevision: number;
 }
 
-// Carried by every per-step payload. expectedRevision is optional only while no
-// preferences row exists — the very first 'goal' save — and is required and
-// exact from then on; preferences.logic.ts answers 409 stale_revision when it is
-// missing or mismatched after creation. A type cannot express "optional until a
-// row exists", so it is optional here and the rule lives in this comment.
+// Carried by every per-step payload. expectedRevision is optional only for the
+// very first 'goal' save, which is the one that creates the preferences row,
+// and is required and exact from then on; preferences.logic.ts answers 409
+// stale_revision when it is missing or mismatched after creation, and refuses
+// any OTHER step that arrives before the row exists. A type cannot express
+// "optional until a row exists", so it is optional here and the rule lives in
+// this comment.
+//
+// Each step payload below is also a CLOSED key set, exactly like
+// PreferencesUpdatePayload above: preferences.logic.ts accepts a step body's
+// own keys only from that step's own interface plus the two envelope keys, and
+// rejects every other key — server-owned, unknown or misspelled — with 400
+// invalid_request and code 'read_only_field'. Adding a key to one of these
+// interfaces is therefore how a step comes to accept it; the parser's table is
+// typed against these declarations so the two cannot drift apart.
+//
+// For the body step, whose payload is the discriminated union below, the closed
+// set is the set of the BRANCH the body selects, not the union of both:
+// `skipped: true` accepts the discriminant alone, so a measurement sent
+// alongside Skip is refused rather than accepted and discarded by the parser's
+// early return. Anything other than `skipped: true` selects the measured
+// branch, which owns the discriminant's own type check.
 export interface SetupStepEnvelope {
     timeZone: string; // IANA zone name
     expectedRevision?: number;
@@ -944,6 +961,18 @@ export interface StaleRevisionCounterErrorData {
     currentRevision: number;
 }
 
+// 409 stale_revision, in its two forms, and the payload a thrower supplies. The
+// plan routes (POST /plans, POST /plans/:planId/regenerate) pin both counters
+// at once and answer StaleRevisionErrorData; the preference routes
+// (PUT /preferences, PUT /preferences/steps/:step) pin one and answer
+// StaleRevisionCounterErrorData. `?: never` on the other form's members adds
+// nothing to the wire body and nothing to the emitted JS: it is what makes
+// "exactly one form" a compile-time fact, so a payload mixing the two forms —
+// or carrying neither — does not typecheck.
+export type StaleRevisionErrorPayload =
+    | (StaleRevisionErrorData & { currentRevision?: never })
+    | (StaleRevisionCounterErrorData & { preferencesRevision?: never; targetsRevision?: never });
+
 // 409 stale_targets. Carries the authoritative revision so the client can
 // re-read, compare against its draft, and resolve silently when they already
 // agree.
@@ -956,7 +985,21 @@ export interface StalePlanErrorData {
     currentRevision: number;
 }
 
-// A regeneration replaced this plan; the client follows the replacement.
+// A regeneration replaced this plan; the client follows the replacement, which
+// is the whole point of the variant — so the id is a required, non-nullable
+// string rather than a member that may be absent or null. That is an invariant
+// of the write path and not an optimistic assumption: regeneration creates the
+// successor and links `meal_plans.replaced_plan_id` to the plan it supersedes in
+// the SAME transaction, so every superseded plan has exactly one successor and
+// it is always resolvable (through the reverse link, since the column lives on
+// the new plan).
+//
+// A caller holding a superseded plan whose successor it cannot resolve is
+// therefore reading contradictory data, not a legitimate state, and must fail
+// loudly through its own module's data-integrity error — emitting `null` here
+// would answer a documented 409 with a body that does not carry what the
+// variant promises, and answering `reason: 'ended'` instead would state
+// something false about the plan's dates.
 export interface PlanSupersededErrorData {
     replacementPlanId: string;
 }
@@ -966,8 +1009,14 @@ export interface PlanEndedErrorData {
     reason: 'ended';
 }
 
-// 409 plan_not_active, in its two forms. The members discriminate the variants.
-export type PlanNotActiveErrorData = PlanSupersededErrorData | PlanEndedErrorData;
+// 409 plan_not_active, in its two forms. The members discriminate the variants,
+// and `?: never` on the opposite variant's member is what makes the choice
+// exclusive: it adds nothing to the wire body and nothing to the emitted JS,
+// while turning "exactly one variant" into a compile-time fact at the throw
+// site — a payload carrying both members, or neither, does not typecheck.
+export type PlanNotActiveErrorData =
+    | (PlanSupersededErrorData & { reason?: never })
+    | (PlanEndedErrorData & { replacementPlanId?: never });
 
 // 409 plan_overlap — the requested week collides with an existing active plan.
 export interface PlanOverlapErrorData {

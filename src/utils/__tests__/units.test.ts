@@ -286,6 +286,15 @@ describe('toBaseQuantity — count and edge cases', () => {
         expect(() => toBaseQuantity(amount, 'g')).toThrow(UnitConversionError);
         expect(() => toBaseQuantity(amount, 'g')).toThrow('quantity must be a finite number');
     });
+
+    // A finite quantity times a finite factor is not necessarily finite: 1e308 g
+    // is a valid double and 1e308 kg is not. Returning Infinity would send a
+    // quantity onward to be aggregated, compared or stored as a number nothing
+    // downstream behaves sensibly against.
+    it('throws when a finite quantity converts out of range', () => {
+        expect(() => toBaseQuantity(1e308, 'kg')).toThrow(UnitConversionError);
+        expect(() => toBaseQuantity(1e308, 'kg')).toThrow('is not a finite quantity');
+    });
 });
 
 describe('millilitersToGrams', () => {
@@ -317,6 +326,16 @@ describe('millilitersToGrams', () => {
 
     it.each(NON_FINITE_QUANTITIES)('throws for a %s quantity', (_case, milliliters) => {
         expect(() => millilitersToGrams(milliliters, 1)).toThrow('millilitres must be a finite number');
+    });
+
+    // The volume and the density are each finite and each usable; their product
+    // is not. Catalog validation distinguishes this from a missing density by
+    // the density it handed in, so the two faults must stay distinguishable
+    // here too — same error type, different message.
+    it('throws when a finite volume and density multiply out of range', () => {
+        expect(() => millilitersToGrams(1e308, 10)).toThrow(UnitConversionError);
+        expect(() => millilitersToGrams(1e308, 10)).toThrow('is not a finite quantity');
+        expect(() => millilitersToGrams(1e308, 10)).not.toThrow('density_g_per_ml is required');
     });
 
     it('reports the failure as a UnitConversionError by name', () => {
@@ -357,6 +376,12 @@ describe('gramsToMilliliters', () => {
 
     it.each(NON_FINITE_QUANTITIES)('throws for a %s quantity', (_case, grams) => {
         expect(() => gramsToMilliliters(grams, 1)).toThrow('grams must be a finite number');
+    });
+
+    // A denormal density is positive and finite, and dividing by it overflows.
+    it('throws when a finite mass divides out of range', () => {
+        expect(() => gramsToMilliliters(1e308, 5e-324)).toThrow(UnitConversionError);
+        expect(() => gramsToMilliliters(1e308, 5e-324)).toThrow('is not a finite quantity');
     });
 
     it('reports the failure as a UnitConversionError by name', () => {

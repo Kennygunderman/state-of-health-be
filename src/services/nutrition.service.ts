@@ -14,9 +14,9 @@ import {
     UpdateMealEntryPayload,
 } from '../types/nutrition';
 import { CatalogFoodNotFoundError } from './mealPlanning.errors';
+import { PLANNED_INPUT_METHOD, resolveLegacyInputMethod } from './nutrition.logic';
 
 const DEFAULT_MEALS = ['Breakfast', 'Lunch', 'Dinner', 'Snack'];
-const INPUT_METHODS = ['library', 'search', 'ai_text', 'ai_photo', 'meal_plan'];
 
 const NUTRITION_PROVENANCES: NutritionProvenance[] = [
     'source_backed',
@@ -197,8 +197,11 @@ export const logMealEntry = async (
         }
     }
 
-    const inputMethod =
-        payload.inputMethod && INPUT_METHODS.includes(payload.inputMethod) ? payload.inputMethod : 'library';
+    // Resolved, never taken as given: the method arrives from the request, and
+    // the ones the server writes on its own authority — 'meal_plan' above all,
+    // the field the diary reads as "From meal plan" — are not among those a body
+    // may choose. Anything unusable becomes 'library', as it always has.
+    const inputMethod = resolveLegacyInputMethod(payload.inputMethod);
     const entry = await prisma.meal_entries.create({
         data: {
             meal_id: mealId,
@@ -420,7 +423,10 @@ export const insertPlannedMealEntry = async (
             protein_g: Math.round(params.perServing.protein),
             carbs_g: Math.round(params.perServing.carbs),
             fat_g: Math.round(params.perServing.fat),
-            input_method: 'meal_plan',
+            // The only place this value is written. No request can ask for it:
+            // `resolveLegacyInputMethod` keeps it off the legacy path, and the
+            // catalog writer stamps 'search'.
+            input_method: PLANNED_INPUT_METHOD,
             // Planning admits only source-backed ingredients, so a planned meal
             // is never an estimate.
             nutrition_provenance: 'source_backed',

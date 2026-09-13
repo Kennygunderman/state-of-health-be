@@ -25,13 +25,19 @@
  *     row additionally asserts that the module's `parseCidr` agrees with an
  *     independently written text parser, so the two derivations cannot drift
  *     together.
- *  3. **The document and the code counter-sign each other.** The JSON's
+ *  3. **Three sources counter-sign each other.** The JSON's
  *     `allowlistVersion`, `registrySnapshot` and row set are asserted against
  *     `REVIEWED_ALLOWLIST_VERSION`, `REVIEWED_REGISTRY_SNAPSHOT` and
- *     `REVIEWED_RANGE_TABLE`, in both directions and per row, so refreshing one
- *     without the other turns this suite red. `docs/meal-planning/catalog-policy.md`
- *     is the third place §0.3.2 wants that pair recorded; it does not exist in
- *     this revision, so the cross-check here is JSON ↔ module only.
+ *     `REVIEWED_RANGE_TABLE`, in both directions and per row; and both are
+ *     asserted against the values transcribed independently into
+ *     `docs/meal-planning/catalog-policy.md`, which §0.3.2 names as the third
+ *     place the snapshot date and the row counts are recorded. The document is
+ *     read off disk and its attestation block parsed strictly — a missing
+ *     document, an absent marker, an unknown key or an unparsable count fails
+ *     loudly rather than skipping the cross-check — and every comparison prints
+ *     all three values labelled by their file, so a red run says which source
+ *     disagreed. Refreshing the registries is therefore three coordinated
+ *     edits, any one of which alone turns this suite red.
  *
  * Everything in the module is pure, so nothing below is mocked: each predicate
  * takes its policy data as an argument, and the tests hand it real or
@@ -59,7 +65,10 @@ import {
     REVIEWED_ALLOWLIST_VERSION,
     REVIEWED_RANGE_ROW_COUNT,
     REVIEWED_RANGE_TABLE,
+    REVIEWED_REGISTRY_ROW_COUNT,
     REVIEWED_REGISTRY_SNAPSHOT,
+    REVIEWED_SUPPLEMENTAL_CIDRS,
+    REVIEWED_SUPPLEMENTAL_ROW_COUNT,
     SpecialPurposeRange,
     addressAfter,
     addressBefore,
@@ -123,6 +132,185 @@ const committedPolicy: EvidencePolicy = (() => {
 
 const committedRows: readonly SpecialPurposeRange[] = committedPolicy.specialPurposeRanges;
 const committedHostClasses: readonly EvidenceHostClass[] = committedPolicy.hostClasses;
+
+// ---------------------------------------------------------------------------
+// The reviewed policy record.
+//
+// `docs/meal-planning/catalog-policy.md` carries the snapshot date and the row
+// counts transcribed by the reviewer, independently of both the JSON and this
+// module. That is the third signature §0.3.2 asks for, and the reason it has to
+// exist: the JSON and the module can be edited together in one commit, and two
+// signatures that always move together are one signature.
+//
+// Everything below is read off disk and parsed strictly. A document that is
+// missing, or whose block cannot be parsed, fails this suite rather than
+// quietly reducing the cross-check to JSON ↔ module — which is the exact state
+// this attestation existed to leave behind.
+// ---------------------------------------------------------------------------
+
+const POLICY_DOC_RELATIVE_PATH = 'docs/meal-planning/catalog-policy.md';
+const POLICY_DOC_PATH = join(__dirname, '..', '..', '..', 'docs', 'meal-planning', 'catalog-policy.md');
+
+const ATTESTATION_BEGIN = '<!-- BEGIN EVIDENCE ALLOWLIST ATTESTATION -->';
+const ATTESTATION_END = '<!-- END EVIDENCE ALLOWLIST ATTESTATION -->';
+
+/** One supplemental block as the record states it: the block, and why it is carried. */
+interface RecordedSupplementalBlock {
+    readonly cidr: string;
+    readonly reason: string;
+}
+
+/** The attestation block of `catalog-policy.md`, parsed. */
+interface RecordedAttestation {
+    readonly allowlistVersion: string;
+    readonly registrySnapshot: string;
+    readonly totalRows: number;
+    readonly registryRows: number;
+    readonly supplementalRows: number;
+    readonly supplementalBlocks: readonly RecordedSupplementalBlock[];
+}
+
+const recordError = (detail: string): Error =>
+    new Error(
+        `${POLICY_DOC_RELATIVE_PATH} ${detail}. It is the third signature of the evidence allowlist ` +
+            'attestation (Agent Action Plan §0.3.2): without it, data/meal-planning/evidence-allowlist.v1.json ' +
+            'and src/services/evidence.logic.ts counter-sign only each other, and a refresh of one can be ' +
+            'matched by an edit to the other with this suite staying green.',
+    );
+
+/**
+ * The record, read off disk. Takes its path so the absent-document failure is
+ * exercised below against a path that really is absent, rather than asserted
+ * about code nothing ever runs.
+ */
+const readPolicyRecord = (path: string = POLICY_DOC_PATH): string => {
+    try {
+        return readFileSync(path, 'utf8');
+    } catch (error) {
+        throw recordError(`could not be read (${(error as Error).message})`);
+    }
+};
+
+/** The keys the block states exactly once. */
+const RECORD_SINGLE_KEYS: readonly string[] = [
+    'allowlist-version',
+    'registry-snapshot',
+    'reviewed-rows-total',
+    'registry-derived-rows',
+    'supplemental-rows',
+];
+
+const RECORD_BLOCK_KEY = 'supplemental-block';
+const RECORD_LINE_PATTERN = /^([a-z][a-z-]*):[ \t]*(\S.*)$/;
+const RECORD_COUNT_PATTERN = /^(0|[1-9]\d*)$/;
+const RECORD_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+const recordedCount = (key: string, value: string): number => {
+    if (!RECORD_COUNT_PATTERN.test(value)) {
+        throw recordError(`states "${key}: ${value}", which is not a plain non-negative integer`);
+    }
+    return Number(value);
+};
+
+/**
+ * The attestation block, parsed the way the document says it is written:
+ * delimited by the two HTML comment markers, blank and fence lines ignored,
+ * every other line `key: value`, the five single-value keys exactly once, and
+ * `supplemental-block` once per block as `<cidr> | <reason>`.
+ *
+ * Strict on purpose, and never lenient in the direction of "carry on with what
+ * parsed": an unknown key or a missing one means the reviewer wrote something
+ * this cross-check does not understand, and reading it permissively would
+ * amount to attesting a value nobody signed.
+ */
+const parseRecordedAttestation = (markdown: string): RecordedAttestation => {
+    const begin = markdown.indexOf(ATTESTATION_BEGIN);
+    const end = markdown.indexOf(ATTESTATION_END);
+
+    if (begin === -1 || end === -1) {
+        throw recordError(`carries no ${begin === -1 ? 'BEGIN' : 'END'} EVIDENCE ALLOWLIST ATTESTATION marker`);
+    }
+    if (end < begin) {
+        throw recordError('carries its END EVIDENCE ALLOWLIST ATTESTATION marker before its BEGIN marker');
+    }
+    if (markdown.indexOf(ATTESTATION_BEGIN, begin + 1) !== -1 || markdown.indexOf(ATTESTATION_END, end + 1) !== -1) {
+        throw recordError('carries more than one attestation block, so which one is the attestation is ambiguous');
+    }
+
+    const single = new Map<string, string>();
+    const supplementalBlocks: RecordedSupplementalBlock[] = [];
+
+    for (const rawLine of markdown.slice(begin + ATTESTATION_BEGIN.length, end).split('\n')) {
+        const line = rawLine.trim();
+        if (line === '' || line.startsWith('```')) {
+            continue;
+        }
+
+        const matched = RECORD_LINE_PATTERN.exec(line);
+        if (matched === null) {
+            throw recordError(`states the unreadable attestation line "${line}"`);
+        }
+
+        const [, key, value] = matched;
+
+        if (key === RECORD_BLOCK_KEY) {
+            const separator = value.indexOf('|');
+            if (separator === -1) {
+                throw recordError(`states the supplemental block "${value}" without the "|" that precedes its reason`);
+            }
+            const cidr = value.slice(0, separator).trim();
+            const reason = value.slice(separator + 1).trim();
+            if (cidr === '' || reason === '') {
+                throw recordError(`states a supplemental block with an empty ${cidr === '' ? 'CIDR' : 'reason'}`);
+            }
+            supplementalBlocks.push({ cidr, reason });
+            continue;
+        }
+
+        if (RECORD_SINGLE_KEYS.indexOf(key) === -1) {
+            throw recordError(`states the unknown attestation key "${key}"`);
+        }
+        if (single.has(key)) {
+            throw recordError(`states "${key}" more than once`);
+        }
+        single.set(key, value.trim());
+    }
+
+    for (const key of RECORD_SINGLE_KEYS) {
+        if (!single.has(key)) {
+            throw recordError(`does not state "${key}"`);
+        }
+    }
+
+    const registrySnapshot = single.get('registry-snapshot') as string;
+    if (!RECORD_DATE_PATTERN.test(registrySnapshot)) {
+        throw recordError(`states the registry snapshot "${registrySnapshot}", which is not a YYYY-MM-DD date`);
+    }
+
+    return {
+        allowlistVersion: single.get('allowlist-version') as string,
+        registrySnapshot,
+        totalRows: recordedCount('reviewed-rows-total', single.get('reviewed-rows-total') as string),
+        registryRows: recordedCount('registry-derived-rows', single.get('registry-derived-rows') as string),
+        supplementalRows: recordedCount('supplemental-rows', single.get('supplemental-rows') as string),
+        supplementalBlocks,
+    };
+};
+
+const recordedAttestation: RecordedAttestation = parseRecordedAttestation(readPolicyRecord());
+
+/**
+ * One attested value from all three sources, labelled by the file it came from,
+ * so a mismatch prints which source disagreed instead of two anonymous values.
+ */
+const threeWay = <T>(record: T, json: T, code: T): Record<string, T> => ({
+    [POLICY_DOC_RELATIVE_PATH]: record,
+    'data/meal-planning/evidence-allowlist.v1.json': json,
+    'src/services/evidence.logic.ts': code,
+});
+
+/** What agreement looks like: the same value from all three. */
+const agreedOn = <T>(value: T): Record<string, T> => threeWay(value, value, value);
 
 // ---------------------------------------------------------------------------
 // The independent oracle.
@@ -332,10 +520,57 @@ describe('the committed evidence allowlist and the reviewed attestation', () => 
         expect(committedPolicy.registrySnapshot).toBe('2026-09-08');
     });
 
-    it('carries exactly the reviewed number of rows, and says so in rowCount', () => {
+    it('carries exactly the reviewed number of address rows, and says so in rowCount', () => {
+        // 52 is the whole reviewed table — registry-derived rows plus the
+        // supplemental hardening rows — and not a count of registry entries.
+        // The two halves are asserted independently below.
         expect(committedRows.length).toBe(REVIEWED_RANGE_ROW_COUNT);
         expect(committedPolicy.rowCount).toBe(REVIEWED_RANGE_ROW_COUNT);
         expect(committedPolicy.rowCount).toBe(52);
+    });
+
+    it('states the registry-derived and supplemental counts separately, and they add up', () => {
+        // The distinction is load-bearing for a refresh: the registry-derived
+        // figure is what a reviewer diffs against the two IANA registry pages,
+        // and it would be wrong by one if `::/96` — which the registries do not
+        // list — were counted into it.
+        expect(committedPolicy.registryRowCount).toBe(REVIEWED_REGISTRY_ROW_COUNT);
+        expect(committedPolicy.registryRowCount).toBe(51);
+        expect(committedPolicy.supplementalRowCount).toBe(REVIEWED_SUPPLEMENTAL_ROW_COUNT);
+        expect(committedPolicy.supplementalRowCount).toBe(1);
+        expect(committedPolicy.registryRowCount + committedPolicy.supplementalRowCount).toBe(
+            committedPolicy.rowCount,
+        );
+    });
+
+    it('names the supplemental blocks, and carries every one of them in the table', () => {
+        // Exactly `::/96`: RFC 4291's deprecated IPv4-Compatible prefix, carried
+        // because `unwrapEmbeddedIpv4` unwraps it and `::a9fe:a9fe` must not
+        // outflank `169.254.0.0/16`.
+        expect(committedPolicy.supplementalCidrs).toStrictEqual(['::/96']);
+        expect(REVIEWED_SUPPLEMENTAL_CIDRS).toStrictEqual(['::/96']);
+
+        for (const cidr of committedPolicy.supplementalCidrs) {
+            expect(committedRows.map((row) => row.cidr)).toContain(cidr);
+        }
+    });
+
+    it('counts the registry-derived rows as the table minus the supplemental ones', () => {
+        // Derived from the document, not from a remembered number: whichever
+        // rows the supplemental list names, the rest are registry-derived.
+        const supplemental = committedRows.filter(
+            (row) => committedPolicy.supplementalCidrs.indexOf(row.cidr) !== -1,
+        );
+        const registryDerived = committedRows.filter(
+            (row) => committedPolicy.supplementalCidrs.indexOf(row.cidr) === -1,
+        );
+
+        expect(supplemental).toHaveLength(committedPolicy.supplementalRowCount);
+        expect(registryDerived).toHaveLength(committedPolicy.registryRowCount);
+        // 26 IPv4 registry rows and 25 IPv6 ones, every supplemental block
+        // being IPv6 today.
+        expect(registryDerived.filter((row) => row.registry === 'ipv4')).toHaveLength(26);
+        expect(registryDerived.filter((row) => row.registry === 'ipv6')).toHaveLength(25);
     });
 
     it.each(asCase(committedRows))('states the reviewed reachability for %s', (_cidr, row) => {
@@ -400,6 +635,258 @@ describe('the committed evidence allowlist and the reviewed attestation', () => 
                 expect(EVIDENCE_TYPES).toContain(evidenceType);
             }
         }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// The three-way counter-signature: record ↔ document ↔ module.
+// ---------------------------------------------------------------------------
+
+describe('the reviewed policy record, the committed document and this module', () => {
+    it('agree on the allowlist version', () => {
+        expect(
+            threeWay(recordedAttestation.allowlistVersion, committedPolicy.allowlistVersion, REVIEWED_ALLOWLIST_VERSION),
+        ).toStrictEqual(agreedOn('v1'));
+    });
+
+    it('agree on the registry snapshot date', () => {
+        // §0.3.2: "a registry refresh is a reviewed data change, not a code
+        // edit". Three transcriptions of one date is what makes that true —
+        // refreshing the JSON and the module together still fails here until
+        // the reviewer has recorded the new date.
+        expect(
+            threeWay(
+                recordedAttestation.registrySnapshot,
+                committedPolicy.registrySnapshot,
+                REVIEWED_REGISTRY_SNAPSHOT,
+            ),
+        ).toStrictEqual(agreedOn('2026-09-08'));
+    });
+
+    it('agree on the total number of reviewed address rows', () => {
+        expect(
+            threeWay(recordedAttestation.totalRows, committedPolicy.rowCount, REVIEWED_RANGE_ROW_COUNT),
+        ).toStrictEqual(agreedOn(52));
+        expect(committedRows.length).toBe(recordedAttestation.totalRows);
+    });
+
+    it('agree on how many of those rows are registry-derived', () => {
+        expect(
+            threeWay(recordedAttestation.registryRows, committedPolicy.registryRowCount, REVIEWED_REGISTRY_ROW_COUNT),
+        ).toStrictEqual(agreedOn(51));
+    });
+
+    it('agree on how many are supplemental', () => {
+        expect(
+            threeWay(
+                recordedAttestation.supplementalRows,
+                committedPolicy.supplementalRowCount,
+                REVIEWED_SUPPLEMENTAL_ROW_COUNT,
+            ),
+        ).toStrictEqual(agreedOn(1));
+    });
+
+    it('agree on which blocks are supplemental', () => {
+        const recorded = recordedAttestation.supplementalBlocks.map((block) => block.cidr).sort();
+
+        expect(
+            threeWay(
+                recorded,
+                committedPolicy.supplementalCidrs.slice().sort(),
+                REVIEWED_SUPPLEMENTAL_CIDRS.slice().sort(),
+            ),
+        ).toStrictEqual(agreedOn(['::/96']));
+    });
+
+    it('records the counts consistently within the document itself', () => {
+        // The record is a transcription, so it is also checked against itself:
+        // a reviewer who updated one count and not the other is caught here
+        // rather than by arithmetic somebody has to do by hand.
+        expect(recordedAttestation.registryRows + recordedAttestation.supplementalRows).toBe(
+            recordedAttestation.totalRows,
+        );
+        expect(recordedAttestation.supplementalBlocks).toHaveLength(recordedAttestation.supplementalRows);
+    });
+
+    it('gives a reason for every supplemental block it records', () => {
+        // A block carried without a recorded reason is a hardening rule nobody
+        // reviewed, which is the state the supplemental set exists to prevent.
+        for (const block of recordedAttestation.supplementalBlocks) {
+            expect(block.reason.length).toBeGreaterThan(20);
+            expect(committedPolicy.supplementalCidrs).toContain(block.cidr);
+        }
+
+        expect(recordedAttestation.supplementalBlocks[0].reason).toContain('169.254.0.0/16');
+    });
+});
+
+describe('the parser that reads that record', () => {
+    /** The committed record with its attestation block replaced. */
+    const documentWithBlock = (body: string): string =>
+        `# heading\n\n${ATTESTATION_BEGIN}\n${body}\n${ATTESTATION_END}\n\nprose after the block\n`;
+
+    const wellFormedBody = [
+        '```text',
+        'allowlist-version: v1',
+        'registry-snapshot: 2026-09-08',
+        'reviewed-rows-total: 52',
+        'registry-derived-rows: 51',
+        'supplemental-rows: 1',
+        'supplemental-block: ::/96 | carried so an embedded form cannot outflank 169.254.0.0/16',
+        '```',
+    ].join('\n');
+
+    const bodyWithout = (key: string): string =>
+        wellFormedBody
+            .split('\n')
+            .filter((line) => !line.startsWith(`${key}:`))
+            .join('\n');
+
+    const recordDetail = (markdown: string): string => {
+        try {
+            parseRecordedAttestation(markdown);
+        } catch (error) {
+            return (error as Error).message;
+        }
+        throw new Error('expected the attestation block to be refused, but it parsed');
+    };
+
+    it('reads a well-formed block, ignoring blank and fence lines', () => {
+        const parsed = parseRecordedAttestation(documentWithBlock(`\n${wellFormedBody}\n\n`));
+
+        expect(parsed).toStrictEqual({
+            allowlistVersion: 'v1',
+            registrySnapshot: '2026-09-08',
+            totalRows: 52,
+            registryRows: 51,
+            supplementalRows: 1,
+            supplementalBlocks: [
+                {
+                    cidr: '::/96',
+                    reason: 'carried so an embedded form cannot outflank 169.254.0.0/16',
+                },
+            ],
+        });
+    });
+
+    it('reads nothing outside the markers', () => {
+        // Prose elsewhere in the document — including a sentence that mentions
+        // a row count — is not the attestation.
+        const parsed = parseRecordedAttestation(
+            `reviewed-rows-total: 9\n${documentWithBlock(wellFormedBody)}\nsupplemental-rows: 9\n`,
+        );
+
+        expect(parsed.totalRows).toBe(52);
+        expect(parsed.supplementalRows).toBe(1);
+    });
+
+    it.each([
+        ['no markers at all', '# heading\n\nno attestation here\n', 'carries no BEGIN'],
+        [
+            'no END marker',
+            `# heading\n\n${ATTESTATION_BEGIN}\n${wellFormedBody}\n`,
+            'carries no END EVIDENCE ALLOWLIST ATTESTATION marker',
+        ],
+        [
+            'its markers the wrong way round',
+            `${ATTESTATION_END}\n${wellFormedBody}\n${ATTESTATION_BEGIN}\n`,
+            'carries its END EVIDENCE ALLOWLIST ATTESTATION marker before its BEGIN marker',
+        ],
+        [
+            'two blocks',
+            `${documentWithBlock(wellFormedBody)}\n${documentWithBlock(wellFormedBody)}`,
+            'carries more than one attestation block',
+        ],
+    ])('refuses a record with %s', (_case, markdown, detail) => {
+        expect(recordDetail(markdown)).toContain(detail);
+    });
+
+    it.each(RECORD_SINGLE_KEYS)('refuses a record that does not state %s', (key) => {
+        expect(recordDetail(documentWithBlock(bodyWithout(key)))).toContain(`does not state "${key}"`);
+    });
+
+    it('refuses a record that states one key twice', () => {
+        expect(recordDetail(documentWithBlock(`${wellFormedBody}\nsupplemental-rows: 2`))).toContain(
+            'states "supplemental-rows" more than once',
+        );
+    });
+
+    it('refuses a record that states a key nothing here understands', () => {
+        expect(recordDetail(documentWithBlock(`${wellFormedBody}\nregistry-derived-row: 51`))).toContain(
+            'states the unknown attestation key "registry-derived-row"',
+        );
+    });
+
+    it('refuses a line that is not a labelled value', () => {
+        expect(recordDetail(documentWithBlock(`${wellFormedBody}\nfifty two rows were reviewed`))).toContain(
+            'states the unreadable attestation line "fifty two rows were reviewed"',
+        );
+    });
+
+    it.each(['fifty two', '52 rows', '+52', '52.0', '052', '-52', ''])(
+        'refuses the count "%s"',
+        (value) => {
+            const body = `${bodyWithout('reviewed-rows-total')}\nreviewed-rows-total: ${value}`;
+
+            // An empty value is not a labelled value at all, so it is refused a
+            // line earlier — by the shape of the line rather than by the shape
+            // of the number. Both refuse.
+            expect(recordDetail(documentWithBlock(body))).toContain(
+                value === '' ? 'states the unreadable attestation line' : 'which is not a plain non-negative integer',
+            );
+        },
+    );
+
+    it.each(['yesterday', '2026-9-8', '2026-09-08T00:00:00Z'])('refuses the snapshot date "%s"', (date) => {
+        const body = `${bodyWithout('registry-snapshot')}\nregistry-snapshot: ${date}`;
+
+        expect(recordDetail(documentWithBlock(body))).toContain(
+            `states the registry snapshot "${date}", which is not a YYYY-MM-DD date`,
+        );
+    });
+
+    it('refuses a supplemental block recorded without its reason', () => {
+        const body = `${bodyWithout('supplemental-block')}\nsupplemental-block: ::/96`;
+
+        expect(recordDetail(documentWithBlock(body))).toContain('without the "|" that precedes its reason');
+    });
+
+    it.each([
+        ['an empty reason', 'supplemental-block: ::/96 |', 'an empty reason'],
+        ['an empty CIDR', 'supplemental-block: | carried for hardening', 'an empty CIDR'],
+    ])('refuses a supplemental block with %s', (_case, line, detail) => {
+        expect(recordDetail(documentWithBlock(`${bodyWithout('supplemental-block')}\n${line}`))).toContain(detail);
+    });
+
+    it('refuses to fall back to a JSON-to-module cross-check when the record is absent', () => {
+        // The state this attestation was added to leave behind: with no record
+        // on disk the suite fails loudly instead of silently checking two of
+        // the three sources.
+        let detail = 'the absent record was read without complaint';
+        try {
+            readPolicyRecord(join(__dirname, 'catalog-policy.md.absent'));
+        } catch (error) {
+            detail = (error as Error).message;
+        }
+
+        expect(detail).toContain('could not be read');
+        expect(detail).toContain('ENOENT');
+        expect(detail).toContain('third signature');
+    });
+
+    it('reads the record that is actually committed', () => {
+        expect(readPolicyRecord()).toContain(ATTESTATION_BEGIN);
+    });
+
+    it('says what the document is for in every refusal', () => {
+        // The failure has to be legible to whoever refreshed the registries, so
+        // it names the file, what went wrong, and why the file exists.
+        const detail = recordDetail('# heading\n');
+
+        expect(detail).toContain('docs/meal-planning/catalog-policy.md');
+        expect(detail).toContain('third signature');
+        expect(detail).toContain('data/meal-planning/evidence-allowlist.v1.json');
+        expect(detail).toContain('src/services/evidence.logic.ts');
     });
 });
 
@@ -2506,9 +2993,12 @@ describe('validateEvidencePolicy on the committed document', () => {
                 'allowlistVersion',
                 'fetchLimits',
                 'hostClasses',
+                'registryRowCount',
                 'registrySnapshot',
                 'rowCount',
                 'specialPurposeRanges',
+                'supplementalCidrs',
+                'supplementalRowCount',
             ]);
             expect(verdict.policy.specialPurposeRanges).toHaveLength(REVIEWED_RANGE_ROW_COUNT);
             expect(verdict.policy.hostClasses).toHaveLength(4);
@@ -2612,6 +3102,151 @@ describe('validateEvidencePolicy on the reviewed attestation members', () => {
 
         expect(policyDetail(policyWith({ specialPurposeRanges: truncated, rowCount: truncated.length }))).toBe(
             `the address table carries ${truncated.length} rows, not the ${REVIEWED_RANGE_ROW_COUNT} reviewed at ${REVIEWED_REGISTRY_SNAPSHOT}`,
+        );
+    });
+
+    it.each([
+        ['absent', { registryRowCount: undefined }, 'undefined'],
+        ['zero', { registryRowCount: 0 }, '0'],
+        ['negative', { registryRowCount: -51 }, '-51'],
+        ['fractional', { registryRowCount: 51.5 }, '51.5'],
+        ['a string', { registryRowCount: '51' }, '"51"'],
+        ['NaN', { registryRowCount: Number.NaN }, 'NaN'],
+    ])('refuses a registryRowCount that is %s', (_case, patch, rendered) => {
+        expect(policyDetail(policyWith(patch))).toBe(
+            `the policy document declares the registry row count ${rendered}`,
+        );
+    });
+
+    it.each([
+        ['absent', { supplementalRowCount: undefined }, 'undefined'],
+        ['zero', { supplementalRowCount: 0 }, '0'],
+        ['negative', { supplementalRowCount: -1 }, '-1'],
+        ['fractional', { supplementalRowCount: 1.5 }, '1.5'],
+        ['a string', { supplementalRowCount: '1' }, '"1"'],
+        ['NaN', { supplementalRowCount: Number.NaN }, 'NaN'],
+    ])('refuses a supplementalRowCount that is %s', (_case, patch, rendered) => {
+        expect(policyDetail(policyWith(patch))).toBe(
+            `the policy document declares the supplemental row count ${rendered}`,
+        );
+    });
+
+    it('refuses counts that do not add up to the rows carried', () => {
+        // The half-merged document: one half was updated and the other was not,
+        // so the sum stops matching what is actually in the table.
+        expect(policyDetail(policyWith({ registryRowCount: REVIEWED_REGISTRY_ROW_COUNT + 1 }))).toBe(
+            `the policy document declares ${REVIEWED_REGISTRY_ROW_COUNT + 1} registry rows and ` +
+                `${REVIEWED_SUPPLEMENTAL_ROW_COUNT} supplemental rows, which do not add up to the ` +
+                `${REVIEWED_RANGE_ROW_COUNT} rows it carries`,
+        );
+    });
+
+    it('refuses a split that reclassifies a registry row as supplemental', () => {
+        // The sum still holds — one row moved from one half to the other — and
+        // that is exactly why the halves are compared with the review as well.
+        expect(
+            policyDetail(
+                policyWith({
+                    registryRowCount: REVIEWED_REGISTRY_ROW_COUNT - 1,
+                    supplementalRowCount: REVIEWED_SUPPLEMENTAL_ROW_COUNT + 1,
+                }),
+            ),
+        ).toBe(
+            `the policy document declares ${REVIEWED_REGISTRY_ROW_COUNT - 1} registry-derived rows, not the ` +
+                `${REVIEWED_REGISTRY_ROW_COUNT} reviewed at ${REVIEWED_REGISTRY_SNAPSHOT}`,
+        );
+    });
+
+    it('refuses a split that reclassifies the supplemental row as a registry row', () => {
+        // `::/96` is not an IANA registry entry, so a document counting all 52
+        // rows as registry-derived — and declaring no supplemental rows — is
+        // claiming a review that never happened. It is refused on the count
+        // before the list it would have had to empty is even read.
+        expect(
+            policyDetail(
+                policyWith({
+                    registryRowCount: REVIEWED_RANGE_ROW_COUNT,
+                    supplementalRowCount: 0,
+                    supplementalCidrs: [],
+                }),
+            ),
+        ).toBe('the policy document declares the supplemental row count 0');
+    });
+
+    it.each([
+        ['absent', { supplementalCidrs: undefined }, 'undefined'],
+        ['an empty list', { supplementalCidrs: [] }, 'a list'],
+        ['a string', { supplementalCidrs: '::/96' }, '"::/96"'],
+        ['an object', { supplementalCidrs: {} }, 'object'],
+        ['a number', { supplementalCidrs: 1 }, '1'],
+    ])('refuses a supplementalCidrs that is %s', (_case, patch, rendered) => {
+        expect(policyDetail(policyWith(patch))).toBe(`supplementalCidrs is ${rendered}, not a non-empty list`);
+    });
+
+    it.each([
+        ['a number', 96, '96'],
+        ['null', null, 'null'],
+        ['an empty string', '', '""'],
+        ['whitespace', '   ', '"   "'],
+        ['a nested list', [], 'a list'],
+    ])('refuses a supplemental entry that is %s', (_case, entry, rendered) => {
+        expect(policyDetail(policyWith({ supplementalCidrs: [entry] }))).toBe(
+            `supplementalCidrs declares ${rendered}, not a CIDR`,
+        );
+    });
+
+    it.each(['::', '::/', '::/129', 'not-a-block/96'])('refuses the unparsable supplemental entry %s', (entry) => {
+        expect(policyDetail(policyWith({ supplementalCidrs: [entry] }))).toBe(
+            `supplementalCidrs declares "${entry}", which is not a valid CIDR`,
+        );
+    });
+
+    it('refuses a supplemental list that declares one block twice', () => {
+        // Uniqueness is one of the three legs of the set-equality argument: a
+        // list could otherwise name one reviewed block twice and omit another.
+        expect(policyDetail(policyWith({ supplementalCidrs: ['::/96', '::/96'] }))).toBe(
+            'supplementalCidrs declares the block "::/96" twice',
+        );
+        expect(policyDetail(policyWith({ supplementalCidrs: ['::/96', '0:0::/96'] }))).toBe(
+            'supplementalCidrs declares the block "0:0::/96" twice',
+        );
+    });
+
+    it.each(['169.254.0.0/16', 'fc00::/7', '::ffff:0:0/96'])(
+        'refuses %s as supplemental, because the review does not class it so',
+        (cidr) => {
+            // A real registry row marked supplemental would understate the
+            // registry-derived count a reviewer checks against the registries.
+            expect(policyDetail(policyWith({ supplementalCidrs: [cidr] }))).toBe(
+                `supplementalCidrs declares "${cidr}", which the ${REVIEWED_REGISTRY_SNAPSHOT} review ` +
+                    'does not class as a supplemental block',
+            );
+        },
+    );
+
+    it('refuses a supplemental block the address table no longer carries', () => {
+        // The substitution that keeps every count intact: `::/96` is replaced
+        // by a second copy of another reviewed block, so the row count still
+        // matches and the hardening rule has silently stopped applying —
+        // nothing would match `::/96` and an embedded link-local address would
+        // read as ordinary global unicast.
+        const refusal = policyRefusal(
+            policyWith({ specialPurposeRanges: tableWithRow('::/96', { cidr: '2001:db8::/32' }) }),
+        );
+
+        expect(refusal.reason).toBe('policy_invalid');
+        expect(refusal.detail).toBe('the supplemental block "::/96" is not carried by the address table');
+    });
+
+    it('still refuses a table that dropped the supplemental row outright', () => {
+        // The same loss with the row deleted rather than substituted, which the
+        // row count sees first. Either way the document is refused; only the
+        // recorded cause differs.
+        const truncated = tableWithRow('::/96', null);
+
+        expect(policyDetail(policyWith({ specialPurposeRanges: truncated, rowCount: truncated.length }))).toBe(
+            `the address table carries ${truncated.length} rows, not the ` +
+                `${REVIEWED_RANGE_ROW_COUNT} reviewed at ${REVIEWED_REGISTRY_SNAPSHOT}`,
         );
     });
 

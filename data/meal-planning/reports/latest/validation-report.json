@@ -1,0 +1,150 @@
+{
+  "stage": "catalog-validate",
+  "generatedAt": "2026-09-13T11:36:52.694Z",
+  "runId": "6b5602c3-7ed2-4f42-abfc-347b30f1c5dd",
+  "coveragePlanVersion": "v1",
+  "options": {
+    "categories": [],
+    "revalidateQuarantined": false
+  },
+  "counts": {
+    "considered": 11983,
+    "published": 11046,
+    "quarantined": 107,
+    "rejected": 0,
+    "unchanged": 830,
+    "candidatesHeld": 830,
+    "aliasesMerged": 2,
+    "aliasRecordsRestated": 2,
+    "identityNotVerified": 0,
+    "awaitingClassification": 830
+  },
+  "failedChecks": {
+    "allergens_unknown": 11859,
+    "out_of_category_range": 1223,
+    "duplicate_identity": 107
+  },
+  "reviewFlags": {
+    "allergens_unknown": 11859,
+    "out_of_category_range": 1223
+  },
+  "duplicateIdentities": 117,
+  "coverage": {
+    "publishedTargetTotal": 11010,
+    "publishedActualTotal": 11046,
+    "shortfallTotal": 2344,
+    "publishedGapToTotal": 0,
+    "byCategory": {
+      "produce_vegetable": {
+        "published": 1424,
+        "target": 1200,
+        "shortfall": 0
+      },
+      "produce_fruit": {
+        "published": 730,
+        "target": 700,
+        "shortfall": 0
+      },
+      "protein_meat": {
+        "published": 2218,
+        "target": 700,
+        "shortfall": 0
+      },
+      "protein_poultry": {
+        "published": 499,
+        "target": 400,
+        "shortfall": 0
+      },
+      "protein_seafood": {
+        "published": 558,
+        "target": 600,
+        "shortfall": 42
+      },
+      "protein_egg": {
+        "published": 58,
+        "target": 60,
+        "shortfall": 2
+      },
+      "protein_plant": {
+        "published": 38,
+        "target": 350,
+        "shortfall": 312
+      },
+      "dairy": {
+        "published": 371,
+        "target": 600,
+        "shortfall": 229
+      },
+      "dairy_alternative": {
+        "published": 52,
+        "target": 250,
+        "shortfall": 198
+      },
+      "grain": {
+        "published": 537,
+        "target": 600,
+        "shortfall": 63
+      },
+      "bread_bakery": {
+        "published": 805,
+        "target": 500,
+        "shortfall": 0
+      },
+      "legume": {
+        "published": 297,
+        "target": 250,
+        "shortfall": 0
+      },
+      "nut_seed": {
+        "published": 293,
+        "target": 350,
+        "shortfall": 57
+      },
+      "oil_fat": {
+        "published": 152,
+        "target": 150,
+        "shortfall": 0
+      },
+      "condiment_sauce": {
+        "published": 198,
+        "target": 700,
+        "shortfall": 502
+      },
+      "spice_herb": {
+        "published": 49,
+        "target": 300,
+        "shortfall": 251
+      },
+      "beverage": {
+        "published": 432,
+        "target": 600,
+        "shortfall": 168
+      },
+      "snack": {
+        "published": 233,
+        "target": 600,
+        "shortfall": 367
+      },
+      "sweet": {
+        "published": 556,
+        "target": 500,
+        "shortfall": 0
+      },
+      "prepared_meal": {
+        "published": 1499,
+        "target": 1400,
+        "shortfall": 0
+      },
+      "other": {
+        "published": 47,
+        "target": 200,
+        "shortfall": 153
+      }
+    }
+  },
+  "modelCalls": {
+    "reserved": 0,
+    "used": 0,
+    "note": "No advisory review call was made. Every row is a USDA record whose disposition the deterministic checks settle, and the advisory review never promotes a value, so a call would spend budget without changing an outcome. llm_review is recorded as null on every record, which is the honest value for a review that did not happen."
+  }
+}

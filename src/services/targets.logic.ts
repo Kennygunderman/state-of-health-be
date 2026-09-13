@@ -230,9 +230,11 @@ export interface BoundedCalories {
     /** True exactly when `clampReason` is non-null. */
     clamped: boolean;
     /**
-     * Which bound moved the figure, or null when none did. Non-null is what
-     * drives the user-visible "adjusted for your details" caption, so a
-     * sub-kcal difference must not produce one — see `applyTargetBounds`.
+     * Which bound decided the figure, or null when the user's own details
+     * decided it. Non-null is what drives the user-visible "adjusted for your
+     * details" caption. Every bound is judged at full precision, so a
+     * shortfall of a fraction of a kcal against a bound is still that bound
+     * deciding the number — see `applyTargetBounds`.
      */
     clampReason: ClampReason | null;
 }
@@ -386,42 +388,50 @@ export const calculateGoalAdjustment = (goal: Goal, paceLbPerWeek: PaceLbPerWeek
  * the lower bounds cannot both bind; applying it last keeps the function total
  * if that ever changes.
  *
- * Bounds are compared against the ROUNDED figure, so `clamped` answers exactly
- * "is the number you see different from the number your details produced?" at
- * the precision the user sees it. A 1199.6 kcal result rounds to 1200 and is
- * reported as unclamped rather than triggering an "adjusted" caption next to a
- * number that was not visibly adjusted.
+ * EVERY BOUND IS COMPARED AT FULL PRECISION and the rounding is the last step:
+ * the bounds are `max(adjusted, sex floor, basal rate)` capped by the ceiling,
+ * taken against the unrounded adjusted value and the unrounded basal rate, and
+ * only the surviving figure is rounded to the whole kcal the app presents. A
+ * pre-rounded comparison would let a 1199.6 kcal result read as satisfying a
+ * 1200 kcal floor it does not satisfy.
+ *
+ * The rule is uniform across the three bounds — a shortfall of a fraction of a
+ * kcal is still a bound deciding the presented number rather than the user's
+ * details, so 1199.6 against the female floor reports `floor` at 1200 kcal and
+ * 1606 against a 1606.25 kcal basal rate reports `below_bmr` at 1606 kcal. That
+ * is what `clamped` claims: a bound, not your details, decided this number,
+ * which is exactly what the "adjusted for your details" caption says. It has
+ * never claimed the difference is large enough to see, and no bound gets a
+ * visibility threshold the other two do not.
  */
 export const applyTargetBounds = (
     adjustedCalories: number,
     bmr: number,
     sexForEstimate: CalculableSex,
 ): BoundedCalories => {
-    const presented = Math.round(adjustedCalories);
     const sexFloor = CALORIE_FLOOR_BY_SEX[sexForEstimate];
-    const bmrFloor = Math.round(bmr);
 
-    const raised = Math.max(presented, sexFloor, bmrFloor);
-    const calories = Math.min(raised, CALORIE_CEILING);
+    const raised = Math.max(adjustedCalories, sexFloor, bmr);
+    const bounded = Math.min(raised, CALORIE_CEILING);
 
-    const clampReason = resolveClampReason(presented, raised, calories, sexFloor, bmrFloor);
+    const clampReason = resolveClampReason(adjustedCalories, raised, bounded, sexFloor, bmr);
 
-    return { calories, clamped: clampReason !== null, clampReason };
+    return { calories: Math.round(bounded), clamped: clampReason !== null, clampReason };
 };
 
 const resolveClampReason = (
-    presented: number,
+    adjustedCalories: number,
     raised: number,
-    calories: number,
+    bounded: number,
     sexFloor: number,
-    bmrFloor: number,
+    bmr: number,
 ): ClampReason | null => {
-    if (calories < raised) {
+    if (bounded < raised) {
         return 'ceiling';
     }
 
-    if (raised > presented) {
-        return bmrFloor > sexFloor ? 'below_bmr' : 'floor';
+    if (raised > adjustedCalories) {
+        return bmr > sexFloor ? 'below_bmr' : 'floor';
     }
 
     return null;

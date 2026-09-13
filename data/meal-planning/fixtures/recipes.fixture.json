@@ -1,0 +1,2215 @@
+{
+    "fixture_version": "v1",
+    "description": "Deterministic recipe fixture for AAP 0.3.3, referentially closed against catalog-foods.fixture.json: every recipe_ingredients row resolves to a food in that file by source_key AND by catalog_food_id, and the retired catalog food is referenced by version 1 of lemon-herb-chicken-and-rice. It stands in for recipes, recipe_versions and recipe_ingredients so the recipe, planner, grocery and planned-log rules can be exercised against ONE food graph instead of four private inline ones. Every row is synthetic and its numbers are illustrative; they are never nutrition evidence and must never be loaded into a development, shadow or production database.",
+    "synthetic_data_notice": "Column names, types, closed vocabularies and unique constraints were checked against prisma/migrations/20260908000000_meal_planning/migration.sql and src/types/recipe.ts. Quantities were chosen to land on named policy boundaries (the quick badge ceiling, the 30% high-protein energy share, the 1.5/2.5 budget-tier cuts, the 5% sourced-calorie divergence), not measured.",
+    "determinism": "No value is derived from the current time and none is random. Every id is a fixed uuid-v4-shaped literal and every timestamp a fixed ISO-8601 instant. Every derived column - total_minutes, diet_tags, allergen_tags, allergen_status, nutrition_provenance, badges, budget_tier, the four per_serving_* values and sourced_calories_note - was computed by deriveRecipeVersionFields in src/services/recipe.logic.ts from the recipe_ingredients rows in this file and then accepted by validateRecipeDeclaration. Two reads of this file give byte-identical data.",
+    "secrets_policy": "This file holds no credential of any kind and no URL at all: no vendor key, no authorization header value, no database connection string and no real email address. It must never gain one.",
+    "reading_guide": {
+        "annotation_fields": "Every row may carry a 'note' field. It is documentation, not a column: a loader strips it. The other non-column fields are named under non_column_fields below.",
+        "row_shape": "Rows are snake_case database rows, not camelCase wire DTOs, so a row can be handed to recipe.logic.ts unmapped. RecipeVersionResponse in src/types/recipe.ts is the camelCase wire shape, and recipe.mapper.ts is the one place the two meet.",
+        "parent_reference": "A recipe_versions row names its recipe by recipe_slug and by the resolved recipe_id; a recipe_ingredients row names its catalog food by food_source_key - the stable key a seed file resolves, never a database id - and by the resolved catalog_food_id. Both are present so a consumer can join either way without loading the catalog fixture first.",
+        "uuid_scheme": "Uuid primary keys are deterministic and encode their table in the first group: d1000000=recipes, d2000000=recipe_versions, d3000000=recipe_ingredients. Catalog ids referenced here are c1000000=catalog_foods, as catalog-foods.fixture.json defines them. The last group is a per-table counter.",
+        "per_serving_is_derived": "per_serving_calories/protein_g/carbs_g/fat_g are SUM(gram_weight x snapshot_per_100g value / 100) / yield_servings, kept as unrounded floats. They are recomputable from the ingredient rows alone and are deliberately not pre-rounded: the rounding contract rounds once, at the diary snapshot and at display, and an early round here would make a plan card disagree with the entry it writes.",
+        "gram_weight_is_whole_recipe": "quantity and gram_weight describe the WHOLE recipe, which yields yield_servings servings. quantity x unit resolves to gram_weight through the catalog food own portions: for the unit g the two are equal, and for every other unit gram_weight = quantity x (portion.gram_weight / portion.amount) for the portion in that unit.",
+        "tag_order": "diet_tags, allergen_tags and badges are stored exactly as recipe.logic.ts returns them: the two tag arrays sorted by normalizeCanonicalName key (so alphabetically), and badges in RECIPE_BADGES declaration order. The ingredient SNAPSHOT arrays instead mirror the catalog row order, because they are a copy of it.",
+        "diet_tag_spelling": "The pescatarian tag is spelled 'pescatarian' here and in catalog-foods.fixture.json, because that is the spelling recipe.logic.ts's DIET_TAG_IMPLICATIONS emits and the only one isDietCompatible matches. data/meal-planning/catalog/releases/v1/foods.jsonl spells it 'pescatarian_ok', which isDietCompatible('pescatarian', ...) does not match - see catalog-foods.fixture.json reading_guide.diet_tag_spelling. salmon-and-kale-plate is what makes it load-bearing: its derived diet_tags are exactly [gluten_free, pescatarian], with no vegetarian tag for the implication closure to rescue, so under the release spelling a pescatarian user would be told the dish does not suit their diet.",
+        "icon_key_coverage": "RECIPE_ICON_KEYS is a closed nine-value set; seven of the nine appear here (pot, fork_knife, bowl, bowl_dash, salad, cloche, dome). wrap and crosshair are absent because no recipe in this fixture is one, and inventing a dish to reach them would be a worse fixture than a documented gap.",
+        "non_column_fields": {
+            "recipe_slug": "On recipe_versions: the parent recipes.slug, so a version reads without a join. recipe_id is the real column.",
+            "food_source_key": "On recipe_ingredients: the catalog food stable source_key. catalog_food_id is the real column.",
+            "resolved_catalog_facts": "On recipe_ingredients: the catalog_foods facts recipe_ingredients does NOT snapshot, which the seed holds from the row it resolved and which RecipePublicationIngredient in src/services/recipe.logic.ts requires - allergen_status and cost_class are required there, and food_group, nutrition_basis and density_g_per_ml are the optional extras the planner and the volume-basis conversion need. publication_status is carried too so a consumer can see that the retired food is retired without loading the catalog fixture. Grouped under one key rather than spread flat so the boundary between real columns and resolved facts stays unambiguous.",
+            "derived_reference": "On recipe_versions: three derived values with no column - per_serving_fiber_g (null when ANY ingredient fibre is unknown; recipe_versions stores only the four macros), cost_score (the mass-weighted 1-3 score budget_tier is cut from) and calorie_divergence (the ratio sourced_calories_note is written from). Recorded so the fibre-unknown, tier-boundary and 5% divergence rules can be asserted as numbers rather than parsed out of prose."
+        }
+    },
+    "insert_order": [
+        "recipes",
+        "recipe_versions",
+        "recipe_ingredients"
+    ],
+    "type_notes": {
+        "everything_is_derived": "A recipe file declares nothing the derivation owns. total_minutes = prep_minutes + cook_minutes; allergen_tags is the UNION of the ingredient snapshots and diet_tags their INTERSECTION closed under vegan -> vegetarian -> pescatarian; allergen_status is known only when every ingredient is reviewed; nutrition_provenance is the WEAKEST ingredient provenance; badges are earned from the ingredient set and the derived nutrition; budget_tier is cut from the mass-weighted cost score. Every value in this file was produced that way and then re-checked by validateRecipeDeclaration, so no row can talk its way into a badge or an understated allergen list.",
+        "optional_is_still_in_the_dish": "An optional ingredient counts for the allergen union, for the diet intersection and for the nutrition totals. roasted-carrot-and-lentil-salad exists to pin that: its optional Greek yogurt is what puts milk into the allergen list and what takes vegan out of the diet list.",
+        "two_versions_one_current": "lemon-herb-chicken-and-rice holds both versions. Exactly one is current, which the partial unique index unique_current_recipe_version enforces and recipes.current_version_id points at; the retired one stays readable so a historical plan or diary link still resolves.",
+        "staleness_is_a_pointer_comparison": "recipe_ingredients.catalog_nutrition_version is a POINTER, and snapshot_per_100g is the frozen copy the per-serving numbers were derived from. herbed-yogurt-and-kale-dip-plate points at version 1 of a food now at version 2, so a refresh detects the difference and publishes a NEW version rather than rewriting this one - which is precisely why a catalog refresh can never change an existing recipe_versions row.",
+        "planning_admits_three_facts": "A version is plannable only when it is current, source_backed and allergen-known. Three of the ten versions here fail exactly one of those on purpose: roasted-carrot-and-lentil-salad is ai_estimated, lemon-dressed-spinach-salad is ingredient_derived, and cracker-and-yogurt-snack-plate has an unreviewed ingredient. The retired version fails the first.",
+        "fibre_propagates_unknown": "soy-glazed-chicken-and-rice-bowl has a null per-serving fibre because soy sauce states none. A sum missing a term is not a smaller sum, and 0 would claim a fibre content no source stated."
+    },
+    "counts": {
+        "recipes": 9,
+        "recipe_versions": 10,
+        "recipe_ingredients": 42,
+        "current_versions": 9,
+        "retired_versions": 1,
+        "plannable_versions": 6
+    },
+    "recipes": [
+        {
+            "id": "d1000000-0000-4000-8000-000000000001",
+            "slug": "lemon-herb-chicken-and-rice",
+            "current_version_id": "d2000000-0000-4000-8000-000000000002",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the only recipe with two versions: exactly one is 'current' and the other stays readable for the plans and diary links that reference it. Version 1 is also the fixture's proof that a RETIRED catalog food stays referenceable by recipe_ingredients."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000002",
+            "slug": "spinach-egg-white-scramble",
+            "current_version_id": "d2000000-0000-4000-8000-000000000003",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the breakfast slot, and the only version with a per_100ml ingredient: whole milk's snapshot is stated per 100 ml and converts through its stored density, the branch ingredientScaleFactor takes for a volume basis."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000003",
+            "slug": "lentil-and-kale-stew",
+            "current_version_id": "d2000000-0000-4000-8000-000000000004",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the vegan, budget-tier-1 recipe: every ingredient carries the vegan tag, so the intersection keeps it and the badge is earned."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000004",
+            "slug": "soy-glazed-chicken-and-rice-bowl",
+            "current_version_id": "d2000000-0000-4000-8000-000000000005",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the recipe whose fibre is UNKNOWN: soy sauce states no fibre, and one unknown term makes the whole sum unknown rather than smaller. It is also where the gluten_free badge is OMITTED."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000005",
+            "slug": "herbed-yogurt-and-kale-dip-plate",
+            "current_version_id": "d2000000-0000-4000-8000-000000000006",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "carries the deliberately STALE ingredient snapshot: the Greek yogurt row is frozen at catalog_nutrition_version 1 while the catalog food is at 2, which is the comparison a refresh makes before publishing a new version."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000006",
+            "slug": "roasted-carrot-and-lentil-salad",
+            "current_version_id": "d2000000-0000-4000-8000-000000000007",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the ai_estimated recipe, and the one with the OPTIONAL ingredient that changes both derived tag sets: the optional Greek yogurt puts milk into the allergen union and takes vegan out of the diet intersection."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000007",
+            "slug": "lemon-dressed-spinach-salad",
+            "current_version_id": "d2000000-0000-4000-8000-000000000008",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the ingredient_derived recipe: its dressing is an ingredient-derived catalog food, so the version rolls up to ingredient_derived and is not plannable. It is also the version that earns a sourced_calories_note."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000008",
+            "slug": "cracker-and-yogurt-snack-plate",
+            "current_version_id": "d2000000-0000-4000-8000-000000000009",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the allergen_status 'unknown' recipe: one ingredient's allergen metadata is unreviewed, so the version's status is unknown and it is never plannable, whatever the user selected."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-000000000009",
+            "slug": "salmon-and-kale-plate",
+            "current_version_id": "d2000000-0000-4000-8000-00000000000a",
+            "created_at": "2026-09-10T12:00:00.000Z",
+            "note": "the budget-tier-3 recipe and the only pescatarian-without-vegetarian diet set, from the salmon."
+        }
+    ],
+    "recipe_versions": [
+        {
+            "id": "d2000000-0000-4000-8000-000000000001",
+            "recipe_id": "d1000000-0000-4000-8000-000000000001",
+            "recipe_slug": "lemon-herb-chicken-and-rice",
+            "version": 1,
+            "name": "Lemon herb chicken and couscous",
+            "description": "Sheet-pan chicken with lemon, finished over whole wheat couscous.",
+            "icon_key": "pot",
+            "instructions": [
+                "Toss the chicken breast with the olive oil and half the lemon juice and roast until cooked through.",
+                "Cook the whole wheat couscous in twice its volume of water, then fork it through.",
+                "Spoon the chicken and its pan juices over the couscous and finish with the remaining lemon juice."
+            ],
+            "yield_servings": 4,
+            "serving_description": "1 bowl",
+            "prep_minutes": 15,
+            "cook_minutes": 25,
+            "total_minutes": 40,
+            "meal_slots": [
+                "lunch",
+                "dinner"
+            ],
+            "diet_tags": [],
+            "allergen_tags": [
+                "wheat"
+            ],
+            "allergen_status": "known",
+            "budget_tier": 2,
+            "badges": [
+                "high_protein",
+                "dairy_free"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 429.3475,
+            "per_serving_protein_g": 40.1766875,
+            "per_serving_carbs_g": 39.226125,
+            "per_serving_fat_g": 10.9983,
+            "sourced_calories_note": null,
+            "status": "retired",
+            "published_at": "2026-09-10T12:00:00.000Z",
+            "retired_at": "2026-09-12T12:00:00.000Z",
+            "derived_reference": {
+                "per_serving_fiber_g": 2.522875,
+                "cost_score": 1.7667638483965014,
+                "calorie_divergence": 0.029699835215064738
+            },
+            "note": "RETIRED version. Carries the wheat allergen from the couscous, so its derived diet_tags are empty and it earns no gluten_free badge."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000002",
+            "recipe_id": "d1000000-0000-4000-8000-000000000001",
+            "recipe_slug": "lemon-herb-chicken-and-rice",
+            "version": 2,
+            "name": "Lemon herb chicken and rice",
+            "description": "Sheet-pan chicken with lemon, finished over brown rice and wilted spinach.",
+            "icon_key": "pot",
+            "instructions": [
+                "Toss the chicken breast with the olive oil and half the lemon juice and roast until cooked through.",
+                "Simmer the brown rice until tender and let it stand covered.",
+                "Wilt the spinach in the residual heat, then fold it through the rice.",
+                "Spoon the chicken and its pan juices over the rice and finish with the remaining lemon juice."
+            ],
+            "yield_servings": 4,
+            "serving_description": "1 bowl",
+            "prep_minutes": 15,
+            "cook_minutes": 30,
+            "total_minutes": 45,
+            "meal_slots": [
+                "lunch",
+                "dinner"
+            ],
+            "diet_tags": [
+                "gluten_free"
+            ],
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "budget_tier": 2,
+            "badges": [
+                "high_protein",
+                "gluten_free",
+                "dairy_free"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 428.2475,
+            "per_serving_protein_g": 38.3846875,
+            "per_serving_carbs_g": 39.715125,
+            "per_serving_fat_g": 12.2653,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 2.382875,
+                "cost_score": 1.7953964194373402,
+                "calorie_divergence": 0.012750920904383591
+            },
+            "note": "CURRENT version, and the one the recipes row points at. Every ingredient is published, source-backed and allergen-reviewed, so this version is plannable."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000003",
+            "recipe_id": "d1000000-0000-4000-8000-000000000002",
+            "recipe_slug": "spinach-egg-white-scramble",
+            "version": 1,
+            "name": "Spinach and mushroom egg white scramble",
+            "description": "A fast high-protein scramble built on egg whites.",
+            "icon_key": "fork_knife",
+            "instructions": [
+                "Soften the cremini mushrooms in the olive oil over a medium heat.",
+                "Add the baby spinach and let it wilt.",
+                "Whisk the egg whites with the whole milk, pour them in and scramble until just set."
+            ],
+            "yield_servings": 2,
+            "serving_description": "1 plate",
+            "prep_minutes": 5,
+            "cook_minutes": 7,
+            "total_minutes": 12,
+            "meal_slots": [
+                "breakfast"
+            ],
+            "diet_tags": [
+                "gluten_free",
+                "pescatarian",
+                "vegetarian"
+            ],
+            "allergen_tags": [
+                "eggs",
+                "milk"
+            ],
+            "allergen_status": "known",
+            "budget_tier": 2,
+            "badges": [
+                "high_protein",
+                "gluten_free",
+                "quick"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 163.7994573643411,
+            "per_serving_protein_g": 14.487759689922482,
+            "per_serving_carbs_g": 6.1850875968992245,
+            "per_serving_fat_g": 9.116455038759689,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 0.876,
+                "cost_score": 1.7379162191192266,
+                "calorie_divergence": 0.0057388903901678555
+            },
+            "note": "Total time 12 minutes, so it earns the quick badge; the milk costs it the dairy_free badge it would otherwise have."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000004",
+            "recipe_id": "d1000000-0000-4000-8000-000000000003",
+            "recipe_slug": "lentil-and-kale-stew",
+            "version": 1,
+            "name": "Lentil and kale stew",
+            "description": "A one-pot stew of brown lentils, kale and mushrooms.",
+            "icon_key": "pot",
+            "instructions": [
+                "Sweat the cremini mushrooms in the olive oil until they colour.",
+                "Add the brown lentils and three times their volume of water and simmer until tender.",
+                "Stir the curly kale through at the end and let it collapse into the stew."
+            ],
+            "yield_servings": 4,
+            "serving_description": "1 bowl",
+            "prep_minutes": 10,
+            "cook_minutes": 35,
+            "total_minutes": 45,
+            "meal_slots": [
+                "lunch",
+                "dinner"
+            ],
+            "diet_tags": [
+                "gluten_free",
+                "pescatarian",
+                "vegan",
+                "vegetarian"
+            ],
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "budget_tier": 1,
+            "badges": [
+                "gluten_free",
+                "dairy_free",
+                "vegan"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 433.2175,
+            "per_serving_protein_g": 26.517300000000002,
+            "per_serving_carbs_g": 66.39505,
+            "per_serving_fat_g": 8.576725,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 12.86825,
+                "cost_score": 1.4285714285714286,
+                "calorie_divergence": 0.03606138948680518
+            },
+            "note": "Mass-weighted cost score lands in tier 1 because the cheap lentils dominate the weight - the reason the score is weighted by grams rather than counted per ingredient."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000005",
+            "recipe_id": "d1000000-0000-4000-8000-000000000004",
+            "recipe_slug": "soy-glazed-chicken-and-rice-bowl",
+            "version": 1,
+            "name": "Soy glazed chicken and rice bowl",
+            "description": "Chicken glazed in soy sauce over brown rice.",
+            "icon_key": "bowl",
+            "instructions": [
+                "Sear the chicken breast in the olive oil, then glaze it with the soy sauce until sticky.",
+                "Warm the cooked brown rice through.",
+                "Wilt the baby spinach in the glaze and pile everything into bowls."
+            ],
+            "yield_servings": 3,
+            "serving_description": "1 bowl",
+            "prep_minutes": 10,
+            "cook_minutes": 20,
+            "total_minutes": 30,
+            "meal_slots": [
+                "dinner"
+            ],
+            "diet_tags": [],
+            "allergen_tags": [
+                "soy",
+                "wheat"
+            ],
+            "allergen_status": "known",
+            "budget_tier": 1,
+            "badges": [
+                "high_protein",
+                "dairy_free"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 472.88999999999993,
+            "per_serving_protein_g": 40.8498,
+            "per_serving_carbs_g": 51.60059999999999,
+            "per_serving_fat_g": 10.5069,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": null,
+                "cost_score": 1.471264367816092,
+                "calorie_divergence": 0.018030197297468582
+            },
+            "note": "Derived diet_tags are empty: the chicken is not vegetarian and the soy sauce is not gluten free, so the intersection keeps nothing."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000006",
+            "recipe_id": "d1000000-0000-4000-8000-000000000005",
+            "recipe_slug": "herbed-yogurt-and-kale-dip-plate",
+            "version": 1,
+            "name": "Herbed yogurt and kale dip plate",
+            "description": "A cold plate of strained yogurt, lemon and torn kale.",
+            "icon_key": "bowl_dash",
+            "instructions": [
+                "Whisk the Greek yogurt with the lemon juice and the olive oil.",
+                "Massage the curly kale until it softens, then fold it through the yogurt."
+            ],
+            "yield_servings": 2,
+            "serving_description": "1 small plate",
+            "prep_minutes": 10,
+            "cook_minutes": 0,
+            "total_minutes": 10,
+            "meal_slots": [
+                "snack"
+            ],
+            "diet_tags": [
+                "gluten_free",
+                "pescatarian",
+                "vegetarian"
+            ],
+            "allergen_tags": [
+                "milk"
+            ],
+            "allergen_status": "known",
+            "budget_tier": 2,
+            "badges": [
+                "high_protein",
+                "gluten_free",
+                "quick"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 176.7725,
+            "per_serving_protein_g": 18.004887500000002,
+            "per_serving_carbs_g": 8.636825,
+            "per_serving_fat_g": 8.45745,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-10T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 1.396375,
+                "cost_score": 2,
+                "calorie_divergence": 0.0334407218317328
+            },
+            "note": "Still published and still plannable: staleness is a pointer comparison a refresh makes, never a validation failure, so this version keeps serving until the refresh republishes it."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000007",
+            "recipe_id": "d1000000-0000-4000-8000-000000000006",
+            "recipe_slug": "roasted-carrot-and-lentil-salad",
+            "version": 1,
+            "name": "Roasted carrot and lentil salad",
+            "description": "Roasted carrots over boiled lentils, dressed with lemon.",
+            "icon_key": "salad",
+            "instructions": [
+                "Dress the roasted carrot coins and the boiled brown lentils with the olive oil and the lemon juice.",
+                "Fold the curly kale through while the carrots are still warm.",
+                "Spoon the Greek yogurt over the top if you are using it."
+            ],
+            "yield_servings": 3,
+            "serving_description": "1 bowl",
+            "prep_minutes": 15,
+            "cook_minutes": 25,
+            "total_minutes": 40,
+            "meal_slots": [
+                "lunch"
+            ],
+            "diet_tags": [
+                "gluten_free",
+                "pescatarian",
+                "vegetarian"
+            ],
+            "allergen_tags": [
+                "milk"
+            ],
+            "allergen_status": "known",
+            "budget_tier": 1,
+            "badges": [
+                "gluten_free"
+            ],
+            "nutrition_provenance": "ai_estimated",
+            "per_serving_calories": 372.38333333333327,
+            "per_serving_protein_g": 20.268583333333332,
+            "per_serving_carbs_g": 48.44736666666666,
+            "per_serving_fat_g": 12.388533333333333,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 15.409833333333337,
+                "cost_score": 1.338008415147265,
+                "calorie_divergence": 0.03753461934386615
+            },
+            "note": "The only version whose nutrition_provenance is ai_estimated."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000008",
+            "recipe_id": "d1000000-0000-4000-8000-000000000007",
+            "recipe_slug": "lemon-dressed-spinach-salad",
+            "version": 1,
+            "name": "Lemon dressed spinach salad",
+            "description": "Raw spinach and kale under a lemon olive oil dressing.",
+            "icon_key": "salad",
+            "instructions": [
+                "Tear the curly kale and toss it with the baby spinach.",
+                "Dress the leaves with the lemon olive oil dressing just before serving."
+            ],
+            "yield_servings": 2,
+            "serving_description": "1 bowl",
+            "prep_minutes": 8,
+            "cook_minutes": 0,
+            "total_minutes": 8,
+            "meal_slots": [
+                "lunch",
+                "snack"
+            ],
+            "diet_tags": [
+                "gluten_free",
+                "pescatarian",
+                "vegan",
+                "vegetarian"
+            ],
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "budget_tier": 2,
+            "badges": [
+                "gluten_free",
+                "dairy_free",
+                "vegan",
+                "quick"
+            ],
+            "nutrition_provenance": "ingredient_derived",
+            "per_serving_calories": 105.32660000000001,
+            "per_serving_protein_g": 2.7149199999999998,
+            "per_serving_carbs_g": 4.0671800000000005,
+            "per_serving_fat_g": 9.627358000000001,
+            "sourced_calories_note": "Sourced energy 211 kcal differs from the 4/4/9 macro estimate 228 kcal by 8.0%.",
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 2.7112600000000002,
+                "cost_score": 2,
+                "calorie_divergence": 0.08020786771812623
+            },
+            "note": "Every ingredient carries vegan, so the vegan badge survives; the produce-heavy energy makes the 4/4/9 estimate diverge past 5% and the disclosure note is written rather than the numbers corrected."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-000000000009",
+            "recipe_id": "d1000000-0000-4000-8000-000000000008",
+            "recipe_slug": "cracker-and-yogurt-snack-plate",
+            "version": 1,
+            "name": "Cracker and yogurt snack plate",
+            "description": "Wheat crackers with strained yogurt.",
+            "icon_key": "cloche",
+            "instructions": [
+                "Spoon the Greek yogurt into a small bowl.",
+                "Serve the wheat crackers alongside it."
+            ],
+            "yield_servings": 2,
+            "serving_description": "1 plate",
+            "prep_minutes": 5,
+            "cook_minutes": 0,
+            "total_minutes": 5,
+            "meal_slots": [
+                "snack"
+            ],
+            "diet_tags": [],
+            "allergen_tags": [
+                "milk",
+                "wheat"
+            ],
+            "allergen_status": "unknown",
+            "budget_tier": 2,
+            "badges": [
+                "quick"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 188.07000000000002,
+            "per_serving_protein_g": 11.2215,
+            "per_serving_carbs_g": 23.86,
+            "per_serving_fat_g": 5.1315,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 0.9920000000000001,
+                "cost_score": 1.7264957264957266,
+                "calorie_divergence": 0.008297442441644168
+            },
+            "note": "Derived diet_tags are empty because the crackers carry none."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-00000000000a",
+            "recipe_id": "d1000000-0000-4000-8000-000000000009",
+            "recipe_slug": "salmon-and-kale-plate",
+            "version": 1,
+            "name": "Salmon and kale plate",
+            "description": "Roasted salmon fillets with lemon-dressed kale.",
+            "icon_key": "dome",
+            "instructions": [
+                "Roast the salmon fillet pieces until just opaque.",
+                "Massage the curly kale with the olive oil and the lemon juice.",
+                "Plate the kale and set the salmon on top."
+            ],
+            "yield_servings": 2,
+            "serving_description": "1 plate",
+            "prep_minutes": 10,
+            "cook_minutes": 18,
+            "total_minutes": 28,
+            "meal_slots": [
+                "dinner"
+            ],
+            "diet_tags": [
+                "gluten_free",
+                "pescatarian"
+            ],
+            "allergen_tags": [
+                "fish"
+            ],
+            "allergen_status": "known",
+            "budget_tier": 3,
+            "badges": [
+                "high_protein",
+                "gluten_free",
+                "dairy_free"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 440.075,
+            "per_serving_protein_g": 36.723775,
+            "per_serving_carbs_g": 4.01365,
+            "per_serving_fat_g": 30.5989,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 2.79275,
+                "cost_score": 2.6563706563706564,
+                "calorie_divergence": 0.003942964267454328
+            },
+            "note": "The cost-class-3 salmon dominates the mass, so the score clears 2.5 and the tier is 3."
+        }
+    ],
+    "recipe_ingredients": [
+        {
+            "id": "d3000000-0000-4000-8000-000000000001",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000001",
+            "food_source_key": "usda:9200101",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000001",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 120,
+                "protein_g": 22.5,
+                "carbs_g": 0,
+                "fat_g": 2.62,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Chicken breast",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "gluten_free"
+            ],
+            "quantity": 600,
+            "unit": "g",
+            "gram_weight": 600,
+            "display_text": "600 g chicken breast",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "chicken",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000002",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000001",
+            "food_source_key": "usda:9200119",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000013",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 376,
+                "protein_g": 12.8,
+                "carbs_g": 77.4,
+                "fat_g": 0.6,
+                "fiber_g": 5
+            },
+            "snapshot_name": "Whole wheat couscous",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "wheat"
+            ],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian"
+            ],
+            "quantity": 200,
+            "unit": "g",
+            "gram_weight": 200,
+            "display_text": "200 g whole wheat couscous",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "wheat_grain",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "retired"
+            },
+            "note": "The RETIRED catalog food. This version was published while it was still published; catalog-load.ts retiring it later is exactly why version 2 exists. A retired food may never enter a NEW recipe, and this row proves it stays referenceable by the versions that already hold it."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000003",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000001",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 2,
+            "unit": "tbsp",
+            "gram_weight": 27,
+            "display_text": "2 tbsp olive oil",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000004",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000001",
+            "food_source_key": "usda:9200114",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000e",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 0.35,
+                "carbs_g": 6.9,
+                "fat_g": 0.24,
+                "fiber_g": 0.3
+            },
+            "snapshot_name": "Lemon juice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "fl oz",
+            "gram_weight": 30.5,
+            "display_text": "1 fl oz lemon juice",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "citrus",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 1.03,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000005",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000002",
+            "food_source_key": "usda:9200101",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000001",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 120,
+                "protein_g": 22.5,
+                "carbs_g": 0,
+                "fat_g": 2.62,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Chicken breast",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "gluten_free"
+            ],
+            "quantity": 600,
+            "unit": "g",
+            "gram_weight": 600,
+            "display_text": "600 g chicken breast",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "chicken",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000006",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000002",
+            "food_source_key": "usda:9200103",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000003",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 360,
+                "protein_g": 7.5,
+                "carbs_g": 76.2,
+                "fat_g": 2.9,
+                "fiber_g": 3.4
+            },
+            "snapshot_name": "Brown rice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 200,
+            "unit": "g",
+            "gram_weight": 200,
+            "display_text": "200 g brown rice",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "rice",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000007",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000002",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 2,
+            "unit": "tbsp",
+            "gram_weight": 27,
+            "display_text": "2 tbsp olive oil",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000008",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000002",
+            "food_source_key": "usda:9200114",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000e",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 0.35,
+                "carbs_g": 6.9,
+                "fat_g": 0.24,
+                "fiber_g": 0.3
+            },
+            "snapshot_name": "Lemon juice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "fl oz",
+            "gram_weight": 30.5,
+            "display_text": "1 fl oz lemon juice",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "citrus",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 1.03,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000009",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000002",
+            "food_source_key": "usda:9200111",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000b",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 23,
+                "protein_g": 2.86,
+                "carbs_g": 3.63,
+                "fat_g": 0.39,
+                "fiber_g": 2.2
+            },
+            "snapshot_name": "Spinach",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 120,
+            "unit": "g",
+            "gram_weight": 120,
+            "display_text": "120 g baby spinach",
+            "sort_order": 4,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000000a",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000003",
+            "food_source_key": "usda:9200107",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000007",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 52,
+                "protein_g": 10.9,
+                "carbs_g": 0.73,
+                "fat_g": 0.17,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Egg white",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "eggs"
+            ],
+            "snapshot_diet_tags": [
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 6,
+            "unit": "each",
+            "gram_weight": 198,
+            "display_text": "6 large egg whites",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "egg_product",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000000b",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000003",
+            "food_source_key": "usda:9200110",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000a",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 64,
+                "protein_g": 3.28,
+                "carbs_g": 4.78,
+                "fat_g": 3.46,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Whole milk",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "milk"
+            ],
+            "snapshot_diet_tags": [
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 0.5,
+            "unit": "cup",
+            "gram_weight": 122,
+            "display_text": "½ cup whole milk",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "milk",
+                "nutrition_basis": "per_100ml",
+                "density_g_per_ml": 1.032,
+                "publication_status": "published"
+            },
+            "note": "The per_100ml ingredient. Its snapshot_per_100g values are stated per 100 MILLILITRES, so resolved_catalog_facts.nutrition_basis is per_100ml and the density is required: the scale factor is gram_weight / millilitersToGrams(100, density), never gram_weight / 100."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000000c",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000003",
+            "food_source_key": "usda:9200111",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000b",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 23,
+                "protein_g": 2.86,
+                "carbs_g": 3.63,
+                "fat_g": 0.39,
+                "fiber_g": 2.2
+            },
+            "snapshot_name": "Spinach",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 60,
+            "unit": "g",
+            "gram_weight": 60,
+            "display_text": "60 g baby spinach",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000000d",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000003",
+            "food_source_key": "usda:9200120",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000014",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 2.5,
+                "carbs_g": 4.3,
+                "fat_g": 0.1,
+                "fiber_g": 0.6
+            },
+            "snapshot_name": "Cremini mushrooms",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 72,
+            "unit": "g",
+            "gram_weight": 72,
+            "display_text": "72 g cremini mushrooms",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "mushroom",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000000e",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000003",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "tbsp",
+            "gram_weight": 13.5,
+            "display_text": "1 tbsp olive oil",
+            "sort_order": 4,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000000f",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000004",
+            "food_source_key": "usda:9200105",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000005",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 352,
+                "protein_g": 24.6,
+                "carbs_g": 63.4,
+                "fat_g": 1.06,
+                "fiber_g": 10.7
+            },
+            "snapshot_name": "Brown lentils",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 400,
+            "unit": "g",
+            "gram_weight": 400,
+            "display_text": "400 g brown lentils",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "lentil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000010",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000004",
+            "food_source_key": "usda:9200112",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000c",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 35,
+                "protein_g": 2.92,
+                "carbs_g": 4.42,
+                "fat_g": 1.49,
+                "fiber_g": 4.1
+            },
+            "snapshot_name": "Kale",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 201,
+            "unit": "g",
+            "gram_weight": 201,
+            "display_text": "201 g curly kale",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000011",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000004",
+            "food_source_key": "usda:9200120",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000014",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 2.5,
+                "carbs_g": 4.3,
+                "fat_g": 0.1,
+                "fiber_g": 0.6
+            },
+            "snapshot_name": "Cremini mushrooms",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 72,
+            "unit": "g",
+            "gram_weight": 72,
+            "display_text": "72 g cremini mushrooms",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "mushroom",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000012",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000004",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 2,
+            "unit": "tbsp",
+            "gram_weight": 27,
+            "display_text": "2 tbsp olive oil",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000013",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000005",
+            "food_source_key": "usda:9200101",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000001",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 120,
+                "protein_g": 22.5,
+                "carbs_g": 0,
+                "fat_g": 2.62,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Chicken breast",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "gluten_free"
+            ],
+            "quantity": 450,
+            "unit": "g",
+            "gram_weight": 450,
+            "display_text": "450 g chicken breast",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "chicken",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000014",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000005",
+            "food_source_key": "usda:9200104",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000004",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 123,
+                "protein_g": 2.7,
+                "carbs_g": 25.6,
+                "fat_g": 0.97,
+                "fiber_g": 1.6
+            },
+            "snapshot_name": "Brown rice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 585,
+            "unit": "g",
+            "gram_weight": 585,
+            "display_text": "585 g cooked brown rice",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "rice",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000015",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000005",
+            "food_source_key": "usda:9200113",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000d",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 53,
+                "protein_g": 8.14,
+                "carbs_g": 4.93,
+                "fat_g": 0.57,
+                "fiber_g": null
+            },
+            "snapshot_name": "Soy sauce",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "soy",
+                "wheat"
+            ],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian"
+            ],
+            "quantity": 2,
+            "unit": "tbsp",
+            "gram_weight": 36,
+            "display_text": "2 tbsp soy sauce",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "soy_sauce",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 1.2,
+                "publication_status": "published"
+            },
+            "note": "snapshot_per_100g.fiber_g is null, so the whole recipe fibre is null. It also carries soy AND wheat and lacks the gluten_free diet tag, which is what withholds the gluten_free badge."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000016",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000005",
+            "food_source_key": "usda:9200111",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000b",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 23,
+                "protein_g": 2.86,
+                "carbs_g": 3.63,
+                "fat_g": 0.39,
+                "fiber_g": 2.2
+            },
+            "snapshot_name": "Spinach",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 90,
+            "unit": "g",
+            "gram_weight": 90,
+            "display_text": "90 g baby spinach",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000017",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000005",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "tbsp",
+            "gram_weight": 13.5,
+            "display_text": "1 tbsp olive oil",
+            "sort_order": 4,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000018",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000006",
+            "food_source_key": "usda:9200115",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000f",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 61,
+                "protein_g": 10,
+                "carbs_g": 3.9,
+                "fat_g": 0.7,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Greek yogurt, plain",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "milk"
+            ],
+            "snapshot_diet_tags": [
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 340,
+            "unit": "g",
+            "gram_weight": 340,
+            "display_text": "340 g Greek yogurt",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "yogurt",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            },
+            "note": "STALE by construction: catalog_nutrition_version is 1 and usda:9200115 is now at 2, so snapshot_per_100g holds that food's superseded_nutrition values. The snapshot is what the per-serving numbers were derived from and stays frozen - a catalog refresh publishes a NEW version rather than rewriting this one."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000019",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000006",
+            "food_source_key": "usda:9200112",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000c",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 35,
+                "protein_g": 2.92,
+                "carbs_g": 4.42,
+                "fat_g": 1.49,
+                "fiber_g": 4.1
+            },
+            "snapshot_name": "Kale",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 67,
+            "unit": "g",
+            "gram_weight": 67,
+            "display_text": "67 g curly kale",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000001a",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000006",
+            "food_source_key": "usda:9200114",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000e",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 0.35,
+                "carbs_g": 6.9,
+                "fat_g": 0.24,
+                "fiber_g": 0.3
+            },
+            "snapshot_name": "Lemon juice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 0.5,
+            "unit": "fl oz",
+            "gram_weight": 15.25,
+            "display_text": "½ fl oz lemon juice",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "citrus",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 1.03,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000001b",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000006",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "tbsp",
+            "gram_weight": 13.5,
+            "display_text": "1 tbsp olive oil",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000001c",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000007",
+            "food_source_key": "ai:produce_vegetable:roasted carrot coins:cooked",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000016",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 85,
+                "protein_g": 1.2,
+                "carbs_g": 16.5,
+                "fat_g": 1.9,
+                "fiber_g": 3
+            },
+            "snapshot_name": "Roasted carrot coins",
+            "snapshot_provenance": "ai_estimated",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 312,
+            "unit": "g",
+            "gram_weight": 312,
+            "display_text": "312 g roasted carrot coins",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "carrot",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            },
+            "note": "The ai_estimated ingredient. Provenance rolls up to the WEAKEST ingredient, so this one alone makes the whole version ai_estimated and therefore never plannable, however source-backed the rest of it is."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000001d",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000007",
+            "food_source_key": "usda:9200106",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000006",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 116,
+                "protein_g": 9.02,
+                "carbs_g": 20.13,
+                "fat_g": 0.38,
+                "fiber_g": 7.9
+            },
+            "snapshot_name": "Brown lentils, boiled",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 396,
+            "unit": "g",
+            "gram_weight": 396,
+            "display_text": "396 g boiled brown lentils",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "lentil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000001e",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000007",
+            "food_source_key": "usda:9200112",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000c",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 35,
+                "protein_g": 2.92,
+                "carbs_g": 4.42,
+                "fat_g": 1.49,
+                "fiber_g": 4.1
+            },
+            "snapshot_name": "Kale",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 134,
+            "unit": "g",
+            "gram_weight": 134,
+            "display_text": "134 g curly kale",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000001f",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000007",
+            "food_source_key": "usda:9200114",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000e",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 0.35,
+                "carbs_g": 6.9,
+                "fat_g": 0.24,
+                "fiber_g": 0.3
+            },
+            "snapshot_name": "Lemon juice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "fl oz",
+            "gram_weight": 30.5,
+            "display_text": "1 fl oz lemon juice",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "citrus",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 1.03,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000020",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000007",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 2,
+            "unit": "tbsp",
+            "gram_weight": 27,
+            "display_text": "2 tbsp olive oil",
+            "sort_order": 4,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000021",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000007",
+            "food_source_key": "usda:9200115",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000f",
+            "catalog_nutrition_version": 2,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 59,
+                "protein_g": 10.19,
+                "carbs_g": 3.6,
+                "fat_g": 0.39,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Greek yogurt, plain",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "milk"
+            ],
+            "snapshot_diet_tags": [
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 170,
+            "unit": "g",
+            "gram_weight": 170,
+            "display_text": "170 g Greek yogurt",
+            "sort_order": 5,
+            "is_optional": true,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "yogurt",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            },
+            "note": "OPTIONAL and counted anyway: it contributes its milk allergen to the union and removes vegan from the intersection, and its grams are included in the nutrition totals. Optional is still in the dish, and understating an allergen is the one direction of error that reaches a plate."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000022",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000008",
+            "food_source_key": "usda:9200111",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000b",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 23,
+                "protein_g": 2.86,
+                "carbs_g": 3.63,
+                "fat_g": 0.39,
+                "fiber_g": 2.2
+            },
+            "snapshot_name": "Spinach",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 120,
+            "unit": "g",
+            "gram_weight": 120,
+            "display_text": "120 g baby spinach",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000023",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000008",
+            "food_source_key": "usda:9200112",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000c",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 35,
+                "protein_g": 2.92,
+                "carbs_g": 4.42,
+                "fat_g": 1.49,
+                "fiber_g": 4.1
+            },
+            "snapshot_name": "Kale",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 67,
+            "unit": "g",
+            "gram_weight": 67,
+            "display_text": "67 g curly kale",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000024",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000008",
+            "food_source_key": "ai:condiment_sauce:lemon olive oil dressing:prepared",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000017",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 539.1999999999999,
+                "protein_g": 0.13999999999999999,
+                "carbs_g": 2.7600000000000002,
+                "fat_g": 60.096,
+                "fiber_g": 0.12
+            },
+            "snapshot_name": "Lemon olive oil dressing",
+            "snapshot_provenance": "ingredient_derived",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 2,
+            "unit": "tbsp",
+            "gram_weight": 29.6,
+            "display_text": "2 tbsp lemon olive oil dressing",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "salad_dressing",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.94,
+                "publication_status": "published"
+            },
+            "note": "The ingredient_derived ingredient. Its snapshot_per_100g holds the full-precision values deriveComponentNutrition produced for the parent food, so a derived number flows into a recipe snapshot unrounded."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000025",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000009",
+            "food_source_key": "usda:9200116",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000010",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 431,
+                "protein_g": 8,
+                "carbs_g": 65,
+                "fat_g": 15,
+                "fiber_g": 3.1
+            },
+            "snapshot_name": "Wheat crackers",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "wheat"
+            ],
+            "snapshot_diet_tags": [],
+            "quantity": 20,
+            "unit": "each",
+            "gram_weight": 64,
+            "display_text": "20 wheat crackers",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "unknown",
+                "cost_class": 1,
+                "food_group": "cracker",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            },
+            "note": "allergen_status is 'unknown' on this catalog food, and deriveAllergenStatus needs EVERY ingredient reviewed, so the version's status is unknown. That also withholds both the gluten_free and the dairy_free badge, which are claims an unreviewed ingredient cannot support."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000026",
+            "recipe_version_id": "d2000000-0000-4000-8000-000000000009",
+            "food_source_key": "usda:9200115",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000f",
+            "catalog_nutrition_version": 2,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 59,
+                "protein_g": 10.19,
+                "carbs_g": 3.6,
+                "fat_g": 0.39,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Greek yogurt, plain",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "milk"
+            ],
+            "snapshot_diet_tags": [
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 170,
+            "unit": "g",
+            "gram_weight": 170,
+            "display_text": "170 g Greek yogurt",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "yogurt",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000027",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000a",
+            "food_source_key": "usda:9200121",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000015",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 208,
+                "protein_g": 20.42,
+                "carbs_g": 0,
+                "fat_g": 13.42,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Salmon fillet",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "fish"
+            ],
+            "snapshot_diet_tags": [
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 2,
+            "unit": "each",
+            "gram_weight": 340,
+            "display_text": "2 salmon fillets",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 3,
+                "food_group": "salmon",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000028",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000a",
+            "food_source_key": "usda:9200112",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000c",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 35,
+                "protein_g": 2.92,
+                "carbs_g": 4.42,
+                "fat_g": 1.49,
+                "fiber_g": 4.1
+            },
+            "snapshot_name": "Kale",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 134,
+            "unit": "g",
+            "gram_weight": 134,
+            "display_text": "134 g curly kale",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000029",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000a",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "tbsp",
+            "gram_weight": 13.5,
+            "display_text": "1 tbsp olive oil",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000002a",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000a",
+            "food_source_key": "usda:9200114",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000e",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 0.35,
+                "carbs_g": 6.9,
+                "fat_g": 0.24,
+                "fiber_g": 0.3
+            },
+            "snapshot_name": "Lemon juice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 1,
+            "unit": "fl oz",
+            "gram_weight": 30.5,
+            "display_text": "1 fl oz lemon juice",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "citrus",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 1.03,
+                "publication_status": "published"
+            }
+        }
+    ]
+}

@@ -13,6 +13,22 @@ const CHILD_TIMEOUT_MS = 60_000;
 
 const UNROUTABLE_RFC_5737_DOCUMENTATION_HOST = '192.0.2.1';
 
+/**
+ * Stands in for the opaque container-network host a platform-exported
+ * `DATABASE_URL` carries. Synthetic on purpose: a real deployment hostname
+ * written into test data is an infrastructure disclosure that travels with the
+ * repository into every log and diff, and this suite reaches its judgement
+ * without it — like every other host below, which are RFC 2606 / RFC 5737
+ * documentation values rather than anything real.
+ *
+ * Dotless, which is the property that earns it a row of its own: `LOCAL_HOSTS`
+ * accepts `postgres`, a dotless container-network service name, so a host with
+ * no dot in it is the near miss to an accepted value, and no other row in this
+ * matrix has that shape. `assertTestDatabase` judges the string and never
+ * resolves or connects, so the shape is the whole of what the case exercises.
+ */
+const OPAQUE_CONTAINER_NETWORK_HOST = 'db-container-host';
+
 const SAFE_ENV: NodeJS.ProcessEnv = {
     NODE_ENV: 'test',
     ALLOW_DB_TRUNCATE: 'true',
@@ -135,7 +151,7 @@ describe('assertTestDatabase', () => {
             { scenario: 'a test name on a remote host', databaseUrl: secretUrl('db.prod.example.com', 'app_test') },
             { scenario: 'a clone-indexed test name on a remote host', databaseUrl: secretUrl('db.prod.example.com', 'app_test_46') },
             { scenario: "CI's database name on a remote host", databaseUrl: secretUrl('db.prod.example.com', 'ci') },
-            { scenario: 'the production-shaped URL this platform exports', databaseUrl: secretUrl('ev7c65ukrc31l80vndc57w5o', 'state_of_health') },
+            { scenario: 'a production database on an opaque container-network host, the shape a platform-exported URL carries', databaseUrl: secretUrl(OPAQUE_CONTAINER_NETWORK_HOST, 'state_of_health') },
             { scenario: 'a public IP address', databaseUrl: secretUrl('203.0.113.10', 'soh_test') },
         ])('refuses $scenario', ({ databaseUrl }) => {
             const refusal = expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'database_host_not_local');

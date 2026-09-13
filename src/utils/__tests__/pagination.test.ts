@@ -9,7 +9,17 @@
  * depend on.
  */
 
-import { DEFAULT_LIMIT, DEFAULT_PAGE, MAX_LIMIT, parsePagination, toPaginationBlock } from '../pagination';
+import {
+    DEFAULT_LIMIT,
+    DEFAULT_PAGE,
+    MAX_LIMIT,
+    MAX_OFFSET,
+    MAX_PAGE,
+    MAX_ROWS,
+    parsePagination,
+    rowWindowFor,
+    toPaginationBlock,
+} from '../pagination';
 
 describe('parsePagination', () => {
     describe('page', () => {
@@ -51,6 +61,26 @@ describe('parsePagination', () => {
 
         it('takes the first occurrence of a repeated page parameter', () => {
             expect(parsePagination({ page: ['3', '9'] }).page).toBe(3);
+        });
+
+        it('clamps a page beyond the supported depth down to the last one', () => {
+            // The reason this bound exists: `parseInt` reads a twenty-digit
+            // page as a finite but imprecise 1e20, and that number used to be
+            // multiplied by `limit` and handed to `OFFSET`, where PostgreSQL
+            // rejects it — a query parameter answering 500. Clamped, the same
+            // request answers an empty page.
+            expect(parsePagination({ page: '99999999999999999999' }).page).toBe(MAX_PAGE);
+            expect(parsePagination({ page: String(MAX_PAGE + 1) }).page).toBe(MAX_PAGE);
+            expect(parsePagination({ page: Number.MAX_SAFE_INTEGER }).page).toBe(MAX_PAGE);
+        });
+
+        it('passes the deepest supported page through unchanged', () => {
+            expect(parsePagination({ page: String(MAX_PAGE) }).page).toBe(MAX_PAGE);
+            expect(MAX_PAGE).toBe(100_000);
+        });
+
+        it('clamps a hugely negative page up to the first one', () => {
+            expect(parsePagination({ page: '-99999999999999999999' }).page).toBe(DEFAULT_PAGE);
         });
     });
 
@@ -156,6 +186,121 @@ describe('parsePagination', () => {
                 page: DEFAULT_PAGE,
                 limit: DEFAULT_LIMIT,
             });
+        });
+    });
+});
+
+describe('rowWindowFor', () => {
+    describe('the offset it derives', () => {
+        it('starts the first page at no offset', () => {
+            expect(rowWindowFor(1, 25)).toEqual({ limit: 25, offset: 0 });
+        });
+
+        it('skips the pages before the one asked for', () => {
+            expect(rowWindowFor(2, 25).offset).toBe(25);
+            expect(rowWindowFor(3, 25).offset).toBe(50);
+            expect(rowWindowFor(4, 10).offset).toBe(30);
+        });
+
+        it('derives the offset from the limit it reports, not the one it was given', () => {
+            // One value, not two kept in step: a caller cannot page in strides
+            // of the raw limit while selecting a sanitized number of rows.
+            const window = rowWindowFor(3, 0);
+
+            expect(window.limit).toBe(1);
+            expect(window.offset).toBe(2);
+        });
+
+        it('never exceeds the derived ceiling, even at both bounds at once', () => {
+            expect(rowWindowFor(MAX_PAGE, MAX_ROWS).offset).toBe(MAX_OFFSET);
+            expect(rowWindowFor(MAX_PAGE + 5_000, MAX_ROWS + 5_000).offset).toBe(MAX_OFFSET);
+            expect(rowWindowFor(1e20, 25).offset).toBeLessThanOrEqual(MAX_OFFSET);
+            expect(Number.isSafeInteger(rowWindowFor(1e20, 25).offset)).toBe(true);
+        });
+
+        it('treats an unreadable page as the first page rather than as no rows', () => {
+            // Reachable only from a direct service caller — every HTTP path
+            // goes through `parsePagination` first. `Math.trunc(NaN)` is `NaN`,
+            // which would travel all the way into the statement. Unreadable in
+            // either direction means the first page, the same answer the parser
+            // gives an unparseable `?page=`, rather than a clamp to the depth
+            // bound in one direction and zero in the other.
+            expect(rowWindowFor(Number.NaN, 25).offset).toBe(0);
+            expect(rowWindowFor(Number.POSITIVE_INFINITY, 25).offset).toBe(0);
+            expect(rowWindowFor(Number.NEGATIVE_INFINITY, 25).offset).toBe(0);
+        });
+
+        it('clamps a negative or zero page up to the first one', () => {
+            expect(rowWindowFor(0, 25).offset).toBe(0);
+            expect(rowWindowFor(-7, 25).offset).toBe(0);
+        });
+
+        it('truncates a fractional page, as the parser does', () => {
+            expect(rowWindowFor(2.9, 25).offset).toBe(25);
+        });
+    });
+
+    describe('the limit it reports', () => {
+        it('passes a limit inside the supported range through untouched', () => {
+            expect(rowWindowFor(1, 1).limit).toBe(1);
+            expect(rowWindowFor(1, MAX_LIMIT).limit).toBe(MAX_LIMIT);
+        });
+
+        it('allows a limit above the HTTP cap, which the benchmark needs', () => {
+            // `scripts/search-benchmark.ts` reads one in-process `limit=75`
+            // reference page to prove pages 1 to 3 at 25 concatenate to it.
+            // Capping here at `MAX_LIMIT` would truncate that reference and
+            // make the pagination check pass vacuously.
+            expect(rowWindowFor(1, 75)).toEqual({ limit: 75, offset: 0 });
+            expect(MAX_ROWS).toBeGreaterThan(MAX_LIMIT);
+        });
+
+        it('caps a limit above the absolute row guard', () => {
+            expect(rowWindowFor(1, MAX_ROWS + 1).limit).toBe(MAX_ROWS);
+            expect(rowWindowFor(1, 1e9).limit).toBe(MAX_ROWS);
+        });
+
+        it('clamps a zero or negative limit up to one row', () => {
+            expect(rowWindowFor(1, 0).limit).toBe(1);
+            expect(rowWindowFor(1, -5).limit).toBe(1);
+        });
+
+        it('falls back to the module default for a limit that is not finite', () => {
+            expect(rowWindowFor(1, Number.NaN).limit).toBe(DEFAULT_LIMIT);
+            expect(rowWindowFor(1, Number.POSITIVE_INFINITY).limit).toBe(DEFAULT_LIMIT);
+        });
+
+        it('truncates a fractional limit', () => {
+            expect(rowWindowFor(1, 10.7).limit).toBe(10);
+        });
+    });
+
+    describe('what it promises a database', () => {
+        it('always yields two safe non-negative integers, for every hostile pair', () => {
+            const hostile: ReadonlyArray<readonly [number, number]> = [
+                [Number.NaN, Number.NaN],
+                [Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY],
+                [Number.NEGATIVE_INFINITY, Number.NEGATIVE_INFINITY],
+                [1e21, 1e21],
+                [-1e21, -1e21],
+                [2.5, 2.5],
+                [0, 0],
+            ];
+
+            for (const [page, limit] of hostile) {
+                const window = rowWindowFor(page, limit);
+
+                expect(Number.isSafeInteger(window.limit)).toBe(true);
+                expect(Number.isSafeInteger(window.offset)).toBe(true);
+                expect(window.limit).toBeGreaterThanOrEqual(1);
+                expect(window.limit).toBeLessThanOrEqual(MAX_ROWS);
+                expect(window.offset).toBeGreaterThanOrEqual(0);
+                expect(window.offset).toBeLessThanOrEqual(MAX_OFFSET);
+            }
+        });
+
+        it('derives its ceiling from the two bounds rather than a separate number', () => {
+            expect(MAX_OFFSET).toBe((MAX_PAGE - 1) * MAX_ROWS);
         });
     });
 });

@@ -138,6 +138,10 @@ export interface CatalogValidationCheck {
 // The audit trail for a generated food's identity: one record per URL actually
 // retrieved under the SSRF-safe fetch policy.
 export interface CatalogIdentityEvidenceRecord {
+    // The URL that served the bytes this record describes — after a same-host
+    // redirect the hop's target, not the URL originally proposed. The status,
+    // hash and snippet below all came from that response, so this is the
+    // location a reviewer re-fetches to check them.
     url: string;
     finalHost: string;
     status: number;

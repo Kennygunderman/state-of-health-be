@@ -488,4 +488,3 @@ export const mapIngredientSnapshot = (
     nutritionVersion: ingredient.catalog_nutrition_version,
     metadataVersion: ingredient.catalog_metadata_version,
 });
-

@@ -56,6 +56,7 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
+import { parseCanonicalFdcId } from '../catalog.logic';
 import {
     MAX_BATCH_FDC_IDS,
     MAX_LIST_PAGE_SIZE,
@@ -790,6 +791,64 @@ describe('normalizeFdcIds', () => {
 
     it('accepts a decimal string, including one with surrounding whitespace', () => {
         expect(normalizeFdcIds([' 171077 '])).toEqual([171077]);
+    });
+
+    /**
+     * The parser itself now lives in the pure catalog decision layer and this
+     * module imports it, because `usda_api_cache.cache_key` and
+     * `catalog_foods.source_key` are two views of ONE identity: the catalog keys
+     * every imported row on `usda:<fdcId>`. Two parsers that differed by a
+     * single accepted form would fetch one food and file it under another, so
+     * the agreement is asserted here from the vendor boundary's side as well as
+     * in `catalog.logic.test.ts`.
+     */
+    describe('parity with the canonical parser the catalog keys its rows on', () => {
+        const PARITY_CASES: Array<[string, unknown]> = [
+            ['a positive integer', 171077],
+            ['the canonical decimal string', '171077'],
+            ['a decimal string with surrounding whitespace', '  171077  '],
+            ['the largest safe integer', Number.MAX_SAFE_INTEGER],
+            ['zero', 0],
+            ['a negative number', -1],
+            ['a fraction', 1.5],
+            ['an unsafe integer', Number.MAX_SAFE_INTEGER + 2],
+            ['NaN', Number.NaN],
+            ['Infinity', Number.POSITIVE_INFINITY],
+            ['the string zero', '0'],
+            ['a leading zero', '007'],
+            ['hexadecimal notation', '0x10'],
+            ['exponent notation', '1e3'],
+            ['a decimal point', '1.5'],
+            ['an explicit sign', '+1'],
+            ['an empty string', ''],
+            ['whitespace only', '   '],
+            ['a value past the safe integer range', '9007199254740993'],
+            ['null', null],
+            ['undefined', undefined],
+            ['a nested array that stringifies to a number', [1]],
+            ['an object', {}],
+            ['a boolean', true],
+        ];
+
+        it.each(PARITY_CASES)('reaches the same verdict as the catalog parser for %s', (_label, value) => {
+            const canonical = parseCanonicalFdcId(value);
+
+            if (canonical === null) {
+                expect(vendorFailureSync(() => normalizeFdcIds([value as string | number])).message).toBe(
+                    invalidFdcIdMessage(String(value)),
+                );
+                return;
+            }
+
+            expect(normalizeFdcIds([value as string | number])).toEqual([canonical]);
+        });
+
+        it('keeps the vendor boundary error posture, not the catalog one', () => {
+            const error = vendorFailureSync(() => normalizeFdcIds(['0x10']));
+
+            expect(error).toBeInstanceOf(UsdaError);
+            expect(error.name).toBe('UsdaError');
+        });
     });
 
     describe('a value that is not a canonical positive integer', () => {

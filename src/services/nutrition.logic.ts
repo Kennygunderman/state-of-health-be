@@ -1,13 +1,44 @@
-import { LogCatalogMealEntryPayload, LogMealEntryPayload } from '../types/nutrition';
+import {
+    ClientInputMethod,
+    EntryInputMethod,
+    LogCatalogMealEntryPayload,
+    LogMealEntryPayload,
+} from '../types/nutrition';
 
 /**
  * One element of the `400 invalid_request` body's `details` array: the field the
- * caller must fix, plus a stable machine code the client maps to copy.
+ * caller must fix, plus a stable machine code the client maps to copy. Same
+ * shape as the wire's `InvalidRequestDetail`, declared locally because this
+ * module's only import is its own domain's DTOs.
  */
 export interface LogEntryFieldError {
     field: string;
     code: string;
 }
+
+/**
+ * Which 400 the caller earned. Two of these are the wire code itself; the third
+ * is a compatibility verdict that no response ever spells.
+ *
+ * - `legacy_fields_required` — the shipped `isValidMacroPayload` guard refused a
+ *   legacy body. The controller answers it with the historical message-only
+ *   body, because every client that has ever sent a malformed legacy body has
+ *   been shown that exact string. **Not a wire value**: nothing serializes this
+ *   name, and a response must never carry it as `error`.
+ * - `invalid_request` — a catalog body's own fields are unusable. Rendered as
+ *   `{error: 'invalid_request', details}`: the machine code plus the per-field
+ *   codes, which is the contract the catalog shape shipped with and which the
+ *   app's ApiErrorUtility already maps.
+ * - `invalid_payload` — no shape could be chosen at all: the body named both a
+ *   personal and a catalog food, or neither. Rendered as
+ *   `{error: 'invalid_payload', details}`.
+ *
+ * The distinction exists because the two bodies are not interchangeable: the
+ * legacy one is a frozen string kept for compatibility, and reusing it for a
+ * catalog failure loses the code and field details the client needs to say
+ * which field to fix.
+ */
+export type LogEntryErrorCode = 'legacy_fields_required' | 'invalid_request' | 'invalid_payload';
 
 /**
  * The verdict of {@link parseLogEntryBody}. `legacy` and `catalog` name which
@@ -21,10 +52,17 @@ export type ParsedLogEntryBody =
     | { kind: 'catalog'; payload: LogCatalogMealEntryPayload }
     | {
           kind: 'error';
-          code: 'invalid_request' | 'invalid_payload';
+          code: LogEntryErrorCode;
           message: string;
           details: LogEntryFieldError[];
       };
+
+/**
+ * The error verdict on its own, so the controller can map verdict to response
+ * body in one exhaustive function instead of re-deriving the distinction from
+ * the request it already handed over.
+ */
+export type LogEntryErrorVerdict = Extract<ParsedLogEntryBody, { kind: 'error' }>;
 
 type LogEntryRoute = 'legacy' | 'catalog' | 'conflict' | 'unrecognized';
 
@@ -107,6 +145,16 @@ const invalidRequest = (message: string, details: LogEntryFieldError[]): ParsedL
     details,
 });
 
+// The legacy guard's own verdict. Its details are reported for logs and tests
+// but never serialized: the controller owes this case the historical body, and
+// adding a `details` key to it would change a response shipped clients read.
+const legacyFieldsRequired = (details: LogEntryFieldError[]): ParsedLogEntryBody => ({
+    kind: 'error',
+    code: 'legacy_fields_required',
+    message: LEGACY_REQUIRED_MESSAGE,
+    details,
+});
+
 const invalidPayload = (message: string, details: LogEntryFieldError[]): ParsedLogEntryBody => ({
     kind: 'error',
     code: 'invalid_payload',
@@ -159,7 +207,7 @@ const legacyFieldErrors = (record: Record<string, unknown>): LogEntryFieldError[
 
 const parseLegacyBody = (body: unknown, record: Record<string, unknown>): ParsedLogEntryBody => {
     const errors = legacyFieldErrors(record);
-    if (errors.length > 0) return invalidRequest(LEGACY_REQUIRED_MESSAGE, errors);
+    if (errors.length > 0) return legacyFieldsRequired(errors);
 
     // `record` is this same object, narrowed for reading; the body itself is
     // handed on unchanged, exactly as the controller has always handed req.body
@@ -233,3 +281,65 @@ export const parseLogEntryBody = (body: unknown): ParsedLogEntryBody => {
             return unrecognizedPayload();
     }
 };
+
+/**
+ * The value `insertPlannedMealEntry` stamps, and the one no request may ask for.
+ * It is the diary's origin label ("From meal plan") and the plan card's LOGGED
+ * signal, both of which assert a link this module cannot see, so it is named
+ * here only to be excluded from what a body may choose.
+ */
+export const PLANNED_INPUT_METHOD: EntryInputMethod = 'meal_plan';
+
+/**
+ * Every value `meal_entries.input_method` may hold (Agent Action Plan §0.5.1).
+ * The column's vocabulary, not a request's: see {@link CLIENT_INPUT_METHODS}.
+ */
+export const ENTRY_INPUT_METHODS: readonly EntryInputMethod[] = [
+    'library',
+    'search',
+    'ai_text',
+    'ai_photo',
+    PLANNED_INPUT_METHOD,
+];
+
+/**
+ * What the column falls back to. Already the schema default and the value the
+ * legacy writer has always stored for an unrecognised method, so resolving to
+ * it introduces no new wire value and an older client decodes it unchanged.
+ */
+export const DEFAULT_INPUT_METHOD: ClientInputMethod = 'library';
+
+/**
+ * The methods a request body may ask for: the stored vocabulary minus the ones
+ * only the server writes. Derived rather than written out a second time, so a
+ * method added to {@link ENTRY_INPUT_METHODS} cannot be accepted from a body by
+ * omission — it has to be excluded deliberately to stay out.
+ */
+export const CLIENT_INPUT_METHODS: readonly ClientInputMethod[] = ENTRY_INPUT_METHODS.filter(
+    (method): method is ClientInputMethod => method !== PLANNED_INPUT_METHOD,
+);
+
+/**
+ * Resolves the `inputMethod` a legacy body asked for into the value the entry
+ * stores. Unknown, absent and non-string values all become
+ * {@link DEFAULT_INPUT_METHOD}, exactly as the whitelist this replaces did —
+ * nothing is rejected here, because no request that the endpoint accepts today
+ * may start failing.
+ *
+ * The rule it pins, and why it is a rule rather than a formality: **a body may
+ * never choose a method the server writes on its own authority.** `'meal_plan'`
+ * was reachable from here while one list served as both the column's vocabulary
+ * and this accept-list, and the app captions a row "From meal plan" from this
+ * field alone — so a request could claim a planned origin for numbers it
+ * supplied itself, with no plan, no recipe version and `user_entered`
+ * nutrition. §0.1.4(i) and §0.7.3 reserve that claim for the server. Deciding
+ * it here rather than inside the writer's `create` call is what makes it
+ * testable without a database (`backend-architecture` §11), and is the pinnable
+ * rule that earns this module its second export.
+ *
+ * Matching is exact, and what comes back is the vocabulary's own member rather
+ * than the caller's string narrowed by an assertion, so the value reaching the
+ * column can only ever be a method this module names.
+ */
+export const resolveLegacyInputMethod = (value: unknown): ClientInputMethod =>
+    CLIENT_INPUT_METHODS.find((method) => method === value) ?? DEFAULT_INPUT_METHOD;

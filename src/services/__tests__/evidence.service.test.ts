@@ -61,7 +61,9 @@ import {
     EvidenceDeps,
     EvidenceError,
     EvidenceErrorKind,
+    EvidenceFetch,
     EvidenceFetchResult,
+    EvidenceHostLookup,
     EvidenceHttpRequest,
     EvidenceHttpResponse,
     EvidenceResolvedAddress,
@@ -110,6 +112,13 @@ const policyWithLimits = (narrowed: Record<string, unknown>): EvidencePolicy => 
 // and preparation claims only.
 const CANDIDATE_HOST = 'fdc.nal.usda.gov';
 const CANDIDATE_URL = `https://${CANDIDATE_HOST}/food-details/171077/nutrients`;
+/**
+ * Where the same-host redirect used throughout this file leads — the URL that
+ * actually serves the bytes once a hop is followed, and therefore the URL the
+ * retrieval record must carry.
+ */
+const REDIRECT_TARGET_PATH = '/food-details/171077/full';
+const REDIRECT_TARGET_URL = `https://${CANDIDATE_HOST}${REDIRECT_TARGET_PATH}`;
 const EXACT_ENTRY_URL = 'https://nal.usda.gov/food-details/171077';
 const SECOND_ALLOWLISTED_URL = 'https://www.ars.usda.gov/food-details/171077';
 const CULINARY_URL = 'https://www.britannica.com/topic/bread';
@@ -161,7 +170,14 @@ const abortError = (): Error => {
 const PUBLIC_IPV4: EvidenceResolvedAddress = { address: '23.55.1.1', family: 4 };
 const PUBLIC_IPV6: EvidenceResolvedAddress = { address: '2606:2800:220:1::', family: 6 };
 
-type LookupStub = (host: string) => Promise<readonly EvidenceResolvedAddress[]>;
+/**
+ * The resolver seam's shape, signal included. Most stubs below ignore the
+ * signal — a resolver that cannot be cancelled is the realistic case, since
+ * `dns.promises.lookup` takes no signal at all — which is exactly why the
+ * module races every lookup against the deadline instead of trusting the seam
+ * to honour it.
+ */
+type LookupStub = (host: string, signal: AbortSignal) => Promise<readonly EvidenceResolvedAddress[]>;
 type TransportStub = (request: EvidenceHttpRequest, callIndex: number) => Promise<EvidenceHttpResponse>;
 
 interface ScheduledDeadline {
@@ -176,6 +192,11 @@ interface Harness {
     readonly requests: EvidenceHttpRequest[];
     /** Every host the module asked the resolver about, in order. */
     readonly lookedUpHosts: string[];
+    /**
+     * Every abort signal the module handed the resolver, in order — the
+     * resolver's half of the "one budget for the whole retrieval" property.
+     */
+    readonly lookupSignals: AbortSignal[];
     /** Moves the injected clock forward and fires whatever is now due. */
     advance(elapsedMs: number): void;
     /** Deadlines still armed — a leaked timer is a leaked abort. */
@@ -209,6 +230,44 @@ const resolvesToRaw = (answer: unknown): LookupStub => (): Promise<readonly Evid
 
 const lookupRejects = (error: unknown): LookupStub => (): Promise<readonly EvidenceResolvedAddress[]> =>
     Promise.reject(error);
+
+/**
+ * A resolver that never answers **and ignores the signal** — a black-holed
+ * nameserver, and the shape of the real one, since a `getaddrinfo` already in
+ * the threadpool cannot be cancelled.
+ *
+ * The retrieval must still end on time, which is only possible if the module
+ * races the lookup against the deadline rather than awaiting it: without that
+ * race this promise holds the operation open for as long as the process lives,
+ * with the ten-second timeout armed and powerless (§0.3.2).
+ */
+const lookupNeverSettles: LookupStub = (): Promise<readonly EvidenceResolvedAddress[]> =>
+    new Promise<readonly EvidenceResolvedAddress[]>(() => undefined);
+
+/**
+ * A resolver that answers nothing until the test fails it by hand, so a failure
+ * arriving *after* the deadline already decided the outcome is observable.
+ *
+ * `fail` is what a late `SERVFAIL` looks like: the abandoned promise rejecting
+ * with nobody waiting on it. The module must have left a handler on it — an
+ * unhandled rejection in an offline catalog script is a process exit mid-run.
+ */
+const lookupFailedByHand = (): { readonly stub: LookupStub; fail(error: unknown): void } => {
+    let reject: ((error: unknown) => void) | null = null;
+
+    return {
+        stub: (): Promise<readonly EvidenceResolvedAddress[]> =>
+            new Promise<readonly EvidenceResolvedAddress[]>((_resolve, onReject) => {
+                reject = onReject;
+            }),
+        fail: (error: unknown): void => {
+            if (reject === null) {
+                throw new Error('the resolver was never called, so it cannot be failed');
+            }
+            reject(error);
+        },
+    };
+};
 
 /**
  * The default transport answers a perfectly good page.
@@ -290,6 +349,7 @@ const endlessBody = (
 const harness = (options: HarnessOptions = {}): Harness => {
     const requests: EvidenceHttpRequest[] = [];
     const lookedUpHosts: string[] = [];
+    const lookupSignals: AbortSignal[] = [];
     const deadlines: ScheduledDeadline[] = [];
     const lookup = options.lookup ?? resolvesTo(PUBLIC_IPV4);
     const transport = options.transport ?? defaultTransport;
@@ -322,17 +382,19 @@ const harness = (options: HarnessOptions = {}): Harness => {
     return {
         requests,
         lookedUpHosts,
+        lookupSignals,
         advance,
         armedDeadlines: (): number => deadlines.filter((scheduled) => !scheduled.cancelled).length,
         deps: {
-            lookup: (host: string): Promise<readonly EvidenceResolvedAddress[]> => {
+            lookup: (host: string, signal: AbortSignal): Promise<readonly EvidenceResolvedAddress[]> => {
                 lookedUpHosts.push(host);
+                lookupSignals.push(signal);
 
                 if (options.elapseMsPerLookup !== undefined) {
                     advance(options.elapseMsPerLookup);
                 }
 
-                return lookup(host);
+                return lookup(host, signal);
             },
             fetch: (request: EvidenceHttpRequest): Promise<EvidenceHttpResponse> => {
                 const callIndex = requests.length;
@@ -1082,7 +1144,7 @@ describe('fetchEvidence — redirects', () => {
 
         expect(subject.lookedUpHosts).toEqual([CANDIDATE_HOST, CANDIDATE_HOST]);
         expect(subject.requests[1].pinnedAddress).toBe(PUBLIC_IPV4.address);
-        expect(record.url).toBe(CANDIDATE_URL);
+        expect(record.url).toBe(REDIRECT_TARGET_URL);
         expect(record.finalHost).toBe(CANDIDATE_HOST);
     });
 
@@ -1259,6 +1321,124 @@ describe('fetchEvidence — limits', () => {
             expect(refusal.host).toBe(CANDIDATE_HOST);
             expect(subject.requests).toHaveLength(1);
             expect(subject.requests[0].signal.aborted).toBe(true);
+        });
+
+        // The resolver's half of the same property. A deadline that covers only
+        // the HTTPS exchange is not a total timeout: the lookup is the first
+        // I/O of every hop, so a resolver that never settles would hold the
+        // retrieval open indefinitely with the timeout armed and ineffective
+        // (§0.3.2's ten-second total bound; CWE-400). The case below is the
+        // mirror of the never-settling transport above, and it is the one that
+        // can only pass if the lookup is RACED against the deadline rather than
+        // merely awaited under it.
+        it('holds a resolver that never answers until the deadline, then refuses without connecting', async () => {
+            const subject = harness({ lookup: lookupNeverSettles });
+
+            const pending = retrieve(subject);
+            subject.advance(DEADLINE_MS - 1);
+
+            expect(await isPending(pending)).toBe(true);
+
+            subject.advance(1);
+            const refusal = refusalOf(await pending);
+
+            expect(refusal.reason).toBe('fetch_timeout');
+            expect(refusal.error?.kind).toBe('fetch_timeout');
+            expect(refusal.host).toBe(CANDIDATE_HOST);
+            expect(subject.lookedUpHosts).toEqual([CANDIDATE_HOST]);
+            expectNoRequestAttempted(subject);
+        });
+
+        it('abandons the resolver it stopped waiting for without leaving an unhandled rejection', async () => {
+            const resolver = lookupFailedByHand();
+            const unhandled: unknown[] = [];
+            const onUnhandledRejection = (reason: unknown): void => {
+                unhandled.push(reason);
+            };
+
+            process.on('unhandledRejection', onUnhandledRejection);
+            try {
+                const subject = harness({ lookup: resolver.stub });
+
+                const pending = retrieve(subject);
+                subject.advance(DEADLINE_MS);
+                const refusal = refusalOf(await pending);
+
+                // The retrieval is over and nothing is awaiting the resolver
+                // any more; a real one still fails eventually.
+                resolver.fail(new Error('SERVFAIL, long after anyone was waiting'));
+                await new Promise<void>((resolve) => setImmediate(resolve));
+
+                expect(refusal.reason).toBe('fetch_timeout');
+                expect(unhandled).toEqual([]);
+                expectNoRequestAttempted(subject);
+            } finally {
+                process.off('unhandledRejection', onUnhandledRejection);
+            }
+        });
+
+        it('hands the resolver the same abort signal every request of the retrieval gets', async () => {
+            const subject = harness({
+                transport: answers(
+                    (): EvidenceHttpResponse => redirectResponse(REDIRECT_TARGET_PATH),
+                    (): EvidenceHttpResponse => htmlResponse(CANDIDATE_BODY),
+                ),
+            });
+
+            recordOf(await retrieve(subject));
+
+            expect(subject.lookupSignals).toHaveLength(2);
+            expect(subject.lookupSignals[0]).toBe(subject.requests[0].signal);
+            expect(subject.lookupSignals[1]).toBe(subject.requests[0].signal);
+        });
+
+        it('aborts the signal the resolver was handed once the budget runs out', async () => {
+            const subject = harness({ lookup: lookupNeverSettles });
+
+            const pending = retrieve(subject);
+
+            expect(await isPending(pending)).toBe(true);
+            expect(subject.lookupSignals).toHaveLength(1);
+            expect(subject.lookupSignals[0].aborted).toBe(false);
+
+            subject.advance(DEADLINE_MS);
+            refusalOf(await pending);
+
+            expect(subject.lookupSignals[0].aborted).toBe(true);
+        });
+
+        it('refuses a lookup that consumed the whole budget rather than connecting with what it answered', async () => {
+            // A perfectly good answer, delivered too late: the addresses are
+            // public and would classify, and the retrieval is still over. The
+            // budget is therefore re-checked after the resolver settles, which
+            // is the last check before a socket exists.
+            const subject = harness({ elapseMsPerLookup: DEADLINE_MS + 1 });
+
+            const refusal = refusalOf(await retrieve(subject));
+
+            expect(refusal.reason).toBe('fetch_timeout');
+            expect(refusal.error?.kind).toBe('fetch_timeout');
+            expect(refusal.host).toBe(CANDIDATE_HOST);
+            expect(subject.lookedUpHosts).toEqual([CANDIDATE_HOST]);
+            expectNoRequestAttempted(subject);
+        });
+
+        it("refuses when a hop's lookup consumes the rest of the budget, without connecting again", async () => {
+            const perLookupMs = Math.floor(DEADLINE_MS * 0.6);
+            const subject = harness({
+                elapseMsPerLookup: perLookupMs,
+                transport: answersUnlessAborted(
+                    (): EvidenceHttpResponse => redirectResponse(REDIRECT_TARGET_PATH),
+                    (): EvidenceHttpResponse => htmlResponse(CANDIDATE_BODY),
+                ),
+            });
+
+            const refusal = refusalOf(await retrieve(subject));
+
+            expect(perLookupMs).toBeLessThan(DEADLINE_MS);
+            expect(refusal.reason).toBe('fetch_timeout');
+            expect(subject.lookedUpHosts).toEqual([CANDIDATE_HOST, CANDIDATE_HOST]);
+            expect(subject.requests).toHaveLength(1);
         });
 
         it('takes the stricter of the configured timeout and the declared one', async () => {
@@ -1715,18 +1895,54 @@ describe('fetchEvidence — the retrieval record', () => {
         expect(recordOf(await retrieve(subject)).fetchedAt).toBe(stampedAt);
     });
 
-    it('keeps the proposed URL as the retrieval identity while naming the host that served the bytes', async () => {
+    // The record is audit evidence, so every field of it must describe the one
+    // response it was taken from: the URL that served the bytes, the host that
+    // served them, and the status, hash and snippet of that same exchange.
+    // After a followed hop the proposed URL served nothing — it answered a
+    // redirect — so recording it as the retrieval's URL would attribute a hash
+    // and a snippet to a location that never produced them, and a reviewer
+    // re-fetching the recorded URL to verify the hash would be re-fetching the
+    // redirect rather than the page.
+    it('records the URL that served the bytes after a followed hop, and the host that served them', async () => {
         const subject = harness({
             transport: answers(
-                (): EvidenceHttpResponse => redirectResponse('/food-details/171077/full'),
+                (): EvidenceHttpResponse => redirectResponse(REDIRECT_TARGET_PATH),
                 (): EvidenceHttpResponse => htmlResponse(CANDIDATE_BODY),
             ),
         });
 
         const record = recordOf(await retrieve(subject));
 
-        expect(record.url).toBe(CANDIDATE_URL);
+        expect(record.url).toBe(REDIRECT_TARGET_URL);
+        expect(record.url).not.toBe(CANDIDATE_URL);
+        expect(subject.requests[1].url).toBe(record.url);
         expect(record.finalHost).toBe(CANDIDATE_HOST);
+    });
+
+    it('carries the hash and the snippet of the body the redirect target served, not of the one the proposal did', async () => {
+        // Different bytes at the two hops, which is what makes the attribution
+        // observable: a record that named the proposed URL would be pairing
+        // this hash and this snippet with a URL that served the other body.
+        const proposedBody = '<html><body><h1>Duck breast, raw</h1></body></html>';
+        const servedBody = `<html><body><h1>${CANDIDATE_NAME}</h1><p>165 kcal per 100 g.</p></body></html>`;
+
+        const subject = harness({
+            transport: answers(
+                (): EvidenceHttpResponse => ({
+                    ...redirectResponse(REDIRECT_TARGET_PATH),
+                    body: streamOf(Buffer.from(proposedBody)),
+                }),
+                (): EvidenceHttpResponse => htmlResponse(servedBody),
+            ),
+        });
+
+        const record = recordOf(await retrieve(subject));
+
+        expect(record.url).toBe(REDIRECT_TARGET_URL);
+        expect(record.bodySha256).toBe(createHash('sha256').update(Buffer.from(servedBody)).digest('hex'));
+        expect(record.bodySha256).not.toBe(createHash('sha256').update(Buffer.from(proposedBody)).digest('hex'));
+        expect(record.matchedSnippet).toContain('165 kcal per 100 g.');
+        expect(subject.requests.map((request) => request.url)).toEqual([CANDIDATE_URL, REDIRECT_TARGET_URL]);
     });
 
     describe('the snippet', () => {
@@ -1891,10 +2107,44 @@ describe('fetchEvidence — the retrieval record', () => {
 // ---------------------------------------------------------------------------
 // The default seams.
 //
-// Present, typed and cancellable — but never invoked in a way that would open
-// a socket or ask a resolver anything. The guard below holds with no `deps` at
-// all, which is the only assertion about the real transport worth making here.
+// Present, typed and cancellable — and never invoked in a way that could open
+// a socket or ask a resolver anything.
+//
+// That is a property of this FILE, not only of the module: a suite that leaves
+// the real resolver or the real transport wired behind a refusal it expects is
+// safe only while the module keeps deciding that refusal first. A regression in
+// check ordering would turn such a case into real DNS or real HTTPS traffic
+// from a unit-test run against a model-proposed hostname, which is the SSRF the
+// module exists to prevent, issued by its own test suite (CWE-918). So every
+// case below either supplies recording sentinels for both network seams, or
+// supplies a URL there is nothing to resolve in the first place.
 // ---------------------------------------------------------------------------
+
+/** A resolver that cannot resolve: it records the attempt and then refuses to. */
+const resolverSentinel = (): { readonly lookup: EvidenceHostLookup; consulted(): readonly string[] } => {
+    const hosts: string[] = [];
+
+    return {
+        lookup: (host: string): Promise<readonly EvidenceResolvedAddress[]> => {
+            hosts.push(host);
+            throw new Error(`the resolver sentinel was consulted for ${host}`);
+        },
+        consulted: (): readonly string[] => hosts,
+    };
+};
+
+/** A transport that cannot transport, on the same terms. */
+const transportSentinel = (): { readonly fetch: EvidenceFetch; consulted(): readonly string[] } => {
+    const urls: string[] = [];
+
+    return {
+        fetch: (request: EvidenceHttpRequest): Promise<EvidenceHttpResponse> => {
+            urls.push(request.url);
+            throw new Error(`the transport sentinel was consulted for ${request.host}`);
+        },
+        consulted: (): readonly string[] => urls,
+    };
+};
 
 describe('the default seams', () => {
     it('supplies a real resolver and a real transport', () => {
@@ -1918,6 +2168,12 @@ describe('the default seams', () => {
         expect(fired).toBe(false);
     });
 
+    // This is the one case that exercises the real transport, and it is safe by
+    // construction rather than by trusting an ordering: `defaultEvidenceFetch`
+    // rejects at `new URL(request.url)`, before it builds an agent, asks for a
+    // socket or reads `pinnedAddress`. No hostname is resolved by it — the
+    // string it is handed is not a URL, so there is no host in it to resolve,
+    // and the default resolver is never reached by any path through this call.
     it('refuses a request it cannot even parse, before any connection is made', async () => {
         await expect(
             defaultEvidenceFetch({
@@ -1931,38 +2187,54 @@ describe('the default seams', () => {
         ).rejects.toThrow();
     });
 
-    it('refuses an off-allowlist host with the real resolver and the real clock wired in', async () => {
-        const attempted: EvidenceHttpRequest[] = [];
+    // The ordering property, asserted with BOTH network seams replaced by
+    // sentinels that record and then throw. Recording makes "never consulted"
+    // observable; throwing means a regression that consulted one could not
+    // quietly succeed and let the case pass. Neither sentinel can reach a
+    // network, so the assertion no longer depends on the module refusing first
+    // in order to stay offline.
+    it('refuses an off-allowlist host without consulting either network seam', async () => {
+        const resolver = resolverSentinel();
+        const transport = transportSentinel();
 
         const result = await fetchEvidence(
             'https://evil.example/food-details',
             CANDIDATE_NAME,
             committedPolicy,
             'canonical_identity',
-            {
-                fetch: (request: EvidenceHttpRequest): Promise<EvidenceHttpResponse> => {
-                    attempted.push(request);
-                    return Promise.resolve(htmlResponse(CANDIDATE_BODY));
-                },
-            },
+            { lookup: resolver.lookup, fetch: transport.fetch },
         );
 
         expect(refusalOf(result).reason).toBe('host_not_allowlisted');
-        expect(attempted).toHaveLength(0);
+        expect(resolver.consulted()).toEqual([]);
+        expect(transport.consulted()).toEqual([]);
     });
 
-    // The only case in this file with no call count to assert: it supplies no
-    // `deps` at all, which is the point — the verdict must not depend on the
-    // seam being injected. The test above is the observable half of the pair.
-    it('reaches the same verdict with no deps supplied at all', async () => {
+    // The property the replaced no-deps case was reaching for — the verdict
+    // does not depend on a seam being injected — without the risk that paid for
+    // it. The old case passed an off-allowlist HOSTNAME with no deps at all, so
+    // the real resolver and the real transport were both wired, and a
+    // regression in check ordering would have made this suite issue live DNS
+    // and live HTTPS toward a name a model could have proposed.
+    //
+    // This one is refused on the policy document, which is judged before the
+    // URL is read at all — hence `host: null`, no host was ever known — and the
+    // URL it carries is not a URL, so it contains no hostname for even a
+    // module that skipped every check to resolve. Nothing in the call is
+    // resolvable, which is what makes the missing seams harmless here rather
+    // than harmless-for-now.
+    it('reaches a verdict with no deps supplied at all, from a call carrying nothing resolvable', async () => {
         const result = await fetchEvidence(
-            'https://evil.example/food-details',
+            'not-a-url',
             CANDIDATE_NAME,
-            committedPolicy,
+            ({ ...cloneDocument(), allowlistVersion: 'v2' } as unknown) as EvidencePolicy,
             'canonical_identity',
         );
 
-        expect(refusalOf(result).reason).toBe('host_not_allowlisted');
+        const refusal = refusalOf(result);
+
+        expect(refusal.reason).toBe('policy_invalid');
+        expect(refusal.host).toBeNull();
     });
 });
 

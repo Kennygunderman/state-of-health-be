@@ -10,15 +10,27 @@
 // data/meal-planning/reports/latest/benchmark-report.json (Agent Action Plan
 // §0.7.1 Group 3, §0.9.3).
 //
-// WHAT IT DOES IN THIS REVISION. Neither the query set nor the search service
-// exists in this checkout: data/meal-planning/search-benchmark.v1.json and
-// src/services/catalog.service.ts are Agent Action Plan §0.7.1 Group 3
-// deliverables. This entry point is therefore the stage's input contract: it
-// parses its flags, reports the accepted database origin, checks the inputs the
-// benchmark consumes, and refuses, naming either the unsatisfied inputs and
-// their remedies or the pipeline module that still has to be wired in. No query
-// is issued and no report is written on any path — an empty or stale benchmark
-// report must never be mistakable for a measured one.
+// WHAT IT DOES IN THIS REVISION — AND WHAT NOTHING ELSE MAY CLAIM IT DOES.
+// Both of the stage's inputs are now in the checkout:
+// data/meal-planning/search-benchmark.v1.json carries the query set, the
+// expected source_keys, the thresholds and the measurement protocol, and
+// src/services/catalog.service.ts exposes searchPublishedFoods. What is still
+// missing is this file's measurement body: the passes, the per-query timing, the
+// rank scoring, the pagination check and the report writer (Agent Action Plan
+// §0.7.1 Group 3). Until that lands, this entry point is the stage's input
+// contract only — it parses its flags, reports the accepted database origin,
+// checks the inputs the benchmark consumes, and refuses, naming either the
+// unsatisfied inputs and their remedies or the body that still has to be wired
+// in.
+//
+// So: this file does NOT import catalog.service.ts, does not open a query, times
+// nothing, and writes no report on any path. No p50, p95 or hit rate for the
+// search exists anywhere yet, and an empty or stale benchmark report must never
+// be mistakable for a measured one. The measured-unit note in
+// src/services/catalog.service.ts says the same thing from the other side; the
+// two must be corrected together, because a policy comment that claims a
+// measurement this file never took is how unmeasured search quality comes to
+// read as acceptance evidence.
 //
 // The two guard imports are ordered and load-bearing: Rule
 // backend-architecture §10's IPv4-first DNS ordering, then dbGuard's
@@ -40,8 +52,13 @@ import { CheckpointError } from './lib/checkpoint';
 
 const STAGE = 'search-benchmark';
 
+// What the refusal names as the missing piece. Both inputs exist, so this is
+// the body itself: the timing passes, the rank scoring, the pagination check and
+// the report writer that would drive src/services/catalog.service.ts through
+// data/meal-planning/search-benchmark.v1.json.
 const WIRED_BY =
-    'src/services/catalog.service.ts with data/meal-planning/search-benchmark.v1.json (AAP §0.7.1 Group 3)';
+    'the measurement body of this stage — timing passes, rank scoring, pagination check and report writer over ' +
+    'src/services/catalog.service.ts and data/meal-planning/search-benchmark.v1.json (AAP §0.7.1 Group 3, §0.9.3)';
 
 const CATALOG_SERVICE_MODULE = 'src/services/catalog.service.ts';
 
@@ -190,9 +207,10 @@ export const describeUsage = (): string =>
         `Usage: npm run search:benchmark -- [options]   (${STAGE})`,
         '',
         'Checks every input the search benchmark consumes and reports what is missing.',
-        'This revision carries no benchmark body, so no query is issued and no report',
-        'is written: the command exits 1 naming either the unsatisfied prerequisites',
-        'or the pipeline module that still has to be wired in.',
+        'This revision carries no measurement body, so no query is issued, nothing is',
+        'timed and no report is written: the command exits 1 naming either the',
+        'unsatisfied prerequisites or the body that still has to be wired in. No',
+        'latency or hit-rate figure for catalog search exists until it does.',
         '',
         'Options:',
         '  --out <path>     Write the report to this path instead of the default.',

@@ -1,0 +1,1273 @@
+// Unit tests for the swap selection rules. No database, no network, no mocks
+// and no clock: every rule in `swap.logic.ts` takes the rows it judges as
+// arguments, so each test states a whole scenario from object literals and
+// asserts a returned value.
+//
+// The scenarios that matter most are the ones a future change could plausibly
+// "simplify" away, and each has its own describe block below:
+//
+//  - LIST = PREVIEW = COMMIT. One fixture proves `selectSwapCandidate` returns
+//    the identical candidate the list carries — every row of a full eight-row
+//    list included — that a recipe the list never offered is refused with
+//    `RecipeIneligibleError`, and that the committed write holds exactly the
+//    previewed numbers. Three separate implementations of "which meals fit",
+//    and a preview reading a wider set than the sheet, are the failures this
+//    pins.
+//  - THE CURRENT MEAL REMOVED FROM REPETITION. A recipe whose only other use in
+//    the week IS the meal being replaced stays admissible, and one more use
+//    elsewhere makes it inadmissible again — so the removal subtracts exactly
+//    one. The day-before and day-after cases are asserted separately, because
+//    passing only one neighbour is the plausible mistake (the generator has
+//    one).
+//  - DETERMINISM WITHOUT A PRNG. The same candidates in a shuffled input order
+//    yield an identical list, equal-proximity candidates order by slug then
+//    version, and `Math.random` is asserted never to be consulted. The ranking
+//    key is also proved TRANSITIVE — every permutation of a triple whose
+//    proximities sit within one epsilon of each other sorts to one list —
+//    because approximate equality is not an equivalence relation and a
+//    comparator built on it makes the list depend on the input order.
+//  - AN EMPTY LIST IS AN ANSWER. A slot whose only eligible recipe is the one
+//    already planned returns `[]` (the client's 13d state) rather than offering
+//    the user their own lunch, and an allergen is never relaxed to fill a short
+//    list.
+//  - THE PREVIEW BINDS THE PORTION. Including the §0.9.2 pair: a target change
+//    that moves the recomputed multiplier ends in `PreviewStaleError`, and one
+//    that leaves it equal does not.
+//  - A COMMITTED SWAP CLEARS THE MEAL'S FLAGS. `swapMealWrite` returns empty
+//    `flags` for every candidate, because a candidate that reached a commit
+//    passed the eligibility rule a flag is raised by (§0.7.3).
+//  - A -> B -> C LOGGED STATE, composed here from `swapMealWrite` and
+//    `plannedMealLog.logic.ts::deriveLoggedStatus` rather than re-implemented in
+//    `swap.logic.ts`: the audit column names B while the diary entries still
+//    name A, and it is the entries the caption must come from.
+//
+// Fixtures put every recipe on the TARGET'S OWN MACRO RATIO, so the day
+// tolerance binds on calories alone and each scenario's arithmetic is readable
+// (`proportional` below). Where a test needs the tolerance to bind on a macro
+// instead, it states an explicit per-serving profile. Thresholds are never
+// hand-copied: the multiplier sets and the list length come from the modules'
+// own exported constants.
+
+import {
+    MAX_SWAP_ALTERNATIVES,
+    SwapCandidate,
+    SwapDayMeal,
+    SwapSelectionContext,
+    SwapWeekMeal,
+    compareSwapCandidates,
+    currentDayTotalsFor,
+    requireBoundPortion,
+    selectSwapCandidate,
+    selectSwapCandidates,
+    selectSwapPortion,
+    swapMealWrite,
+} from '../swap.logic';
+import {
+    MAIN_SLOT_PORTION_MULTIPLIERS,
+    MealPlanInputError,
+    PlanRecipeCandidate,
+    SNACK_PORTION_MULTIPLIERS,
+    TOLERANCE_EPSILON,
+    computeDayTotals,
+    isDayWithinTolerance,
+    targetProximity,
+} from '../mealPlan.logic';
+import { PreviewStaleError, RecipeIneligibleError } from '../mealPlanning.errors';
+import { LinkedDiaryEntryRow, deriveLoggedStatus } from '../plannedMealLog.logic';
+import { PlanningPreferences } from '../recipe.logic';
+import type { MealPlanMacroTotals } from '../../types/mealPlanning';
+import type { MealSlot } from '../../types/recipe';
+
+/* ---------------------------------------------------------------------------
+ * Fixtures
+ * ------------------------------------------------------------------------- */
+
+const TARGETS: MealPlanMacroTotals = { calories: 2000, protein: 150, carbs: 200, fat: 65 };
+
+/** A nutrition profile on the target's own macro ratio, so only calories vary. */
+const proportional = (calories: number): MealPlanMacroTotals => ({
+    calories,
+    protein: calories * (TARGETS.protein / TARGETS.calories),
+    carbs: calories * (TARGETS.carbs / TARGETS.calories),
+    fat: calories * (TARGETS.fat / TARGETS.calories),
+});
+
+/** A target set on the same ratio — what "the user moved their targets" looks like. */
+const targetsAt = (calories: number): MealPlanMacroTotals => proportional(calories);
+
+const PLAN_START = '2026-07-05';
+/** Mid-week ON PURPOSE: this day has a day before AND a day after. */
+const SWAP_DATE = '2026-07-08';
+const DAY_BEFORE = '2026-07-07';
+const DAY_AFTER = '2026-07-09';
+const TWO_DAYS_LATER = '2026-07-10';
+const PLAN_END = '2026-07-11';
+
+const BREAKFAST_MEAL_ID = 'meal-breakfast';
+const LUNCH_MEAL_ID = 'meal-lunch';
+const DINNER_MEAL_ID = 'meal-dinner';
+
+/** The recipe the day's breakfast holds — reused as the same-day repetition case. */
+const SHARED_RECIPE_ID = 'shared-recipe';
+/** The recipe the lunch being replaced holds, and its planned version. */
+const WRAP_RECIPE_ID = 'wrap-recipe';
+const WRAP_VERSION_1 = 'wrap-version-1';
+const WRAP_VERSION_2 = 'wrap-version-2';
+
+type Ingredient = PlanRecipeCandidate['ingredients'][number];
+
+interface RecipeSpec {
+    slug: string;
+    /** Per-serving calories; the other three macros follow the target ratio. */
+    perServingCalories?: number;
+    /** An explicit profile, for fixtures that need the tolerance to bind on a macro. */
+    nutrition?: MealPlanMacroTotals;
+    recipeId?: string;
+    versionId?: string;
+    version?: number;
+    slots?: MealSlot[];
+    totalMinutes?: number;
+    status?: 'current' | 'retired';
+    provenance?: 'source_backed' | 'ingredient_derived' | 'ai_estimated';
+    allergenTags?: string[];
+    allergenStatus?: 'known' | 'unknown';
+    dietTags?: string[];
+    ingredientIds?: string[];
+    foodGroups?: string[];
+}
+
+const makeRecipe = (spec: RecipeSpec): PlanRecipeCandidate => {
+    const version = spec.version ?? 1;
+    const ingredientIds = spec.ingredientIds ?? [`${spec.slug}-food`];
+    const provenance = spec.provenance ?? 'source_backed';
+    const allergenStatus = spec.allergenStatus ?? 'known';
+
+    const ingredients: Ingredient[] = ingredientIds.map((catalogFoodId, index) => ({
+        catalog_food_id: catalogFoodId,
+        snapshot_name: catalogFoodId,
+        snapshot_provenance: provenance,
+        snapshot_allergen_tags: spec.allergenTags ?? [],
+        snapshot_diet_tags: spec.dietTags ?? ['vegan'],
+        is_optional: false,
+        food_group: spec.foodGroups?.[index] ?? `${catalogFoodId}-group`,
+        allergen_status: allergenStatus,
+    }));
+
+    return {
+        recipe_version_id: spec.versionId ?? `${spec.slug}-version-${version}`,
+        recipe_id: spec.recipeId ?? `${spec.slug}-recipe`,
+        slug: spec.slug,
+        version,
+        status: spec.status ?? 'current',
+        nutrition_provenance: provenance,
+        allergen_status: allergenStatus,
+        total_minutes: spec.totalMinutes ?? 20,
+        meal_slots: spec.slots ?? ['lunch'],
+        ingredients,
+        budget_tier: 1,
+        per_serving: spec.nutrition ?? proportional(spec.perServingCalories ?? 700),
+    };
+};
+
+/**
+ * The day being edited: breakfast 500 kcal, the lunch under replacement 700,
+ * dinner 800 — a day that sits exactly on the 2,000 kcal target, so every
+ * candidate's effect on it is the candidate's own arithmetic.
+ */
+const dayMeals = (lunchOverrides: Partial<SwapDayMeal> = {}): SwapDayMeal[] => [
+    {
+        id: BREAKFAST_MEAL_ID,
+        slot: 'breakfast',
+        recipeId: SHARED_RECIPE_ID,
+        recipeVersionId: 'shared-version-1',
+        portionMultiplier: 1,
+        planned: proportional(500),
+        revision: 1,
+    },
+    {
+        id: LUNCH_MEAL_ID,
+        slot: 'lunch',
+        recipeId: WRAP_RECIPE_ID,
+        recipeVersionId: WRAP_VERSION_1,
+        portionMultiplier: 1,
+        planned: proportional(700),
+        revision: 1,
+        ...lunchOverrides,
+    },
+    {
+        id: DINNER_MEAL_ID,
+        slot: 'dinner',
+        recipeId: 'salmon-recipe',
+        recipeVersionId: 'salmon-version-1',
+        portionMultiplier: 1,
+        planned: proportional(800),
+        revision: 1,
+    },
+];
+
+const currentLunch = (): SwapDayMeal => {
+    const lunch = dayMeals().find((meal) => meal.id === LUNCH_MEAL_ID);
+
+    if (lunch === undefined) {
+        throw new Error('the lunch fixture must exist');
+    }
+
+    return lunch;
+};
+
+/**
+ * The week the repetition rule reads: this day's three meals plus one meal on
+ * the plan's first day, with whatever the scenario adds.
+ */
+const weekMeals = (extra: readonly SwapWeekMeal[] = []): SwapWeekMeal[] => [
+    ...dayMeals().map((meal) => ({ id: meal.id, date: SWAP_DATE, recipeId: meal.recipeId })),
+    { id: 'meal-first-day-lunch', date: PLAN_START, recipeId: 'first-day-recipe' },
+    ...extra,
+];
+
+const makePreferences = (overrides: Partial<PlanningPreferences> = {}): PlanningPreferences => ({
+    diet: null,
+    allergens: [],
+    disliked_food_ids: [],
+    disliked_food_groups: [],
+    cooking_time_limit_min: null,
+    ...overrides,
+});
+
+const makeContext = (overrides: Partial<SwapSelectionContext> = {}): SwapSelectionContext => ({
+    mealId: LUNCH_MEAL_ID,
+    date: SWAP_DATE,
+    slot: 'lunch',
+    dayMeals: dayMeals(),
+    weekMeals: weekMeals(),
+    targets: TARGETS,
+    preferences: makePreferences(),
+    recipes: [],
+    ...overrides,
+});
+
+/** The candidate the list would carry for one recipe, or a failure naming it. */
+const requirePortion = (context: SwapSelectionContext, recipe: PlanRecipeCandidate): SwapCandidate => {
+    const candidate = selectSwapPortion(context, recipe);
+
+    if (candidate === null) {
+        throw new Error(`expected ${recipe.slug} to have an admissible portion`);
+    }
+
+    return candidate;
+};
+
+/** The `field` a {@link MealPlanInputError} names — what the controller renders. */
+const inputErrorField = (act: () => unknown): string => {
+    try {
+        act();
+    } catch (error) {
+        if (error instanceof MealPlanInputError) {
+            return error.field;
+        }
+
+        throw error;
+    }
+
+    throw new Error('expected a MealPlanInputError');
+};
+
+const slugsOf = (candidates: readonly SwapCandidate[]): string[] =>
+    candidates.map((candidate) => candidate.recipe.slug);
+
+/**
+ * The day that would result from putting exactly `nutrition` in the lunch slot —
+ * the counterfactual a test needs to show that a portion the rule REJECTED (or
+ * passed over) really was admissible, or really was not.
+ */
+const dayIfLunchWere = (nutrition: MealPlanMacroTotals): MealPlanMacroTotals =>
+    computeDayTotals(
+        dayMeals().map((meal) => (meal.id === LUNCH_MEAL_ID ? { planned: nutrition } : meal)),
+    );
+
+const scaled = (nutrition: MealPlanMacroTotals, multiplier: number): MealPlanMacroTotals => ({
+    calories: nutrition.calories * multiplier,
+    protein: nutrition.protein * multiplier,
+    carbs: nutrition.carbs * multiplier,
+    fat: nutrition.fat * multiplier,
+});
+
+/* ---------------------------------------------------------------------------
+ * The recipes the scenarios draw from
+ *
+ * With the day at 500 + 800 = 1,300 kcal around the lunch slot, a candidate
+ * portion of C kcal lands the day at 1,300 + C against a 2,000 kcal target, and
+ * the ±10 % calorie band admits C between 500 and 900.
+ * ------------------------------------------------------------------------- */
+
+/** 700 per serving: one serving lands the day exactly on target. */
+const ALT_ALPHA = makeRecipe({ slug: 'alt-alpha', perServingCalories: 700 });
+
+/** Identical numbers to alpha — the equal-proximity case the slug key orders. */
+const ALT_BETA = makeRecipe({ slug: 'alt-beta', perServingCalories: 700 });
+
+/** 1,400 per serving: admissible ONLY at half a portion (0.5 -> 700 kcal). */
+const ALT_HALF = makeRecipe({ slug: 'alt-half', perServingCalories: 1400 });
+
+/**
+ * 1,120 per serving: 0.5 -> 560 (day 1,860) and 0.75 -> 840 (day 2,140) are
+ * exactly equidistant from the target, so the tie must resolve to 0.5.
+ */
+const ALT_TIE = makeRecipe({ slug: 'alt-tie', perServingCalories: 1120 });
+
+/**
+ * 500 per serving: the FIRST admissible multiplier (1 -> day 1,800, on the band
+ * edge) is 200 kcal out, while 1.5 -> day 2,050 is 50 out. The chosen portion
+ * proves the rule minimises rather than taking the first portion that fits.
+ */
+const ALT_LARGER = makeRecipe({ slug: 'alt-larger', perServingCalories: 500 });
+
+/** 200 per serving: even two portions leave the day below the band. */
+const ALT_TINY = makeRecipe({ slug: 'alt-tiny', perServingCalories: 200 });
+
+/**
+ * Lands the day's CALORIES exactly on target at one serving while leaving its
+ * protein far below the band — the whole-day tolerance case.
+ */
+const ALT_PROTEIN_POOR = makeRecipe({
+    slug: 'alt-protein-poor',
+    nutrition: { calories: 700, protein: 0, carbs: 175, fat: 0 },
+});
+
+/**
+ * 350 per serving, declared for lunch AND snack: the main-slot set reaches 2
+ * (day exactly on target) where the snack set stops at 1.5, so the two slots
+ * choose different portions for the same recipe.
+ */
+const ALT_SNACKABLE = makeRecipe({
+    slug: 'alt-snackable',
+    perServingCalories: 350,
+    slots: ['lunch', 'snack'],
+});
+
+/** The republished version of the dish currently in the slot. */
+const WRAP_V2 = makeRecipe({
+    slug: 'wrap',
+    version: 2,
+    versionId: WRAP_VERSION_2,
+    recipeId: WRAP_RECIPE_ID,
+    perServingCalories: 700,
+});
+
+/** The version the slot already holds — never an alternative to itself. */
+const WRAP_V1 = makeRecipe({
+    slug: 'wrap',
+    version: 1,
+    versionId: WRAP_VERSION_1,
+    recipeId: WRAP_RECIPE_ID,
+    perServingCalories: 700,
+});
+
+/**
+ * Twelve interchangeable alternatives, each 2 kcal lighter than the last, so
+ * their resulting days are 2 kcal further from the target in `slug` order and
+ * the ranking has one unambiguous answer.
+ */
+const rankedAlternatives = (): PlanRecipeCandidate[] =>
+    Array.from({ length: 12 }, (unused, index) =>
+        makeRecipe({
+            slug: `rank-${String(index).padStart(2, '0')}`,
+            perServingCalories: 700 - 2 * index,
+        }),
+    );
+
+/* ---------------------------------------------------------------------------
+ * currentDayTotalsFor
+ * ------------------------------------------------------------------------- */
+
+describe('currentDayTotalsFor', () => {
+    it('sums the day as it stands, the meal being replaced included', () => {
+        const context = makeContext();
+        const totals = currentDayTotalsFor(context);
+
+        expect(totals).toEqual(computeDayTotals(context.dayMeals));
+        expect(totals.calories).toBe(2000);
+    });
+
+    it('refuses a day that does not contain the meal being replaced', () => {
+        const context = makeContext({ mealId: 'meal-from-another-day' });
+
+        expect(() => currentDayTotalsFor(context)).toThrow(MealPlanInputError);
+        expect(inputErrorField(() => currentDayTotalsFor(context))).toBe('dayMeals');
+    });
+
+    it('refuses a date that does not exist, rather than planning against it', () => {
+        const context = makeContext({ date: '2026-02-30' });
+
+        expect(inputErrorField(() => currentDayTotalsFor(context))).toBe('date');
+    });
+
+    it('refuses a slot that disagrees with the stored meal', () => {
+        const context = makeContext({ slot: 'dinner' });
+
+        expect(inputErrorField(() => currentDayTotalsFor(context))).toBe('slot');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * selectSwapPortion — the portion, and only the portion
+ * ------------------------------------------------------------------------- */
+
+describe('selectSwapPortion', () => {
+    it('minimises the resulting day\'s calorie gap rather than taking the first portion that fits', () => {
+        const candidate = requirePortion(makeContext(), ALT_LARGER);
+
+        expect(candidate.portionMultiplier).toBe(1.5);
+        expect(candidate.dayTotalsIfSwapped.calories).toBe(2050);
+        // One serving is tried FIRST and genuinely fits — the day lands on the
+        // band edge at 1,800 — so a "first admissible" rule would have returned
+        // it, 200 kcal out instead of 50.
+        const onePortionDay = dayIfLunchWere(ALT_LARGER.per_serving);
+
+        expect(MAIN_SLOT_PORTION_MULTIPLIERS).toContain(1);
+        expect(isDayWithinTolerance(onePortionDay, TARGETS)).toBe(true);
+        expect(Math.abs(onePortionDay.calories - TARGETS.calories)).toBeGreaterThan(
+            Math.abs(candidate.dayTotalsIfSwapped.calories - TARGETS.calories),
+        );
+    });
+
+    it('offers a recipe that is admissible only at a non-default portion at that portion', () => {
+        const candidate = requirePortion(makeContext(), ALT_HALF);
+
+        expect(candidate.portionMultiplier).toBe(0.5);
+        expect(candidate.dayTotalsIfSwapped.calories).toBe(2000);
+        // A full portion — the default, and the one a "portion 1 unless asked"
+        // shortcut would offer — puts the day at 2,700 kcal, 500 above the band.
+        expect(isDayWithinTolerance(dayIfLunchWere(ALT_HALF.per_serving), TARGETS)).toBe(false);
+    });
+
+    it('breaks a tie between two equidistant portions toward the smaller multiplier', () => {
+        const candidate = requirePortion(makeContext(), ALT_TIE);
+
+        expect(candidate.portionMultiplier).toBe(0.5);
+        expect(candidate.dayTotalsIfSwapped.calories).toBe(1860);
+        // The tie is real: three quarters of a portion is the same distance out.
+        expect(Math.abs(2140 - TARGETS.calories)).toBe(
+            Math.abs(candidate.dayTotalsIfSwapped.calories - TARGETS.calories),
+        );
+    });
+
+    it('returns null when no portion keeps the day inside tolerance', () => {
+        expect(selectSwapPortion(makeContext(), ALT_TINY)).toBeNull();
+    });
+
+    it('applies the whole-day tolerance, not the calorie band alone', () => {
+        // One serving lands the day's calories exactly on target, so a
+        // calories-only gate would admit it — the protein band is what refuses
+        // it, at this and at every other portion.
+        const onePortionDay = dayIfLunchWere(ALT_PROTEIN_POOR.per_serving);
+
+        expect(onePortionDay.calories).toBe(TARGETS.calories);
+        expect(onePortionDay.protein).toBeLessThan(TARGETS.protein);
+        expect(isDayWithinTolerance(onePortionDay, TARGETS)).toBe(false);
+        expect(selectSwapPortion(makeContext(), ALT_PROTEIN_POOR)).toBeNull();
+    });
+
+    it('uses the slot\'s own multiplier set, so a snack is never offered a main-slot portion', () => {
+        const lunchCandidate = requirePortion(makeContext(), ALT_SNACKABLE);
+        const snackContext = makeContext({
+            slot: 'snack',
+            dayMeals: dayMeals({ slot: 'snack' }),
+        });
+        const snackCandidate = requirePortion(snackContext, ALT_SNACKABLE);
+
+        expect(lunchCandidate.portionMultiplier).toBe(2);
+        expect(MAIN_SLOT_PORTION_MULTIPLIERS).toContain(2);
+        expect(SNACK_PORTION_MULTIPLIERS).not.toContain(2);
+        expect(snackCandidate.portionMultiplier).toBe(1.5);
+    });
+
+    it('carries the per-portion nutrition unrounded and the delta against the day as it stands', () => {
+        const context = makeContext();
+        const half = requirePortion(context, ALT_HALF);
+        const larger = requirePortion(context, ALT_LARGER);
+
+        expect(half.nutrition).toEqual(scaled(ALT_HALF.per_serving, 0.5));
+        expect(larger.nutrition).toEqual(scaled(ALT_LARGER.per_serving, 1.5));
+        // A like-for-like swap moves nothing; the heavier portion moves the day up.
+        expect(half.calorieDelta).toBe(0);
+        expect(larger.calorieDelta).toBe(50);
+    });
+
+    it('ranks on the resulting whole day, never on a slot share', () => {
+        const candidate = requirePortion(makeContext(), ALT_LARGER);
+
+        expect(candidate.targetProximity).toBe(targetProximity(candidate.dayTotalsIfSwapped, TARGETS, 1));
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Eligibility — the generator's hard set, asserted one refusal at a time
+ * ------------------------------------------------------------------------- */
+
+describe('selectSwapCandidates eligibility', () => {
+    const listWith = (
+        recipes: readonly PlanRecipeCandidate[],
+        preferences: PlanningPreferences = makePreferences(),
+    ): SwapCandidate[] => selectSwapCandidates(makeContext({ recipes, preferences }));
+
+    it('lists an eligible alternative', () => {
+        expect(slugsOf(listWith([ALT_ALPHA]))).toEqual(['alt-alpha']);
+    });
+
+    it('excludes a retired version, which stays readable but is never planned again', () => {
+        const retired = makeRecipe({ slug: 'alt-retired', status: 'retired' });
+
+        expect(listWith([retired])).toEqual([]);
+    });
+
+    it('excludes a recipe whose nutrition is not source-backed, so a planned meal is never an estimate', () => {
+        const derived = makeRecipe({ slug: 'alt-derived', provenance: 'ingredient_derived' });
+        const estimated = makeRecipe({ slug: 'alt-estimated', provenance: 'ai_estimated' });
+
+        expect(listWith([derived, estimated])).toEqual([]);
+    });
+
+    it('excludes a recipe whose allergen metadata is unreviewed, whatever the user selected', () => {
+        const unreviewed = makeRecipe({ slug: 'alt-unreviewed', allergenStatus: 'unknown' });
+
+        expect(listWith([unreviewed], makePreferences({ allergens: ['none'] }))).toEqual([]);
+    });
+
+    it('excludes a recipe carrying one of the user\'s allergens', () => {
+        const milky = makeRecipe({ slug: 'alt-milky', allergenTags: ['milk'] });
+
+        expect(slugsOf(listWith([milky, ALT_ALPHA], makePreferences({ allergens: ['Milk'] })))).toEqual([
+            'alt-alpha',
+        ]);
+    });
+
+    it('never relaxes an allergen to fill a short list', () => {
+        const milky = makeRecipe({ slug: 'alt-milky', allergenTags: ['milk'] });
+
+        // The only otherwise-eligible alternative carries the allergen, so the
+        // honest answer is nothing at all.
+        expect(listWith([milky], makePreferences({ allergens: ['milk'] }))).toEqual([]);
+    });
+
+    it('excludes a recipe incompatible with the user\'s diet', () => {
+        const meaty = makeRecipe({ slug: 'alt-meaty', dietTags: [] });
+
+        expect(slugsOf(listWith([meaty, ALT_ALPHA], makePreferences({ diet: 'vegetarian' })))).toEqual([
+            'alt-alpha',
+        ]);
+    });
+
+    it('excludes a recipe containing a disliked food, by id and by food group', () => {
+        const mushroomy = makeRecipe({
+            slug: 'alt-mushroomy',
+            ingredientIds: ['mushroom-food'],
+            foodGroups: ['mushroom'],
+        });
+
+        expect(listWith([mushroomy], makePreferences({ disliked_food_ids: ['mushroom-food'] }))).toEqual([]);
+        expect(listWith([mushroomy], makePreferences({ disliked_food_groups: ['Mushroom'] }))).toEqual([]);
+    });
+
+    it('excludes a recipe that takes longer than the user\'s cooking-time limit', () => {
+        const slow = makeRecipe({ slug: 'alt-slow', totalMinutes: 45 });
+
+        expect(listWith([slow], makePreferences({ cooking_time_limit_min: 30 }))).toEqual([]);
+        expect(slugsOf(listWith([slow], makePreferences({ cooking_time_limit_min: 45 })))).toEqual([
+            'alt-slow',
+        ]);
+    });
+
+    it('excludes a recipe that does not declare this slot', () => {
+        const breakfastOnly = makeRecipe({ slug: 'alt-breakfast', slots: ['breakfast'] });
+
+        expect(listWith([breakfastOnly])).toEqual([]);
+    });
+
+    it('excludes a recipe no portion of which fits the day', () => {
+        expect(slugsOf(listWith([ALT_TINY, ALT_ALPHA]))).toEqual(['alt-alpha']);
+    });
+
+    it('lists a recipe admissible only at a non-default portion AT that portion', () => {
+        // §0.7.3's explicit list assertion: the ROW carries the half portion,
+        // not the default one, so the number the user taps is the number the
+        // preview and the commit work from.
+        const [listed] = listWith([ALT_HALF]);
+
+        expect(listed.portionMultiplier).toBe(0.5);
+        expect(listed.nutrition).toEqual(scaled(ALT_HALF.per_serving, 0.5));
+        expect(listed.dayTotalsIfSwapped.calories).toBe(2000);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Repetition — evaluated with the meal being replaced removed
+ * ------------------------------------------------------------------------- */
+
+describe('selectSwapCandidates repetition', () => {
+    it('keeps a recipe whose only other use in the week is the meal being replaced', () => {
+        // `wrap` is planned twice: at this very lunch and on the last day. The
+        // meal being replaced does not count against itself, so one use remains
+        // and the republished version is admissible — and because the current
+        // meal also leaves the SAME-DAY set, its own dish does not block it.
+        const context = makeContext({
+            recipes: [WRAP_V2],
+            weekMeals: weekMeals([{ id: 'meal-last-day-lunch', date: PLAN_END, recipeId: WRAP_RECIPE_ID }]),
+        });
+
+        expect(slugsOf(selectSwapCandidates(context))).toEqual(['wrap']);
+    });
+
+    it('removes the meal being replaced exactly once, not the whole recipe', () => {
+        // A third use — this lunch plus two other days — leaves two after the
+        // removal, which is the weekly maximum.
+        const context = makeContext({
+            recipes: [WRAP_V2],
+            weekMeals: weekMeals([
+                { id: 'meal-last-day-lunch', date: PLAN_END, recipeId: WRAP_RECIPE_ID },
+                { id: 'meal-first-day-dinner', date: PLAN_START, recipeId: WRAP_RECIPE_ID },
+            ]),
+        });
+
+        expect(selectSwapCandidates(context)).toEqual([]);
+    });
+
+    it('excludes a recipe planned on the day before', () => {
+        const neighbour = makeRecipe({ slug: 'alt-neighbour', recipeId: 'neighbour-recipe' });
+        const context = makeContext({
+            recipes: [neighbour, ALT_ALPHA],
+            weekMeals: weekMeals([{ id: 'meal-before-dinner', date: DAY_BEFORE, recipeId: 'neighbour-recipe' }]),
+        });
+
+        expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-alpha']);
+    });
+
+    it('excludes a recipe planned on the day after, because the rule is symmetric', () => {
+        const neighbour = makeRecipe({ slug: 'alt-neighbour', recipeId: 'neighbour-recipe' });
+        const context = makeContext({
+            recipes: [neighbour, ALT_ALPHA],
+            weekMeals: weekMeals([{ id: 'meal-after-lunch', date: DAY_AFTER, recipeId: 'neighbour-recipe' }]),
+        });
+
+        expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-alpha']);
+    });
+
+    it('admits a recipe two days away, which is the clear day the rule asks for', () => {
+        const neighbour = makeRecipe({ slug: 'alt-neighbour', recipeId: 'neighbour-recipe' });
+        const context = makeContext({
+            recipes: [neighbour],
+            weekMeals: weekMeals([
+                { id: 'meal-two-days-later', date: TWO_DAYS_LATER, recipeId: 'neighbour-recipe' },
+            ]),
+        });
+
+        expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-neighbour']);
+    });
+
+    it('excludes a recipe already planned at another meal of the same day', () => {
+        const sameDish = makeRecipe({
+            slug: 'alt-same-dish',
+            recipeId: SHARED_RECIPE_ID,
+            versionId: 'shared-version-2',
+        });
+        const context = makeContext({ recipes: [sameDish, ALT_ALPHA] });
+
+        expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-alpha']);
+    });
+
+    it('excludes a recipe already used twice elsewhere in the week', () => {
+        const twice = makeRecipe({ slug: 'alt-twice', recipeId: 'twice-recipe' });
+        const context = makeContext({
+            recipes: [twice, ALT_ALPHA],
+            weekMeals: weekMeals([
+                { id: 'meal-first-day-dinner', date: PLAN_START, recipeId: 'twice-recipe' },
+                { id: 'meal-last-day-lunch', date: PLAN_END, recipeId: 'twice-recipe' },
+            ]),
+        });
+
+        expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-alpha']);
+    });
+
+    it('refuses a week that does not contain the meal being replaced', () => {
+        const context = makeContext({
+            recipes: [ALT_ALPHA],
+            weekMeals: weekMeals().filter((meal) => meal.id !== LUNCH_MEAL_ID),
+        });
+
+        expect(() => selectSwapCandidates(context)).toThrow(MealPlanInputError);
+        expect(inputErrorField(() => selectSwapCandidates(context))).toBe('weekMeals');
+    });
+
+    it('refuses a malformed week day key rather than silently never matching it', () => {
+        const context = makeContext({
+            recipes: [ALT_ALPHA],
+            weekMeals: weekMeals([{ id: 'meal-broken', date: '2026-07-32', recipeId: 'broken-recipe' }]),
+        });
+
+        expect(inputErrorField(() => selectSwapCandidates(context))).toBe('weekMeals');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Ranking, determinism and truncation
+ * ------------------------------------------------------------------------- */
+
+describe('selectSwapCandidates ranking', () => {
+    it('ranks by the resulting day\'s proximity to the target', () => {
+        const context = makeContext({ recipes: [ALT_LARGER, ALT_ALPHA, ALT_TIE] });
+        const candidates = selectSwapCandidates(context);
+
+        expect(slugsOf(candidates)).toEqual(['alt-alpha', 'alt-larger', 'alt-tie']);
+        expect(candidates[0].targetProximity).toBeLessThan(candidates[1].targetProximity);
+        expect(candidates[1].targetProximity).toBeLessThan(candidates[2].targetProximity);
+    });
+
+    it('orders equal-proximity candidates by slug, whichever order they arrive in', () => {
+        const forwards = selectSwapCandidates(makeContext({ recipes: [ALT_ALPHA, ALT_BETA] }));
+        const backwards = selectSwapCandidates(makeContext({ recipes: [ALT_BETA, ALT_ALPHA] }));
+
+        expect(forwards[0].targetProximity).toBe(forwards[1].targetProximity);
+        expect(slugsOf(forwards)).toEqual(['alt-alpha', 'alt-beta']);
+        expect(backwards).toEqual(forwards);
+    });
+
+    it('is identical for the same candidates in a shuffled input order', () => {
+        const recipes = [...rankedAlternatives(), ALT_HALF, ALT_TIE, ALT_LARGER];
+        const shuffled = [...recipes.slice(7), ...recipes.slice(0, 7).reverse()];
+
+        expect(selectSwapCandidates(makeContext({ recipes: shuffled }))).toEqual(
+            selectSwapCandidates(makeContext({ recipes })),
+        );
+    });
+
+    it('never consults a PRNG, so the list is stable across refetches', () => {
+        const random = jest.spyOn(Math, 'random');
+
+        try {
+            const context = makeContext({ recipes: rankedAlternatives() });
+
+            expect(selectSwapCandidates(context)).toEqual(selectSwapCandidates(context));
+            expect(random).not.toHaveBeenCalled();
+        } finally {
+            random.mockRestore();
+        }
+    });
+
+    it('truncates to the policy maximum AFTER ranking, so the rows are the best ones', () => {
+        const candidates = selectSwapCandidates(makeContext({ recipes: rankedAlternatives() }));
+
+        expect(candidates).toHaveLength(MAX_SWAP_ALTERNATIVES);
+        expect(slugsOf(candidates)).toEqual([
+            'rank-00',
+            'rank-01',
+            'rank-02',
+            'rank-03',
+            'rank-04',
+            'rank-05',
+            'rank-06',
+            'rank-07',
+        ]);
+    });
+
+    it('lets a caller ask for fewer, and never for more than the policy maximum', () => {
+        const recipes = rankedAlternatives();
+
+        expect(slugsOf(selectSwapCandidates(makeContext({ recipes, limit: 3 })))).toEqual([
+            'rank-00',
+            'rank-01',
+            'rank-02',
+        ]);
+        expect(selectSwapCandidates(makeContext({ recipes, limit: 50 }))).toHaveLength(
+            MAX_SWAP_ALTERNATIVES,
+        );
+    });
+
+    it('refuses a limit that is not a positive integer', () => {
+        const recipes = [ALT_ALPHA];
+
+        expect(inputErrorField(() => selectSwapCandidates(makeContext({ recipes, limit: 0 })))).toBe('limit');
+        expect(inputErrorField(() => selectSwapCandidates(makeContext({ recipes, limit: 2.5 })))).toBe(
+            'limit',
+        );
+    });
+});
+
+describe('compareSwapCandidates', () => {
+    const context = makeContext();
+    const alpha = requirePortion(context, ALT_ALPHA);
+    const beta = requirePortion(context, ALT_BETA);
+    const larger = requirePortion(context, ALT_LARGER);
+
+    it('orders by the resulting day\'s proximity first', () => {
+        expect(compareSwapCandidates(alpha, larger)).toBeLessThan(0);
+        expect(compareSwapCandidates(larger, alpha)).toBeGreaterThan(0);
+    });
+
+    it('orders equal proximity by slug, in both directions', () => {
+        expect(compareSwapCandidates(alpha, beta)).toBe(-1);
+        expect(compareSwapCandidates(beta, alpha)).toBe(1);
+    });
+
+    it('orders one slug\'s versions by version number, so the key is total', () => {
+        const first = requirePortion(context, WRAP_V1);
+        const second = requirePortion(context, WRAP_V2);
+
+        expect(first.recipe.slug).toBe(second.recipe.slug);
+        expect(compareSwapCandidates(first, second)).toBeLessThan(0);
+        expect(compareSwapCandidates(second, second)).toBe(0);
+    });
+
+    /**
+     * The intransitivity counterexample, at the scale the epsilon lives at: with
+     * an "equal within epsilon" primary key, A and B tie (so the slugs order
+     * them A after B), B and C tie (B after C), yet A sorts before C on
+     * proximity — an order no list can satisfy, which is why the six input
+     * permutations produced three different outputs.
+     */
+    const NEAR_TIE_STEP = TOLERANCE_EPSILON * 0.75;
+
+    const atProximity = (slug: string, targetProximity: number): SwapCandidate => ({
+        ...alpha,
+        recipe: { ...alpha.recipe, slug },
+        targetProximity,
+    });
+
+    const permutationsOfThree = <T>([first, second, third]: readonly T[]): T[][] => [
+        [first, second, third],
+        [first, third, second],
+        [second, first, third],
+        [second, third, first],
+        [third, first, second],
+        [third, second, first],
+    ];
+
+    it('sorts every permutation of a near-tied triple into one identical list', () => {
+        const near = [
+            atProximity('z', 0),
+            atProximity('m', NEAR_TIE_STEP),
+            atProximity('a', 2 * NEAR_TIE_STEP),
+        ];
+        const expected = ['z', 'm', 'a'];
+
+        // Each neighbouring pair differs by less than epsilon, so the old
+        // approximate-equality key called each pair equal and deferred to the
+        // slugs while ordering the outer pair by proximity.
+        expect(near[2].targetProximity - near[0].targetProximity).toBeGreaterThan(TOLERANCE_EPSILON);
+        expect(near[1].targetProximity - near[0].targetProximity).toBeLessThan(TOLERANCE_EPSILON);
+        expect(near[2].targetProximity - near[1].targetProximity).toBeLessThan(TOLERANCE_EPSILON);
+
+        for (const permutation of permutationsOfThree(near)) {
+            expect(slugsOf([...permutation].sort(compareSwapCandidates))).toEqual(expected);
+        }
+    });
+
+    it('is transitive across that triple, so no pair contradicts another', () => {
+        const [first, second, third] = [
+            atProximity('z', 0),
+            atProximity('m', NEAR_TIE_STEP),
+            atProximity('a', 2 * NEAR_TIE_STEP),
+        ];
+
+        expect(compareSwapCandidates(first, second)).toBeLessThan(0);
+        expect(compareSwapCandidates(second, third)).toBeLessThan(0);
+        expect(compareSwapCandidates(first, third)).toBeLessThan(0);
+    });
+
+    it('treats two proximities inside one epsilon bucket as genuinely equal', () => {
+        // Both round to bucket 0, so the lexical keys decide — the intent the
+        // epsilon carried, now expressed as a real equivalence class.
+        const noisy = atProximity('z', TOLERANCE_EPSILON * 0.2);
+        const exact = atProximity('a', 0);
+
+        expect(compareSwapCandidates(noisy, exact)).toBe(1);
+        expect(compareSwapCandidates(exact, noisy)).toBe(-1);
+    });
+
+    it('orders a pair straddling a bucket boundary by proximity, and does so both ways round', () => {
+        // 0.4ε and 0.6ε are closer together than epsilon but round to 0 and 1:
+        // the documented trade-off of a transitive key. Either answer is stable;
+        // what matters is that it is the same answer whichever order they arrive
+        // in, and that no third candidate can contradict it.
+        const below = atProximity('z', TOLERANCE_EPSILON * 0.4);
+        const above = atProximity('a', TOLERANCE_EPSILON * 0.6);
+
+        expect(compareSwapCandidates(below, above)).toBe(-1);
+        expect(compareSwapCandidates(above, below)).toBe(1);
+        expect(slugsOf([below, above].sort(compareSwapCandidates))).toEqual(['z', 'a']);
+        expect(slugsOf([above, below].sort(compareSwapCandidates))).toEqual(['z', 'a']);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * One function, three callers — the list, the preview and the commit agree
+ * ------------------------------------------------------------------------- */
+
+describe('selectSwapCandidate', () => {
+    it('returns the identical candidate the list carries', () => {
+        const context = makeContext({ recipes: [ALT_ALPHA, ALT_HALF, ALT_LARGER] });
+        const listed = selectSwapCandidates(context);
+
+        expect(listed).toHaveLength(3);
+
+        for (const candidate of listed) {
+            expect(selectSwapCandidate(context, candidate.recipe.recipe_version_id)).toEqual(candidate);
+        }
+    });
+
+    it('returns every one of a FULL list\'s rows identically, row for row', () => {
+        // The eight-row case, so "identical to its row" is asserted at the
+        // truncation boundary and not only on a short list.
+        const context = makeContext({ recipes: rankedAlternatives() });
+        const listed = selectSwapCandidates(context);
+
+        expect(listed).toHaveLength(MAX_SWAP_ALTERNATIVES);
+        expect(
+            listed.map((candidate) => selectSwapCandidate(context, candidate.recipe.recipe_version_id)),
+        ).toEqual(listed);
+    });
+
+    it('binds the commit to exactly the previewed numbers', () => {
+        const context = makeContext({ recipes: [ALT_HALF] });
+        const listed = selectSwapCandidates(context)[0];
+        const previewed = selectSwapCandidate(context, listed.recipe.recipe_version_id);
+        const committed = selectSwapCandidate(context, previewed.recipe.recipe_version_id);
+
+        expect(() => requireBoundPortion(previewed.portionMultiplier, committed.portionMultiplier)).not.toThrow();
+
+        const write = swapMealWrite(currentLunch(), committed, new Date('2026-07-08T12:30:00.000Z'));
+
+        expect(write.portion_multiplier).toBe(previewed.portionMultiplier);
+        expect(write.planned_calories).toBe(previewed.nutrition.calories);
+        expect(write.planned_protein_g).toBe(previewed.nutrition.protein);
+        expect(write.planned_carbs_g).toBe(previewed.nutrition.carbs);
+        expect(write.planned_fat_g).toBe(previewed.nutrition.fat);
+    });
+
+    it('refuses a recipe outside the eight listed rows, however eligible it is on its own', () => {
+        // `rank-08` is admissible and has a perfectly good portion — the list
+        // simply never offered it, because ranking put it ninth. Committing a
+        // row the sheet did not present is the disagreement the one-function
+        // rule exists to prevent, so it is `recipe_ineligible` (§0.7.3).
+        const recipes = rankedAlternatives();
+        const context = makeContext({ recipes });
+        const ninth = recipes[8];
+
+        expect(selectSwapPortion(context, ninth)).not.toBeNull();
+        expect(slugsOf(selectSwapCandidates(context))).not.toContain(ninth.slug);
+        expect(() => selectSwapCandidate(context, ninth.recipe_version_id)).toThrow(RecipeIneligibleError);
+    });
+
+    it('refuses a row a narrowed list dropped, so the preview never widens the offer', () => {
+        // A caller may ask for fewer rows than the policy maximum; the preview
+        // and the commit are held to the rows that caller was given.
+        const recipes = rankedAlternatives();
+        const narrowed = makeContext({ recipes, limit: 2 });
+        const third = recipes[2];
+
+        expect(slugsOf(selectSwapCandidates(narrowed))).toEqual(['rank-00', 'rank-01']);
+        expect(() => selectSwapCandidate(narrowed, third.recipe_version_id)).toThrow(RecipeIneligibleError);
+        expect(selectSwapCandidate(makeContext({ recipes }), third.recipe_version_id).recipe.slug).toBe(
+            third.slug,
+        );
+    });
+
+    it('refuses a recipe that is not in the plannable set', () => {
+        const context = makeContext({ recipes: [ALT_ALPHA] });
+
+        expect(() => selectSwapCandidate(context, 'some-other-version')).toThrow(RecipeIneligibleError);
+    });
+
+    it('refuses a retired recipe, which is what a catalog refresh between list and commit looks like', () => {
+        const retired = makeRecipe({ slug: 'alt-retired', status: 'retired' });
+        const context = makeContext({ recipes: [retired] });
+
+        expect(() => selectSwapCandidate(context, retired.recipe_version_id)).toThrow(RecipeIneligibleError);
+    });
+
+    it('refuses a recipe a preference change has since ruled out', () => {
+        const milky = makeRecipe({ slug: 'alt-milky', allergenTags: ['milk'] });
+        const listing = makeContext({ recipes: [milky] });
+        const committing = makeContext({
+            recipes: [milky],
+            preferences: makePreferences({ allergens: ['milk'] }),
+        });
+
+        expect(slugsOf(selectSwapCandidates(listing))).toEqual(['alt-milky']);
+        expect(() => selectSwapCandidate(committing, milky.recipe_version_id)).toThrow(RecipeIneligibleError);
+    });
+
+    it('refuses the version already in the slot, which would be a swap to itself', () => {
+        const context = makeContext({ recipes: [WRAP_V1] });
+
+        expect(() => selectSwapCandidate(context, WRAP_VERSION_1)).toThrow(RecipeIneligibleError);
+    });
+
+    it('refuses a recipe the week\'s repetition rule now excludes', () => {
+        const neighbour = makeRecipe({ slug: 'alt-neighbour', recipeId: 'neighbour-recipe' });
+        const context = makeContext({
+            recipes: [neighbour],
+            weekMeals: weekMeals([{ id: 'meal-after-lunch', date: DAY_AFTER, recipeId: 'neighbour-recipe' }]),
+        });
+
+        expect(() => selectSwapCandidate(context, neighbour.recipe_version_id)).toThrow(RecipeIneligibleError);
+    });
+
+    it('refuses a recipe no portion of which keeps the day inside tolerance', () => {
+        const context = makeContext({ recipes: [ALT_TINY] });
+
+        expect(() => selectSwapCandidate(context, ALT_TINY.recipe_version_id)).toThrow(RecipeIneligibleError);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The empty answer — the client's 13d state
+ * ------------------------------------------------------------------------- */
+
+describe('an empty alternatives list', () => {
+    it('is the answer when the slot\'s only eligible recipe is the one already planned', () => {
+        expect(selectSwapCandidates(makeContext({ recipes: [WRAP_V1] }))).toEqual([]);
+    });
+
+    it('is the answer when nothing is plannable at all', () => {
+        expect(selectSwapCandidates(makeContext({ recipes: [] }))).toEqual([]);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The preview binding
+ * ------------------------------------------------------------------------- */
+
+describe('requireBoundPortion', () => {
+    it('accepts the portion the preview showed', () => {
+        expect(() => requireBoundPortion(1.25, 1.25)).not.toThrow();
+    });
+
+    it('accepts float noise within the two-decimal representation the contract stores', () => {
+        expect(() => requireBoundPortion(0.75, 0.7500000000001)).not.toThrow();
+    });
+
+    it('refuses a portion that is not the recomputed one', () => {
+        expect(() => requireBoundPortion(1.25, 1)).toThrow(PreviewStaleError);
+        expect(() => requireBoundPortion(0.75, 0.76)).toThrow(PreviewStaleError);
+    });
+
+    it('fails closed on a value that is not a portion at all', () => {
+        expect(() => requireBoundPortion(Number.NaN, 1)).toThrow(PreviewStaleError);
+    });
+
+    it('turns a target change that moves the chosen multiplier into a stale preview', () => {
+        // Previewed at 2,000 kcal: half a portion (day 1,860) ties with three
+        // quarters and wins. Re-targeted at 2,140, only three quarters is
+        // admissible, so the previewed portion is no longer the one the server
+        // would write.
+        const previewed = selectSwapCandidate(makeContext({ recipes: [ALT_TIE] }), ALT_TIE.recipe_version_id);
+        const recomputed = selectSwapCandidate(
+            makeContext({ recipes: [ALT_TIE], targets: targetsAt(2140) }),
+            ALT_TIE.recipe_version_id,
+        );
+
+        expect(previewed.portionMultiplier).toBe(0.5);
+        expect(recomputed.portionMultiplier).toBe(0.75);
+        expect(() => requireBoundPortion(previewed.portionMultiplier, recomputed.portionMultiplier)).toThrow(
+            PreviewStaleError,
+        );
+    });
+
+    it('lets a target change that leaves the multiplier equal commit, because the preview binds the portion', () => {
+        const previewed = selectSwapCandidate(
+            makeContext({ recipes: [ALT_ALPHA] }),
+            ALT_ALPHA.recipe_version_id,
+        );
+        const recomputed = selectSwapCandidate(
+            makeContext({ recipes: [ALT_ALPHA], targets: targetsAt(2010) }),
+            ALT_ALPHA.recipe_version_id,
+        );
+
+        expect(previewed.portionMultiplier).toBe(1);
+        expect(recomputed.portionMultiplier).toBe(1);
+        expect(recomputed.targetProximity).not.toBe(previewed.targetProximity);
+        expect(() =>
+            requireBoundPortion(previewed.portionMultiplier, recomputed.portionMultiplier),
+        ).not.toThrow();
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The committed write
+ * ------------------------------------------------------------------------- */
+
+describe('swapMealWrite', () => {
+    const now = new Date('2026-07-08T12:30:00.000Z');
+
+    it('records the new version, its portion, the planned macros and the audit trail', () => {
+        const context = makeContext({ recipes: [ALT_HALF] });
+        const candidate = selectSwapCandidate(context, ALT_HALF.recipe_version_id);
+        const write = swapMealWrite(currentLunch(), candidate, now);
+
+        expect(write).toEqual({
+            recipe_version_id: ALT_HALF.recipe_version_id,
+            portion_multiplier: 0.5,
+            planned_calories: candidate.nutrition.calories,
+            planned_protein_g: candidate.nutrition.protein,
+            planned_carbs_g: candidate.nutrition.carbs,
+            planned_fat_g: candidate.nutrition.fat,
+            previous_recipe_version_id: WRAP_VERSION_1,
+            swapped_at: now,
+            revision: 2,
+            flags: [],
+        });
+    });
+
+    it('clears the meal\'s incompatibility flags, because a listed candidate is compatible', () => {
+        // §0.7.3: a swap to a compatible recipe clears that meal's flags. The
+        // value is UNCONDITIONAL and the stored flags are not even an input —
+        // the candidate came out of the list, so it passed the same eligibility
+        // rule a flag is raised by. Two unrelated meals are asserted to make the
+        // point that nothing about the incoming row can change the answer; that
+        // the column really is rewritten on a meal that carried a flag is a
+        // database fact, proved at the service level.
+        const context = makeContext({ recipes: [ALT_ALPHA, ALT_HALF] });
+        const alpha = selectSwapCandidate(context, ALT_ALPHA.recipe_version_id);
+        const half = selectSwapCandidate(context, ALT_HALF.recipe_version_id);
+
+        expect(swapMealWrite(currentLunch(), alpha, now).flags).toEqual([]);
+        expect(swapMealWrite({ ...currentLunch(), revision: 4 }, half, now).flags).toEqual([]);
+    });
+
+    it('advances the meal\'s own revision, whatever it has reached', () => {
+        const context = makeContext({ recipes: [ALT_ALPHA] });
+        const candidate = selectSwapCandidate(context, ALT_ALPHA.recipe_version_id);
+
+        expect(swapMealWrite({ ...currentLunch(), revision: 7 }, candidate, now).revision).toBe(8);
+    });
+
+    it('keeps the planned macros at full precision, so the diary rounds exactly once', () => {
+        const context = makeContext({ recipes: [ALT_LARGER] });
+        const candidate = selectSwapCandidate(context, ALT_LARGER.recipe_version_id);
+        const write = swapMealWrite(currentLunch(), candidate, now);
+
+        // 37.5 g of protein at one and a half portions is 56.25 g, and it is
+        // stored as 56.25: a round here would shift the diary snapshot, the
+        // consumed total and the client's "This adds" card with it.
+        expect(write.planned_protein_g).toBe(ALT_LARGER.per_serving.protein * 1.5);
+        expect(Number.isInteger(write.planned_protein_g)).toBe(false);
+    });
+
+    it('refuses an invalid timestamp rather than writing one nobody can reconstruct', () => {
+        const context = makeContext({ recipes: [ALT_ALPHA] });
+        const candidate = selectSwapCandidate(context, ALT_ALPHA.recipe_version_id);
+
+        expect(inputErrorField(() => swapMealWrite(currentLunch(), candidate, new Date('not a date')))).toBe(
+            'now',
+        );
+    });
+
+    it('refuses a revision that could not have been stored', () => {
+        const context = makeContext({ recipes: [ALT_ALPHA] });
+        const candidate = selectSwapCandidate(context, ALT_ALPHA.recipe_version_id);
+
+        expect(
+            inputErrorField(() => swapMealWrite({ ...currentLunch(), revision: 0 }, candidate, now)),
+        ).toBe('revision');
+        expect(
+            inputErrorField(() => swapMealWrite({ ...currentLunch(), revision: 1.5 }, candidate, now)),
+        ).toBe('revision');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A -> B -> C, with the meal logged before the first swap
+ *
+ * Composed from `swapMealWrite` and `plannedMealLog.logic.ts::deriveLoggedStatus`
+ * rather than re-implemented here: the logged state is that module's rule, and
+ * this suite's job is to prove the two agree after two swaps.
+ * ------------------------------------------------------------------------- */
+
+describe('a logged meal swapped twice', () => {
+    /** The two intentional entries: one meal eaten, then a second serving of it. */
+    const twoEntriesForA = (): LinkedDiaryEntryRow[] => [
+        { id: 'entry-first-serving', recipe_version_id: WRAP_VERSION_1 },
+        { id: 'entry-second-serving', recipe_version_id: WRAP_VERSION_1 },
+    ];
+
+    /** The week as it stands after the slot has been swapped to `recipeId`. */
+    const weekAfterSwapTo = (recipeId: string): SwapWeekMeal[] =>
+        weekMeals().map((meal) => (meal.id === LUNCH_MEAL_ID ? { ...meal, recipeId } : meal));
+
+    const swapTwice = (): { toB: ReturnType<typeof swapMealWrite>; toC: ReturnType<typeof swapMealWrite> } => {
+        const mealA = currentLunch();
+        const contextA = makeContext({ recipes: [ALT_ALPHA, ALT_BETA] });
+        const candidateB = selectSwapCandidate(contextA, ALT_ALPHA.recipe_version_id);
+        const toB = swapMealWrite(mealA, candidateB, new Date('2026-07-06T09:00:00.000Z'));
+
+        const mealB: SwapDayMeal = {
+            ...mealA,
+            recipeId: ALT_ALPHA.recipe_id,
+            recipeVersionId: toB.recipe_version_id,
+            portionMultiplier: toB.portion_multiplier,
+            planned: candidateB.nutrition,
+            revision: toB.revision,
+        };
+        const contextB = makeContext({
+            recipes: [ALT_ALPHA, ALT_BETA],
+            dayMeals: dayMeals(mealB),
+            weekMeals: weekAfterSwapTo(ALT_ALPHA.recipe_id),
+        });
+        const candidateC = selectSwapCandidate(contextB, ALT_BETA.recipe_version_id);
+        const toC = swapMealWrite(mealB, candidateC, new Date('2026-07-07T09:00:00.000Z'));
+
+        return { toB, toC };
+    };
+
+    it('chains the versions and the revisions through both swaps', () => {
+        const { toB, toC } = swapTwice();
+
+        expect(toB.previous_recipe_version_id).toBe(WRAP_VERSION_1);
+        expect(toB.recipe_version_id).toBe(ALT_ALPHA.recipe_version_id);
+        expect(toC.previous_recipe_version_id).toBe(ALT_ALPHA.recipe_version_id);
+        expect(toC.recipe_version_id).toBe(ALT_BETA.recipe_version_id);
+        expect([toB.revision, toC.revision]).toEqual([2, 3]);
+        expect(toC.swapped_at.getTime()).toBeGreaterThan(toB.swapped_at.getTime());
+    });
+
+    it('reports the slot as logged-then-swapped, naming the recipe actually eaten', () => {
+        const { toB, toC } = swapTwice();
+        const state = deriveLoggedStatus(twoEntriesForA(), toC.recipe_version_id);
+
+        expect(state.status).toBe('logged_then_swapped');
+        expect(state.isLogged).toBe(false);
+        // The entries still say A, and both intentional servings collapse to one
+        // caption. The audit column says B — which is exactly why the caption
+        // must be derived from the entries and never from
+        // `previous_recipe_version_id`.
+        expect(state.previousRecipeVersionIds).toEqual([WRAP_VERSION_1]);
+        expect(toC.previous_recipe_version_id).not.toBe(state.previousRecipeVersionIds[0]);
+        expect(toB.recipe_version_id).toBe(toC.previous_recipe_version_id);
+    });
+
+    it('reports every earlier version when the user logged before each swap', () => {
+        const { toB, toC } = swapTwice();
+        const entries: LinkedDiaryEntryRow[] = [
+            ...twoEntriesForA(),
+            { id: 'entry-after-first-swap', recipe_version_id: toB.recipe_version_id },
+        ];
+
+        expect(deriveLoggedStatus(entries, toC.recipe_version_id)).toEqual({
+            status: 'logged_then_swapped',
+            isLogged: false,
+            previousRecipeVersionIds: [WRAP_VERSION_1, toB.recipe_version_id],
+        });
+    });
+
+    it('reports the slot as logged once the recipe now planned has itself been eaten', () => {
+        const { toC } = swapTwice();
+        const entries: LinkedDiaryEntryRow[] = [
+            ...twoEntriesForA(),
+            { id: 'entry-current', recipe_version_id: toC.recipe_version_id },
+        ];
+        const state = deriveLoggedStatus(entries, toC.recipe_version_id);
+
+        expect(state.status).toBe('logged');
+        expect(state.isLogged).toBe(true);
+    });
+});

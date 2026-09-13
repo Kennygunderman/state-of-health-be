@@ -45,22 +45,28 @@ jobs:
       - run: npm ci
       - run: npx prisma generate
       - run: npx prisma validate
-      - run: npx prisma migrate deploy
+      # Named, because prisma/manual-migrations/meal-planning/README.md and the
+      # header of that folder's up script both point an operator at this step as
+      # the proof that the ledger is applied automatically.
+      - name: Apply the migration ledger
+        run: npx prisma migrate deploy
       - run: npm run typecheck
       - run: npm run typecheck:test
       - run: npm run typecheck:scripts
 
-      # docs/meal-planning/expected-schema-diff.sql is the committed record of
-      # every construct in the migration that prisma/schema.prisma cannot
-      # express. This step re-derives both of its sections from the database the
-      # ledger was just applied to and fails on any difference, in either
-      # direction. The file's header documents the same two commands for local
-      # use; this runs them without needing a psql binary on the runner.
+      # docs/meal-planning/expected-schema-diff.sql is the reviewed output of
+      # one `prisma migrate diff` run: the record of what the migration ledger
+      # holds that prisma/schema.prisma cannot express. This step re-runs that
+      # exact command against a throwaway shadow database, requires the same
+      # exit code, and compares the output with the committed file, failing on
+      # any difference in either direction. The file's header documents the same
+      # command for local use; the node helper below stands in for psql, which
+      # the runner does not have.
       - name: Schema-drift evidence gate
         run: |
           # Actions runs this under `bash -e`; set it here too so the script
           # behaves the same when it is run by hand. errexit is lifted only
-          # around the two commands whose non-zero exit is expected.
+          # around the one command whose non-zero exit is expected.
           set -euo pipefail
 
           EVIDENCE=docs/meal-planning/expected-schema-diff.sql
@@ -83,10 +89,6 @@ jobs:
           client
             .connect()
             .then(() => client.query(sql))
-            .then((result) => {
-              const rows = result.rows || [];
-              console.log(rows.map((row) => Object.values(row)[0]).join('\n'));
-            })
             .then(() => client.end())
             .catch((error) => {
               console.error(error.message || error);
@@ -96,48 +98,38 @@ jobs:
 
           # `migrate diff --from-migrations` resets the database it is given, so
           # it gets its own, never the one holding the applied ledger.
-          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "DROP DATABASE IF EXISTS ${SHADOW_URL##*/}" > /dev/null || exit 1
-          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "CREATE DATABASE ${SHADOW_URL##*/}" > /dev/null || exit 1
+          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "DROP DATABASE IF EXISTS ${SHADOW_URL##*/}" || exit 1
+          PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "CREATE DATABASE ${SHADOW_URL##*/}" || exit 1
 
           # --exit-code makes 2 the success case here: it means the datamodel
-          # and the ledger differ, which is exactly what section A records.
+          # and the ledger differ, which is exactly what the evidence records.
           set +e
           npx prisma migrate diff \
             --from-migrations prisma/migrations \
             --to-schema-datamodel prisma/schema.prisma \
             --shadow-database-url "$SHADOW_URL" \
-            --exit-code --script > "$WORK/actual-a.sql"
+            --exit-code --script > "$WORK/actual.sql"
           diff_exit=$?
           set -e
           if [ "$diff_exit" -ne 2 ]; then
             echo "prisma migrate diff exited $diff_exit; the gate expects 2 (differences found)."
-            echo "0 means the evidence file is stale; 1 means the command itself failed."
-            cat "$WORK/actual-a.sql"
+            echo "0 means the evidence file is stale, or the construct it records is gone from the migration."
+            echo "1 means the command itself failed."
+            cat "$WORK/actual.sql"
             exit 1
           fi
 
-          sed -n 's/^-- @@Q //p' "$EVIDENCE" > "$WORK/evidence-query.sql"
-          PGURL="$DATABASE_URL" node "$WORK/run-sql.js" < "$WORK/evidence-query.sql" > "$WORK/actual-b.sql" || exit 1
+          # Comment lines and empty lines only, on both sides. Whitespace inside
+          # or around a statement is compared as content.
+          sed '/^--/d;/^$/d' "$EVIDENCE" > "$WORK/expected.sql"
+          sed '/^--/d;/^$/d' "$WORK/actual.sql" > "$WORK/normalised.sql"
 
-          norm() { grep -vE '^[[:space:]]*--|^[[:space:]]*$' || true; }
-          section() {
-            awk -v marker="-- @@SECTION $1" '$0 == marker { inside = 1; next } /^-- @@SECTION /{ inside = 0 } inside' "$EVIDENCE"
-          }
-
-          status=0
-          section A | norm > "$WORK/expected-a.sql"
-          norm < "$WORK/actual-a.sql" > "$WORK/normalised-a.sql"
-          diff -u "$WORK/expected-a.sql" "$WORK/normalised-a.sql" || status=1
-          section B | norm > "$WORK/expected-b.sql"
-          norm < "$WORK/actual-b.sql" > "$WORK/normalised-b.sql"
-          diff -u "$WORK/expected-b.sql" "$WORK/normalised-b.sql" || status=1
-
-          if [ "$status" -ne 0 ]; then
-            echo "$EVIDENCE no longer matches the schema."
+          if ! diff -u "$WORK/expected.sql" "$WORK/normalised.sql"; then
+            echo "$EVIDENCE no longer matches what the command reports."
             echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the evidence if the change was intended."
             exit 1
           fi
-          echo "schema-drift evidence gate: PASS ($(wc -l < "$WORK/expected-a.sql") statement(s) in section A, $(wc -l < "$WORK/expected-b.sql") in section B)"
+          echo "schema-drift evidence gate: PASS ($(wc -l < "$WORK/expected.sql") statement(s) compared)"
 
       - run: npm test
       - run: docker build -t soh-be-ci .

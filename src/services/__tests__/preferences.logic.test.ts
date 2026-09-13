@@ -31,6 +31,7 @@ import {
     isNoAllergenSelection,
     isPayloadBearingSetupStep,
     MAX_DISLIKED_FOOD_IDS,
+    MAX_REVISION,
     mealsPerDayForSchedule,
     NAMED_ALLERGENS,
     nextSetupState,
@@ -51,6 +52,7 @@ import {
     requiredSetupSteps,
     resolveTargetRouteForBodyStep,
     routeStepOrder,
+    SetupAnswerFacts,
     SetupStateSnapshot,
     SetupStepContext,
     slotsForSchedule,
@@ -117,23 +119,133 @@ const okPayload = <T>(verdict: ParsedSetupStep): T => {
     return verdict.payload as T;
 };
 
+/** A row with nothing answered — what `PROVABLE_STEP_ANSWERS` reads before any save. */
+const noAnswers = (overrides: Partial<SetupAnswerFacts> = {}): SetupAnswerFacts => ({
+    goal: null,
+    activityLevel: null,
+    diet: null,
+    mealSchedule: null,
+    cookingTimeLimitMin: null,
+    ...overrides,
+});
+
+/** Every provable answer present — a row whose required steps are all on record. */
+const allAnswers = (overrides: Partial<SetupAnswerFacts> = {}): SetupAnswerFacts => ({
+    goal: 'lose',
+    activityLevel: 'lightly_active',
+    diet: 'none',
+    mealSchedule: 'three',
+    cookingTimeLimitMin: 30,
+    ...overrides,
+});
+
 const snapshot = (overrides: Partial<SetupStateSnapshot> = {}): SetupStateSnapshot => ({
     setupStatus: 'not_started',
     setupStep: null,
     targetRoute: null,
+    answers: noAnswers(),
     ...overrides,
 });
 
-/** Walks a whole route through `nextSetupState`, as the wizard's Continue presses would. */
+/**
+ * The columns a step's save writes, as the readiness check reads them — the
+ * service's write, modelled. `body` is proved by the resolved `targetRoute`
+ * rather than by a column here, and `dislikes` is provable by nothing, so
+ * neither appears.
+ */
+const answersAfter = (step: SetupStep, answers: SetupAnswerFacts): SetupAnswerFacts => {
+    switch (step) {
+        case 'goal':
+            return { ...answers, goal: 'lose' };
+        case 'activity':
+            return { ...answers, activityLevel: 'lightly_active' };
+        case 'diet':
+            return { ...answers, diet: 'none' };
+        case 'schedule':
+            return { ...answers, mealSchedule: 'three' };
+        case 'cooking':
+            return { ...answers, cookingTimeLimitMin: 30 };
+        default:
+            return answers;
+    }
+};
+
+/**
+ * The answers a row sitting on a marker must already hold: every required step
+ * of the route that comes before it, answered. `body` is proved by the route
+ * rather than by a column, and `dislikes` by nothing, so neither contributes.
+ *
+ * A marker the route does not contain is stale — an `activity` marker left
+ * behind by a switch to the manual route — and is treated as past every stop,
+ * because the alternative would leave the readiness check pulling the marker
+ * somewhere the assertion is not about.
+ */
+const answersReaching = (
+    setupStep: SetupStep,
+    route: 'estimated' | 'manual' | null,
+): SetupAnswerFacts => {
+    const order = routeStepOrder(route);
+    const markerIndex = order.indexOf(setupStep);
+    const limit = markerIndex < 0 ? order.length : markerIndex;
+
+    return requiredSetupSteps(route)
+        .filter((step) => order.indexOf(step) < limit)
+        .reduce<SetupAnswerFacts>((answers, step) => answersAfter(step, answers), noAnswers());
+};
+
+/**
+ * A row that legitimately REACHED a screen: the marker, the route, and the
+ * answers such a row must hold.
+ *
+ * A late marker over an all-null row describes a state no sequence of saves can
+ * produce, and the readiness check rightly pulls that marker back to the first
+ * missing answer — so a fixture meaning "this user is on the schedule screen"
+ * has to say what they have already answered to get there.
+ */
+const reached = (
+    setupStatus: SetupStatus,
+    setupStep: SetupStep,
+    route: 'estimated' | 'manual' | null,
+    overrides: Partial<SetupStateSnapshot> = {},
+): SetupStateSnapshot => ({
+    setupStatus,
+    setupStep,
+    targetRoute: route,
+    answers: answersReaching(setupStep, route),
+    ...overrides,
+});
+
+/** One Continue press: the transition, plus the answer the save just stored. */
+const saveStepState = (
+    state: SetupStateSnapshot,
+    step: SetupStep,
+    route: 'estimated' | 'manual' | null,
+): SetupStateSnapshot => {
+    const next = nextSetupState(state, step, route);
+
+    return {
+        setupStatus: next.setupStatus,
+        setupStep: next.setupStep,
+        targetRoute: next.targetRoute,
+        answers: answersAfter(step, state.answers),
+    };
+};
+
+/**
+ * Walks a whole route through `nextSetupState`, as the wizard's Continue presses
+ * would. A resolved route is passed only for the body step, which is the only
+ * save that resolves one in production; every other save carries null and the
+ * stored route stands.
+ */
 const walkRoute = (
     steps: readonly SetupStep[],
     route: 'estimated' | 'manual' | null,
+    from: SetupStateSnapshot = snapshot(),
 ): SetupStateSnapshot =>
-    steps.reduce<SetupStateSnapshot>((state, step) => {
-        const next = nextSetupState(state, step, route);
-
-        return { setupStatus: next.setupStatus, setupStep: next.setupStep, targetRoute: next.targetRoute };
-    }, snapshot());
+    steps.reduce<SetupStateSnapshot>(
+        (state, step) => saveStepState(state, step, step === 'body' ? route : null),
+        from,
+    );
 
 const ingredient = (overrides: Partial<RecipeIngredientIdentity> = {}): RecipeIngredientIdentity => ({
     catalog_food_id: UUIDS[0],
@@ -791,9 +903,17 @@ describe('parseBudgetAnswer', () => {
     });
 
     describe('amount boundaries', () => {
+        it('pins the mandated whole-dollar range, so the constants cannot drift', () => {
+            // The bound is the contract's, not the implementation's: asserting
+            // it only through BUDGET_AMOUNT_RANGE would let a widened constant
+            // keep every boundary case below green.
+            expect(BUDGET_AMOUNT_RANGE).toEqual({ min: 1, max: 10_000 });
+        });
+
         it.each([
             [0, PREFERENCE_FIELD_CODES.BELOW_MINIMUM],
             [BUDGET_AMOUNT_RANGE.max + 1, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
+            [10_001, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
             [12.5, PREFERENCE_FIELD_CODES.NOT_AN_INTEGER],
             ['120', PREFERENCE_FIELD_CODES.INVALID_TYPE],
             [undefined, PREFERENCE_FIELD_CODES.REQUIRED],
@@ -803,14 +923,18 @@ describe('parseBudgetAnswer', () => {
             );
         });
 
-        it.each([1, BUDGET_AMOUNT_RANGE.max])('accepts the amount %s', (amount) => {
+        it.each([1, 10_000, BUDGET_AMOUNT_RANGE.max])('accepts the amount %s', (amount) => {
             expect(parseBudgetAnswer(usd(amount), false).kind).toBe('ok');
         });
     });
 
     describe('currency', () => {
-        it('accepts the supported currency case-insensitively and stores it canonically', () => {
-            const verdict = parseBudgetAnswer({ amount: 120, currency: ' usd ' }, false);
+        it('pins the only accepted spelling, which the wire contract declares exactly', () => {
+            expect(BUDGET_CURRENCY).toBe('USD');
+        });
+
+        it('accepts the supported currency and stores it unchanged', () => {
+            const verdict = parseBudgetAnswer({ amount: 120, currency: 'USD' }, false);
 
             expect(verdict.kind).toBe('ok');
 
@@ -824,6 +948,15 @@ describe('parseBudgetAnswer', () => {
                 codesFor(parseBudgetAnswer({ amount: 120, currency: 'EUR' }, false), 'budget.currency'),
             ).toEqual([PREFERENCE_FIELD_CODES.UNSUPPORTED_CURRENCY]);
         });
+
+        it.each([' usd ', 'usd', 'Usd', 'USD ', ' USD'])(
+            'refuses %p rather than normalising it, because the contract declares one spelling',
+            (currency) => {
+                expect(codesFor(parseBudgetAnswer({ amount: 120, currency }, false), 'budget.currency')).toEqual(
+                    [PREFERENCE_FIELD_CODES.UNSUPPORTED_CURRENCY],
+                );
+            },
+        );
 
         it.each([
             [undefined, PREFERENCE_FIELD_CODES.REQUIRED],
@@ -853,8 +986,21 @@ describe('parseBudgetAnswer', () => {
  * ------------------------------------------------------------------------- */
 
 describe('parseDislikedFoodIds', () => {
+    it('pins the mandated ceiling, so the constant cannot drift under the cases below', () => {
+        expect(MAX_DISLIKED_FOOD_IDS).toBe(100);
+    });
+
     it('accepts an empty selection: the food preferences screen is optional', () => {
         expect(parseDislikedFoodIds([])).toEqual({ kind: 'ok', dislikedFoodIds: [] });
+    });
+
+    it('accepts exactly 100 distinct ids and refuses 101, at the literal bound', () => {
+        const hundred = Array.from({ length: 100 }, (_, index) => uuidAt(index));
+
+        expect(parseDislikedFoodIds(hundred).kind).toBe('ok');
+        expect(codesFor(parseDislikedFoodIds([...hundred, uuidAt(100)]), 'dislikedFoodIds')).toEqual([
+            PREFERENCE_FIELD_CODES.TOO_MANY,
+        ]);
     });
 
     it(`accepts ${MAX_DISLIKED_FOOD_IDS} distinct ids`, () => {
@@ -1063,6 +1209,29 @@ describe('parseSetupStep', () => {
         ...overrides,
     });
 
+    /** The revision the row carries once the first `goal` save has created it. */
+    const SAVED_REVISION = 3;
+
+    /**
+     * A save made after the row exists, which is every step but the first.
+     *
+     * Only the first `goal` save may arrive with no row and no pinned revision
+     * (see the envelope block), so every other block saves through this: the
+     * revision is present and exact, which is the real state those steps are
+     * saved in and the one their field rules have to hold under.
+     */
+    const savedContext = (overrides: Partial<SetupStepContext> = {}): SetupStepContext =>
+        stepContext({ currentRevision: SAVED_REVISION, ...overrides });
+
+    const saveStep = (
+        step: string,
+        body: Record<string, unknown>,
+        context: SetupStepContext = savedContext(),
+    ): ParsedSetupStep => parseSetupStep(step, { expectedRevision: SAVED_REVISION, ...body }, context);
+
+    /** What every payload accepted through {@link saveStep} carries. */
+    const savedEnvelope = { timeZone: ZONE, expectedRevision: SAVED_REVISION };
+
     describe('the step segment and the envelope', () => {
         it('refuses an unknown step', () => {
             expect(codesFor(parseSetupStep('goals', goalBody(), stepContext()), 'step')).toEqual([
@@ -1100,11 +1269,81 @@ describe('parseSetupStep', () => {
             expect(okPayload<{ timeZone: string }>(verdict).timeZone).toBe(normalizeTimeZone('UTC'));
         });
 
-        it('ignores an extra key: the closed-key contract belongs to the full save', () => {
-            const verdict = parseSetupStep('goal', goalBody({ setupStatus: 'completed' }), stepContext());
+        it.each(['setupStatus', 'setupStep', 'revision', 'budgetTier', 'hasActivePlan', 'targetRoute'])(
+            'refuses the server-owned key %s rather than ignoring it',
+            (key) => {
+                const verdict = parseSetupStep('goal', goalBody({ [key]: 'completed' }), stepContext());
 
-            expect(verdict.kind).toBe('ok');
-            expect(okPayload<Record<string, unknown>>(verdict).setupStatus).toBeUndefined();
+                expect(codesFor(verdict, key)).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+            },
+        );
+
+        it('refuses an unknown key, which is how a misspelled answer is caught', () => {
+            // Ignoring it would drop the answer and return 200, and the screen
+            // would read its own saved value back as unanswered.
+            const verdict = parseSetupStep(
+                'activity',
+                { timeZone: ZONE, activityLevl: 'active', expectedRevision: 3 },
+                stepContext({ currentRevision: 3 }),
+            );
+
+            expect(codesFor(verdict, 'activityLevl')).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+        });
+
+        it('refuses a key that belongs to a DIFFERENT step, so each step is closed to its own', () => {
+            const verdict = saveStep('activity', {
+                timeZone: ZONE,
+                activityLevel: 'active',
+                cookingTimeLimitMin: 30,
+            });
+
+            expect(codesFor(verdict, 'cookingTimeLimitMin')).toEqual([
+                PREFERENCE_FIELD_CODES.READ_ONLY_FIELD,
+            ]);
+        });
+
+        it.each([
+            ['goal', { goal: 'lose', paceLbPerWeek: 1, goalWeightKg: 77 }],
+            ['body', { skipped: true }],
+            [
+                'body',
+                {
+                    age: 34,
+                    heightCm: 177.8,
+                    weightKg: 82.6,
+                    sexForEstimate: 'female',
+                    heightUnitPref: 'cm',
+                    weightUnitPref: 'kg',
+                },
+            ],
+            ['activity', { activityLevel: 'active' }],
+            ['diet', { diet: 'none', allergens: ['none'] }],
+            ['dislikes', { dislikedFoodIds: [] }],
+            [
+                'schedule',
+                {
+                    mealSchedule: 'three',
+                    mealTimes: [
+                        { slot: 'breakfast', time: '08:00' },
+                        { slot: 'lunch', time: '12:30' },
+                        { slot: 'dinner', time: '18:30' },
+                    ],
+                },
+            ],
+            ['cooking', { cookingTimeLimitMin: 30, budget: null, noBudgetPreference: true }],
+            ['review', { startDate: '2026-07-05' }],
+        ])('accepts every key %s declares, so the closed set is not too narrow', (step, body) => {
+            expect(saveStep(step, { timeZone: ZONE, ...body }).kind).toBe('ok');
+        });
+
+        it('names every offending key at once, beside the field problems', () => {
+            const verdict = parseSetupStep(
+                'goal',
+                goalBody({ revision: 9, nickname: 'x', goal: 'shrink' }),
+                stepContext(),
+            );
+
+            expect(fieldsOf(verdict).sort()).toEqual(['goal', 'nickname', 'revision']);
         });
 
         it('reports every offending field in one refusal', () => {
@@ -1115,6 +1354,54 @@ describe('parseSetupStep', () => {
             );
 
             expect(fieldsOf(verdict).sort()).toEqual(['goal', 'paceLbPerWeek', 'timeZone']);
+        });
+    });
+
+    describe('the first write creates the row, and only the goal step may make it', () => {
+        it.each(['body', 'activity', 'diet', 'dislikes', 'schedule', 'cooking', 'review'])(
+            'refuses %s as the first save, so setup cannot be created from the middle of the flow',
+            (step) => {
+                const verdict = parseSetupStep(
+                    step,
+                    { timeZone: ZONE, expectedRevision: NO_PREFERENCES_REVISION },
+                    stepContext({ currentRevision: null }),
+                );
+
+                expect(codesFor(verdict, 'step')).toEqual([PREFERENCE_FIELD_CODES.NOT_ALLOWED]);
+            },
+        );
+
+        it('refuses a first non-goal save even when its own fields are valid', () => {
+            const verdict = parseSetupStep(
+                'activity',
+                { timeZone: ZONE, activityLevel: 'active', expectedRevision: 0 },
+                stepContext({ currentRevision: null }),
+            );
+
+            expect(verdict.kind).toBe('error');
+            expect(fieldsOf(verdict)).toEqual(['step']);
+        });
+
+        it('accepts the goal step as the first save', () => {
+            expect(parseSetupStep('goal', goalBody(), stepContext({ currentRevision: null })).kind).toBe(
+                'ok',
+            );
+        });
+
+        it('accepts every other step once the row exists', () => {
+            expect(saveStep('activity', { timeZone: ZONE, activityLevel: 'active' }).kind).toBe('ok');
+        });
+
+        it('requires a pinned revision from a non-goal step, never treating it as optional', () => {
+            // The row exists here, so the omission is a lost race rather than a
+            // creation: exactly one of two concurrent editors may win.
+            const verdict = parseSetupStep(
+                'activity',
+                { timeZone: ZONE, activityLevel: 'active' },
+                stepContext({ currentRevision: 3 }),
+            );
+
+            expect(verdict).toMatchObject({ kind: 'stale_revision', currentRevision: 3 });
         });
     });
 
@@ -1175,8 +1462,17 @@ describe('parseSetupStep', () => {
         it.each([
             ['3', PREFERENCE_FIELD_CODES.INVALID_TYPE],
             [Number.NaN, PREFERENCE_FIELD_CODES.INVALID_TYPE],
+            [Number.POSITIVE_INFINITY, PREFERENCE_FIELD_CODES.INVALID_TYPE],
             [3.5, PREFERENCE_FIELD_CODES.NOT_AN_INTEGER],
             [-1, PREFERENCE_FIELD_CODES.BELOW_MINIMUM],
+            // Whole numbers that no revision column can hold, and that
+            // JavaScript cannot compare exactly. Classifying them as stale
+            // would send the client away to re-read and retry a value that can
+            // never match anything.
+            [1e30, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
+            [Number.MAX_SAFE_INTEGER, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
+            [Number.MAX_SAFE_INTEGER + 2, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
+            [MAX_REVISION + 1, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
         ])('reports the malformed revision %p as a 400 detail (%s)', (expectedRevision, code) => {
             const verdict = parseSetupStep(
                 'goal',
@@ -1185,6 +1481,28 @@ describe('parseSetupStep', () => {
             );
 
             expect(codesFor(verdict, 'expectedRevision')).toEqual([code]);
+        });
+
+        it('bounds a revision token by the integer column that stores it', () => {
+            expect(MAX_REVISION).toBe(2_147_483_647);
+            expect(Number.isSafeInteger(MAX_REVISION)).toBe(true);
+        });
+
+        it('still compares a token at the column bound rather than refusing it outright', () => {
+            expect(
+                parseSetupStep(
+                    'goal',
+                    goalBody({ expectedRevision: MAX_REVISION }),
+                    stepContext({ currentRevision: MAX_REVISION }),
+                ).kind,
+            ).toBe('ok');
+            expect(
+                parseSetupStep(
+                    'goal',
+                    goalBody({ expectedRevision: MAX_REVISION }),
+                    stepContext({ currentRevision: 3 }),
+                ),
+            ).toMatchObject({ kind: 'stale_revision', currentRevision: 3 });
         });
 
         it('reports field problems before the race, because a malformed body\u2019s revision is moot', () => {
@@ -1336,6 +1654,18 @@ describe('parseSetupStep', () => {
                 ).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
             });
 
+            it('reports only the goal when the goal itself is unknown, never a side check', () => {
+                // There is no direction to judge a target against, so the one
+                // mistake produces the one detail that can be acted on.
+                const verdict = parseSetupStep(
+                    'goal',
+                    goalBody({ goal: 'shrink', goalWeightKg: 90 }),
+                    withWeight,
+                );
+
+                expect(fieldsOf(verdict)).toEqual(['goal']);
+            });
+
             it('reads an explicit null goal weight as no target', () => {
                 const verdict = parseSetupStep('goal', goalBody({ goalWeightKg: null }), withWeight);
 
@@ -1357,10 +1687,10 @@ describe('parseSetupStep', () => {
         });
 
         it('accepts the measured answer', () => {
-            const verdict = parseSetupStep('body', bodyPayload(), stepContext());
+            const verdict = saveStep('body', bodyPayload());
 
             expect(okPayload<Record<string, unknown>>(verdict)).toEqual({
-                timeZone: ZONE,
+                ...savedEnvelope,
                 skipped: false,
                 age: 34,
                 heightCm: 177.8,
@@ -1372,24 +1702,100 @@ describe('parseSetupStep', () => {
         });
 
         it('accepts Skip, which carries no measurements at all', () => {
-            const verdict = parseSetupStep('body', { timeZone: ZONE, skipped: true }, stepContext());
+            const verdict = saveStep('body', { timeZone: ZONE, skipped: true });
 
-            expect(okPayload<Record<string, unknown>>(verdict)).toEqual({ timeZone: ZONE, skipped: true });
+            expect(okPayload<Record<string, unknown>>(verdict)).toEqual({ ...savedEnvelope, skipped: true });
         });
 
         it('accepts an explicit skipped: false alongside measurements', () => {
-            expect(parseSetupStep('body', bodyPayload({ skipped: false }), stepContext()).kind).toBe('ok');
+            expect(saveStep('body', bodyPayload({ skipped: false })).kind).toBe('ok');
         });
 
         it.each(['yes', 1, {}])('refuses the non-boolean skipped %p', (skipped) => {
-            expect(codesFor(parseSetupStep('body', bodyPayload({ skipped }), stepContext()), 'skipped')).toEqual([
+            expect(codesFor(saveStep('body', bodyPayload({ skipped })), 'skipped')).toEqual([
                 PREFERENCE_FIELD_CODES.INVALID_TYPE,
             ]);
         });
 
+        describe('Skip is its own closed key set, and not the measured one', () => {
+            // The body step is the only step whose payload is a discriminated
+            // union, so "the step's own keys" is not one set but two. Skip
+            // declares the discriminant and nothing else, and the parser returns
+            // the moment it sees it — so measurements sent alongside Skip would
+            // be accepted under a 200 and then dropped, which is a client that
+            // filled the form, tapped Skip, and read its own values back as
+            // unanswered.
+            const MEASURED_KEYS = [
+                'age',
+                'heightCm',
+                'weightKg',
+                'sexForEstimate',
+                'heightUnitPref',
+                'weightUnitPref',
+            ] as const;
+
+            it('refuses every measurement sent alongside skipped: true', () => {
+                const verdict = saveStep('body', bodyPayload({ skipped: true }));
+
+                expect(verdict.kind).toBe('error');
+                expect(fieldsOf(verdict).sort()).toEqual([...MEASURED_KEYS].sort());
+                for (const key of MEASURED_KEYS) {
+                    expect(codesFor(verdict, key)).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+                }
+            });
+
+            it.each(MEASURED_KEYS)('refuses %s on its own alongside skipped: true', (key) => {
+                const verdict = saveStep('body', {
+                    timeZone: ZONE,
+                    skipped: true,
+                    [key]: key === 'age' ? 34 : 'whatever',
+                });
+
+                expect(codesFor(verdict, key)).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+            });
+
+            it('never silently drops a supplied value: the refusal replaces the 200', () => {
+                // The precise failure this closes — the verdict used to be
+                // accepted and carry only the envelope and the discriminant.
+                const verdict = saveStep('body', bodyPayload({ skipped: true }));
+
+                expect(verdict.kind).not.toBe('ok');
+            });
+
+            it('still accepts Skip on its own', () => {
+                expect(saveStep('body', { timeZone: ZONE, skipped: true }).kind).toBe('ok');
+            });
+
+            it.each(MEASURED_KEYS)('still accepts %s under the measured branch', (key) => {
+                expect(saveStep('body', bodyPayload()).kind).toBe('ok');
+                expect(Object.keys(bodyPayload())).toContain(key);
+            });
+
+            it('still accepts the measured branch under an explicit skipped: false', () => {
+                expect(saveStep('body', bodyPayload({ skipped: false })).kind).toBe('ok');
+            });
+
+            it('reports a malformed discriminant as a type problem, not as an unacceptable key', () => {
+                // Only `skipped: true` selects Skip. Anything else selects the
+                // measured branch, whose parser owns the discriminant's type.
+                const verdict = saveStep('body', bodyPayload({ skipped: 'true' }));
+
+                expect(codesFor(verdict, 'skipped')).toEqual([PREFERENCE_FIELD_CODES.INVALID_TYPE]);
+                expect(codesFor(verdict, 'age')).toEqual([]);
+            });
+
+            it('keeps refusing server-owned keys under Skip', () => {
+                const verdict = saveStep('body', { timeZone: ZONE, skipped: true, setupStatus: 'completed' });
+
+                expect(codesFor(verdict, 'setupStatus')).toEqual([
+                    PREFERENCE_FIELD_CODES.READ_ONLY_FIELD,
+                ]);
+            });
+        });
+
         it('accepts "prefer not to say", which is an answer rather than a gap', () => {
             expect(
-                parseSetupStep('body', bodyPayload({ sexForEstimate: 'prefer_not_to_say' }), stepContext()).kind,
+                saveStep('body', bodyPayload({ sexForEstimate: 'prefer_not_to_say' })).kind,
             ).toBe('ok');
         });
 
@@ -1401,26 +1807,135 @@ describe('parseSetupStep', () => {
             ['weightUnitPref', undefined, PREFERENCE_FIELD_CODES.REQUIRED],
             ['weightUnitPref', 'st', PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
         ])('reports %s of %p as %s', (field, value, code) => {
-            const verdict = parseSetupStep('body', bodyPayload({ [field]: value }), stepContext());
+            const verdict = saveStep('body', bodyPayload({ [field]: value }));
 
             expect(codesFor(verdict, field)).toEqual([code]);
         });
 
         it('holds the measurements to the envelope', () => {
-            const verdict = parseSetupStep('body', bodyPayload({ age: 17, weightKg: 400 }), stepContext());
+            const verdict = saveStep('body', bodyPayload({ age: 17, weightKg: 400 }));
 
             expect(codesFor(verdict, 'age')).toEqual([PREFERENCE_FIELD_CODES.BELOW_MINIMUM]);
             expect(codesFor(verdict, 'weightKg')).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
         });
 
         it('reports a measurement gap and a missing selection together', () => {
-            const verdict = parseSetupStep(
-                'body',
-                bodyPayload({ age: undefined, sexForEstimate: undefined }),
-                stepContext(),
-            );
+            const verdict = saveStep('body', bodyPayload({ age: undefined, sexForEstimate: undefined }));
 
             expect(fieldsOf(verdict).sort()).toEqual(['age', 'sexForEstimate']);
+        });
+
+        describe('the stored goal weight becomes judgeable here for the first time', () => {
+            // The goal screen comes first and may be answered with no current
+            // weight to compare against. This step supplies it, so a target
+            // accepted there must be re-judged now — otherwise "lose weight,
+            // target 77 kg" plus "I weigh 70 kg" is stored as a coherent answer
+            // and then drives a plan.
+            it('accepts a weight above a losing target', () => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg: 82.6 }),
+                    savedContext({ currentGoal: 'lose', currentGoalWeightKg: 77 }),
+                );
+
+                expect(verdict.kind).toBe('ok');
+            });
+
+            it.each([77, 70])('refuses the weight %p against a losing target of 77', (weightKg) => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg }),
+                    savedContext({ currentGoal: 'lose', currentGoalWeightKg: 77 }),
+                );
+
+                expect(codesFor(verdict, 'goalWeightKg')).toEqual([
+                    PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT,
+                ]);
+            });
+
+            it('accepts a weight below a gaining target', () => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg: 82.6 }),
+                    savedContext({ currentGoal: 'gain', currentGoalWeightKg: 90 }),
+                );
+
+                expect(verdict.kind).toBe('ok');
+            });
+
+            it.each([90, 95])('refuses the weight %p against a gaining target of 90', (weightKg) => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg }),
+                    savedContext({ currentGoal: 'gain', currentGoalWeightKg: 90 }),
+                );
+
+                expect(codesFor(verdict, 'goalWeightKg')).toEqual([
+                    PREFERENCE_FIELD_CODES.NOT_ABOVE_CURRENT_WEIGHT,
+                ]);
+            });
+
+            it('leaves maintenance alone, which has no target to contradict', () => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg: 70 }),
+                    savedContext({ currentGoal: 'maintain', currentGoalWeightKg: null }),
+                );
+
+                expect(verdict.kind).toBe('ok');
+            });
+
+            it('judges nothing when the goal step has not been answered yet', () => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg: 70 }),
+                    savedContext({ currentGoal: null, currentGoalWeightKg: 77 }),
+                );
+
+                expect(verdict.kind).toBe('ok');
+            });
+
+            it('judges nothing when no target was ever set', () => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg: 70 }),
+                    savedContext({ currentGoal: 'lose', currentGoalWeightKg: null }),
+                );
+
+                expect(verdict.kind).toBe('ok');
+            });
+
+            it('re-judges nothing for Skip, which carries no weight at all', () => {
+                // Skip takes the manual-target route and supplies no
+                // measurements, so nothing became comparable.
+                const verdict = saveStep(
+                    'body',
+                    { timeZone: ZONE, skipped: true },
+                    savedContext({ currentGoal: 'lose', currentGoalWeightKg: 77 }),
+                );
+
+                expect(verdict.kind).toBe('ok');
+            });
+
+            it('reports the conflict beside the step\u2019s own field problems in one refusal', () => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg: 70, sexForEstimate: undefined }),
+                    savedContext({ currentGoal: 'lose', currentGoalWeightKg: 77 }),
+                );
+
+                expect(fieldsOf(verdict).sort()).toEqual(['goalWeightKg', 'sexForEstimate']);
+            });
+
+            it('does not re-judge a weight the envelope already refused', () => {
+                const verdict = saveStep(
+                    'body',
+                    bodyPayload({ weightKg: 400 }),
+                    savedContext({ currentGoal: 'lose', currentGoalWeightKg: 77 }),
+                );
+
+                expect(fieldsOf(verdict)).toEqual(['weightKg']);
+            });
         });
     });
 
@@ -1428,9 +1943,9 @@ describe('parseSetupStep', () => {
         it.each(['not_very_active', 'lightly_active', 'active', 'very_active'])(
             'accepts %s',
             (activityLevel) => {
-                const verdict = parseSetupStep('activity', { timeZone: ZONE, activityLevel }, stepContext());
+                const verdict = saveStep('activity', { timeZone: ZONE, activityLevel });
 
-                expect(okPayload<Record<string, unknown>>(verdict)).toEqual({ timeZone: ZONE, activityLevel });
+                expect(okPayload<Record<string, unknown>>(verdict)).toEqual({ ...savedEnvelope, activityLevel });
             },
         );
 
@@ -1439,7 +1954,7 @@ describe('parseSetupStep', () => {
             ['athlete', PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
             [3, PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
         ])('reports %p as %s', (activityLevel, code) => {
-            const verdict = parseSetupStep('activity', { timeZone: ZONE, activityLevel }, stepContext());
+            const verdict = saveStep('activity', { timeZone: ZONE, activityLevel });
 
             expect(codesFor(verdict, 'activityLevel')).toEqual([code]);
         });
@@ -1447,25 +1962,17 @@ describe('parseSetupStep', () => {
 
     describe('diet', () => {
         it.each(['none', 'vegetarian', 'vegan', 'pescatarian'])('accepts the diet %s', (diet) => {
-            const verdict = parseSetupStep(
-                'diet',
-                { timeZone: ZONE, diet, allergens: ['none'] },
-                stepContext(),
-            );
+            const verdict = saveStep('diet', { timeZone: ZONE, diet, allergens: ['none'] });
 
             expect(okPayload<Record<string, unknown>>(verdict)).toEqual({
-                timeZone: ZONE,
+                ...savedEnvelope,
                 diet,
                 allergens: ['none'],
             });
         });
 
         it('carries the normalised allergen selection through', () => {
-            const verdict = parseSetupStep(
-                'diet',
-                { timeZone: ZONE, diet: 'none', allergens: ['Tree nuts', 'Milk'] },
-                stepContext(),
-            );
+            const verdict = saveStep('diet', { timeZone: ZONE, diet: 'none', allergens: ['Tree nuts', 'Milk'] });
 
             expect(okPayload<{ allergens: string[] }>(verdict).allergens).toEqual(['milk', 'tree_nuts']);
         });
@@ -1474,21 +1981,13 @@ describe('parseSetupStep', () => {
             [undefined, PREFERENCE_FIELD_CODES.REQUIRED],
             ['keto', PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
         ])('reports the diet %p as %s', (diet, code) => {
-            const verdict = parseSetupStep(
-                'diet',
-                { timeZone: ZONE, diet, allergens: ['none'] },
-                stepContext(),
-            );
+            const verdict = saveStep('diet', { timeZone: ZONE, diet, allergens: ['none'] });
 
             expect(codesFor(verdict, 'diet')).toEqual([code]);
         });
 
         it('reports the diet and the allergens together', () => {
-            const verdict = parseSetupStep(
-                'diet',
-                { timeZone: ZONE, diet: 'keto', allergens: ['none', 'milk'] },
-                stepContext(),
-            );
+            const verdict = saveStep('diet', { timeZone: ZONE, diet: 'keto', allergens: ['none', 'milk'] });
 
             expect(fieldsOf(verdict).sort()).toEqual(['allergens', 'diet']);
         });
@@ -1496,24 +1995,16 @@ describe('parseSetupStep', () => {
 
     describe('dislikes', () => {
         it('accepts an empty selection', () => {
-            const verdict = parseSetupStep(
-                'dislikes',
-                { timeZone: ZONE, dislikedFoodIds: [] },
-                stepContext(),
-            );
+            const verdict = saveStep('dislikes', { timeZone: ZONE, dislikedFoodIds: [] });
 
             expect(okPayload<Record<string, unknown>>(verdict)).toEqual({
-                timeZone: ZONE,
+                ...savedEnvelope,
                 dislikedFoodIds: [],
             });
         });
 
         it('refuses a malformed id', () => {
-            const verdict = parseSetupStep(
-                'dislikes',
-                { timeZone: ZONE, dislikedFoodIds: ['mushrooms'] },
-                stepContext(),
-            );
+            const verdict = saveStep('dislikes', { timeZone: ZONE, dislikedFoodIds: ['mushrooms'] });
 
             expect(codesFor(verdict, 'dislikedFoodIds[0]')).toEqual([PREFERENCE_FIELD_CODES.INVALID_ID]);
         });
@@ -1527,28 +2018,23 @@ describe('parseSetupStep', () => {
         ];
 
         it('accepts three meals with three times', () => {
-            const verdict = parseSetupStep(
-                'schedule',
-                { timeZone: ZONE, mealSchedule: 'three', mealTimes: times },
-                stepContext(),
-            );
+            const verdict = saveStep('schedule', { timeZone: ZONE, mealSchedule: 'three', mealTimes: times });
 
             expect(okPayload<Record<string, unknown>>(verdict)).toEqual({
-                timeZone: ZONE,
+                ...savedEnvelope,
                 mealSchedule: 'three',
                 mealTimes: times,
             });
         });
 
         it('accepts a snack schedule with the snack between lunch and dinner', () => {
-            const verdict = parseSetupStep(
+            const verdict = saveStep(
                 'schedule',
                 {
                     timeZone: ZONE,
                     mealSchedule: 'three_plus_snack',
                     mealTimes: [...times, { slot: 'snack', time: '15:30' }],
                 },
-                stepContext(),
             );
 
             expect(verdict.kind).toBe('ok');
@@ -1558,21 +2044,13 @@ describe('parseSetupStep', () => {
             [undefined, PREFERENCE_FIELD_CODES.REQUIRED],
             ['four', PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
         ])('reports the schedule %p as %s', (mealSchedule, code) => {
-            const verdict = parseSetupStep(
-                'schedule',
-                { timeZone: ZONE, mealSchedule, mealTimes: times },
-                stepContext(),
-            );
+            const verdict = saveStep('schedule', { timeZone: ZONE, mealSchedule, mealTimes: times });
 
             expect(codesFor(verdict, 'mealSchedule')).toEqual([code]);
         });
 
         it('refuses a count that does not match the schedule', () => {
-            const verdict = parseSetupStep(
-                'schedule',
-                { timeZone: ZONE, mealSchedule: 'three_plus_snack', mealTimes: times },
-                stepContext(),
-            );
+            const verdict = saveStep('schedule', { timeZone: ZONE, mealSchedule: 'three_plus_snack', mealTimes: times });
 
             expect(codesFor(verdict, 'mealTimes')).toEqual([PREFERENCE_FIELD_CODES.SLOT_MISMATCH]);
         });
@@ -1580,14 +2058,10 @@ describe('parseSetupStep', () => {
 
     describe('cooking', () => {
         it.each([15, 30, 45, 60])('accepts the cooking limit %s', (cookingTimeLimitMin) => {
-            const verdict = parseSetupStep(
-                'cooking',
-                { timeZone: ZONE, cookingTimeLimitMin, budget: null, noBudgetPreference: true },
-                stepContext(),
-            );
+            const verdict = saveStep('cooking', { timeZone: ZONE, cookingTimeLimitMin, budget: null, noBudgetPreference: true });
 
             expect(okPayload<Record<string, unknown>>(verdict)).toEqual({
-                timeZone: ZONE,
+                ...savedEnvelope,
                 cookingTimeLimitMin,
                 budget: null,
                 noBudgetPreference: true,
@@ -1595,7 +2069,7 @@ describe('parseSetupStep', () => {
         });
 
         it('accepts a weekly amount', () => {
-            const verdict = parseSetupStep(
+            const verdict = saveStep(
                 'cooking',
                 {
                     timeZone: ZONE,
@@ -1603,7 +2077,6 @@ describe('parseSetupStep', () => {
                     budget: { amount: 140, currency: 'USD' },
                     noBudgetPreference: false,
                 },
-                stepContext(),
             );
 
             expect(okPayload<{ budget: { amount: number } | null }>(verdict).budget).toEqual({
@@ -1617,20 +2090,15 @@ describe('parseSetupStep', () => {
             [20, PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
             ['30', PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
         ])('reports the cooking limit %p as %s', (cookingTimeLimitMin, code) => {
-            const verdict = parseSetupStep(
-                'cooking',
-                { timeZone: ZONE, cookingTimeLimitMin, budget: null, noBudgetPreference: true },
-                stepContext(),
-            );
+            const verdict = saveStep('cooking', { timeZone: ZONE, cookingTimeLimitMin, budget: null, noBudgetPreference: true });
 
             expect(codesFor(verdict, 'cookingTimeLimitMin')).toEqual([code]);
         });
 
         it('reports the cooking limit and the budget together', () => {
-            const verdict = parseSetupStep(
+            const verdict = saveStep(
                 'cooking',
                 { timeZone: ZONE, cookingTimeLimitMin: 20, budget: null, noBudgetPreference: false },
-                stepContext(),
             );
 
             expect(fieldsOf(verdict).sort()).toEqual(['budget', 'cookingTimeLimitMin']);
@@ -1639,14 +2107,10 @@ describe('parseSetupStep', () => {
 
     describe('review', () => {
         it('accepts a real calendar day', () => {
-            const verdict = parseSetupStep(
-                'review',
-                { timeZone: ZONE, startDate: '2026-07-05' },
-                stepContext(),
-            );
+            const verdict = saveStep('review', { timeZone: ZONE, startDate: '2026-07-05' });
 
             expect(okPayload<Record<string, unknown>>(verdict)).toEqual({
-                timeZone: ZONE,
+                ...savedEnvelope,
                 startDate: '2026-07-05',
             });
         });
@@ -1656,14 +2120,14 @@ describe('parseSetupStep', () => {
             ['2026-02-30', PREFERENCE_FIELD_CODES.INVALID_DATE],
             ['05/07/2026', PREFERENCE_FIELD_CODES.INVALID_DATE],
         ])('reports the start date %p as %s', (startDate, code) => {
-            const verdict = parseSetupStep('review', { timeZone: ZONE, startDate }, stepContext());
+            const verdict = saveStep('review', { timeZone: ZONE, startDate });
 
             expect(codesFor(verdict, 'startDate')).toEqual([code]);
         });
     });
 
     it('labels each accepted payload with its own step', () => {
-        const verdict = parseSetupStep('activity', { timeZone: ZONE, activityLevel: 'active' }, stepContext());
+        const verdict = saveStep('activity', { timeZone: ZONE, activityLevel: 'active' });
 
         expect(verdict.kind === 'ok' && verdict.step).toBe('activity');
     });
@@ -1748,6 +2212,47 @@ describe('parsePreferencesUpdate', () => {
 
             expect(codesFor(verdict, 'expectedRevision')).toEqual([PREFERENCE_FIELD_CODES.INVALID_TYPE]);
         });
+
+        it.each([
+            ['a token equal to the absent row\u2019s read-back value', NO_PREFERENCES_REVISION],
+            ['a pinned non-zero revision', 2],
+        ])('refuses a full save against no row at all, given %s', (_label, expectedRevision) => {
+            // This endpoint edits; creation belongs to the first `goal` step. A
+            // zero here compares equal to what an absent row reads back, so
+            // without this rule a full save could materialise setup state that
+            // the wizard never produced.
+            const verdict = parsePreferencesUpdate(
+                { diet: 'vegan', expectedRevision },
+                updateContext({ currentRevision: null }),
+            );
+
+            expect(verdict).toMatchObject({
+                kind: 'stale_revision',
+                currentRevision: NO_PREFERENCES_REVISION,
+            });
+        });
+
+        it('refuses a full save against no row even with no revision pinned at all', () => {
+            expect(
+                parsePreferencesUpdate({ diet: 'vegan' }, updateContext({ currentRevision: null })),
+            ).toMatchObject({ kind: 'stale_revision', currentRevision: NO_PREFERENCES_REVISION });
+        });
+
+        it('still reports field problems before the missing row, because a 400 is the fixable answer', () => {
+            const verdict = parsePreferencesUpdate(
+                { diet: 'keto', expectedRevision: NO_PREFERENCES_REVISION },
+                updateContext({ currentRevision: null }),
+            );
+
+            expect(verdict.kind).toBe('error');
+            expect(codesFor(verdict, 'diet')).toEqual([PREFERENCE_FIELD_CODES.UNKNOWN_VALUE]);
+        });
+
+        it('reports an unsafe-integer revision as malformed rather than as a lost race', () => {
+            const verdict = parsePreferencesUpdate({ diet: 'vegan', expectedRevision: 1e30 }, updateContext());
+
+            expect(codesFor(verdict, 'expectedRevision')).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
+        });
     });
 
     describe('omitted is not null', () => {
@@ -1760,13 +2265,24 @@ describe('parsePreferencesUpdate', () => {
             expect(payloadOf(verdict)).toEqual({ goalWeightKg: null, expectedRevision: 4 });
         });
 
-        it('clears a pace on an explicit null', () => {
+        it('clears a pace on an explicit null once the goal no longer needs one', () => {
             const verdict = parsePreferencesUpdate(
                 { paceLbPerWeek: null, expectedRevision: 4 },
-                updateContext({ currentGoal: 'lose' }),
+                updateContext({ currentGoal: 'maintain' }),
             );
 
             expect(payloadOf(verdict)).toEqual({ paceLbPerWeek: null, expectedRevision: 4 });
+        });
+
+        it('refuses to clear the pace of a goal that still has a direction', () => {
+            // An explicit null is a real edit, so it is judged as one: 'lose'
+            // with no pace cannot be estimated from at all.
+            const verdict = parsePreferencesUpdate(
+                { paceLbPerWeek: null, expectedRevision: 4 },
+                updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1 }),
+            );
+
+            expect(codesFor(verdict, 'paceLbPerWeek')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
         });
 
         it('leaves an omitted key out of the payload entirely', () => {
@@ -1856,7 +2372,7 @@ describe('parsePreferencesUpdate', () => {
         it('uses the goal in the same body when it changes too', () => {
             const verdict = parsePreferencesUpdate(
                 { goal: 'gain', goalWeightKg: 90, expectedRevision: 4 },
-                updateContext({ currentGoal: 'lose', currentWeightKg: 82.6 }),
+                updateContext({ currentGoal: 'lose', currentWeightKg: 82.6, currentPaceLbPerWeek: 1 }),
             );
 
             expect(verdict.kind).toBe('ok');
@@ -1884,6 +2400,192 @@ describe('parsePreferencesUpdate', () => {
             );
 
             expect(payloadOf(verdict)).toEqual({ goalWeightKg: 90, expectedRevision: 4 });
+        });
+
+        describe('and is re-judged whenever any member of the tuple changes', () => {
+            const losing = (overrides: Partial<PreferencesUpdateContext> = {}): PreferencesUpdateContext =>
+                updateContext({
+                    currentGoal: 'lose',
+                    currentPaceLbPerWeek: 1,
+                    currentWeightKg: 82.6,
+                    currentGoalWeightKg: 77,
+                    ...overrides,
+                });
+
+            it('refuses a new current weight that the STORED target no longer sits below', () => {
+                // The body never mentions the target, which is exactly why this
+                // has to be checked here: 77 kg was a valid losing target at
+                // 82.6 kg and is not one at 70 kg.
+                const verdict = parsePreferencesUpdate({ weightKg: 70, expectedRevision: 4 }, losing());
+
+                expect(codesFor(verdict, 'goalWeightKg')).toEqual([
+                    PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT,
+                ]);
+            });
+
+            it('accepts a new current weight the stored target still sits below', () => {
+                const verdict = parsePreferencesUpdate({ weightKg: 95, expectedRevision: 4 }, losing());
+
+                expect(payloadOf(verdict)).toEqual({ weightKg: 95, expectedRevision: 4 });
+            });
+
+            it('refuses a change of direction that leaves the stored target on the wrong side', () => {
+                const verdict = parsePreferencesUpdate(
+                    { goal: 'gain', paceLbPerWeek: 1, expectedRevision: 4 },
+                    losing(),
+                );
+
+                expect(codesFor(verdict, 'goalWeightKg')).toEqual([
+                    PREFERENCE_FIELD_CODES.NOT_ABOVE_CURRENT_WEIGHT,
+                ]);
+            });
+
+            it('accepts a change of direction that sends the same body a fresh target', () => {
+                const verdict = parsePreferencesUpdate(
+                    { goal: 'gain', paceLbPerWeek: 1, goalWeightKg: 90, expectedRevision: 4 },
+                    losing(),
+                );
+
+                expect(verdict.kind).toBe('ok');
+            });
+
+            it('accepts a change of direction that clears the target outright', () => {
+                const verdict = parsePreferencesUpdate(
+                    { goal: 'gain', paceLbPerWeek: 1, goalWeightKg: null, expectedRevision: 4 },
+                    losing(),
+                );
+
+                expect(payloadOf(verdict)).toEqual({
+                    goal: 'gain',
+                    paceLbPerWeek: 1,
+                    goalWeightKg: null,
+                    expectedRevision: 4,
+                });
+            });
+
+            it('leaves an incoherent stored row alone when the body touches no member of it', () => {
+                // A row written before this rule existed must not block an
+                // unrelated edit: the diet save has nothing to do with the
+                // target, and refusing it would strand the settings screen.
+                const verdict = parsePreferencesUpdate(
+                    { diet: 'vegan', expectedRevision: 4 },
+                    losing({ currentWeightKg: 70 }),
+                );
+
+                expect(payloadOf(verdict)).toEqual({ diet: 'vegan', expectedRevision: 4 });
+            });
+
+            it('reports one detail for one mistake, not two', () => {
+                const verdict = parsePreferencesUpdate({ weightKg: 70, expectedRevision: 4 }, losing());
+
+                expect(detailsOf(verdict)).toHaveLength(1);
+            });
+
+            it('does not re-judge a weight the envelope already refused', () => {
+                const verdict = parsePreferencesUpdate({ weightKg: 10, expectedRevision: 4 }, losing());
+
+                expect(fieldsOf(verdict)).toEqual(['weightKg']);
+            });
+
+            it('does not re-judge a target the envelope already refused', () => {
+                const verdict = parsePreferencesUpdate({ goalWeightKg: 400, expectedRevision: 4 }, losing());
+
+                expect(codesFor(verdict, 'goalWeightKg')).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
+            });
+
+            it('leaves maintenance alone, whose target is cleared rather than compared', () => {
+                const verdict = parsePreferencesUpdate({ goal: 'maintain', expectedRevision: 4 }, losing());
+
+                expect(payloadOf(verdict)).toEqual({
+                    goal: 'maintain',
+                    goalWeightKg: null,
+                    paceLbPerWeek: null,
+                    expectedRevision: 4,
+                });
+            });
+        });
+    });
+
+    describe('a direction needs a pace, whichever half of the pair the body carries', () => {
+        it('refuses a switch to a direction that leaves no pace behind it', () => {
+            // 'maintain' never had a pace, so switching to 'lose' without
+            // sending one stores a goal no estimate can be computed from — which
+            // surfaces later as an unexplained estimate_unavailable on the
+            // review screen rather than as a rejected save.
+            const verdict = parsePreferencesUpdate(
+                { goal: 'lose', expectedRevision: 4 },
+                updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
+            );
+
+            expect(codesFor(verdict, 'paceLbPerWeek')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+        });
+
+        it.each([0.5, 1, 1.5] as const)('accepts a switch that supplies the pace %p', (paceLbPerWeek) => {
+            const verdict = parsePreferencesUpdate(
+                { goal: 'gain', paceLbPerWeek, expectedRevision: 4 },
+                updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
+            );
+
+            expect(payloadOf(verdict)).toEqual({ goal: 'gain', paceLbPerWeek, expectedRevision: 4 });
+        });
+
+        it('accepts a switch that keeps a pace already stored', () => {
+            const verdict = parsePreferencesUpdate(
+                { goal: 'gain', expectedRevision: 4 },
+                updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1.5 }),
+            );
+
+            expect(payloadOf(verdict)).toEqual({ goal: 'gain', expectedRevision: 4 });
+        });
+
+        it('accepts a pace edit on its own, which changes the pair\u2019s other half not at all', () => {
+            const verdict = parsePreferencesUpdate(
+                { paceLbPerWeek: 0.5, expectedRevision: 4 },
+                updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1 }),
+            );
+
+            expect(payloadOf(verdict)).toEqual({ paceLbPerWeek: 0.5, expectedRevision: 4 });
+        });
+
+        it('leaves a pace-less directional row alone when the body changes neither half', () => {
+            const verdict = parsePreferencesUpdate(
+                { diet: 'vegan', expectedRevision: 4 },
+                updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: null }),
+            );
+
+            expect(payloadOf(verdict)).toEqual({ diet: 'vegan', expectedRevision: 4 });
+        });
+
+        it('reports one detail for a pace that is present but unknown, not two', () => {
+            const verdict = parsePreferencesUpdate(
+                { goal: 'lose', paceLbPerWeek: 2, expectedRevision: 4 },
+                updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
+            );
+
+            expect(codesFor(verdict, 'paceLbPerWeek')).toEqual([PREFERENCE_FIELD_CODES.UNKNOWN_VALUE]);
+        });
+
+        it('says nothing about the pace when the goal itself was refused', () => {
+            const verdict = parsePreferencesUpdate(
+                { goal: 'shrink', expectedRevision: 4 },
+                updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
+            );
+
+            expect(fieldsOf(verdict)).toEqual(['goal']);
+        });
+
+        it('accepts maintenance with no pace, which is the one goal that needs none', () => {
+            const verdict = parsePreferencesUpdate(
+                { goal: 'maintain', expectedRevision: 4 },
+                updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1 }),
+            );
+
+            expect(payloadOf(verdict)).toEqual({
+                goal: 'maintain',
+                goalWeightKg: null,
+                paceLbPerWeek: null,
+                expectedRevision: 4,
+            });
         });
     });
 
@@ -1992,7 +2694,7 @@ describe('parsePreferencesUpdate', () => {
 
         it('accepts an amount against a stored "no preference" of false', () => {
             const verdict = parsePreferencesUpdate(
-                { budget: { amount: 150, currency: 'usd' }, expectedRevision: 4 },
+                { budget: { amount: 150, currency: 'USD' }, expectedRevision: 4 },
                 updateContext({ currentNoBudgetPreference: false }),
             );
 
@@ -2132,6 +2834,27 @@ describe('parsePreferencesUpdate', () => {
             expect(codesFor(verdict, 'dislikedFoodGroups')).toEqual([PREFERENCE_FIELD_CODES.TOO_MANY]);
         });
 
+        it('bounds the food-group list at the literal 100, accepting 100 and refusing 101', () => {
+            const groups = (count: number): string[] =>
+                Array.from({ length: count }, (_, index) => `group-${index}`);
+
+            expect(
+                parsePreferencesUpdate(
+                    { dislikedFoodGroups: groups(100), expectedRevision: 4 },
+                    updateContext(),
+                ).kind,
+            ).toBe('ok');
+            expect(
+                codesFor(
+                    parsePreferencesUpdate(
+                        { dislikedFoodGroups: groups(101), expectedRevision: 4 },
+                        updateContext(),
+                    ),
+                    'dislikedFoodGroups',
+                ),
+            ).toEqual([PREFERENCE_FIELD_CODES.TOO_MANY]);
+        });
+
         it('reports a read-only key and a field error in the same refusal', () => {
             const verdict = parsePreferencesUpdate(
                 { revision: 9, diet: 'keto', expectedRevision: 4 },
@@ -2239,30 +2962,22 @@ describe('nextSetupState', () => {
     it('reaches ready for review after the estimated route\u2019s seven steps', () => {
         const state = walkRoute(requiredSetupSteps('estimated'), 'estimated');
 
-        expect(state).toEqual({
-            setupStatus: 'ready_for_review',
-            setupStep: 'review',
-            targetRoute: 'estimated',
-        });
+        expect(state.setupStatus).toBe('ready_for_review');
+        expect(state.setupStep).toBe('review');
+        expect(state.targetRoute).toBe('estimated');
     });
 
     it('reaches ready for review on the manual route WITHOUT the activity step', () => {
         const state = walkRoute(['goal', 'body', 'targets_manual', 'diet', 'dislikes', 'schedule', 'cooking'], 'manual');
 
-        expect(state).toEqual({
-            setupStatus: 'ready_for_review',
-            setupStep: 'review',
-            targetRoute: 'manual',
-        });
+        expect(state.setupStatus).toBe('ready_for_review');
+        expect(state.setupStep).toBe('review');
+        expect(state.targetRoute).toBe('manual');
     });
 
     it('records the manual target screen as the resume point after Skip', () => {
-        const afterGoal = nextSetupState(snapshot(), 'goal', null);
-        const afterBody = nextSetupState(
-            { ...afterGoal, setupStep: afterGoal.setupStep },
-            'body',
-            'manual',
-        );
+        const afterGoal = saveStepState(snapshot(), 'goal', null);
+        const afterBody = nextSetupState(afterGoal, 'body', 'manual');
 
         expect(afterBody).toEqual({
             setupStatus: 'in_progress',
@@ -2280,7 +2995,7 @@ describe('nextSetupState', () => {
 
     it('does NOT send a completed user back into onboarding when a settings row is re-saved', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'completed', setupStep: 'review', targetRoute: 'estimated' }),
+            reached('completed', 'review', 'estimated'),
             'diet',
             null,
         );
@@ -2296,7 +3011,7 @@ describe('nextSetupState', () => {
         'holds a completed user at completed when %s is edited',
         (step) => {
             const state = nextSetupState(
-                snapshot({ setupStatus: 'completed', setupStep: 'review', targetRoute: 'estimated' }),
+                reached('completed', 'review', 'estimated'),
                 step,
                 null,
             );
@@ -2308,7 +3023,7 @@ describe('nextSetupState', () => {
 
     it('holds a ready-for-review user where they are', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'ready_for_review', setupStep: 'review', targetRoute: 'estimated' }),
+            reached('ready_for_review', 'review', 'estimated'),
             'dislikes',
             null,
         );
@@ -2322,7 +3037,7 @@ describe('nextSetupState', () => {
 
     it('keeps the resume marker where the user reached when they step back to change an answer', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'in_progress', setupStep: 'schedule', targetRoute: 'estimated' }),
+            reached('in_progress', 'schedule', 'estimated'),
             'goal',
             null,
         );
@@ -2333,7 +3048,7 @@ describe('nextSetupState', () => {
 
     it('never promotes on a review save, which only persists a start date', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'in_progress', setupStep: 'diet', targetRoute: 'estimated' }),
+            reached('in_progress', 'diet', 'estimated'),
             'review',
             null,
         );
@@ -2357,7 +3072,7 @@ describe('nextSetupState', () => {
 
     it('holds a ready-for-review user through a review save', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'ready_for_review', setupStep: 'review', targetRoute: 'manual' }),
+            reached('ready_for_review', 'review', 'manual'),
             'review',
             null,
         );
@@ -2368,7 +3083,7 @@ describe('nextSetupState', () => {
 
     it('moves nothing when a step the active route does not include is saved', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'in_progress', setupStep: 'diet', targetRoute: 'manual' }),
+            reached('in_progress', 'diet', 'manual'),
             'activity',
             null,
         );
@@ -2378,7 +3093,7 @@ describe('nextSetupState', () => {
 
     it('keeps the stored route when the save names none', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'in_progress', setupStep: 'body', targetRoute: 'manual' }),
+            reached('in_progress', 'body', 'manual'),
             'diet',
             null,
         );
@@ -2388,7 +3103,7 @@ describe('nextSetupState', () => {
 
     it('switches the route when the save names a new one', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'in_progress', setupStep: 'activity', targetRoute: 'estimated' }),
+            reached('in_progress', 'activity', 'estimated'),
             'body',
             'manual',
         );
@@ -2399,13 +3114,322 @@ describe('nextSetupState', () => {
 
     it('advances from the last step to the review screen and no further', () => {
         const state = nextSetupState(
-            snapshot({ setupStatus: 'in_progress', setupStep: 'cooking', targetRoute: 'estimated' }),
+            reached('in_progress', 'cooking', 'estimated'),
             'cooking',
             null,
         );
 
         expect(state.setupStep).toBe('review');
         expect(state.setupStatus).toBe('ready_for_review');
+    });
+
+    describe('progress is sequential, so readiness cannot be claimed by jumping ahead', () => {
+        it.each(['body', 'activity', 'diet', 'dislikes', 'schedule', 'cooking'] as const)(
+            'earns no progress from %s as the first save, leaving the user at question one',
+            (step) => {
+                // The parser refuses these outright (only `goal` may create the
+                // row), and the state machine must not reward them either: the
+                // row could exist already because manual targets were saved
+                // from Account before any onboarding.
+                const state = nextSetupState(snapshot(), step, null);
+
+                expect(state).toEqual({
+                    setupStatus: 'in_progress',
+                    setupStep: 'goal',
+                    targetRoute: null,
+                });
+            },
+        );
+
+        it('does NOT reach ready for review from a single cooking save', () => {
+            const state = nextSetupState(snapshot(), 'cooking', null);
+
+            expect(state.setupStatus).not.toBe('ready_for_review');
+            expect(state.setupStep).not.toBe('review');
+        });
+
+        it.each([
+            ['activity', 'body'],
+            ['dislikes', 'body'],
+            ['cooking', 'body'],
+            ['schedule', 'activity'],
+        ] as const)(
+            'earns no progress from %s while the user is still on %s',
+            (step, marker) => {
+                const state = nextSetupState(
+                    reached('in_progress', marker, 'estimated'),
+                    step,
+                    null,
+                );
+
+                expect(state.setupStep).toBe(marker);
+                expect(state.setupStatus).toBe('in_progress');
+            },
+        );
+
+        it('earns no progress from the last step while earlier ones are unanswered', () => {
+            const state = nextSetupState(
+                reached('in_progress', 'diet', 'estimated'),
+                'cooking',
+                null,
+            );
+
+            expect(state).toEqual({
+                setupStatus: 'in_progress',
+                setupStep: 'diet',
+                targetRoute: 'estimated',
+            });
+        });
+
+        it('earns no progress from the last step on the manual route either', () => {
+            const state = nextSetupState(
+                reached('in_progress', 'targets_manual', 'manual'),
+                'cooking',
+                'manual',
+            );
+
+            expect(state).toEqual({
+                setupStatus: 'in_progress',
+                setupStep: 'targets_manual',
+                targetRoute: 'manual',
+            });
+        });
+
+        it('advances only one stop per answered step, however often the jump is retried', () => {
+            const first = saveStepState(snapshot(), 'cooking', null);
+            const second = saveStepState(first, 'cooking', null);
+            const third = saveStepState(second, 'cooking', null);
+
+            expect(third.setupStep).toBe('goal');
+            expect(third.setupStatus).toBe('in_progress');
+        });
+
+        it('reaches review only by answering every stop in order', () => {
+            const jumped = (['cooking', 'schedule', 'dislikes'] as readonly SetupStep[]).reduce(
+                (state, step) => saveStepState(state, step, null),
+                snapshot(),
+            );
+
+            expect(jumped.setupStatus).toBe('in_progress');
+
+            const walked = walkRoute(requiredSetupSteps('estimated'), 'estimated');
+
+            expect(walked.setupStatus).toBe('ready_for_review');
+        });
+
+        it('lets the manual route past its target screen once the targets are saved', () => {
+            // `targets_manual` is a stop of the route but saves through the
+            // targets endpoint, so the save itself is what moves the marker off
+            // it — otherwise the manual route would stall there for good.
+            const state = nextSetupState(
+                reached('in_progress', 'targets_manual', 'manual'),
+                'targets_manual',
+                'manual',
+            );
+
+            expect(state.setupStep).toBe('diet');
+        });
+
+        it('also lets the next step past it, since the target screen is not a step save', () => {
+            const state = nextSetupState(
+                reached('in_progress', 'targets_manual', 'manual'),
+                'diet',
+                'manual',
+            );
+
+            expect(state.setupStep).toBe('dislikes');
+        });
+
+        it('moves nothing when the saved step is not a stop of the active route at all', () => {
+            // The activity screen is skipped on the manual route, so an edit
+            // that re-sends it has no stop to advance from and none to advance
+            // to. The marker stays exactly where the user is.
+            const state = nextSetupState(
+                reached('in_progress', 'activity', 'manual'),
+                'activity',
+                'manual',
+            );
+
+            expect(state).toEqual({
+                setupStatus: 'in_progress',
+                setupStep: 'activity',
+                targetRoute: 'manual',
+            });
+        });
+
+        it('keeps an edit from a completed user at completed, wherever the edit lands', () => {
+            const state = nextSetupState(
+                reached('completed', 'review', 'estimated'),
+                'cooking',
+                null,
+            );
+
+            expect(state).toEqual({
+                setupStatus: 'completed',
+                setupStep: 'review',
+                targetRoute: 'estimated',
+            });
+        });
+    });
+
+    describe('a route change reconciles the answers the new route newly requires', () => {
+        // The estimated route requires `activity`; the manual route never asks
+        // for it. So re-answering the body step with a measured sex moves a
+        // manual-route user onto the estimated route and newly requires a step
+        // they were never asked. Sequential progress alone cannot see it: the
+        // marker sits on a stop both routes share, the body save reads as an
+        // edit of an earlier answer, and the walk would carry on to `review`
+        // with no activity level ever written — a plan built from a row whose
+        // answers were never given.
+        const manualAt = (marker: SetupStep) => reached('in_progress', marker, 'manual');
+
+        it.each(['diet', 'dislikes', 'schedule', 'cooking'] as const)(
+            'pulls the marker back to activity when a manual row on %s switches to the estimated route',
+            (marker) => {
+                const state = nextSetupState(manualAt(marker), 'body', 'estimated');
+
+                expect(state.targetRoute).toBe('estimated');
+                expect(state.setupStep).toBe('activity');
+                expect(state.setupStatus).toBe('in_progress');
+            },
+        );
+
+        it('never reaches review after the switch, however far the walk continues', () => {
+            // The exact sequence the review reproduced: a manual row on `diet`
+            // switches route, then walks diet, dislikes, schedule, cooking.
+            const switched = saveStepState(manualAt('diet'), 'body', 'estimated');
+            const walked = walkRoute(['diet', 'dislikes', 'schedule', 'cooking'], null, switched);
+
+            expect(walked.setupStatus).toBe('in_progress');
+            expect(walked.setupStep).toBe('activity');
+            expect(walked.answers.activityLevel).toBeNull();
+        });
+
+        it('releases the marker as soon as the activity answer is given', () => {
+            const switched = saveStepState(manualAt('diet'), 'body', 'estimated');
+            const answered = saveStepState(switched, 'activity', null);
+
+            expect(answered.setupStep).toBe('diet');
+            expect(answered.setupStatus).toBe('in_progress');
+        });
+
+        it('reaches ready for review once the whole estimated route is answered', () => {
+            const switched = saveStepState(manualAt('diet'), 'body', 'estimated');
+            const walked = walkRoute(
+                ['activity', 'diet', 'dislikes', 'schedule', 'cooking'],
+                null,
+                switched,
+            );
+
+            expect(walked.setupStatus).toBe('ready_for_review');
+            expect(walked.setupStep).toBe('review');
+        });
+
+        it('does not pull back when the activity answer is already on record', () => {
+            // Answered on the estimated route, took the manual route, and has
+            // now switched back: nothing provable is missing, so nothing moves.
+            const state = nextSetupState(
+                reached('in_progress', 'schedule', 'manual', {
+                    answers: allAnswers({ mealSchedule: null, cookingTimeLimitMin: null }),
+                }),
+                'body',
+                'estimated',
+            );
+
+            expect(state.setupStep).toBe('schedule');
+            expect(state.setupStatus).toBe('in_progress');
+        });
+
+        it('un-readies a manual row that had already reached review', () => {
+            const state = nextSetupState(
+                reached('ready_for_review', 'review', 'manual'),
+                'body',
+                'estimated',
+            );
+
+            expect(state.setupStatus).toBe('in_progress');
+            expect(state.setupStep).toBe('activity');
+        });
+
+        it('leaves a completed user completed, who has a plan and edits from settings', () => {
+            const state = nextSetupState(reached('completed', 'review', 'manual'), 'body', 'estimated');
+
+            expect(state.setupStatus).toBe('completed');
+        });
+
+        it('does not stall the other direction, where the switch requires nothing new', () => {
+            // estimated → manual DROPS the activity stop and puts the manual
+            // target screen in its place, so nothing is newly missing.
+            const state = nextSetupState(reached('in_progress', 'activity', 'estimated'), 'body', 'manual');
+
+            expect(state.targetRoute).toBe('manual');
+            expect(state.setupStep).toBe('targets_manual');
+        });
+
+        it('reaches ready for review on the manual route after switching back to it', () => {
+            const switched = saveStepState(reached('in_progress', 'activity', 'estimated'), 'body', 'manual');
+            const walked = walkRoute(
+                ['targets_manual', 'diet', 'dislikes', 'schedule', 'cooking'],
+                null,
+                switched,
+            );
+
+            expect(walked.setupStatus).toBe('ready_for_review');
+            expect(walked.setupStep).toBe('review');
+        });
+
+        it('reconciles a stale marker the active route does not contain at all', () => {
+            // A `review` save is the one path that neither advances the marker
+            // nor replaces it, so an `activity` marker left behind by a switch
+            // to the manual route would survive as a stop nothing can answer.
+            // Treating an off-route marker as past everything reconciles it to
+            // the first answer actually missing.
+            const state = nextSetupState(
+                {
+                    setupStatus: 'in_progress',
+                    setupStep: 'activity',
+                    targetRoute: 'manual',
+                    answers: allAnswers({ activityLevel: null, diet: null }),
+                },
+                'review',
+                null,
+            );
+
+            expect(state.setupStep).toBe('diet');
+            expect(state.setupStatus).toBe('in_progress');
+        });
+
+        it.each([
+            ['goal', 'goal'],
+            ['activityLevel', 'activity'],
+            ['diet', 'diet'],
+            ['mealSchedule', 'schedule'],
+            ['cookingTimeLimitMin', 'cooking'],
+        ] as const)(
+            'never claims readiness while %s is missing, whatever step is saved',
+            (answerKey, owningStep) => {
+                for (const route of ['estimated', 'manual'] as const) {
+                    const requiredHere = requiredSetupSteps(route).includes(owningStep);
+
+                    for (const step of routeStepOrder(route)) {
+                        const state = nextSetupState(
+                            reached('ready_for_review', 'review', route, {
+                                answers: { ...answersReaching('review', route), [answerKey]: null },
+                            }),
+                            step,
+                            null,
+                        );
+
+                        // The save itself answers the missing step where they
+                        // are the same step, and the manual route does not
+                        // require an activity level at all.
+                        expect(state.setupStatus).toBe(
+                            !requiredHere || step === owningStep ? 'ready_for_review' : 'in_progress',
+                        );
+                    }
+                }
+            },
+        );
     });
 
     it('never regresses the status for any route and step combination', () => {
@@ -2419,11 +3443,7 @@ describe('nextSetupState', () => {
 
         for (const setupStatus of statuses) {
             for (const step of routeStepOrder('manual')) {
-                const next = nextSetupState(
-                    snapshot({ setupStatus, setupStep: 'review', targetRoute: 'manual' }),
-                    step,
-                    null,
-                );
+                const next = nextSetupState(reached(setupStatus, 'review', 'manual'), step, null);
 
                 expect(rank[next.setupStatus]).toBeGreaterThanOrEqual(rank[setupStatus]);
             }
@@ -2570,33 +3590,76 @@ describe('evaluateMealAgainstPreferences', () => {
 
         expect(flags).toHaveLength(1);
         expect(flags[0].code).toBe('allergen');
-        expect(flags[0].detail.sort()).toEqual(['milk', 'sesame']);
+        // Unsorted: the details come back deterministically ordered too, and
+        // sorting the actual value here would hide it if they stopped.
+        expect(flags[0].detail).toEqual(['milk', 'sesame']);
     });
 
-    it('reports every preference conflict a meal has at once', () => {
-        const recipe = plannableRecipe({
-            total_minutes: 60,
-            ingredients: [
+    describe('reports every preference conflict a meal has at once, in one stable order', () => {
+        // The settings screen renders these in sequence, so the order is part
+        // of the contract: asserting a sorted copy would let a nondeterministic
+        // or row-order-dependent implementation reshuffle a user's warnings
+        // between two reads of an unchanged plan and still pass.
+        const CONTRACT_ORDER: MealFlagCode[] = ['allergen', 'diet', 'dislike', 'cooking_time'];
+
+        const conflicted = (reversed = false): PlannedMealForFlagging => {
+            const ingredients = [
                 ingredient({
                     snapshot_name: 'Feta',
                     snapshot_allergen_tags: ['milk'],
                     snapshot_diet_tags: ['vegetarian'],
                     food_group: 'cheese',
                 }),
-            ],
+                ingredient({
+                    catalog_food_id: UUIDS[1],
+                    snapshot_name: 'Brown rice, cooked',
+                    food_group: 'grain',
+                }),
+            ];
+
+            return plannedMeal(
+                plannableRecipe({
+                    total_minutes: 60,
+                    ingredients: reversed ? [...ingredients].reverse() : ingredients,
+                }),
+            );
+        };
+
+        const allConflicting = planningPreferences({
+            diet: 'vegan',
+            allergens: ['milk'],
+            disliked_food_groups: ['cheese'],
+            cooking_time_limit_min: 30,
         });
 
-        const flags = evaluateMealAgainstPreferences(
-            plannedMeal(recipe),
-            planningPreferences({
-                diet: 'vegan',
-                allergens: ['milk'],
-                disliked_food_groups: ['cheese'],
-                cooking_time_limit_min: 30,
-            }),
-        );
+        it('emits the four codes in the order the eligibility rule declares them', () => {
+            expect(flagCodes(evaluateMealAgainstPreferences(conflicted(), allConflicting))).toEqual(
+                CONTRACT_ORDER,
+            );
+        });
 
-        expect(flagCodes(flags).sort()).toEqual(['allergen', 'cooking_time', 'diet', 'dislike']);
+        it('emits the same order for identical inputs, call after call', () => {
+            const first = flagCodes(evaluateMealAgainstPreferences(conflicted(), allConflicting));
+            const second = flagCodes(evaluateMealAgainstPreferences(conflicted(), allConflicting));
+
+            expect(second).toEqual(first);
+            expect(second).toEqual(CONTRACT_ORDER);
+        });
+
+        it('emits the same order when the ingredients arrive in the opposite order', () => {
+            expect(flagCodes(evaluateMealAgainstPreferences(conflicted(true), allConflicting))).toEqual(
+                CONTRACT_ORDER,
+            );
+        });
+
+        it('keeps that relative order for any subset of the four', () => {
+            const flags = evaluateMealAgainstPreferences(
+                conflicted(),
+                planningPreferences({ allergens: ['milk'], cooking_time_limit_min: 30 }),
+            );
+
+            expect(flagCodes(flags)).toEqual(['allergen', 'cooking_time']);
+        });
     });
 
     it('drops the structural refusals, which describe a recipe nobody may be served', () => {
