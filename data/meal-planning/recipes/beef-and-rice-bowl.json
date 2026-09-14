@@ -1,0 +1,105 @@
+{
+  "slug": "beef-and-rice-bowl",
+  "name": "Beef and rice bowl",
+  "description": "Browned lean ground beef with broccoli, carrot and onion over warm brown rice, seasoned with garlic and chili powder.",
+  "iconKey": "dome",
+  "instructions": [
+    "Warm the olive oil in a wide skillet over medium-high heat.",
+    "Add the onion and carrot, and cook for 4 to 5 minutes until they soften.",
+    "Add the ground beef and the chili powder, then brown the beef for 6 to 7 minutes, breaking it apart as it cooks.",
+    "Stir in the broccoli and garlic, and cook for another 4 to 5 minutes, until the broccoli softens but keeps its bite.",
+    "Divide the warm brown rice between two bowls, then spoon the beef mixture over the top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173110",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 282.5,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 303,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 176,
+      "displayText": "2 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122,
+      "displayText": "2",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1.5,
+      "unit": "tsp",
+      "gramWeight": 4.05,
+      "displayText": "1½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

@@ -111,8 +111,8 @@ import {
 import { MealSlot } from '../types/recipe';
 import { rebuildPlanGroceries } from './grocery.service';
 import { PlanLifecycleState, requireWritablePlan } from './mealPlan.logic';
+import { formatPortionText } from './mealPlan.mapper';
 import {
-    formatPortionText,
     loadMealPlanDayResponse,
     loadMealPlanMealResponse,
     loadPlanLifecycleStates,

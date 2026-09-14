@@ -383,12 +383,31 @@ export const getRecipeVersionDetail = async (
  * under-exclude, and under-exclusion is the failure the user notices — the
  * ingredient they declined appearing in their week.
  *
- * `allergen_status` is deliberately NOT supplied per ingredient: the column is
- * not snapshotted, and `evaluatePlanningEligibility` falls back to the recipe's
- * rolled-up `allergen_status` where the per-ingredient value is absent. Feeding
- * it the LIVE per-ingredient status would let a catalog re-review change the
- * safety verdict on an already-published recipe in either direction; the rollup
- * frozen at publication is the reviewed fact.
+ * `allergen_status` is the SECOND live column, joined for the same reason and
+ * subject to the same requirement. `recipe_ingredients` does not snapshot it —
+ * the table carries the allergen TAGS but not the review that produced them —
+ * so `catalog_foods.allergen_status` is the only place the per-ingredient
+ * review exists, and `recipe.logic.ts` declares the field optional precisely
+ * because it is the supplier's to provide, exactly as it says of `food_group`.
+ *
+ * IT MUST BE SUPPLIED, and omitting it is not a safe default but a silent
+ * refusal of everything. `evaluatePlanningEligibility` reads anything other
+ * than an explicit `known` as unreviewed, including the absent value, and it
+ * does NOT fall back to the recipe's rollup — the rollup is an ADDITIONAL
+ * clause there, never a substitute. Leaving this column out therefore makes
+ * every ingredient unreviewed, every recipe ineligible, and the planner
+ * unable to fill a single slot: generation answers `no_matching_meals`
+ * forever, swap alternatives come back empty forever, and flag recomputation
+ * marks every planned meal. `deriveAllergenStatus` rolls the recipe-level
+ * column UP from these per-ingredient values, which is the proof of direction:
+ * the ingredient review is the primary fact and the recipe column is the
+ * frozen record of it.
+ *
+ * Reading it LIVE is also the correct direction for safety. A catalog
+ * re-review that withdraws a food's allergen review stops that recipe being
+ * planned again, which is the outcome we want from losing evidence; the
+ * allergen CLAIMS a user is matched against remain the frozen
+ * `snapshot_allergen_tags` above, so no published claim is restated.
  */
 const PLANNING_INGREDIENT_SELECT = {
     catalog_food_id: true,
@@ -397,7 +416,7 @@ const PLANNING_INGREDIENT_SELECT = {
     snapshot_allergen_tags: true,
     snapshot_diet_tags: true,
     is_optional: true,
-    catalog_foods: { select: { food_group: true } },
+    catalog_foods: { select: { food_group: true, allergen_status: true } },
 } satisfies Prisma.recipe_ingredientsSelect;
 
 /**
@@ -425,6 +444,20 @@ const UNVERIFIABLE_PROVENANCE: NutritionProvenance = 'user_entered';
 const UNREVIEWED_ALLERGEN_STATUS: RecipeAllergenStatus = 'unknown';
 
 /**
+ * The only rolled-up nutrition grade and the only rolled-up allergen review a
+ * plannable version may carry — the two recipe-level halves of the plannable
+ * universe {@link getRecipeVersionsForPlanning} selects.
+ *
+ * Typed against the unions rather than written as bare strings in the `where`,
+ * so a column value that stops being a member of its union fails to compile
+ * here instead of silently matching nothing at runtime — the same construction
+ * the fallbacks above use.
+ */
+const SOURCE_BACKED_PROVENANCE: NutritionProvenance = 'source_backed';
+
+const REVIEWED_ALLERGEN_STATUS: RecipeAllergenStatus = 'known';
+
+/**
  * Reads a stored provenance column into the union the rules are typed against.
  *
  * The membership DECISION stays in the logic layer — `catalog.logic.ts`'s
@@ -447,7 +480,7 @@ interface PlanningIngredientRow {
     snapshot_allergen_tags: string[];
     snapshot_diet_tags: string[];
     is_optional: boolean;
-    catalog_foods: { food_group: string };
+    catalog_foods: { food_group: string; allergen_status: string };
 }
 
 /**
@@ -456,6 +489,11 @@ interface PlanningIngredientRow {
  * `sort_order` is used to ORDER the array (see {@link INGREDIENT_ORDER}) and is
  * not carried on the identity: `RecipeIngredientIdentity` declares no such
  * member, and the array order is what every derivation walks.
+ *
+ * Both live columns are narrowed through the logic layer's own guards rather
+ * than cast, so a column holding a value outside its closed set degrades to the
+ * least-permissive reading — `unknown` for a review, which can only ever make a
+ * recipe ineligible — instead of entering the rules as an unchecked string.
  */
 const toIngredientIdentity = (row: PlanningIngredientRow): RecipeIngredientIdentity => ({
     catalog_food_id: row.catalog_food_id,
@@ -465,6 +503,7 @@ const toIngredientIdentity = (row: PlanningIngredientRow): RecipeIngredientIdent
     snapshot_diet_tags: row.snapshot_diet_tags,
     is_optional: row.is_optional,
     food_group: row.catalog_foods.food_group,
+    allergen_status: readAllergenStatus(row.catalog_foods.allergen_status),
 });
 
 /**
@@ -602,13 +641,26 @@ export const getPlanningRecipeVersionsByIds = async (
  * Every plannable recipe version, as the candidate shape the planner and the
  * swap selector both consume.
  *
- * `status = 'current'` is the ONLY filter applied. Eligibility — source-backed
- * nutrition, reviewed allergen metadata, the user's diet, allergens, dislikes,
- * cooking-time limit and the slot — is `recipe.logic.ts`'s single
- * implementation, called by the generator, the swap selector and flag
- * recomputation alike. Pre-filtering any of it here would be a second
- * eligibility rule, and two of those is how one of them starts serving an
- * allergen (§5 "no business rules inline").
+ * WHAT THE WHERE CLAUSE FILTERS, and why that is not a second eligibility
+ * rule. Three predicates define the plannable UNIVERSE, and all three are
+ * properties of the recipe alone — no user, no preference, no request: the
+ * version is `current`, its rolled-up nutrition is `source_backed`, and its
+ * rolled-up allergen review is `known`. A row failing any of them is
+ * unplannable for every user who will ever exist, so excluding it here removes
+ * rows that could never be chosen rather than deciding anything. It is also
+ * the direction a mistake has to fail in: the set handed to the search cannot
+ * contain an estimate or an unreviewed dish even if a future caller forgot to
+ * ask the rules.
+ *
+ * WHAT IT DELIBERATELY DOES NOT FILTER is everything that depends on the user
+ * — diet, allergens, dislikes, the cooking-time limit and slot membership —
+ * plus the per-ingredient half of provenance and review. Those stay with
+ * `recipe.logic.ts::evaluatePlanningEligibility`, the SINGLE implementation the
+ * generator, the swap selector and flag recomputation all call, because that is
+ * the half where two copies would eventually disagree and one of them would
+ * start serving an allergen (§5 "no business rules inline"). The rules
+ * re-check the three columns above as well, so the query narrows the input and
+ * the logic still owns every verdict.
  *
  * THE ORDER IS `slug, version`, AND IT IS LOAD-BEARING. The planner's candidate
  * pre-order is the portable identity `(slug, version, portion_multiplier)`
@@ -635,15 +687,19 @@ export const getRecipeVersionsForPlanning = async (
     db: Prisma.TransactionClient = prisma,
 ): Promise<PlanRecipeCandidate[]> => {
     const versions = await db.recipe_versions.findMany({
-        where: { status: CURRENT_VERSION_STATUS },
+        where: {
+            status: CURRENT_VERSION_STATUS,
+            nutrition_provenance: SOURCE_BACKED_PROVENANCE,
+            allergen_status: REVIEWED_ALLERGEN_STATUS,
+        },
         select: {
             id: true,
             recipe_id: true,
             version: true,
-            // Projected even though the predicate above pins it: the shared
-            // mapper narrows the column rather than trusting a WHERE clause it
-            // cannot see, which is what lets the same mapper serve
-            // getPlanningRecipeVersionsByIds, where the status genuinely varies.
+            // Projected even though the predicates above pin these three: the
+            // shared mapper narrows each column rather than trusting a WHERE
+            // clause it cannot see, which is what lets the same mapper serve
+            // getPlanningRecipeVersionsByIds, where all three genuinely vary.
             status: true,
             nutrition_provenance: true,
             allergen_status: true,

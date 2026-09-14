@@ -31,15 +31,16 @@
 //    reserve, replay, complete — and is the ONLY thing below that opens a lock
 //    or reserves a ledger row.
 //
-// WHY THE DTO ASSEMBLY LIVES HERE. Agent Action Plan §0.7.1 sketched a
-// `mealPlan.mapper.ts`; Rule backend-architecture §6 says a row -> DTO mapper is
-// "a private const at the top of the service while there's one, promoted to
-// `src/services/<domain>.mapper.ts` once two services need it or it grows past a
-// screenful". Exactly one service reads these rows — `swap.service.ts` and
-// `plannedMealLog.service.ts` obtain their meal and day DTOs by calling the
-// three `load*Response` functions below rather than by mapping rows themselves —
-// so the shape has one owner and stays here. That is also what keeps the import
-// graph acyclic: this module imports neither of those two.
+//  * `mealPlan.mapper.ts` owns the plan, day and meal DTOs. Rule
+//    backend-architecture §6 promotes a row -> DTO mapper out of its service
+//    "once two services need it or it grows past a screenful", and this shape is
+//    both: `swap.service.ts` and `plannedMealLog.service.ts` return the same
+//    meal and day shapes, and the mapping ran to some four hundred lines. So
+//    nothing below spells out a plan DTO key — the `load*Response` functions
+//    query rows and hand them over, and the two values the mapper cannot derive
+//    (the user's current targets and the summary counts) are read here and
+//    passed in. The import graph stays acyclic because the mapper imports no
+//    service.
 //
 // WHY THE SEARCH RUNS OUTSIDE THE TRANSACTION. §0.5.1 requires the candidate
 // week to be computed in memory BEFORE the transaction opens, and the ordering
@@ -89,8 +90,6 @@ import {
     Diet,
     GeneratePlanPayload,
     LoggedPlannedEntry,
-    MealFlag,
-    MealFlagCode,
     MealPlanDayEnvelopeResponse,
     MealPlanDayResponse,
     MealPlanMacroTotals,
@@ -100,11 +99,8 @@ import {
     MealSchedule,
     MealTimeEntry,
     PlanStatus,
-    PreviousRecipeSummary,
     RegeneratePlanPayload,
 } from '../types/mealPlanning';
-import { MealSlot } from '../types/recipe';
-import { formatQuarters, pluralizeCount } from '../utils/units';
 import { PlannedMealForGroceries } from './grocery.logic';
 import { buildPlanGroceryDrafts, loadStoredGroceryRows, writePlanGroceryRows } from './grocery.service';
 import {
@@ -124,6 +120,18 @@ import {
     startDateWindow,
 } from './mealPlan.logic';
 import {
+    MealPlanDataError,
+    readMealSlot,
+    readPlanStatus,
+    readStoredFlags,
+    readTargetsSnapshot,
+    sameMacroTotals,
+    toDayKey,
+    toMealPlanDayResponse,
+    toMealPlanMealResponse,
+    toMealPlanResponse,
+} from './mealPlan.mapper';
+import {
     PlanNotFoundError,
     PreferencesIncompleteError,
     StalePlanError,
@@ -140,7 +148,6 @@ import {
 import { isClockTime } from './preferences.logic';
 import { PreferencesRow, dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
 import { PlanningPreferences, isMealSlot } from './recipe.logic';
-import { mapPlannedRecipeSummary } from './recipe.mapper';
 import { getRecipeVersionsForPlanning } from './recipe.service';
 import { getTargets, previewConfirmedTargets, requireConfirmedTargets } from './targets.service';
 
@@ -184,58 +191,25 @@ const GENERATABLE_SETUP_STATUSES: readonly string[] = ['ready_for_review', 'comp
 /** What the preferences row records once a plan has been published from it. */
 const COMPLETED_SETUP_STATUS = 'completed';
 
-/** The noun a portion is counted in. Inflected by `utils/units.ts::pluralizeCount`. */
-const PORTION_NOUN = 'serving';
-
-const DAY_KEY_LENGTH = 10;
 
 /* ---------------------------------------------------------------------------
  * Stored columns and the two naming worlds
  *
- * The database is snake_case and the wire is camelCase; the translation happens
- * here and nowhere else in this module (Rule backend-architecture §6). Every
- * `jsonb` column arrives as `unknown` and is READ DEFENSIVELY — never asserted —
- * because a column is data to inspect, not a shape to assume.
+ * The database is snake_case and the wire is camelCase; that translation belongs
+ * to `mealPlan.mapper.ts` (Rule backend-architecture §6), which is also where
+ * the column readers this module still needs — `toDayKey`, `readStoredFlags`,
+ * `readMealSlot`, `readPlanStatus`, `readTargetsSnapshot` — are defined and
+ * imported from. What remains below is what only a WRITE needs: the day key on
+ * the way IN to a `@db.Date` column, the JSON cast a Prisma write demands, and
+ * the preference narrowings the generator reads. Every `jsonb` column arrives as
+ * `unknown` and is READ DEFENSIVELY — never asserted — because a column is data
+ * to inspect, not a shape to assume.
  * ------------------------------------------------------------------------- */
 
-/**
- * A stored column contradicting the response contract.
- *
- * Its own class rather than a bare `Error` so the message says which column of
- * which row could not be read, and deliberately NOT a member of
- * `mealPlanning.errors.ts`: that vocabulary exists for failures the CLIENT must
- * distinguish and act on, and there is no client action for "the plan row this
- * server wrote is not readable". It reaches the controller as a 500, exactly as
- * `grocery.service.ts`'s and `mealPlanningAction.service.ts`'s own invariant
- * faults do.
- */
-export class MealPlanDataError extends Error {
-    constructor(message: string) {
-        super(message);
-        this.name = 'MealPlanDataError';
-    }
-}
 
 /** A `YYYY-MM-DD` day key as the `@db.Date` column stores it: midnight UTC. */
 const toStoredDate = (dayKey: string): Date => new Date(`${dayKey}T00:00:00.000Z`);
 
-/**
- * A stored `@db.Date` as a day key, from its UTC components and nothing else.
- *
- * The repository's `toDayKey` convention, spelled the same way in
- * `nutrition.service.ts`, `preferences.service.ts` and `grocery.mapper.ts`: the
- * column holds a calendar day, Prisma returns it as midnight UTC, and reading
- * LOCAL components on a server west of UTC would move a plan's last day back by
- * one and end the week a day early. An unparseable value is named rather than
- * left to surface as `toISOString`'s bare `RangeError`.
- */
-const toDayKey = (date: Date, column: string, rowId: string): string => {
-    if (!Number.isFinite(date.getTime())) {
-        throw new MealPlanDataError(`${column} on row ${rowId} is not a valid date`);
-    }
-
-    return date.toISOString().slice(0, DAY_KEY_LENGTH);
-};
 
 /**
  * A value as a JSON column value.
@@ -252,22 +226,6 @@ const asJsonValue = (value: MealPlanMacroTotals): Prisma.InputJsonValue =>
 const asRecord = (value: unknown): Record<string, unknown> | null =>
     typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 
-/**
- * A membership test keyed off the DTO's own union, so it is exhaustive by
- * construction: widening `MealFlagCode` in `types/mealPlanning.ts` stops the
- * literal below compiling until the new code is handled. The construction
- * `recipe.mapper.ts` and `preferences.service.ts` both use, and for the same
- * stated reason — a hand-listed array of the same strings falls behind the
- * contract silently.
- */
-const MEAL_FLAG_CODES: Readonly<Record<MealFlagCode, true>> = {
-    diet: true,
-    allergen: true,
-    dislike: true,
-    cooking_time: true,
-};
-
-const PLAN_STATUSES: Readonly<Record<PlanStatus, true>> = { active: true, superseded: true };
 
 const DIETS: Readonly<Record<Diet, true>> = { none: true, vegetarian: true, vegan: true, pescatarian: true };
 
@@ -276,169 +234,6 @@ const MEAL_SCHEDULES: Readonly<Record<MealSchedule, true>> = { three: true, thre
 const asMember = <T extends string>(set: Readonly<Record<T, true>>, value: unknown): T | null =>
     typeof value === 'string' && Object.prototype.hasOwnProperty.call(set, value) ? (value as T) : null;
 
-/**
- * The stored `meal_plan_meals.flags` column as the DTO's flags.
- *
- * VALIDATED, never asserted, and defensive PER ENTRY: a malformed entry is
- * dropped rather than failing the whole read, because the alternative is a plan
- * screen that cannot load — and therefore cannot be used to fix anything. The
- * same reading `preferences.service.ts` applies where it writes the column, so
- * a flag written there round-trips through here unchanged.
- *
- * An array of `{code, detail}` objects rather than of bare codes, because
- * several details can share one code: two milk-bearing meals both flag
- * `allergen` with their own ingredient names.
- */
-const readStoredFlags = (stored: unknown): MealFlag[] => {
-    if (!Array.isArray(stored)) {
-        return [];
-    }
-
-    const flags: MealFlag[] = [];
-
-    for (const candidate of stored) {
-        const record = asRecord(candidate);
-
-        if (record === null) {
-            continue;
-        }
-
-        const code = asMember(MEAL_FLAG_CODES, record.code);
-
-        if (code === null) {
-            continue;
-        }
-
-        const detail = Array.isArray(record.detail)
-            ? record.detail.filter((entry): entry is string => typeof entry === 'string')
-            : [];
-
-        flags.push({ code, detail });
-    }
-
-    return flags;
-};
-
-/**
- * The stored `meal_plans.targets_snapshot` column as four macro values.
- *
- * THROWS rather than defaulting, and that is the right trade here even though
- * the flags above are read leniently. The two columns fail differently: a
- * missing flag understates an incompatibility the user can still see on the
- * meal itself, while a fabricated snapshot would report that the week was built
- * against zero calories — it would make `targetsStale` meaningless and caption a
- * plan with a target nobody ever set. The column is written by the insert below
- * from four confirmed positive numbers, so an unreadable value is a data fault
- * to surface and fix.
- */
-const readTargetsSnapshot = (stored: unknown, planId: string): MealPlanMacroTotals => {
-    const record = asRecord(stored);
-    const values = ['calories', 'protein', 'carbs', 'fat'].map((key) => record?.[key]);
-
-    if (!values.every((value): value is number => typeof value === 'number' && Number.isFinite(value))) {
-        throw new MealPlanDataError(
-            `meal_plans.targets_snapshot on plan ${planId} does not carry four finite macro values ` +
-                `(${JSON.stringify(stored)}); the plan it was built against cannot be reported without them`,
-        );
-    }
-
-    const [calories, protein, carbs, fat] = values;
-
-    return { calories, protein, carbs, fat };
-};
-
-/**
- * The stored `meal_plans.status` column as the DTO's two-value union.
- *
- * An unrecognised value is a fault rather than a default: the two statuses mean
- * "you may write to this" and "follow the replacement", and guessing either
- * would let a stale screen mutate a plan or send the user nowhere. Note that an
- * ENDED plan is `active` here by design — §0.5.1 keeps the column as it is and
- * makes endedness a RULE (`isPlanEnded`), which every write path applies.
- */
-const readPlanStatus = (stored: string, planId: string): PlanStatus => {
-    const status = asMember(PLAN_STATUSES, stored);
-
-    if (status === null) {
-        throw new MealPlanDataError(
-            `meal_plans.status on plan ${planId} is "${stored}", which is neither ` +
-                `"${ACTIVE_PLAN_STATUS}" nor "${SUPERSEDED_PLAN_STATUS}"`,
-        );
-    }
-
-    return status;
-};
-
-/**
- * The stored `meal_plan_meals.slot` column as the slot union.
- *
- * `recipe.logic.ts::isMealSlot` decides membership, so the vocabulary has one
- * owner. A meal whose slot is unreadable is a fault: the slot is what the
- * portion set, the eligibility clause and the day's ordering all turn on, so
- * reporting a guessed one would describe a meal that was never planned.
- */
-const readMealSlot = (stored: string, mealId: string): MealSlot => {
-    if (!isMealSlot(stored)) {
-        throw new MealPlanDataError(`meal_plan_meals.slot on meal ${mealId} is "${stored}", which is not a meal slot`);
-    }
-
-    return stored;
-};
-
-/**
- * The stored `meal_plan_meals.slot_time` column as an `HH:mm` clock time.
- *
- * `preferences.logic.ts::isClockTime` decides the format, so the one definition
- * the schedule parser enforces on the way in is the one applied on the way out.
- */
-const readSlotTime = (stored: string, mealId: string): string => {
-    if (!isClockTime(stored)) {
-        throw new MealPlanDataError(
-            `meal_plan_meals.slot_time on meal ${mealId} is "${stored}", which is not an HH:mm time`,
-        );
-    }
-
-    return stored;
-};
-
-/* ---------------------------------------------------------------------------
- * Portion text — ONE definition
- * ------------------------------------------------------------------------- */
-
-/**
- * A portion multiplier as the string the plan card and the swap preview render,
- * e.g. `'1 serving'`, `'½ serving'`, `'1¼ servings'`.
- *
- * THE ONE DEFINITION, exported for that reason: `MealPlanMealResponse.portionText`
- * and `SwapPreviewAlternative.portionText` describe the same quantity, and the
- * preview a user approves must read exactly as the meal they end up with. A
- * second spelling in `swap.service.ts` is how the two come to disagree over
- * three quarters of a serving.
- *
- * The glyph comes from `utils/units.ts::formatQuarters` — the same renderer the
- * grocery list uses for cups and tablespoons — because every allowed multiplier
- * (`{0.5, 0.75, 1, 1.25, 1.5, 1.75, 2}`, snacks `{0.5 … 1.5}`) is an exact
- * quarter, so nothing is rounded away. The noun is inflected by that module's
- * `pluralizeCount`, so "serving" has one plural in the codebase.
- *
- * Singular AT OR BELOW one and plural above it: "½ serving" is the English a
- * reader expects, while `pluralizeCount`'s own numeric rule (plural for
- * anything but exactly one) would render "½ servings". The count handed to it is
- * therefore the INFLECTION, not the quantity — the quantity is already in the
- * glyph.
- */
-export const formatPortionText = (portionMultiplier: number): string => {
-    if (!Number.isFinite(portionMultiplier) || portionMultiplier <= 0) {
-        throw new MealPlanDataError(
-            `portion_multiplier must be a finite number greater than 0 to render, received ` +
-                `${String(portionMultiplier)}`,
-        );
-    }
-
-    const noun = pluralizeCount(portionMultiplier > 1 ? 2 : 1, PORTION_NOUN);
-
-    return `${formatQuarters(portionMultiplier)} ${noun}`;
-};
 
 /* ---------------------------------------------------------------------------
  * Row projections
@@ -463,9 +258,6 @@ const PLAN_MEAL_INCLUDE = {
     previous_recipe_versions: { select: { id: true, name: true } },
 } satisfies Prisma.meal_plan_mealsInclude;
 
-/** One planned meal with its joins, as the reads below return it. */
-type PlanMealRow = Prisma.meal_plan_mealsGetPayload<{ include: typeof PLAN_MEAL_INCLUDE }>;
-
 /** Meals of one day in the order the day is READ: the clock order generation stored. */
 const PLAN_MEAL_ORDER: Prisma.meal_plan_mealsOrderByWithRelationInput[] = [{ sort_order: 'asc' }, { id: 'asc' }];
 
@@ -473,8 +265,6 @@ const PLAN_MEAL_ORDER: Prisma.meal_plan_mealsOrderByWithRelationInput[] = [{ sor
 const PLAN_DAY_INCLUDE = {
     meal_plan_meals: { include: PLAN_MEAL_INCLUDE, orderBy: PLAN_MEAL_ORDER },
 } satisfies Prisma.meal_plan_daysInclude;
-
-type PlanDayRow = Prisma.meal_plan_daysGetPayload<{ include: typeof PLAN_DAY_INCLUDE }>;
 
 /**
  * One day with its meals AND its plan's end date.
@@ -594,80 +384,6 @@ export const loadLoggedEntriesForMeals = async (
     return byMealId;
 };
 
-/* ---------------------------------------------------------------------------
- * The DTO boundary — one row shape, one mapper (Rule §6)
- * ------------------------------------------------------------------------- */
-
-/** The recipe this slot held before its last swap, or null when it was never swapped. */
-const mapPreviousRecipe = (row: PlanMealRow): PreviousRecipeSummary | null =>
-    row.previous_recipe_versions === null
-        ? null
-        : { versionId: row.previous_recipe_versions.id, name: row.previous_recipe_versions.name };
-
-/**
- * One `meal_plan_meals` row as the wire shape.
- *
- * `planned` carries the stored `planned_*` columns UNROUNDED, which is what
- * keeps a day's total equal to the sum of its meals: the columns hold full
- * precision by design (`mealPlan.logic.ts::computeDayTotals` sums them the same
- * way), and rounding each meal here before the client added them up would drift
- * the card away from the day.
- */
-const mapPlanMeal = (row: PlanMealRow, loggedEntries: readonly LoggedPlannedEntry[]): MealPlanMealResponse => ({
-    id: row.id,
-    revision: row.revision,
-    slot: readMealSlot(row.slot, row.id),
-    slotTime: readSlotTime(row.slot_time, row.id),
-    sortOrder: row.sort_order,
-    recipe: mapPlannedRecipeSummary(row.recipe_versions),
-    portionMultiplier: row.portion_multiplier,
-    portionText: formatPortionText(row.portion_multiplier),
-    planned: {
-        calories: row.planned_calories,
-        protein: row.planned_protein_g,
-        carbs: row.planned_carbs_g,
-        fat: row.planned_fat_g,
-    },
-    flags: readStoredFlags(row.flags),
-    loggedEntries: [...loggedEntries],
-    previousRecipe: mapPreviousRecipe(row),
-});
-
-/**
- * One `meal_plan_days` row as the wire shape.
- *
- * `plannedTotals` comes from the STORED `planned_*` columns rather than from
- * re-summing the meals. The two agree — generation writes the sum and a swap
- * rewrites it in the same transaction that rewrites the meal — and reading the
- * column is what makes that agreement checkable: a day whose stored total had
- * drifted would be visible, where a re-sum would silently paper over it.
- *
- * `isLastDay` is `date === endDate`, the plan's seventh day, which is where the
- * client offers the next week. Derived from the plan's own end date rather than
- * from `day_index === 6`, so a day that was stored with a wrong index cannot
- * move the offer to the wrong card.
- */
-const mapPlanDay = (
-    row: PlanDayRow,
-    endDate: string,
-    loggedByMealId: ReadonlyMap<string, LoggedPlannedEntry[]>,
-): MealPlanDayResponse => {
-    const date = toDayKey(row.date, 'meal_plan_days.date', row.id);
-
-    return {
-        id: row.id,
-        date,
-        dayIndex: row.day_index,
-        plannedTotals: {
-            calories: row.planned_calories,
-            protein: row.planned_protein_g,
-            carbs: row.planned_carbs_g,
-            fat: row.planned_fat_g,
-        },
-        isLastDay: date === endDate,
-        meals: row.meal_plan_meals.map((meal) => mapPlanMeal(meal, loggedByMealId.get(meal.id) ?? [])),
-    };
-};
 
 /* ---------------------------------------------------------------------------
  * The three composed reads every caller shares
@@ -703,7 +419,7 @@ export const loadMealPlanMealResponse = async (
 
     const logged = await loadLoggedEntriesForMeals(db, userId, [meal.id]);
 
-    return mapPlanMeal(meal, logged.get(meal.id) ?? []);
+    return toMealPlanMealResponse(meal, meal.recipe_versions, logged.get(meal.id) ?? []);
 };
 
 /**
@@ -736,7 +452,10 @@ export const loadMealPlanDayResponse = async (
         day.meal_plan_meals.map((meal) => meal.id),
     );
 
-    return mapPlanDay(day, toDayKey(day.meal_plans.end_date, 'meal_plans.end_date', day.meal_plans.id), logged);
+    return toMealPlanDayResponse(day, day.meal_plan_meals, {
+        endDate: toDayKey(day.meal_plans.end_date, 'meal_plans.end_date', day.meal_plans.id),
+        loggedByMealId: logged,
+    });
 };
 
 /**
@@ -772,26 +491,22 @@ const loadPlanSummary = async (
     return { plannedMeals, groceryItemCount, loggedEntryCount };
 };
 
-/** Whether two target sets are the same four numbers. */
-const sameTotals = (left: MealPlanMacroTotals, right: MealPlanMacroTotals): boolean =>
-    left.calories === right.calories &&
-    left.protein === right.protein &&
-    left.carbs === right.carbs &&
-    left.fat === right.fat;
 
 /**
  * The targets a plan response reports, and whether they have moved since it was
  * built.
  *
- * `targets` is the user's CURRENT confirmed targets — the same values Account,
+ * The result is the user's CURRENT confirmed targets — the same values Account,
  * Progress and the diary show — read through `targets.service.ts::getTargets` so
- * there is one canonical target read in the product. `generationTargets` is the
- * snapshot the week was actually searched against, and `targetsStale` is simply
- * their inequality; nothing regenerates on its own, the client captions it.
+ * there is one canonical target read in the product. The comparison against the
+ * plan's own snapshot is NOT made here: `mealPlan.mapper.ts` derives
+ * `targetsStale` from these values and `targets_snapshot`, so the inequality has
+ * one definition beside the two fields it explains.
  *
  * THE FALLBACK IS FOR AN INCOMPLETE CURRENT READ ONLY. When the stored targets
  * are not all four present the plan reports its snapshot as its current targets,
- * which keeps `targetsStale` false and the card truthful: the alternative is
+ * which keeps the derived `targetsStale` false and the card truthful: the
+ * alternative is
  * showing a plan against `null` calories, and a plan that EXISTS was necessarily
  * built against four confirmed values. A `legacy` source is deliberately NOT
  * treated as incomplete — those four values are what the user's other surfaces
@@ -803,7 +518,7 @@ const resolvePlanTargets = async (
     db: Prisma.TransactionClient,
     userId: string,
     generationTargets: MealPlanMacroTotals,
-): Promise<{ targets: MealPlanMacroTotals; targetsStale: boolean }> => {
+): Promise<MealPlanMacroTotals> => {
     const stored = await getTargets(userId, db);
     const values = stored.targets;
 
@@ -815,17 +530,15 @@ const resolvePlanTargets = async (
         values.carbs === null ||
         values.fat === null
     ) {
-        return { targets: generationTargets, targetsStale: false };
+        return generationTargets;
     }
 
-    const targets: MealPlanMacroTotals = {
+    return {
         calories: values.calories,
         protein: values.protein,
         carbs: values.carbs,
         fat: values.fat,
     };
-
-    return { targets, targetsStale: !sameTotals(targets, generationTargets) };
 };
 
 /**
@@ -859,9 +572,7 @@ export const loadPlanTargets = async (
         throw new PlanNotFoundError();
     }
 
-    const { targets } = await resolvePlanTargets(db, userId, readTargetsSnapshot(plan.targets_snapshot, plan.id));
-
-    return targets;
+    return resolvePlanTargets(db, userId, readTargetsSnapshot(plan.targets_snapshot, plan.id));
 };
 
 /**
@@ -871,14 +582,18 @@ export const loadPlanTargets = async (
  * must be indistinguishable, and the caller decides whether that is a 404 or
  * (for `plans/current`) simply an absent member (§8).
  *
- * `hasIncompatibilities` is ANY meal carrying a flag, derived from the meals
- * already loaded. `meal_plans.incompatibility_flags` is the audit record
- * `preferences.service.ts` writes and is never read as authority here — two
- * sources for one fact is how a banner outlives the meal that caused it.
+ * THE THREE READS THIS COMPOSES ARE THE THREE A MAPPER CANNOT DO: the plan's
+ * own row, its days with their meals, and the diary entries linked to those
+ * meals. `mealPlan.mapper.ts::toMealPlanResponse` shapes all of it, including
+ * `hasIncompatibilities` and `targetsStale`, so no field is spelled out here.
  *
- * Days come back in `date` order and their meals in `sort_order` (clock) order,
- * which is the order the day is read; the search's own slot order is a detail of
- * generation and is not re-derivable from — or needed by — a read.
+ * The two values the mapper is HANDED are the two it could not derive: the
+ * user's current confirmed targets (a `targets.service.ts` read) and the summary
+ * counts (two of the three live in other tables).
+ *
+ * Days are queried in `date` order and their meals in `sort_order`; the mapper
+ * re-establishes both orderings from the rows themselves, so the response's
+ * order is a property of the contract rather than of this query.
  */
 export const loadMealPlanResponse = async (
     db: Prisma.TransactionClient,
@@ -903,30 +618,11 @@ export const loadMealPlanResponse = async (
         days.flatMap((day) => day.meal_plan_meals.map((meal) => meal.id)),
     );
 
-    const generationTargets = readTargetsSnapshot(plan.targets_snapshot, plan.id);
-    const { targets, targetsStale } = await resolvePlanTargets(db, userId, generationTargets);
-    const endDate = toDayKey(plan.end_date, 'meal_plans.end_date', plan.id);
-    // Mapped once and then read for `hasIncompatibilities`, so the banner turns
-    // on exactly the flags the response carries rather than on a second reading
-    // of the same column.
-    const dayResponses = days.map((day) => mapPlanDay(day, endDate, logged));
-
-    return {
-        id: plan.id,
-        revision: plan.revision,
-        generationAttempt: plan.generation_attempt,
-        startDate: toDayKey(plan.start_date, 'meal_plans.start_date', plan.id),
-        endDate,
-        status: readPlanStatus(plan.status, plan.id),
-        targets,
-        generationTargets,
-        targetsStale,
-        preferencesRevision: plan.preferences_revision,
-        targetsRevision: plan.targets_revision,
-        hasIncompatibilities: dayResponses.some((day) => day.meals.some((meal) => meal.flags.length > 0)),
+    return toMealPlanResponse(plan, days, {
+        targets: await resolvePlanTargets(db, userId, readTargetsSnapshot(plan.targets_snapshot, plan.id)),
         summary: await loadPlanSummary(db, userId, planId),
-        days: dayResponses,
-    };
+        loggedByMealId: logged,
+    });
 };
 
 /* ---------------------------------------------------------------------------
@@ -1595,7 +1291,7 @@ const requirePinnedInputs = async (
     // one of those two mechanisms has been broken by a later change, and
     // `targets_unconfirmed` is the honest answer: these numbers are no longer
     // ones this feature can attest to.
-    if (!sameTotals(targets, candidate.targets)) {
+    if (!sameMacroTotals(targets, candidate.targets)) {
         throw new TargetsUnconfirmedError();
     }
 };

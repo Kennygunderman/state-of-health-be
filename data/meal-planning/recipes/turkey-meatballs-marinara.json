@@ -1,0 +1,103 @@
+{
+  "slug": "turkey-meatballs-marinara",
+  "name": "Turkey meatballs in marinara",
+  "description": "Lean turkey meatballs bound with rolled oats and grated onion, browned and then simmered in a garlicky fresh tomato sauce with torn basil.",
+  "iconKey": "dome",
+  "instructions": [
+    "Grate the onion on the coarse side of a box grater, then work it into the ground turkey breast with the rolled oats and black pepper until the mixture holds its shape.",
+    "Roll the mixture into 16 even meatballs.",
+    "Warm the olive oil in a wide pan over medium-high heat, then brown the meatballs on all sides, about 6 minutes in total.",
+    "Lift the meatballs onto a plate, add the sliced garlic to the pan for 1 minute, then add the chopped tomato and simmer until it collapses into a thick sauce, about 10 minutes.",
+    "Nestle the meatballs back into the sauce, cover the pan, and simmer for 13 minutes, until they are cooked through and firm.",
+    "Tear the fresh basil over the pan and serve the meatballs in the sauce."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "4 meatballs with sauce",
+  "prepMinutes": 15,
+  "cookMinutes": 30,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171098",
+      "quantity": 20,
+      "unit": "oz",
+      "gramWeight": 565,
+      "displayText": "20 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 40.5,
+      "displayText": "½ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "¾ cup, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 4,
+      "unit": "clove",
+      "gramWeight": 12,
+      "displayText": "4 cloves",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 6,
+      "unit": "each",
+      "gramWeight": 738,
+      "displayText": "6 medium",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 27,
+      "displayText": "2 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 10,
+      "unit": "g",
+      "gramWeight": 10,
+      "displayText": "10 g",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.3,
+      "displayText": "1 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

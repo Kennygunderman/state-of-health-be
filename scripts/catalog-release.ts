@@ -473,6 +473,33 @@ export interface ReleaseOutcome {
 /** `null` rather than an omitted key: the release's readers expect the field. */
 const orNull = <T>(value: T | undefined): T | null => (value === undefined ? null : value);
 
+/** A check's name, or `''` for a payload that is not a named check. */
+const checkName = (check: unknown): string =>
+    typeof check === 'object' && check !== null && typeof (check as { name?: unknown }).name === 'string'
+        ? (check as { name: string }).name
+        : '';
+
+/**
+ * `checks` in the release's stated order: by check name, ascending.
+ *
+ * Validation writes them in evaluation order — reject tier, then quarantine,
+ * then review — which is stable but is not the order the release format states.
+ * Sorting happens here, beside the `aliases` sort and for the same reason: the
+ * release has to be byte-reproducible, so the ordering belongs to the export
+ * rather than to the stored row, and the evaluation order the validator wrote
+ * is left undisturbed. Comparison is by code point, not `localeCompare`, so the
+ * bytes do not depend on the exporting machine's locale. A payload that is not
+ * an array is passed through untouched rather than reshaped into one.
+ */
+const toReleaseChecks = (checks: unknown): unknown =>
+    Array.isArray(checks)
+        ? checks.slice().sort((left, right) => {
+              const leftName = checkName(left);
+              const rightName = checkName(right);
+              return leftName < rightName ? -1 : leftName > rightName ? 1 : 0;
+          })
+        : checks;
+
 /**
  * One `foods.jsonl` line. The key order is the reviewed release's own, so a
  * regenerated file diffs against its predecessor line by line rather than
@@ -561,7 +588,7 @@ export const toReleaseValidationLine = (row: ReleaseFoodRow): Record<string, unk
         nutrition_assumptions: assumptions,
         portion_units: record.portion_units,
         identity_evidence: record.identity_evidence,
-        checks: record.checks,
+        checks: toReleaseChecks(record.checks),
         llm_review: orNull(record.llm_review) ?? null,
         outcome: record.outcome,
         reviewed_at: record.reviewed_at.toISOString(),

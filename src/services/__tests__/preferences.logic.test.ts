@@ -66,8 +66,8 @@ import {
     PREFERENCE_FLAG_CODES,
     RecipeIngredientIdentity,
 } from '../recipe.logic';
-import { ESTIMATE_INPUT_RANGES } from '../targets.logic';
 import { InvalidRequestDetail, MealFlagCode, SetupStatus, SetupStep } from '../../types/mealPlanning';
+import coveragePlan from '../../../data/meal-planning/coverage-plan.v1.json';
 
 /* ---------------------------------------------------------------------------
  * Helpers
@@ -84,6 +84,24 @@ const UUIDS = [
 
 const uuidAt = (index: number): string =>
     `${index.toString(16).padStart(8, '0')}-1111-4222-8333-444444444444`;
+
+/**
+ * The shipped controlled `food_group` vocabulary, read from the committed
+ * coverage plan through the shape these tests need.
+ *
+ * The literal fixtures below name four groups; this is the real 123, so the
+ * blast-radius rule is checked against the vocabulary the catalog is actually
+ * loaded with rather than against a convenient sample of it.
+ */
+interface CoverageFoodGroup {
+    foodGroup: string;
+    category: string;
+    isCommonDislikeGroup: boolean;
+}
+
+const SHIPPED_FOOD_GROUPS: readonly CoverageFoodGroup[] = coveragePlan.foodGroups;
+
+const SHIPPED_GROUP_NAMES: readonly string[] = SHIPPED_FOOD_GROUPS.map((entry) => entry.foodGroup);
 
 /** Every refusal carries details; this is the shorthand the assertions read through. */
 interface MaybeRefusal {
@@ -348,7 +366,10 @@ describe('isClockTime', () => {
     it.each([
         ['24:00', 'midnight spelled as the 24th hour is not a time of day'],
         ['23:60', 'minute 60'],
+        ['08:60', 'minute 60 again, because the bound is 59 at every hour and not only at 23'],
         ['9:05', 'the contract declares HH:mm, so the short form is a second spelling'],
+        ['8:00', 'the schedule screen\u2019s own default hour, unpadded'],
+        ['8:00 AM', 'the 12-hour spelling the screen renders, which is display and not storage'],
         ['08:0', 'an unpadded minute'],
         ['8am', 'a label rather than a time'],
         ['', 'the empty string'],
@@ -384,9 +405,18 @@ describe('normalizeTimeZone', () => {
         expect(normalizeTimeZone('  Europe/Berlin  ')).toBe('Europe/Berlin');
     });
 
-    it('refuses an unknown zone through the RangeError rather than a maintained list', () => {
-        expect(normalizeTimeZone('Not/AZone')).toBeNull();
-        expect(normalizeTimeZone('America/Atlantis')).toBeNull();
+    it.each(['Not/AZone', 'America/Atlantis', 'America/Nowhere', 'Mars/Olympus'])(
+        'refuses the unknown zone %s through the RangeError rather than a maintained list',
+        (name) => {
+            // The verdict asserted is the module's own null, not the RangeError:
+            // the throw is the detection mechanism, and callers read the null.
+            expect(normalizeTimeZone(name)).toBeNull();
+        },
+    );
+
+    it('returns the same answer for the same name however often it is asked', () => {
+        expect(normalizeTimeZone('Pacific/Auckland')).toBe(normalizeTimeZone('Pacific/Auckland'));
+        expect(normalizeTimeZone('Mars/Olympus')).toBe(normalizeTimeZone('Mars/Olympus'));
     });
 
     it.each([undefined, null, 0, {}, '', '   '])('refuses %p', (value) => {
@@ -608,8 +638,15 @@ describe('normalizeToMetric', () => {
         expect(fieldsOf(verdict).sort()).toEqual(['age', 'heightCm', 'weightKg']);
     });
 
-    it('agrees with the envelope targets.logic refuses to estimate outside of', () => {
-        expect(BODY_INPUT_RANGES).toEqual(ESTIMATE_INPUT_RANGES);
+    it('holds the mandated adult envelope, the same one an estimate refuses to work outside of', () => {
+        // The bounds are asserted as literals rather than against another
+        // module's constant, so a drift shows up here instead of two modules
+        // drifting together and staying equal.
+        expect(BODY_INPUT_RANGES).toEqual({
+            age: { min: 18, max: 100 },
+            heightCm: { min: 120, max: 250 },
+            weightKg: { min: 30, max: 300 },
+        });
     });
 });
 
@@ -754,6 +791,11 @@ describe('validateMealTimes', () => {
         });
     });
 
+    // Storage does not require sorted times: the plan day sorts its meals by time
+    // at render, so the snack's 15:30 default lands between lunch and dinner on
+    // screen while the payload keeps the wire order breakfast, lunch, dinner,
+    // snack. A check that insisted the times ascend would reject the schedule
+    // screen's own defaults.
     it('ACCEPTS a snack at 15:30 sitting between lunch and dinner — the screen\u2019s own default', () => {
         const verdict = validateMealTimes('three_plus_snack', [
             { slot: 'breakfast', time: '08:00' },
@@ -785,6 +827,27 @@ describe('validateMealTimes', () => {
         const verdict = validateMealTimes('three', [...threeTimes, { slot: 'snack', time: '15:30' }]);
 
         expect(codesFor(verdict, 'mealTimes')).toEqual([PREFERENCE_FIELD_CODES.SLOT_MISMATCH]);
+    });
+
+    it('refuses a repeated slot, which would leave one meal of the day with no time', () => {
+        const verdict = validateMealTimes('three', [
+            { slot: 'breakfast', time: '08:00' },
+            { slot: 'breakfast', time: '09:00' },
+            { slot: 'dinner', time: '18:30' },
+        ]);
+
+        expect(codesFor(verdict, 'mealTimes[1].slot')).toEqual([PREFERENCE_FIELD_CODES.SLOT_MISMATCH]);
+        expect(fieldsOf(verdict)).toEqual(['mealTimes[1].slot']);
+    });
+
+    it('refuses a missing slot even when the count is right', () => {
+        const verdict = validateMealTimes('three', [
+            { slot: 'breakfast', time: '08:00' },
+            { slot: 'snack', time: '15:30' },
+            { slot: 'dinner', time: '18:30' },
+        ]);
+
+        expect(codesFor(verdict, 'mealTimes[1].slot')).toEqual([PREFERENCE_FIELD_CODES.SLOT_MISMATCH]);
     });
 
     it('refuses entries that are out of wire order', () => {
@@ -863,6 +926,14 @@ describe('deriveBudgetTier', () => {
         expect(deriveBudgetTier(83, 4)).toBe(1);
     });
 
+    it('applies BOTH thresholds through the four-meal divisor, not only the first', () => {
+        // 28 meals a week rather than 21, so the same tier boundaries land on
+        // different weekly amounts: hard-coding 21 meals would put a 168-dollar
+        // four-meal week in tier 3 and penalise a budget that is in fact ample.
+        expect(deriveBudgetTier(BUDGET_PER_MEAL_THRESHOLDS.tier2Max * 4 * 7, 4)).toBe(2);
+        expect(deriveBudgetTier(BUDGET_PER_MEAL_THRESHOLDS.tier2Max * 4 * 7 + 1, 4)).toBe(3);
+    });
+
     it('answers tier 3 — no penalty — for "no budget preference"', () => {
         expect(deriveBudgetTier(null, 3)).toBe(3);
         expect(deriveBudgetTier(null, 4)).toBe(3);
@@ -934,7 +1005,7 @@ describe('parseBudgetAnswer', () => {
             [0, PREFERENCE_FIELD_CODES.BELOW_MINIMUM],
             [BUDGET_AMOUNT_RANGE.max + 1, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
             [10_001, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
-            [12.5, PREFERENCE_FIELD_CODES.NOT_AN_INTEGER],
+            [50.5, PREFERENCE_FIELD_CODES.NOT_AN_INTEGER],
             ['120', PREFERENCE_FIELD_CODES.INVALID_TYPE],
             [undefined, PREFERENCE_FIELD_CODES.REQUIRED],
         ])('reports the amount %p as %s', (amount, code) => {
@@ -1198,6 +1269,55 @@ describe('deriveDislikedFoodGroups', () => {
             unrecognizedFoodGroups: [],
         });
     });
+
+    describe('against the shipped food-group vocabulary', () => {
+        const [COMMON_DISLIKE_GROUP] = SHIPPED_FOOD_GROUPS.filter(
+            (entry) => entry.isCommonDislikeGroup,
+        );
+
+        it('keeps every declared group distinct under the spelling rule the derivation applies', () => {
+            // Asserted THROUGH the function, because the folding it compares by
+            // is module-private: one food per declared group must produce one
+            // group per food. Two names that folded together — 'tree_nuts' and
+            // 'Tree nuts' say — would collapse into a single entry here, and a
+            // dislike of one would silently exclude the other.
+            const oneFoodPerGroup = SHIPPED_FOOD_GROUPS.map((entry, index) => ({
+                id: uuidAt(index),
+                food_group: entry.foodGroup,
+            }));
+
+            const derivation = deriveDislikedFoodGroups(
+                oneFoodPerGroup.map((food) => food.id),
+                { foods: oneFoodPerGroup, knownFoodGroups: SHIPPED_GROUP_NAMES },
+            );
+
+            expect(SHIPPED_GROUP_NAMES).toHaveLength(coveragePlan.foodGroupCount);
+            expect(derivation.foodGroups).toHaveLength(coveragePlan.foodGroupCount);
+            expect(derivation.unrecognizedFoodGroups).toEqual([]);
+        });
+
+        it('excludes one suggested group and leaves the other 122 untouched', () => {
+            const derivation = deriveDislikedFoodGroups([UUIDS[0]], {
+                foods: [{ id: UUIDS[0], food_group: COMMON_DISLIKE_GROUP.foodGroup }],
+                knownFoodGroups: SHIPPED_GROUP_NAMES,
+            });
+
+            expect(SHIPPED_GROUP_NAMES).toContain(COMMON_DISLIKE_GROUP.foodGroup);
+            expect(derivation.foodGroups).toEqual([COMMON_DISLIKE_GROUP.foodGroup]);
+            expect(derivation.unrecognizedFoodGroups).toEqual([]);
+        });
+
+        it('reports a catalog group the shipped plan never declared', () => {
+            const derivation = deriveDislikedFoodGroups([UUIDS[0]], {
+                foods: [{ id: UUIDS[0], food_group: 'sea_vegetable' }],
+                knownFoodGroups: SHIPPED_GROUP_NAMES,
+            });
+
+            expect(SHIPPED_GROUP_NAMES).not.toContain('sea_vegetable');
+            expect(derivation.foodGroups).toEqual(['sea_vegetable']);
+            expect(derivation.unrecognizedFoodGroups).toEqual(['sea_vegetable']);
+        });
+    });
 });
 
 /* ---------------------------------------------------------------------------
@@ -1299,8 +1419,8 @@ describe('parseSetupStep', () => {
         );
 
         it('refuses an unknown key, which is how a misspelled answer is caught', () => {
-            // Ignoring it would drop the answer and return 200, and the screen
-            // would read its own saved value back as unanswered.
+            // Ignoring it would drop the answer while the save still succeeded,
+            // and the screen would read its own saved value back as unanswered.
             const verdict = parseSetupStep(
                 'activity',
                 { timeZone: ZONE, activityLevl: 'active', expectedRevision: 3 },
@@ -1493,7 +1613,7 @@ describe('parseSetupStep', () => {
             [Number.MAX_SAFE_INTEGER, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
             [Number.MAX_SAFE_INTEGER + 2, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
             [MAX_REVISION + 1, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
-        ])('reports the malformed revision %p as a 400 detail (%s)', (expectedRevision, code) => {
+        ])('reports the malformed revision %p as a field detail (%s)', (expectedRevision, code) => {
             const verdict = parseSetupStep(
                 'goal',
                 goalBody({ expectedRevision }),
@@ -1553,7 +1673,9 @@ describe('parseSetupStep', () => {
             expect(parseSetupStep('goal', goalBody({ paceLbPerWeek }), stepContext()).kind).toBe('ok');
         });
 
-        it.each([2, 0, 1.25, '1'])('refuses the pace %p', (paceLbPerWeek) => {
+        // 0.75 and 1.25 fall BETWEEN the accepted paces, which is what proves the
+        // three are a closed set rather than a range with a step this loose.
+        it.each([0.75, 1.25, 2, 0, '1'])('refuses the pace %p', (paceLbPerWeek) => {
             expect(codesFor(parseSetupStep('goal', goalBody({ paceLbPerWeek }), stepContext()), 'paceLbPerWeek')).toEqual(
                 [PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
             );
@@ -1742,9 +1864,8 @@ describe('parseSetupStep', () => {
             // union, so "the step's own keys" is not one set but two. Skip
             // declares the discriminant and nothing else, and the parser returns
             // the moment it sees it — so measurements sent alongside Skip would
-            // be accepted under a 200 and then dropped, which is a client that
-            // filled the form, tapped Skip, and read its own values back as
-            // unanswered.
+            // be accepted and then dropped, which is a client that filled the
+            // form, tapped Skip, and read its own values back as unanswered.
             const MEASURED_KEYS = [
                 'age',
                 'heightCm',
@@ -1774,7 +1895,7 @@ describe('parseSetupStep', () => {
                 expect(codesFor(verdict, key)).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
             });
 
-            it('never silently drops a supplied value: the refusal replaces the 200', () => {
+            it('never silently drops a supplied value: the refusal replaces the acceptance', () => {
                 // The precise failure this closes — the verdict used to be
                 // accepted and carry only the envelope and the discriminant.
                 const verdict = saveStep('body', bodyPayload({ skipped: true }));
@@ -2191,11 +2312,20 @@ describe('parsePreferencesUpdate', () => {
             },
         );
 
-        it.each(['nickname', 'userId', 'allergen'])('refuses the unknown key %s', (key) => {
-            const verdict = parsePreferencesUpdate({ [key]: 'x', expectedRevision: 4 }, updateContext());
+        // 'allergen' and 'activityLevell' are near misses of real keys: the set is
+        // CLOSED, so a mistyped key is refused rather than filtered out, and the
+        // client learns its edit did not land instead of reading the old value back.
+        it.each(['nickname', 'userId', 'allergen', 'activityLevell'])(
+            'refuses the unknown key %s',
+            (key) => {
+                const verdict = parsePreferencesUpdate(
+                    { [key]: 'x', expectedRevision: 4 },
+                    updateContext(),
+                );
 
-            expect(codesFor(verdict, key)).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
-        });
+                expect(codesFor(verdict, key)).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+            },
+        );
 
         it('names every offending key at once', () => {
             const verdict = parsePreferencesUpdate(
@@ -2227,7 +2357,7 @@ describe('parsePreferencesUpdate', () => {
             });
         });
 
-        it('reports a malformed revision as a 400', () => {
+        it('reports a malformed revision as a field detail, not as a lost race', () => {
             const verdict = parsePreferencesUpdate({ diet: 'vegan', expectedRevision: '4' }, updateContext());
 
             expect(codesFor(verdict, 'expectedRevision')).toEqual([PREFERENCE_FIELD_CODES.INVALID_TYPE]);
@@ -2258,7 +2388,7 @@ describe('parsePreferencesUpdate', () => {
             ).toMatchObject({ kind: 'stale_revision', currentRevision: NO_PREFERENCES_REVISION });
         });
 
-        it('still reports field problems before the missing row, because a 400 is the fixable answer', () => {
+        it('still reports field problems before the missing row, because a field error is fixable', () => {
             const verdict = parsePreferencesUpdate(
                 { diet: 'keto', expectedRevision: NO_PREFERENCES_REVISION },
                 updateContext({ currentRevision: null }),
@@ -2710,6 +2840,26 @@ describe('parsePreferencesUpdate', () => {
             );
 
             expect(codesFor(verdict, 'budget')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+        });
+
+        it('lets a stored amount stand in when no preference is switched off without one', () => {
+            // The other half of the rule above: unchecking the box is an answer of
+            // "an amount", and the amount the row already holds is that answer —
+            // so the settings screen does not have to re-send a figure the user
+            // never edited.
+            const verdict = parsePreferencesUpdate(
+                { noBudgetPreference: false, expectedRevision: 4 },
+                updateContext({
+                    currentBudget: { amount: 120, currency: 'USD' },
+                    currentNoBudgetPreference: true,
+                }),
+            );
+
+            expect(payloadOf(verdict)).toEqual({
+                budget: { amount: 120, currency: BUDGET_CURRENCY },
+                noBudgetPreference: false,
+                expectedRevision: 4,
+            });
         });
 
         it('accepts an amount against a stored "no preference" of false', () => {
@@ -3450,6 +3600,21 @@ describe('nextSetupState', () => {
                 }
             },
         );
+    });
+
+    it('never awards completed itself, which only a published plan earns', () => {
+        // `completed` is set where the plan is published, in `mealPlan.service.ts`;
+        // this module can only carry a status that is already there. A step save
+        // that promoted it would mark setup finished for a user who has no plan.
+        for (const route of ['estimated', 'manual'] as const) {
+            for (const step of routeStepOrder(route)) {
+                for (const setupStatus of ['not_started', 'in_progress', 'ready_for_review'] as const) {
+                    const state = reached(setupStatus, 'review', route, { answers: allAnswers() });
+
+                    expect(nextSetupState(state, step, null).setupStatus).not.toBe('completed');
+                }
+            }
+        }
     });
 
     it('never regresses the status for any route and step combination', () => {
