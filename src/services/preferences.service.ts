@@ -48,6 +48,7 @@ import {
     TargetRoute,
     WeightUnitPref,
 } from '../types/mealPlanning';
+import { StaleRevisionError } from './mealPlanning.errors';
 import { withUserLock } from './mealPlanningAction.service';
 import {
     BUDGET_CURRENCY,
@@ -876,26 +877,62 @@ export const recomputeActivePlanFlags = async (
     return flaggedMealCount;
 };
 
-
 /* ---------------------------------------------------------------------------
  * The write side — one transaction, lock first
  *
- * WHY BOTH SAVES RETURN A UNION INSTEAD OF THROWING A REFUSAL. The pure parsers
- * answer with a verdict rather than an exception — that is their own stated
- * convention, and it is what makes them testable without try/catch — and there
- * is deliberately no `InvalidRequestError` class in the shared vocabulary
- * (`mealPlanning.errors.ts`: "Field-level validation has no class at all").
- * Returning the verdict unchanged therefore keeps ONE representation of a
- * refusal from the parser to the controller, which maps `invalid_request` to
- * 400 and `stale_revision` to 409. It also matters for the stale case
- * specifically: a returned verdict carries the authoritative revision without
- * this file constructing `StaleRevisionError`, whose two-counter payload
- * belongs to the plan routes and is being reshaped by another unit at this
- * checkpoint.
+ * A REFUSAL LEAVES THIS FILE IN ONE OF TWO WAYS, and the split is the
+ * difference between "fix these fields" and "you are writing against a row that
+ * has moved". Neither way picks a status code: each carries the data the client
+ * acts on and the controller maps it (Rule backend-architecture §8).
+ *
+ *  * A FIELD-LEVEL REFUSAL IS RETURNED, carrying every offending field.
+ *    `parseSetupStep` and `parsePreferencesUpdate` accumulate one
+ *    `InvalidRequestDetail` per problem — including one `read_only_field` entry
+ *    per server-owned or unknown key — and answer with the whole list, which is
+ *    precisely the `400 invalid_request` body with `details: [{field, code}]`
+ *    the contract declares and the wizard needs in order to mark every bad
+ *    input at once. An exception can carry one field, so throwing would discard
+ *    the rest and cost a client three round trips to learn what it sent wrong;
+ *    `mealPlanning.errors.ts` states the same conclusion from the other side
+ *    ("Field-level validation has no class at all"), and `ReadOnlyFieldError`
+ *    remains available to a caller that genuinely has a single field to report.
+ *  * A STALE REVISION IS THROWN as `StaleRevisionError`, in the one-counter
+ *    form the preference routes own (`StaleRevisionCounterErrorData`); the
+ *    two-counter form belongs to the plan routes, which pin two inputs at once.
+ *    It is not a malformed request but a lost race, and its recovery is a
+ *    different one — re-read, compare with the draft, resolve silently when
+ *    they already agree. The sibling revisioned save throws for exactly this
+ *    condition (`targets.service.ts`, `StaleTargetsError`), and throwing
+ *    additionally aborts the transaction it is raised in, which releases the
+ *    advisory lock at once and makes "nothing was written" a property of the
+ *    mechanism rather than of this code.
  * ------------------------------------------------------------------------- */
 
-/** The outcome of either save: the response, or the pure layer's refusal verbatim. */
-export type SavePreferencesResult = { kind: 'ok'; response: PreferencesSaveResponse } | PreferenceRefusal;
+/**
+ * The outcome of either save: the response, or the field-level refusal verbatim.
+ *
+ * A stale revision is deliberately absent from this union — it leaves as an
+ * exception — so a caller that has an `ok` or an `error` in hand has already
+ * been told everything a 200 or a 400 needs.
+ */
+export type SavePreferencesResult =
+    | { kind: 'ok'; response: PreferencesSaveResponse }
+    | PreferenceErrorVerdict;
+
+/**
+ * The pure layer's refusal, delivered the way its kind demands.
+ *
+ * One helper for all four refusal sites — the preflight parse and the
+ * authoritative parse inside the lock, in both saves — so the two saves cannot
+ * drift on which refusal throws and which returns.
+ */
+const refuse = (refusal: PreferenceRefusal): PreferenceErrorVerdict => {
+    if (refusal.kind === 'stale_revision') {
+        throw new StaleRevisionError({ currentRevision: refusal.currentRevision });
+    }
+
+    return refusal;
+};
 
 /** The revision a freshly created row carries, so the client's next write can pin it. */
 const FIRST_REVISION = 1;
@@ -1361,7 +1398,7 @@ export const saveSetupStep = async (
     const preflight = parseSetupStep(step, body, stepContext(await loadPreferencesRow(userId)));
 
     if (preflight.kind !== 'ok') {
-        return preflight;
+        return refuse(preflight);
     }
 
     return prisma.$transaction((tx) =>
@@ -1370,7 +1407,7 @@ export const saveSetupStep = async (
             const verdict = parseSetupStep(step, body, stepContext(current));
 
             if (verdict.kind !== 'ok') {
-                return verdict;
+                return refuse(verdict);
             }
 
             // Re-typed as the payload union so the switch in `stepColumnWrites`
@@ -1571,12 +1608,18 @@ const updateContext = (row: PreferencesRow | null): PreferencesUpdateContext => 
  * trips to learn what it sent wrong. The class stays available for a caller that
  * has a single field to report; this path has a list.
  *
- * THE SETUP STATE MACHINE IS NOT TOUCHED. A full save is a settings edit, not a
- * wizard step: it never advances `setupStep`, never promotes `setupStatus`, and
- * — for the legacy user whose first ever write this is — creates the row as
- * `not_started`, exactly as the targets upsert does, because preference content
- * is not onboarding progress. Generation keeps refusing with
- * `preferences_incomplete` until the wizard actually runs.
+ * THE SETUP STATE MACHINE IS NOT TOUCHED, AND NO ROW IS CREATED. A full save is
+ * a settings edit rather than a wizard step: it never advances `setupStep` and
+ * never promotes `setupStatus`, so generation keeps refusing with
+ * `preferences_incomplete` until the wizard actually runs. It also never
+ * creates — `parsePreferencesUpdate` refuses a user who has no row at all ("this
+ * endpoint EDITS; it never creates"), because a partial has nothing to apply to
+ * and creating here would materialise the setup state the first `goal` step
+ * owns. The client recovery is the one it already has for a lost race: re-read,
+ * see `revision: 0` and `setupStatus: 'not_started'`, and go through setup. The
+ * one route that upserts the row for a user who never onboarded is
+ * `PUT /meal-planning/targets`, whose write is a confirmed target rather than a
+ * preference (AAP §0.5.2).
  */
 export const savePreferences = async (
     userId: string,
@@ -1586,7 +1629,7 @@ export const savePreferences = async (
     const preflight = parsePreferencesUpdate(body, updateContext(await loadPreferencesRow(userId)));
 
     if (preflight.kind !== 'ok') {
-        return preflight;
+        return refuse(preflight);
     }
 
     return prisma.$transaction((tx) =>
@@ -1595,7 +1638,7 @@ export const savePreferences = async (
             const verdict = parsePreferencesUpdate(body, updateContext(current));
 
             if (verdict.kind !== 'ok') {
-                return verdict;
+                return refuse(verdict);
             }
 
             const columns = await updateColumnWrites(verdict.payload, current, locked);
@@ -1608,30 +1651,26 @@ export const savePreferences = async (
             const today = dayKeyInTimeZone(now, timeZone);
 
             if (current === null) {
-                await locked.meal_plan_preferences.create({
-                    data: {
-                        user_id: userId,
-                        time_zone: timeZone,
-                        setup_status: 'not_started',
-                        revision: FIRST_REVISION,
-                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
-                        ...columns.writes,
-                    },
-                });
-            } else {
-                await locked.meal_plan_preferences.update({
-                    where: { user_id: userId },
-                    data: {
-                        time_zone: timeZone,
-                        revision: current.revision + 1,
-                        // A settings edit that moves an estimate input advances
-                        // this counter and so flips `TargetsResponse.stale`; one
-                        // that moves anything else leaves it alone.
-                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
-                        ...columns.writes,
-                    },
-                });
+                // Unreachable: the parse above refuses a body from a user with
+                // no row, and that refusal has already returned. A loud failure
+                // rather than a create branch, which would be a second, silent
+                // answer to a question the pure layer has already decided.
+                throw new Error('preferences update parsed against a missing row');
             }
+
+            await locked.meal_plan_preferences.update({
+                // `user_id` IS the owner key and the unique index (§5.1).
+                where: { user_id: userId },
+                data: {
+                    time_zone: timeZone,
+                    revision: current.revision + 1,
+                    // A settings edit that moves an estimate input advances this
+                    // counter and so flips `TargetsResponse.stale`; one that
+                    // moves anything else leaves it alone.
+                    estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
+                    ...columns.writes,
+                },
+            });
 
             const affectedMealCount = await recomputeActivePlanFlags(locked, userId, today);
             const saved = await loadPreferencesRow(userId, locked);

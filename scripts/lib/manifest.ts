@@ -1199,6 +1199,14 @@ export interface CatalogReleaseFile {
 
 export interface CatalogReleaseCounts {
     readonly foods: number;
+    /**
+     * `foods` under the name the release's own format contract uses. A release
+     * exports published foods only, so the two are the same measurement;
+     * writing both keeps either spelling readable without a translation step,
+     * as `path`/`name` above does. Optional: only a manifest written after
+     * this field existed carries it.
+     */
+    readonly published_foods?: number;
     readonly aliases: number;
     readonly portions: number;
     readonly components: number;
@@ -1242,12 +1250,25 @@ export interface CatalogReleaseModelVersions {
     readonly generation_model: string | null;
     readonly review_model: string | null;
     readonly prompt_version: string | null;
+    /**
+     * `prompt_version` under the release format contract's spelling, which
+     * names it for the generation prompt it records and pairs it with
+     * `review_prompt_version`. Optional: only a manifest written after this
+     * field existed carries it.
+     */
+    readonly generation_prompt_version?: string | null;
     readonly review_prompt_version: string | null;
 }
 
 export interface CatalogReleaseCoverageRow {
     readonly category: CoverageCategory;
     readonly published: number;
+    /**
+     * `published` under the name the release format contract uses, written
+     * alongside it for the same reason `by_category` accompanies `categories`.
+     * Optional: only a manifest written after this field existed carries it.
+     */
+    readonly published_actual?: number;
     readonly published_target: number;
     /** Reported exactly and never rounded: a shortfall is an unmet requirement. */
     readonly shortfall: number;

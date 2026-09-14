@@ -92,6 +92,13 @@
 //  * NO DEDUPLICATION OF ITS OWN. A double tap or a retry replays the stored
 //    `200` through `runKeyedAction`; a second guard here would be a second
 //    policy.
+//  * NO ENVIRONMENT READS, THOUGH IT DOES CARRY ONE INJECTED FAULT. The commit
+//    asks `utils/featureFlags.ts` whether `MEAL_PLANNING_FAULT` names this
+//    action and throws `SwapFailedError` before opening its transaction when it
+//    does (§0.9.4) — the development switch that makes frame 13e reachable from
+//    a device. The accessor resolves the value once at import and forces it to
+//    `'off'` in production, so nothing here branches on `process.env` (§5) and
+//    the branch cannot fire in production at all.
 //  * NO FLAG EVALUATION. The commit DOES write `meal_plan_meals.flags` — it
 //    writes the empty value `swapMealWrite` decides, because §0.7.3 has a swap
 //    to a compatible recipe clear that meal's flags, and the candidate's
@@ -109,6 +116,7 @@ import {
     SwapPreviewResponse,
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
+import { mealPlanningFault } from '../utils/featureFlags';
 import { rebuildPlanGroceries } from './grocery.service';
 import { PlanLifecycleState, requireWritablePlan } from './mealPlan.logic';
 import { formatPortionText } from './mealPlan.mapper';
@@ -120,7 +128,12 @@ import {
     loadPlannedMealsForGroceries,
     toPlanningPreferences,
 } from './mealPlan.service';
-import { PlanNotFoundError, RecipeIneligibleError, StalePlanError } from './mealPlanning.errors';
+import {
+    PlanNotFoundError,
+    RecipeIneligibleError,
+    StalePlanError,
+    SwapFailedError,
+} from './mealPlanning.errors';
 import { buildRequestFingerprint } from './mealPlanningAction.logic';
 import { KeyedActionResult, runKeyedAction } from './mealPlanningAction.service';
 import { dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
@@ -781,8 +794,12 @@ export const getSwapPreview = async (
  * STEP ZERO IS THE PARSE, and it is outside the transaction because it reads no
  * state: `parseSwapCommitRequest` judges the two path ids and the four body
  * fields together, and its refusal is returned for the controller to answer
- * `400 invalid_request`. Nothing below may run before it. The fingerprint the
- * reservation is keyed against is built from `parsed.payload` — the requirement
+ * `400 invalid_request`. Nothing below may run before it — including the
+ * injected `MEAL_PLANNING_FAULT=swap` fault, which sits between the parse and
+ * the transaction so that a faulted run is a truthful `502 swap_failed` over a
+ * valid request while a malformed one is still the `400` it would be with the
+ * switch off. The fingerprint the reservation is keyed against is built from
+ * `parsed.payload` — the requirement
  * `mealPlanningAction.logic.ts::buildRequestFingerprint` states, because it
  * refuses a magnitude it cannot canonicalise and a raw body would make that a
  * `500` — and `requireBoundPortion` at step 4 must never see an unparsed
@@ -803,6 +820,36 @@ export const commitSwap = async (
     }
 
     const payload: SwapMealPayload = parsed.payload;
+
+    // THE INJECTED FAULT, AND IT FIRES BEFORE THE TRANSACTION OPENS (§0.9.4).
+    //
+    // `MEAL_PLANNING_FAULT=swap` is how a developer on a device reaches frame
+    // 13e without breaking the backend, and 13e's copy — "your lunch is
+    // unchanged and your grocery list was not updated" — is the thing this
+    // position keeps true. Thrown here, nothing has run: no advisory lock, no
+    // `meal_plan_actions` reservation, no meal write, no grocery
+    // reconciliation. That is what §0.9.2 asserts of it (no action row, no meal
+    // change, no grocery change, and a retry WITHOUT the fault that commits
+    // exactly once) and it holds because the fault never reaches the ledger to
+    // be rolled back rather than because a rollback cleaned up after it.
+    //
+    // AFTER THE PARSE, THOUGH, NOT BEFORE IT. A malformed body is a `400`
+    // whether or not a developer has the switch on; answering `502 swap_failed`
+    // for a request the parser had already judged invalid would hide the real
+    // defect behind the injected one, and 13e's assurance would be attached to
+    // a request that was never committable in the first place.
+    //
+    // The value comes from the `featureFlags.ts` accessor and never from
+    // `process.env` (§5): that module resolves it once at import and forces it
+    // to `'off'` under `NODE_ENV=production`, so this branch is unreachable in
+    // production by construction rather than by this service remembering to
+    // check the environment. Only the commit is faulted — the two GETs stay
+    // truthful, because the device flow has to reach 13b before there is a
+    // commit to fail.
+    if (mealPlanningFault() === 'swap') {
+        throw new SwapFailedError();
+    }
+
     const result = await prisma.$transaction((tx) =>
         runKeyedAction(
             tx,

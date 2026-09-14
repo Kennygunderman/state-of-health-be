@@ -43,6 +43,7 @@
   ],
   "counts": {
     "foods": 11046,
+    "published_foods": 11046,
     "aliases": 15939,
     "portions": 31899,
     "components": 0,
@@ -97,6 +98,7 @@
     "generation_model": null,
     "review_model": null,
     "prompt_version": null,
+    "generation_prompt_version": null,
     "review_prompt_version": null
   },
   "coverage": {
@@ -110,126 +112,147 @@
       {
         "category": "produce_vegetable",
         "published": 1424,
+        "published_actual": 1424,
         "published_target": 1200,
         "shortfall": 0
       },
       {
         "category": "produce_fruit",
         "published": 730,
+        "published_actual": 730,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_meat",
         "published": 2218,
+        "published_actual": 2218,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_poultry",
         "published": 499,
+        "published_actual": 499,
         "published_target": 400,
         "shortfall": 0
       },
       {
         "category": "protein_seafood",
         "published": 558,
+        "published_actual": 558,
         "published_target": 600,
         "shortfall": 42
       },
       {
         "category": "protein_egg",
         "published": 58,
+        "published_actual": 58,
         "published_target": 60,
         "shortfall": 2
       },
       {
         "category": "protein_plant",
         "published": 38,
+        "published_actual": 38,
         "published_target": 350,
         "shortfall": 312
       },
       {
         "category": "dairy",
         "published": 371,
+        "published_actual": 371,
         "published_target": 600,
         "shortfall": 229
       },
       {
         "category": "dairy_alternative",
         "published": 52,
+        "published_actual": 52,
         "published_target": 250,
         "shortfall": 198
       },
       {
         "category": "grain",
         "published": 537,
+        "published_actual": 537,
         "published_target": 600,
         "shortfall": 63
       },
       {
         "category": "bread_bakery",
         "published": 805,
+        "published_actual": 805,
         "published_target": 500,
         "shortfall": 0
       },
       {
         "category": "legume",
         "published": 297,
+        "published_actual": 297,
         "published_target": 250,
         "shortfall": 0
       },
       {
         "category": "nut_seed",
         "published": 293,
+        "published_actual": 293,
         "published_target": 350,
         "shortfall": 57
       },
       {
         "category": "oil_fat",
         "published": 152,
+        "published_actual": 152,
         "published_target": 150,
         "shortfall": 0
       },
       {
         "category": "condiment_sauce",
         "published": 198,
+        "published_actual": 198,
         "published_target": 700,
         "shortfall": 502
       },
       {
         "category": "spice_herb",
         "published": 49,
+        "published_actual": 49,
         "published_target": 300,
         "shortfall": 251
       },
       {
         "category": "beverage",
         "published": 432,
+        "published_actual": 432,
         "published_target": 600,
         "shortfall": 168
       },
       {
         "category": "snack",
         "published": 233,
+        "published_actual": 233,
         "published_target": 600,
         "shortfall": 367
       },
       {
         "category": "sweet",
         "published": 556,
+        "published_actual": 556,
         "published_target": 500,
         "shortfall": 0
       },
       {
         "category": "prepared_meal",
         "published": 1499,
+        "published_actual": 1499,
         "published_target": 1400,
         "shortfall": 0
       },
       {
         "category": "other",
         "published": 47,
+        "published_actual": 47,
         "published_target": 200,
         "shortfall": 153
       }
@@ -238,126 +261,147 @@
       {
         "category": "produce_vegetable",
         "published": 1424,
+        "published_actual": 1424,
         "published_target": 1200,
         "shortfall": 0
       },
       {
         "category": "produce_fruit",
         "published": 730,
+        "published_actual": 730,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_meat",
         "published": 2218,
+        "published_actual": 2218,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_poultry",
         "published": 499,
+        "published_actual": 499,
         "published_target": 400,
         "shortfall": 0
       },
       {
         "category": "protein_seafood",
         "published": 558,
+        "published_actual": 558,
         "published_target": 600,
         "shortfall": 42
       },
       {
         "category": "protein_egg",
         "published": 58,
+        "published_actual": 58,
         "published_target": 60,
         "shortfall": 2
       },
       {
         "category": "protein_plant",
         "published": 38,
+        "published_actual": 38,
         "published_target": 350,
         "shortfall": 312
       },
       {
         "category": "dairy",
         "published": 371,
+        "published_actual": 371,
         "published_target": 600,
         "shortfall": 229
       },
       {
         "category": "dairy_alternative",
         "published": 52,
+        "published_actual": 52,
         "published_target": 250,
         "shortfall": 198
       },
       {
         "category": "grain",
         "published": 537,
+        "published_actual": 537,
         "published_target": 600,
         "shortfall": 63
       },
       {
         "category": "bread_bakery",
         "published": 805,
+        "published_actual": 805,
         "published_target": 500,
         "shortfall": 0
       },
       {
         "category": "legume",
         "published": 297,
+        "published_actual": 297,
         "published_target": 250,
         "shortfall": 0
       },
       {
         "category": "nut_seed",
         "published": 293,
+        "published_actual": 293,
         "published_target": 350,
         "shortfall": 57
       },
       {
         "category": "oil_fat",
         "published": 152,
+        "published_actual": 152,
         "published_target": 150,
         "shortfall": 0
       },
       {
         "category": "condiment_sauce",
         "published": 198,
+        "published_actual": 198,
         "published_target": 700,
         "shortfall": 502
       },
       {
         "category": "spice_herb",
         "published": 49,
+        "published_actual": 49,
         "published_target": 300,
         "shortfall": 251
       },
       {
         "category": "beverage",
         "published": 432,
+        "published_actual": 432,
         "published_target": 600,
         "shortfall": 168
       },
       {
         "category": "snack",
         "published": 233,
+        "published_actual": 233,
         "published_target": 600,
         "shortfall": 367
       },
       {
         "category": "sweet",
         "published": 556,
+        "published_actual": 556,
         "published_target": 500,
         "shortfall": 0
       },
       {
         "category": "prepared_meal",
         "published": 1499,
+        "published_actual": 1499,
         "published_target": 1400,
         "shortfall": 0
       },
       {
         "category": "other",
         "published": 47,
+        "published_actual": 47,
         "published_target": 200,
         "shortfall": 153
       }

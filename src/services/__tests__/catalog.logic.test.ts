@@ -9,7 +9,7 @@
  *
  *  - **The shipped plan and the committed fixture are what the coverage runs
  *    against.** `data/meal-planning/coverage-plan.v1.json` (21 categories) and
- *    `data/meal-planning/fixtures/catalog-foods.fixture.json` (34 rows, every
+ *    `data/meal-planning/fixtures/catalog-foods.fixture.json` (38 rows, every
  *    §0.7.3 boundary among them) are read from disk at the bottom of this file
  *    and drive the per-category sweeps, the per-tier cases and every boundary
  *    case. A reduced stand-in cannot pin a band it does not declare.
@@ -3137,7 +3137,7 @@ const DEDUPED_CONTEXT: CatalogValidationContext = { duplicateOfSourceKey: null }
  * fixtures/catalog-foods.fixture.json
  *
  * Snake_case database rows, not wire DTOs, so a row is handed to this module
- * unmapped. 34 foods, 24 published, and every boundary AAP §0.7.3 names among
+ * unmapped. 38 foods, 26 published, and every boundary AAP §0.7.3 names among
  * them. The `note` field every row may carry is documentation rather than a
  * column, and nothing below reads it.
  * ------------------------------------------------------------------------- */
@@ -3570,6 +3570,10 @@ const ROW = {
     MACRO_MASS_PAST_ALLOWANCE: 'ai:protein_plant:textured pea protein concentrate:dry',
     BRAND_PATTERN: 'ai:snack:acme brand protein crisps:as_purchased',
     UNVALIDATED_CANDIDATE: 'ai:produce_fruit:frozen mango chunks:raw',
+    DISLIKE_SAME_GROUP: 'usda:9200122',
+    DISLIKE_OTHER_GROUP: 'usda:9200123',
+    PER_SERVING_NO_SERVING_WEIGHT: 'ai:prepared_meal:vegetable barley soup cup:prepared',
+    NO_DEFAULT_PORTION: 'ai:condiment_sauce:garlic herb marinade:prepared',
 } as const;
 
 /* ---------------------------------------------------------------------------
@@ -4072,10 +4076,25 @@ describe('the committed catalog fixture', () => {
         }
     });
 
-    // The partial unique index allows exactly one, and the
-    // `missing_gram_weight` check requires its weight to be sourced.
-    it('gives every food exactly one default portion with a sourced gram weight', () => {
-        for (const food of CATALOG_FIXTURE.foods) {
+    // Scoped to the rows validation ACCEPTED — every published row plus the
+    // retired one, which was published before a later release dropped it.
+    // That is where the guarantee actually lives: AAP §0.5.2 states it of a
+    // published item, the partial unique index allows at MOST one default (zero
+    // passes an index), and `requiredDefaultPortionCount` is enforced at
+    // publication rather than on arrival. Asserting it over every row would
+    // contradict the fixture's own purpose, because the two candidates that
+    // FAIL it are what make the `missing_gram_weight` and
+    // `default_portion_count` quarantines testable at all. They are pinned as
+    // exceptions immediately below, so the negative cases are part of this
+    // contract instead of holes in it.
+    it('gives every accepted food exactly one default portion with a sourced gram weight', () => {
+        const accepted = CATALOG_FIXTURE.foods.filter(
+            (food) => fixtureRecord(food.source_key)?.outcome === 'accepted',
+        );
+
+        expect(accepted).toHaveLength(CATALOG_FIXTURE.counts.published_foods + 1);
+
+        for (const food of accepted) {
             const defaults = fixturePortions(food.source_key).filter((portion) => portion.is_default);
 
             expect({
@@ -4086,6 +4105,42 @@ describe('the committed catalog fixture', () => {
                 ),
             }).toEqual({ sourceKey: food.source_key, defaults: 1, positiveWeight: true });
         }
+    });
+
+    // The two rows the default-portion requirement exists to catch, each
+    // failing it from a different side: one names a default serving whose gram
+    // weight the source never gave, the other marks no portion default at all.
+    // Both are quarantined, so neither reaches search, a recipe or a grocery
+    // row — and because the weight is what a grocery quantity is measured in,
+    // publishing either would mean inventing one.
+    it('quarantines the candidates whose default portion is unweighed or absent', () => {
+        const unweighed = fixturePortions(ROW.PER_SERVING_NO_SERVING_WEIGHT);
+        const absent = fixturePortions(ROW.NO_DEFAULT_PORTION);
+
+        expect({
+            defaults: unweighed.filter((portion) => portion.is_default).length,
+            weights: unweighed.filter((portion) => portion.is_default).map((portion) => portion.gram_weight),
+            status: fixtureFood(ROW.PER_SERVING_NO_SERVING_WEIGHT).publication_status,
+        }).toEqual({ defaults: 1, weights: [null], status: 'quarantined' });
+
+        expect({
+            defaults: absent.filter((portion) => portion.is_default).length,
+            // The portions it DOES carry are sound, so the only fault is the
+            // missing default — `unsupported_portion` must not also fire.
+            othersSound: absent.every((portion) => portion.amount > 0 && (portion.gram_weight ?? 0) > 0),
+            status: fixtureFood(ROW.NO_DEFAULT_PORTION).publication_status,
+        }).toEqual({ defaults: 0, othersSound: true, status: 'quarantined' });
+
+        expect(
+            validateFixtureRow(ROW.PER_SERVING_NO_SERVING_WEIGHT)
+                .checks.filter((check) => !check.pass)
+                .map((check) => check.name),
+        ).toEqual([CATALOG_CHECK_NAMES.MISSING_GRAM_WEIGHT]);
+        expect(
+            validateFixtureRow(ROW.NO_DEFAULT_PORTION)
+                .checks.filter((check) => !check.pass)
+                .map((check) => check.name),
+        ).toEqual([CATALOG_CHECK_NAMES.MISSING_GRAM_WEIGHT, CATALOG_CHECK_NAMES.DEFAULT_PORTION_COUNT]);
     });
 
     // The fixture's records were produced with `duplicateOfSourceKey: null`, so

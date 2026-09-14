@@ -860,6 +860,11 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         return {
             category: category.category,
             published,
+            // The same count under the name the release format contract uses,
+            // written alongside so neither reader has to know the other's
+            // spelling — the convention `path`/`name` and
+            // `categories`/`by_category` already follow.
+            published_actual: published,
             published_target: category.publishedTarget,
             shortfall: Math.max(0, category.publishedTarget - published),
         };
@@ -886,6 +891,10 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         files,
         counts: {
             foods: foods.length,
+            // Every exported food is published — the query selects on that
+            // status — so the two spellings are the same measurement, and both
+            // are written for the same reason `path` and `name` are.
+            published_foods: foods.length,
             aliases: aliases.length,
             portions: portions.length,
             components: components.length,
@@ -913,6 +922,9 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
             generation_model: null,
             review_model: null,
             prompt_version: null,
+            // `prompt_version` under the release format contract's spelling,
+            // which pairs it with the review prompt it sits beside.
+            generation_prompt_version: null,
             review_prompt_version: null,
         },
         coverage: {

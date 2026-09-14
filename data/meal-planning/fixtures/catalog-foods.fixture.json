@@ -9,7 +9,7 @@
         "row_shape": "Rows are snake_case database rows, not camelCase wire DTOs - the same convention as data/meal-planning/catalog/releases/v1/*.jsonl, so a row can be handed to catalog.logic.ts unmapped. Turning any of this into a response shape is catalog.mapper.ts job.",
         "parent_reference": "Children name their parent by food_source_key (a component's second reference by component_source_key), mirroring the release JSONL files, AND carry the resolved catalog_food_id. The release files omit id because Postgres generates it; these rows carry fixed literal ids so a test can reference a food without first loading anything.",
         "uuid_scheme": "Uuid primary keys are deterministic and encode their table in the first group: c1000000=catalog_foods, c2000000=catalog_food_aliases, c3000000=catalog_food_portions, c4000000=catalog_food_components, c5000000=catalog_validation_records. The last group is a per-table counter.",
-        "search_vector": "catalog_foods.search_vector is a STORED generated column and is therefore absent from every row. search_text, the expression it is generated from, is present.",
+        "generated_search_column": "catalog_foods carries a STORED generated tsvector column for search. It is absent from every row here because Postgres generates it; search_text, the expression it is generated from, is present.",
         "no_tenant_column": "catalog_foods and its children are shared reference data and carry no user_id by design. There is none anywhere in this file.",
         "vocabularies": "category and food_group are codes from data/meal-planning/coverage-plan.v1.json (21 categories, 123 food groups). food_state, identity_source, identity_status, nutrition_provenance, nutrition_basis, allergen_status and publication_status are the closed sets declared in src/types/catalog.ts.",
         "allergen_tag_order": "allergen_tags are written in the nine-allergen order the diet step lists them in (milk, eggs, peanuts, tree_nuts, soy, wheat, fish, shellfish, sesame - NAMED_ALLERGENS in src/services/preferences.logic.ts), so the array is stable across runs. Comparison is always through normalizeCanonicalName, so the order is presentation only.",
@@ -34,16 +34,18 @@
         "checks_are_generated": "validation_records.checks, outcome and publication_status were produced by validateCatalogCandidate over the rows in this file, with duplicateOfSourceKey null (duplicate detection ran and found none) and, for every ai_generated row, an advisory review that confirms no check. Every check entry carries its tier, so the record is auditable without reading the validator.",
         "staleness_is_a_pointer_comparison": "Staleness is not a validation check and never produces a status. It is the comparison between a stored pointer (catalog_food_components.component_nutrition_version, recipe_ingredients.catalog_nutrition_version) and the referenced food nutrition_version, which a refresh makes and re-derives against. That is why ai:prepared_meal:herbed yogurt dip:prepared is published with stale numbers rather than quarantined.",
         "component_derivation": "A component contributes quantity_grams/100 of its per-100 g values; cooking changes MASS, not nutrients, so the nutrient totals are the plain sum of the inputs while the finished weight is SUM(quantity_grams * yield_factor), and the per-100 g result is total / yieldedGrams * 100. Any unknown component nutrient makes the derived value null.",
-        "one_default_portion": "Every food carries exactly one is_default portion with a positive sourced gram_weight, which the partial unique index unique_default_catalog_food_portion enforces and the missing_gram_weight check requires. Portion units are always tokens src/utils/units.ts resolves, so a grocery row can read its family back off the unit."
+        "one_default_portion": "Every PUBLISHED food carries exactly one is_default portion with a positive sourced gram_weight, which the partial unique index unique_default_catalog_food_portion enforces and the missing_gram_weight check requires. Two quarantined rows exist to fail that requirement from its two sides: ai:prepared_meal:vegetable barley soup cup:prepared has one default portion whose gram_weight is null, and ai:condiment_sauce:garlic herb marinade:prepared has portions but marks none default. Portion units are always tokens src/utils/units.ts resolves, so a grocery row can read its family back off the unit.",
+        "nutrition_basis_coverage": "All three nutrition_basis values appear. per_100g is the norm; usda:9200110 is per_100ml WITH a density and is converted; ai:beverage:cold brew coffee concentrate:prepared is per_100ml WITHOUT one and is quarantined missing_density; ai:prepared_meal:vegetable barley soup cup:prepared is per_serving with no sourced serving gram weight and is quarantined missing_gram_weight. On the per_serving basis, basis_amount counts SERVINGS, so the stated values describe basis_amount x the serving weight.",
+        "dislike_groups_need_a_pair": "A dislike stores the food id AND its food_group, so excluding a group is only provable against two foods in that group plus one outside it. usda:9200120 and usda:9200122 are both in the mushroom group and usda:9200123 is in the unrelated olive group; both groups are marked isCommonDislikeGroup in coverage-plan.v1.json. One mushroom row alone could not tell excluding the group apart from excluding the selected food."
     },
     "counts": {
-        "foods": 34,
-        "aliases": 64,
-        "portions": 36,
+        "foods": 38,
+        "aliases": 70,
+        "portions": 41,
         "components": 4,
-        "validation_records": 33,
-        "published_foods": 24,
-        "recipe_eligible_foods": 18
+        "validation_records": 37,
+        "published_foods": 26,
+        "recipe_eligible_foods": 20
     },
     "foods": [
         {
@@ -1560,6 +1562,181 @@
             "created_at": "2026-09-12T00:00:00.000Z",
             "updated_at": "2026-09-12T00:00:00.000Z",
             "note": "the CANDIDATE row: generated but not yet validated, so it carries NO validation record at all — the one food in this fixture whose publication_status is not a validation outcome. identity_status 'ambiguous' is the third identity value"
+        },
+        {
+            "id": "c1000000-0000-4000-8000-000000000023",
+            "source_key": "usda:9200122",
+            "canonical_name": "white mushrooms",
+            "display_name": "White mushrooms",
+            "category": "produce_vegetable",
+            "food_state": "raw",
+            "food_group": "mushroom",
+            "identity_source": "usda",
+            "identity_status": "verified",
+            "nutrition_provenance": "source_backed",
+            "publication_status": "published",
+            "nutrition_version": 1,
+            "metadata_version": 1,
+            "nutrition_basis": "per_100g",
+            "basis_amount": 100,
+            "calories": 22,
+            "protein_g": 3.1,
+            "carbs_g": 3.3,
+            "fat_g": 0.3,
+            "fiber_g": 1,
+            "density_g_per_ml": null,
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "is_common_dislike": true,
+            "cost_class": 1,
+            "usda_fdc_id": 9200122,
+            "usda_data_type": "Foundation",
+            "usda_description": "Mushrooms, white, button, raw",
+            "source_version": "Foundation 2022-10",
+            "source_cache_key": "/food/9200122?format=full",
+            "generation_batch_key": null,
+            "search_text": "white mushrooms button mushrom",
+            "imported_at": "2026-09-12T00:00:00.000Z",
+            "created_at": "2026-09-12T00:00:00.000Z",
+            "updated_at": "2026-09-12T00:00:00.000Z",
+            "note": "second food in the mushroom group, so a dislike on one mushroom must exclude the group rather than only the selected row; carries the plural alias and the common misspelling"
+        },
+        {
+            "id": "c1000000-0000-4000-8000-000000000024",
+            "source_key": "usda:9200123",
+            "canonical_name": "black olives",
+            "display_name": "Black olives",
+            "category": "produce_vegetable",
+            "food_state": "as_purchased",
+            "food_group": "olive",
+            "identity_source": "usda",
+            "identity_status": "verified",
+            "nutrition_provenance": "source_backed",
+            "publication_status": "published",
+            "nutrition_version": 1,
+            "metadata_version": 1,
+            "nutrition_basis": "per_100g",
+            "basis_amount": 100,
+            "calories": 115,
+            "protein_g": 0.8,
+            "carbs_g": 6.3,
+            "fat_g": 10.7,
+            "fiber_g": 3.2,
+            "density_g_per_ml": null,
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "is_common_dislike": true,
+            "cost_class": 2,
+            "usda_fdc_id": 9200123,
+            "usda_data_type": "SR Legacy",
+            "usda_description": "Olives, ripe, canned (small-extra large)",
+            "source_version": "SR Legacy 2019-04",
+            "source_cache_key": "/food/9200123?format=full",
+            "generation_batch_key": null,
+            "search_text": "black olives ripe",
+            "imported_at": "2026-09-12T00:00:00.000Z",
+            "created_at": "2026-09-12T00:00:00.000Z",
+            "updated_at": "2026-09-12T00:00:00.000Z",
+            "note": "is_common_dislike in the olive group, unrelated to mushroom, so a mushroom dislike must leave it in place"
+        },
+        {
+            "id": "c1000000-0000-4000-8000-000000000025",
+            "source_key": "ai:prepared_meal:vegetable barley soup cup:prepared",
+            "canonical_name": "vegetable barley soup cup",
+            "display_name": "Vegetable barley soup cup",
+            "category": "prepared_meal",
+            "food_state": "prepared",
+            "food_group": "soup",
+            "identity_source": "ai_generated",
+            "identity_status": "verified",
+            "nutrition_provenance": "ai_estimated",
+            "publication_status": "quarantined",
+            "nutrition_version": 1,
+            "metadata_version": 1,
+            "nutrition_basis": "per_serving",
+            "basis_amount": 1,
+            "calories": 118,
+            "protein_g": 4.2,
+            "carbs_g": 19.6,
+            "fat_g": 2.1,
+            "fiber_g": 3.4,
+            "density_g_per_ml": null,
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian"
+            ],
+            "is_common_dislike": false,
+            "cost_class": 1,
+            "usda_fdc_id": null,
+            "usda_data_type": null,
+            "usda_description": null,
+            "source_version": null,
+            "source_cache_key": null,
+            "generation_batch_key": "v1:prepared_meal:0007",
+            "search_text": "vegetable barley soup cup",
+            "imported_at": "2026-09-12T00:00:00.000Z",
+            "created_at": "2026-09-12T00:00:00.000Z",
+            "updated_at": "2026-09-12T00:00:00.000Z",
+            "note": "the only per_serving row: the source states one serving and no sourced gram weight for it, so normalizeToPer100g cannot bring it onto the per-100 g basis and quarantines it missing_gram_weight. Its single default portion keeps default_portion_count passing, so this row fails that check alone. vegan without gluten_free because barley carries gluten, which is not one of the nine named allergens"
+        },
+        {
+            "id": "c1000000-0000-4000-8000-000000000026",
+            "source_key": "ai:condiment_sauce:garlic herb marinade:prepared",
+            "canonical_name": "garlic herb marinade",
+            "display_name": "Garlic herb marinade",
+            "category": "condiment_sauce",
+            "food_state": "prepared",
+            "food_group": "condiment_other",
+            "identity_source": "ai_generated",
+            "identity_status": "verified",
+            "nutrition_provenance": "ai_estimated",
+            "publication_status": "quarantined",
+            "nutrition_version": 1,
+            "metadata_version": 1,
+            "nutrition_basis": "per_100g",
+            "basis_amount": 100,
+            "calories": 176,
+            "protein_g": 1.1,
+            "carbs_g": 4.4,
+            "fat_g": 17.2,
+            "fiber_g": 0.3,
+            "density_g_per_ml": null,
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "is_common_dislike": false,
+            "cost_class": 2,
+            "usda_fdc_id": null,
+            "usda_data_type": null,
+            "usda_description": null,
+            "source_version": null,
+            "source_cache_key": null,
+            "generation_batch_key": "v1:condiment_sauce:0012",
+            "search_text": "garlic herb marinade",
+            "imported_at": "2026-09-12T00:00:00.000Z",
+            "created_at": "2026-09-12T00:00:00.000Z",
+            "updated_at": "2026-09-12T00:00:00.000Z",
+            "note": "portions exist with sourced weights but none is marked is_default, so default_portion_count fails at 0. missing_gram_weight fails alongside it reporting \"no default portion\" - the same defect from the other side, which is what the validator does rather than something this row hides. unsupported_portion still passes, so the portion-validity branch stays clean"
         }
     ],
     "aliases": [
@@ -1946,6 +2123,42 @@
             "food_source_key": "ai:produce_fruit:frozen mango chunks:raw",
             "catalog_food_id": "c1000000-0000-4000-8000-000000000022",
             "alias": "frozen mango"
+        },
+        {
+            "id": "c2000000-0000-4000-8000-000000000041",
+            "food_source_key": "usda:9200122",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000023",
+            "alias": "button mushrooms"
+        },
+        {
+            "id": "c2000000-0000-4000-8000-000000000042",
+            "food_source_key": "usda:9200122",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000023",
+            "alias": "white button mushrooms"
+        },
+        {
+            "id": "c2000000-0000-4000-8000-000000000043",
+            "food_source_key": "usda:9200122",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000023",
+            "alias": "mushrooms, white"
+        },
+        {
+            "id": "c2000000-0000-4000-8000-000000000044",
+            "food_source_key": "usda:9200122",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000023",
+            "alias": "mushrom"
+        },
+        {
+            "id": "c2000000-0000-4000-8000-000000000045",
+            "food_source_key": "usda:9200123",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000024",
+            "alias": "olives"
+        },
+        {
+            "id": "c2000000-0000-4000-8000-000000000046",
+            "food_source_key": "usda:9200123",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000024",
+            "alias": "ripe olives"
         }
     ],
     "portions": [
@@ -2343,6 +2556,61 @@
             "unit": "g",
             "gram_weight": 165,
             "is_default": true,
+            "source": "ai_generated_portion"
+        },
+        {
+            "id": "c3000000-0000-4000-8000-000000000025",
+            "food_source_key": "usda:9200122",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000023",
+            "description": "1 cup, sliced",
+            "amount": 70,
+            "unit": "g",
+            "gram_weight": 70,
+            "is_default": true,
+            "source": "usda_food_portion"
+        },
+        {
+            "id": "c3000000-0000-4000-8000-000000000026",
+            "food_source_key": "usda:9200123",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000024",
+            "description": "5 olives",
+            "amount": 5,
+            "unit": "each",
+            "gram_weight": 20,
+            "is_default": true,
+            "source": "usda_food_portion"
+        },
+        {
+            "id": "c3000000-0000-4000-8000-000000000027",
+            "food_source_key": "ai:prepared_meal:vegetable barley soup cup:prepared",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000025",
+            "description": "1 cup",
+            "amount": 1,
+            "unit": "cup",
+            "gram_weight": null,
+            "is_default": true,
+            "source": "ai_generated_portion"
+        },
+        {
+            "id": "c3000000-0000-4000-8000-000000000028",
+            "food_source_key": "ai:condiment_sauce:garlic herb marinade:prepared",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000026",
+            "description": "1 tbsp",
+            "amount": 1,
+            "unit": "tbsp",
+            "gram_weight": 15,
+            "is_default": false,
+            "source": "ai_generated_portion"
+        },
+        {
+            "id": "c3000000-0000-4000-8000-000000000029",
+            "food_source_key": "ai:condiment_sauce:garlic herb marinade:prepared",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000026",
+            "description": "2 tbsp",
+            "amount": 2,
+            "unit": "tbsp",
+            "gram_weight": 30,
+            "is_default": false,
             "source": "ai_generated_portion"
         }
     ],
@@ -7520,6 +7788,617 @@
             },
             "history": [],
             "note": "outcome rejected; deciding checks [brand_pattern_name]; review flags [none]"
+        },
+        {
+            "id": "c5000000-0000-4000-8000-000000000022",
+            "food_source_key": "usda:9200122",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000023",
+            "canonical_identity": {
+                "source_key": "usda:9200122",
+                "canonical_name": "white mushrooms",
+                "display_name": "White mushrooms",
+                "category": "produce_vegetable",
+                "food_group": "mushroom",
+                "food_state": "raw",
+                "nutrition_version": 1,
+                "metadata_version": 1
+            },
+            "aliases": [
+                "button mushrooms",
+                "white button mushrooms",
+                "mushrooms, white",
+                "mushrom"
+            ],
+            "category": "produce_vegetable",
+            "food_state": "raw",
+            "identity_source": "usda",
+            "identity_status": "verified",
+            "nutrition_provenance": "source_backed",
+            "nutrition_method": "usda_foundation_per_100g",
+            "nutrition_assumptions": null,
+            "portion_units": {
+                "default": {
+                    "description": "1 cup, sliced",
+                    "amount": 70,
+                    "unit": "g",
+                    "gram_weight": 70,
+                    "source": "usda_food_portion"
+                },
+                "additional": []
+            },
+            "identity_evidence": [],
+            "checks": [
+                {
+                    "name": "unknown_category",
+                    "pass": true,
+                    "observed": "produce_vegetable",
+                    "bound": "a category declared by the coverage plan",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_not_finite",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "finite numbers, or null for unknown",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_negative",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "greater than or equal to 0",
+                    "tier": "reject"
+                },
+                {
+                    "name": "kcal_ceiling",
+                    "pass": true,
+                    "observed": 22,
+                    "bound": 900,
+                    "tier": "reject"
+                },
+                {
+                    "name": "macro_mass_ceiling",
+                    "pass": true,
+                    "observed": 6.7,
+                    "bound": 102,
+                    "tier": "reject"
+                },
+                {
+                    "name": "energy_macro_mismatch",
+                    "pass": true,
+                    "observed": 6.300000000000001,
+                    "bound": 30,
+                    "tier": "reject"
+                },
+                {
+                    "name": "missing_core_nutrient",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "calories, protein_g, carbs_g, fat_g",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "missing_gram_weight",
+                    "pass": true,
+                    "observed": 70,
+                    "bound": "one default portion with a sourced gram weight greater than 0",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "default_portion_count",
+                    "pass": true,
+                    "observed": 1,
+                    "bound": 1,
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsupported_portion",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "positive amounts and sourced gram weights, in a convertible unit",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsourced",
+                    "pass": true,
+                    "observed": "verified",
+                    "bound": "verified or ambiguous",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "duplicate_identity",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "a canonical name and food state no published food already holds",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "out_of_category_range",
+                    "pass": true,
+                    "observed": 22,
+                    "bound": "5-150 kcal/100g for produce_vegetable",
+                    "tier": "review"
+                },
+                {
+                    "name": "allergens_unknown",
+                    "pass": true,
+                    "observed": "known",
+                    "bound": "known",
+                    "tier": "review"
+                }
+            ],
+            "llm_review": null,
+            "outcome": "accepted",
+            "reviewed_at": "2026-09-12T06:00:00.000Z",
+            "publication_status": "published",
+            "source_versions": {
+                "coverage_plan": "v1",
+                "usda_fdc": "Foundation 2022-10"
+            },
+            "history": [],
+            "note": "outcome accepted; deciding checks [none]; review flags [none]"
+        },
+        {
+            "id": "c5000000-0000-4000-8000-000000000023",
+            "food_source_key": "usda:9200123",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000024",
+            "canonical_identity": {
+                "source_key": "usda:9200123",
+                "canonical_name": "black olives",
+                "display_name": "Black olives",
+                "category": "produce_vegetable",
+                "food_group": "olive",
+                "food_state": "as_purchased",
+                "nutrition_version": 1,
+                "metadata_version": 1
+            },
+            "aliases": [
+                "olives",
+                "ripe olives"
+            ],
+            "category": "produce_vegetable",
+            "food_state": "as_purchased",
+            "identity_source": "usda",
+            "identity_status": "verified",
+            "nutrition_provenance": "source_backed",
+            "nutrition_method": "usda_sr_legacy_per_100g",
+            "nutrition_assumptions": null,
+            "portion_units": {
+                "default": {
+                    "description": "5 olives",
+                    "amount": 5,
+                    "unit": "each",
+                    "gram_weight": 20,
+                    "source": "usda_food_portion"
+                },
+                "additional": []
+            },
+            "identity_evidence": [],
+            "checks": [
+                {
+                    "name": "unknown_category",
+                    "pass": true,
+                    "observed": "produce_vegetable",
+                    "bound": "a category declared by the coverage plan",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_not_finite",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "finite numbers, or null for unknown",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_negative",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "greater than or equal to 0",
+                    "tier": "reject"
+                },
+                {
+                    "name": "kcal_ceiling",
+                    "pass": true,
+                    "observed": 115,
+                    "bound": 900,
+                    "tier": "reject"
+                },
+                {
+                    "name": "macro_mass_ceiling",
+                    "pass": true,
+                    "observed": 17.799999999999997,
+                    "bound": 102,
+                    "tier": "reject"
+                },
+                {
+                    "name": "energy_macro_mismatch",
+                    "pass": true,
+                    "observed": 9.699999999999989,
+                    "bound": 34.5,
+                    "tier": "reject"
+                },
+                {
+                    "name": "missing_core_nutrient",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "calories, protein_g, carbs_g, fat_g",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "missing_gram_weight",
+                    "pass": true,
+                    "observed": 20,
+                    "bound": "one default portion with a sourced gram weight greater than 0",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "default_portion_count",
+                    "pass": true,
+                    "observed": 1,
+                    "bound": 1,
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsupported_portion",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "positive amounts and sourced gram weights, in a convertible unit",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsourced",
+                    "pass": true,
+                    "observed": "verified",
+                    "bound": "verified or ambiguous",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "duplicate_identity",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "a canonical name and food state no published food already holds",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "out_of_category_range",
+                    "pass": true,
+                    "observed": 115,
+                    "bound": "5-150 kcal/100g for produce_vegetable",
+                    "tier": "review"
+                },
+                {
+                    "name": "allergens_unknown",
+                    "pass": true,
+                    "observed": "known",
+                    "bound": "known",
+                    "tier": "review"
+                }
+            ],
+            "llm_review": null,
+            "outcome": "accepted",
+            "reviewed_at": "2026-09-12T06:00:00.000Z",
+            "publication_status": "published",
+            "source_versions": {
+                "coverage_plan": "v1",
+                "usda_fdc": "SR Legacy 2019-04"
+            },
+            "history": [],
+            "note": "outcome accepted; deciding checks [none]; review flags [none]"
+        },
+        {
+            "id": "c5000000-0000-4000-8000-000000000024",
+            "food_source_key": "ai:prepared_meal:vegetable barley soup cup:prepared",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000025",
+            "canonical_identity": {
+                "source_key": "ai:prepared_meal:vegetable barley soup cup:prepared",
+                "canonical_name": "vegetable barley soup cup",
+                "display_name": "Vegetable barley soup cup",
+                "category": "prepared_meal",
+                "food_group": "soup",
+                "food_state": "prepared",
+                "nutrition_version": 1,
+                "metadata_version": 1
+            },
+            "aliases": [],
+            "category": "prepared_meal",
+            "food_state": "prepared",
+            "identity_source": "ai_generated",
+            "identity_status": "verified",
+            "nutrition_provenance": "ai_estimated",
+            "nutrition_method": "ai_generated_estimate_second_model_reviewed",
+            "nutrition_assumptions": "Values are stated per serving and the serving carries no sourced gram weight, so they cannot be brought onto the per-100 g basis. Nothing was assumed - inventing a cup weight is exactly what the missing_gram_weight quarantine exists to prevent.",
+            "portion_units": {
+                "default": {
+                    "description": "1 cup",
+                    "amount": 1,
+                    "unit": "cup",
+                    "gram_weight": null,
+                    "source": "ai_generated_portion"
+                },
+                "additional": []
+            },
+            "identity_evidence": [
+                {
+                    "url": "https://catalog-fixture.invalid/evidence/vegetable-barley-soup",
+                    "finalHost": "catalog-fixture.invalid",
+                    "status": 200,
+                    "bodySha256": "7b0c3f6de1a84c2f95d4e0b7a63c8115f2ad9e4470c6b8d31e5a92f0c7d4be41",
+                    "matchedSnippet": "Vegetable barley soup is a generic preparation described in general nutrition references.",
+                    "fetchedAt": "2026-09-12T06:00:00.000Z"
+                }
+            ],
+            "checks": [
+                {
+                    "name": "brand_pattern_name",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "generic preparation names only",
+                    "tier": "reject"
+                },
+                {
+                    "name": "unknown_category",
+                    "pass": true,
+                    "observed": "prepared_meal",
+                    "bound": "a category declared by the coverage plan",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_not_finite",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "finite numbers, or null for unknown",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_negative",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "greater than or equal to 0",
+                    "tier": "reject"
+                },
+                {
+                    "name": "missing_gram_weight",
+                    "pass": false,
+                    "observed": null,
+                    "bound": "a sourced serving gram weight greater than 0",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "missing_core_nutrient",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "calories, protein_g, carbs_g, fat_g",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "default_portion_count",
+                    "pass": true,
+                    "observed": 1,
+                    "bound": 1,
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsupported_portion",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "positive amounts and sourced gram weights, in a convertible unit",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsourced",
+                    "pass": true,
+                    "observed": "verified",
+                    "bound": "verified or ambiguous",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "duplicate_identity",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "a canonical name and food state no published food already holds",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "allergens_unknown",
+                    "pass": true,
+                    "observed": "known",
+                    "bound": "known",
+                    "tier": "review"
+                }
+            ],
+            "llm_review": {
+                "model": "openai/gpt-4o-mini",
+                "reviewPromptVersion": "catalog-review-2026-09-08",
+                "verdict": "plausible",
+                "confirmedCheckNames": [],
+                "note": "Advisory only: this review confirms no check and supplies no nutrient value."
+            },
+            "outcome": "quarantined",
+            "reviewed_at": "2026-09-12T06:00:00.000Z",
+            "publication_status": "quarantined",
+            "source_versions": {
+                "coverage_plan": "v1",
+                "catalog_generation_prompt": "catalog-generation-2026-09-08",
+                "catalog_review_prompt": "catalog-review-2026-09-08"
+            },
+            "history": [],
+            "note": "outcome quarantined; deciding checks [missing_gram_weight]; review flags [none]"
+        },
+        {
+            "id": "c5000000-0000-4000-8000-000000000025",
+            "food_source_key": "ai:condiment_sauce:garlic herb marinade:prepared",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000026",
+            "canonical_identity": {
+                "source_key": "ai:condiment_sauce:garlic herb marinade:prepared",
+                "canonical_name": "garlic herb marinade",
+                "display_name": "Garlic herb marinade",
+                "category": "condiment_sauce",
+                "food_group": "condiment_other",
+                "food_state": "prepared",
+                "nutrition_version": 1,
+                "metadata_version": 1
+            },
+            "aliases": [],
+            "category": "condiment_sauce",
+            "food_state": "prepared",
+            "identity_source": "ai_generated",
+            "identity_status": "verified",
+            "nutrition_provenance": "ai_estimated",
+            "nutrition_method": "ai_generated_estimate_second_model_reviewed",
+            "nutrition_assumptions": "The per-100 g values themselves need no assumption. The defect is the portion set: no portion is marked default, so there is no serving the pipeline could write.",
+            "portion_units": {
+                "default": null,
+                "additional": [
+                    {
+                        "description": "1 tbsp",
+                        "amount": 1,
+                        "unit": "tbsp",
+                        "gram_weight": 15,
+                        "source": "ai_generated_portion"
+                    },
+                    {
+                        "description": "2 tbsp",
+                        "amount": 2,
+                        "unit": "tbsp",
+                        "gram_weight": 30,
+                        "source": "ai_generated_portion"
+                    }
+                ]
+            },
+            "identity_evidence": [
+                {
+                    "url": "https://catalog-fixture.invalid/evidence/garlic-herb-marinade",
+                    "finalHost": "catalog-fixture.invalid",
+                    "status": 200,
+                    "bodySha256": "d4f1a97c6b25e08349fa7c1db6e530824ac9f7be1d035a6c48e921fb7c0a36d5",
+                    "matchedSnippet": "Garlic herb marinade is a generic oil-and-vinegar preparation described in general culinary references.",
+                    "fetchedAt": "2026-09-12T06:00:00.000Z"
+                }
+            ],
+            "checks": [
+                {
+                    "name": "brand_pattern_name",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "generic preparation names only",
+                    "tier": "reject"
+                },
+                {
+                    "name": "unknown_category",
+                    "pass": true,
+                    "observed": "condiment_sauce",
+                    "bound": "a category declared by the coverage plan",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_not_finite",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "finite numbers, or null for unknown",
+                    "tier": "reject"
+                },
+                {
+                    "name": "nutrient_negative",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "greater than or equal to 0",
+                    "tier": "reject"
+                },
+                {
+                    "name": "kcal_ceiling",
+                    "pass": true,
+                    "observed": 176,
+                    "bound": 900,
+                    "tier": "reject"
+                },
+                {
+                    "name": "macro_mass_ceiling",
+                    "pass": true,
+                    "observed": 22.7,
+                    "bound": 102,
+                    "tier": "reject"
+                },
+                {
+                    "name": "energy_macro_mismatch",
+                    "pass": true,
+                    "observed": 0.799999999999983,
+                    "bound": 52.8,
+                    "tier": "reject"
+                },
+                {
+                    "name": "missing_core_nutrient",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "calories, protein_g, carbs_g, fat_g",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "missing_gram_weight",
+                    "pass": false,
+                    "observed": "no default portion",
+                    "bound": "one default portion with a sourced gram weight greater than 0",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "default_portion_count",
+                    "pass": false,
+                    "observed": 0,
+                    "bound": 1,
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsupported_portion",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "positive amounts and sourced gram weights, in a convertible unit",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "unsourced",
+                    "pass": true,
+                    "observed": "verified",
+                    "bound": "verified or ambiguous",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "duplicate_identity",
+                    "pass": true,
+                    "observed": null,
+                    "bound": "a canonical name and food state no published food already holds",
+                    "tier": "quarantine"
+                },
+                {
+                    "name": "out_of_category_range",
+                    "pass": true,
+                    "observed": 176,
+                    "bound": "0-600 kcal/100g for condiment_sauce",
+                    "tier": "review"
+                },
+                {
+                    "name": "allergens_unknown",
+                    "pass": true,
+                    "observed": "known",
+                    "bound": "known",
+                    "tier": "review"
+                }
+            ],
+            "llm_review": {
+                "model": "openai/gpt-4o-mini",
+                "reviewPromptVersion": "catalog-review-2026-09-08",
+                "verdict": "plausible",
+                "confirmedCheckNames": [],
+                "note": "Advisory only: this review confirms no check and supplies no nutrient value."
+            },
+            "outcome": "quarantined",
+            "reviewed_at": "2026-09-12T06:00:00.000Z",
+            "publication_status": "quarantined",
+            "source_versions": {
+                "coverage_plan": "v1",
+                "catalog_generation_prompt": "catalog-generation-2026-09-08",
+                "catalog_review_prompt": "catalog-review-2026-09-08"
+            },
+            "history": [],
+            "note": "outcome quarantined; deciding checks [missing_gram_weight, default_portion_count]; review flags [none]"
         }
     ]
 }
