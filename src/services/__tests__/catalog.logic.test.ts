@@ -104,6 +104,7 @@ import {
     normalizeToPer100g,
     parseCanonicalFdcId,
     parseCatalogSearchQuery,
+    parseCatalogSearchRequest,
     parseCatalogSuggestionsQuery,
     resolveCatalogDisposition,
     resolveCategoryBounds,
@@ -868,6 +869,147 @@ describe('parseCatalogSearchQuery', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * parseCatalogSearchRequest
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The whole query string of `GET /catalog/foods` as one verdict.
+ *
+ * The rule worth pinning here is that a page block the endpoint cannot serve is
+ * REFUSED. `?page=0`, `?page=2.7`, `?page=-1`, `?page=abc` and `?limit=1000`
+ * used to be clamped or truncated by the lenient `parsePagination` and answered
+ * `200 OK` with a page nobody asked for, which is the CWE-20 defect AAP §0.5.2
+ * forbids ("`page >= 1`", "`limit ∈ [1, 50]`", validation "before any Prisma or
+ * planning work … 400 with field codes"). The converse matters just as much and
+ * is asserted first: an OMITTED field still takes the route's default, so a
+ * plain `?q=` request is unaffected.
+ */
+describe('parseCatalogSearchRequest', () => {
+    /** The route's band, from AAP §0.5.2: 25 rows by default, 50 at most. */
+    const DEFAULT_SEARCH_LIMIT = 25;
+    const MAX_SEARCH_LIMIT = 50;
+
+    describe('what it accepts', () => {
+        it('defaults the page block when the request names only q', () => {
+            expect(parseCatalogSearchRequest({ q: 'chicken' })).toEqual({
+                kind: 'ok',
+                q: 'chicken',
+                page: 1,
+                limit: DEFAULT_SEARCH_LIMIT,
+            });
+        });
+
+        it('reads a well-formed page block as Express delivers it', () => {
+            expect(parseCatalogSearchRequest({ q: '  rice  ', page: '3', limit: '10' })).toEqual({
+                kind: 'ok',
+                q: 'rice',
+                page: 3,
+                limit: 10,
+            });
+        });
+
+        it('accepts this route´s maximum page size exactly', () => {
+            expect(parseCatalogSearchRequest({ q: 'rice', limit: String(MAX_SEARCH_LIMIT) })).toMatchObject({
+                kind: 'ok',
+                limit: MAX_SEARCH_LIMIT,
+            });
+        });
+
+        it('takes the first occurrence of every repeated parameter', () => {
+            expect(
+                parseCatalogSearchRequest({ q: ['rice', 'beans'], page: ['2', '9'], limit: ['5', '40'] }),
+            ).toEqual({ kind: 'ok', q: 'rice', page: 2, limit: 5 });
+        });
+    });
+
+    // Each row is a request that used to be silently rewritten and answered
+    // 200. The detail is what the client renders beside its field.
+    describe('what it refuses', () => {
+        it.each([
+            ['a zero page', { q: 'rice', page: '0' }, { field: 'page', code: 'out_of_range' }],
+            ['a negative page', { q: 'rice', page: '-1' }, { field: 'page', code: 'out_of_range' }],
+            ['a fractional page', { q: 'rice', page: '2.7' }, { field: 'page', code: 'invalid' }],
+            ['a nonnumeric page', { q: 'rice', page: 'abc' }, { field: 'page', code: 'invalid' }],
+            ['a blank page', { q: 'rice', page: '' }, { field: 'page', code: 'invalid' }],
+            [
+                'an oversized page',
+                { q: 'rice', page: '99999999999999999999' },
+                { field: 'page', code: 'out_of_range' },
+            ],
+            ['a limit above the cap', { q: 'rice', limit: '51' }, { field: 'limit', code: 'out_of_range' }],
+            ['a limit of a thousand', { q: 'rice', limit: '1000' }, { field: 'limit', code: 'out_of_range' }],
+            ['a zero limit', { q: 'rice', limit: '0' }, { field: 'limit', code: 'out_of_range' }],
+            ['a fractional limit', { q: 'rice', limit: '7.9' }, { field: 'limit', code: 'invalid' }],
+        ])('refuses %s', (_label, query, detail) => {
+            expect(parseCatalogSearchRequest(query)).toMatchObject({
+                kind: 'error',
+                code: 'invalid_request',
+                details: [detail],
+            });
+        });
+
+        it('still refuses a query that is too short, with the page block valid', () => {
+            expect(parseCatalogSearchRequest({ q: 'x', page: '2', limit: '10' })).toEqual({
+                kind: 'error',
+                code: 'invalid_request',
+                message: `q must be between ${MIN_SEARCH_QUERY_LENGTH} and ${MAX_SEARCH_QUERY_LENGTH} characters`,
+                details: [{ field: 'q', code: 'invalid_length' }],
+            });
+        });
+
+        it('refuses a request with no q at all, whatever its page block', () => {
+            expect(parseCatalogSearchRequest({ page: '2' })).toMatchObject({
+                kind: 'error',
+                details: [{ field: 'q', code: 'required' }],
+            });
+        });
+
+        // A query object that is not readable is the same request as an empty
+        // one: the missing `q` is what it is refused for.
+        it.each([
+            ['undefined', undefined],
+            ['null', null],
+            ['a bare string', 'rice'],
+            ['an array', ['rice']],
+        ])('refuses %s as a query object', (_label, query) => {
+            expect(parseCatalogSearchRequest(query)).toMatchObject({
+                kind: 'error',
+                details: [{ field: 'q', code: 'required' }],
+            });
+        });
+
+        // One round trip per malformed request, not one per malformed field,
+        // and the order is the field order of the contract.
+        it('names every failing field, q before page before limit', () => {
+            expect(parseCatalogSearchRequest({ page: 'abc', limit: '0' })).toEqual({
+                kind: 'error',
+                code: 'invalid_request',
+                message: `q is required; page must be a whole number; limit must be between 1 and ${MAX_SEARCH_LIMIT}`,
+                details: [
+                    { field: 'q', code: 'required' },
+                    { field: 'page', code: 'invalid' },
+                    { field: 'limit', code: 'out_of_range' },
+                ],
+            });
+        });
+
+        it('never returns a usable page block alongside a refusal', () => {
+            const verdict = parseCatalogSearchRequest({ q: 'rice', limit: '1000' });
+
+            expect(verdict.kind).toBe('error');
+            expect(verdict).not.toHaveProperty('limit');
+            expect(verdict).not.toHaveProperty('q');
+        });
+    });
+
+    it('declares the band AAP §0.5.2 fixes for this endpoint', () => {
+        expect(parseCatalogSearchRequest({ q: 'rice' })).toMatchObject({ limit: DEFAULT_SEARCH_LIMIT });
+        expect(parseCatalogSearchRequest({ q: 'rice', limit: '50' })).toMatchObject({ limit: 50 });
+        expect(parseCatalogSearchRequest({ q: 'rice', limit: '51' })).toMatchObject({ kind: 'error' });
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * parseCatalogSuggestionsQuery
  * ------------------------------------------------------------------------- */
 
@@ -950,18 +1092,22 @@ describe('parseCatalogSuggestionsQuery', () => {
         );
     });
 
-    // The limit rules are parsePagination's, exercised here through the bounds
-    // this endpoint declares: a request may not draw more than the maximum, an
-    // unreadable value falls back to the default, and nothing can produce a
-    // non-positive page of chips.
-    it('caps the limit at the maximum this endpoint declares', () => {
+    // The limit rules are parsePaginationStrict's, exercised here through the
+    // bounds this endpoint declares: a request may not draw more than the
+    // maximum, and one that asks for more is REFUSED rather than quietly served
+    // a smaller page. It used to be capped — `?limit=31` answered 30 chips with
+    // `200 OK` — which reported success for a request nobody made (CWE-20,
+    // AAP §0.5.2 requires `400 invalid_request` with field codes).
+    it('refuses a limit above the maximum this endpoint declares', () => {
         expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: '31' })).toEqual({
-            kind: 'ok',
-            suggestionKind: 'dislike',
-            limit: CATALOG_SUGGESTIONS_MAX_LIMIT,
+            kind: 'error',
+            code: 'invalid_request',
+            message: `limit must be between 1 and ${CATALOG_SUGGESTIONS_MAX_LIMIT}`,
+            details: [{ field: 'limit', code: 'out_of_range' }],
         });
         expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: '1000' })).toMatchObject({
-            limit: CATALOG_SUGGESTIONS_MAX_LIMIT,
+            kind: 'error',
+            details: [{ field: 'limit', code: 'out_of_range' }],
         });
     });
 
@@ -979,22 +1125,46 @@ describe('parseCatalogSuggestionsQuery', () => {
         ).toMatchObject({ limit: CATALOG_SUGGESTIONS_MAX_LIMIT });
     });
 
+    // Every one of these used to resolve to a number of chips and a `200`: zero
+    // and a negative floored to one row, free text and a blank parameter fell
+    // back to twelve, and `7.9` was truncated to seven. Each is now the field
+    // error its own shape earns — `out_of_range` for a whole number this
+    // endpoint will not serve, `invalid` for a value that is not one.
     it.each([
-        ['zero', '0', 1],
-        ['a negative limit', '-5', 1],
-        ['free text', 'twelve', CATALOG_SUGGESTIONS_DEFAULT_LIMIT],
-        ['an empty limit', '', CATALOG_SUGGESTIONS_DEFAULT_LIMIT],
-        ['a fractional limit', '7.9', 7],
-    ])('resolves %s to %s rows', (_label, limit, expected) => {
+        ['zero', '0', 'out_of_range'],
+        ['a negative limit', '-5', 'out_of_range'],
+        ['free text', 'twelve', 'invalid'],
+        ['an empty limit', '', 'invalid'],
+        ['a whitespace-only limit', '   ', 'invalid'],
+        ['a fractional limit', '7.9', 'invalid'],
+        ['a numeric prefix', '7abc', 'invalid'],
+        ['a non-scalar', {}, 'invalid'],
+    ])('refuses %s with the %s code', (_label, limit, code) => {
         expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit })).toMatchObject({
-            kind: 'ok',
-            limit: expected,
+            kind: 'error',
+            code: 'invalid_request',
+            details: [{ field: 'limit', code }],
         });
     });
 
     it('takes the first occurrence of a repeated limit', () => {
         expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: ['4', '25'] })).toMatchObject({
             limit: 4,
+        });
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: ['31', '4'] })).toMatchObject({
+            kind: 'error',
+            details: [{ field: 'limit', code: 'out_of_range' }],
+        });
+    });
+
+    it('treats a limit nobody sent as absent and serves the default page of chips', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: undefined })).toMatchObject({
+            kind: 'ok',
+            limit: CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
+        });
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: [] })).toMatchObject({
+            kind: 'ok',
+            limit: CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
         });
     });
 

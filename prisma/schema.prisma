@@ -896,14 +896,23 @@ model grocery_items {
 // The idempotency ledger for every keyed write (generate, regenerate, swap,
 // log). A row is RESERVED first and completed by the same transaction, so
 // response_status, response_snapshot and plan_revision_after are nullable and
-// deliberately carry no defaults: NULL means "reserved but not yet completed",
-// and a replay returns the stored status exactly and the stored body as a
-// VALUE deep-equal to the first response — jsonb normalises an object's key
-// order at rest, so the text can differ while every value is preserved — which
-// is why a client cannot tell a replay from the original response and why a
-// test of it must compare the parsed body rather than its JSON text. The
-// precise statement lives with the code that makes the guarantee, in
-// src/services/mealPlanningAction.logic.ts (readStoredResponse).
+// deliberately carry no defaults: NULL means "reserved but not yet completed".
+// A replay returns the stored status exactly and a body that serialises to the
+// SAME BYTES as the first response, which is AAP §0.9.2 read literally: a
+// client cannot tell a replay from the original, and a test of it may assert
+// both the parsed value AND JSON.stringify of the two bodies.
+// What makes the byte equality hold is that this column is only ever written a
+// value whose object keys are already in jsonb's own at-rest order (UTF-8 byte
+// length, then bytes, at every nesting level), so the column has nothing to
+// reorder and the value read back is ordered identically to the value served
+// the first time. That ordering is applied by canonicalizeResponseBody in
+// src/services/mealPlanningAction.logic.ts — on the write path through
+// shapeStoredResponse and again on the read path through readStoredResponse,
+// where it is idempotent for a row this build wrote and is what keeps the
+// guarantee true for a row written by an earlier build. The same function
+// REFUSES a body with no faithful JSON representation (a non-finite number, a
+// Date, a Decimal, a bigint, a cycle) rather than store something a replay
+// could not reproduce, so a value in this column always round-trips.
 // request_fingerprint is what distinguishes a genuine retry from a reused key
 // with a different body.
 model meal_plan_actions {

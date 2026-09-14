@@ -14,17 +14,28 @@
 // EVERY HANDLER HERE IS `getUserId(req)` → A PURE PARSER → ONE SERVICE CALL
 // (AAP §0.7.2, Rule backend-architecture §4). Each request decision these four
 // routes make is owned by a `*.logic.ts` function this file calls —
-// `parseCatalogSearchQuery` and `parseCatalogSuggestionsQuery` in
-// `catalog.logic.ts`, `parseRecipeVersionPath` in `recipe.logic.ts`, and
-// `parsePagination` for the shared page block — so no allowed-value check or
-// coercion is written inline below, and no service is handed a raw request
-// value or asked to answer with a 400-shaped verdict. That is what keeps the
-// validation rules unit-testable without HTTP and the services HTTP-agnostic
-// (§8): they return a DTO or `null`, and the mapping to 400/404/503 happens
-// only in this file.
+// `parseCatalogSearchRequest` and `parseCatalogSuggestionsQuery` in
+// `catalog.logic.ts`, and `parseRecipeVersionPath` in `recipe.logic.ts` — so no
+// allowed-value check or coercion is written inline below, and no service is
+// handed a raw request value or asked to answer with a 400-shaped verdict. That
+// is what keeps the validation rules unit-testable without HTTP and the
+// services HTTP-agnostic (§8): they return a DTO or `null`, and the mapping to
+// 400/404/503 happens only in this file.
+//
+// THE PAGE BLOCK IS PARSED, NOT CLAMPED. `?page=` and `?limit=` used to be read
+// here through the lenient `parsePagination`, which bounds whatever it is given
+// — so `?page=0`, `?page=2.7`, `?page=-1`, `?page=abc` and `?limit=1000` were
+// rewritten into a valid request and answered `200 OK`, reporting success for
+// input nobody sent (CWE-20). `parseCatalogSearchRequest` now validates `q` and
+// the page block as ONE verdict, and the same strict rule reaches
+// `/catalog/foods/suggestions` through its own parser, so every malformed page
+// block leaves this file as `400 invalid_request` with the field named — and it
+// does so before a service, and therefore before Prisma, is reached (§0.5.2).
+// `toPaginationBlock` still builds the response envelope from the parsed pair,
+// so the request and the block it is answered with can never disagree.
 
 import { Request, Response } from 'express';
-import { parseCatalogSearchQuery, parseCatalogSuggestionsQuery } from '../services/catalog.logic';
+import { parseCatalogSearchRequest, parseCatalogSuggestionsQuery } from '../services/catalog.logic';
 import { getStatus, getSuggestions, searchPublishedFoods } from '../services/catalog.service';
 import { MealPlanningDisabledError } from '../services/mealPlanning.errors';
 import { parseRecipeVersionPath } from '../services/recipe.logic';
@@ -32,12 +43,7 @@ import { getRecipeVersionForUser } from '../services/recipe.service';
 import { CatalogSearchResponse } from '../types/catalog';
 import { isMealPlanningEnabled } from '../utils/featureFlags';
 import { getUserId } from '../utils/getUserId';
-import {
-    DEFAULT_LIMIT,
-    MAX_LIMIT,
-    parsePagination,
-    toPaginationBlock,
-} from '../utils/pagination';
+import { toPaginationBlock } from '../utils/pagination';
 
 const FEATURE_DISABLED = 'feature_disabled';
 const RECIPE_NOT_FOUND = 'Recipe not found';
@@ -53,18 +59,14 @@ const handleCatalogError = (res: Response, error: unknown, fallback: string) => 
 export const searchCatalogFoodsController = async (req: Request, res: Response) => {
     try {
         getUserId(req);
-        const parsed = parseCatalogSearchQuery(req.query.q);
+        const parsed = parseCatalogSearchRequest(req.query);
         if (parsed.kind !== 'ok') {
             return res.status(400).json({ error: parsed.code, details: parsed.details });
         }
-        const { page, limit } = parsePagination(req.query, {
-            defaultLimit: DEFAULT_LIMIT,
-            maxLimit: MAX_LIMIT,
-        });
-        const { items, total } = await searchPublishedFoods(parsed.q, page, limit);
+        const { items, total } = await searchPublishedFoods(parsed.q, parsed.page, parsed.limit);
         const response: CatalogSearchResponse = {
             items,
-            pagination: toPaginationBlock(total, page, limit),
+            pagination: toPaginationBlock(total, parsed.page, parsed.limit),
         };
         return res.json(response);
     } catch (error) {

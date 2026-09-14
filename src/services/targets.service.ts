@@ -16,11 +16,15 @@
 // function, called with this transaction's client — rather than issuing its own
 // UPDATE, so there is one statement in the codebase that writes a target value
 // and one place a future change to that write lands. In the same transaction it
-// records `confirmed_targets`, `target_source` and `targets_revision + 1` on
-// `meal_plan_preferences`, which is what makes the canonical read able to tell a
-// confirmed target from a legacy one at all: the legacy route never bumps the
-// revision and leaves no other trace, so the snapshot written here is the only
-// record of what was confirmed. Both halves must commit or neither, or a
+// records `confirmed_targets`, `target_source`, `targets_input_revision`,
+// `estimated_targets` and `targets_revision + 1` on `meal_plan_preferences`,
+// which is what makes the canonical read able to tell a confirmed target from a
+// legacy one at all: the legacy route never bumps the revision and leaves no
+// other trace, so the snapshot written here is the only record of what was
+// confirmed. `estimated_targets` is the companion record of HOW an estimated
+// figure was reached — AAP §0.5.1's "last estimate with input revision" — and
+// exists because the derivation behind a confirmed estimate is otherwise gone
+// the moment the response is sent. Both halves must commit or neither, or a
 // confirmed target would be recorded against preferences that never got it.
 //
 // NEVER GATED BY THE FEATURE FLAG. `/meal-planning/targets*` stays available
@@ -43,6 +47,7 @@ import {
     MealPlanMacroTotals,
     NutritionTargetValues,
     SaveTargetsResponse,
+    StoredEstimateSnapshot,
     TargetEstimateResponse,
     TargetRoute,
     TargetsResponse,
@@ -63,6 +68,7 @@ import {
     TargetsPreferencesRow,
     TargetsUserRow,
     assessFeasibility,
+    buildStoredEstimate,
     computeTargetEstimate,
     deriveTargetsResponse,
     parseSaveTargetsRequest,
@@ -349,6 +355,31 @@ export const getTargetEstimate = async (
 const asSnapshotColumnValue = (values: MealPlanMacroTotals): Prisma.InputJsonValue =>
     values as unknown as Prisma.InputJsonValue;
 
+/**
+ * The stored estimate as the JSONB column takes it, or `undefined` when this
+ * save computed no estimate.
+ *
+ * `undefined` IS PRISMA'S "DO NOT WRITE THIS COLUMN", and that is the whole
+ * manual-save rule in one value: a manual confirmation leaves
+ * `estimated_targets` exactly where it stood, and on the create arm falls
+ * through to the column's own SQL default of NULL. It is NOT
+ * `Prisma.JsonNull`, which would clear the column — the reasoning for
+ * retaining rather than clearing is in {@link writeConfirmedTargets}. The same
+ * semantics are what `preferences.service.ts::nextEstimateInputsRevision`
+ * relies on for its own counter, so there is one reading of `undefined` across
+ * both writers of this row.
+ *
+ * The cast is unavoidable for the reason {@link asSnapshotColumnValue} gives —
+ * `InputJsonValue` wants a string index signature a declared interface does not
+ * have — and is confined here, narrowed to the stored shape rather than
+ * `unknown`, so no call site carries a cast and no other shape can reach the
+ * column.
+ */
+const asStoredEstimateColumnValue = (
+    estimate: StoredEstimateSnapshot | null,
+): Prisma.InputJsonValue | undefined =>
+    estimate === null ? undefined : (estimate as unknown as Prisma.InputJsonValue);
+
 /* ---------------------------------------------------------------------------
  * PUT /meal-planning/targets — the write
  * ------------------------------------------------------------------------- */
@@ -376,10 +407,21 @@ const NOT_STARTED_SETUP_STATUS = 'not_started';
  * Manual targets carry null, because the user typed them and a later change of
  * inputs says nothing about them — leaving a previous estimate's input revision
  * behind would make a manual target claim an ancestry it does not have.
+ *
+ * `estimate` is the whole recomputed figure the estimated arm confirmed, kept
+ * so the write can record it as `meal_plan_preferences.estimated_targets` (AAP
+ * §0.5.1's "last estimate with input revision"). It is null for a manual save,
+ * which computes no estimate — and null here means "write nothing to that
+ * column", never "clear it" (see {@link writeConfirmedTargets}). Carrying the
+ * derivation rather than only the four values is the point: the bmr, the
+ * maintenance rate, the adjustment and the clamp are what make the stored
+ * record an account of HOW the figure was reached, and they exist nowhere else
+ * once the response has been sent.
  */
 interface ResolvedTargetValues {
     values: MealPlanMacroTotals;
     targetsInputRevision: number | null;
+    estimate: StoredEstimateSnapshot | null;
 }
 
 /**
@@ -431,6 +473,11 @@ const resolveEstimatedValues = (
             carbs: estimate.carbs,
             fat: estimate.fat,
         },
+        // The whole figure, not just the four values it resolved to: the stored
+        // record is the only account of the derivation that survives this
+        // request, and `buildStoredEstimate` is the one place its shape is
+        // decided (it is deliberately not this response's shape).
+        estimate: buildStoredEstimate(estimate),
         // `row.revision` is both what `estimateRevision` pins — the wire check a
         // few lines above, which refuses an estimate computed from answers that
         // have since changed — and what is RECORDED as this figure's ancestry,
@@ -500,8 +547,29 @@ const readTargetsRevision = async (
  * as it has become. `StaleTargetsError` is the answer the contract already
  * defines for that (§0.5.2), so refusing costs the client no new behaviour:
  * it re-reads, compares with its draft, and resolves. The pair of tests in
- * `__tests__/targets.service.test.ts` drives exactly that interleaving, and the
- * counter-test shows a merely-locked row still saves.
+ * `src/__tests__/api/targets.test.ts` ("the pinned targets revision as a write
+ * predicate") drives exactly that interleaving from a second session, and the
+ * counter-test there shows a merely-locked row still saves.
+ *
+ * FOUR COLUMNS, ONE STATEMENT. `target_source`, `confirmed_targets`,
+ * `targets_input_revision` and `estimated_targets` are written together with
+ * the bumped `targets_revision`, and together with `users.target_*` in the
+ * caller's transaction. Splitting any of them out would allow a row that claims
+ * a route it has no snapshot for, or an estimate record that explains numbers
+ * the row does not hold.
+ *
+ * WHY A MANUAL SAVE RETAINS THE STORED ESTIMATE RATHER THAN CLEARING IT. AAP
+ * §0.5.1 defines `estimated_targets` as the "last estimate with input
+ * revision" — a record of the last estimate computed FOR THIS USER, not of the
+ * figure currently confirmed. So a user who types their own targets after
+ * confirming an estimate keeps that record: clearing it would destroy the only
+ * account of a calculation that really happened, and it would do so on the one
+ * route where the user is least likely to have any other trace of it. Nothing
+ * can misread the retained value as the confirmed figure, because
+ * `target_source` says which route was confirmed, `confirmed_targets` holds
+ * what was confirmed, and the snapshot carries its own `inputRevision`.
+ * A user who has never confirmed an estimate stores NULL, which is the honest
+ * reading — no estimate was ever computed for them.
  *
  * A missing row is CREATED rather than upserted for the same reason in reverse:
  * there is no revision to pin, the lock makes a concurrent meal-planning create
@@ -517,6 +585,12 @@ const writeConfirmedTargets = async (
         target_source: write.source,
         confirmed_targets: asSnapshotColumnValue(write.resolved.values),
         targets_input_revision: write.resolved.targetsInputRevision,
+        // The estimate this confirmation was computed from, in the SAME
+        // statement as the values it produced — so the record and the figure it
+        // explains can never be half-written. `undefined` on a manual save,
+        // which is retention rather than a clear, for the reason the docblock
+        // above gives.
+        estimated_targets: asStoredEstimateColumnValue(write.resolved.estimate),
     };
 
     if (!write.rowExists) {
@@ -580,7 +654,10 @@ const writeConfirmedTargets = async (
  *     save.
  *  6. Write `users.target_*` through `updateTargets(..., tx)` and record the
  *     snapshot, the source and the bumped revision — the pair that makes the
- *     canonical read truthful.
+ *     canonical read truthful — together with `estimated_targets`, the account
+ *     of the estimate an estimated confirmation was computed from (§0.5.1). A
+ *     manual save leaves that last record standing rather than clearing it; see
+ *     {@link writeConfirmedTargets}.
  *
  * INFEASIBLE-BUT-VALID TARGETS SUCCEED. `assessFeasibility` is advisory: its
  * warnings accompany a 200 and a stored value, and there is no 422 on this
@@ -617,10 +694,14 @@ export const saveTargets = async (
                 throw new StaleTargetsError(storedRevision);
             }
 
-            const resolved =
+            const resolved: ResolvedTargetValues =
                 request.source === 'estimated'
                     ? resolveEstimatedValues(row, request)
-                    : { values: request.values, targetsInputRevision: null };
+                    : // A manual save carries no calculated ancestry and no
+                      // estimate: the user typed these four numbers. `estimate:
+                      // null` leaves any previously stored estimate in place
+                      // rather than clearing it (see `writeConfirmedTargets`).
+                      { values: request.values, targetsInputRevision: null, estimate: null };
 
             await writeConfirmedTargets(locked, userId, {
                 source: request.source,

@@ -52,6 +52,14 @@
  *     regenerate), `swap.service.ts` (commit), `plannedMealLog.service.ts`
  *     (log). There are deliberately no per-action wrappers: four thin wrappers
  *     is how one of them starts skipping the replay gate.
+ *   replayCommittedKeyedAction — the same sequence asked ONE TURN EARLIER, by a
+ *     caller that must judge mutable state before it can open its own
+ *     transaction: today's date in the user's zone, a setup status, a pinned
+ *     revision, a five-second candidate search. Both generation entry points
+ *     use it, because every one of those refusals would otherwise pre-empt the
+ *     replay a lost response entitles the client to. It lives here rather than
+ *     with them because what a used key means is this module's decision, and a
+ *     second implementation would be a second replay policy.
  *   withUserLock — additionally `preferences.service.ts` and
  *     `targets.service.ts`, whose saves are revisioned rather than keyed, and
  *     the grocery writes, which are state-setting (no key, no revision, and no
@@ -740,3 +748,116 @@ export const runKeyedAction = async <TAction extends KeyedActionType>(
             planRevisionAfter: response.planRevisionAfter,
         };
     });
+
+/* ---------------------------------------------------------------------------
+ * The preflight — the same gate, asked before a caller does any work
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The rejection that rolls a preflight transaction back.
+ *
+ * Module-private and its own class, so {@link replayCommittedKeyedAction} can
+ * recognise exactly its own rollback signal and let every other failure — a
+ * conflict, a lock timeout, a connection fault — propagate untouched. A boolean
+ * return from `work` could not do this: `work` must not RESOLVE, because a
+ * resolved `work` is what makes {@link runKeyedAction} complete the reserved
+ * row.
+ *
+ * Verified rather than assumed: Prisma's interactive `$transaction` rethrows the
+ * callback's rejection as the same object (probed against PostgreSQL 16 —
+ * identity and `instanceof` both hold), so the `instanceof` test below is not a
+ * guess about wrapping behaviour.
+ */
+class KeyedActionPreflightRollback extends Error {
+    constructor(actionType: KeyedActionType) {
+        super(
+            `Rolling back the ${actionType} idempotency-key preflight: the key is unused, so nothing may ` +
+                'persist from a transaction that only asked whether it had committed.',
+        );
+        this.name = 'KeyedActionPreflightRollback';
+    }
+}
+
+/**
+ * Answers ONE question before a keyed write does any work: has this exact
+ * request already committed?
+ *
+ *  * the stored {@link KeyedActionResult} — this key committed, so replay it
+ *  * `null` — the key has never been used, so the caller proceeds
+ *  * throws `IdempotencyConflictError` — the key exists with a different
+ *    fingerprint, which is a different request wearing a used key (§0.5.2)
+ *
+ * WHY THIS EXISTS. §0.5.1 fixes the order of a keyed write: lock, then reserve
+ * or replay, and a matching fingerprint "replay[s] the stored `response_status`
+ * and `response_snapshot` verbatim and end[s] the transaction BEFORE any
+ * revision or status check, so a committed action replays even when the plan has
+ * since moved on". {@link runKeyedAction} honours that for everything inside its
+ * transaction — but generation and regeneration must judge mutable state and run
+ * a five-second candidate search BEFORE the transaction opens, because §0.5.1
+ * equally requires the candidate week to be "computed in memory before the
+ * transaction" (a transaction holding the per-user lock for a five-second search
+ * would block every other write that user makes). Those pre-transaction
+ * refusals sit in front of the replay gate, and for a regeneration one of them
+ * is CERTAIN to fire on the retry path: a successful regeneration supersedes the
+ * very plan the request pinned, so the immediate same-key retry — exactly what a
+ * client sends when the response was lost — would be answered
+ * `409 plan_not_active` and could never reach its stored `201`. A generation
+ * fails the same way less deterministically, through the preference gate, a
+ * moved revision, a start-date window the clock has shifted under it, or a
+ * search that now reports `no_matching_meals`.
+ *
+ * WHY IT REUSES `runKeyedAction` RATHER THAN READING THE LEDGER ITSELF. The
+ * fingerprint comparison, the pending-row invariant and the stored-response
+ * shaping all live behind functions this module keeps private —
+ * `reserveAction`, `readAction` and `replayReservedAction`, §0.5.1's
+ * reserve-or-replay step — over the pure `decideReplay` / `readStoredResponse`.
+ * A second implementation would be a second replay policy, and the two would
+ * drift on the first change to either. So this calls the authoritative gate and
+ * supplies a `work` that cannot succeed:
+ *
+ *  * key committed  -> `runKeyedAction` replays through its own path and never
+ *    reaches `work`; the transaction commits, having only read
+ *  * key unused     -> the reservation is made, `work` rejects with
+ *    {@link KeyedActionPreflightRollback}, and the whole transaction rolls back,
+ *    so the reserved row disappears with it (probed: zero `meal_plan_actions`
+ *    rows survive) and the answer is `null`
+ *  * fingerprint differs -> `IdempotencyConflictError` is raised before `work`
+ *    is called at all
+ *
+ * THIS DOES NOT REPLACE THE FINAL LOCKED GATE, and neither may be "simplified"
+ * away. The gate inside the caller's own transaction stays the authority: a key
+ * that commits on another connection WHILE this request is searching must still
+ * replay rather than reserve twice, and only a gate in the publishing
+ * transaction can see that. This preflight is an early exit on the ERROR path —
+ * it turns a refusal that would have pre-empted a replay into the replay itself
+ * — and it deliberately makes no decision the gate does not make again.
+ *
+ * WHY IT LIVES HERE. It is the keyed-write sequence asked one turn earlier, so
+ * it belongs to the module that owns that sequence (Rule `backend-architecture`
+ * §5, §7.1): one file decides what a used key means, and a caller that must
+ * judge mutable state before its transaction imports this rather than writing a
+ * variant of it. It is generic in exactly the way `runKeyedAction` is — it takes
+ * {@link KeyedActionParams} and nothing about plans — and it is not a
+ * per-action wrapper; there are still none of those.
+ *
+ * The transaction is two statements long — the advisory lock and the
+ * reservation attempt — so the serialisation it costs the user is negligible
+ * beside the work that follows it.
+ */
+export const replayCommittedKeyedAction = async (
+    params: KeyedActionParams,
+): Promise<KeyedActionResult | null> => {
+    const rollback = new KeyedActionPreflightRollback(params.actionType);
+
+    try {
+        return await withMealPlanningTransaction((tx) =>
+            runKeyedAction(tx, params, () => Promise.reject(rollback)),
+        );
+    } catch (error) {
+        if (error === rollback || error instanceof KeyedActionPreflightRollback) {
+            return null;
+        }
+
+        throw error;
+    }
+};

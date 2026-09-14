@@ -27,8 +27,10 @@
 //    `recipe.logic.ts`), the repetition window with the current meal REMOVED,
 //    the portion choice, the ranking, the eight-row truncation — which the
 //    preview and the commit inherit, because `selectSwapCandidate` picks one of
-//    the LISTED rows (§0.7.3) — the preview binding (`requireBoundPortion`) and
-//    the columns a commit writes (`swapMealWrite`).
+//    the LISTED rows (§0.7.3) — the preview binding (`requireBoundPortion`),
+//    the columns a commit writes (`swapMealWrite`) and the predicate they are
+//    written through (`swapMealWhere`), which are one pair built from one row so
+//    the revision the write advances is the revision the write is addressed by.
 //  * `mealPlan.mapper.ts` owns the plan's SHAPE: the meal and day DTOs,
 //    portion-text rendering, the reading of stored day keys, flags and targets
 //    snapshots, the grouping of linked diary entries, and the one display
@@ -179,6 +181,7 @@ import {
     requireBoundPortion,
     selectSwapCandidate,
     selectSwapCandidates,
+    swapMealWhere,
     swapMealWrite,
 } from './swap.logic';
 import { getTargets } from './targets.service';
@@ -851,8 +854,10 @@ export const getSwapAlternatives = async (
  * `quantity × portionMultiplier / yieldServings`, exactly as recipe detail
  * derives its "Your portion" column. Emitting a scaled copy as well would give
  * one number two sources of truth and put a display-rounding rule in a second
- * place. The mobile side applies that formula through the one shared helper
- * both screens call (`mobile/src/utility/RecipeIngredientUtility.ts`).
+ * place. The mobile side applies that formula through the one shared helper both
+ * screens call: `mobile/src/utility/ServingsUtility.ts`, whose
+ * `plannedPortionFactor` is the `portionMultiplier / yieldServings` above and
+ * whose `scaleIngredientsForDisplay` renders each row at that factor.
  *
  * `planRevision` is the revision the preview was computed against; the client
  * sends it back as `expectedPlanRevision` to commit, and a plan that has moved
@@ -960,7 +965,12 @@ export const getSwapPreview = async (
  *  5. THE MEAL is written from `swapMealWrite`: the new version and portion, the
  *     planned macros at full precision, the outgoing version as
  *     `previous_recipe_version_id`, the injected `now` as `swapped_at`, and the
- *     meal's next revision.
+ *     meal's next revision — through `swapMealWhere`'s predicate, so the
+ *     statement carries the owner, the parent plan AND the revision the
+ *     selection read (§0.5.1). The meal's own counter is compare-and-swapped
+ *     here for the same reason the plan's is at step 8: the two move
+ *     independently, so a change that reached THIS row since step 2 is invisible
+ *     to the plan's check and would otherwise be overwritten.
  *  6. THE DAY'S `planned_*` are rewritten from the candidate's
  *     `dayTotalsIfSwapped`, which IS `computeDayTotals` over this day with this
  *     candidate substituted in the stored order — the very value the preview
@@ -1107,19 +1117,32 @@ interface SwapWrite {
  * new plan revision.
  *
  * Each predicate carries the owner key AND the parent chain — `{id, user_id,
- * meal_plan_id}` for the meal, `{id, user_id, meal_plan_id}` for the day,
- * `{id, user_id, revision}` for the plan (§5.1, §0.5.1) — and `updateMany` is
- * used rather than `update` precisely so the full predicate can be expressed:
- * `update` needs a unique key and would become an id-only write after a separate
- * ownership read, which is the pattern the rule forbids.
+ * meal_plan_id, revision}` for the meal (from `swap.logic.ts::swapMealWhere`),
+ * `{meal_plan_id, user_id, date}` for the day, `{id, user_id, revision}` for the
+ * plan (§5.1, §0.5.1) — and `updateMany` is used rather than `update` precisely
+ * so the full predicate can be expressed: `update` needs a unique key and would
+ * become an id-only write after a separate ownership read, which is the pattern
+ * the rule forbids.
+ *
+ * TWO OF THE THREE ARE COMPARE-AND-SWAPS, on two counters that move
+ * independently. The plan's write pins `revision`, so a stale commit cannot win
+ * even if the lock were somehow not held; the meal's write pins ITS OWN
+ * `revision`, because a change confined to this row moves no plan counter and
+ * the plan's check would pass straight over it. Without that second pin, a write
+ * that reached this meal between the context read at step 2 and this statement
+ * would be silently overwritten and the commit would report success for a meal
+ * it had clobbered — so the meal is addressed by the revision the selection was
+ * computed from, and by nothing looser.
  *
  * Every affected-row count is CHECKED rather than assumed. All three rows were
  * read under the per-user advisory lock this transaction holds, so a count of
- * anything but one means an invariant this module depends on is broken, and
- * reporting a successful swap for a write that did not happen would be worse
- * than failing. The plan's write additionally pins `revision`, so it is a
- * compare-and-swap: even if the lock were somehow not held, a stale commit could
- * not win.
+ * anything but one means either that invariant is broken or a compare-and-swap
+ * lost, and reporting a successful swap for a write that did not happen would be
+ * worse than failing. The failure is one class — `SwapDataError`, a 500 — and
+ * deliberately so: every writer of these rows takes the lock, so there is no
+ * legitimate concurrent path for a client to be told to retry, and a swap that
+ * cannot write the row it selected is a server fault to surface rather than a
+ * conflict to negotiate.
  *
  * THE MEAL'S `flags` COLUMN IS PART OF THAT WRITE, and it is written on every
  * commit rather than only when something was flagged: `swapMealWrite` decides
@@ -1144,7 +1167,7 @@ const applySwap = async (tx: Prisma.TransactionClient, write: SwapWrite): Promis
     const { flags, ...mealColumns } = swapMealWrite(meal, candidate, write.now);
 
     const written = await tx.meal_plan_meals.updateMany({
-        where: { id: context.mealId, user_id: userId, meal_plan_id: context.planId },
+        where: swapMealWhere(meal, { userId, planId: context.planId }),
         data: { ...mealColumns, flags: asJsonValue(flags) },
     });
 

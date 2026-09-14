@@ -67,7 +67,15 @@ import type {
 } from './lib/manifest';
 import { ModelBudgetError } from './lib/budget';
 import { RateLimitConfigError, createUsdaRateLimiter, getUsdaImportRateLimitPerHour } from './lib/rateLimiter';
-import { CheckpointError, appendRunLog, finishRun, openOrResumeRun, recordCounts, saveCursor } from './lib/checkpoint';
+import {
+    CheckpointError,
+    appendRunLog,
+    finishRun,
+    openOrResumeRun,
+    recordCounts,
+    saveCursor,
+    withCatalogStageLock,
+} from './lib/checkpoint';
 import type { CatalogRunDb } from './lib/checkpoint';
 
 // The normaliser and the checks. Pure, so importing it costs nothing and opens
@@ -1674,16 +1682,16 @@ export const dedupeSortedAliases = (aliases: readonly string[], canonicalName: s
  */
 export interface ImportDb {
     catalog_foods: {
-        findUnique(args: unknown): Promise<{
-            id: string;
-            imported_at: Date | null;
-            metadata_version: number | null;
-            canonical_name: string | null;
-            food_group: string | null;
-            allergen_status: string | null;
-            allergen_tags: string[] | null;
-            diet_tags: string[] | null;
-        } | null>;
+        /**
+         * The stored row carries `id` and `imported_at` for the write itself
+         * and {@link StoredVersionedFacts} for the version decision, as one
+         * intersection rather than a second hand-maintained field list: a fact
+         * the comparison reads and the read does not return would be invisible
+         * to it, and that is the failure this shape rules out.
+         */
+        findUnique(
+            args: unknown,
+        ): Promise<({ id: string; imported_at: Date | null } & StoredVersionedFacts) | null>;
         create(args: unknown): Promise<{ id: string }>;
         update(args: unknown): Promise<{ id: string }>;
     };
@@ -1703,6 +1711,220 @@ export interface ImportDb {
 
 /** What persisting one record did, so the report counts real outcomes. */
 export type PersistOutcome = 'inserted' | 'updated';
+
+/**
+ * Everything the two version counters on `catalog_foods` answer for, plus the
+ * counters themselves.
+ *
+ * Every field is optional and nullable on purpose. The columns Prisma reads
+ * back are nullable where prisma/schema.prisma says so — the five nutrients
+ * and `density_g_per_ml` are `DOUBLE PRECISION NULL`, where NULL means unknown
+ * and never zero — and a field the caller has no value for arrives as
+ * `undefined`. {@link nextCatalogFoodVersions} normalises the two into one
+ * "no value" so neither reads as a change against the other.
+ */
+export interface StoredVersionedFacts {
+    /**
+     * The counters as stored. Read from the existing row only — the incoming
+     * facts do not carry a version, because what the next version IS is this
+     * module's decision rather than the vendor payload's.
+     */
+    nutrition_version?: number | null;
+    metadata_version?: number | null;
+
+    // THE NUTRITION SET: the five values `recipe_ingredients.snapshot_per_100g`
+    // freezes, the three that fix what "per 100" means (a per_100ml basis, a
+    // basis amount of 50 or a density each change what the same five numbers
+    // describe), the provenance `snapshot_provenance` freezes, and the vendor
+    // facts the numbers were read from — a different fdc id, data type or
+    // publication month means a different source record produced them, which a
+    // recipe holding the old snapshot has to be told about.
+    calories?: number | null;
+    protein_g?: number | null;
+    carbs_g?: number | null;
+    fat_g?: number | null;
+    fiber_g?: number | null;
+    nutrition_basis?: string | null;
+    basis_amount?: number | null;
+    density_g_per_ml?: number | null;
+    nutrition_provenance?: string | null;
+    usda_fdc_id?: number | null;
+    usda_data_type?: string | null;
+    source_version?: string | null;
+
+    // THE METADATA SET: identity and safety. `snapshot_name` freezes the name a
+    // recipe displays, `snapshot_allergen_tags` and `snapshot_diet_tags` freeze
+    // what it may claim, and `food_group` is what a user's dislike selection
+    // excludes by. `allergen_status` is here because 'known' → 'unknown' is a
+    // change of safety standing even when the tag list is untouched.
+    canonical_name?: string | null;
+    display_name?: string | null;
+    food_group?: string | null;
+    allergen_status?: string | null;
+    allergen_tags?: readonly string[] | null;
+    diet_tags?: readonly string[] | null;
+}
+
+// TWO FIELDS THIS STAGE WRITES ARE DELIBERATELY IN NEITHER SET, because the
+// next reader's first instinct is to add them and a spurious bump is not free:
+// it makes every recipe using the food stale, and `recipes-seed.ts` answers a
+// stale ingredient by publishing a NEW recipe version and retiring the old one.
+//   * source_cache_key is retrieval bookkeeping — the key of the batch response
+//     this row was read out of. Re-fetching the same food in a differently
+//     composed batch changes it while changing no snapshot value and no
+//     provenance, so bumping on it would version the catalog by how the import
+//     happened to group its requests.
+//   * category is read by no snapshot column. It drives the grocery aisle,
+//     which is derived live from the current row at list time, so a
+//     recategorised food is already reported correctly without a new version.
+// Both remain fully written by the upsert below; they are simply not evidence
+// that a frozen snapshot has stopped describing this food.
+
+/** The two counters to write, and which set moved to get them there. */
+export interface CatalogFoodVersions {
+    readonly nutritionVersion: number;
+    readonly metadataVersion: number;
+    /** False on an insert: a new row's counters start at 1, they do not move. */
+    readonly nutritionChanged: boolean;
+    readonly metadataChanged: boolean;
+}
+
+/**
+ * The Prisma `select` the version decision needs, typed as a total record over
+ * {@link StoredVersionedFacts} so that adding a field to a comparison set
+ * without selecting it is a compile error. Left unselected it would arrive as
+ * `undefined` on every read and bump the counter on every rerun.
+ */
+const VERSIONED_FACT_SELECT: Record<keyof StoredVersionedFacts, true> = {
+    nutrition_version: true,
+    metadata_version: true,
+    calories: true,
+    protein_g: true,
+    carbs_g: true,
+    fat_g: true,
+    fiber_g: true,
+    nutrition_basis: true,
+    basis_amount: true,
+    density_g_per_ml: true,
+    nutrition_provenance: true,
+    usda_fdc_id: true,
+    usda_data_type: true,
+    source_version: true,
+    canonical_name: true,
+    display_name: true,
+    food_group: true,
+    allergen_status: true,
+    allergen_tags: true,
+    diet_tags: true,
+};
+
+/**
+ * Order-insensitive set comparison for the two tag arrays: a food whose diet
+ * tags came back in a different order has not changed, and versioning it would
+ * be versioning the vendor's array ordering.
+ */
+const sameStringSet = (
+    left: readonly string[] | null | undefined,
+    right: readonly string[] | null | undefined,
+): boolean => {
+    const a = [...(left ?? [])].sort();
+    const b = [...(right ?? [])].sort();
+    return a.length === b.length && a.every((value, index) => value === b[index]);
+};
+
+/**
+ * One fact compared, with absent and NULL treated as the same "no value".
+ *
+ * Strict equality is the right test for the numbers here: they are read per
+ * 100 g out of the same vendor payload by the same deterministic code, so a
+ * rerun that changes nothing produces bit-identical doubles, and a tolerance
+ * would only hide a real vendor revision. What DOES need normalising is
+ * `undefined` vs `null` — `fiber_g` is written as `?? null` and a fact the
+ * caller omits arrives as `undefined` — which without this would read as a
+ * change on every single rerun.
+ */
+const sameFact = (
+    left: string | number | null | undefined,
+    right: string | number | null | undefined,
+): boolean => (left ?? null) === (right ?? null);
+
+/**
+ * Both version counters for the row about to be written.
+ *
+ * WHY THIS EXISTS AT ALL. `recipe_ingredients` freezes `snapshot_per_100g`,
+ * `snapshot_name`, `snapshot_provenance`, `snapshot_allergen_tags` and
+ * `snapshot_diet_tags` beside the two counters they were taken at, and
+ * `src/services/recipe.logic.ts::isIngredientSnapshotStale` detects a stale
+ * snapshot by comparing BOTH counters for INEQUALITY — nothing compares the
+ * values themselves. A counter that is reset to 1, or that fails to move when
+ * its facts did, therefore means a published recipe goes on claiming nutrition
+ * or safety metadata the catalog no longer states: with the allergen set that
+ * is a safety bug, not a cosmetic one (AAP §0.5.1, §0.7.3, and the counter
+ * contract "nutrition_version bumped on any nutrient change, metadata_version
+ * bumped on any allergen/diet/name/food-group change").
+ *
+ * Each counter answers for its own set and only its own: a renamed food does
+ * not reversion its nutrition, and a changed nutrient does not reversion its
+ * safety metadata, because either spurious bump forces a needless new recipe
+ * version across every recipe using the food. An unchanged set PRESERVES the
+ * stored counter rather than recomputing it, which is what keeps a no-op rerun
+ * byte-identical and an exported release stable.
+ *
+ * `next` may carry more than the compared facts — the caller passes the whole
+ * scalar set it is about to write — and everything outside the two sets above
+ * is ignored.
+ *
+ * @param existing the stored row, or `null` when this `source_key` is new
+ * @param next the facts about to be written
+ *
+ * @example
+ * // A rerun that changed nothing keeps both counters where they were.
+ * nextCatalogFoodVersions({ nutrition_version: 3, metadata_version: 2, calories: 165 }, { calories: 165 });
+ * // → { nutritionVersion: 3, metadataVersion: 2, nutritionChanged: false, metadataChanged: false }
+ */
+export const nextCatalogFoodVersions = (
+    existing: StoredVersionedFacts | null,
+    next: StoredVersionedFacts,
+): CatalogFoodVersions => {
+    // A new row is at version 1 on both counters. There is no stored snapshot
+    // of it anywhere yet, so nothing has moved and nothing can be stale.
+    if (existing === null) {
+        return { nutritionVersion: 1, metadataVersion: 1, nutritionChanged: false, metadataChanged: false };
+    }
+
+    const nutritionChanged =
+        !sameFact(existing.calories, next.calories) ||
+        !sameFact(existing.protein_g, next.protein_g) ||
+        !sameFact(existing.carbs_g, next.carbs_g) ||
+        !sameFact(existing.fat_g, next.fat_g) ||
+        !sameFact(existing.fiber_g, next.fiber_g) ||
+        !sameFact(existing.nutrition_basis, next.nutrition_basis) ||
+        !sameFact(existing.basis_amount, next.basis_amount) ||
+        !sameFact(existing.density_g_per_ml, next.density_g_per_ml) ||
+        !sameFact(existing.nutrition_provenance, next.nutrition_provenance) ||
+        !sameFact(existing.usda_fdc_id, next.usda_fdc_id) ||
+        !sameFact(existing.usda_data_type, next.usda_data_type) ||
+        !sameFact(existing.source_version, next.source_version);
+
+    const metadataChanged =
+        !sameFact(existing.canonical_name, next.canonical_name) ||
+        !sameFact(existing.display_name, next.display_name) ||
+        !sameFact(existing.food_group, next.food_group) ||
+        !sameFact(existing.allergen_status, next.allergen_status) ||
+        !sameStringSet(existing.allergen_tags, next.allergen_tags) ||
+        !sameStringSet(existing.diet_tags, next.diet_tags);
+
+    // A stored counter this stage never wrote (a hand-loaded row, a release
+    // predating the column) is read as 1 rather than as "no version": the
+    // column is NOT NULL in the schema, and treating a missing counter as 0
+    // would silently renumber a snapshot that already cites 1.
+    return {
+        nutritionVersion: (existing.nutrition_version ?? 1) + (nutritionChanged ? 1 : 0),
+        metadataVersion: (existing.metadata_version ?? 1) + (metadataChanged ? 1 : 0),
+        nutritionChanged,
+        metadataChanged,
+    };
+};
 
 /**
  * Writes one food, its aliases, its portions and its validation record.
@@ -1725,38 +1947,15 @@ export const persistPreparedFood = async (
         select: {
             id: true,
             imported_at: true,
-            metadata_version: true,
-            canonical_name: true,
-            food_group: true,
-            allergen_status: true,
-            allergen_tags: true,
-            diet_tags: true,
+            ...VERSIONED_FACT_SELECT,
         },
     });
 
-    // metadata_version is what a recipe's ingredient snapshot compares itself
-    // against to notice that a food's SAFETY or identity metadata has moved
-    // (AAP 0.5.1, 0.7.3): a stale snapshot is detected by version, so leaving
-    // the version at 1 while changing an allergen set would hide exactly the
-    // change a published recipe most needs to see. It is therefore bumped
-    // whenever any of those fields differs from what is stored, and left alone
-    // when nothing did, so a no-op rerun stays byte-identical.
-    const sameStringSet = (left: readonly string[] | null, right: readonly string[]): boolean => {
-        const a = [...(left ?? [])].sort();
-        const b = [...right].sort();
-        return a.length === b.length && a.every((value, index) => value === b[index]);
-    };
-    const metadataChanged =
-        existing !== null &&
-        (existing.canonical_name !== prepared.row.canonical_name ||
-            existing.food_group !== prepared.row.food_group ||
-            existing.allergen_status !== prepared.candidate.allergen_status ||
-            !sameStringSet(existing.allergen_tags, prepared.candidate.allergen_tags ?? []) ||
-            !sameStringSet(existing.diet_tags, prepared.row.diet_tags));
-    const metadataVersion =
-        existing === null ? 1 : (existing.metadata_version ?? 1) + (metadataChanged ? 1 : 0);
-
-    const scalars = {
+    // Assembled without the two version counters, because the counters are
+    // DERIVED from these very values: comparing what this write is about to
+    // store — rather than re-reading `prepared` a second time — is what keeps
+    // the comparison and the write from ever describing different facts.
+    const facts = {
         canonical_name: prepared.row.canonical_name,
         display_name: prepared.row.display_name,
         category: prepared.row.category,
@@ -1764,8 +1963,6 @@ export const persistPreparedFood = async (
         identity_source: 'usda',
         identity_status: prepared.row.identity_status,
         nutrition_provenance: 'source_backed',
-        nutrition_version: 1,
-        metadata_version: metadataVersion,
         nutrition_basis: 'per_100g',
         basis_amount: 100,
         calories: prepared.candidate.calories,
@@ -1788,6 +1985,13 @@ export const persistPreparedFood = async (
         cost_class: prepared.row.cost_class,
         search_text: prepared.row.search_text,
         updated_at: now,
+    };
+
+    const versions = nextCatalogFoodVersions(existing, facts);
+    const scalars = {
+        ...facts,
+        nutrition_version: versions.nutritionVersion,
+        metadata_version: versions.metadataVersion,
     };
 
     const foodId =
@@ -2337,6 +2541,12 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
         const byCategory: Record<string, number> = {};
         const byCheck: Record<string, number> = {};
         let processedBatches = 0;
+        // The batch index the durable `batchesProcessed` total was last brought
+        // up to. It starts at the RESUME index, not at 0: recordCounts merges
+        // additively into the run row, the earlier invocation already recorded
+        // the batches it did, and starting from 0 would record them a second
+        // time. On a fresh run startIndex is 0, so the two readings agree.
+        let lastCheckpointBatchIndex = startIndex;
 
         for (let index = startIndex; index < plan.batches.length; index += 1) {
             const batch = plan.batches[index];
@@ -2390,9 +2600,16 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                     fingerprint: plan.fingerprint,
                     nextBatchIndex: done,
                 });
+                // The batches THIS checkpoint covers, never the save interval:
+                // the final partial checkpoint of a 7-batch run covers 2, and
+                // recording 5 would overstate the durable total by 3 for the
+                // rest of the run's life. The delta needs no lower guard — this
+                // block is reached only when `done` advanced past the previous
+                // checkpoint, so it is always at least 1.
                 await recordCounts(deps.runDb, claim.run.id, {
-                    batchesProcessed: CURSOR_SAVE_EVERY_BATCHES,
+                    batchesProcessed: done - lastCheckpointBatchIndex,
                 });
+                lastCheckpointBatchIndex = done;
                 logger.info('batch_progress', {
                     stage: STAGE,
                     batch: done,
@@ -2600,7 +2817,7 @@ const main = async (): Promise<number> => {
     const coveragePlan = loadCoveragePlan();
     const requestsPerHour = getUsdaImportRateLimitPerHour(process.env);
 
-    const outcome = await runImport({
+    const importDeps: RunImportDeps = {
         db: prisma as unknown as ImportDb,
         runDb: prisma as unknown as CatalogRunDb,
         usda: {
@@ -2649,7 +2866,28 @@ const main = async (): Promise<number> => {
             fs.mkdirSync(path.dirname(target), { recursive: true });
             fs.writeFileSync(target, `${JSON.stringify(report, null, 2)}\n`, 'utf-8');
         },
-    });
+    };
+
+    // THE IMPORT'S STAGE CLAIM, AND THE ONE INVOCATION THAT DOES NOT TAKE IT.
+    //
+    // A real import MUTATES the catalog graph — it upserts foods and replaces
+    // their aliases and portions by source_key — so it holds the catalog-graph
+    // lock EXCLUSIVELY for as long as it runs, and no second import, no
+    // generation, no validation pass and no release load can hold it at the same
+    // time (lib/checkpoint.ts's THE STAGE LOCK). The run claim cannot give this:
+    // its advisory lock is transaction-scoped and released the moment the claim
+    // commits, so it guarantees one run ROW rather than one writer, and a
+    // validation pass judging a row this import is about to rewrite was the
+    // difference between those two promises.
+    //
+    // A DRY RUN TAKES NO LOCK, for the same reason it opens no run: it reaches
+    // neither `db` nor `runDb` — reportDryRun touches only the plan it was
+    // handed, and the suite proves it by refusing every property access on both
+    // clients — so it has nothing to exclude and nothing to be excluded from. An
+    // operator must be able to ask what an import would do while one is running.
+    const outcome = parsed.options.dryRun
+        ? await runImport(importDeps)
+        : await withCatalogStageLock({ stage: 'usda_import', logger }, () => runImport(importDeps));
 
     logger.info('stage_completed', {
         stage: STAGE,

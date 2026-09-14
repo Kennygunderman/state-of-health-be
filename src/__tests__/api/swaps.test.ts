@@ -490,6 +490,32 @@ describe('a committed swap', () => {
         expect(others.map((meal) => meal.swapped_at)).toEqual([null, null]);
     });
 
+    it('writes the meal through a predicate carrying the revision it currently stands at', async () => {
+        // §0.5.1 addresses a revisioned row by `{id, user_id, meal_plan_id}`
+        // AND its expected `revision`, and this is the case that proves the
+        // fourth column is the CURRENT one rather than a constant or the
+        // advanced value. The meal is moved off revision 1 first — a plan whose
+        // meal has already been swapped once is the ordinary state of things —
+        // and the commit then has to find it at 4 and leave it at 5. A predicate
+        // pinning `revision + 1` would match nothing here and the commit would
+        // fail; one pinning a literal 1 would match nothing either. The plan's
+        // own revision is untouched by the bump, which is exactly why the
+        // plan-level compare-and-swap cannot stand in for this one: the two
+        // counters move independently.
+        await prisma.$executeRaw`UPDATE meal_plan_meals SET revision = 4 WHERE id = ${fixture.lunchMealId}::uuid`;
+
+        const result = await commitResultOrThrow(swapBody(fixture.equalPortionCandidate.id, 1));
+        const lunch = await storedLunch();
+
+        expect(lunch.revision).toBe(5);
+        expect(lunch.recipe_version_id).toBe(fixture.equalPortionCandidate.id);
+        expect(lunch.previous_recipe_version_id).toBe(fixture.lunchRecipe.id);
+        // The plan's counter still advanced by exactly one from the revision the
+        // client pinned, so the meal's history has no effect on the plan's.
+        expect(result.planRevisionAfter).toBe(PLAN_REVISION_AFTER);
+        expect((await storedPlan()).revision).toBe(PLAN_REVISION_AFTER);
+    });
+
     it("rewrites the day's stored totals from the candidate's own resulting day", async () => {
         const preview = await previewOrThrow(fixture.equalPortionCandidate.id);
 

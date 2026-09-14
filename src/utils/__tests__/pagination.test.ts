@@ -17,6 +17,7 @@ import {
     MAX_PAGE,
     MAX_ROWS,
     parsePagination,
+    parsePaginationStrict,
     rowWindowFor,
     toPaginationBlock,
 } from '../pagination';
@@ -186,6 +187,285 @@ describe('parsePagination', () => {
                 page: DEFAULT_PAGE,
                 limit: DEFAULT_LIMIT,
             });
+        });
+    });
+});
+
+/**
+ * `parsePaginationStrict` is the REQUEST boundary, and the cases below are
+ * chosen for the one property that distinguishes it from its lenient sibling:
+ * a value the endpoint cannot serve is REFUSED, never rewritten. Every row
+ * here is a request that used to be answered `200 OK` with a different page
+ * than the one asked for (AAP §0.5.2 requires `400 invalid_request` with field
+ * codes; answering success for silently normalized input is CWE-20), plus the
+ * converse — an OMITTED field still takes its default, because a request that
+ * names no page is a well-formed request for the first one.
+ */
+describe('parsePaginationStrict', () => {
+    /** The `/catalog/foods/suggestions` band, used for the option cases. */
+    const SUGGESTION_OPTIONS = { defaultLimit: 12, maxLimit: 30 };
+
+    describe('what it accepts', () => {
+        it('applies both defaults when the query names neither field', () => {
+            expect(parsePaginationStrict({})).toEqual({
+                kind: 'ok',
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            });
+        });
+
+        it('reads well-formed values as Express delivers them', () => {
+            expect(parsePaginationStrict({ page: '3', limit: '10' })).toEqual({
+                kind: 'ok',
+                page: 3,
+                limit: 10,
+            });
+        });
+
+        it('reads values a typed caller has already coerced to numbers', () => {
+            expect(parsePaginationStrict({ page: 4, limit: 50 })).toEqual({
+                kind: 'ok',
+                page: 4,
+                limit: 50,
+            });
+        });
+
+        it('accepts each bound exactly, so > and >= cannot drift', () => {
+            expect(parsePaginationStrict({ page: '1', limit: '1' })).toMatchObject({ page: 1, limit: 1 });
+            expect(parsePaginationStrict({ page: String(MAX_PAGE), limit: String(MAX_LIMIT) })).toMatchObject({
+                page: MAX_PAGE,
+                limit: MAX_LIMIT,
+            });
+        });
+
+        it('tolerates whitespace around an otherwise well-formed value', () => {
+            expect(parsePaginationStrict({ page: ' 2 ', limit: '\t25\n' })).toMatchObject({
+                page: 2,
+                limit: 25,
+            });
+        });
+
+        // `qs` yields an array for a repeated parameter; the first occurrence
+        // wins, as it does in the lenient parser. A repeated parameter with no
+        // values at all carries nothing to read and is therefore absent.
+        it('takes the first occurrence of a repeated parameter', () => {
+            expect(parsePaginationStrict({ page: ['3', '9'], limit: ['10', '40'] })).toMatchObject({
+                page: 3,
+                limit: 10,
+            });
+        });
+
+        it('treats a repeated parameter with no values as absent', () => {
+            expect(parsePaginationStrict({ page: [], limit: [] })).toEqual({
+                kind: 'ok',
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            });
+        });
+
+        it('treats an explicitly undefined member as absent', () => {
+            expect(parsePaginationStrict({ page: undefined, limit: undefined })).toEqual({
+                kind: 'ok',
+                page: DEFAULT_PAGE,
+                limit: DEFAULT_LIMIT,
+            });
+        });
+    });
+
+    // Not a whole number at all: the correction is "send a number", which is
+    // what the `invalid` code asks for. `parseInt` would have read a PREFIX of
+    // each of the first four and answered a page the caller never requested.
+    describe('what it refuses as unreadable', () => {
+        it.each([
+            ['a fraction', '2.7'],
+            ['a numeric prefix', '2abc'],
+            ['free text', 'abc'],
+            ['exponent notation', '1e3'],
+            ['a hexadecimal literal', '0x10'],
+            ['a thousands separator', '1,000'],
+            ['a leading plus', '+5'],
+            ['a blank parameter', ''],
+            ['whitespace only', '   '],
+            ['null', null],
+            ['a boolean', true],
+            ['an object', {}],
+            ['a fractional number', 2.5],
+            ['NaN', Number.NaN],
+            ['Infinity', Number.POSITIVE_INFINITY],
+        ])('refuses %s as an invalid page', (_label, page) => {
+            expect(parsePaginationStrict({ page })).toEqual({
+                kind: 'error',
+                message: 'page must be a whole number',
+                details: [{ field: 'page', code: 'invalid' }],
+            });
+        });
+
+        it('refuses the same values in limit, naming limit', () => {
+            expect(parsePaginationStrict({ limit: '7.9' })).toEqual({
+                kind: 'error',
+                message: 'limit must be a whole number',
+                details: [{ field: 'limit', code: 'invalid' }],
+            });
+        });
+    });
+
+    // A whole number the endpoint does not accept: the correction is "send a
+    // different number", which is what `out_of_range` asks for. A negative sign
+    // is deliberately readable so `-1` is reported this way rather than as
+    // unreadable text.
+    describe('what it refuses as out of range', () => {
+        it.each([
+            ['zero', '0'],
+            ['a negative page', '-3'],
+            ['one past the supported depth', String(MAX_PAGE + 1)],
+            // `Number('99999999999999999999')` is an imprecise 1e20: an integer
+            // literal larger than IEEE-754 holds exactly. It used to be
+            // multiplied by `limit` and handed to `OFFSET`, where PostgreSQL
+            // rejects it — a 500 from a query parameter. It is now a 400.
+            ['a twenty-digit page', '99999999999999999999'],
+            ['a hugely negative page', '-99999999999999999999'],
+            ['the largest safe integer', Number.MAX_SAFE_INTEGER],
+            // A typed caller's own number can be past the exact range too: 1e21
+            // is an integer `Number` that no longer holds its digits, so it is
+            // out of range rather than unreadable — the same answer the
+            // twenty-digit string above gets, reached through the other branch.
+            ['a number too large to hold exactly', 1e21],
+        ])('refuses %s', (_label, page) => {
+            expect(parsePaginationStrict({ page })).toEqual({
+                kind: 'error',
+                message: `page must be between ${DEFAULT_PAGE} and ${MAX_PAGE}`,
+                details: [{ field: 'page', code: 'out_of_range' }],
+            });
+        });
+
+        it('refuses a limit above the route cap instead of trimming it to it', () => {
+            expect(parsePaginationStrict({ limit: '51' })).toEqual({
+                kind: 'error',
+                message: `limit must be between 1 and ${MAX_LIMIT}`,
+                details: [{ field: 'limit', code: 'out_of_range' }],
+            });
+            expect(parsePaginationStrict({ limit: '1000' })).toMatchObject({
+                details: [{ field: 'limit', code: 'out_of_range' }],
+            });
+        });
+
+        it('refuses a zero or negative limit instead of flooring it at one row', () => {
+            expect(parsePaginationStrict({ limit: '0' })).toMatchObject({
+                details: [{ field: 'limit', code: 'out_of_range' }],
+            });
+            expect(parsePaginationStrict({ limit: '-5' })).toMatchObject({
+                details: [{ field: 'limit', code: 'out_of_range' }],
+            });
+        });
+    });
+
+    // One round trip per malformed request, not one per malformed field.
+    describe('reporting', () => {
+        it('names every failing field, page before limit', () => {
+            expect(parsePaginationStrict({ page: 'abc', limit: '0' })).toEqual({
+                kind: 'error',
+                message: `page must be a whole number; limit must be between 1 and ${MAX_LIMIT}`,
+                details: [
+                    { field: 'page', code: 'invalid' },
+                    { field: 'limit', code: 'out_of_range' },
+                ],
+            });
+        });
+
+        it('keeps a valid field out of the details', () => {
+            expect(parsePaginationStrict({ page: '2', limit: '999' })).toEqual({
+                kind: 'error',
+                message: `limit must be between 1 and ${MAX_LIMIT}`,
+                details: [{ field: 'limit', code: 'out_of_range' }],
+            });
+        });
+
+        it('never applies a default to a field that failed', () => {
+            const verdict = parsePaginationStrict({ page: '0' });
+
+            expect(verdict.kind).toBe('error');
+            expect(verdict).not.toHaveProperty('page');
+        });
+    });
+
+    // A route's band is configuration, not request input: a route that
+    // mis-declares it is a bug to fix in code, so options are sanitized exactly
+    // as the lenient parser sanitizes them rather than refused.
+    describe('options', () => {
+        it('uses the caller band for an omitted limit', () => {
+            expect(parsePaginationStrict({}, SUGGESTION_OPTIONS)).toEqual({
+                kind: 'ok',
+                page: DEFAULT_PAGE,
+                limit: 12,
+            });
+        });
+
+        it('refuses a limit above the caller maximum', () => {
+            expect(parsePaginationStrict({ limit: '31' }, SUGGESTION_OPTIONS)).toEqual({
+                kind: 'error',
+                message: 'limit must be between 1 and 30',
+                details: [{ field: 'limit', code: 'out_of_range' }],
+            });
+        });
+
+        it('accepts the caller maximum itself', () => {
+            expect(parsePaginationStrict({ limit: '30' }, SUGGESTION_OPTIONS)).toMatchObject({ limit: 30 });
+        });
+
+        it('clamps a caller default above the caller maximum down to it', () => {
+            expect(parsePaginationStrict({}, { defaultLimit: 100, maxLimit: 30 })).toMatchObject({ limit: 30 });
+        });
+
+        it('sanitizes a non-positive or fractional caller default', () => {
+            expect(parsePaginationStrict({}, { defaultLimit: 0 })).toMatchObject({ limit: 1 });
+            expect(parsePaginationStrict({}, { defaultLimit: 10.7 })).toMatchObject({ limit: 10 });
+        });
+
+        it('falls back to the module band when a caller option is not finite', () => {
+            expect(parsePaginationStrict({}, { defaultLimit: Number.NaN })).toMatchObject({
+                limit: DEFAULT_LIMIT,
+            });
+            expect(parsePaginationStrict({ limit: '999' }, { maxLimit: Number.NaN })).toMatchObject({
+                details: [{ field: 'limit', code: 'out_of_range' }],
+            });
+            expect(parsePaginationStrict({ limit: String(MAX_LIMIT) }, { maxLimit: Number.NaN })).toMatchObject(
+                { limit: MAX_LIMIT },
+            );
+        });
+
+        it('treats an empty options object as no options at all', () => {
+            expect(parsePaginationStrict({ page: '2' }, {})).toEqual({ kind: 'ok', page: 2, limit: DEFAULT_LIMIT });
+        });
+    });
+
+    // The two contracts share one band and one set of constants; what differs
+    // is only what happens to a value outside it. Pinning both answers side by
+    // side is what stops a future edit from "unifying" them back into one.
+    describe('the division of labour with the lenient parser', () => {
+        it.each([
+            ['a zero page', { page: '0' }],
+            ['a negative page', { page: '-3' }],
+            ['a fractional page', { page: '2.7' }],
+            ['free text', { page: 'abc' }],
+            ['a limit above the cap', { limit: '1000' }],
+            ['a zero limit', { limit: '0' }],
+        ])('refuses %s where parsePagination clamps it', (_label, query) => {
+            expect(parsePaginationStrict(query).kind).toBe('error');
+            expect(() => parsePagination(query)).not.toThrow();
+            expect(parsePagination(query)).toEqual({
+                page: expect.any(Number),
+                limit: expect.any(Number),
+            });
+        });
+
+        it('agrees with it on every well-formed request', () => {
+            const query = { page: '3', limit: '25' };
+
+            expect(parsePaginationStrict(query)).toEqual({ kind: 'ok', ...parsePagination(query) });
+        });
+
+        it('never throws, whatever it is handed', () => {
+            expect(() => parsePaginationStrict({ page: {}, limit: Symbol('limit') })).not.toThrow();
         });
     });
 });

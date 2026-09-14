@@ -65,7 +65,7 @@ import {
     CatalogValidationOutcome,
 } from '../types/catalog';
 import { NutritionProvenance } from '../types/nutrition';
-import { parsePagination } from '../utils/pagination';
+import { DEFAULT_LIMIT, MAX_LIMIT, parsePaginationStrict } from '../utils/pagination';
 import { millilitersToGrams, UnitConversionError, unitFamily } from '../utils/units';
 
 /* ---------------------------------------------------------------------------
@@ -848,6 +848,31 @@ export const dedupeIdentity = (candidates: readonly CatalogIdentityCandidate[]):
 };
 
 /* ---------------------------------------------------------------------------
+ * Shared request-query readers — used by BOTH request parsers below
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A query that is not a readable object becomes an EMPTY record rather than a
+ * refusal of its own: a request with no query string and one carrying none of
+ * the fields a route reads are the same request here, and the missing field is
+ * what each parser then refuses (or defaults, where the contract has a
+ * default). Keeping the narrowing total is what lets the page-block delegation
+ * be unconditional — `parsePaginationStrict` never has to be reached with
+ * something it would guard again.
+ */
+const asQueryRecord = (query: unknown): Record<string, unknown> =>
+    typeof query === 'object' && query !== null && !Array.isArray(query)
+        ? (query as Record<string, unknown>)
+        : {};
+
+/**
+ * `qs` yields an array when a parameter repeats (`?kind=dislike&kind=x`); the
+ * first occurrence wins, exactly as {@link parseCatalogSearchQuery} treats a
+ * repeated `q` and `parsePaginationStrict` a repeated `page`.
+ */
+const firstOccurrence = (value: unknown): unknown => (Array.isArray(value) ? value[0] : value);
+
+/* ---------------------------------------------------------------------------
  * The search query parser
  * ------------------------------------------------------------------------- */
 
@@ -868,6 +893,15 @@ export type ParsedCatalogSearchQuery =
           message: string;
           details: CatalogFieldError[];
       };
+
+/**
+ * The refusal branch {@link parseCatalogSearchQuery} already produces, derived
+ * rather than re-declared so every request parser in this module answers with
+ * ONE body shape. A hand-written copy would be free to drift from the `details`
+ * the client renders beside its fields, which is why
+ * `recipe.logic.ts::RecipeVersionPathRefusal` derives its own the same way.
+ */
+type CatalogQueryRefusal = Exclude<ParsedCatalogSearchQuery, { kind: 'ok' }>;
 
 const SEARCH_QUERY_FIELD = 'q';
 
@@ -892,9 +926,13 @@ const invalidSearchQuery = (message: string, code: string): ParsedCatalogSearchQ
  *
  * The lower bound is the rule worth pinning — a one-character query matches
  * most of a ten-thousand-item catalog, so it is rejected rather than served.
- * The page and limit of the same request belong to `parsePagination`, which
- * caps `limit` at the controller boundary; this module never clamps a limit,
- * because the in-process benchmark fetch deliberately reads past that cap.
+ * The page and limit of the same request belong to `parsePaginationStrict`, and
+ * {@link parseCatalogSearchRequest} is what composes the two rules into the one
+ * verdict the handler receives — so this function stays the `q` rule alone and
+ * is still separately testable as such. This module never CLAMPS a limit: a
+ * request outside the route's band is refused, and the in-process benchmark
+ * fetch reads past that band by calling the service directly, where no request
+ * band applies.
  *
  * A control character is refused HERE, and before the length is measured. The
  * refusal has to happen in the parser because U+0000 cannot be represented in
@@ -911,7 +949,7 @@ const invalidSearchQuery = (message: string, code: string): ParsedCatalogSearchQ
  *
  * `unknown` rather than `string`: `req.query` members are user input, and `qs`
  * yields an array when a parameter repeats — the first occurrence wins, exactly
- * as `parsePagination` treats a repeated `page`.
+ * as `parsePaginationStrict` treats a repeated `page`.
  */
 export const parseCatalogSearchQuery = (query: unknown): ParsedCatalogSearchQuery => {
     const raw = Array.isArray(query) ? query[0] : query;
@@ -934,6 +972,72 @@ export const parseCatalogSearchQuery = (query: unknown): ParsedCatalogSearchQuer
     }
 
     return { kind: 'ok', q };
+};
+
+export type ParsedCatalogSearchRequest =
+    | { kind: 'ok'; q: string; page: number; limit: number }
+    | CatalogQueryRefusal;
+
+/**
+ * Validates the WHOLE query string of `GET /catalog/foods`: `?q=`, `?page=` and
+ * `?limit=`, as one verdict.
+ *
+ * THIS IS THE ONE PARSER THE SEARCH HANDLER CALLS, which is the point of it.
+ * The handler is `getUserId` → parse → one service call (§0.7.2,
+ * Rule backend-architecture §4), and the page block used to be read separately
+ * through the LENIENT `parsePagination` after `q` had been validated here — so
+ * `?page=0`, `?page=2.7`, `?page=-1`, `?page=abc` and `?limit=1000` were
+ * clamped or truncated into a different, valid request and answered `200 OK`
+ * (CWE-20). §0.5.2 requires the opposite: `page >= 1`, `limit` within the
+ * route's band, and validation "before any Prisma or planning work
+ * (`*.logic.ts` parsers, 400 with field codes)". Composing both rules into one
+ * verdict is what makes that structural rather than a habit — there is no
+ * second, laxer path to the service left to take.
+ *
+ * THE BOUNDS ARE THIS ROUTE'S, stated here where the route's rule lives:
+ * `DEFAULT_LIMIT` (25) when `?limit=` is omitted and `MAX_LIMIT` (50) as its
+ * ceiling (§0.5.2). They are passed explicitly rather than left to the
+ * helper's own defaults so that reading this function tells you the contract,
+ * and `catalog.service.searchPublishedFoods` still accepts a larger `limit`
+ * from a direct in-process caller — `scripts/search-benchmark.ts` reads a
+ * `limit=75` reference page (§0.9.3) — because the cap is a property of the
+ * REQUEST, not of the query.
+ *
+ * EVERY FAILING FIELD IS NAMED, in field order `q`, `page`, `limit`, so a
+ * request that gets two of them wrong is corrected in one round trip. The
+ * messages are joined into one server-side diagnostic; the client renders
+ * `details` and maps each `code` to its own copy.
+ */
+export const parseCatalogSearchRequest = (query: unknown): ParsedCatalogSearchRequest => {
+    const record = asQueryRecord(query);
+
+    const parsedQuery = parseCatalogSearchQuery(record[SEARCH_QUERY_FIELD]);
+    const parsedPage = parsePaginationStrict(
+        { page: record.page, limit: record.limit },
+        { defaultLimit: DEFAULT_LIMIT, maxLimit: MAX_LIMIT },
+    );
+
+    if (parsedQuery.kind !== 'ok' || parsedPage.kind !== 'ok') {
+        const messages = [
+            ...(parsedQuery.kind === 'ok' ? [] : [parsedQuery.message]),
+            ...(parsedPage.kind === 'ok' ? [] : [parsedPage.message]),
+        ];
+        const details: CatalogFieldError[] = [
+            ...(parsedQuery.kind === 'ok' ? [] : parsedQuery.details),
+            ...(parsedPage.kind === 'ok' ? [] : parsedPage.details),
+        ];
+
+        return {
+            kind: 'error',
+            code: 'invalid_request',
+            // A server-side diagnostic; the client renders `details`, never
+            // this string.
+            message: messages.join('; '),
+            details,
+        };
+    }
+
+    return { kind: 'ok', q: parsedQuery.q, page: parsedPage.page, limit: parsedPage.limit };
 };
 
 /* ---------------------------------------------------------------------------
@@ -985,38 +1089,9 @@ const SUGGESTION_KIND_FIELD = 'kind';
  */
 const UNSUPPORTED_KIND_CODE = 'unsupported';
 
-/**
- * The refusal branch {@link parseCatalogSearchQuery} already produces, derived
- * rather than re-declared so both of this module's request parsers answer with
- * ONE body shape. A hand-written copy would be free to drift from the `details`
- * the client renders beside its fields, which is why
- * `recipe.logic.ts::RecipeVersionPathRefusal` derives its own the same way.
- */
-type CatalogQueryRefusal = Exclude<ParsedCatalogSearchQuery, { kind: 'ok' }>;
-
 export type ParsedCatalogSuggestionsQuery =
     | { kind: 'ok'; suggestionKind: CatalogSuggestionKindRequest; limit: number }
     | CatalogQueryRefusal;
-
-/**
- * A query that is not a readable object becomes an EMPTY record rather than a
- * refusal of its own: a request with no query string and one carrying no `kind`
- * are the same request here, and both are refused below for the kind. Keeping
- * the narrowing total is also what lets the limit delegation be unconditional —
- * `parsePagination` never has to be reached with something it would guard
- * again.
- */
-const asQueryRecord = (query: unknown): Record<string, unknown> =>
-    typeof query === 'object' && query !== null && !Array.isArray(query)
-        ? (query as Record<string, unknown>)
-        : {};
-
-/**
- * `qs` yields an array when a parameter repeats (`?kind=dislike&kind=x`); the
- * first occurrence wins, exactly as {@link parseCatalogSearchQuery} treats a
- * repeated `q` and `parsePagination` a repeated `page`.
- */
-const firstOccurrence = (value: unknown): unknown => (Array.isArray(value) ? value[0] : value);
 
 /**
  * Validates `?kind=` and `?limit=` for `GET /catalog/foods/suggestions`.
@@ -1040,12 +1115,20 @@ const firstOccurrence = (value: unknown): unknown => (Array.isArray(value) ? val
  * a non-string, or a repeated parameter whose first occurrence is not
  * `dislike`.
  *
- * `limit` is DELEGATED to `parsePagination` rather than clamped again here. That
- * helper already treats an unreadable value as absent (so the default applies),
- * floors the result at one row and caps it at the maximum it is handed, so this
- * parser states the bounds and owns no arithmetic that could disagree with the
- * search route's. `page` is not part of this endpoint's contract — the
- * suggestion set is one capped page — so it is neither read nor returned.
+ * `limit` is DELEGATED to `parsePaginationStrict` rather than parsed again here,
+ * so this parser states the bounds and owns no arithmetic that could disagree
+ * with the search route's. That helper applies the default only when the field
+ * is OMITTED and refuses anything else it cannot serve — a fraction, free text,
+ * a blank parameter, zero, a negative number, or a value above the maximum —
+ * which is the §0.5.2 contract (`limit` 1 to 30, 12 by default, `400
+ * invalid_request` with field codes otherwise). It used to CLAMP instead, so
+ * `?limit=31` quietly returned 30 chips with `200 OK` and `?limit=7.9` returned
+ * seven, reporting success for a request nobody made (CWE-20).
+ *
+ * `kind` is still refused FIRST, so a request that gets both fields wrong is
+ * told about the one that makes the endpoint unanswerable rather than about its
+ * page size. `page` is not part of this endpoint's contract — the suggestion
+ * set is one capped page — so it is neither read, refused, nor returned.
  */
 export const parseCatalogSuggestionsQuery = (query: unknown): ParsedCatalogSuggestionsQuery => {
     const record = asQueryRecord(query);
@@ -1061,7 +1144,7 @@ export const parseCatalogSuggestionsQuery = (query: unknown): ParsedCatalogSugge
         };
     }
 
-    const { limit } = parsePagination(
+    const parsedLimit = parsePaginationStrict(
         { limit: record.limit },
         {
             defaultLimit: CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
@@ -1069,7 +1152,18 @@ export const parseCatalogSuggestionsQuery = (query: unknown): ParsedCatalogSugge
         },
     );
 
-    return { kind: 'ok', suggestionKind: SUGGESTION_KIND, limit };
+    if (parsedLimit.kind !== 'ok') {
+        return {
+            kind: 'error',
+            code: 'invalid_request',
+            // A server-side diagnostic; the client renders `details`, never
+            // this string.
+            message: parsedLimit.message,
+            details: parsedLimit.details,
+        };
+    }
+
+    return { kind: 'ok', suggestionKind: SUGGESTION_KIND, limit: parsedLimit.limit };
 };
 
 /* ---------------------------------------------------------------------------
@@ -2893,4 +2987,3 @@ export const assessComponentCoverage = (
         derivedCount: derived.length,
     };
 };
-

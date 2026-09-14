@@ -5,18 +5,24 @@
 // Orchestration only (Rule backend-architecture §5). Every decision this file
 // needs already belongs to a neighbour and is delegated to it:
 //
-//  * `catalog.logic.ts` owns the rules. `parseCatalogSearchQuery` validates
-//    `?q=` and is called by the CONTROLLER, not here — a 2-to-60-character
-//    bound is a request-validation verdict (§4), and a service that re-decided
-//    it would own the rule twice. `q` arrives already trimmed and bounded.
+//  * `catalog.logic.ts` owns the rules. `parseCatalogSearchRequest` validates
+//    `?q=` together with the page block and is called by the CONTROLLER, not
+//    here — a 2-to-60-character bound and a `limit` band are request-validation
+//    verdicts (§4), and a service that re-decided them would own the rules
+//    twice. `q` arrives already trimmed and bounded, and `page`/`limit` arrive
+//    as whole numbers inside the route's band or not at all, because a request
+//    outside it was refused with `400 invalid_request` before this file was
+//    reached.
 //  * `catalog.mapper.ts` owns the row -> DTO boundary, including the closed-set
 //    narrowing of every TEXT code column. No response shape is assembled here.
 //  * `utils/pagination.ts` owns the offset scheme end to end: the
-//    `{page, limit, total, totalPages}` envelope and the per-route `limit` cap
-//    at the controller boundary, and `rowWindowFor` — the bounded `LIMIT` and
-//    `OFFSET` a paged statement runs with — here, so request input is turned
-//    into query arithmetic in one audited place rather than per service. This
-//    file returns `{items, total}` and never the envelope (§4).
+//    `{page, limit, total, totalPages}` envelope and the strictly parsed
+//    per-route `page`/`limit` band at the request boundary
+//    (`parsePaginationStrict`, which refuses an out-of-range value rather than
+//    clamping it), and `rowWindowFor` — the bounded `LIMIT` and `OFFSET` a
+//    paged statement runs with — here, so request input is turned into query
+//    arithmetic in one audited place rather than per service. This file returns
+//    `{items, total}` and never the envelope (§4).
 //
 // A SANCTIONED EXCEPTION TO §5.1. Rule backend-architecture §5.1 requires
 // `user_id` in every `where`; the reads below carry no tenant predicate,
@@ -491,7 +497,7 @@ const defaultPortionsByFood = async (
 /**
  * `GET /api/catalog/foods` — one page of published catalog foods matching `q`.
  *
- * `q` is expected trimmed and within the bounds `parseCatalogSearchQuery`
+ * `q` is expected trimmed and within the bounds `parseCatalogSearchRequest`
  * enforces at the controller; an out-of-range query is that parser's verdict and
  * never an exception from here. A caller that passes no search term at all gets
  * an empty page without a query being issued, because an empty prefix pattern is
@@ -501,19 +507,21 @@ const defaultPortionsByFood = async (
  * `page` AND `limit` ARE BOUNDED, NOT CAPPED AT THE ROUTE'S NUMBERS.
  * `rowWindowFor` in `utils/pagination.ts` turns the pair into the `LIMIT` and
  * `OFFSET` this query runs with, and it is what keeps request input out of the
- * statement: `page` and `limit` arrive as text through Express, and
- * `(page - 1) * limit` on a twenty-digit page is a number PostgreSQL rejects for
- * `OFFSET` — a 500 from a query parameter. Deriving the window in the shared
- * helper rather than here means the bound holds for the HTTP path and for the
- * direct callers that never meet `parsePagination` alike.
+ * statement: `(page - 1) * limit` on a twenty-digit page is a number PostgreSQL
+ * rejects for `OFFSET` — a 500 from a query parameter. An HTTP caller can no
+ * longer reach that case, because `parseCatalogSearchRequest` refuses a page
+ * outside `[1, MAX_PAGE]` at the boundary; the window is still derived in the
+ * shared helper rather than here so the bound also holds for the direct
+ * callers that never meet a request parser at all.
  *
  * What it does NOT do is apply `MAX_LIMIT`. That cap is the HTTP contract (a
- * page of `GET /catalog/foods` is at most 50) and is applied by the controller,
- * because `scripts/search-benchmark.ts` reads a single `limit=75` reference page
- * in process to prove that pages 1 to 3 at `limit=25` concatenate to it with no
- * duplicate and no missing id. Capping at 50 here would silently truncate that
- * reference and make the pagination check pass vacuously, which is why
- * `rowWindowFor`'s own guard (`MAX_ROWS`) sits far above the route's cap.
+ * page of `GET /catalog/foods` is at most 50) and is applied by the request
+ * parser the controller calls, because `scripts/search-benchmark.ts` reads a
+ * single `limit=75` reference page in process to prove that pages 1 to 3 at
+ * `limit=25` concatenate to it with no duplicate and no missing id. Capping at
+ * 50 here would silently truncate that reference and make the pagination check
+ * pass vacuously, which is why `rowWindowFor`'s own guard (`MAX_ROWS`) sits far
+ * above the route's cap.
  *
  * THE THREE STATEMENTS READ ONE SNAPSHOT. Page, total and default portions are a
  * single answer: the total describes the set the page came from, and every
@@ -605,7 +613,8 @@ const SUGGESTION_FILTERS: Record<CatalogSuggestionKind, Prisma.Sql> = {
  * `limit` is bounded by {@link rowWindowFor}'s row guard rather than by the
  * route's cap, as in {@link searchPublishedFoods}, so a direct caller cannot put
  * a non-finite value into `LIMIT`; the per-route maximum belongs to
- * `parsePagination` at the controller.
+ * `parseCatalogSuggestionsQuery`, which refuses a `?limit=` above 30 rather
+ * than trimming it to 30.
  */
 export const getSuggestions = async (
     kind: CatalogSuggestionKind,

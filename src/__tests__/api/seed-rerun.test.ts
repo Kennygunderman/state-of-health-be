@@ -12,18 +12,25 @@
 // once the rows are actually in a table. That gap is code review finding
 // DATA-04's remaining clause, and closing it is this file's whole purpose.
 //
-// WHY THIS SUITE INSERTS ITS OWN ROWS. `scripts/catalog-load.ts` and
-// `scripts/recipes-seed.ts` are preflight-only at this checkpoint: each parses
-// its arguments, reports the accepted database origin, checks its inputs and
-// refuses with `stage_pipeline_pending`, and neither imports Prisma — their
-// write halves are §0.7.1 Group 3/4 deliverables. So this suite loads the
-// release through Prisma directly, reconciling on the stable identities
-// `catalog-load.ts` documents (`catalog_foods.source_key`, and each food's
-// aliases, portions and validation record replaced wholesale inside that
-// food's own transaction) and publishing recipes by `recipes.slug`. It proves
-// the DATA, not the CLI; when the CLI's write half lands, the loader is
-// swapped in behind `applyCatalogSlice`/`applyRecipeCorpus` and every
-// assertion below still states what it states today.
+// HOW THE ROWS GET IN. The recipes are published by the PRODUCTION stage:
+// `scripts/recipes-seed.ts::runSeed` is called below with the committed recipe
+// directory, the real Prisma client, a pinned clock and a report path outside
+// the repository, so the 42 payloads reach the database through exactly the
+// code an operator runs and every §0.7.3 gate — ingredient resolution by
+// `source_key`, the publication preconditions, declared-versus-derived,
+// instruction completeness — is exercised against the real corpus rather than
+// restated here.
+//
+// `scripts/catalog-load.ts` is still preflight-only at this checkpoint: it
+// parses its arguments, reports the accepted database origin, checks its inputs
+// and refuses with `stage_pipeline_pending`, its write half being a §0.7.1
+// Group 3 deliverable. So the CATALOG slice is still loaded through Prisma
+// directly, reconciling on the stable identities `catalog-load.ts` documents
+// (`catalog_foods.source_key`, and each food's aliases, portions and validation
+// record replaced wholesale inside that food's own transaction). When that
+// stage's write half lands, the loader is swapped in behind
+// `applyCatalogSlice` and every assertion below still states what it states
+// today.
 //
 // WHAT IT PROVES, in the order the describes run:
 //   1. the manifest gate — every release file's streamed SHA-256, byte length
@@ -46,9 +53,15 @@
 //   6. nutrition recomputed from the STORED rows through the production
 //      derivation in `services/recipe.logic.ts`, per-serving = total ÷
 //      `yield_servings`, and `total_minutes` = prep + cook;
-//   7. idempotent re-application — the same release applied a second time
+//   7. the §0.7.3 coverage matrix — the diet × single-allergen × slot ×
+//      time-tier table the seed derives FROM the seeded rows — meeting every
+//      guaranteed cell's threshold of four and every reduced cell's threshold
+//      of two, and equalling the committed
+//      `data/meal-planning/recipes/coverage-report.json` byte for byte;
+//   8. idempotent re-application — the same release applied a second time
 //      leaves the row counts, the food identities and every row's content
-//      unchanged and publishes no second recipe version.
+//      unchanged, publishes no second recipe version and re-emits the same
+//      coverage report.
 //
 // WHY IT LOADS ONLY A SLICE. `validation-records.jsonl` is 50 MB and
 // `foods.jsonl` 13 MB, against 11,046 published foods. Loading all of them
@@ -59,23 +72,19 @@
 // portions (139) and validation records (69). Whole-file integrity is asserted
 // from the streamed measurements, which never materialise the files.
 //
-// WHAT THIS SUITE DELIBERATELY DOES NOT ASSERT, and why. Two review findings
-// against this data are being fixed in parallel — the guaranteed coverage
-// cells in `recipes/coverage-report.json`, and `pescatarian_ok` not being the
-// runtime `pescatarian` code — so anything downstream of the diet taxonomy or
-// of that report would be asserting against data mid-change:
-//   * `coverage-report.json` is neither read nor written here, and the
-//     diet × allergen × slot × time coverage matrix §0.7.3 requires is not
-//     computed here. It remains `recipes-seed.ts`'s output and belongs with
-//     that stage's own suite.
-//   * declared `dietTags` are STORED (as the derivation's own output, which is
-//     what the seed publishes) and never compared against a declaration.
-//     Every other declaration this corpus makes — `allergenTags`,
-//     `allergenStatus`, `badges`, `budgetTier` — was measured across all 42
-//     payloads before being asserted, and all four agree with the derivation
-//     for every payload.
-//   * plan-DTO nutrition rounding and `portionText` strings belong to the
-//     mapper's own suites and appear nowhere here.
+// HOW `coverage-report.json` IS TREATED HERE. The committed artefact is READ
+// and never written: the seed is given a report path under `os.tmpdir()`, and
+// the emitted document is compared against the committed one both as parsed
+// values and byte for byte. A suite that rewrote it could not fail on a
+// coverage regression — it would simply commit one.
+//
+// WHAT THIS SUITE DELIBERATELY DOES NOT ASSERT, and why. Plan-DTO nutrition
+// rounding and `portionText` strings belong to the mapper's own suites and
+// appear nowhere here. Everything else this corpus declares — `dietTags`,
+// `allergenTags`, `allergenStatus`, `badges`, `budgetTier` — is compared
+// against the derivation below, which is also the gate the seed itself applied
+// before publishing: a payload whose declaration disagreed would have refused
+// the whole run rather than reaching these assertions.
 //
 // MEASURED FACTS THE ASSERTIONS BELOW ARE CALIBRATED TO, so a reader does not
 // mistake a deliberate silence for an oversight: three slice foods state no
@@ -105,11 +114,29 @@
 
 import { createHash } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import readline from 'readline';
 
-import { loadReleaseManifest, recipesDir, releaseFilePath } from '../../../scripts/lib/manifest';
+import {
+    loadCoveragePlan,
+    loadReleaseManifest,
+    recipesDir,
+    releaseFilePath,
+    writeJsonFile,
+} from '../../../scripts/lib/manifest';
 import type { CatalogReleaseManifest } from '../../../scripts/lib/manifest';
+import type { ScriptLogger } from '../../../scripts/lib/logger';
+// The stage under test. Importing a `scripts/` entry point is safe here for the
+// reason `scripts/lib/dbGuard.ts` documents at its module-load block: its
+// enforcement is keyed on `argv[1]` naming one of the known scripts, which
+// under Jest is the jest binary, so the import classifies nothing and can end
+// no process. The module is side-effect-free otherwise — its `main()` is behind
+// `require.main === module` and it reaches Prisma only through a dynamic import
+// inside it, which `src/__tests__/scripts/recipes-seed.test.ts` proves from a
+// child process.
+import { runSeed } from '../../../scripts/recipes-seed';
+import type { CoverageReport, SeedDb, SeedDeps, SeedOutcome } from '../../../scripts/recipes-seed';
 import { Prisma } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
 import {
@@ -140,12 +167,11 @@ const RELEASE_ID = 'v1';
  * them.
  *
  * Restated here rather than imported from `scripts/catalog-release.ts`, which
- * exports the same list as `RELEASE_DATA_FILES`: that module's scope runs the
- * CLI database guard (`import './lib/dbGuard'`), which classifies the ambient
- * `DATABASE_URL` and can exit the process, so importing it into a test would
- * hand the suite's fate to an argument parser. The list is asserted against
- * the manifest's own `files[]` below, so a release that grew or lost a member
- * fails here rather than being silently half-checked.
+ * exports the same list as `RELEASE_DATA_FILES`: this list is what the
+ * manifest's own `files[]` is CHECKED against below, and a check that imported
+ * its expectation from the producer of the thing it checks would pass by
+ * construction. A release that grew or lost a member therefore fails here
+ * rather than being silently half-checked.
  */
 const RELEASE_DATA_FILES: readonly string[] = Object.freeze([
     'foods.jsonl',
@@ -210,48 +236,6 @@ const sameStoredNumber = (stored: number, recomputed: number): boolean => {
 
     const scale = Math.max(Math.abs(stored), Math.abs(recomputed));
     return Math.abs(stored - recomputed) <= scale * FLOAT8_ROUND_TRIP_TOLERANCE;
-};
-
-/**
- * Deep equivalence between a value read back from the database and the value
- * that was written.
- *
- * Two deliberate differences from `JSON.stringify` equality. Numbers are
- * compared through {@link sameStoredNumber}, for the reason above. And objects
- * are compared by KEY rather than by serialised order, because a `jsonb` column
- * does not preserve insertion order — PostgreSQL stores object keys sorted, so
- * `snapshot_per_100g` comes back as `{fat_g, carbs_g, fiber_g, calories,
- * protein_g}` however it was written, which is the same object and a different
- * string.
- */
-const equivalentContent = (stored: unknown, written: unknown): boolean => {
-    if (typeof stored === 'number' && typeof written === 'number') {
-        return sameStoredNumber(stored, written);
-    }
-
-    if (Array.isArray(stored) && Array.isArray(written)) {
-        return (
-            stored.length === written.length &&
-            stored.every((entry, index) => equivalentContent(entry, written[index]))
-        );
-    }
-
-    if (
-        typeof stored === 'object' &&
-        stored !== null &&
-        typeof written === 'object' &&
-        written !== null &&
-        !Array.isArray(stored) &&
-        !Array.isArray(written)
-    ) {
-        const storedRecord = stored as Record<string, unknown>;
-        const writtenRecord = written as Record<string, unknown>;
-        const keys = new Set([...Object.keys(storedRecord), ...Object.keys(writtenRecord)]);
-
-        return [...keys].every((key) => equivalentContent(storedRecord[key], writtenRecord[key]));
-    }
-
-    return stored === written;
 };
 
 /* ---------------------------------------------------------------------------
@@ -1044,409 +1028,41 @@ const requireBasis = (value: string, where: string): RecipeNutritionBasis => {
     return value;
 };
 
-const requireSnapshot = (food: ReleaseFood): RecipeIngredientNutrientSnapshot => {
-    const where = food.source_key;
-    const core = { calories: food.calories, protein_g: food.protein_g, carbs_g: food.carbs_g, fat_g: food.fat_g };
+/* ---------------------------------------------------------------------------
+ * Publishing the recipes: the production stage
+ *
+ * The corpus is published by `scripts/recipes-seed.ts::runSeed` — the same
+ * function `npm run recipes:seed` calls — with four seams supplied: the Prisma
+ * client, the committed recipe directory, a pinned clock and a coverage-report
+ * path under `os.tmpdir()`. Nothing about the publication is restated here, so
+ * this suite cannot agree with a seeder that is wrong; what it asserts is what
+ * the stage left in the database.
+ * ------------------------------------------------------------------------- */
 
-    for (const [field, value] of Object.entries(core)) {
-        if (value === null) {
-            throw new Error(`${where}: ${field} is null, so it cannot be a recipe ingredient (§0.7.3)`);
-        }
-    }
+/** Where the emitted coverage report goes, so the committed artefact is only ever READ. */
+let emittedReportPath: string;
 
-    return {
-        calories: core.calories as number,
-        protein_g: core.protein_g as number,
-        carbs_g: core.carbs_g as number,
-        fat_g: core.fat_g as number,
-        fiber_g: food.fiber_g,
-    };
+const silentLogger: ScriptLogger = {
+    debug: () => undefined,
+    info: () => undefined,
+    warn: () => undefined,
+    error: () => undefined,
+    child: () => silentLogger,
 };
 
-/**
- * A recipe ingredient as the derivation reads it, built from the release row
- * and the food it resolves to.
- *
- * `catalog_food_id` carries the `source_key` here rather than a uuid, because
- * this shape is used to compute what will be WRITTEN, before the ids are known;
- * the derivation reads the field for ordering and dislike matching only, and
- * the stored-row counterpart below carries the real uuid.
- */
-const toPublicationIngredient = (
-    ingredient: PayloadIngredient,
-    food: ReleaseFood,
-): RecipePublicationIngredient => ({
-    catalog_food_id: food.source_key,
-    snapshot_name: food.display_name,
-    snapshot_provenance: requireProvenance(food.nutrition_provenance, food.source_key),
-    snapshot_allergen_tags: food.allergen_tags,
-    snapshot_diet_tags: food.diet_tags,
-    is_optional: ingredient.isOptional,
-    food_group: food.food_group,
-    allergen_status: requireAllergenStatus(food.allergen_status, food.source_key),
-    cost_class: food.cost_class,
-    catalog_nutrition_version: food.nutrition_version,
-    catalog_metadata_version: food.metadata_version,
-    snapshot_per_100g: requireSnapshot(food),
-    quantity: ingredient.quantity,
-    unit: ingredient.unit,
-    gram_weight: ingredient.gramWeight,
-    display_text: ingredient.displayText,
-    sort_order: ingredient.sortOrder,
-    nutrition_basis: requireBasis(food.nutrition_basis, food.source_key),
-    density_g_per_ml: food.density_g_per_ml,
+const seedDeps = (): SeedDeps => ({
+    prisma: prisma as unknown as SeedDb,
+    recipesDir: recipesDir(),
+    now: () => PUBLISHED_AT,
+    options: { help: false, only: [], dryRun: false },
+    logger: silentLogger,
+    coveragePlan: loadCoveragePlan(),
+    reportPath: emittedReportPath,
+    writeReport: writeJsonFile,
 });
 
-/**
- * The columns one publication of a payload writes.
- *
- * Every derived column comes from `deriveRecipeVersionFields` and NONE is read
- * from the file — the seed's rule (§0.7.1): `diet_tags`, `allergen_tags`,
- * `allergen_status`, `badges`, `budget_tier`, `nutrition_provenance`,
- * `total_minutes`, the four `per_serving_*` values and `sourced_calories_note`
- * are all the derivation's own output. `meal_slots` is the one list the file
- * owns, because which meals a dish belongs to is not derivable from its
- * ingredients.
- */
-interface PlannedVersion {
-    readonly name: string;
-    readonly description: string;
-    readonly icon_key: string;
-    readonly instructions: string[];
-    readonly yield_servings: number;
-    readonly serving_description: string;
-    readonly prep_minutes: number;
-    readonly cook_minutes: number;
-    readonly total_minutes: number;
-    readonly meal_slots: string[];
-    readonly diet_tags: string[];
-    readonly allergen_tags: string[];
-    readonly allergen_status: string;
-    readonly budget_tier: number;
-    readonly badges: string[];
-    readonly nutrition_provenance: string;
-    readonly per_serving_calories: number;
-    readonly per_serving_protein_g: number;
-    readonly per_serving_carbs_g: number;
-    readonly per_serving_fat_g: number;
-    readonly sourced_calories_note: string | null;
-    readonly status: string;
-}
-
-interface PlannedIngredient {
-    readonly source_key: string;
-    readonly catalog_nutrition_version: number;
-    readonly catalog_metadata_version: number;
-    readonly snapshot_per_100g: RecipeIngredientNutrientSnapshot;
-    readonly snapshot_name: string;
-    readonly snapshot_provenance: string;
-    readonly snapshot_allergen_tags: string[];
-    readonly snapshot_diet_tags: string[];
-    readonly quantity: number;
-    readonly unit: string;
-    readonly gram_weight: number;
-    readonly display_text: string;
-    readonly sort_order: number;
-    readonly is_optional: boolean;
-}
-
-interface PlannedPublication {
-    readonly slug: string;
-    readonly version: PlannedVersion;
-    readonly ingredients: readonly PlannedIngredient[];
-}
-
-const planPublication = (payload: RecipePayload, foodsByKey: ReadonlyMap<string, ReleaseFood>): PlannedPublication => {
-    const ingredients = payload.ingredients.map((ingredient) => {
-        const food = foodsByKey.get(ingredient.sourceKey);
-        if (food === undefined) {
-            throw new Error(
-                `recipes/${payload.file}: ingredient source key "${ingredient.sourceKey}" is not in the ` +
-                    `${RELEASE_ID} release`,
-            );
-        }
-
-        return { ingredient, food, snapshot: toPublicationIngredient(ingredient, food) };
-    });
-
-    const derived = deriveRecipeVersionFields(
-        ingredients.map((entry) => entry.snapshot),
-        payload.yieldServings,
-        payload.prepMinutes,
-        payload.cookMinutes,
-    );
-
-    return {
-        slug: payload.slug,
-        version: {
-            name: payload.name,
-            description: payload.description,
-            icon_key: payload.iconKey,
-            instructions: payload.instructions,
-            yield_servings: payload.yieldServings,
-            serving_description: payload.servingDescription,
-            prep_minutes: payload.prepMinutes,
-            cook_minutes: payload.cookMinutes,
-            total_minutes: derived.totalMinutes,
-            meal_slots: payload.mealSlots,
-            diet_tags: derived.dietTags,
-            allergen_tags: derived.allergenTags,
-            allergen_status: derived.allergenStatus,
-            budget_tier: derived.budgetTier,
-            badges: derived.badges,
-            nutrition_provenance: derived.nutritionProvenance,
-            per_serving_calories: derived.perServing.calories,
-            per_serving_protein_g: derived.perServing.protein,
-            per_serving_carbs_g: derived.perServing.carbs,
-            per_serving_fat_g: derived.perServing.fat,
-            sourced_calories_note: derived.sourcedCaloriesNote,
-            status: 'current',
-        },
-        ingredients: ingredients.map((entry) => ({
-            source_key: entry.food.source_key,
-            catalog_nutrition_version: entry.snapshot.catalog_nutrition_version,
-            catalog_metadata_version: entry.snapshot.catalog_metadata_version,
-            snapshot_per_100g: entry.snapshot.snapshot_per_100g,
-            snapshot_name: entry.snapshot.snapshot_name,
-            snapshot_provenance: entry.snapshot.snapshot_provenance,
-            snapshot_allergen_tags: [...entry.snapshot.snapshot_allergen_tags],
-            snapshot_diet_tags: [...entry.snapshot.snapshot_diet_tags],
-            quantity: entry.ingredient.quantity,
-            unit: entry.ingredient.unit,
-            gram_weight: entry.ingredient.gramWeight,
-            display_text: entry.ingredient.displayText,
-            sort_order: entry.ingredient.sortOrder,
-            is_optional: entry.ingredient.isOptional,
-        })),
-    };
-};
-
-interface RecipeDrift {
-    readonly slug: string;
-    readonly field: string;
-    readonly stored: string;
-    readonly release: string;
-}
-
-interface RecipeApplyReport {
-    readonly published: readonly string[];
-    readonly unchanged: readonly string[];
-    readonly drifted: readonly RecipeDrift[];
-}
-
-/**
- * The stored content of a published recipe, in the shape `planPublication`
- * produces, so the two can be compared field by field.
- */
-interface StoredPublication {
-    readonly version: PlannedVersion;
-    readonly ingredients: readonly PlannedIngredient[];
-}
-
-const readStoredPublication = async (
-    slug: string,
-    sourceKeyById: ReadonlyMap<string, string>,
-): Promise<StoredPublication | null> => {
-    const recipe = await prisma.recipes.findUnique({
-        where: { slug },
-        include: { current_version: { include: { recipe_ingredients: true } } },
-    });
-
-    if (recipe === null || recipe.current_version === null) {
-        return null;
-    }
-
-    const version = recipe.current_version;
-
-    return {
-        version: {
-            name: version.name,
-            description: version.description ?? '',
-            icon_key: version.icon_key,
-            instructions: version.instructions as unknown as string[],
-            yield_servings: version.yield_servings,
-            serving_description: version.serving_description,
-            prep_minutes: version.prep_minutes,
-            cook_minutes: version.cook_minutes,
-            total_minutes: version.total_minutes,
-            meal_slots: version.meal_slots,
-            diet_tags: version.diet_tags,
-            allergen_tags: version.allergen_tags,
-            allergen_status: version.allergen_status,
-            budget_tier: version.budget_tier,
-            badges: version.badges,
-            nutrition_provenance: version.nutrition_provenance,
-            per_serving_calories: version.per_serving_calories,
-            per_serving_protein_g: version.per_serving_protein_g,
-            per_serving_carbs_g: version.per_serving_carbs_g,
-            per_serving_fat_g: version.per_serving_fat_g,
-            sourced_calories_note: version.sourced_calories_note,
-            status: version.status,
-        },
-        ingredients: [...version.recipe_ingredients]
-            .sort((left, right) => left.sort_order - right.sort_order)
-            .map((row) => {
-                const sourceKey = sourceKeyById.get(row.catalog_food_id);
-                if (sourceKey === undefined) {
-                    throw new Error(
-                        `${slug}: recipe_ingredients row ${row.id} references catalog food ${row.catalog_food_id}, ` +
-                            'which is not a loaded food',
-                    );
-                }
-
-                return {
-                    source_key: sourceKey,
-                    catalog_nutrition_version: row.catalog_nutrition_version,
-                    catalog_metadata_version: row.catalog_metadata_version,
-                    snapshot_per_100g: row.snapshot_per_100g as unknown as RecipeIngredientNutrientSnapshot,
-                    snapshot_name: row.snapshot_name,
-                    snapshot_provenance: row.snapshot_provenance,
-                    snapshot_allergen_tags: row.snapshot_allergen_tags,
-                    snapshot_diet_tags: row.snapshot_diet_tags,
-                    quantity: row.quantity,
-                    unit: row.unit,
-                    gram_weight: row.gram_weight,
-                    display_text: row.display_text,
-                    sort_order: row.sort_order,
-                    is_optional: row.is_optional,
-                };
-            }),
-    };
-};
-
-const compareStoredPublication = (
-    planned: PlannedPublication,
-    stored: StoredPublication,
-): RecipeDrift[] => {
-    const drifts: RecipeDrift[] = [];
-
-    for (const [field, plannedValue] of Object.entries(planned.version)) {
-        const storedValue = stored.version[field as keyof PlannedVersion];
-        if (!equivalentContent(storedValue, plannedValue)) {
-            drifts.push({
-                slug: planned.slug,
-                field,
-                stored: render(storedValue),
-                release: render(plannedValue),
-            });
-        }
-    }
-
-    if (!equivalentContent(stored.ingredients, planned.ingredients)) {
-        drifts.push({
-            slug: planned.slug,
-            field: 'recipe_ingredients',
-            stored: render(stored.ingredients),
-            release: render(planned.ingredients),
-        });
-    }
-
-    return drifts;
-};
-
-/**
- * Publishes every payload that is not already stored, and reports — rather than
- * rewrites — any whose stored content differs from the release.
- *
- * Idempotent by `slug`, which is the property this file is named for: a second
- * application publishes nothing and reports every payload `unchanged`. Drift is
- * REPORTED because a corpus that changed under a loaded database is a finding
- * for whoever changed it; promoting a new version and retiring the previous one
- * is `recipes-seed.ts`'s transaction (§0.7.1 Group 4) and not this suite's to
- * perform.
- */
-const applyRecipeCorpus = async (
-    plans: readonly PlannedPublication[],
-    foodIdBySourceKey: ReadonlyMap<string, string>,
-    sourceKeyById: ReadonlyMap<string, string>,
-): Promise<RecipeApplyReport> => {
-    const published: string[] = [];
-    const unchanged: string[] = [];
-    const drifted: RecipeDrift[] = [];
-
-    for (const plan of plans) {
-        const stored = await readStoredPublication(plan.slug, sourceKeyById);
-
-        if (stored !== null) {
-            const drifts = compareStoredPublication(plan, stored);
-            if (drifts.length === 0) {
-                unchanged.push(plan.slug);
-            } else {
-                drifted.push(...drifts);
-            }
-            continue;
-        }
-
-        const ingredientRows: Prisma.recipe_ingredientsUncheckedCreateWithoutRecipe_versionsInput[] =
-            plan.ingredients.map((ingredient) => {
-                const catalogFoodId = foodIdBySourceKey.get(ingredient.source_key);
-                if (catalogFoodId === undefined) {
-                    throw new Error(
-                        `${plan.slug}: ingredient "${ingredient.source_key}" was not loaded into catalog_foods`,
-                    );
-                }
-
-                return {
-                    catalog_food_id: catalogFoodId,
-                    catalog_nutrition_version: ingredient.catalog_nutrition_version,
-                    catalog_metadata_version: ingredient.catalog_metadata_version,
-                    snapshot_per_100g: ingredient.snapshot_per_100g as unknown as Prisma.InputJsonValue,
-                    snapshot_name: ingredient.snapshot_name,
-                    snapshot_provenance: ingredient.snapshot_provenance,
-                    snapshot_allergen_tags: ingredient.snapshot_allergen_tags,
-                    snapshot_diet_tags: ingredient.snapshot_diet_tags,
-                    quantity: ingredient.quantity,
-                    unit: ingredient.unit,
-                    gram_weight: ingredient.gram_weight,
-                    display_text: ingredient.display_text,
-                    sort_order: ingredient.sort_order,
-                    is_optional: ingredient.is_optional,
-                };
-            });
-
-        // One transaction per recipe, as the seed publishes them: the version and
-        // its ingredient rows land together or not at all.
-        await prisma.$transaction(async (tx) => {
-            const recipe = await tx.recipes.create({ data: { slug: plan.slug } });
-            const version = await tx.recipe_versions.create({
-                data: {
-                    recipe_id: recipe.id,
-                    version: FIRST_VERSION,
-                    name: plan.version.name,
-                    description: plan.version.description,
-                    icon_key: plan.version.icon_key,
-                    instructions: plan.version.instructions,
-                    yield_servings: plan.version.yield_servings,
-                    serving_description: plan.version.serving_description,
-                    prep_minutes: plan.version.prep_minutes,
-                    cook_minutes: plan.version.cook_minutes,
-                    total_minutes: plan.version.total_minutes,
-                    meal_slots: plan.version.meal_slots,
-                    diet_tags: plan.version.diet_tags,
-                    allergen_tags: plan.version.allergen_tags,
-                    allergen_status: plan.version.allergen_status,
-                    budget_tier: plan.version.budget_tier,
-                    badges: plan.version.badges,
-                    nutrition_provenance: plan.version.nutrition_provenance,
-                    per_serving_calories: plan.version.per_serving_calories,
-                    per_serving_protein_g: plan.version.per_serving_protein_g,
-                    per_serving_carbs_g: plan.version.per_serving_carbs_g,
-                    per_serving_fat_g: plan.version.per_serving_fat_g,
-                    sourced_calories_note: plan.version.sourced_calories_note,
-                    status: plan.version.status,
-                    published_at: PUBLISHED_AT,
-                    recipe_ingredients: { create: ingredientRows },
-                },
-            });
-
-            await tx.recipes.update({ where: { id: recipe.id }, data: { current_version_id: version.id } });
-        });
-
-        published.push(plan.slug);
-    }
-
-    return { published, unchanged, drifted };
-};
+/** The committed coverage report, as bytes and as parsed values. */
+const committedReportPath = (): string => path.join(recipesDir(), COVERAGE_REPORT_FILE);
 
 /* ---------------------------------------------------------------------------
  * Reading the loaded state back
@@ -1666,29 +1282,26 @@ const UNRESTRICTED_PREFERENCES: PlanningPreferences = {
  * ------------------------------------------------------------------------- */
 
 let corpus: Corpus;
-let plans: PlannedPublication[];
 let catalogApply: CatalogApplyReport;
-let recipeApply: RecipeApplyReport;
+let recipeApply: SeedOutcome;
+let emittedReport: string;
 let catalogAfterFirstApply: CatalogState;
 let storedRecipes: StoredRecipe[];
 let foodIdBySourceKey: Map<string, string>;
-let sourceKeyById: Map<string, string>;
 
 beforeAll(async () => {
     await truncateFeatureTables();
 
     corpus = await readCorpus();
-
-    const foodsByKey = new Map(corpus.slice.foods.map((food) => [food.source_key, food]));
-    plans = corpus.payloads.map((payload) => planPublication(payload, foodsByKey));
+    emittedReportPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'seed-rerun-report-')), COVERAGE_REPORT_FILE);
 
     catalogApply = await applyCatalogSlice(corpus.slice);
 
     const loaded = await prisma.catalog_foods.findMany({ select: { id: true, source_key: true } });
     foodIdBySourceKey = new Map(loaded.map((row) => [row.source_key, row.id]));
-    sourceKeyById = new Map(loaded.map((row) => [row.id, row.source_key]));
 
-    recipeApply = await applyRecipeCorpus(plans, foodIdBySourceKey, sourceKeyById);
+    recipeApply = await runSeed(seedDeps());
+    emittedReport = fs.readFileSync(emittedReportPath, 'utf8');
 
     catalogAfterFirstApply = await readCatalogState();
     storedRecipes = await readStoredRecipes();
@@ -1696,6 +1309,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
     await truncateFeatureTables();
+    fs.rmSync(path.dirname(emittedReportPath), { recursive: true, force: true });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -1990,9 +1604,10 @@ describe('the planning preconditions every recipe ingredient must satisfy', () =
 
 describe('recipe nutrition recomputed from the stored rows', () => {
     it('publishes one current version per payload, with its ingredient rows', () => {
-        expect(recipeApply.drifted).toEqual([]);
-        expect(recipeApply.published).toEqual(corpus.payloads.map((payload) => payload.slug).sort());
+        expect(recipeApply.promoted).toEqual([]);
+        expect(recipeApply.created).toEqual(corpus.payloads.map((payload) => payload.slug).sort());
         expect(recipeApply.unchanged).toEqual([]);
+        expect(recipeApply.ingredientRows).toBe(corpus.ingredientRowCount);
         expect(storedRecipes).toHaveLength(corpus.payloads.length);
 
         const withoutCurrent = storedRecipes.filter((recipe) => recipe.current_version === null).map((r) => r.slug);
@@ -2134,16 +1749,20 @@ describe('recipe nutrition recomputed from the stored rows', () => {
 
 describe('the declarations this corpus makes about its recipes', () => {
     /**
-     * Declared versus DERIVED. Every case below was measured across all 42
-     * payloads before it was written, and each one agrees for every payload —
-     * the stored column is the derivation's own output, so an agreement here is
-     * the file's declaration being confirmed by the rules that will consume it.
+     * Declared versus DERIVED, for every field §0.7.3 holds a recipe file to.
      *
-     * `diet_tags` is deliberately not among them: the diet taxonomy is being
-     * corrected in parallel (`pescatarian_ok` against the runtime
-     * `pescatarian` code), so the derived value is stored and the declaration
-     * is not held to it here. That comparison belongs to `recipes-seed.ts`'s
-     * own gate once the taxonomy has settled.
+     * The stored column is the DERIVATION's own output — the seed publishes no
+     * declared value — so an agreement here is the file's declaration being
+     * confirmed by the rules that will consume it. The seed's own gate refuses
+     * a disagreement outright, which is why these five cases could not have
+     * reached the database disagreeing: they restate that gate's verdict
+     * field by field, so a future corpus edit that drifted is named here with
+     * its slug and its field rather than only as a refused run.
+     *
+     * `diet_tags` is among them. Seafood admissibility is carried by the
+     * `pescatarian` tag and by no other spelling — an earlier release spelled
+     * it `pescatarian_ok`, which the runtime `pescatarian` diet code does not
+     * match — and this case is what pins the two to the same vocabulary.
      */
     interface DeclarationCase {
         readonly field: string;
@@ -2152,6 +1771,11 @@ describe('the declarations this corpus makes about its recipes', () => {
     }
 
     const declarationCases: readonly DeclarationCase[] = [
+        {
+            field: 'diet_tags',
+            declared: (payload) => payload.dietTags.slice().sort(),
+            stored: (version) => version.diet_tags.slice().sort(),
+        },
         {
             field: 'allergen_tags',
             declared: (payload) => payload.allergenTags.slice().sort(),
@@ -2246,15 +1870,108 @@ describe('planning eligibility for a user who has answered nothing restrictive',
     });
 });
 
+describe('the coverage matrix the seed derives from the seeded rows', () => {
+    /**
+     * §0.7.3's claim about this corpus, settled against the database rather
+     * than against the files: the guaranteed profiles hold at least four
+     * eligible recipes per slot — which is what the repeat rule (at most two
+     * uses a week, never on consecutive days) needs to fill seven days — and
+     * the reduced profiles at least two, which is asserted and explicitly NOT
+     * sufficient for a week.
+     */
+    const report = (): CoverageReport => {
+        if (recipeApply.report === null) {
+            throw new Error('the seed reported no coverage matrix, so §0.7.3 cannot be asserted from it');
+        }
+
+        return recipeApply.report;
+    };
+
+    it('counts the corpus and its cross-listed recipes', () => {
+        expect(report().recipeCount).toBe(corpus.payloads.length);
+        expect(report().crossListedRecipeCount).toBe(
+            corpus.payloads.filter((payload) => payload.mealSlots.length > 1).length,
+        );
+        expect(report().eligibleCounts).toHaveLength(
+            report().dimensions.diets.length *
+                report().dimensions.allergens.length *
+                report().dimensions.slots.length *
+                report().dimensions.timeTiers.length,
+        );
+    });
+
+    it('satisfies every guaranteed cell: at least four eligible recipes', () => {
+        const shortfalls = report()
+            .guaranteedCells.filter((cell) => cell.count < cell.threshold)
+            .map(
+                (cell) =>
+                    `${cell.diet}/${cell.allergen}/${cell.slot}/<=${cell.timeTier}min: ${cell.count} eligible, ` +
+                    `threshold ${cell.threshold}`,
+            );
+
+        expect(shortfalls).toEqual([]);
+        // The clause is not passing because nothing exercises it.
+        expect(report().guaranteedCells.length).toBeGreaterThan(0);
+        expect(report().guaranteedCells.every((cell) => cell.threshold === 4)).toBe(true);
+    });
+
+    it('satisfies every reduced cell: at least two eligible recipes', () => {
+        const shortfalls = report()
+            .reducedCells.filter((cell) => cell.count < cell.threshold)
+            .map(
+                (cell) =>
+                    `${cell.diet}/${cell.allergen}/${cell.slot}/<=${cell.timeTier}min: ${cell.count} eligible, ` +
+                    `threshold ${cell.threshold}`,
+            );
+
+        expect(shortfalls).toEqual([]);
+        expect(report().reducedCells.length).toBeGreaterThan(0);
+        expect(report().reducedCells.every((cell) => cell.threshold === 2)).toBe(true);
+    });
+
+    it('meets the §0.7.3 composition floors for every slot that states them', () => {
+        const shortfalls: string[] = [];
+
+        for (const [slot, composition] of Object.entries(report().slotComposition)) {
+            for (const [stratum, value] of Object.entries(composition.composition)) {
+                if (value.floor !== null && value.count < value.floor) {
+                    shortfalls.push(`${slot}.${stratum}: ${value.count} recipes, floor ${value.floor}`);
+                }
+            }
+        }
+
+        expect(shortfalls).toEqual([]);
+    });
+
+    it('equals the committed data/meal-planning/recipes/coverage-report.json', () => {
+        const committed = JSON.parse(fs.readFileSync(committedReportPath(), 'utf8')) as unknown;
+
+        // Parsed first, so a failure names the member that moved rather than a
+        // byte offset...
+        expect(JSON.parse(JSON.stringify(report()))).toEqual(committed);
+        // ...and byte for byte after it, which is what makes the committed
+        // artefact reviewable as a diff.
+        expect(emittedReport).toBe(fs.readFileSync(committedReportPath(), 'utf8'));
+    });
+
+    it('wrote its output to the injected path and left the committed artefact alone', () => {
+        expect(recipeApply.reportPath).toBe(emittedReportPath);
+        expect(emittedReportPath.startsWith(recipesDir())).toBe(false);
+        expect(recipeApply.reportSkippedReason).toBeNull();
+    });
+});
+
 describe('re-applying the same release', () => {
     let secondCatalogApply: CatalogApplyReport;
-    let secondRecipeApply: RecipeApplyReport;
+    let secondRecipeApply: SeedOutcome;
+    let secondEmittedReport: string;
     let catalogAfterSecondApply: CatalogState;
     let recipesAfterSecondApply: StoredRecipe[];
 
     beforeAll(async () => {
         secondCatalogApply = await applyCatalogSlice(corpus.slice);
-        secondRecipeApply = await applyRecipeCorpus(plans, foodIdBySourceKey, sourceKeyById);
+        secondRecipeApply = await runSeed(seedDeps());
+        secondEmittedReport = fs.readFileSync(emittedReportPath, 'utf8');
         catalogAfterSecondApply = await readCatalogState();
         recipesAfterSecondApply = await readStoredRecipes();
     }, LOAD_TIMEOUT_MS);
@@ -2273,14 +1990,22 @@ describe('re-applying the same release', () => {
         expect(catalogAfterSecondApply.records).toEqual(catalogAfterFirstApply.records);
     });
 
-    it('publishes no second recipe, version or ingredient row and reports no content drift', async () => {
-        expect(secondRecipeApply.drifted).toEqual([]);
-        expect(secondRecipeApply.published).toEqual([]);
+    it('publishes no second recipe, version or ingredient row and promotes nothing', async () => {
+        expect(secondRecipeApply.created).toEqual([]);
+        expect(secondRecipeApply.promoted).toEqual([]);
         expect(secondRecipeApply.unchanged).toEqual(corpus.payloads.map((payload) => payload.slug).sort());
+        expect(secondRecipeApply.ingredientRows).toBe(0);
 
         expect(await prisma.recipes.count()).toBe(corpus.payloads.length);
         expect(await prisma.recipe_versions.count()).toBe(corpus.payloads.length);
         expect(await prisma.recipe_ingredients.count()).toBe(corpus.ingredientRowCount);
+    });
+
+    it('re-emits a byte-identical coverage report', () => {
+        // The one property that makes the committed artefact reviewable: a rerun
+        // that reordered a key or moved a float would show as a whole-file diff
+        // and bury the change a reviewer is there to read.
+        expect(secondEmittedReport).toBe(emittedReport);
     });
 
     it('holds one current version per recipe, still at version 1, with no duplicate slug', () => {

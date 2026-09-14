@@ -227,7 +227,13 @@ jest.mock('../../prisma/client', () => {
     };
 });
 
+import { Request, Response } from 'express';
+
 import { prisma } from '../../prisma/client';
+import {
+    getCatalogSuggestionsController,
+    searchCatalogFoodsController,
+} from '../../controllers/catalog.controller';
 import { makeCatalogFood } from '../setup/factories';
 import { CatalogFoodRow, CatalogMappingError, mapCatalogFood } from '../../services/catalog.mapper';
 import { getStatus, getSuggestions, searchPublishedFoods } from '../../services/catalog.service';
@@ -557,6 +563,244 @@ describe('catalog read ordering across databases', () => {
             expect(() => mapCatalogFood(foodRow({ allergen_tags: ['milk', 7] }), portions)).toThrow(
                 /catalog_foods\.allergen_tags\[1\]/,
             );
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The page block of a catalog request is PARSED, not clamped.
+ *
+ * WHAT IS BEING PROVEN. `?page=` and `?limit=` used to be read at the controller
+ * through the lenient `parsePagination`, which bounds whatever it is handed — so
+ * `?page=0` was served as page one, `?page=2.7` as page two, `?limit=1000` as
+ * fifty rows, and `?limit=31` on the suggestions route as thirty chips, each
+ * with `200 OK`. A caller could not tell any of those from a request that was
+ * actually honoured. AAP §0.5.2 requires the opposite — `page >= 1`, `limit`
+ * inside the route's band, and validation "before any Prisma or planning work
+ * (`*.logic.ts` parsers, 400 with field codes)" — and answering success for
+ * input that was silently rewritten is the CWE-20 defect this describe pins
+ * closed.
+ *
+ * WHY HERE, AND WHY THROUGH THE HANDLERS RATHER THAN SUPERTEST. Both halves of
+ * the contract are one claim and belong in one place: a malformed page block is
+ * refused WITHOUT the database being touched, and an omitted one still takes the
+ * route's default and returns a real page. The second half needs published rows,
+ * which this file's disposable database already has, so the handlers are driven
+ * with a minimal request/response pair — the instrument
+ * `src/__tests__/api/requestParserWiring.test.ts` uses for the same two catalog
+ * handlers. A supertest round-trip is not available: `src/routes/catalog.routes.ts`
+ * does not exist yet, so no catalog path is mounted on `app`, and asserting
+ * through a router that is not there would assert nothing.
+ *
+ * "BEFORE ANY PRISMA WORK" IS MEASURED, not assumed. The mocked singleton this
+ * file installs emits a `query` event per statement, so a refusal is asserted to
+ * have produced NONE. That is what makes the POSITION of the parse — the first
+ * statement of the handler, before the service call — load-bearing rather than
+ * tidy.
+ *
+ * DECLARATION ORDER IS NOT LOAD-BEARING, by the same rule the rest of this file
+ * follows: nothing below writes to the database, and the five published `beans`
+ * foods are the whole corpus a `beans` search can reach (the probe food the next
+ * describe seeds matches no `beans` prefix and no `beans` full-text term), so
+ * every count here holds whichever order the describes run in.
+ * ------------------------------------------------------------------------- */
+describe('the catalog request boundary refuses a malformed page block before any I/O', () => {
+    /** The route bands AAP §0.5.2 fixes, restated where they are asserted. */
+    const SEARCH_DEFAULT_LIMIT = 25;
+    const SEARCH_MAX_LIMIT = 50;
+    const SUGGESTIONS_MAX_LIMIT = 30;
+
+    /** Every published food a `beans` search can reach (seeded in `beforeAll`). */
+    const PUBLISHED_BEANS = COLLATION_SENSITIVE_NAMES.length;
+
+    /** What the response double recorded, in place of a wire response. */
+    interface RecordedResponse {
+        statusCode: number | null;
+        body: unknown;
+    }
+
+    interface ResponseDouble {
+        status(code: number): ResponseDouble;
+        json(body: unknown): ResponseDouble;
+    }
+
+    const handlerDoubles = (
+        query: Record<string, unknown>,
+    ): { req: Request; res: Response; recorded: RecordedResponse } => {
+        const recorded: RecordedResponse = { statusCode: null, body: null };
+        const res: ResponseDouble = {
+            status: (code: number) => {
+                recorded.statusCode = code;
+
+                return res;
+            },
+            json: (body: unknown) => {
+                recorded.body = body;
+
+                return res;
+            },
+        };
+
+        return {
+            // `getUserId` reads the uid the auth middleware attached; these
+            // routes resolve the caller and then have nothing to scope by, the
+            // catalog being shared reference data.
+            req: { user: { uid: 'catalog-boundary-user' }, params: {}, query } as unknown as Request,
+            res: res as unknown as Response,
+            recorded,
+        };
+    };
+
+    /**
+     * Statements the mocked client issued while `recordingQueries` is on.
+     *
+     * Prisma exposes no `$off`, so the listener registered below outlives each
+     * test; the flag and the reset are what bound what any one assertion sees.
+     */
+    const observedStatements: string[] = [];
+    let recordingQueries = false;
+
+    beforeAll(() => {
+        (prisma as unknown as QueryEventSource).$on('query', (event) => {
+            if (recordingQueries) {
+                observedStatements.push(event.query);
+            }
+        });
+    });
+
+    /**
+     * Drives a handler with a clean statement log and returns what it recorded.
+     *
+     * The macrotask tick after the handler resolves is deliberate: a `query`
+     * event is emitted asynchronously, so a statement issued by this call could
+     * otherwise arrive after the assertion read the log and make "no statement"
+     * true only by racing it.
+     */
+    const driveHandler = async (
+        handler: (req: Request, res: Response) => Promise<unknown>,
+        query: Record<string, unknown>,
+    ): Promise<{ recorded: RecordedResponse; statements: string[] }> => {
+        observedStatements.length = 0;
+        recordingQueries = true;
+
+        const { req, res, recorded } = handlerDoubles(query);
+        await handler(req, res);
+        await new Promise((resolve) => setImmediate(resolve));
+
+        recordingQueries = false;
+
+        return { recorded, statements: [...observedStatements] };
+    };
+
+    describe('GET /catalog/foods', () => {
+        it('serves the default page block when the request names only q', async () => {
+            const { recorded, statements } = await driveHandler(searchCatalogFoodsController, { q: QUERY });
+
+            expect(recorded.statusCode).toBeNull();
+            expect(recorded.body).toMatchObject({
+                pagination: {
+                    page: 1,
+                    limit: SEARCH_DEFAULT_LIMIT,
+                    total: PUBLISHED_BEANS,
+                    totalPages: 1,
+                },
+            });
+            expect((recorded.body as { items: unknown[] }).items).toHaveLength(PUBLISHED_BEANS);
+            // The converse of every refusal below: a well-formed request DOES
+            // reach the database, so the gate cannot be passing by refusing
+            // everything.
+            expect(statements.length).toBeGreaterThan(0);
+        });
+
+        it('uses an explicit page block exactly as it was asked for', async () => {
+            const { recorded } = await driveHandler(searchCatalogFoodsController, {
+                q: QUERY,
+                page: '2',
+                limit: '2',
+            });
+
+            expect(recorded.statusCode).toBeNull();
+            expect(recorded.body).toMatchObject({
+                pagination: { page: 2, limit: 2, total: PUBLISHED_BEANS, totalPages: 3 },
+            });
+            expect((recorded.body as { items: unknown[] }).items).toHaveLength(2);
+        });
+
+        it.each([
+            ['a zero page', { page: '0' }, { field: 'page', code: 'out_of_range' }],
+            ['a negative page', { page: '-1' }, { field: 'page', code: 'out_of_range' }],
+            ['a fractional page', { page: '2.7' }, { field: 'page', code: 'invalid' }],
+            ['a nonnumeric page', { page: 'abc' }, { field: 'page', code: 'invalid' }],
+            [
+                'a page past the supported depth',
+                { page: '99999999999999999999' },
+                { field: 'page', code: 'out_of_range' },
+            ],
+            [
+                'a limit above the route cap',
+                { limit: String(SEARCH_MAX_LIMIT + 1) },
+                { field: 'limit', code: 'out_of_range' },
+            ],
+            ['a limit of a thousand', { limit: '1000' }, { field: 'limit', code: 'out_of_range' }],
+            ['a zero limit', { limit: '0' }, { field: 'limit', code: 'out_of_range' }],
+            ['a fractional limit', { limit: '7.9' }, { field: 'limit', code: 'invalid' }],
+        ])('refuses %s with no statement issued', async (_label, pageBlock, detail) => {
+            const { recorded, statements } = await driveHandler(searchCatalogFoodsController, {
+                q: QUERY,
+                ...pageBlock,
+            });
+
+            expect(recorded.statusCode).toBe(400);
+            expect(recorded.body).toEqual({ error: 'invalid_request', details: [detail] });
+            expect(statements).toEqual([]);
+        });
+
+        it('names both fields of a request that gets both wrong', async () => {
+            const { recorded, statements } = await driveHandler(searchCatalogFoodsController, {
+                q: QUERY,
+                page: 'abc',
+                limit: '0',
+            });
+
+            expect(recorded.statusCode).toBe(400);
+            expect(recorded.body).toEqual({
+                error: 'invalid_request',
+                details: [
+                    { field: 'page', code: 'invalid' },
+                    { field: 'limit', code: 'out_of_range' },
+                ],
+            });
+            expect(statements).toEqual([]);
+        });
+    });
+
+    describe('GET /catalog/foods/suggestions', () => {
+        it('serves the maximum page of chips when it is asked for exactly', async () => {
+            const { recorded, statements } = await driveHandler(getCatalogSuggestionsController, {
+                kind: 'dislike',
+                limit: String(SUGGESTIONS_MAX_LIMIT),
+            });
+
+            expect(recorded.statusCode).toBeNull();
+            expect((recorded.body as { items: unknown[] }).items).toHaveLength(PUBLISHED_BEANS);
+            expect(statements.length).toBeGreaterThan(0);
+        });
+
+        it.each([
+            ['above the maximum', String(SUGGESTIONS_MAX_LIMIT + 1), 'out_of_range'],
+            ['a thousand', '1000', 'out_of_range'],
+            ['zero', '0', 'out_of_range'],
+            ['fractional', '7.9', 'invalid'],
+            ['free text', 'twelve', 'invalid'],
+        ])('refuses a limit %s with no statement issued', async (_label, limit, code) => {
+            const { recorded, statements } = await driveHandler(getCatalogSuggestionsController, {
+                kind: 'dislike',
+                limit,
+            });
+
+            expect(recorded.statusCode).toBe(400);
+            expect(recorded.body).toEqual({ error: 'invalid_request', details: [{ field: 'limit', code }] });
+            expect(statements).toEqual([]);
         });
     });
 });

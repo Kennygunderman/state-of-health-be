@@ -5,15 +5,27 @@ import { PaginationBlock } from '../types/catalog';
  * declared once, in the type layer, and this module only builds it — the
  * dependency runs utils → types and never the reverse.
  *
- * The three exports divide the scheme by boundary: `parsePagination` reads the
- * request, `toPaginationBlock` builds the response block, and `rowWindowFor`
- * derives the `LIMIT`/`OFFSET` pair the query actually runs with. The offset
- * lives here rather than at each call site because `(page - 1) * limit` is
- * arithmetic on request input: a page of `99999999999999999999` parses to a
- * finite but imprecise 1e20, and the product then exceeds what PostgreSQL will
- * accept for `OFFSET`, turning a query parameter into a 500. One bounded
- * derivation serves every caller, including the ones that reach a service
- * directly and never pass through `parsePagination`.
+ * The exports divide the scheme by boundary: `parsePaginationStrict` reads a
+ * REQUEST and refuses a page block the endpoint cannot serve, `parsePagination`
+ * bounds a page block that has no request behind it, `toPaginationBlock` builds
+ * the response block, and `rowWindowFor` derives the `LIMIT`/`OFFSET` pair the
+ * query actually runs with.
+ *
+ * TWO PARSERS, ONE BAND. Both read the same fields against the same constants
+ * and the same caller options; what differs is the answer to a value outside
+ * the band. A request gets a field error, because serving a clamped value
+ * reports success for input that was silently rewritten (see
+ * {@link parsePaginationStrict}); a trusted in-process caller gets a bounded
+ * number, because there is no client to tell and no request to refuse (see
+ * {@link parsePagination}).
+ *
+ * The offset lives here rather than at each call site because
+ * `(page - 1) * limit` is arithmetic on request input: a page of
+ * `99999999999999999999` parses to a finite but imprecise 1e20, and the product
+ * then exceeds what PostgreSQL will accept for `OFFSET`, turning a query
+ * parameter into a 500. One bounded derivation serves every caller, including
+ * the ones that reach a service directly and never pass through a parser at
+ * all.
  */
 
 /**
@@ -41,6 +53,50 @@ export interface RowWindow {
     limit: number;
     offset: number;
 }
+
+/** The two fields of the page block a request can get wrong. */
+export type PaginationField = 'page' | 'limit';
+
+/**
+ * The machine-readable `details[].code` vocabulary a refused page block uses:
+ *
+ *  - `invalid` — the value is not a whole number at all: free text, a
+ *    fraction, a blank parameter, a non-scalar.
+ *  - `out_of_range` — it IS a whole number, and not one this endpoint accepts.
+ *
+ * Two codes rather than one because the two corrections differ: the first asks
+ * the caller to send a number, the second to send a different number. The
+ * client maps the code to its own copy and never renders these words, which is
+ * why they are wire tokens and not sentences (§0.5.2).
+ */
+export type PaginationFieldErrorCode = 'invalid' | 'out_of_range';
+
+/**
+ * One element of a `400 invalid_request` body's `details` array, narrowed to
+ * the fields this module reads.
+ *
+ * `field` is a literal union so a caller cannot report a field the page block
+ * does not have, and the shape stays structurally assignable to the wider
+ * `{field: string; code: string}` detail the `*.logic.ts` request parsers merge
+ * it into — so the one wire shape is shared rather than re-declared.
+ */
+export interface PaginationFieldError {
+    field: PaginationField;
+    code: PaginationFieldErrorCode;
+}
+
+/**
+ * What {@link parsePaginationStrict} answers: the bounded pair, or every field
+ * error the request earned.
+ *
+ * A RETURNED VERDICT, never a throw. The module stays deterministic, pure and
+ * framework-free — no error class, no status code — and mapping the refusal to
+ * `400 invalid_request` belongs to the controller that receives it
+ * (Rule backend-architecture §7, §8).
+ */
+export type ParsedPaginationQuery =
+    | { kind: 'ok'; page: number; limit: number }
+    | { kind: 'error'; message: string; details: PaginationFieldError[] };
 
 export const DEFAULT_PAGE = 1;
 export const DEFAULT_LIMIT = 25;
@@ -123,10 +179,152 @@ const sanitizeOptionLimit = (value: number | undefined, fallback: number): numbe
         : Math.max(Math.trunc(value), MIN_LIMIT);
 
 /**
- * Clamps out-of-range values instead of rejecting them: a stale `limit` in a
- * client's saved request must not turn a list screen into an error, and an
- * unconditional clamp means no caller can forget the maximum. Request bodies
- * that must be refused belong to the `*.logic.ts` parsers that answer 400.
+ * A decimal integer literal, optionally negative, and nothing else.
+ *
+ * Deliberately narrower than `Number.parseInt`, which is what makes the strict
+ * reader below strict: `parseInt` reads a PREFIX, so `'2.7'` is 2 and
+ * `'2abc'` is 2 — it answers a different request than the one that was sent.
+ * A negative sign is admitted by the pattern on purpose so that `'-1'` is
+ * classified as a whole number OUT OF RANGE rather than as unreadable text;
+ * the range test below is what refuses it, and the caller is then told the
+ * useful thing ("page must be between 1 and 100000") instead of being told its
+ * number is not a number. A leading `+`, an exponent, a hexadecimal literal,
+ * a thousands separator and a blank value are all refused as `invalid`.
+ */
+const INTEGER_TEXT_PATTERN = /^-?\d+$/;
+
+/**
+ * A request value as the strict reader classifies it, before any bound is
+ * applied. `unrepresentable` is a fourth case rather than part of `invalid`
+ * because a twenty-digit page IS an integer literal — it is simply larger than
+ * IEEE-754 can hold exactly (`Number('99999999999999999999')` is 1e20), so the
+ * honest answer is that it is out of range, and the arithmetic it would have
+ * reached never runs.
+ */
+type RequestedInteger =
+    | { kind: 'absent' }
+    | { kind: 'integer'; value: number }
+    | { kind: 'invalid' }
+    | { kind: 'unrepresentable' };
+
+/**
+ * Reads one request value strictly.
+ *
+ * `qs` yields an array when a parameter repeats (`?page=1&page=2`); the first
+ * occurrence wins, exactly as {@link parsePagination} treats it, and a repeated
+ * parameter with no values at all (`?page[]=`) reads as absent. A value already
+ * coerced to a `number` by a typed caller is accepted when it is a safe
+ * integer, so the same parser serves an Express query string and an internal
+ * call without either having to pre-format for the other.
+ */
+const readRequestedInteger = (value: unknown): RequestedInteger => {
+    const raw = Array.isArray(value) ? value[0] : value;
+
+    if (raw === undefined) {
+        return { kind: 'absent' };
+    }
+
+    if (typeof raw === 'number') {
+        if (Number.isSafeInteger(raw)) {
+            return { kind: 'integer', value: raw };
+        }
+
+        // `Number.isInteger` is false for NaN and both infinities, so only a
+        // genuine integer too large to hold exactly reaches the second branch.
+        return Number.isInteger(raw) ? { kind: 'unrepresentable' } : { kind: 'invalid' };
+    }
+
+    if (typeof raw !== 'string') {
+        return { kind: 'invalid' };
+    }
+
+    const text = raw.trim();
+
+    if (!INTEGER_TEXT_PATTERN.test(text)) {
+        return { kind: 'invalid' };
+    }
+
+    const parsed = Number(text);
+
+    return Number.isSafeInteger(parsed) ? { kind: 'integer', value: parsed } : { kind: 'unrepresentable' };
+};
+
+/** The rule one strictly parsed field is held to. */
+interface FieldBounds {
+    field: PaginationField;
+    min: number;
+    max: number;
+    /** Applied only when the field is absent — never to a value that failed. */
+    fallback: number;
+}
+
+/**
+ * One resolved field. Discriminated on `kind` rather than on the presence of a
+ * property so that a single early return narrows BOTH fields for the success
+ * path below — no unreachable fallback, and therefore no branch a test could
+ * never cover.
+ */
+type ResolvedField =
+    | { kind: 'value'; value: number }
+    | { kind: 'error'; error: PaginationFieldError; message: string };
+
+type ResolvedFieldError = Extract<ResolvedField, { kind: 'error' }>;
+
+const isFieldFailure = (resolved: ResolvedField): resolved is ResolvedFieldError => resolved.kind === 'error';
+
+/**
+ * Resolves one field of the page block: the caller's default when it was not
+ * sent, the value when it is a whole number inside the bound, and a field error
+ * otherwise.
+ *
+ * The `message` is a server-side diagnostic the request parser composes into
+ * one sentence; the client renders `details`, never this string.
+ */
+const resolveRequestedField = (raw: unknown, bounds: FieldBounds): ResolvedField => {
+    const requested = readRequestedInteger(raw);
+
+    if (requested.kind === 'absent') {
+        return { kind: 'value', value: bounds.fallback };
+    }
+
+    if (requested.kind === 'invalid') {
+        return {
+            kind: 'error',
+            error: { field: bounds.field, code: 'invalid' },
+            message: `${bounds.field} must be a whole number`,
+        };
+    }
+
+    const outOfRange: ResolvedField = {
+        kind: 'error',
+        error: { field: bounds.field, code: 'out_of_range' },
+        message: `${bounds.field} must be between ${bounds.min} and ${bounds.max}`,
+    };
+
+    if (requested.kind === 'unrepresentable') {
+        return outOfRange;
+    }
+
+    return requested.value < bounds.min || requested.value > bounds.max
+        ? outOfRange
+        : { kind: 'value', value: requested.value };
+};
+
+/**
+ * THE LENIENT CONTRACT, AND NO LONGER THE REQUEST BOUNDARY. Clamps
+ * out-of-range values instead of rejecting them, so it is total and can be
+ * called with anything — which makes it the safety backstop for a trusted
+ * caller that never met a request parser, and the shape the six shipped list
+ * controllers' `parseInt(req.query.page) || 1` idiom can be replaced with
+ * without changing what those endpoints answer.
+ *
+ * It is NOT what an HTTP request parses through any more, and must not become
+ * that again: a clamp answers a request nobody made (`limit=51` served as 50,
+ * `page=2.7` served as page 2, `page=-1` served as page 1) and reports success
+ * for input it silently rewrote, which is the CWE-20 defect
+ * {@link parsePaginationStrict} exists to close. A route boundary uses the
+ * strict sibling and answers `400 invalid_request`; this function bounds a
+ * value that has no request behind it.
  */
 export const parsePagination = (
     query: PaginationQuery,
@@ -142,6 +340,72 @@ export const parsePagination = (
         page: requestedPage === null ? DEFAULT_PAGE : clampPage(requestedPage),
         limit: requestedLimit === null ? fallbackLimit : clampLimit(requestedLimit, maxLimit),
     };
+};
+
+/**
+ * THE REQUEST-BOUNDARY CONTRACT: parses `?page=` and `?limit=` strictly, and
+ * refuses what it cannot serve instead of rewriting it.
+ *
+ * AAP §0.5.2 fixes the rule this implements — `page >= 1`, `limit` within the
+ * route's band, and "server-side validation applied before any Prisma or
+ * planning work (`*.logic.ts` parsers, 400 with field codes)". Clamping cannot
+ * express that: a caller who sends `limit=1000` and receives 50 rows with
+ * `200 OK` was told its request succeeded, and a caller who sends `page=2.7`
+ * silently reads page 2. Neither can be distinguished from a correct request,
+ * so a paging bug in a client — or a probe of the endpoint — looks like normal
+ * traffic (CWE-20). This parser makes the difference visible at the boundary,
+ * before a statement is issued.
+ *
+ * TWO CONTRACTS, ONE SCHEME. The bounds, the defaults and the option handling
+ * are the same ones {@link parsePagination} applies, taken from the same
+ * constants, so the strict and lenient answers can never disagree about what
+ * the band IS — only about what to do with a value outside it.
+ *
+ * DEFAULTS BELONG TO OMITTED FIELDS ONLY. An absent `page` is page one and an
+ * absent `limit` is the caller's default, because a request that names neither
+ * is a well-formed request for the first page. A field that was SENT is
+ * answered on its own terms: a whole number inside the band is used exactly as
+ * given, and anything else is a field error. Nothing sent is ever replaced by a
+ * default, which would hide the caller's mistake behind a plausible answer.
+ *
+ * EVERY FAILING FIELD IS REPORTED, page before limit, so a request that gets
+ * both wrong is corrected in one round trip rather than two. The CALLER'S OWN
+ * options are still sanitized rather than refused (see
+ * {@link sanitizeOptionLimit}): they are a route's configuration, not request
+ * input, and a route that mis-declares its band is a bug to fix in code, not a
+ * 400 to show a user.
+ */
+export const parsePaginationStrict = (
+    query: PaginationQuery,
+    options: PaginationOptions = {},
+): ParsedPaginationQuery => {
+    const maxLimit = sanitizeOptionLimit(options.maxLimit, MAX_LIMIT);
+    const fallbackLimit = clampLimit(sanitizeOptionLimit(options.defaultLimit, DEFAULT_LIMIT), maxLimit);
+
+    const page = resolveRequestedField(query.page, {
+        field: 'page',
+        min: DEFAULT_PAGE,
+        max: MAX_PAGE,
+        fallback: DEFAULT_PAGE,
+    });
+    const limit = resolveRequestedField(query.limit, {
+        field: 'limit',
+        min: MIN_LIMIT,
+        max: maxLimit,
+        fallback: fallbackLimit,
+    });
+
+    if (page.kind === 'error' || limit.kind === 'error') {
+        const failures = [page, limit].filter(isFieldFailure);
+
+        return {
+            kind: 'error',
+            message: failures.map((failure) => failure.message).join('; '),
+            details: failures.map((failure) => failure.error),
+        };
+    }
+
+    return { kind: 'ok', page: page.value, limit: limit.value };
 };
 
 /**

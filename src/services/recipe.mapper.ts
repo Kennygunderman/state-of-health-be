@@ -424,9 +424,11 @@ const readInstructions = (value: unknown, versionId: string): string[] => {
  * yieldServings` — from the multiplier its own response carries beside the
  * recipe: `MealPlanMealResponse.portionMultiplier` for a planned meal,
  * `SwapPreviewAlternative.portionMultiplier` for the swap preview. Both mobile
- * screens do exactly that through one shared helper
- * (`mobile/src/utility/RecipeIngredientUtility.ts`), which is what keeps the
- * amounts on screen consistent with the portion-scaled nutrition beside them.
+ * screens do exactly that through one shared helper —
+ * `mobile/src/utility/ServingsUtility.ts`, where `plannedPortionFactor` turns
+ * the multiplier and the yield into one factor and `scaleIngredientsForDisplay`
+ * applies it to every ingredient row — which is what keeps the amounts on screen
+ * consistent with the portion-scaled nutrition beside them.
  */
 export const mapRecipeIngredient = (ingredient: RecipeIngredientRow): RecipeIngredientResponse => {
     const snapshot = mapIngredientSnapshot(ingredient);

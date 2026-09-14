@@ -62,6 +62,7 @@ import {
     budgetPenalty,
     buildPlanCandidates,
     candidatesForSlot,
+    checkStartDateWindow,
     compareCandidateMoves,
     computeDayTotals,
     daysBetweenDayKeys,
@@ -81,6 +82,7 @@ import {
     nextCookingTimeTier,
     parseAffectedMealsPath,
     parseGeneratePlanRequest,
+    parseGeneratePlanSyntax,
     parseMealPlanDayPath,
     parseRegeneratePlanRequest,
     parseRegenerateRequest,
@@ -3473,6 +3475,186 @@ describe('parseGeneratePlanRequest', () => {
 
         expect(verdict.kind).toBe('error');
         expect(verdict.kind === 'error' ? verdict.details : []).toHaveLength(4);
+    });
+
+    it('reports an out-of-window date together with the other problems, in one verdict', () => {
+        // The reason the composed form exists at all: a caller that already
+        // knows the window gets one round trip's worth of problems, including
+        // the range, rather than the range on a second attempt.
+        const verdict = parseGeneratePlanRequest(
+            body({ startDate: '2026-08-08', idempotencyKey: 'nope' }),
+            window,
+        );
+
+        expect(verdict).toMatchObject({
+            kind: 'error',
+            details: [
+                { field: 'startDate', code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE },
+                { field: 'idempotencyKey', code: MEAL_PLAN_FIELD_CODES.INVALID_ID },
+            ],
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The generation parse, split in two
+ *
+ * `parseGeneratePlanSyntax` judges a request against ITSELF and touches no
+ * clock and no database; `checkStartDateWindow` judges it against a window
+ * derived from today in the user's zone and from their active plan. The split
+ * is what lets `mealPlan.service.ts::generatePlan` fingerprint a request and
+ * ask the idempotency ledger whether it already committed BEFORE it measures
+ * that request against anything mutable (AAP §0.5.1). Without it, a same-key
+ * retry sent after the user's local midnight is refused `invalid_request` for a
+ * start date that has fallen behind `window.earliest`, and can never be given
+ * the `201` its first attempt already stored.
+ *
+ * So these tests pin two things: that the syntax half accepts exactly the dates
+ * the window half is left to judge, and that the two halves together say
+ * precisely what the one-call form says.
+ * ------------------------------------------------------------------------- */
+
+describe('parseGeneratePlanSyntax', () => {
+    const WINDOW = startDateWindow('2026-07-08', null);
+
+    const body = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        startDate: '2026-07-12',
+        idempotencyKey: '8f1f4d7e-0d2c-4a0b-9f3e-2b6a1c5d4e7f',
+        expectedPreferencesRevision: 3,
+        expectedTargetsRevision: 2,
+        ...overrides,
+    });
+
+    it('accepts a complete request and yields the payload a fingerprint is built from', () => {
+        expect(parseGeneratePlanSyntax(body())).toEqual({
+            kind: 'ok',
+            payload: {
+                startDate: '2026-07-12',
+                idempotencyKey: '8f1f4d7e-0d2c-4a0b-9f3e-2b6a1c5d4e7f',
+                expectedPreferencesRevision: 3,
+                expectedTargetsRevision: 2,
+            },
+        });
+    });
+
+    it.each([
+        ['a day before the window', '2026-07-07'],
+        ['the day after the window', '2026-08-08'],
+        ['a year before the window', '2025-07-12'],
+        ['a decade after the window', '2036-07-12'],
+    ])('accepts %s, because the range is not its question', (_label, startDate) => {
+        // THE POINT OF THIS FUNCTION. A retried generation whose start date has
+        // fallen out of the window must still produce a payload, because the
+        // payload is what the request fingerprint — and therefore the replay —
+        // is built from.
+        expect(parseGeneratePlanSyntax(body({ startDate }))).toEqual({
+            kind: 'ok',
+            payload: expect.objectContaining({ startDate }),
+        });
+        expect(startDate < WINDOW.earliest || startDate > WINDOW.latest).toBe(true);
+    });
+
+    it.each([undefined, null, 'not-an-object', 42, []])('requires a body object, not %p', (value) => {
+        expect(parseGeneratePlanSyntax(value).kind).toBe('error');
+    });
+
+    it('still refuses a date that is not a real calendar day', () => {
+        // Shape, not range: `2026-02-30` would become an Invalid Date that a
+        // query compares as NULL, so it is refused before any I/O even though
+        // the window is not consulted.
+        expect(parseGeneratePlanSyntax(body({ startDate: '2026-02-30' }))).toMatchObject({
+            details: [{ field: 'startDate', code: MEAL_PLAN_FIELD_CODES.INVALID_DATE }],
+        });
+    });
+
+    it('still requires a start date', () => {
+        expect(parseGeneratePlanSyntax(body({ startDate: undefined }))).toMatchObject({
+            details: [{ field: 'startDate', code: MEAL_PLAN_FIELD_CODES.REQUIRED }],
+        });
+    });
+
+    it.each([
+        ['not-a-uuid', MEAL_PLAN_FIELD_CODES.INVALID_ID],
+        [null, MEAL_PLAN_FIELD_CODES.REQUIRED],
+    ])('still judges the idempotency key %p', (idempotencyKey, code) => {
+        expect(parseGeneratePlanSyntax(body({ idempotencyKey }))).toMatchObject({
+            details: [{ field: 'idempotencyKey', code }],
+        });
+    });
+
+    it.each([
+        ['expectedPreferencesRevision', '3', MEAL_PLAN_FIELD_CODES.INVALID_TYPE],
+        ['expectedPreferencesRevision', -1, MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE],
+        ['expectedTargetsRevision', undefined, MEAL_PLAN_FIELD_CODES.REQUIRED],
+        ['expectedTargetsRevision', 1e30, MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE],
+    ])('still judges %s = %p', (field, value, code) => {
+        expect(parseGeneratePlanSyntax(body({ [field]: value }))).toMatchObject({
+            details: [{ field, code }],
+        });
+    });
+
+    it('agrees with the composed parser on every request the window admits', () => {
+        // One rule, two entry points: the composed form may only ADD the range
+        // detail, never report a different verdict for the same request.
+        for (const startDate of ['2026-07-08', '2026-07-12', '2026-08-07']) {
+            expect(parseGeneratePlanSyntax(body({ startDate }))).toEqual(
+                parseGeneratePlanRequest(body({ startDate }), WINDOW),
+            );
+        }
+    });
+});
+
+describe('checkStartDateWindow', () => {
+    const WINDOW = startDateWindow('2026-07-08', null);
+
+    it('accepts both ends of the window', () => {
+        expect(checkStartDateWindow(WINDOW.earliest, WINDOW)).toEqual({ kind: 'ok' });
+        expect(checkStartDateWindow(WINDOW.latest, WINDOW)).toEqual({ kind: 'ok' });
+    });
+
+    it('accepts a date inside it', () => {
+        expect(checkStartDateWindow('2026-07-12', WINDOW).kind).toBe('ok');
+    });
+
+    it.each(['2026-07-07', '2026-08-08'])('refuses %s as out of range', (startDate) => {
+        expect(checkStartDateWindow(startDate, WINDOW)).toEqual({
+            kind: 'error',
+            code: 'invalid_request',
+            message: 'The plan request is not valid',
+            details: [{ field: 'startDate', code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE }],
+        });
+    });
+
+    it('reports exactly what the composed parser reports for the same date', () => {
+        // The two forms share one comparison, so a start date the one-call form
+        // refuses is refused by the separate check with the same field, code and
+        // message — which is what makes splitting the parse safe.
+        const startDate = '2026-08-08';
+        const composed = parseGeneratePlanRequest(
+            {
+                startDate,
+                idempotencyKey: '8f1f4d7e-0d2c-4a0b-9f3e-2b6a1c5d4e7f',
+                expectedPreferencesRevision: 3,
+                expectedTargetsRevision: 2,
+            },
+            WINDOW,
+        );
+
+        expect(checkStartDateWindow(startDate, WINDOW)).toEqual(composed);
+    });
+
+    it('moves with the clock, which is why it cannot run before the replay gate', () => {
+        // The same request, judged against yesterday's window and today's: the
+        // start date was admissible when the first attempt was made and is not
+        // when the retry arrives. `generatePlan` therefore asks the ledger
+        // first, and only a request with no stored answer reaches this check.
+        const startDate = '2026-07-08';
+
+        expect(checkStartDateWindow(startDate, startDateWindow('2026-07-08', null)).kind).toBe('ok');
+        expect(checkStartDateWindow(startDate, startDateWindow('2026-07-09', null))).toMatchObject({
+            kind: 'error',
+            details: [{ field: 'startDate', code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE }],
+        });
     });
 });
 

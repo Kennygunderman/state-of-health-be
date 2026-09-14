@@ -92,6 +92,13 @@ export type FeasibilityWarning = 'macro_energy_mismatch' | 'below_catalog_min' |
 // ended by every write path; 'superseded' means a regeneration replaced it.
 export type PlanStatus = 'active' | 'superseded';
 
+// The two stored statuses with the one state storage cannot express: 'ended',
+// an 'active' plan whose end_date has passed in the user's own calendar. A
+// lifecycle is therefore computed per request rather than read from a column,
+// and 'active' here means "active AND unfinished" — the only state writes are
+// accepted in (§0.5.1). Reported beside PlanStatus, never instead of it.
+export type PlanLifecycle = 'active' | 'ended' | 'superseded';
+
 // Why a planned meal no longer matches the user's saved preferences. Allergen
 // and diet flags are never resolved by relaxing a restriction.
 export type MealFlagCode = 'diet' | 'allergen' | 'dislike' | 'cooking_time';
@@ -475,6 +482,57 @@ export interface TargetEstimateResponse {
     clampReason: ClampReason | null;
 }
 
+// The estimate as `meal_plan_preferences.estimated_targets` stores it: the last
+// estimate the server computed for this user and the user confirmed, together
+// with the preferences revision its inputs came from — AAP §0.5.1's "last
+// estimate with input revision".
+//
+// A STORED RECORD, NOT A WIRE SHAPE. No response carries it and no request
+// accepts it: `PreferencesResponse` has no such member, and the estimate a
+// screen shows is always recomputed through `GET /meal-planning/targets/
+// estimate`. It is declared here, beside the estimate it is derived from,
+// because this is where the target vocabulary lives, and it is declared APART
+// from TargetEstimateResponse for the same reason MealPlanMacroTotals is
+// declared apart from MacroTotals: rows already written to the database must
+// not be reshaped by a later change to a response.
+//
+// Two deliberate differences from the response it is built from. There is no
+// `source` discriminator — the column name says the route, and a stored
+// literal that can only ever hold one value records nothing. And the revision
+// is named `inputRevision`, which is what the stored number means: the
+// preferences revision whose goal, body, activity and pace produced the
+// figure. It is the same number the wire calls `estimateRevision` and the same
+// one `targets_input_revision` records as the confirmed figure's ancestry, so a
+// reader can always tell whether a stored estimate still describes the answers
+// on file by comparing it with the current `revision`.
+//
+// Written only by the estimated arm of `PUT /meal-planning/targets`, inside the
+// transaction that writes the confirmed values themselves. A manual save leaves
+// the column exactly as it stands, so this is the last estimate COMPUTED for
+// the user rather than the estimate behind the current targets — what the
+// current targets are is `confirmed_targets` and `target_source`, and those are
+// what every read judges. Null until a user has confirmed an estimate at least
+// once.
+export interface StoredEstimateSnapshot {
+    inputRevision: number;
+    inputs: TargetEstimateInputs;
+    // The derivation, as the review screen was shown it: basal rate, the rate
+    // after the activity factor, and the goal adjustment.
+    bmr: number;
+    tdee: number;
+    adjustment: number;
+    calories: number;
+    protein: number;
+    carbs: number;
+    fat: number;
+    // Whether a bound moved the calculated calories, and which one — kept
+    // because a clamped figure is a different fact about the user's details
+    // from an unclamped one, and the stored record is the only place that fact
+    // survives the confirmation.
+    clamped: boolean;
+    clampReason: ClampReason | null;
+}
+
 // Confirming the calculated estimate. The client never sends the numbers: the
 // server recomputes them from stored preferences, which is what stops a client
 // declaring its own values as "estimated".
@@ -711,12 +769,37 @@ export interface CurrentMealPlanResponse {
 }
 
 // One day read on its own, for fresh logged state without refetching the week.
-// Readable for a superseded plan too, so history keeps working — planStatus is
-// what tells the client whether writes are still allowed.
+// Readable for a superseded or an ENDED plan too, so history keeps working.
+//
+// WHICH MEMBER ANSWERS "MAY I STILL WRITE TO THIS?" — `isWritable`, and only
+// `isWritable`. `planStatus` is the stored column, and §0.5.1 leaves it
+// `'active'` on a plan whose last date has passed: no job rewrites it, because
+// its rows have to stay readable. A client that gated Swap and Log on
+// `planStatus === 'active'` would therefore offer both on last month's week and
+// be refused `409 plan_not_active {reason: 'ended'}` by every write path. The
+// two effective members below exist so the envelope cannot be read that way.
 export interface MealPlanDayEnvelopeResponse {
     planId: string;
     planRevision: number;
+    // STORAGE TRUTH, not a capability: `'active'` here includes an ended week.
+    // Reported because §0.5.2 declares it and a client may want to distinguish
+    // a superseded plan from a finished one — never as a writeability gate.
     planStatus: PlanStatus;
+    // The plan's EFFECTIVE lifecycle, computed in the user's stored IANA zone
+    // (the same "today" `GET /plans/current` resolves, never server time): a
+    // stored-`superseded` plan is `'superseded'`, an active plan whose
+    // `end_date` has passed in that zone is `'ended'`, and only a plan that is
+    // both active and unfinished is `'active'`. This is `mealPlan.logic.ts`'s
+    // own endedness rule reported, not a second spelling of it.
+    planLifecycle: PlanLifecycle;
+    // The server's verdict on whether a write against this plan would be
+    // accepted right now — exactly `planLifecycle === 'active'` today, and the
+    // one member clients gate Swap and Log on. `planLifecycle` is the REASON
+    // the verdict is what it is, which is what a client needs to say something
+    // truthful about it ("this week has finished" versus "this plan was
+    // replaced"); a future non-lifecycle reason to refuse writes would move
+    // this boolean without needing a new lifecycle value.
+    isWritable: boolean;
     day: MealPlanDayResponse;
 }
 

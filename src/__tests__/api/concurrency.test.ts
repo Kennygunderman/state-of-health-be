@@ -82,6 +82,7 @@ import {
     regeneratePlan,
 } from '../../services/mealPlan.service';
 import {
+    IdempotencyConflictError,
     PlanNotActiveError,
     PlanOverlapError,
     PreviewStaleError,
@@ -93,7 +94,7 @@ import { withMealPlanningTransaction, withUserLock } from '../../services/mealPl
 import { logPlannedMeal } from '../../services/plannedMealLog.service';
 import { savePreferences } from '../../services/preferences.service';
 import { getRecipeVersionForUser } from '../../services/recipe.service';
-import { commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
+import { SwapDataError, commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
 import { saveTargets } from '../../services/targets.service';
 import {
     FIXTURE_TARGETS,
@@ -1561,6 +1562,152 @@ describe('a response lost after the write committed', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * A generation retried after the user's local midnight
+ * ------------------------------------------------------------------------- */
+
+describe('a generation retried after the user’s local midnight', () => {
+    /**
+     * The same wall-clock time, one day on. The planning user's stored zone is
+     * UTC, so this moves `today` from {@link TODAY} to the next day and the
+     * start-date window's LOWER bound with it — leaving the start date the
+     * committed request carries behind `window.earliest`.
+     */
+    const NEXT_DAY_NOW = new Date(`${addDaysToDayKey(TODAY, 1)}T12:00:00.000Z`);
+
+    /** What a refusal looks like when it comes back, so the branch is readable. */
+    const refusalOf = (result: Awaited<ReturnType<typeof generatePlan>>) =>
+        result.kind === 'error' ? result : null;
+
+    it('replays its stored 201 rather than refusing the start date the clock moved under it', async () => {
+        await seedPlannableWorld();
+
+        // The client's one intent: one key, one body, held so the retry is
+        // byte-identical to the request that committed.
+        const intent = generateBody(TODAY);
+        const committed = await generatePlan(PLANNING_USER_ID, intent, NOW);
+
+        if (committed.kind !== 'ok') {
+            throw new Error(`the generation was refused: ${JSON.stringify(committed)}`);
+        }
+
+        expect(committed.result.status).toBe(201);
+
+        const published = await theOnlyPlanOf(PLANNING_USER_ID);
+
+        expectWholeWeek(published);
+
+        // THE COUNTER-PROOF, and the reason this case exists. The very same body
+        // sent with a NEW key after midnight is refused `invalid_request`,
+        // because its start date is now behind the window's lower bound. That is
+        // the refusal the committed key must NOT receive.
+        const newKey = await generatePlan(
+            PLANNING_USER_ID,
+            { ...intent, idempotencyKey: randomUUID() },
+            NEXT_DAY_NOW,
+        );
+
+        expect(refusalOf(newKey)).toMatchObject({
+            kind: 'error',
+            code: 'invalid_request',
+            details: [{ field: 'startDate', code: 'out_of_range' }],
+        });
+
+        // And it reserved nothing: the preflight's transaction rolled back, so
+        // the only ledger row is still the publication's.
+        expect(await ledgerRows(PLANNING_USER_ID)).toHaveLength(1);
+
+        // The retry the client actually sends — same key, same body, the clock
+        // a day on — is answered by the ledger, before the window, the setup
+        // status the publication itself set to `completed`, the pinned revisions
+        // or a fresh search can refuse it (§0.5.1).
+        const replay = await generatePlan(PLANNING_USER_ID, intent, NEXT_DAY_NOW);
+
+        if (replay.kind !== 'ok') {
+            throw new Error(`the same-key retry was refused: ${JSON.stringify(replay)}`);
+        }
+
+        expect(replay.result.status).toBe(committed.result.status);
+        expect(replay.result.planRevisionAfter).toBe(committed.result.planRevisionAfter);
+        expect(replay.result.body).toEqual(committed.result.body);
+        // §0.9.2's "byte-for-byte": the replayed body comes back out of the
+        // `jsonb` column while the first came from memory, and the two texts
+        // agree because both serialise a canonically ordered value
+        // (`mealPlanningAction.logic.ts::canonicalizeResponseBody`).
+        expect(JSON.stringify(replay.result.body)).toBe(JSON.stringify(committed.result.body));
+
+        // Nothing was written twice: one plan, one whole week, one ledger row.
+        const afterReplay = await theOnlyPlanOf(PLANNING_USER_ID);
+
+        expect(afterReplay.id).toBe(published.id);
+        expect(afterReplay.revision).toBe(1);
+        expect(afterReplay.status).toBe(ACTIVE_PLAN);
+        expectWholeWeek(afterReplay);
+        expect(mealsOf(afterReplay)).toHaveLength(PLAN_DAY_COUNT * 3);
+
+        const actions = await ledgerRows(PLANNING_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            action_type: 'generate',
+            idempotency_key: intent.idempotencyKey,
+            response_status: 201,
+            plan_revision_after: 1,
+            meal_plan_id: published.id,
+        });
+        await expectOneActivePlanPerStartDate(PLANNING_USER_ID);
+    });
+
+    it('still refuses the used key carrying a different body, before any stateful check', async () => {
+        await seedPlannableWorld();
+
+        const intent = generateBody(TODAY);
+
+        expect((await generatePlan(PLANNING_USER_ID, intent, NOW)).kind).toBe('ok');
+
+        // Same key, different start date: a different request wearing a used
+        // key, which is `409 idempotency_conflict` and not a replay — and it is
+        // decided by the fingerprint rather than by the window, so it holds on
+        // the far side of midnight too.
+        const conflict = await outcomeOf(() =>
+            generatePlan(
+                PLANNING_USER_ID,
+                { ...intent, startDate: addDaysToDayKey(TODAY, 7) },
+                NEXT_DAY_NOW,
+            ),
+        );
+
+        expect(conflict).toBeInstanceOf(IdempotencyConflictError);
+
+        // One plan, one ledger row: the conflict wrote nothing.
+        const published = await theOnlyPlanOf(PLANNING_USER_ID);
+
+        expect(dayKeyOf(published.start_date)).toBe(TODAY);
+        expect(await ledgerRows(PLANNING_USER_ID)).toHaveLength(1);
+    });
+
+    it('refuses a malformed body with no idempotency key before it reaches the ledger', async () => {
+        await seedPlannableWorld();
+
+        // The syntax half of the parse runs first precisely so a body with no
+        // key never reserves one. There is nothing to fingerprint, so there is
+        // nothing to reserve, and the ledger stays empty.
+        const refused = await generatePlan(
+            PLANNING_USER_ID,
+            { startDate: TODAY, expectedPreferencesRevision: 1, expectedTargetsRevision: 1 },
+            NOW,
+        );
+
+        expect(refusalOf(refused)).toMatchObject({
+            kind: 'error',
+            code: 'invalid_request',
+            details: [{ field: 'idempotencyKey', code: 'required' }],
+        });
+        expect(await ledgerRows(PLANNING_USER_ID)).toHaveLength(0);
+        expect(await plansOf(PLANNING_USER_ID)).toHaveLength(0);
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * Two generations for weeks that overlap
  * ------------------------------------------------------------------------- */
 
@@ -2112,6 +2259,144 @@ describe('two swaps on one meal', () => {
                 (alternative) => alternative.recipeVersionId,
             ),
         ).toEqual([refused]);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A write that reaches the meal while the swap is writing it
+ *
+ * The meal's own compare-and-swap, which is a DIFFERENT guard from the plan's
+ * (§0.5.1, Rule backend-architecture §5.1): `meal_plan_meals.revision` and
+ * `meal_plans.revision` move independently, so a change confined to one meal
+ * leaves the plan's counter exactly where the commit pinned it and the
+ * plan-level check passes straight over it. The predicate
+ * `swap.logic.ts::swapMealWhere` builds is what makes that change visible.
+ *
+ * HOW THE INTERLEAVING IS MADE DETERMINISTIC, since every service writer takes
+ * the per-user advisory lock and could not produce this on its own. A second
+ * session holds a ROW lock on the meal — `SELECT … FOR UPDATE`, which the
+ * advisory lock knows nothing about — so the swap runs unimpeded until its own
+ * `UPDATE`, which then waits. That session bumps the revision and commits,
+ * PostgreSQL re-evaluates the waiting statement's qualification against the
+ * committed row version, and the revision term is what decides the outcome:
+ * with it the statement matches nothing, without it the swap overwrites the
+ * foreign write and reports success. Nothing here depends on timing beyond
+ * {@link BLOCK_OBSERVATION_MS}, which is only how long the blocked call is
+ * watched — the counter-proof below settles inside the same window.
+ * ------------------------------------------------------------------------- */
+
+describe("a foreign write to the meal a swap is committing", () => {
+    /**
+     * Holds a row lock on one meal until released, then bumps ONLY that row's
+     * `revision` — no recipe change, no plan write — and commits.
+     *
+     * The bump is deliberately the narrowest possible change: it is what a
+     * writer that moved the meal and not the plan looks like, and it is the
+     * exact state the plan-level compare-and-swap cannot detect.
+     */
+    const holdMealRowThenBumpRevision = async (
+        mealId: string,
+    ): Promise<{ release: () => void; held: Promise<unknown> }> => {
+        const taken = deferred();
+        const releaseSignal = deferred();
+
+        const held = contendingClient.$transaction(
+            async (tx) => {
+                await tx.$queryRaw`SELECT revision FROM meal_plan_meals WHERE id = ${mealId}::uuid FOR UPDATE`;
+                taken.release();
+                await releaseSignal.promise;
+                await tx.$executeRaw`UPDATE meal_plan_meals SET revision = revision + 1 WHERE id = ${mealId}::uuid`;
+            },
+            { timeout: 20_000 },
+        );
+
+        await taken.promise;
+
+        return { release: releaseSignal.release, held };
+    };
+
+    it('refuses the commit and leaves the foreign revision standing, with nothing else written', async () => {
+        const mealBefore = await mealRow(week.breakfastMeal.id);
+        const groceriesBefore = await groceryStateOf(week.plan.id);
+        const foreignWriter = await holdMealRowThenBumpRevision(week.breakfastMeal.id);
+
+        const swapping = watch(
+            commitSwap(USER_ID, week.plan.id, week.breakfastMeal.id, swapBody(week.alternative.id, 1), NOW),
+        );
+
+        await sleep(BLOCK_OBSERVATION_MS);
+
+        // Waiting on the row it means to write, with its transaction — and so
+        // its ledger reservation — still open and invisible.
+        expect(swapping.settled()).toBe(false);
+        expect((await mealRow(week.breakfastMeal.id)).recipe_version_id).toBe(week.breakfast.id);
+
+        foreignWriter.release();
+        await foreignWriter.held;
+
+        await expect(swapping.done).rejects.toThrow(SwapDataError);
+
+        // ONLY the foreign bump survived. The recipe, the audit columns and the
+        // meal's flags are as they were, which is the difference between a
+        // compare-and-swap and a write that lost a race silently.
+        expect(await mealRow(week.breakfastMeal.id)).toEqual({
+            ...mealBefore,
+            revision: mealBefore.revision + 1,
+        });
+        // The plan's revision never moved, so the whole transaction — the day's
+        // totals, the grocery rebuild and the reservation with them — rolled
+        // back rather than half-applying.
+        expect(await planRevision(week.plan.id)).toBe(1);
+        expect(await groceryStateOf(week.plan.id)).toEqual(groceriesBefore);
+        expect(await ledgerRows()).toHaveLength(0);
+    });
+
+    it('commits inside the same window when nothing reaches the meal', async () => {
+        // The counter-proof. Without it the case above could pass because of
+        // something incidental to a blocked transaction rather than because of
+        // the revision term, and a build that had dropped the term would look
+        // exactly as correct.
+        const swapping = watch(
+            commitSwap(USER_ID, week.plan.id, week.breakfastMeal.id, swapBody(week.alternative.id, 1), NOW),
+        );
+
+        await sleep(BLOCK_OBSERVATION_MS);
+
+        expect(swapping.settled()).toBe(true);
+        expect((await swapping.done).kind).toBe('ok');
+
+        const meal = await mealRow(week.breakfastMeal.id);
+
+        expect(meal.recipe_version_id).toBe(week.alternative.id);
+        expect(meal.revision).toBe(2);
+        expect(await planRevision(week.plan.id)).toBe(2);
+    });
+
+    it('finds the meal at whatever revision it stands at, and advances it from there', async () => {
+        // A meal that has been swapped before is the ordinary case, and the
+        // predicate has to follow it: the commit must match revision 6 and
+        // leave 7. The plan's counter is untouched by the bump, so the client's
+        // pinned `expectedPlanRevision` is still 1 — which is precisely why the
+        // meal needs its own pin.
+        await prisma.$executeRaw`UPDATE meal_plan_meals SET revision = 6 WHERE id = ${week.breakfastMeal.id}::uuid`;
+
+        const result = await commitSwap(
+            USER_ID,
+            week.plan.id,
+            week.breakfastMeal.id,
+            swapBody(week.alternative.id, 1),
+            NOW,
+        );
+
+        if (result.kind !== 'ok') {
+            throw new Error(`the swap was refused as invalid: ${JSON.stringify(result)}`);
+        }
+
+        const meal = await mealRow(week.breakfastMeal.id);
+
+        expect(meal.revision).toBe(7);
+        expect(meal.recipe_version_id).toBe(week.alternative.id);
+        expect(result.result.planRevisionAfter).toBe(2);
     });
 });
 

@@ -24,9 +24,9 @@
 //    (the whole search), `planDatesFrom` / `planEndDate` (the week's dates),
 //    `resolveSlotSchedule` (the two orders a day has), `derivePlanSeed`,
 //    `computeDayTotals`, `requireWritablePlan`, `requireNonConflictingWeek`,
-//    `resolveCurrentAndUpcoming`, `startDateWindow` and the two request parsers.
-//    Nothing below decides whether a week is feasible, whether a plan is
-//    writable, or which plan is "this week".
+//    `resolveCurrentAndUpcoming`, `startDateWindow`, the request parsers and the
+//    start-date window verdict. Nothing below decides whether a week is
+//    feasible, whether a plan is writable, or which plan is "this week".
 //  * `targets.service.ts` owns the targets gate — `requireConfirmedTargets` is
 //    what stops a week being built on numbers nobody confirmed — and
 //    `getTargets` is the one canonical target read every surface shares.
@@ -41,7 +41,10 @@
 //    insert that publishes them and the check state a regeneration carries over.
 //  * `mealPlanningAction.service.ts` owns the keyed-write sequence — lock,
 //    reserve, replay, complete — and is the ONLY thing below that opens a lock
-//    or reserves a ledger row.
+//    or reserves a ledger row. It owns the PREFLIGHT form of that sequence too
+//    (`replayCommittedKeyedAction`): asking "has this key already committed?"
+//    is the same question the gate answers, so one module answers it, and the
+//    two generation entry points below ask rather than re-implement.
 //
 //  * `mealPlan.mapper.ts` owns the plan, day and meal DTOs. Rule
 //    backend-architecture §6 promotes a row -> DTO mapper out of its service
@@ -68,21 +71,24 @@
 //  * NO HTTP. No `res`, no status codes. The success statuses the two keyed
 //    writes return are values the pure layer produced and the ledger persisted;
 //    every typed error is mapped once, at the controller (§8).
-//  * NO FIELD VALIDATION OF ITS OWN. `parseGeneratePlanRequest`,
-//    `parseRegeneratePlanRequest`, `parseMealPlanDayPath` and
-//    `parseAffectedMealsPath` are pure verdicts in `mealPlan.logic.ts`, and
-//    their refusal is RETURNED unchanged rather than thrown — the convention
-//    `preferences.service.ts` and `targets.service.ts` already follow, and the
-//    reason both generation entry points take `body: unknown`: the parser needs
-//    a `StartDateWindow` that only a database read can supply, so the parse
-//    cannot happen in the controller.
+//  * NO FIELD VALIDATION OF ITS OWN. `parseGeneratePlanSyntax`,
+//    `checkStartDateWindow`, `parseRegeneratePlanRequest`,
+//    `parseMealPlanDayPath` and `parseAffectedMealsPath` are pure verdicts in
+//    `mealPlan.logic.ts`, and their refusal is RETURNED unchanged rather than
+//    thrown — the convention `preferences.service.ts` and `targets.service.ts`
+//    already follow, and the reason the generation entry points take
+//    `body: unknown`: the generation parse has a second half,
+//    `checkStartDateWindow`, whose `StartDateWindow` only a database read can
+//    supply, so that half cannot happen in a controller.
 //
-//    THE TWO READ ENTRY POINTS PARSE FIRST, BEFORE ANY `await`, which the two
-//    write entry points cannot (see the window above): a `:planId` that is not
-//    a UUID would otherwise reach a PostgreSQL `uuid` predicate and a `:date`
-//    that is not a real calendar day would reach `toStoredDate`'s
+//    EVERY ENTRY POINT PARSES FIRST, BEFORE ANY `await`: a `:planId` that is
+//    not a UUID would otherwise reach a PostgreSQL `uuid` predicate and a
+//    `:date` that is not a real calendar day would reach `toStoredDate`'s
 //    `new Date(`${dayKey}T00:00:00.000Z`)`, and each would surface as a generic
-//    `500` where §0.5.2 promises a `400 invalid_request` naming the field.
+//    `500` where §0.5.2 promises a `400 invalid_request` naming the field. The
+//    two write entry points do it with the SYNTAX half of their parse, which is
+//    also what §0.5.1 requires of them: see the generation section on why the
+//    stateful half has to wait for the replay gate.
 //  * NO FLAG RECOMPUTATION. `preferences.service.ts::recomputeActivePlanFlags`
 //    owns it. This file READS `meal_plan_meals.flags` and never writes it.
 //  * NO READ OF `meal_plans.incompatibility_flags`. That column is an audit
@@ -123,9 +129,10 @@ import {
     PlanGenerationPreferences,
     PlanLifecycleState,
     PlanRecipeCandidate,
+    checkStartDateWindow,
     generateWeeklyPlan,
     parseAffectedMealsPath,
-    parseGeneratePlanRequest,
+    parseGeneratePlanSyntax,
     parseMealPlanDayPath,
     parseRegeneratePlanRequest,
     requireNonConflictingWeek,
@@ -139,10 +146,10 @@ import {
 import {
     groupLoggedPlannedEntries,
     readMealSlot,
-    readPlanStatus,
     readStoredFlags,
     readTargetsSnapshot,
     toDayKey,
+    toMealPlanDayEnvelopeResponse,
     toMealPlanDayResponse,
     toMealPlanResponse,
     toPlanLifecycleState,
@@ -154,15 +161,16 @@ import {
     StaleRevisionError,
     TargetsUnconfirmedError,
 } from './mealPlanning.errors';
-import { KeyedActionType, buildRequestFingerprint } from './mealPlanningAction.logic';
+import { buildRequestFingerprint } from './mealPlanningAction.logic';
 import {
     KeyedActionParams,
     KeyedActionResult,
     MealPlanningTransactionClient,
+    replayCommittedKeyedAction,
     runKeyedAction,
 } from './mealPlanningAction.service';
 import { isClockTime } from './preferences.logic';
-import { PreferencesRow, dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
+import { PreferencesRow, dayKeyInTimeZone, loadPreferencesRow, resolveUserToday } from './preferences.service';
 import { isMealSlot } from './recipe.logic';
 import { getRecipeVersionsForPlanning } from './recipe.service';
 import { getTargets, previewConfirmedTargets, requireConfirmedTargets } from './targets.service';
@@ -249,8 +257,10 @@ export class MealPlanDataError extends Error {
  * The database is snake_case and the wire is camelCase; that translation belongs
  * to `mealPlan.mapper.ts` (Rule backend-architecture §6), which is also where
  * the column readers this module still needs — `toDayKey`, `readStoredFlags`,
- * `readMealSlot`, `readPlanStatus`, `readTargetsSnapshot` — are defined and
- * imported from. What remains below is what only a WRITE needs: the day key on
+ * `readMealSlot`, `readTargetsSnapshot` — are defined and imported from, along
+ * with the two response builders (`toMealPlanResponse`,
+ * `toMealPlanDayEnvelopeResponse`) that read the status and lifecycle columns
+ * themselves. What remains below is what only a WRITE needs: the day key on
  * the way IN to a `@db.Date` column, the JSON cast a Prisma write demands, and
  * the preference narrowings the generator reads. Every `jsonb` column arrives as
  * `unknown` and is READ DEFENSIVELY — never asserted — because a column is data
@@ -644,7 +654,7 @@ export const getCurrentMealPlan = async (
  * Both reuse {@link MealPlanRefusal} — declared with the generation entry
  * points below, and by construction `mealPlan.logic.ts`'s one error verdict —
  * because `parseMealPlanDayPath` and `parseAffectedMealsPath` carry exactly the
- * shape `parseGeneratePlanRequest` does. One refusal type for the module means
+ * shape `parseGeneratePlanSyntax` does. One refusal type for the module means
  * the controller maps one vocabulary for every `400 invalid_request` this file
  * can produce, and a hand-written second copy would be free to drift from the
  * details the client renders beside its fields.
@@ -673,10 +683,25 @@ export type AffectedMealsResult = { kind: 'ok'; response: AffectedMealsResponse 
  *
  * READABLE FOR A SUPERSEDED OR ENDED PLAN, deliberately: §0.5.2 declares no
  * `plan_not_active` for this route, because history has to keep working — the
- * diary still shows what was eaten from last week's plan, and `planStatus` is
- * what tells the client whether writes are still allowed. That is also why this
- * function takes no clock: no calendar day can change its answer, so a `now`
- * parameter would be one accepted only to be ignored.
+ * diary still shows what was eaten from last week's plan. What the envelope
+ * owes the client instead is an honest answer about whether that week may still
+ * be WRITTEN to, and `meal_plans.status` is not that answer: §0.5.1 leaves a
+ * finished week stored `'active'`, so reporting the column alone told a client
+ * it could swap and log into last month's plan, which every write path then
+ * refused with `409 plan_not_active {reason: 'ended'}`. The envelope therefore
+ * carries `planLifecycle` and `isWritable` beside `planStatus`, built by
+ * `mealPlan.mapper.ts::toMealPlanDayEnvelopeResponse` from the writers' own
+ * `isPlanEnded` predicate.
+ *
+ * WHICH IS WHY THIS FUNCTION TAKES A CLOCK. Endedness is a comparison against
+ * the caller's calendar day, resolved from the IANA zone their last save stored
+ * — the same "today" `getCurrentMealPlan` resolves, never the server's. `now` is
+ * a parameter so a test can fix it rather than wait for a week to finish.
+ *
+ * THE READS ARE ORDERED SO THE REFUSALS STAY CHEAPEST: the owner-scoped plan
+ * read comes first, the day second, and the zone lookup only once the answer is
+ * certain to be a `200`. A request for someone else's plan therefore still
+ * costs exactly one query, and the parse still precedes all three.
  *
  * `PlanNotFoundError` covers a plan that is absent or not the caller's AND a
  * date outside the plan's week — §0.5.2's 404 for this route — because
@@ -689,6 +714,7 @@ export const getMealPlanDay = async (
     userId: string,
     planId: string,
     date: string,
+    now: Date = new Date(),
 ): Promise<MealPlanDayResult> => {
     const parsed = parseMealPlanDayPath({ planId, date });
 
@@ -698,7 +724,9 @@ export const getMealPlanDay = async (
 
     const plan = await prisma.meal_plans.findFirst({
         where: { id: parsed.planId, user_id: userId },
-        select: { id: true, revision: true, status: true },
+        // `end_date` is what makes the lifecycle answerable: without it the
+        // envelope can only repeat the stored status.
+        select: { id: true, revision: true, status: true, end_date: true },
     });
 
     if (plan === null) {
@@ -713,12 +741,7 @@ export const getMealPlanDay = async (
 
     return {
         kind: 'ok',
-        envelope: {
-            planId: plan.id,
-            planRevision: plan.revision,
-            planStatus: readPlanStatus(plan.status, plan.id),
-            day,
-        },
+        envelope: toMealPlanDayEnvelopeResponse(plan, day, await resolveUserToday(userId, now)),
     };
 };
 
@@ -733,8 +756,9 @@ export const getMealPlanDay = async (
  * The flags are READ, not recomputed: `preferences.service.ts` recomputes them
  * inside the transaction of the preference save that caused them, so a read that
  * re-derived them would either duplicate that rule or report a verdict the
- * stored plan does not carry. No clock parameter for the same reason as the day
- * read — the answer is the plan's stored state.
+ * stored plan does not carry. This function therefore takes NO clock, unlike the
+ * day read above: every member of its answer is a stored value, and no calendar
+ * day can change which meals carry a flag.
  *
  * `:planId` is parsed as the FIRST statement, for the reason
  * {@link getMealPlanDay} states: a malformed id would otherwise reach the
@@ -796,8 +820,8 @@ export const getAffectedMeals = async (userId: string, planId: string): Promise<
  *
  * Both follow §0.5.1's sequence exactly, and the ORDER is the guarantee:
  *
- *   outside the transaction  read inputs -> parse -> REPLAY PREFLIGHT
- *                            -> judge state -> search in memory
+ *   outside the transaction  PARSE (syntax only, no I/O) -> REPLAY PREFLIGHT
+ *                            -> read inputs -> judge state -> search in memory
  *   inside  the transaction  lock -> reserve -> replay -> re-check -> write
  *
  * The authoritative replay gate sits inside `runKeyedAction`, before `work`
@@ -808,10 +832,20 @@ export const getAffectedMeals = async (userId: string, planId: string): Promise<
  * Neither route can put ALL of its state checks there, because §0.5.1 also
  * requires the candidate week to be searched in memory before the transaction
  * opens, and a search worth pre-empting is a search whose inputs were judged
- * first. {@link replayCommittedKeyedAction} is what keeps that ordering from
- * costing a replay: it asks the same gate, in its own two-statement
- * transaction, whether this exact key has already committed, and every
- * pre-transaction refusal below runs only after it has answered no.
+ * first. `mealPlanningAction.service.ts::replayCommittedKeyedAction` — the
+ * ledger's own gate, asked one turn earlier — is what keeps that ordering from
+ * costing a replay: it asks whether this exact key has already committed, in
+ * its own two-statement transaction, and EVERY stateful judgement below runs
+ * only after it has answered no.
+ *
+ * NOTHING BEFORE THE PREFLIGHT MAY READ MUTABLE STATE. That is the rule the two
+ * entry points are written to, and it is why the only step in front of the
+ * preflight is a parse of the request's own SYNTAX: a request's fingerprint has
+ * to be computable from the request alone, or a retry can be refused before the
+ * ledger is ever consulted. `generatePlan` observes it through the
+ * window-independent `parseGeneratePlanSyntax`, whose stateful other half —
+ * `checkStartDateWindow`, which needs today in the user's zone — is applied
+ * after the preflight, for a new key only.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -827,113 +861,6 @@ export type MealPlanRefusal = Exclude<ParsedGeneratePlanRequest, { kind: 'ok' }>
 
 /** Either the ledger's result for a published week, or the parser's refusal verbatim. */
 export type GeneratePlanResult = { kind: 'ok'; result: KeyedActionResult } | MealPlanRefusal;
-
-/**
- * The rejection that rolls a preflight transaction back.
- *
- * Module-private and its own class, so {@link replayCommittedKeyedAction} can
- * recognise exactly its own rollback signal and let every other failure — a
- * conflict, a lock timeout, a connection fault — propagate untouched. A boolean
- * return from `work` could not do this: `work` must not RESOLVE, because a
- * resolved `work` is what makes `runKeyedAction` complete the reserved row.
- *
- * Verified rather than assumed: Prisma's interactive `$transaction` rethrows the
- * callback's rejection as the same object (probed against PostgreSQL 16 —
- * identity and `instanceof` both hold), so the `instanceof` test below is not a
- * guess about wrapping behaviour.
- */
-class KeyedActionPreflightRollback extends Error {
-    constructor(actionType: KeyedActionType) {
-        super(
-            `Rolling back the ${actionType} idempotency-key preflight: the key is unused, so nothing may ` +
-                'persist from a transaction that only asked whether it had committed.',
-        );
-        this.name = 'KeyedActionPreflightRollback';
-    }
-}
-
-/**
- * Answers ONE question before a keyed write does any work: has this exact
- * request already committed?
- *
- *  * the stored `KeyedActionResult` — this key committed, so replay it
- *  * `null` — the key has never been used, so the caller proceeds
- *  * throws `IdempotencyConflictError` — the key exists with a different
- *    fingerprint, which is a different request wearing a used key (§0.5.2)
- *
- * WHY THIS EXISTS. §0.5.1 fixes the order of a keyed write: lock, then reserve
- * or replay, and a matching fingerprint "replay[s] the stored `response_status`
- * and `response_snapshot` verbatim and end[s] the transaction BEFORE any
- * revision or status check, so a committed action replays even when the plan has
- * since moved on". `runKeyedAction` honours that for everything inside its
- * transaction — but generation and regeneration must judge mutable state and run
- * a five-second candidate search BEFORE the transaction opens, because §0.5.1
- * equally requires the candidate week to be "computed in memory before the
- * transaction" (see the module header on why the lock cannot be held for a
- * search). Those pre-transaction refusals sit in front of the replay gate, and
- * for a regeneration one of them is CERTAIN to fire on the retry path: a
- * successful regeneration supersedes the very plan the request pinned, so the
- * immediate same-key retry — exactly what a client sends when the response was
- * lost — would be answered `409 plan_not_active` and could never reach its
- * stored `201`. A generation fails the same way less deterministically, through
- * the preference gate, a moved revision or a search that now reports
- * `no_matching_meals`.
- *
- * WHY IT REUSES `runKeyedAction` RATHER THAN READING THE LEDGER ITSELF. The
- * fingerprint comparison, the pending-row invariant and the stored-response
- * shaping all live behind functions `mealPlanningAction.service.ts` keeps
- * private — `reserveAction`, `readAction` and `replayReservedAction`, §0.5.1's
- * reserve-or-replay step — over the pure `decideReplay` / `readStoredResponse`.
- * A second implementation here would be a second replay policy, and the two
- * would drift on the first change to either. So this calls the authoritative
- * gate and supplies a `work` that cannot succeed:
- *
- *  * key committed  -> `runKeyedAction` replays through its own path and never
- *    reaches `work`; the transaction commits, having only read
- *  * key unused     -> the reservation is made, `work` rejects with
- *    {@link KeyedActionPreflightRollback}, and the whole transaction rolls back,
- *    so the reserved row disappears with it (probed: zero `meal_plan_actions`
- *    rows survive) and the answer is `null`
- *  * fingerprint differs -> `IdempotencyConflictError` is raised before `work`
- *    is called at all
- *
- * THIS DOES NOT REPLACE THE FINAL LOCKED GATE, and neither may be "simplified"
- * away. The gate inside the caller's own `prisma.$transaction` stays the
- * authority: a key that commits on another connection WHILE this request is
- * searching must still replay rather than reserve twice, and only a gate in the
- * publishing transaction can see that. This preflight is an early exit on the
- * ERROR path — it turns a refusal that would have pre-empted a replay into the
- * replay itself — and it deliberately makes no decision the gate does not make
- * again.
- *
- * WHY IT LIVES HERE. Beside `runKeyedAction` in `mealPlanningAction.service.ts`
- * is where it belongs, and that file is another work unit's at this checkpoint,
- * so it is exported from here instead: the two callers below share it, and any
- * later keyed write that has to judge state before its transaction can import it
- * rather than writing a third variant. Moving it is a one-line change once both
- * files are in one hand.
- *
- * The transaction is two statements long — the advisory lock and the
- * reservation attempt — so the serialisation it costs the user is negligible
- * beside the search that follows it.
- */
-export const replayCommittedKeyedAction = async (
-    params: KeyedActionParams,
-): Promise<KeyedActionResult | null> => {
-    const rollback = new KeyedActionPreflightRollback(params.actionType);
-
-    try {
-        return await prisma.$transaction((tx) =>
-            runKeyedAction(tx, params, () => Promise.reject(rollback)),
-        );
-    } catch (error) {
-        if (error === rollback || error instanceof KeyedActionPreflightRollback) {
-            return null;
-        }
-
-        throw error;
-    }
-};
 
 /**
  * The preference row a week may be built from, or `PreferencesIncompleteError`.
@@ -1362,13 +1289,48 @@ const loadRegenerationTarget = async (
 /**
  * `POST /api/meal-planning/plans` — search a week and publish it.
  *
+ * THE ORDER OF THE FIRST THREE STEPS IS THE IDEMPOTENCY CONTRACT (§0.5.1).
+ *
+ *   1. `parseGeneratePlanSyntax` — the request judged against ITSELF, with no
+ *      I/O of any kind, so a malformed body is refused before Prisma is touched
+ *      (§0.5.2) and, more importantly, so the fingerprint below is computable
+ *      from the request alone.
+ *   2. `replayCommittedKeyedAction` — the ledger asked whether this exact
+ *      request already committed. A retry of a committed generation is answered
+ *      here, with its stored `201` and stored body.
+ *   3. only then the STATEFUL judgements: the user's zone and today, the
+ *      start-date window, the setup gate, the pinned revisions, the search.
+ *
+ * Every one of those third-step refusals would otherwise pre-empt a replay, and
+ * the window is the one that made the ordering unavoidable rather than merely
+ * tidy: its lower bound is TODAY in the user's stored zone, so a client that
+ * retries a committed generation after its own local midnight sends a `startDate`
+ * that has silently fallen behind `window.earliest`. Judged before the replay
+ * gate, that retry is answered `400 invalid_request` for a field the first
+ * attempt had already accepted, and the plan it published can never be returned
+ * to it. `mealPlan.logic.ts` therefore splits the parse in two —
+ * `parseGeneratePlanSyntax` for what the request says, `checkStartDateWindow`
+ * for what the clock and the user's plans allow — and this function asks them
+ * at the two different moments the ledger requires. The window is applied for a
+ * NEW key only, which is exactly the request that has not yet been answered.
+ *
+ * It is not re-derived inside the publication transaction, and deliberately
+ * not: the window is an input-range rule about the moment the user asked, and a
+ * request that crosses midnight between its window check and its COMMIT must
+ * not be refused because the clock moved under it by a second. What the locked
+ * transaction re-checks is the write-safety state — `requirePinnedInputs` for
+ * the two revisions and the confirmed targets, `requireNonConflictingWeek` for
+ * overlap and the single-upcoming rule — which is what could actually make the
+ * publication wrong.
+ *
  * Takes `body: unknown` and returns a refusal-or-ok union rather than parsing in
- * the controller, because `parseGeneratePlanRequest` needs a `StartDateWindow`
+ * a controller, because the second half of the parse needs a `StartDateWindow`
  * that only a database read can supply: the upper bound is the later of today +
  * 30 days and the day after the active plan's last day, so the picker's own rule
- * and the server's agree. The refusal is the parser's verdict UNCHANGED — one
- * representation of an `invalid_request` from the parser to the controller, the
- * convention `preferences.service.ts` and `targets.service.ts` set.
+ * and the server's agree. Both refusals are the pure verdict UNCHANGED — one
+ * representation of an `invalid_request` from the logic module to the
+ * controller, the convention `preferences.service.ts` and `targets.service.ts`
+ * set.
  *
  * The window's second term is the CURRENT plan's end date: the bound exists to
  * admit the successor week "Plan another week" offers, and an upcoming plan is
@@ -1378,31 +1340,18 @@ const loadRegenerationTarget = async (
  * On success the ledger's `201` and the stored `MealPlanResponse` come back
  * through `KeyedActionResult`, and a repeated key with the same body replays
  * both verbatim — `runKeyedAction`'s job, which is why nothing here
- * deduplicates. {@link replayCommittedKeyedAction} runs that same gate once
- * before the setup check and the search, so a retry is answered by the ledger
- * rather than by a refusal the first attempt's own success produced (§0.5.1).
+ * deduplicates.
  */
 export const generatePlan = async (
     userId: string,
     body: unknown,
     now: Date = new Date(),
 ): Promise<GeneratePlanResult> => {
-    // The preferences row is READ here but not yet JUDGED, and the order is
-    // §0.5.1's rather than a preference. Two things have to happen before the
-    // replay preflight: the row supplies the user's IANA zone, from which
-    // `today` and therefore the start-date window follow, and the parse needs
-    // that window to produce the payload the fingerprint is built from. Judging
-    // the row — `requireGeneratableSetup`, the one mutable-state check this
-    // route owns — is deferred until AFTER the preflight, because a client
-    // retrying a committed generation whose response was lost must learn that it
-    // succeeded even if the setup status, the revisions or the catalog have
-    // moved since. A null row reads as "no stored zone", exactly as
-    // `plannedMealLog.service.ts` resolves the same value, and is refused by
-    // `requireGeneratableSetup` a few lines down.
-    const row = await loadPreferencesRow(userId);
-    const today = dayKeyInTimeZone(now, row?.time_zone ?? null);
-    const { current } = resolveCurrentAndUpcoming(await loadPlanLifecycleStates(prisma, userId), today);
-    const parsed = parseGeneratePlanRequest(body, startDateWindow(today, current?.end_date ?? null));
+    // STEP 1 — the request judged against itself, before any I/O. Nothing in
+    // this parse reads the clock or the database, which is what makes the
+    // fingerprint below a property of the request rather than of the moment it
+    // arrived, and what lets step 2 run first.
+    const parsed = parseGeneratePlanSyntax(body);
 
     if (parsed.kind !== 'ok') {
         return parsed;
@@ -1416,28 +1365,41 @@ export const generatePlan = async (
         fingerprint: buildRequestFingerprint('POST', 'generate', { userId }, payload),
     };
 
-    // §0.5.1's replay, before every mutable-state check and before the search.
-    // A retry of a committed generation would otherwise be refused by whichever
-    // moved first — the setup status the publication itself set to `completed`,
-    // the preference or target revision another device bumped, or a search that
-    // now reports `no_matching_meals` — and would never reach its stored `201`.
-    //
-    // ONE RESIDUAL THIS ROUTE CANNOT CLOSE FROM HERE: the fingerprint is built
-    // from the PARSED payload, and `parseGeneratePlanRequest` rejects a
-    // `startDate` outside the window above, which is derived from the database
-    // (today in the user's zone, and the current plan's end date). So a retry
-    // whose `startDate` has fallen out of that window between attempts — a
-    // midnight crossing in the user's zone — is still answered
-    // `invalid_request` instead of replaying, because there is no payload to
-    // fingerprint. Closing it needs a window-independent SYNTAX parse in
-    // `mealPlan.logic.ts` (another work unit's file at this checkpoint) whose
-    // verdict feeds the fingerprint while the window check stays a separate,
-    // post-replay judgement. The window only ever widens with a new plan, so the
-    // clock is the sole trigger.
+    // STEP 2 — §0.5.1's replay, before EVERY stateful refusal: the start-date
+    // window, the setup gate, the pinned revisions and the search. A retry of a
+    // committed generation would otherwise be refused by whichever moved first —
+    // today's date in the user's zone (the window's own lower bound, which a
+    // local midnight moves under a retry), the setup status the publication
+    // itself set to `completed`, a revision another device bumped, or a search
+    // that now reports `no_matching_meals` — and would never reach its stored
+    // `201`. The gate inside the publication transaction below is unchanged and
+    // remains the authority; `replayCommittedKeyedAction` documents why both
+    // exist.
     const replayed = await replayCommittedKeyedAction(keyedAction);
 
     if (replayed !== null) {
         return { kind: 'ok', result: replayed };
+    }
+
+    // STEP 3 — the stateful judgements, for a key that has never committed.
+    //
+    // The preferences row is read first because it supplies the user's IANA
+    // zone, from which `today` and therefore the start-date window follow. A
+    // null row reads as "no stored zone", exactly as
+    // `plannedMealLog.service.ts` resolves the same value, and is refused by
+    // `requireGeneratableSetup` two statements down — the row is READ here and
+    // JUDGED after the window, so a client sees the field error it can act on
+    // rather than a setup error about a request it never got to send.
+    const row = await loadPreferencesRow(userId);
+    const today = dayKeyInTimeZone(now, row?.time_zone ?? null);
+    const { current } = resolveCurrentAndUpcoming(await loadPlanLifecycleStates(prisma, userId), today);
+    const windowVerdict = checkStartDateWindow(
+        payload.startDate,
+        startDateWindow(today, current?.end_date ?? null),
+    );
+
+    if (windowVerdict.kind !== 'ok') {
+        return windowVerdict;
     }
 
     const generatable = requireGeneratableSetup(row);

@@ -383,6 +383,231 @@ describe('a confirmed estimate across real preference saves', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The stored estimate a confirmation leaves behind
+ *
+ * AAP §0.5.1 defines `meal_plan_preferences.estimated_targets` as the "last
+ * estimate with input revision": the estimate the server last computed for this
+ * user and the user confirmed, together with the preferences revision its
+ * inputs came from. `targets.logic.test.ts` pins the SHAPE of that record
+ * without a database; what only a real save can establish is that the record
+ * reaches the column at all, that it lands in the same transaction as the four
+ * confirmed values, and what each route does to it.
+ *
+ * Four properties, each asserted in both directions so none of them can pass by
+ * being constant:
+ *
+ *  1. The column is NULL before any confirmation and holds the estimate after
+ *     one — so the assertions are about this write rather than about a fixture.
+ *  2. The record explains the figure that was confirmed: its four values are
+ *     the four the canonical read reports, and its derivation is the one the
+ *     estimate GET returned.
+ *  3. It is the LAST estimate: a second confirmation, after an answer changed,
+ *     replaces it and records the revision that one was derived from.
+ *  4. A manual save RETAINS it rather than clearing it (§0.5.1 defines the
+ *     column as the last estimate computed for the user, not as the estimate
+ *     behind the current targets), while a user whose first confirmation is
+ *     manual stores NULL — no estimate was ever computed for them.
+ *
+ * And the refusal case, which is the atomicity claim: a save the revision
+ * predicate rejects leaves the column exactly as it was.
+ * ------------------------------------------------------------------------- */
+
+describe('the stored estimate a confirmation leaves behind', () => {
+    /** `meal_plan_preferences.estimated_targets`, as the column holds it. */
+    const storedEstimate = async (): Promise<unknown> => {
+        const row = await prisma.meal_plan_preferences.findUniqueOrThrow({
+            where: { user_id: USER_ID },
+            select: { estimated_targets: true },
+        });
+
+        return row.estimated_targets;
+    };
+
+    /**
+     * The fixture user's estimate, written out rather than computed: male, 34,
+     * 178 cm, 79 kg, lightly active, maintaining. A record derived here from the
+     * same function under test would assert nothing about the numbers, so these
+     * are the Mifflin–St Jeor figures for that row — basal 1737.5 → 1738,
+     * maintenance 1737.5 × 1.375 = 2388.9 → 2389, no adjustment, nothing
+     * clamped, and 30/40/30 of 2389 kcal at 4/4/9 kcal per gram.
+     */
+    const FIXTURE_ESTIMATE = {
+        inputRevision: 1,
+        inputs: {
+            age: 34,
+            heightCm: 178,
+            weightKg: 79,
+            sexForEstimate: 'male',
+            activityLevel: 'lightly_active',
+            goal: 'maintain',
+            paceLbPerWeek: null,
+        },
+        bmr: 1738,
+        tdee: 2389,
+        adjustment: 0,
+        calories: 2389,
+        protein: 179,
+        carbs: 239,
+        fat: 80,
+        clamped: false,
+        clampReason: null,
+    };
+
+    /** Confirm the current estimate, refusing to continue if the save is rejected. */
+    const confirmEstimate = async (expectedTargetsRevision: number): Promise<void> => {
+        const estimate = await getTargetEstimate(USER_ID);
+        const saved = await saveTargets(USER_ID, {
+            source: 'estimated',
+            estimateRevision: estimate.estimateRevision,
+            expectedTargetsRevision,
+        });
+
+        if (saved.kind !== 'ok') {
+            throw new Error(`estimated save was refused: ${JSON.stringify(saved)}`);
+        }
+    };
+
+    it('is null before any confirmation, so what follows is this write and not the fixture', async () => {
+        expect(await storedEstimate()).toBeNull();
+    });
+
+    it('records the whole recomputed estimate, not only the four values it confirmed', async () => {
+        await confirmEstimate(1);
+
+        expect(await storedEstimate()).toEqual(FIXTURE_ESTIMATE);
+    });
+
+    it('records the estimate the review screen was shown, derivation included', async () => {
+        const estimate = await getTargetEstimate(USER_ID);
+
+        await confirmEstimate(1);
+
+        // Every member of the figure the user reviewed is in the record, and
+        // the revision it was derived from is stored under the name it means at
+        // rest. This is the claim the finding was about: before the fix the
+        // column was always empty, so none of this was recoverable.
+        expect(await storedEstimate()).toMatchObject({
+            inputRevision: estimate.estimateRevision,
+            bmr: estimate.bmr,
+            tdee: estimate.tdee,
+            adjustment: estimate.adjustment,
+            calories: estimate.calories,
+            protein: estimate.protein,
+            carbs: estimate.carbs,
+            fat: estimate.fat,
+            clamped: estimate.clamped,
+            clampReason: estimate.clampReason,
+        });
+    });
+
+    it('explains the figure the canonical read reports, value for value', async () => {
+        await confirmEstimate(1);
+
+        const targets = await getTargets(USER_ID);
+
+        expect(await storedEstimate()).toMatchObject({
+            calories: targets.targets?.calories,
+            protein: targets.targets?.protein,
+            carbs: targets.targets?.carbs,
+            fat: targets.targets?.fat,
+        });
+        expect(await storedRevisions()).toMatchObject({ revision: 1, targetsInput: 1 });
+    });
+
+    it('is the LAST estimate: a later confirmation replaces it at its own input revision', async () => {
+        await confirmEstimate(1);
+        await saveStep('activity', { activityLevel: 'active', timeZone: TIME_ZONE, expectedRevision: 1 });
+
+        // Stale now, and the recalculation the review screen offers is taken.
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
+        await confirmEstimate(2);
+
+        const stored = await storedEstimate();
+
+        // The new answer, the new maintenance rate (1737.5 × 1.55 = 2693.1),
+        // and the PREFERENCES revision the new figure was derived from — so the
+        // record tracks the latest confirmation rather than accumulating
+        // history. `revision: 3` is the TARGETS counter, which each of the two
+        // confirmations advanced by one from the fixture's 1; `inputRevision`
+        // is the preferences counter, which the single activity save moved to
+        // 2. The two are different numbers on purpose.
+        expect(stored).toMatchObject({
+            inputRevision: 2,
+            inputs: { ...FIXTURE_ESTIMATE.inputs, activityLevel: 'active' },
+            tdee: 2693,
+            calories: 2693,
+        });
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: false, revision: 3 });
+    });
+
+    it('survives a manual save rather than being cleared by it', async () => {
+        await confirmEstimate(1);
+
+        const saved = await saveTargets(USER_ID, {
+            source: 'manual',
+            calories: 1800,
+            protein: 140,
+            carbs: 180,
+            fat: 60,
+            // The confirmation above consumed the fixture's revision 1, so the
+            // manual save pins the 2 it left behind.
+            expectedTargetsRevision: 2,
+        });
+
+        expect(saved.kind).toBe('ok');
+
+        // The confirmed figure is now the typed one and the ancestry is gone,
+        // because the user typed these numbers — but the account of the
+        // calculation that really happened is retained (AAP §0.5.1: the LAST
+        // ESTIMATE computed for the user, not the estimate behind the current
+        // targets). Nothing can misread it as the confirmed figure: the source
+        // says `manual` and the snapshot carries its own input revision.
+        expect(await getTargets(USER_ID)).toMatchObject({ source: 'manual', stale: false });
+        expect(await storedRevisions()).toMatchObject({ targetsInput: null });
+        expect(await storedEstimate()).toEqual(FIXTURE_ESTIMATE);
+    });
+
+    it('stays null when the first confirmation a user ever makes is manual', async () => {
+        // The create arm: a legacy user editing targets from Account before any
+        // onboarding. No estimate was ever computed for them, and NULL is the
+        // honest record of that — the column is not given a fabricated one.
+        await prisma.meal_plan_preferences.delete({ where: { user_id: USER_ID } });
+
+        const saved = await saveTargets(USER_ID, {
+            source: 'manual',
+            calories: 1800,
+            protein: 140,
+            carbs: 180,
+            fat: 60,
+            expectedTargetsRevision: null,
+        });
+
+        expect(saved.kind).toBe('ok');
+        expect(await storedEstimate()).toBeNull();
+    });
+
+    it('is left untouched by a save the revision predicate refuses', async () => {
+        await confirmEstimate(1);
+
+        // A second confirmation pinning the revision the first one consumed:
+        // refused, and the record must not be half-written. The estimate is
+        // recomputed from the same unchanged answers, so only the pin is wrong.
+        const estimate = await getTargetEstimate(USER_ID);
+
+        await expect(
+            saveTargets(USER_ID, {
+                source: 'estimated',
+                estimateRevision: estimate.estimateRevision,
+                expectedTargetsRevision: 1,
+            }),
+        ).rejects.toMatchObject({ name: 'StaleTargetsError', currentRevision: 2 });
+
+        expect(await storedEstimate()).toEqual(FIXTURE_ESTIMATE);
+        expect(await storedRevisions()).toMatchObject({ revision: 1, targetsInput: 1 });
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * The manual route refuses an estimate, whatever the row still holds
  *
  * The Skip branch of the body step is the case only a real save can produce:

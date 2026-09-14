@@ -63,8 +63,10 @@ export interface RecipePerServingNutrition {
 // from the shape: a reader who assumes displayText is already the portion's
 // amount ships ingredient quantities that contradict the portion-scaled
 // nutrition printed beside them. Both mobile screens apply the formula through
-// one shared helper (mobile/src/utility/RecipeIngredientUtility.ts) rather than
-// each carrying its own copy of it.
+// one shared helper rather than each carrying its own copy of it:
+// mobile/src/utility/ServingsUtility.ts, whose plannedPortionFactor computes
+// portionMultiplier / yieldServings and whose scaleIngredientsForDisplay
+// applies that factor to every row of this collection.
 export interface RecipeIngredientResponse {
     catalogFoodId: string;
     // name and nutritionProvenance are read from the frozen recipe_ingredients

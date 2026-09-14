@@ -49,8 +49,12 @@
 // THE COMPOSITION CHAIN is the file's shape (§6, "composite responses get their
 // own mapper that composes the smaller ones"):
 //
-//     toMealPlanResponse -> toMealPlanDayResponse -> toMealPlanMealResponse
-//                                                -> mapPlannedRecipeSummary
+//     toMealPlanResponse            -> toMealPlanDayResponse -> toMealPlanMealResponse
+//     toMealPlanDayEnvelopeResponse -^                       -> mapPlannedRecipeSummary
+//
+// The envelope is the second composite: one day plus the plan facts the
+// single-day read reports around it, including the effective lifecycle a client
+// gates Swap and Log on.
 //
 // `recipe.mapper.ts` owns that last step. Every planned meal carries the same
 // compact recipe projection the swap rows do, and its header names this file as
@@ -95,9 +99,12 @@
 // WHAT THIS FILE DOES NOT DECIDE (each belongs to a neighbour, and a rule
 // re-decided here would be a rule no unit test could reach — §7, §11):
 //
-//  * WHETHER A PLAN IS ENDED. `status` is reported exactly as stored, and an
+//  * WHAT MAKES A PLAN ENDED. `status` is reported exactly as stored, and an
 //    ended plan is still `'active'` in the column by design (§0.5.1). Endedness
-//    is `mealPlan.logic.ts::isPlanEnded`, which every write path applies.
+//    is `mealPlan.logic.ts::isPlanEnded`, which every write path applies —
+//    `readPlanLifecycle` and `toMealPlanDayEnvelopeResponse` below CALL that
+//    predicate with the day key their caller resolved, so the day envelope
+//    reports the writers' own verdict rather than a local re-derivation of it.
 //  * WHETHER A MEAL IS LOGGED. `plannedMealLog.logic.ts::deriveLoggedStatus`
 //    owns that rule; this file emits the `loggedEntries` it and the client read.
 //  * ELIGIBILITY, TOLERANCES, SCORING AND PORTION SETS — `mealPlan.logic.ts`
@@ -114,17 +121,26 @@ import {
     LoggedPlannedEntry,
     MealFlag,
     MealFlagCode,
+    MealPlanDayEnvelopeResponse,
     MealPlanDayResponse,
     MealPlanMacroTotals,
     MealPlanMealResponse,
     MealPlanResponse,
     MealPlanSummary,
+    PlanLifecycle,
     PlanStatus,
     PreviousRecipeSummary,
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
 import { formatQuarters, pluralizeCount } from '../utils/units';
-import { PlanLifecycleState, derivePortionUnit, isDayKey, sameMacroTotals } from './mealPlan.logic';
+import {
+    PlanLifecycleState,
+    derivePortionUnit,
+    isDayKey,
+    isPlanActiveStatus,
+    isPlanEnded,
+    sameMacroTotals,
+} from './mealPlan.logic';
 import { isClockTime } from './preferences.logic';
 import { isMealSlot, roundNutritionForDisplay } from './recipe.logic';
 import { RecipeVersionRow, mapPlannedRecipeSummary } from './recipe.mapper';
@@ -193,6 +209,15 @@ const MEAL_FLAG_CODES: Readonly<Record<MealFlagCode, true>> = {
 };
 
 const PLAN_STATUSES: Readonly<Record<PlanStatus, true>> = { active: true, superseded: true };
+
+/**
+ * The three `PlanLifecycle` members, named so the values the envelope reports
+ * are typed against the union rather than written as bare strings at three call
+ * sites. `ACTIVE_LIFECYCLE` doubles as the one definition of `isWritable`.
+ */
+const ACTIVE_LIFECYCLE: PlanLifecycle = 'active';
+const ENDED_LIFECYCLE: PlanLifecycle = 'ended';
+const SUPERSEDED_LIFECYCLE: PlanLifecycle = 'superseded';
 
 /* ---------------------------------------------------------------------------
  * Reading a stored column into the type the contract promises
@@ -410,7 +435,10 @@ export const readPlannedTotals = (stored: MealPlanMacroTotals, column: string, r
  * would let a stale screen mutate a plan or send the user nowhere. Note that an
  * ENDED plan is `'active'` here by design — §0.5.1 keeps the column as it is and
  * makes endedness a RULE (`mealPlan.logic.ts::isPlanEnded`) that every write
- * path applies, so this file reports the column and never reinterprets it.
+ * path applies, so this function reports the column and never reinterprets it.
+ * {@link readPlanLifecycle} is where that rule is applied to say what the column
+ * MEANS on a given calendar day; a caller wanting to know whether a plan still
+ * accepts writes wants that one, not this.
  */
 export const readPlanStatus = (stored: string, planId: string): PlanStatus => {
     const status = asMember(PLAN_STATUSES, stored);
@@ -422,6 +450,43 @@ export const readPlanStatus = (stored: string, planId: string): PlanStatus => {
     }
 
     return status;
+};
+
+/**
+ * A plan row and the caller's calendar day as the DTO's effective lifecycle.
+ *
+ * The one place the stored status and the plan's dates are read TOGETHER. An
+ * `'active'` row whose last date has passed in the user's zone is `'ended'` —
+ * the state §0.5.1 defines and no column holds — while a stored `'superseded'`
+ * row stays `'superseded'` however its dates fall, because following the
+ * replacement is what a client does about it either way.
+ *
+ * Both halves come from `mealPlan.logic.ts`, so this is the rule REPORTED and
+ * not a second copy of it: `isPlanActiveStatus` decides which status accepts
+ * writes and `isPlanEnded` owns the date comparison (including the rejection of
+ * a malformed day key, which is why `today` is not re-validated here).
+ *
+ * Unlike `requireWritablePlan`, a superseded plan does NOT have to have its
+ * successor resolved here. That function raises on an unresolved one because
+ * following the link is the whole point of its refusal; a READ may not fail for
+ * it, because the day payload — the diary's history — is the answer the caller
+ * came for.
+ *
+ * `today` is a `YYYY-MM-DD` key resolved by the caller in the user's stored
+ * zone; passing the server's day would report a finished week as live for every
+ * user east of it for up to a day.
+ */
+export const readPlanLifecycle = (
+    plan: { id: string; status: string; end_date: Date },
+    today: string,
+): PlanLifecycle => {
+    if (!isPlanActiveStatus(plan)) {
+        return SUPERSEDED_LIFECYCLE;
+    }
+
+    const endDate = toDayKey(plan.end_date, 'meal_plans.end_date', plan.id);
+
+    return isPlanEnded({ end_date: endDate }, today) ? ENDED_LIFECYCLE : ACTIVE_LIFECYCLE;
 };
 
 /**
@@ -1014,5 +1079,71 @@ export const toMealPlanResponse = (
         hasIncompatibilities: dayResponses.some((day) => day.meals.some((meal) => meal.flags.length > 0)),
         summary: context.summary,
         days: dayResponses,
+    };
+};
+
+/* ---------------------------------------------------------------------------
+ * The single-day envelope
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The `meal_plans` columns the day envelope reports, as Prisma returns them.
+ *
+ * `end_date` is here for one reason: endedness is a comparison against the
+ * caller's calendar day, so the envelope cannot state whether writes are still
+ * accepted without the plan's last date. A day read that selected only
+ * `{id, revision, status}` is exactly the read that could not tell an ended week
+ * from a live one.
+ */
+export interface PlanDayEnvelopeRow {
+    id: string;
+    revision: number;
+    status: string;
+    end_date: Date;
+}
+
+/**
+ * One day as `GET /plans/:planId/days/:date` answers it.
+ *
+ * WHY THE ENVELOPE IS BUILT HERE rather than inline in the service: it now
+ * carries a derived verdict, and a derived member assembled at a call site is
+ * one nothing can test and the next call site will spell differently. This is
+ * the file that owns every field of these responses.
+ *
+ * `today` is a `YYYY-MM-DD` day key the CALLER resolves in the user's stored
+ * IANA zone (`preferences.service.ts::resolveUserToday`). A day key rather than
+ * a clock, because this file has none by design — and the user's zone rather
+ * than the server's, because a bare date plus a Firebase identity cannot
+ * establish which calendar day it is for them (§0.5.2).
+ *
+ * THE RULE IS APPLIED HERE, NOT RESTATED. `planLifecycle` and `isWritable` come
+ * from `mealPlan.logic.ts::isPlanActiveStatus` and `::isPlanEnded` — the same
+ * two predicates `requireWritablePlan` refuses writes with, so the envelope
+ * cannot promise a write the writer would answer
+ * `409 plan_not_active {reason: 'ended'}` on. Comparing `end_date` against
+ * `today` locally instead is the "second, subtly different spelling"
+ * `isPlanEnded`'s own docblock warns about.
+ *
+ * `planStatus` stays the stored column, unreinterpreted: §0.5.1 keeps an ended
+ * plan `'active'` in storage and §0.5.2 declares the member, so the envelope
+ * reports both what is stored and what it MEANS today.
+ */
+export const toMealPlanDayEnvelopeResponse = (
+    plan: PlanDayEnvelopeRow,
+    day: MealPlanDayResponse,
+    today: string,
+): MealPlanDayEnvelopeResponse => {
+    const status = readPlanStatus(plan.status, plan.id);
+    const lifecycle = readPlanLifecycle(plan, today);
+
+    return {
+        planId: plan.id,
+        planRevision: plan.revision,
+        planStatus: status,
+        planLifecycle: lifecycle,
+        // Derived from the lifecycle rather than re-tested, so the verdict and
+        // the reason it reports can never disagree.
+        isWritable: lifecycle === ACTIVE_LIFECYCLE,
+        day,
     };
 };

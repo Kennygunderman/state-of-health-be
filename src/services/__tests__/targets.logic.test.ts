@@ -37,6 +37,7 @@ import {
     ACTIVITY_FACTORS,
     applyTargetBounds,
     assessFeasibility,
+    buildStoredEstimate,
     CALORIE_CEILING,
     CALORIE_FLOOR_BY_SEX,
     CalculableEstimateInputs,
@@ -1003,6 +1004,164 @@ describe('computeTargetEstimate', () => {
                 );
                 expect(estimate.calories).toBeLessThanOrEqual(CALORIE_CEILING);
             }
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * buildStoredEstimate
+ *
+ * The record `meal_plan_preferences.estimated_targets` holds — AAP §0.5.1's
+ * "last estimate with input revision". These assertions are what make the
+ * stored shape a decision rather than an accident: the KEY SET is pinned
+ * exactly, so a member added to the estimate response cannot reach the database
+ * silently and a member removed from the stored record cannot pass unnoticed;
+ * the two deliberate differences from the response (no `source`, and
+ * `estimateRevision` stored as `inputRevision`) are asserted as differences;
+ * and the record is checked to survive a JSON round trip, because a JSONB
+ * column is exactly a JSON round trip and a value that does not survive one is
+ * not storable.
+ * ------------------------------------------------------------------------- */
+
+describe('buildStoredEstimate', () => {
+    /** The keys the stored record has, and the complete list of them. */
+    const STORED_KEYS = [
+        'inputRevision',
+        'inputs',
+        'bmr',
+        'tdee',
+        'adjustment',
+        'calories',
+        'protein',
+        'carbs',
+        'fat',
+        'clamped',
+        'clampReason',
+    ];
+
+    describe('the reference derivation, as it is stored', () => {
+        const stored = buildStoredEstimate(estimateFrom(REFERENCE_ROW, 4));
+
+        it('keeps the whole derivation, not only the four confirmed values', () => {
+            expect(stored).toEqual({
+                inputRevision: 4,
+                inputs: {
+                    age: 34,
+                    heightCm: 177.8,
+                    weightKg: 82.6,
+                    sexForEstimate: 'female',
+                    activityLevel: 'lightly_active',
+                    goal: 'lose',
+                    paceLbPerWeek: 1,
+                },
+                bmr: 1606,
+                tdee: 2209,
+                adjustment: -500,
+                calories: 1709,
+                protein: 128,
+                carbs: 171,
+                fat: 57,
+                clamped: false,
+                clampReason: null,
+            });
+        });
+
+        it('carries exactly the stored key set, so a wire change cannot reach the column unnoticed', () => {
+            expect(Object.keys(stored).sort()).toEqual([...STORED_KEYS].sort());
+        });
+
+        it('stores the estimate revision as the input revision, which is what the number means at rest', () => {
+            const estimate = estimateFrom(REFERENCE_ROW, 4);
+
+            expect(stored.inputRevision).toBe(estimate.estimateRevision);
+        });
+
+        it('drops the wire-only source discriminator, because the column name already says the route', () => {
+            expect(stored).not.toHaveProperty('source');
+            expect(stored).not.toHaveProperty('estimateRevision');
+        });
+    });
+
+    describe('the input revision it records', () => {
+        it.each([0, 1, 9, MAX_REVISION])('is the revision the estimate was computed at (%i)', (revision) => {
+            expect(buildStoredEstimate(estimateFrom(REFERENCE_ROW, revision)).inputRevision).toBe(revision);
+        });
+    });
+
+    describe('the clamp it preserves', () => {
+        it('records a floor clamp and its reason, which the four confirmed values cannot express', () => {
+            const stored = buildStoredEstimate(estimateFrom(LOW_CORNER, 2));
+
+            expect(stored.calories).toBe(1200);
+            expect(stored.clamped).toBe(true);
+            expect(stored.clampReason).toBe('floor');
+            // The pre-clamp derivation survives beside the clamped figure, so
+            // the record shows that a bound moved the number and by how much:
+            // the low corner's 467 kcal maintenance rate (AAP §0.7.3) is what
+            // the 1,200 kcal floor replaced, and a record holding only the
+            // confirmed 1,200 could not say that.
+            expect(stored.bmr).toBe(389);
+            expect(stored.tdee).toBe(467);
+            expect(stored.adjustment).toBe(0);
+        });
+
+        it('records a ceiling clamp at the high corner', () => {
+            const stored = buildStoredEstimate(estimateFrom(HIGH_CORNER, 2));
+
+            expect(stored.calories).toBe(CALORIE_CEILING);
+            expect(stored.clamped).toBe(true);
+            expect(stored.clampReason).toBe('ceiling');
+        });
+
+        it('records the absence of a clamp as an absence, not as a missing field', () => {
+            const stored = buildStoredEstimate(estimateFrom(REFERENCE_ROW, 2));
+
+            expect(stored.clamped).toBe(false);
+            expect(stored.clampReason).toBeNull();
+        });
+    });
+
+    describe('as a JSONB value', () => {
+        it('survives a JSON round trip unchanged, for every fixture', () => {
+            for (const row of [REFERENCE_ROW, LOW_CORNER, HIGH_CORNER]) {
+                const stored = buildStoredEstimate(estimateFrom(row, 3));
+
+                expect(JSON.parse(JSON.stringify(stored))).toEqual(stored);
+            }
+        });
+
+        it('holds no undefined member, which JSON would silently drop', () => {
+            const stored = buildStoredEstimate(estimateFrom(LOW_CORNER, 3));
+
+            for (const key of STORED_KEYS) {
+                expect(stored[key as keyof typeof stored]).toBeDefined();
+            }
+        });
+
+        it("stores a maintain goal's absent pace as null rather than dropping the member", () => {
+            const stored = buildStoredEstimate(estimateFrom(LOW_CORNER, 3));
+
+            expect(stored.inputs.paceLbPerWeek).toBeNull();
+            expect(JSON.parse(JSON.stringify(stored)).inputs).toHaveProperty('paceLbPerWeek');
+        });
+    });
+
+    describe('independence from the estimate it was built from', () => {
+        it('copies the inputs rather than aliasing them, so a later mutation cannot rewrite the record', () => {
+            const estimate = estimateFrom(REFERENCE_ROW, 4);
+            const stored = buildStoredEstimate(estimate);
+
+            estimate.inputs.weightKg = 1;
+            estimate.inputs.activityLevel = 'very_active';
+
+            expect(stored.inputs.weightKg).toBe(82.6);
+            expect(stored.inputs.activityLevel).toBe('lightly_active');
+        });
+
+        it('is deterministic: the same estimate always yields the same record', () => {
+            expect(buildStoredEstimate(estimateFrom(REFERENCE_ROW, 4))).toEqual(
+                buildStoredEstimate(estimateFrom(REFERENCE_ROW, 4)),
+            );
         });
     });
 });

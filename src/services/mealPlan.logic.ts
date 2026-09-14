@@ -2698,6 +2698,23 @@ export type ParsedGeneratePlanRequest =
     | { kind: 'ok'; payload: GeneratePlanPayload }
     | MealPlanErrorVerdict;
 
+/**
+ * The verdict of the one generation check that needs DATABASE STATE: is the
+ * requested start date inside the window today and the user's plans imply?
+ *
+ * Its own verdict type rather than a branch of
+ * {@link ParsedGeneratePlanRequest} because it is judged at a different MOMENT.
+ * {@link parseGeneratePlanSyntax} judges the request against itself and can run
+ * before any I/O; this judges it against a window derived from the clock in the
+ * user's zone and from their active plan, which is state that moves. §0.5.1
+ * requires a keyed write's replay gate to run before every stateful refusal, so
+ * the two halves cannot be one call: the fingerprint is built from the syntax
+ * verdict, the ledger is asked whether that exact request already committed,
+ * and only a request that has NOT committed is measured against the current
+ * window.
+ */
+export type StartDateWindowVerdict = { kind: 'ok' } | MealPlanErrorVerdict;
+
 export type ParsedRegeneratePlanRequest =
     | { kind: 'ok'; planId: string; payload: RegeneratePlanPayload }
     | MealPlanErrorVerdict;
@@ -2848,14 +2865,62 @@ export const parseAffectedMealsPath = (params: { planId?: unknown }): ParsedAffe
 };
 
 /**
- * Validates `POST /meal-planning/plans`.
+ * The one comparison that decides whether a day key is inside a window, so the
+ * composed parser and {@link checkStartDateWindow} cannot disagree about it.
  *
- * Every field is judged before returning, so a request with three problems
- * reports three details instead of sending the caller back three times.
+ * Day keys are zero-padded, so a lexicographic comparison is a chronological
+ * one — the same property {@link startDateWindow} relies on. Both ends answer
+ * with `out_of_range`, the field-code map's documented code for a well-formed
+ * value outside its permitted window.
  */
-export const parseGeneratePlanRequest = (
-    body: unknown,
+const startDateWindowDetail = (
+    startDate: string,
     window: StartDateWindow,
+): InvalidRequestDetail | null =>
+    startDate < window.earliest || startDate > window.latest
+        ? { field: START_DATE_FIELD, code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE }
+        : null;
+
+/**
+ * Judges the start date against the window, as its own step.
+ *
+ * This is the half of the generation parse that CANNOT run before I/O: the
+ * window is derived from today in the user's stored zone and from their active
+ * plan's last day, so it moves with the clock and with their plans. Separating
+ * it is what lets `mealPlan.service.ts::generatePlan` fingerprint and replay a
+ * request before measuring it against anything mutable — without the split, a
+ * same-key retry sent after the user's local midnight is answered
+ * `400 invalid_request` for a start date that has fallen behind `window.earliest`
+ * and can never reach the `201` its first attempt already stored (§0.5.1's
+ * "replay ... BEFORE any revision or status check").
+ *
+ * `startDate` is a day key the syntax parse has already accepted; this adds no
+ * shape check of its own, because a value that is not a real calendar day was
+ * refused with `invalid_date` before the ledger was consulted.
+ */
+export const checkStartDateWindow = (
+    startDate: string,
+    window: StartDateWindow,
+): StartDateWindowVerdict => {
+    const detail = startDateWindowDetail(startDate, window);
+
+    return detail === null
+        ? { kind: 'ok' }
+        : invalidRequest('The plan request is not valid', [detail]);
+};
+
+/**
+ * The shared body of the two generation parses below: `window === null` judges
+ * the request against itself alone, and a window judges the range as well.
+ *
+ * One function rather than two so the details, their order and the message are
+ * identical whichever entry point produced them — a client rendering a field
+ * error must not see a different verdict depending on which half of the parse
+ * its caller used.
+ */
+const parseGeneratePlanBody = (
+    body: unknown,
+    window: StartDateWindow | null,
 ): ParsedGeneratePlanRequest => {
     const record = asRecord(body);
 
@@ -2873,8 +2938,12 @@ export const parseGeneratePlanRequest = (
         details.push({ field: START_DATE_FIELD, code: MEAL_PLAN_FIELD_CODES.REQUIRED });
     } else if (!isDayKey(startDate)) {
         details.push({ field: START_DATE_FIELD, code: MEAL_PLAN_FIELD_CODES.INVALID_DATE });
-    } else if (startDate < window.earliest || startDate > window.latest) {
-        details.push({ field: START_DATE_FIELD, code: MEAL_PLAN_FIELD_CODES.OUT_OF_RANGE });
+    } else if (window !== null) {
+        const outOfWindow = startDateWindowDetail(startDate, window);
+
+        if (outOfWindow !== null) {
+            details.push(outOfWindow);
+        }
     }
 
     const idempotencyKey = record[IDEMPOTENCY_KEY_FIELD];
@@ -2917,6 +2986,44 @@ export const parseGeneratePlanRequest = (
         },
     };
 };
+
+/**
+ * Validates `POST /meal-planning/plans` against the request itself: types,
+ * formats, ids and revision bounds, and nothing that needs a database read.
+ *
+ * Every field is judged before returning, so a request with three problems
+ * reports three details instead of sending the caller back three times.
+ *
+ * THE START DATE IS CHECKED FOR SHAPE, NOT FOR RANGE. `2026-02-30` is refused
+ * here — it would otherwise become an `Invalid Date` a query compares as NULL —
+ * while a perfectly formed date outside the permitted window is accepted by
+ * THIS function and refused by {@link checkStartDateWindow} afterwards. The
+ * division is deliberate and is the whole reason this function exists: it makes
+ * the request fingerprint computable from the request alone, so a keyed
+ * generation can consult the idempotency ledger before it consults the clock
+ * (§0.5.1). {@link parseGeneratePlanRequest} is the two halves in one call for
+ * a caller that already holds the window.
+ */
+export const parseGeneratePlanSyntax = (body: unknown): ParsedGeneratePlanRequest =>
+    parseGeneratePlanBody(body, null);
+
+/**
+ * Validates `POST /meal-planning/plans` completely: the syntax above AND the
+ * start-date window, reported together in one verdict.
+ *
+ * Kept as the single-call form because a request with a malformed key and an
+ * out-of-window date is one round trip's worth of problems, and because a
+ * caller that already knows the window should be able to ask one question. It
+ * is {@link parseGeneratePlanSyntax} and {@link checkStartDateWindow} over one
+ * shared comparison, never a second implementation of either — which is why
+ * the composed verdict still reports both halves' details together, and why
+ * `generatePlan`, which must ask them in two moments, cannot be accused of
+ * applying a different rule from this one.
+ */
+export const parseGeneratePlanRequest = (
+    body: unknown,
+    window: StartDateWindow,
+): ParsedGeneratePlanRequest => parseGeneratePlanBody(body, window);
 
 /**
  * Validates `POST /meal-planning/plans/:planId/regenerate` — the path id and the

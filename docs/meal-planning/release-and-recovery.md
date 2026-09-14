@@ -20,7 +20,9 @@ folder README point here rather than repeating it.
 | --- | --- |
 | `prisma/migrations/20260908000000_meal_planning` (the schema), `prisma/manual-migrations/meal-planning/*`, `docs/meal-planning/expected-schema-diff.sql`, `.github/workflows/ci.yml`, `src/utils/featureFlags.ts`, `MEAL_PLANNING_ENABLED` | present |
 | `data/meal-planning/catalog/releases/v1/` — the reviewed release artefact, with a `manifest.json` carrying a SHA-256 and a row count for each of its five files (11,046 foods, 15,939 aliases, 31,899 portions, 0 components, 11,046 validation records) | present. This is the input a release loads, not loaded data: committing it puts no row in any database. |
-| `npm run catalog:load`, `npm run recipes:seed`, `npm run search:benchmark` | present as commands, each already checking its own inputs — `catalog:load -- --release v1` finds and accepts the manifest above — but **none of them writes to a database yet**: each ends by reporting `stage_pipeline_pending`, or `stage_prerequisites_unmet` for an input it cannot see (`recipes:seed` reports `gap_recipes_directory_absent` while `data/meal-planning/recipes/` is absent), and exits non-zero without touching the database. The loading, seeding and measurement bodies land with this branch's catalog commits. |
+| `npm run catalog:load` | present **and writing**. `catalog:load -- --release v1` finds and accepts the manifest above, verifies all five files against their declared SHA-256, byte length and row count before it writes anything, reconciles the release into `catalog_foods` and its aliases, portions, compositions and validation records — each food's four child sets replaced wholesale inside that food's own transaction — retires a published food the release no longer carries, re-compares the bytes it actually applied against the manifest, verifies the loaded counts against it, and only then records the run that makes it the active release. A rerun of a release already loaded reports 0 inserts and 0 updates. `--dry-run` reports the same reconciliation — the foods it would insert, update, retire and leave unchanged, and the alias, portion, composition and validation-record rows it would write and remove — and writes nothing at all, not even a run row. |
+| `npm run recipes:seed` | present **and writing**. Publishes the 42 committed recipe files as `recipe_versions` rows with their immutable ingredient snapshots against the catalog loaded in `DATABASE_URL`, is idempotent by slug (an unchanged recipe is a no-op; changed content or a stale ingredient snapshot publishes a new version, retires the previous one and moves `recipes.current_version_id` in one transaction), refuses the whole run — publishing nothing — if any file fails validation, and rewrites `data/meal-planning/recipes/coverage-report.json` from the seeded rows on a full run (`--dry-run` and `--only <slug>` both leave it alone). |
+| `npm run search:benchmark` | present as a command, already checking its own inputs, but **it does not write to a database yet**: it ends by reporting `stage_pipeline_pending`, or `stage_prerequisites_unmet` for an input it cannot see, and exits non-zero without touching the database. The measurement body lands with this branch's catalog commits. |
 | `GET /api/catalog/status` | `catalog.service.getStatus` is present; the `/api/catalog` route and controller land with this branch's API commits, so the endpoint is not yet reachable. |
 | Firebase Remote Config `meal_planning_enabled`, the mobile store build | outside this repository |
 
@@ -79,8 +81,28 @@ Backend first, app second, feature flags last.
    paid for are not handed back as fresh budget. A stage that already succeeded
    reports that it is complete and writes nothing at all — producing new
    candidates is not a rerun, it is a new `coveragePlanVersion`, which brings
-   batch keys and a budget of its own. The catalog data itself stays idempotent
-   throughout, because foods upsert on `source_key` and recipes on `slug`.
+   batch keys and a budget of its own. `catalog:load` is the deliberate
+   exception to that last case: a release is a statement of desired state rather
+   than a one-shot action, so loading one that already succeeded reconciles
+   every food again under a run row of its own and reports 0 inserts and 0
+   updates, leaving the settled run's evidence untouched. The catalog data
+   itself stays idempotent throughout, because foods upsert on `source_key` and
+   recipes on `slug`.
+
+   Two refusals are worth recognising on sight, because both leave the active
+   release exactly where it was. `release_file_digest_mismatch` (or its size and
+   row-count siblings) means the artefact on disk is not the one the manifest
+   describes, and it is raised before anything is written — reproduce or restore
+   the release. `release_file_changed_during_load` means a release file changed
+   while the load was running, which is what happens when a second operator
+   regenerates it or a copy is still in flight: the load refuses rather than
+   applying bytes nobody reviewed, records the run `failed`, and does not move
+   the pointer. Re-run the load once the directory is settled. A load that ends
+   any other way than `succeeded` is likewise repaired by re-running it: a food
+   whose composition points at another food in the same release is written whole
+   or not at all, and the run's cursor only ever names foods that finished, so a
+   rerun re-reconciles from the last completed one and everything it re-reads is
+   a no-op.
 5. **Verify before switching on.** `GET /api/catalog/status` must report the
    expected release with at least 10,000 published foods and at least 40
    recipes; the benchmark report must meet its thresholds; per-table row counts
@@ -201,11 +223,12 @@ the removal is only recoverable if you keep both in view:
   same ids, same plan and shopping history, same stored responses. That is why
   the `pg_dump` in the script's step 3 is a precondition and not a precaution.
 
-Today the backup is also the *only* route back to either kind of data: as this
-commit stands, `catalog:load` and `recipes:seed` both stop before any database
-write — the status table above is where that is tracked — so plan a removal
-around the backup, and check the state of the load path rather than assuming it
-has changed.
+Both halves of a fresh load are available now: `catalog:load` writes the
+reviewed release and `recipes:seed` publishes the committed recipe corpus
+against it — the status table above is where that is tracked. The backup is
+therefore no longer the only route back to that shared content, but it remains
+the only route back to user data, so plan a removal around the backup and check
+the state of both paths rather than assuming either has changed.
 
 Afterwards, `_prisma_migrations` still records `20260908000000_meal_planning` as
 applied, so `migrate deploy` would report nothing pending and leave the database

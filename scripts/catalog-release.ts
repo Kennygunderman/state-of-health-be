@@ -36,6 +36,16 @@
 // components.jsonl is therefore a PROVEN consequence of publishing no
 // ingredient-derived food, and never an unexplained blank.
 //
+// WHAT THE EXPORTED BYTES ARE A SNAPSHOT OF. The published graph and the
+// pipeline run ledger are read in ONE Repeatable Read transaction, so the
+// manifest's counts and the prerequisite-order check describe the same database
+// state rather than two states a concurrent ingest moved between. The stage also
+// holds the catalog-graph lock SHARED for its whole run (lib/checkpoint.ts's THE
+// STAGE LOCK), which is refused while any mutating stage holds it exclusively,
+// and it refuses outright when the ledger shows a mutating run still marked
+// 'running' — a crashed stage's half-written work is not something to freeze
+// into a reviewed artefact.
+//
 // A RELEASE IS REFUSED RATHER THAN SHIPPED INCOMPLETE. Every published food
 // must carry a validation record — that record is the machine-readable
 // evidence the feature requires — so a published row without one raises
@@ -66,7 +76,17 @@ import { ManifestError, assertReleaseVersion, loadCoveragePlan, releaseDir } fro
 import type { CoveragePlan } from './lib/manifest';
 import { ModelBudgetError } from './lib/budget';
 import { RateLimitConfigError } from './lib/rateLimiter';
-import { CheckpointError } from './lib/checkpoint';
+import {
+    CheckpointError,
+    GRAPH_MUTATING_RUN_KINDS,
+    canonicalValidationRunKey,
+    catalogInputIdentity,
+    isRestrictedValidationRunKey,
+    validationRunKeyInputPart,
+    validationRunKeyNamesInput,
+    withCatalogStageLock,
+} from './lib/checkpoint';
+import type { CatalogRunKind } from './lib/checkpoint';
 import type { ScriptLogger } from './lib/logger';
 import { assessComponentCoverage } from '../src/services/catalog.logic';
 import crypto from 'crypto';
@@ -449,9 +469,22 @@ export interface ReleaseDb {
     catalog_foods: { findMany(args: unknown): Promise<ReleaseFoodRow[]> };
     catalog_import_runs: {
         create(args: unknown): Promise<{ id: string }>;
-        /** Read to prove the published set is a validated set and not a mid-pipeline one. */
+        /**
+         * Read to prove the published set is a validated set and not a
+         * mid-pipeline one, and to refuse while a mutating run is still open.
+         */
         findMany(args: unknown): Promise<ReleaseRunRow[]>;
     };
+    /**
+     * Both reads happen inside ONE of these, at Repeatable Read — see
+     * ONE SNAPSHOT, TWO READS in runRelease. The options are declared narrowly
+     * because that isolation level and an explicit timeout are the only two this
+     * stage ever asks for.
+     */
+    $transaction<T>(
+        work: (tx: ReleaseDb) => Promise<T>,
+        options?: { isolationLevel?: 'RepeatableRead'; timeout?: number },
+    ): Promise<T>;
 }
 
 /** The slice of a pipeline run this stage reads to check its prerequisite order. */
@@ -615,6 +648,111 @@ const toJsonl = (rows: readonly Record<string, unknown>[]): string =>
     rows.length === 0 ? '' : `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`;
 
 /**
+ * The published graph and every child the release carries, in the order the
+ * release format states. Hoisted to a constant because the read now happens
+ * inside a Repeatable Read transaction (see ONE SNAPSHOT, TWO READS) and the
+ * query is worth reading on its own rather than nested two levels deeper.
+ */
+const RELEASE_FOOD_QUERY = {
+    where: { publication_status: 'published' },
+    orderBy: { source_key: 'asc' },
+    select: {
+        source_key: true,
+        canonical_name: true,
+        display_name: true,
+        category: true,
+        food_state: true,
+        food_group: true,
+        identity_source: true,
+        identity_status: true,
+        nutrition_provenance: true,
+        publication_status: true,
+        nutrition_basis: true,
+        basis_amount: true,
+        calories: true,
+        protein_g: true,
+        carbs_g: true,
+        fat_g: true,
+        fiber_g: true,
+        density_g_per_ml: true,
+        allergen_tags: true,
+        allergen_status: true,
+        diet_tags: true,
+        is_common_dislike: true,
+        cost_class: true,
+        nutrition_version: true,
+        metadata_version: true,
+        usda_fdc_id: true,
+        usda_data_type: true,
+        usda_description: true,
+        source_version: true,
+        source_cache_key: true,
+        search_text: true,
+        imported_at: true,
+        catalog_generation_batches: { select: { batch_key: true } },
+        catalog_food_aliases: { select: { alias: true }, orderBy: { alias: 'asc' } },
+        catalog_food_portions: {
+            select: {
+                description: true,
+                amount: true,
+                unit: true,
+                gram_weight: true,
+                is_default: true,
+                source: true,
+            },
+            orderBy: { description: 'asc' },
+        },
+        catalog_food_components: {
+            select: {
+                quantity_grams: true,
+                yield_factor: true,
+                component_nutrition_version: true,
+                sort_order: true,
+                component_catalog_foods: { select: { source_key: true } },
+            },
+            orderBy: { sort_order: 'asc' },
+        },
+        catalog_validation_records: {
+            select: {
+                canonical_identity: true,
+                aliases: true,
+                category: true,
+                food_state: true,
+                identity_source: true,
+                identity_status: true,
+                nutrition_provenance: true,
+                nutrition_method: true,
+                nutrition_assumptions: true,
+                portion_units: true,
+                identity_evidence: true,
+                checks: true,
+                llm_review: true,
+                outcome: true,
+                reviewed_at: true,
+                publication_status: true,
+                source_versions: true,
+                history: true,
+            },
+        },
+    },
+};
+
+/**
+ * Two minutes for the snapshot's two reads.
+ *
+ * Prisma's default interactive-transaction timeout is 5 seconds, which is not a
+ * ceiling this export can live with: it reads ~11,000 published parents with
+ * five child relations each — on the order of 60,000 rows — and a cold
+ * connection pool, a cold page cache or a loaded development machine turns a
+ * few seconds into tens of them. The cost of a generous ceiling is nothing,
+ * because the transaction holds no locks that block a writer (a Repeatable Read
+ * reader takes none) and it is released the moment the two reads return; the
+ * cost of a tight one is a failed release on a slow disk. Two minutes is an
+ * order of magnitude above the measured read and still far below "hung".
+ */
+const RELEASE_SNAPSHOT_TIMEOUT_MS = 120_000;
+
+/**
  * Exports the published catalog.
  *
  * Ordering is by `source_key` throughout, and children are ordered within
@@ -626,89 +764,30 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     const { logger, coveragePlan } = deps;
     const generatedAt = deps.now();
 
-    const rows = await deps.db.catalog_foods.findMany({
-        where: { publication_status: 'published' },
-        orderBy: { source_key: 'asc' },
-        select: {
-            source_key: true,
-            canonical_name: true,
-            display_name: true,
-            category: true,
-            food_state: true,
-            food_group: true,
-            identity_source: true,
-            identity_status: true,
-            nutrition_provenance: true,
-            publication_status: true,
-            nutrition_basis: true,
-            basis_amount: true,
-            calories: true,
-            protein_g: true,
-            carbs_g: true,
-            fat_g: true,
-            fiber_g: true,
-            density_g_per_ml: true,
-            allergen_tags: true,
-            allergen_status: true,
-            diet_tags: true,
-            is_common_dislike: true,
-            cost_class: true,
-            nutrition_version: true,
-            metadata_version: true,
-            usda_fdc_id: true,
-            usda_data_type: true,
-            usda_description: true,
-            source_version: true,
-            source_cache_key: true,
-            search_text: true,
-            imported_at: true,
-            catalog_generation_batches: { select: { batch_key: true } },
-            catalog_food_aliases: { select: { alias: true }, orderBy: { alias: 'asc' } },
-            catalog_food_portions: {
-                select: {
-                    description: true,
-                    amount: true,
-                    unit: true,
-                    gram_weight: true,
-                    is_default: true,
-                    source: true,
-                },
-                orderBy: { description: 'asc' },
-            },
-            catalog_food_components: {
-                select: {
-                    quantity_grams: true,
-                    yield_factor: true,
-                    component_nutrition_version: true,
-                    sort_order: true,
-                    component_catalog_foods: { select: { source_key: true } },
-                },
-                orderBy: { sort_order: 'asc' },
-            },
-            catalog_validation_records: {
-                select: {
-                    canonical_identity: true,
-                    aliases: true,
-                    category: true,
-                    food_state: true,
-                    identity_source: true,
-                    identity_status: true,
-                    nutrition_provenance: true,
-                    nutrition_method: true,
-                    nutrition_assumptions: true,
-                    portion_units: true,
-                    identity_evidence: true,
-                    checks: true,
-                    llm_review: true,
-                    outcome: true,
-                    reviewed_at: true,
-                    publication_status: true,
-                    source_versions: true,
-                    history: true,
-                },
-            },
+    // ONE SNAPSHOT, TWO READS.
+    //
+    // The published graph and the run ledger are two statements that have to
+    // describe ONE database state. Read independently, the prerequisite-order
+    // check can pass against a ledger the exported bytes do not match: an
+    // ingest that commits between them writes the records it touched back as
+    // candidates, so the export can carry rows the ledger says nothing about —
+    // and the only symptom is a count nobody was watching. Repeatable Read puts
+    // both statements on the same snapshot, so the manifest's counts and the
+    // prerequisite check are statements about the same catalog.
+    //
+    // The transaction holds READS ONLY. The pure mapping below and the six file
+    // writes stay outside it: building 11,000 JSONL lines and writing six files
+    // inside a database transaction would hold a snapshot open for the length of
+    // a disk write and buy nothing.
+    const snapshot = await deps.db.$transaction(
+        async (tx) => {
+            const publishedRows = await tx.catalog_foods.findMany(RELEASE_FOOD_QUERY);
+            const pipelineRuns = await loadPipelineRuns(tx);
+            return { publishedRows, pipelineRuns };
         },
-    });
+        { isolationLevel: 'RepeatableRead', timeout: RELEASE_SNAPSHOT_TIMEOUT_MS },
+    );
+    const rows = snapshot.publishedRows;
 
     const foods: Record<string, unknown>[] = [];
     const aliases: Record<string, unknown>[] = [];
@@ -791,7 +870,18 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     // check. It is a snapshot of a pipeline halfway through, and the only
     // symptom is a count nobody was watching. Refused instead, with the order
     // to run.
-    const staleReason = releaseStalenessReason(await loadPipelineRuns(deps.db), deps.logger);
+    // Read in the same snapshot as the rows above, not here: see ONE SNAPSHOT,
+    // TWO READS for why a second, independent read of the ledger is exactly the
+    // defect this check is supposed to catch.
+    // The canonical validation this catalog must have passed, resolved from the
+    // SAME ledger rows as everything else in the snapshot — the identity of the
+    // input and the identity of the run that judged it have to be read together
+    // or the pair can disagree (see ONE SNAPSHOT, TWO READS).
+    const expectedValidationKey = canonicalValidationRunKey(
+        deps.coveragePlan.coveragePlanVersion,
+        catalogInputIdentity(snapshot.pipelineRuns),
+    );
+    const staleReason = releaseStalenessReason(snapshot.pipelineRuns, expectedValidationKey, deps.logger);
     if (staleReason !== null) {
         throw new ReleaseIntegrityError(staleReason);
     }
@@ -1062,11 +1152,52 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     };
 };
 
-/** A release that would ship incomplete. Reported, never written. */
-/** Every finished pipeline run, newest last, for the prerequisite-order check. */
-const loadPipelineRuns = async (db: ReleaseDb): Promise<ReleaseRunRow[]> =>
+/**
+ * The stages that MUTATE the catalog graph.
+ *
+ * Two different rules read this one list, which is why it is a list rather than
+ * two `in` clauses: the prerequisite-order check compares the newest ingest
+ * against the newest validation, and the active-run refusal treats any of them
+ * left 'running' as a reason not to export. `release_load` is here because a
+ * load upserts foods, replaces their children and retires rows — it is as much
+ * a mutator as an import.
+ */
+const MUTATING_RUN_KINDS: readonly string[] = ['usda_import', 'ai_generation', 'validation', 'release_load'];
+
+/**
+ * The command that settles a run of each kind.
+ *
+ * Named in the refusal message rather than left to the operator to work out,
+ * because an abandoned 'running' row from a crashed stage would otherwise block
+ * every future release with no stated way out: re-running that stage RESUMES
+ * the same run (checkpoint.ts's THE CLAIM finds it by kind + manifest_version)
+ * and closes it, which is the only thing that clears the row.
+ */
+const SETTLING_COMMANDS: Readonly<Record<string, string>> = {
+    usda_import: 'npm run catalog:import',
+    ai_generation: 'npm run catalog:generate',
+    validation: 'npm run catalog:validate',
+    release_load: 'npm run catalog:load -- --release <release>',
+};
+
+/**
+ * Every pipeline run that bears on whether this database may be released:
+ * succeeded runs, for the prerequisite order, and runs still marked 'running',
+ * because the graph they are writing is the graph this export would freeze.
+ *
+ * Reading both in one query is what keeps the two rules on one snapshot (see
+ * ONE SNAPSHOT, TWO READS).
+ */
+export const loadPipelineRuns = async (db: ReleaseDb): Promise<ReleaseRunRow[]> =>
     db.catalog_import_runs.findMany({
-        where: { kind: { in: ['usda_import', 'ai_generation', 'validation'] }, status: 'succeeded' },
+        // FAILED rows are read too, and that is not incidental. A failed
+        // validation attempt of the CURRENT catalog is the most important row in
+        // this ledger: without it, an older success for a different input — or an
+        // earlier attempt of the same one — reads as "validation passed" and the
+        // release ships a catalog whose judgement is known to have not finished.
+        // Whether a failure blocks is decided in releaseStalenessReason, which it
+        // cannot do for a row it never sees.
+        where: { kind: { in: MUTATING_RUN_KINDS }, status: { in: ['succeeded', 'running', 'failed'] } },
         select: { kind: true, manifest_version: true, status: true, finished_at: true },
         orderBy: { finished_at: 'asc' },
     });
@@ -1074,14 +1205,78 @@ const loadPipelineRuns = async (db: ReleaseDb): Promise<ReleaseRunRow[]> =>
 /**
  * Why this database is not ready to be released, or `null` when it is.
  *
- * Pure over the run rows so the rule is testable without a database. A run
- * whose `finished_at` is null never finished and says nothing about order, so
- * it is ignored rather than treated as the newest.
+ * Pure over the run rows so every rule is testable without a database. Four
+ * refusals live here, in this order:
+ *
+ *   1. a mutating run still marked 'running' — the graph is moving;
+ *   2. no successful CANONICAL validation for this catalog under the current
+ *      coverage plan — a restricted `+scope:` pass judged part of the plan and
+ *      cannot stand in for it, and a full pass of a DIFFERENT input judged a
+ *      catalog this one no longer is;
+ *   3. a later FAILED attempt of that same canonical run — validation closes
+ *      itself failed when it could not judge every row it considered, and an
+ *      older success must not hide it;
+ *   4. an ingest that finished after that validation — the rows it touched are
+ *      unpublished right now.
+ *
+ * A run whose `finished_at` is null never finished and says nothing about
+ * ORDER, so rules 3 and 4 ignore it — which is exactly why the open-run rule
+ * has to be stated separately rather than folded into them.
+ *
+ * @param expectedKey the canonical validation run key for the coverage plan and
+ * catalog input being released — `canonicalValidationRunKey(planVersion,
+ * catalogInputIdentity(runs))`. Passed in rather than derived here so the
+ * caller resolves it from the SAME snapshot as the rows (see ONE SNAPSHOT, TWO
+ * READS), and so this function stays pure over its arguments.
  */
-export const releaseStalenessReason = (runs: readonly ReleaseRunRow[], logger: ScriptLogger): string | null => {
-    const latest = (kinds: readonly string[]): ReleaseRunRow | null =>
+export const releaseStalenessReason = (
+    runs: readonly ReleaseRunRow[],
+    expectedKey: string,
+    logger: ScriptLogger,
+): string | null => {
+    // A MUTATING RUN THAT IS STILL OPEN IS CHECKED FIRST, because it makes every
+    // other question unanswerable: the run is writing the rows this export would
+    // freeze, so the published set is moving and the order check below is
+    // comparing against a ledger entry that has not happened yet. The shared
+    // stage lock stops a LIVE mutator from overlapping this export; this rule
+    // catches the other case — a row left 'running' by a stage that crashed,
+    // whose work is genuinely half-done.
+    //
+    // The remedy has to be stated, because without it an abandoned row would
+    // block every future release and an operator's only visible options would be
+    // editing the table by hand.
+    const active = runs
+        .filter((run) => MUTATING_RUN_KINDS.includes(run.kind) && run.status === 'running')
+        // Deterministic: the same ledger always names the same run, so the
+        // message an operator gets is reproducible.
+        .sort((left, right) =>
+            left.kind === right.kind
+                ? left.manifest_version < right.manifest_version
+                    ? -1
+                    : left.manifest_version > right.manifest_version
+                      ? 1
+                      : 0
+                : left.kind < right.kind
+                  ? -1
+                  : 1,
+        );
+
+    if (active.length > 0) {
+        const run = active[0];
+        const settle = SETTLING_COMMANDS[run.kind] ?? 'the stage that opened it';
+        return (
+            `a ${run.kind} run for ${run.manifest_version} is still marked running${
+                active.length > 1 ? ` (${active.length} mutating runs are open)` : ''
+            }, so the published set can change underneath this export and the release would freeze a catalog ` +
+            'halfway through a stage. Settle it first: re-run that stage with ' +
+            `"${settle}", which resumes that same run and closes it — a run left running by a crashed stage is ` +
+            'cleared no other way. Then run catalog:validate, then catalog:release.'
+        );
+    }
+
+    const latest = (predicate: (run: ReleaseRunRow) => boolean): ReleaseRunRow | null =>
         runs
-            .filter((run) => kinds.includes(run.kind) && run.finished_at !== null)
+            .filter((run) => predicate(run) && run.finished_at !== null)
             .reduce<ReleaseRunRow | null>(
                 (newest, run) =>
                     newest === null || (run.finished_at as Date).getTime() > (newest.finished_at as Date).getTime()
@@ -1090,12 +1285,125 @@ export const releaseStalenessReason = (runs: readonly ReleaseRunRow[], logger: S
                 null,
             );
 
-    const validation = latest(['validation']);
-    if (validation === null) {
+    // WHICH VALIDATION ROW COUNTS: THE CANONICAL ONE FOR THIS CATALOG, AND ONLY
+    // IT.
+    //
+    // "The newest validation row" is not the question. A validation run key
+    // names the policy it judged against and the catalog input it judged
+    // (lib/checkpoint.ts), and a restricted pass — `--category`,
+    // `--revalidate-quarantined` — carries a `+scope:` suffix precisely because
+    // it judged a FRACTION of the plan. Taking the newest row of any shape lets
+    // this sequence through: an old full validation, then an import, then a
+    // category-only validation — three rows whose newest is more recent than the
+    // import, so the ordering check below passes and the release ships a catalog
+    // most of which was judged before the import touched it, stamped with the
+    // current coverage plan version. That is the failure this paragraph exists
+    // to prevent, and the reason the expected key is passed in rather than
+    // guessed at.
+    const canonicalRuns = runs.filter((run) => run.kind === 'validation' && run.manifest_version === expectedKey);
+    const canonicalSuccess = latest((run) => canonicalRuns.includes(run) && run.status === 'succeeded');
+    const canonicalFailure = latest((run) => canonicalRuns.includes(run) && run.status === 'failed');
+
+    if (canonicalSuccess === null) {
+        // Naming what IS on record matters here: an operator looking at a
+        // ledger full of validation rows needs to know why none of them counts,
+        // and the two reasons are different remedies.
+        const scoped = runs.filter(
+            (run) => run.kind === 'validation' && isRestrictedValidationRunKey(run.manifest_version),
+        );
+        const fullRuns = runs.filter(
+            (run) => run.kind === 'validation' && !isRestrictedValidationRunKey(run.manifest_version),
+        );
+        const expectedInput = validationRunKeyInputPart(expectedKey);
+        const namingAnInput = fullRuns.filter(
+            (run) => run.manifest_version !== expectedKey && validationRunKeyNamesInput(run.manifest_version),
+        );
+        const otherInputs = namingAnInput.filter(
+            (run) => validationRunKeyInputPart(run.manifest_version) !== expectedInput,
+        );
+        // Same catalog, different coverage plan: the rows were judged against
+        // bounds this release is not being cut under, which is a different
+        // remedy from "an import has run since".
+        const otherPlans = namingAnInput.filter(
+            (run) => validationRunKeyInputPart(run.manifest_version) === expectedInput,
+        );
+        // A row from before the run key named the catalog input. It is not
+        // wrong, it is SILENT about the one thing this check needs, and saying
+        // so beats accusing the operator of an import they did not run.
+        const silentAboutInput = fullRuns.filter((run) => !validationRunKeyNamesInput(run.manifest_version));
+
+        if (scoped.length > 0 || otherInputs.length > 0 || otherPlans.length > 0 || silentAboutInput.length > 0) {
+            return (
+                `no successful catalog:validate run is on record for this catalog under the current coverage plan ` +
+                `(expected run ${expectedKey}), so the published set has not been judged as it now stands. ` +
+                `${
+                    scoped.length > 0
+                        ? `${scoped.length} restricted run(s) (--category / --revalidate-quarantined) are on record and cannot stand in for the full pass, because each judged only part of the plan. `
+                        : ''
+                }${
+                    otherInputs.length > 0
+                        ? `${otherInputs.length} full run(s) judged a different catalog input — an import or load has run since. `
+                        : ''
+                }${
+                    otherPlans.length > 0
+                        ? `${otherPlans.length} full run(s) judged this same catalog under a different coverage plan, so their verdicts came from bounds this release is not being cut under. `
+                        : ''
+                }${
+                    silentAboutInput.length > 0
+                        ? `${silentAboutInput.length} full run(s) predate validation runs naming the catalog they judged, so they cannot vouch for this one; re-running validation records it against this catalog and is a no-op thereafter. `
+                        : ''
+                }` +
+                'Run catalog:validate (with no --category and no --revalidate-quarantined), then catalog:release.'
+            );
+        }
+
         return 'no successful catalog:validate run is on record, so no food in this database has been judged. Run catalog:validate before catalog:release.';
     }
 
-    const ingest = latest(['usda_import', 'ai_generation']);
+    if (
+        canonicalFailure !== null &&
+        (canonicalFailure.finished_at as Date).getTime() > (canonicalSuccess.finished_at as Date).getTime()
+    ) {
+        // A later attempt of the SAME run key failed, which means the pass that
+        // succeeded earlier no longer describes the database: validation closes
+        // itself failed when it could not judge every row it considered, and
+        // those rows kept the status they already had. An older success must not
+        // hide that.
+        return (
+            `the most recent catalog:validate attempt for this catalog (run ${expectedKey}) FAILED at ` +
+            `${(canonicalFailure.finished_at as Date).toISOString()}, after the earlier success at ` +
+            `${(canonicalSuccess.finished_at as Date).toISOString()}. Rows it could not judge kept the status they ` +
+            'already had, so the published set is not a complete judgement. Run catalog:validate again — it resumes ' +
+            'that same run and revisits exactly those rows — then catalog:release.'
+        );
+    }
+
+    const validation = canonicalSuccess;
+
+    // The ordering rule, kept as a SECOND line of defence rather than the first.
+    // Now that the canonical run key names the catalog input, a newer SUCCEEDED
+    // ingest changes the expected key and the check above refuses for that
+    // reason alone — which is the stronger statement, because it holds even
+    // when the newer ingest has no finish time to compare. This check still
+    // earns its place twice over:
+    //
+    //   * it catches a succeeded ingest the identity did not pick as newest (a
+    //     tie, a clock that moved), stated in the terms an operator recognises;
+    //   * it is THE rule for a FAILED graph mutator that finished after the
+    //     validation. catalogInputIdentity counts succeeded runs only, and says
+    //     so explicitly, precisely because a failed ingest left a graph nobody
+    //     vouched for and naming it would mint a key for a half-written
+    //     catalog — it delegates that case here. A failed import writes back
+    //     every record it got to before it died, as candidates, so those foods
+    //     are unpublished right now and this export would silently omit them.
+    //
+    // Hence no status predicate, and hence the three GRAPH-MUTATING kinds
+    // rather than the two ingest ones: a release_load upserts foods, replaces
+    // their children and retires rows, so a load that failed halfway leaves
+    // exactly the same partial graph as a failed import. Validation is not in
+    // that set (checkpoint.ts states why) — with it, the canonical success
+    // would be compared against itself.
+    const ingest = latest((run) => GRAPH_MUTATING_RUN_KINDS.includes(run.kind as CatalogRunKind));
     if (ingest === null) {
         // Validated with nothing imported is odd but not incoherent — a
         // release loaded from an earlier bundle has no import run of its own.
@@ -1110,10 +1418,15 @@ export const releaseStalenessReason = (runs: readonly ReleaseRunRow[], logger: S
     }
 
     return (
-        `a ${ingest.kind} run for ${ingest.manifest_version} finished at ${ingestAt.toISOString()}, after the last ` +
-        `successful validation at ${validatedAt.toISOString()}. An ingest writes the records it touches back as ` +
-        'candidates, so those foods are unpublished right now and this release would silently omit them. ' +
-        'Run catalog:validate, then catalog:release.'
+        `a ${ingest.kind} run for ${ingest.manifest_version} ${ingest.status === 'failed' ? 'FAILED' : 'finished'} at ` +
+        `${ingestAt.toISOString()}, after the last successful validation at ${validatedAt.toISOString()}. ` +
+        'Writing the catalog graph writes the records it touches back as candidates, so those foods are unpublished ' +
+        `right now and this release would silently omit them${
+            ingest.status === 'failed'
+                ? ' — a run that failed partway wrote back everything it reached before it died, which is why its ' +
+                  'outcome does not excuse it from this rule'
+                : ''
+        }. Run catalog:validate, then catalog:release.`
     );
 };
 
@@ -1203,21 +1516,31 @@ const main = async (): Promise<number> => {
     // serialisers above must not pay for it.
     const { prisma } = await import('../src/prisma/client');
 
-    const outcome = await runRelease({
-        db: prisma as unknown as ReleaseDb,
-        coveragePlan: loadCoveragePlan(),
-        release: assertReleaseVersion(parsed.options.release),
-        logger,
-        now: () => new Date(),
-        releaseDir,
-        writeFile: (absolutePath, contents) => {
-            fs.writeFileSync(absolutePath, contents, 'utf-8');
-        },
-        readFileBytes: (absolutePath) => fs.readFileSync(absolutePath),
-        ensureDir: (absolutePath) => {
-            fs.mkdirSync(absolutePath, { recursive: true });
-        },
-    });
+    // THE STAGE CLAIM, TAKEN SHARED. This stage only READS the catalog graph, so
+    // two exports of one database are harmless and both may hold the lock; what
+    // must not happen is an export running while an import, a generation pass, a
+    // validation pass or a load is writing, and a shared lock is refused exactly
+    // then (lib/checkpoint.ts's THE STAGE LOCK). It is the outer half of the
+    // guarantee the Repeatable Read snapshot makes inside runRelease: the lock
+    // keeps a mutator out for the whole export, the snapshot makes the two reads
+    // describe one state even so.
+    const outcome = await withCatalogStageLock({ stage: 'release', logger }, () =>
+        runRelease({
+            db: prisma as unknown as ReleaseDb,
+            coveragePlan: loadCoveragePlan(),
+            release: assertReleaseVersion(parsed.options.release),
+            logger,
+            now: () => new Date(),
+            releaseDir,
+            writeFile: (absolutePath, contents) => {
+                fs.writeFileSync(absolutePath, contents, 'utf-8');
+            },
+            readFileBytes: (absolutePath) => fs.readFileSync(absolutePath),
+            ensureDir: (absolutePath) => {
+                fs.mkdirSync(absolutePath, { recursive: true });
+            },
+        }),
+    );
 
     logger.info('stage_completed', {
         stage: STAGE,

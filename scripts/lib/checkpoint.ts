@@ -24,9 +24,17 @@
 //   * Claiming a run is serialised on a per-(kind, manifest_version) ADVISORY
 //     LOCK (acquireRunClaimLock), so exactly one caller creates the run and the
 //     rest converge on it rather than opening a competing second run. Read THE
-//     CLAIM for what that does and does not promise — it bounds the damage of a
-//     double launch, it does not make one impossible, and the difference is
-//     stated there rather than glossed here.
+//     CLAIM for what that does and does not promise — it guarantees one run ROW
+//     and not one writer, and the difference is stated there rather than glossed
+//     here.
+//   * Being the only WRITER is a separate guarantee, kept by a separate
+//     mechanism in this module: acquireCatalogStageLock / withCatalogStageLock
+//     take a SESSION-scoped advisory lock on the whole catalog graph, on a
+//     dedicated connection, for as long as a stage runs. The CLI entry points
+//     take it (exclusively for the four mutating stages, shared for the
+//     read-only export), so a second launch of a mutating stage is refused
+//     before it writes anything. Read THE STAGE LOCK for the keyspace it uses
+//     and why that choice is not cosmetic.
 //   * EVERY write to a run row — cursor, counts, log and the close — first reads
 //     that row with SELECT … FOR UPDATE (lockRunForUpdate) inside a transaction.
 //     There is no unlocked write and no exception. `counts` and `log` need it
@@ -64,6 +72,12 @@
 // once now. logger.ts's own recursive sanitizer is private and shapes a terminal
 // line, so the recursion for a stored JSONB entry lives here (see
 // sanitizeRunLogEntry) and is built on those four exports.
+// Node's own hashing, for the run keys below. Nothing here hashes a secret; the
+// digests name a catalog input and a pass restriction so an operator-readable
+// `manifest_version` can carry both (see WHICH CATALOG A VALIDATION RUN ANSWERS
+// FOR).
+import crypto from 'crypto';
+
 import { hostOf, isSecretBearingKey, safeError, scrubSecrets, ScriptLogger } from './logger';
 
 // Types only. Rule §12 forbids editing or reviewing src/generated/prisma, not
@@ -96,6 +110,77 @@ export type CatalogRunKind = 'usda_import' | 'ai_generation' | 'validation' | 'r
 
 export type CatalogRunStatus = 'running' | 'succeeded' | 'failed';
 
+// Every stage that contends for the catalog graph, which is the four run kinds
+// plus the read-only export. `release` is not a CatalogRunKind — that union is
+// the set of stages that OPEN a resumable run through this module, and
+// catalog-release.ts writes its audit row directly (see the note on
+// CatalogRunKind) — but it is a stage for locking purposes, because it reads the
+// whole published graph and must not read one a mutator is rewriting.
+export type CatalogStageName = CatalogRunKind | 'release';
+
+export type CatalogStageLockMode = 'exclusive' | 'shared';
+
+// THE STAGE LOCK'S CONTRACT, stage by stage.
+//
+// Four stages MUTATE the catalog graph and take the lock EXCLUSIVELY, so no two
+// of them ever run against one database at the same time:
+//   * usda_import    — upserts foods and their children by source_key;
+//   * ai_generation  — the same, for generated candidates. The script is still a
+//                      stage stub (catalog-generate-ai.ts writes nothing yet),
+//                      and it takes this exclusive lock when its body is wired:
+//                      that is this table's contract, not a future intention;
+//   * validation     — re-judges rows and moves publication_status;
+//   * release_load   — reconciles a release into the graph and retires rows.
+// One stage only READS it and takes the lock SHARED:
+//   * release        — exports the published graph to a versioned release. Shared
+//                      rather than exclusive because two exports of one database
+//                      are harmless, while an export concurrent with ANY mutator
+//                      would freeze a graph that is still moving — the exact
+//                      defect this table exists to prevent.
+export const CATALOG_STAGE_LOCK_MODES: Readonly<Record<CatalogStageName, CatalogStageLockMode>> = {
+    usda_import: 'exclusive',
+    ai_generation: 'exclusive',
+    validation: 'exclusive',
+    release_load: 'exclusive',
+    release: 'shared',
+};
+
+// ONE LOCK NAME FOR THE WHOLE GRAPH, not one per stage.
+//
+// Exclusivity is a property of the catalog graph rather than of a stage kind: an
+// import and a validation pass collide because they write the same rows, not
+// because they share a name. Keying the lock by stage kind would let exactly the
+// pair of stages this lock exists to separate run at once, which is the defect
+// the run claim already has (it is keyed by kind + manifest_version and is
+// therefore blind to a different stage working the same graph).
+const CATALOG_GRAPH_LOCK_NAME = 'catalog-graph';
+
+// WHY THE TWO-INTEGER ADVISORY KEYSPACE, AND WHY IT IS THE MOST IMPORTANT FACT
+// ABOUT THIS LOCK.
+//
+// PostgreSQL documents the one-argument (bigint) and two-argument (int, int)
+// advisory lock spaces as DISTINCT: a lock taken as pg_advisory_lock(k) never
+// conflicts with one taken as pg_advisory_lock(c, k). This lock therefore uses
+// the two-argument form with the class id below, because everything else in this
+// system that takes an advisory lock uses the ONE-argument form over
+// `hashtext(...)`:
+//   * the request path serialises every mutating meal-planning transaction on
+//     `pg_advisory_xact_lock(hashtext('meal-planning:' || userId))` (Agent Action
+//     Plan §0.5.1, "Lock first");
+//   * acquireRunClaimLock in this very file takes
+//     `pg_advisory_xact_lock(hashtext('catalog-run:<kind>:<version>'))`.
+// hashtext narrows to 32 bits, so two unrelated names CAN hash to the same key.
+// For those two that costs a few milliseconds of waiting. For THIS lock it would
+// be an outage: it is held for the hours an import or a validation pass takes,
+// on a session rather than a transaction, so a collision with a user's
+// meal-planning write would block that user's request for the whole stage. The
+// separate keyspace makes that collision impossible rather than unlikely.
+//
+// The class id is the ASCII bytes of 'CAT' (0x434154) — an arbitrary but fixed
+// and documented constant, which is all a class id has to be. Every catalog
+// stage uses it, so all of them contend, and nothing outside this file does.
+const CATALOG_STAGE_LOCK_CLASS_ID = 0x434154;
+
 // THE ACTIVE-RELEASE CONVENTION, AND WHY IT IS DUPLICATED IN src/.
 //
 // The active catalog release is the newest `catalog_import_runs` row with
@@ -124,13 +209,190 @@ export const RUN_STATUS_SUCCEEDED: CatalogRunStatus = 'succeeded';
 // a full audit trail belongs.
 export const RUN_LOG_MAX_ENTRIES = 200;
 
+// ---------------------------------------------------------------------------
+// WHICH CATALOG A VALIDATION RUN ANSWERS FOR.
+//
+// A validation run key names two things, and it has to name both or it answers
+// the wrong question:
+//
+//   * the POLICY the rows were judged against — the coverage plan version, whose
+//     bounds every verdict is computed from; and
+//   * the INPUT that was judged — the graph as the last ingest left it.
+//
+// Keyed on the policy alone, one successful pass answers "validation succeeded
+// for v1" for ever, so a later import or release load under the same coverage
+// plan is met with the completed-run no-op and its rows are never judged. AAP
+// §0.5.1 requires the opposite ("a refresh re-runs validation"), and the
+// consequence is worse than a missed pass: catalog-release's prerequisite asks
+// for a validation newer than the last ingest, so the release would wait on a
+// run that can no longer happen — a deadlock clearable only by bumping an
+// unrelated coverage plan version.
+//
+// Keyed on both, a refresh is NEW WORK by construction and re-running the stage
+// against an unchanged graph is still a no-op. That is the whole of the rule.
+//
+// It lives here, in the run-ledger module, because the identity is derived from
+// run rows and because BOTH sides need exactly the same definition:
+// catalog-validate.ts to claim the key, and catalog-release.ts to decide which
+// validation row is the canonical one. A second definition would let the two
+// disagree about the same catalog.
+// ---------------------------------------------------------------------------
+
+/**
+ * The run kinds that change the FACTS in the catalog graph.
+ *
+ * Validation is deliberately absent: it moves `publication_status` and writes
+ * validation records, and it never changes a food's nutrients, its basis or its
+ * metadata. Were it included, every pass would change the identity of the input
+ * it was judging and no validation could ever be complete.
+ */
+export const GRAPH_MUTATING_RUN_KINDS: readonly CatalogRunKind[] = [
+    'usda_import',
+    'ai_generation',
+    RELEASE_LOAD_RUN_KIND,
+];
+
+/** The run-ledger fields the identity is derived from. Structural, so both stages' row types satisfy it. */
+export interface CatalogInputRunRow {
+    readonly kind: string;
+    readonly manifest_version: string;
+    readonly status: string;
+    readonly finished_at: Date | null;
+}
+
+/** A graph with no ingest on record — a database whose catalog was never loaded. */
+export const NO_CATALOG_INPUT = 'none';
+
+/** The marker that separates a canonical key from the restriction narrowing it. */
+export const VALIDATION_SCOPE_SEPARATOR = '+scope:';
+
+/**
+ * Names the graph the last completed ingest left, as a value a run key can
+ * carry.
+ *
+ * Derived from the ledger rather than from the graph on purpose: the key has to
+ * be known BEFORE the completed-run no-op decides whether to read the graph at
+ * all, and the ledger is the one record of "what was loaded" that is readable
+ * without touching a single food.
+ *
+ * Only SUCCEEDED runs count. An open or failed ingest left the graph in a state
+ * nobody has vouched for, and naming it would mint a key for a half-written
+ * catalog; the release prerequisite refuses on such a row separately, which is
+ * where that case belongs.
+ *
+ * @param runs ledger rows; anything that is not a succeeded graph-mutating run is ignored
+ * @returns `kind:manifest_version:finishedAt`, or {@link NO_CATALOG_INPUT}
+ */
+export const catalogInputIdentity = (runs: readonly CatalogInputRunRow[]): string => {
+    const ingests = runs.filter(
+        (run) =>
+            GRAPH_MUTATING_RUN_KINDS.includes(run.kind as CatalogRunKind) &&
+            run.status === RUN_STATUS_SUCCEEDED &&
+            run.finished_at !== null,
+    );
+
+    if (ingests.length === 0) {
+        return NO_CATALOG_INPUT;
+    }
+
+    // Newest wins, and ties break on kind then manifest version so the identity
+    // is a function of the ledger's CONTENT and not of the order it came back
+    // in — two stages computing this must agree to the character.
+    const newest = ingests.reduce((best, run) => {
+        const at = (run.finished_at as Date).getTime();
+        const bestAt = (best.finished_at as Date).getTime();
+        if (at !== bestAt) {
+            return at > bestAt ? run : best;
+        }
+        const left = `${run.kind}:${run.manifest_version}`;
+        const right = `${best.kind}:${best.manifest_version}`;
+        return left > right ? run : best;
+    });
+
+    return `${newest.kind}:${newest.manifest_version}:${(newest.finished_at as Date).toISOString()}`;
+};
+
+/**
+ * The key a CANONICAL full validation pass claims, and the only key
+ * catalog-release accepts as a validation prerequisite.
+ *
+ * Kept short: the input identity is hashed rather than embedded, because
+ * `manifest_version` is a database column an operator reads in a terminal, and
+ * a full ISO timestamp plus a manifest name would make every log line and every
+ * refusal message unreadable. Twelve hex characters distinguish every catalog a
+ * database will ever hold.
+ */
+export const canonicalValidationRunKey = (coveragePlanVersion: string, inputIdentity: string): string =>
+    `${coveragePlanVersion}@${crypto.createHash('sha256').update(inputIdentity).digest('hex').slice(0, 12)}`;
+
+/**
+ * True for a key that names a RESTRICTED pass — one narrowed by `--category` or
+ * widened by `--revalidate-quarantined`.
+ *
+ * catalog-release asks this because such a pass judged a fraction of the plan:
+ * it may resume and may refuse to redo itself, but it must never stand in for
+ * the canonical pass in a release prerequisite.
+ */
+export const isRestrictedValidationRunKey = (manifestVersion: string): boolean =>
+    manifestVersion.includes(VALIDATION_SCOPE_SEPARATOR);
+
+/** The marker that separates the policy from the catalog input in a validation run key. */
+export const VALIDATION_INPUT_SEPARATOR = '@';
+
+/**
+ * True for a validation run key that states WHICH CATALOG it judged.
+ *
+ * False for a key recorded before the key named the input — a bare coverage plan
+ * version. Such a row is not wrong, it is simply silent about the thing a
+ * release needs to know, and catalog-release says exactly that rather than
+ * accusing the operator of an import they did not run.
+ */
+export const validationRunKeyNamesInput = (manifestVersion: string): boolean =>
+    manifestVersion.includes(VALIDATION_INPUT_SEPARATOR);
+
+/**
+ * The catalog-input half of a validation run key, or `null` for a key that does
+ * not name one.
+ *
+ * Exists so a refusal can tell an operator WHICH half disagrees. "No canonical
+ * validation" has three quite different causes — a different catalog, a
+ * different coverage plan, a run recorded before keys named the catalog — and
+ * each has its own remedy, so a message that lumps them together sends the
+ * operator looking for an import that never happened.
+ */
+export const validationRunKeyInputPart = (manifestVersion: string): string | null => {
+    const separator = manifestVersion.indexOf(VALIDATION_INPUT_SEPARATOR);
+    if (separator === -1) {
+        return null;
+    }
+    const afterPlan = manifestVersion.slice(separator + VALIDATION_INPUT_SEPARATOR.length);
+    const restriction = afterPlan.indexOf(VALIDATION_SCOPE_SEPARATOR);
+    return restriction === -1 ? afterPlan : afterPlan.slice(0, restriction);
+};
+
 // Not exported: the open and failed statuses are this module's internal
 // lifecycle detail, whereas the two constants above are a contract shared with
 // src/ and the runbook.
 const RUN_STATUS_RUNNING: CatalogRunStatus = 'running';
 const RUN_STATUS_FAILED: CatalogRunStatus = 'failed';
 
-export type CheckpointErrorCode = 'run_not_found' | 'run_not_open' | 'run_already_finished';
+export type CheckpointErrorCode =
+    | 'run_not_found'
+    | 'run_not_open'
+    | 'run_already_finished'
+    | 'catalog_stage_locked'
+    | 'catalog_stage_lock_unavailable';
+
+// What a stage-lock error is about. The two stage-lock codes name a STAGE rather
+// than a run, because the lock is taken BEFORE any run is claimed — that is the
+// point of it (see THE STAGE LOCK) — so `CheckpointError.runId` is empty for
+// them by construction and this subject carries the diagnosis instead.
+export interface CatalogStageLockSubject {
+    readonly stage: CatalogStageName;
+    readonly mode: CatalogStageLockMode;
+    /** How long acquisition waited before giving up. 0 when it refused at once. */
+    readonly waitedMs: number;
+}
 
 // Kept as a function rather than inline in the constructor so a third code
 // could be added without disturbing the two messages that already exist: both
@@ -140,6 +402,7 @@ const checkpointErrorMessage = (
     code: CheckpointErrorCode,
     runId: string,
     storedStatus?: CatalogRunStatus,
+    stageLock?: CatalogStageLockSubject,
 ): string => {
     if (code === 'run_not_found') {
         return `Catalog run ${runId} does not exist`;
@@ -152,29 +415,65 @@ const checkpointErrorMessage = (
             ? `Catalog run ${runId} is already ${storedStatus}`
             : `Catalog run ${runId} is already finished`;
     }
+    if (code === 'catalog_stage_locked') {
+        // Names the stage, the mode it asked for and how long it waited, because
+        // those three are what an operator needs to decide between waiting and
+        // stopping the other stage. The remedy is spelled out rather than
+        // implied: a stage lock is held by a live process, so there is nothing
+        // to clean up — the other launch either finishes or is stopped.
+        const stage = stageLock?.stage ?? 'a catalog stage';
+        const mode = stageLock?.mode ?? 'exclusive';
+        const waited = stageLock?.waitedMs ?? 0;
+        return (
+            `Another catalog pipeline stage holds the lock on the catalog graph, so ${stage} cannot take it ` +
+            `${mode === 'shared' ? 'shared' : 'exclusively'} (waited ${waited} ms). Wait for the running stage to ` +
+            'finish, or stop it, and run this stage again — it resumes from its checkpoint.'
+        );
+    }
+    if (code === 'catalog_stage_lock_unavailable') {
+        // Reached only when DATABASE_URL is absent or empty, which dbGuard
+        // normally refuses at module load. Reported as its own code because
+        // "nobody else holds the lock, this process cannot take one" is a
+        // different operator action from "wait your turn".
+        const stage = stageLock?.stage ?? 'a catalog stage';
+        return (
+            `No database connection string is available (DATABASE_URL is unset or empty), so ${stage} cannot open ` +
+            'the dedicated connection its stage lock is held on. Set DATABASE_URL (see backend/.env.example) and ' +
+            'run the stage again.'
+        );
+    }
     return `Catalog run ${runId} is no longer open`;
 };
 
 // Follows the DailyQuotaError template in src/services/entitlement.service.ts:
 // a named class carrying the data the caller needs rather than a string (§8).
-// The three codes are worth distinguishing because they mean different operator
+// The codes are worth distinguishing because they mean different operator
 // mistakes — a run id that no longer exists (wrong database, wrong environment),
 // a checkpoint written into a run that was already closed (a script that lost
-// track of its own run, which would otherwise corrupt a finished record), and a
+// track of its own run, which would otherwise corrupt a finished record), a
 // second teardown trying to close an already-terminal run as the OTHER status
 // (`run_already_finished`, which finishRun refuses because it would rewrite a
-// settled outcome — see the transition rule there).
+// settled outcome — see the transition rule there), and the two stage-lock
+// refusals (another stage owns the catalog graph, or this process has no
+// connection string to hold a lock on).
 //
-// `storedStatus` is optional so every existing two-argument construction in this
-// module and its callers keeps compiling and keeps producing the same message;
-// only the conflicting-transition path passes it.
+// One class rather than a subclass per code, deliberately: every script's
+// `describeFailure` reports `error.code` for anything that is an instanceof
+// CheckpointError, so a new code reaches operator terminals and the committed
+// reports under its own name with no change to the five scripts.
+//
+// `storedStatus` and `stageLock` are optional so every existing two-argument
+// construction in this module and its callers keeps compiling and keeps
+// producing the same message; only the conflicting-transition path passes the
+// first, and only the stage lock passes the second.
 export class CheckpointError extends Error {
     constructor(
         public readonly code: CheckpointErrorCode,
         public readonly runId: string,
         public readonly storedStatus?: CatalogRunStatus,
+        public readonly stageLock?: CatalogStageLockSubject,
     ) {
-        super(checkpointErrorMessage(code, runId, storedStatus));
+        super(checkpointErrorMessage(code, runId, storedStatus, stageLock));
         this.name = 'CheckpointError';
     }
 }
@@ -630,6 +929,84 @@ export const toCatalogRun = <TCursor>(row: unknown): CatalogRun<TCursor> => {
     };
 };
 
+// The stage lock's decisions, exported and pure for the same reason the merge
+// and the log cap are (§1.2): each is a rule someone could get wrong, and every
+// one of them is checkable with no database.
+
+/**
+ * The mode a stage takes the catalog-graph lock in.
+ *
+ * Unknown names default to `exclusive`, which is the safe direction: a stage
+ * this table has not heard of is assumed to write, so it waits for the mutators
+ * instead of running beside one.
+ */
+export const catalogStageLockMode = (stage: CatalogStageName): CatalogStageLockMode =>
+    CATALOG_STAGE_LOCK_MODES[stage] ?? 'exclusive';
+
+/**
+ * The advisory-lock functions a mode maps onto.
+ *
+ * `try` first in every case — the lock refuses rather than blocks (see
+ * acquireCatalogStageLock) — and the unlock must MATCH the acquisition: calling
+ * `pg_advisory_unlock` on a lock taken with `pg_advisory_lock_shared` releases
+ * nothing and warns, so a mismatched pair would hold the graph until the process
+ * exited. Pairing them here is what keeps that impossible.
+ */
+export const catalogStageLockFunctions = (
+    mode: CatalogStageLockMode,
+): { readonly tryLock: string; readonly unlock: string } =>
+    mode === 'shared'
+        ? { tryLock: 'pg_try_advisory_lock_shared', unlock: 'pg_advisory_unlock_shared' }
+        : { tryLock: 'pg_try_advisory_lock', unlock: 'pg_advisory_unlock' };
+
+/**
+ * The key every catalog stage contends on: one class id, one object name for the
+ * whole graph (see CATALOG_GRAPH_LOCK_NAME and CATALOG_STAGE_LOCK_CLASS_ID).
+ *
+ * It takes no stage argument on purpose — that is the rule, not an omission. The
+ * object id is `hashtext(objectName)` computed in PostgreSQL rather than here,
+ * so the value this pipeline locks on is the one PostgreSQL's own hash produces
+ * for that name.
+ */
+export const catalogStageLockKey = (): { readonly classId: number; readonly objectName: string } => ({
+    classId: CATALOG_STAGE_LOCK_CLASS_ID,
+    objectName: CATALOG_GRAPH_LOCK_NAME,
+});
+
+/** Refuse-immediately is the default: an unbounded wait is what an operator cannot see. */
+const CATALOG_STAGE_LOCK_DEFAULT_WAIT_MS = 0;
+
+/** Long enough that polling costs nothing on an hours-long stage, short enough to feel prompt. */
+const CATALOG_STAGE_LOCK_DEFAULT_POLL_MS = 500;
+
+/**
+ * How long acquisition may wait, as a number of milliseconds it can act on.
+ *
+ * Every shape a caller can pass is given an explicit meaning rather than
+ * collapsing into one, exactly as appendCappedLog's cap is: a negative or
+ * non-numeric request becomes the refuse-immediately default (`NaN` compares
+ * false against everything and would otherwise fall through as "wait forever"),
+ * and `Infinity` is deliberately NOT honoured — no catalog stage may block
+ * forever on a lock an operator cannot see, so it is capped at the ceiling
+ * below.
+ */
+const CATALOG_STAGE_LOCK_MAX_WAIT_MS = 3_600_000;
+
+export const normalizeStageLockWaitMs = (waitMs: number | undefined): number => {
+    if (typeof waitMs !== 'number' || Number.isNaN(waitMs) || waitMs <= 0) {
+        return CATALOG_STAGE_LOCK_DEFAULT_WAIT_MS;
+    }
+    return Math.min(Math.floor(Math.min(waitMs, CATALOG_STAGE_LOCK_MAX_WAIT_MS)), CATALOG_STAGE_LOCK_MAX_WAIT_MS);
+};
+
+/** The poll interval, floored at 1 ms so a misconfigured 0 cannot become a busy loop. */
+export const normalizeStageLockPollMs = (pollIntervalMs: number | undefined): number => {
+    if (typeof pollIntervalMs !== 'number' || !Number.isFinite(pollIntervalMs) || pollIntervalMs < 1) {
+        return CATALOG_STAGE_LOCK_DEFAULT_POLL_MS;
+    }
+    return Math.floor(pollIntervalMs);
+};
+
 // ---------------------------------------------------------------------------
 // I/O recipes (§5). Every function takes the injected `db` first and targets a
 // single run by its primary key.
@@ -964,33 +1341,42 @@ const retryFailedRun = async <TCursor>(
 // without loss, and the terminal transition (see THE TERMINAL-TRANSITION RULE)
 // settles the outcome once.
 //
-// It does NOT grant exclusive processing for the run's lifetime. The advisory
-// lock is transaction-scoped, so it is released when this short claim commits;
-// after that, two processes launched against the same stage both hold a handle
-// to the same run and can both work through it. The residual cost of that is
-// bounded rather than corrupting — the cap still holds, no count or log entry is
-// lost, the outcome cannot be rewritten, and the pipeline's own writes are
-// idempotent (upsert on source_key for catalog foods, slug for recipes), so the
-// waste is repeated work rather than wrong data — but it is real, and this
-// module cannot close it:
+// It does NOT, ON ITS OWN, grant exclusive processing for the run's lifetime,
+// and the two promises are kept by two different mechanisms in this module. THE
+// CLAIM guarantees ONE RUN ROW: its advisory lock is transaction-scoped, so it
+// is released when this short claim commits, and after that two processes
+// launched against the same stage both hold a handle to the same run and can
+// both work through it. THE STAGE LOCK guarantees ONE WRITER:
+// acquireCatalogStageLock holds a SESSION-scoped advisory lock on the whole
+// catalog graph, on a dedicated connection, for as long as the stage runs — and
+// it is what the CLI entry points now take, which is why a second launch of a
+// mutating stage is refused at its entry point instead of racing this one. Do
+// not merge the two descriptions: a caller that holds the stage lock still needs
+// the claim (to converge on one run row and one budget allowance), and a caller
+// that holds the claim still needs the lock (to be the only writer), so neither
+// subsumes the other.
+//
+// Why this claim cannot be the lock, which is also why the lock lives where it
+// does:
 //   * A durable claim (an owner id plus a lease expiry on the run row, taken by
 //     compare-and-set and reasserted as work proceeds) needs columns
 //     catalog_import_runs does not have, i.e. a schema change, and a periodic
 //     reassertion, i.e. the background timer the Agent Action Plan (§0.8.2)
 //     excludes from this feature.
 //   * A session-scoped lock (pg_advisory_lock, held from claim to teardown)
-//     needs one pinned connection for the run's whole lifetime. This module is
+//     needs one pinned connection for the run's whole lifetime. This function is
 //     handed a POOLED client it must neither construct nor pin (see the
 //     type-only import above), and Prisma routes each statement to whichever
-//     pooled connection is free, so a session lock taken here would be held by
-//     an arbitrary connection and could never be released deterministically.
-// That lock belongs to the CLI entry point, which owns its own process and can
-// hold it for exactly as long as it works, and it is the entry points — not
-// this module — that decide whether a second concurrent launch should wait or
-// refuse. Until one of them does, treat "two launches of the same stage" as
-// wasteful and not as unsafe, and do not re-add a justification here claiming
-// this claim makes a second writer impossible: it makes a second run row
-// impossible, which is a different and smaller promise.
+//     pooled connection is free, so a session lock taken THROUGH `db` would be
+//     held by an arbitrary connection and could never be released
+//     deterministically. acquireCatalogStageLock therefore opens its OWN
+//     connection with `pg` and holds the lock there (see THE STAGE LOCK).
+// What is left of the residual cost of a double launch, now that entry points
+// take the lock: the lock is what prevents it, and the claim is still not
+// evidence of it. Do not re-add a justification here claiming this claim makes a
+// second writer impossible — it makes a second run ROW impossible, which is a
+// different and smaller promise, and the difference matters to anyone reading
+// this to decide whether a new caller needs the lock as well (it does).
 export const openOrResumeRun = async <TCursor>(
     db: CatalogRunDb,
     input: {
@@ -1441,4 +1827,324 @@ export const getActiveReleaseLoad = async (
         loadedAt: run.finishedAt ?? run.startedAt,
         runId: run.id,
     };
+};
+
+// ---------------------------------------------------------------------------
+// THE STAGE LOCK.
+//
+// One writer at a time on the catalog graph, for the whole lifetime of a stage
+// process. This is the guarantee THE CLAIM above explicitly does not make, and
+// the reason it cannot is stated there: a transaction-scoped lock dies with the
+// short claim transaction, and a session-scoped one cannot be taken through the
+// injected Prisma client because Prisma hands out POOLED connections and routes
+// each statement to whichever is free. So this lock is taken on a connection
+// this module opens itself, with `pg`, and holds until release() closes it.
+//
+// WHY `pg` AND WHY IT IS REQUIRED LAZILY. `pg` is already a runtime dependency
+// of this service (Prisma's own driver) and needs no addition; @types/pg is
+// deliberately absent, so the narrow interfaces below declare exactly the three
+// calls this file makes, which is the established in-repo precedent
+// (src/__tests__/setup/testDb.ts, src/__tests__/api/compat.test.ts and
+// src/__tests__/api/catalog.test.ts all declare their own PgClient the same
+// way). The require lives INSIDE the opener rather than at module load, for the
+// same reason the Prisma import above is type-only: importing checkpoint.ts must
+// stay side-effect-free, so a suite that only reads the pure decisions never
+// loads a database driver.
+//
+// WHAT HOLDS AND WHAT DOES NOT. A PostgreSQL session advisory lock needs no
+// renewal — there is no lease to reassert, which is what makes it usable without
+// the background timer the Agent Action Plan (§0.8.2) excludes — but it is held
+// by the CONNECTION, so a dropped connection releases it. `keepAlive` is
+// therefore on, and the layers beneath it are what keep a lost lock from being a
+// corrupted catalog: the run claim still converges on one run row, and the
+// writing stages still take row locks and write under version predicates
+// (catalog-validate.ts's per-food compare-and-set is the one to read), so the
+// worst case is duplicated work rather than a stale judgement landing on a
+// changed row.
+// ---------------------------------------------------------------------------
+
+interface PgQueryResult<TRow> {
+    rows: TRow[];
+}
+
+/**
+ * The connection a stage lock is held on: three calls, which is all this module
+ * makes of it. Exported so a caller can inject one (see `openConnection`) and
+ * drive every branch of acquisition with no database.
+ */
+export interface CatalogStageLockConnection {
+    connect(): Promise<void>;
+    query<TRow = Record<string, unknown>>(text: string, values?: readonly unknown[]): Promise<PgQueryResult<TRow>>;
+    end(): Promise<void>;
+}
+
+interface PgModule {
+    Client: new (config: {
+        connectionString: string;
+        application_name?: string;
+        connectionTimeoutMillis?: number;
+        query_timeout?: number;
+        keepAlive?: boolean;
+    }) => CatalogStageLockConnection;
+}
+
+/** A held stage lock. `release()` unlocks, closes the connection, and is safe to call twice. */
+export interface CatalogStageLock {
+    readonly stage: CatalogStageName;
+    readonly mode: CatalogStageLockMode;
+    release(): Promise<void>;
+}
+
+export interface CatalogStageLockInput {
+    readonly stage: CatalogStageName;
+    /** Defaults to the stage's own mode (CATALOG_STAGE_LOCK_MODES). */
+    readonly mode?: CatalogStageLockMode;
+    /**
+     * How long to wait for a refused lock before throwing `catalog_stage_locked`.
+     * Defaults to 0 — refuse at once — and is capped, because a stage waiting
+     * forever on a lock is indistinguishable to an operator from a stage that
+     * hung.
+     */
+    readonly waitMs?: number;
+    readonly pollIntervalMs?: number;
+    /** Defaults to DATABASE_URL, which lib/bootstrap.ts has already loaded from .env. */
+    readonly connectionString?: string;
+    readonly logger?: ScriptLogger;
+    readonly now?: () => Date;
+    readonly sleep?: (ms: number) => Promise<void>;
+    /** Injectable so acquisition is testable without PostgreSQL. */
+    readonly openConnection?: () => CatalogStageLockConnection;
+}
+
+/** Ten seconds: a stage lock that cannot reach the database should say so, not hang. */
+const STAGE_LOCK_CONNECT_TIMEOUT_MS = 10_000;
+
+/** The lock statements are single function calls; anything slower is a database in trouble. */
+const STAGE_LOCK_QUERY_TIMEOUT_MS = 30_000;
+
+/**
+ * Names this connection in pg_stat_activity, so an operator who finds the graph
+ * locked can attribute it to a stage rather than to an anonymous idle session.
+ */
+const STAGE_LOCK_APPLICATION_NAME = 'soh-catalog-stage-lock';
+
+const resolveStageLockConnectionString = (input: CatalogStageLockInput): string => {
+    const candidate = input.connectionString ?? process.env.DATABASE_URL;
+
+    if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+        // Typed rather than left to the driver: `new Client({connectionString:
+        // undefined})` reads the libpq environment instead and can connect
+        // somewhere nobody named (§9 — config is resolved behind an accessor that
+        // fails loudly). dbGuard normally refuses this at module load, so
+        // reaching here means a caller bypassed it.
+        throw new CheckpointError('catalog_stage_lock_unavailable', '', undefined, {
+            stage: input.stage,
+            mode: input.mode ?? catalogStageLockMode(input.stage),
+            waitedMs: 0,
+        });
+    }
+
+    return candidate;
+};
+
+const openStageLockConnection = (connectionString: string): CatalogStageLockConnection => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires -- lazy by design: see the note above
+    const pg = require('pg') as PgModule;
+
+    return new pg.Client({
+        connectionString,
+        application_name: STAGE_LOCK_APPLICATION_NAME,
+        connectionTimeoutMillis: STAGE_LOCK_CONNECT_TIMEOUT_MS,
+        query_timeout: STAGE_LOCK_QUERY_TIMEOUT_MS,
+        // The session sits idle for the hours a stage takes, and the lock lives
+        // in that session: without keepalive probes an idle connection can be
+        // dropped by the network and the lock released with nobody informed.
+        keepAlive: true,
+    });
+};
+
+const defaultSleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+
+interface StageLockHandleInput {
+    readonly stage: CatalogStageName;
+    readonly mode: CatalogStageLockMode;
+    readonly connection: CatalogStageLockConnection;
+    readonly unlock: string;
+    readonly classId: number;
+    readonly objectName: string;
+    readonly logger?: ScriptLogger;
+}
+
+/**
+ * The handle acquisition returns.
+ *
+ * `release()` NEVER THROWS, and that is deliberate: it is called from a
+ * `finally` (see withCatalogStageLock), so an error raised here would replace
+ * the stage's own failure with a teardown failure. A failed unlock is logged and
+ * left alone, because the session lock is released by the connection closing and
+ * — if even that fails — by the process exiting. It is also idempotent: the
+ * second call returns without touching a connection the first one closed.
+ */
+const buildStageLock = (input: StageLockHandleInput): CatalogStageLock => {
+    let released = false;
+
+    return {
+        stage: input.stage,
+        mode: input.mode,
+        release: async (): Promise<void> => {
+            if (released) {
+                return;
+            }
+            // Set BEFORE the statements, so a failure cannot leave the handle
+            // looking unreleased and invite a retry against a broken connection.
+            released = true;
+
+            try {
+                await input.connection.query(`SELECT ${input.unlock}($1::int4, hashtext($2::text))`, [
+                    input.classId,
+                    input.objectName,
+                ]);
+            } catch (error) {
+                input.logger?.warn('catalog_stage_unlock_failed', {
+                    stage: input.stage,
+                    mode: input.mode,
+                    error: safeError(error),
+                });
+            }
+
+            try {
+                await input.connection.end();
+            } catch (error) {
+                input.logger?.warn('catalog_stage_lock_close_failed', {
+                    stage: input.stage,
+                    mode: input.mode,
+                    error: safeError(error),
+                });
+            }
+
+            input.logger?.info('catalog_stage_lock_released', { stage: input.stage, mode: input.mode });
+        },
+    };
+};
+
+/**
+ * Takes the catalog graph's stage lock and returns a handle that releases it.
+ *
+ * Refuses rather than blocks by default: `pg_try_advisory_lock*` is attempted
+ * first, and on refusal acquisition either polls for up to `waitMs` on the
+ * injected sleep or throws `CheckpointError('catalog_stage_locked')` naming the
+ * stage and the mode. There is no branch in which it waits indefinitely.
+ *
+ * The connection, the clock and the sleep are all injectable, so every branch —
+ * granted, refused, waited-then-granted, waited-then-refused, released twice —
+ * is reachable without a database.
+ */
+export const acquireCatalogStageLock = async (input: CatalogStageLockInput): Promise<CatalogStageLock> => {
+    const stage = input.stage;
+    const mode = input.mode ?? catalogStageLockMode(stage);
+    const { classId, objectName } = catalogStageLockKey();
+    const { tryLock, unlock } = catalogStageLockFunctions(mode);
+    const waitMs = normalizeStageLockWaitMs(input.waitMs);
+    const pollIntervalMs = normalizeStageLockPollMs(input.pollIntervalMs);
+    const now = input.now ?? ((): Date => new Date());
+    const sleep = input.sleep ?? defaultSleep;
+
+    const connection = input.openConnection
+        ? input.openConnection()
+        : openStageLockConnection(resolveStageLockConnectionString(input));
+
+    // Closes without raising: this runs on paths that are already failing, and a
+    // teardown error here would replace the reason acquisition failed with a
+    // reason nobody asked about.
+    const closeQuietly = async (): Promise<void> => {
+        try {
+            await connection.end();
+        } catch (error) {
+            input.logger?.warn('catalog_stage_lock_close_failed', { stage, mode, error: safeError(error) });
+        }
+    };
+
+    try {
+        await connection.connect();
+    } catch (error) {
+        await closeQuietly();
+        throw error;
+    }
+
+    const startedAt = now().getTime();
+    // A second, clock-independent bound on the loop. The elapsed-time check
+    // below is the real deadline, but it reads an INJECTED clock: a caller whose
+    // fake clock never advances would otherwise poll forever. One attempt per
+    // poll interval plus the first is exactly how many the deadline allows.
+    const maxAttempts = Math.ceil(waitMs / pollIntervalMs) + 1;
+    let attempts = 0;
+
+    try {
+        for (;;) {
+            // Two-integer keyspace, and the object id is hashtext() computed in
+            // PostgreSQL — see CATALOG_STAGE_LOCK_CLASS_ID for why this must
+            // never be the one-argument form. Both values are BOUND, not
+            // interpolated, so the statement text is constant.
+            const attempt = await connection.query<{ locked: boolean | null }>(
+                `SELECT ${tryLock}($1::int4, hashtext($2::text)) AS locked`,
+                [classId, objectName],
+            );
+            attempts += 1;
+
+            if (attempt.rows[0]?.locked === true) {
+                const waitedMs = now().getTime() - startedAt;
+                input.logger?.info('catalog_stage_lock_acquired', { stage, mode, waitedMs, attempts });
+                return buildStageLock({ stage, mode, connection, unlock, classId, objectName, logger: input.logger });
+            }
+
+            const waitedMs = now().getTime() - startedAt;
+            const remainingMs = waitMs - waitedMs;
+
+            if (remainingMs <= 0 || attempts >= maxAttempts) {
+                await closeQuietly();
+                throw new CheckpointError('catalog_stage_locked', '', undefined, { stage, mode, waitedMs });
+            }
+
+            if (attempts === 1) {
+                // Once, on the first refusal. Polling a one-hour wait every half
+                // second would otherwise write 7,200 identical lines into the
+                // operator's terminal; the acquisition line reports the total
+                // wait and the attempt count when it finally succeeds.
+                input.logger?.info('catalog_stage_lock_waiting', { stage, mode, waitMs, pollIntervalMs });
+            }
+            await sleep(Math.min(pollIntervalMs, remainingMs));
+        }
+    } catch (error) {
+        if (error instanceof CheckpointError && error.code === 'catalog_stage_locked') {
+            // Already closed on the refusal path above; closing twice would log
+            // a driver complaint for no diagnostic gain.
+            throw error;
+        }
+        await closeQuietly();
+        throw error;
+    }
+};
+
+/**
+ * Runs `work` while holding the stage lock, and releases it in a `finally`.
+ *
+ * This is what a CLI entry point calls. The lock is taken before any of the
+ * stage's own work and released after it whatever the outcome, so the window it
+ * covers is exactly the process's writing lifetime — which is the guarantee THE
+ * CLAIM cannot make on its own.
+ */
+export const withCatalogStageLock = async <T>(
+    input: CatalogStageLockInput,
+    work: (lock: CatalogStageLock) => Promise<T>,
+): Promise<T> => {
+    const lock = await acquireCatalogStageLock(input);
+
+    try {
+        return await work(lock);
+    } finally {
+        await lock.release();
+    }
 };

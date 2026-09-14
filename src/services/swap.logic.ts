@@ -262,6 +262,42 @@ export interface SwapMealWrite {
     flags: MealFlag[];
 }
 
+/**
+ * The owner and the parent plan a meal's write is addressed by.
+ *
+ * Taken as an argument rather than read off {@link SwapDayMeal}, because a day
+ * meal projection carries neither and should not: the user a write is entitled
+ * to and the plan the path named are facts of the REQUEST — the authenticated
+ * caller and the route's own id — which is precisely why they have to appear in
+ * the predicate (Rule backend-architecture §5.1) instead of being inherited
+ * from a row the same statement is about to trust.
+ */
+export interface SwapMealOwner {
+    userId: string;
+    planId: string;
+}
+
+/**
+ * The `meal_plan_meals` row a committed swap writes, expressed as a predicate.
+ *
+ * FOUR COLUMNS, AND EACH ONE IS LOAD-BEARING (§0.5.1, Rule
+ * backend-architecture §5.1). `id` names the row; `user_id` and `meal_plan_id`
+ * make it the caller's own meal of the caller's own plan *in the statement that
+ * writes it*, rather than in an ownership read the write then trusts; and
+ * `revision` makes the write a compare-and-swap against the revision the
+ * selection was computed from.
+ *
+ * snake_case, for the same reason {@link SwapMealWrite} is: the two are handed
+ * to Prisma verbatim as one `where`/`data` pair, so a swap's row identity has
+ * exactly one spelling in this codebase.
+ */
+export interface SwapMealWhere {
+    id: string;
+    user_id: string;
+    meal_plan_id: string;
+    revision: number;
+}
+
 /* ---------------------------------------------------------------------------
  * Input integrity — faults that would make the selection meaningless
  *
@@ -756,6 +792,45 @@ export const requireBoundPortion = (requested: number, recomputed: number): void
 };
 
 /**
+ * `meal_plan_meals.revision` as it could actually have been stored.
+ *
+ * Shared by {@link swapMealWrite} and {@link swapMealWhere} so the value one
+ * ADVANCES and the other PINS is judged by a single rule. A revision the write
+ * would refuse must never reach the predicate either: it would produce a
+ * statement addressed by a number no row carries, and an affected-row count of
+ * zero reads as a lost race rather than as the input fault it is.
+ */
+const requireStoredMealRevision = (revision: number): void => {
+    if (!Number.isInteger(revision) || revision < MIN_MEAL_REVISION) {
+        throw new MealPlanInputError(
+            `meal.revision must be an integer of at least ${MIN_MEAL_REVISION} to advance, ` +
+                `received ${String(revision)}`,
+            'revision',
+        );
+    }
+};
+
+/**
+ * An id a stored row can be addressed by: present, and not blank.
+ *
+ * This is the §5.1 failure mode TYPES cannot catch: an empty `user_id` is a
+ * `string`, it compiles, and the predicate it produces is a write scoped to
+ * nobody. It matches no row, and the affected-row count of zero that follows is
+ * indistinguishable from a lost compare-and-swap — so a caller assembling the
+ * predicate from an unset value would see a swap fail intermittently and read it
+ * as contention. Refused here, where the predicate is built, so the fault is
+ * reported as the input fault it is.
+ */
+const requireAddressableId = (value: string, field: string): void => {
+    if (value.trim().length === 0) {
+        throw new MealPlanInputError(
+            `${field} must be a non-empty id to address a stored meal_plan_meals row`,
+            field,
+        );
+    }
+};
+
+/**
  * The `meal_plan_meals` update a committed swap performs.
  *
  * Pure, so the audit trail is decided here and merely written by
@@ -789,13 +864,7 @@ export const requireBoundPortion = (requested: number, recomputed: number): void
  * moved backwards would let a stale client's write win.
  */
 export const swapMealWrite = (meal: SwapDayMeal, candidate: SwapCandidate, now: Date): SwapMealWrite => {
-    if (!Number.isInteger(meal.revision) || meal.revision < MIN_MEAL_REVISION) {
-        throw new MealPlanInputError(
-            `meal.revision must be an integer of at least ${MIN_MEAL_REVISION} to advance, ` +
-                `received ${String(meal.revision)}`,
-            'revision',
-        );
-    }
+    requireStoredMealRevision(meal.revision);
 
     if (Number.isNaN(now.getTime())) {
         throw new MealPlanInputError('now must be a valid Date to stamp swapped_at with', 'now');
@@ -812,6 +881,55 @@ export const swapMealWrite = (meal: SwapDayMeal, candidate: SwapCandidate, now: 
         swapped_at: now,
         revision: meal.revision + 1,
         flags: [],
+    };
+};
+
+/**
+ * The predicate {@link swapMealWrite}'s columns are applied through: the row,
+ * its owner, its parent plan, and the revision the selection read.
+ *
+ * ONE PAIR, BUILT FROM ONE ROW, AND THE PAIRING IS THE POINT. `swapMealWrite`
+ * advances the meal to `revision + 1`; this pins `revision`, the value it
+ * advances FROM. Both read the same {@link SwapDayMeal}, so they cannot
+ * describe different rows or disagree about which revision is current — which
+ * is exactly what a predicate assembled at the call site invites: `revision + 1`
+ * in the `where` matches nothing and fails every swap, a constant matches only
+ * a meal nobody has touched, and a value re-read by a second query belongs to a
+ * different row generation than the nutrition the write carries.
+ *
+ * WHY THE COMPARE-AND-SWAP EXISTS AT ALL, given that every meal-planning write
+ * takes the per-user advisory lock first. The lock serialises the writers this
+ * repository has today; the predicate is what keeps the statement CORRECT
+ * without depending on that. A meal's revision moves independently of its
+ * plan's — this write advances one meal and the plan, and the plan's other
+ * meals keep their own counters — so the plan-level compare-and-swap in
+ * `swap.service.ts::applySwap` cannot see a change to THIS row: it would pass
+ * while the meal write silently overwrote whatever had reached the meal since
+ * the selection read it, and the commit would report success for a meal it had
+ * clobbered. With `revision` in the predicate the statement matches no row, the
+ * affected-row assertion fails, and the transaction rolls back with the meal,
+ * the day, the plan's revision and the grocery list all intact — the state
+ * frame 13e's copy ("your lunch is unchanged and your grocery list was not
+ * updated") actually promises.
+ *
+ * Its refusals mirror `swapMealWrite`'s, and for the same reason: a revision
+ * that could not have been stored, or an owner, parent or row id that cannot
+ * address anything, is a {@link MealPlanInputError} to surface and fix rather
+ * than a predicate that quietly matches nothing — a write that affects zero
+ * rows is indistinguishable from a lost race at the call site, and the two are
+ * different faults with different answers.
+ */
+export const swapMealWhere = (meal: SwapDayMeal, owner: SwapMealOwner): SwapMealWhere => {
+    requireStoredMealRevision(meal.revision);
+    requireAddressableId(meal.id, 'mealId');
+    requireAddressableId(owner.userId, 'userId');
+    requireAddressableId(owner.planId, 'planId');
+
+    return {
+        id: meal.id,
+        user_id: owner.userId,
+        meal_plan_id: owner.planId,
+        revision: meal.revision,
     };
 };
 

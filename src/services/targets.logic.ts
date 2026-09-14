@@ -40,6 +40,7 @@ import {
     SaveEstimatedTargetsPayload,
     SaveManualTargetsPayload,
     SexForEstimate,
+    StoredEstimateSnapshot,
     TargetEstimateInputs,
     TargetEstimateResponse,
     TargetRoute,
@@ -678,6 +679,62 @@ export const computeTargetEstimate = (
         clampReason: bounded.clampReason,
     };
 };
+
+/**
+ * The same estimate as the record `meal_plan_preferences.estimated_targets`
+ * keeps — AAP §0.5.1's "last estimate with input revision".
+ *
+ * WHY THE STORED SHAPE IS BUILT HERE AND NOT ASSIGNED FROM THE RESPONSE. A
+ * stored row outlives every response shape around it, so writing the estimate
+ * response straight into the column would let a later change to that response
+ * — a member added, renamed or dropped — silently change what new rows contain
+ * while the rows already written stay as they were. This function is the one
+ * place the stored shape is decided, so a wire change that should not reach
+ * storage stops compiling here instead of arriving unnoticed in the database.
+ * It is also what makes the stored record testable without a database, which is
+ * the only way to assert the exact JSON a confirmation leaves behind.
+ *
+ * TWO FIELDS DIFFER FROM THE RESPONSE, both deliberately. `source` is dropped:
+ * the column name is the discriminator, and a stored literal with one possible
+ * value records nothing. And `estimateRevision` is stored as `inputRevision`,
+ * which is what the number means once it is at rest — the preferences revision
+ * whose goal, body, activity and pace produced this figure. It is the same
+ * number `targets_input_revision` records as the confirmed figure's ancestry
+ * (see {@link deriveTargetsResponse}), so a later reader can compare the stored
+ * estimate with the current `revision` and see whether it still describes the
+ * answers on file.
+ *
+ * THE CLAMP TRAVELS WITH IT. `clamped` and `clampReason` are part of the
+ * estimate rather than presentation: a figure that a floor or the ceiling moved
+ * is a different fact about the user's details from one nothing bound, and this
+ * record is the only place that fact survives the confirmation — the four
+ * confirmed values alone cannot say whether a bound produced them.
+ *
+ * Pure, total and branchless: every member is copied, nothing is recomputed,
+ * and the inputs are copied rather than aliased so a later mutation of the
+ * caller's estimate cannot change what was stored.
+ */
+export const buildStoredEstimate = (estimate: TargetEstimateResponse): StoredEstimateSnapshot => ({
+    inputRevision: estimate.estimateRevision,
+    inputs: {
+        age: estimate.inputs.age,
+        heightCm: estimate.inputs.heightCm,
+        weightKg: estimate.inputs.weightKg,
+        sexForEstimate: estimate.inputs.sexForEstimate,
+        activityLevel: estimate.inputs.activityLevel,
+        goal: estimate.inputs.goal,
+        paceLbPerWeek: estimate.inputs.paceLbPerWeek,
+    },
+    bmr: estimate.bmr,
+    tdee: estimate.tdee,
+    adjustment: estimate.adjustment,
+    calories: estimate.calories,
+    protein: estimate.protein,
+    carbs: estimate.carbs,
+    fat: estimate.fat,
+    clamped: estimate.clamped,
+    clampReason: estimate.clampReason,
+});
 
 /* ---------------------------------------------------------------------------
  * The estimate's inputs, and when they have changed

@@ -97,6 +97,53 @@ import {
     type UsdaRateLimiter,
     type UsdaRateReservation,
 } from '../../../scripts/lib/rateLimiter';
+// The version decision and the persistence it feeds (DB-F08), plus the batch
+// accounting (DB-F11). `nextCatalogFoodVersions` is pure, so most of that
+// contract is proven with no database at all; `persistPreparedFood` is where it
+// meets the write, and a fake `ImportDb` is how the write is observed.
+import { importPublicationStatus, nextCatalogFoodVersions, persistPreparedFood } from '../../../scripts/catalog-import-usda';
+import type { ImportDb, PreparedCatalogFood, StoredVersionedFacts } from '../../../scripts/catalog-import-usda';
+// The stage lock (DB-F09) and the run identity a validation pass claims
+// (DB-F10) both live with run state, which is what they are about.
+import {
+    CATALOG_STAGE_LOCK_MODES,
+    CheckpointError,
+    NO_CATALOG_INPUT,
+    acquireCatalogStageLock,
+    canonicalValidationRunKey,
+    catalogInputIdentity,
+    catalogStageLockFunctions,
+    catalogStageLockKey,
+    catalogStageLockMode,
+    finishRun,
+    isRestrictedValidationRunKey,
+    normalizeStageLockPollMs,
+    normalizeStageLockWaitMs,
+    openRun,
+    validationRunKeyInputPart,
+    withCatalogStageLock,
+} from '../../../scripts/lib/checkpoint';
+import type { CatalogInputRunRow, CatalogStageLockConnection } from '../../../scripts/lib/checkpoint';
+// Validation's run identity and completed-run no-op (DB-F10) and its per-food
+// lock/re-read/CAS (DB-F09). Importing this module runs nothing: like the import
+// script it guards `main()` behind `require.main === module`.
+import {
+    appendValidationHistory,
+    historyEntryBelongsToRun,
+    identityGroupMoved,
+    runHasJudgedFood,
+    runValidation,
+    settleUnresumableValidationRuns,
+    validationRunScope,
+} from '../../../scripts/catalog-validate';
+import type { RunValidationDeps, ValidateDb, ValidateOptions, ValidationFoodRow } from '../../../scripts/catalog-validate';
+// The release's refusal rule (DB-F09, NEW-01), which is pure over the run
+// ledger, and the read that decides which rows it gets to see.
+import { ReleaseIntegrityError, loadPipelineRuns, releaseStalenessReason, runRelease } from '../../../scripts/catalog-release';
+import type { ReleaseDb, ReleaseRunRow, RunReleaseDeps } from '../../../scripts/catalog-release';
+import { validateCatalogCandidate } from '../../services/catalog.logic';
+import type { CatalogValidationPolicy } from '../../services/catalog.logic';
+import { prisma } from '../../prisma/client';
 
 const manifest: UsdaManifest = loadUsdaManifest();
 const coveragePlan = loadCoveragePlan();
@@ -2962,5 +3009,2850 @@ main().then(
                 expect(fs.readdirSync(directory).filter((entry) => entry.includes('.test.invalid'))).toEqual([]);
             });
         });
+    });
+});
+
+/**
+ * THE TWO VERSION COUNTERS ON A CATALOG FOOD (DB-F08).
+ *
+ * `recipe_ingredients` freezes `snapshot_per_100g`, `snapshot_name`,
+ * `snapshot_provenance`, `snapshot_allergen_tags` and `snapshot_diet_tags`
+ * beside the two counters they were taken at, and
+ * `src/services/recipe.logic.ts::isIngredientSnapshotStale` decides staleness by
+ * comparing BOTH counters for inequality — nothing compares the values. So a
+ * counter the import resets, or fails to move when its facts moved, is the
+ * difference between a published recipe noticing that an ingredient's nutrition
+ * or allergen set has changed and going on claiming the old one.
+ *
+ * The decision is pure, so the sets are pinned here with no database; the two
+ * cases that need the WRITE — that the update branch writes the computed
+ * counter rather than a literal, and that a field outside both sets moves
+ * neither — go through `persistPreparedFood` against a fake `ImportDb`, which is
+ * the seam this suite's charter names for upsert-vs-insert wiring.
+ */
+const versionedFacts = (overrides: Partial<StoredVersionedFacts> = {}): StoredVersionedFacts => ({
+    nutrition_version: 1,
+    metadata_version: 1,
+    calories: 165,
+    protein_g: 31,
+    carbs_g: 0,
+    fat_g: 3.6,
+    fiber_g: null,
+    nutrition_basis: 'per_100g',
+    basis_amount: 100,
+    density_g_per_ml: null,
+    nutrition_provenance: 'source_backed',
+    usda_fdc_id: 171077,
+    usda_data_type: 'SR Legacy',
+    source_version: 'SR Legacy 2019-04',
+    canonical_name: 'chicken breast',
+    display_name: 'Chicken breast',
+    food_group: 'poultry',
+    allergen_status: 'known',
+    allergen_tags: [],
+    diet_tags: ['omnivore'],
+    ...overrides,
+});
+
+describe('nextCatalogFoodVersions (DB-F08)', () => {
+    it('starts a new source_key at 1 on both counters', () => {
+        expect(nextCatalogFoodVersions(null, versionedFacts())).toEqual({
+            nutritionVersion: 1,
+            metadataVersion: 1,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
+    });
+
+    it('preserves both stored counters when a rerun changes nothing', () => {
+        // The defect this finding names: the import wrote `nutrition_version: 1`
+        // unconditionally, so this row came back from a no-op rerun at 1 and
+        // every recipe snapshot citing 3 silently read as current again.
+        const stored = versionedFacts({ nutrition_version: 3, metadata_version: 2 });
+
+        expect(nextCatalogFoodVersions(stored, versionedFacts())).toEqual({
+            nutritionVersion: 3,
+            metadataVersion: 2,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
+    });
+
+    describe('the nutrition set moves nutrition_version and leaves metadata_version alone', () => {
+        const changes: ReadonlyArray<readonly [string, Partial<StoredVersionedFacts>]> = [
+            ['calories', { calories: 166 }],
+            ['protein_g', { protein_g: 30 }],
+            ['carbs_g', { carbs_g: 1 }],
+            ['fat_g', { fat_g: 3.7 }],
+            ['fiber_g', { fiber_g: 2 }],
+            ['nutrition_basis', { nutrition_basis: 'per_100ml' }],
+            ['basis_amount', { basis_amount: 50 }],
+            ['density_g_per_ml', { density_g_per_ml: 1.03 }],
+            ['nutrition_provenance', { nutrition_provenance: 'ingredient_derived' }],
+            ['usda_fdc_id', { usda_fdc_id: 171078 }],
+            ['usda_data_type', { usda_data_type: 'Foundation' }],
+            ['source_version', { source_version: 'SR Legacy 2021-10' }],
+        ];
+
+        it.each(changes)('bumps on a changed %s', (_field, change) => {
+            const stored = versionedFacts({ nutrition_version: 4, metadata_version: 2 });
+
+            expect(nextCatalogFoodVersions(stored, versionedFacts(change))).toEqual({
+                nutritionVersion: 5,
+                metadataVersion: 2,
+                nutritionChanged: true,
+                metadataChanged: false,
+            });
+        });
+    });
+
+    describe('the metadata set moves metadata_version and leaves nutrition_version alone', () => {
+        const changes: ReadonlyArray<readonly [string, Partial<StoredVersionedFacts>]> = [
+            ['canonical_name', { canonical_name: 'chicken breast, skinless' }],
+            // The omission the finding names by itself: a recipe's
+            // `snapshot_name` freezes the displayed name, so a renamed food
+            // whose counter never moved left every recipe showing the old one.
+            ['display_name', { display_name: 'Chicken breast, skinless' }],
+            ['food_group', { food_group: 'meat' }],
+            ['allergen_status', { allergen_status: 'unknown' }],
+            ['allergen_tags', { allergen_tags: ['milk'] }],
+            ['diet_tags', { diet_tags: ['omnivore', 'gluten_free'] }],
+        ];
+
+        it.each(changes)('bumps on a changed %s', (_field, change) => {
+            const stored = versionedFacts({ nutrition_version: 4, metadata_version: 2 });
+
+            expect(nextCatalogFoodVersions(stored, versionedFacts(change))).toEqual({
+                nutritionVersion: 4,
+                metadataVersion: 3,
+                nutritionChanged: false,
+                metadataChanged: true,
+            });
+        });
+    });
+
+    it('treats an absent fact and a stored NULL as the same value', () => {
+        // `fiber_g` is written as `?? null` and a caller that has no value for a
+        // fact omits it. Reading those as different would bump both counters on
+        // every rerun, which is the same defect from the other direction.
+        const stored = versionedFacts({ nutrition_version: 7, metadata_version: 5, fiber_g: null });
+        const next = { ...versionedFacts(), fiber_g: undefined };
+
+        expect(nextCatalogFoodVersions(stored, next)).toMatchObject({
+            nutritionVersion: 7,
+            metadataVersion: 5,
+        });
+    });
+
+    it('ignores the order the vendor returned a tag list in', () => {
+        const stored = versionedFacts({
+            nutrition_version: 2,
+            metadata_version: 2,
+            allergen_tags: ['milk', 'soy'],
+            diet_tags: ['omnivore', 'gluten_free'],
+        });
+        const next = versionedFacts({ allergen_tags: ['soy', 'milk'], diet_tags: ['gluten_free', 'omnivore'] });
+
+        expect(nextCatalogFoodVersions(stored, next)).toMatchObject({
+            nutritionVersion: 2,
+            metadataVersion: 2,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
+    });
+
+    it('moves both counters when both sets moved', () => {
+        const stored = versionedFacts({ nutrition_version: 2, metadata_version: 9 });
+        const next = versionedFacts({ calories: 180, display_name: 'Chicken breast, raw' });
+
+        expect(nextCatalogFoodVersions(stored, next)).toEqual({
+            nutritionVersion: 3,
+            metadataVersion: 10,
+            nutritionChanged: true,
+            metadataChanged: true,
+        });
+    });
+
+    it('reads a counter the column never held as 1 rather than as zero', () => {
+        // The columns are NOT NULL, so this is a hand-loaded or pre-column row.
+        // Treating a missing counter as 0 would renumber a snapshot that already
+        // cites 1 and make it read as current.
+        const stored = versionedFacts({ nutrition_version: null, metadata_version: undefined });
+
+        expect(nextCatalogFoodVersions(stored, versionedFacts({ calories: 200 }))).toMatchObject({
+            nutritionVersion: 2,
+            metadataVersion: 1,
+        });
+    });
+});
+
+describe('persistPreparedFood writes the counters the comparison decided (DB-F08)', () => {
+    const policy: CatalogValidationPolicy = {
+        categories: coveragePlan.categories,
+        validationBounds: coveragePlan.validationBounds,
+    };
+    const base = curatedEntries[0] as UsdaManifestFood & { fdcId: number };
+    const fetchedAt = new Date('2026-09-14T08:30:00.000Z');
+
+    const preparedFood = (cacheKeySuffix = ''): PreparedCatalogFood =>
+        prepareCatalogFood(
+            detailFor(base),
+            { kind: 'curated', entry: base },
+            manifest,
+            fetchedAt,
+            { ...retrieval([base.fdcId]), cacheKey: `${retrieval([base.fdcId]).cacheKey}${cacheKeySuffix}` },
+        );
+
+    type StoredFoodRow = { id: string; imported_at: Date | null } & StoredVersionedFacts;
+
+    interface RecordedWrite {
+        readonly kind: 'create' | 'update';
+        readonly data: Record<string, unknown>;
+    }
+
+    /**
+     * A fake `ImportDb` that records what the upsert was handed.
+     *
+     * The write is the only observable this case has: the counters are computed
+     * from the stored row and written inside the transaction, so what proves the
+     * update branch no longer writes a literal is the `data` it passed.
+     */
+    const recordingDb = (existing: StoredFoodRow | null): { db: ImportDb; writes: RecordedWrite[] } => {
+        const writes: RecordedWrite[] = [];
+        const db: ImportDb = {
+            catalog_foods: {
+                findUnique: async () => existing,
+                create: async (args: unknown) => {
+                    writes.push({ kind: 'create', data: (args as { data: Record<string, unknown> }).data });
+                    return { id: 'food-1' };
+                },
+                update: async (args: unknown) => {
+                    writes.push({ kind: 'update', data: (args as { data: Record<string, unknown> }).data });
+                    return { id: existing?.id ?? 'food-1' };
+                },
+            },
+            catalog_food_aliases: {
+                deleteMany: async () => ({ count: 0 }),
+                createMany: async () => ({ count: 0 }),
+            },
+            catalog_food_portions: {
+                deleteMany: async () => ({ count: 0 }),
+                createMany: async () => ({ count: 0 }),
+            },
+            catalog_validation_records: {
+                upsert: async () => ({ id: 'record-1' }),
+            },
+            $transaction: async (work) => work(db),
+        };
+
+        return { db, writes };
+    };
+
+    const persist = async (existing: StoredFoodRow | null, prepared = preparedFood()): Promise<RecordedWrite> => {
+        const { db, writes } = recordingDb(existing);
+        const verdict = validateCatalogCandidate(prepared.candidate, policy);
+        await persistPreparedFood(db, prepared, verdict, importPublicationStatus(prepared, verdict), fetchedAt);
+
+        expect(writes).toHaveLength(1);
+        return writes[0];
+    };
+
+    /** The stored row this food would have produced, at the counters given. */
+    const storedFrom = (
+        prepared: PreparedCatalogFood,
+        nutritionVersion: number,
+        metadataVersion: number,
+    ): StoredFoodRow => ({
+        id: 'food-1',
+        imported_at: new Date('2026-09-01T00:00:00.000Z'),
+        nutrition_version: nutritionVersion,
+        metadata_version: metadataVersion,
+        calories: prepared.candidate.calories,
+        protein_g: prepared.candidate.protein_g,
+        carbs_g: prepared.candidate.carbs_g,
+        fat_g: prepared.candidate.fat_g,
+        fiber_g: prepared.candidate.fiber_g ?? null,
+        nutrition_basis: 'per_100g',
+        basis_amount: 100,
+        density_g_per_ml: null,
+        nutrition_provenance: 'source_backed',
+        usda_fdc_id: prepared.fdcId,
+        usda_data_type: prepared.row.usda_data_type,
+        source_version: prepared.row.source_version,
+        canonical_name: prepared.row.canonical_name,
+        display_name: prepared.row.display_name,
+        food_group: prepared.row.food_group,
+        allergen_status: prepared.candidate.allergen_status,
+        allergen_tags: prepared.candidate.allergen_tags ?? [],
+        diet_tags: prepared.row.diet_tags,
+    });
+
+    it('creates a new food at 1 on both counters, with imported_at', async () => {
+        const write = await persist(null);
+
+        expect(write.kind).toBe('create');
+        expect(write.data).toMatchObject({ nutrition_version: 1, metadata_version: 1, imported_at: fetchedAt });
+    });
+
+    it('preserves both counters on a rerun that changed nothing', async () => {
+        const prepared = preparedFood();
+        const write = await persist(storedFrom(prepared, 4, 3), prepared);
+
+        expect(write.kind).toBe('update');
+        expect(write.data).toMatchObject({ nutrition_version: 4, metadata_version: 3 });
+        // `imported_at` is an insert-only column: rewriting it would change an
+        // exported release's bytes on a rerun that changed nothing.
+        expect(write.data).not.toHaveProperty('imported_at');
+    });
+
+    it('bumps nutrition_version alone when the stored nutrients differ', async () => {
+        const prepared = preparedFood();
+        const stored = { ...storedFrom(prepared, 4, 3), calories: 999 };
+
+        expect((await persist(stored, prepared)).data).toMatchObject({ nutrition_version: 5, metadata_version: 3 });
+    });
+
+    it('bumps metadata_version alone when the stored display name differs', async () => {
+        const prepared = preparedFood();
+        const stored = { ...storedFrom(prepared, 4, 3), display_name: 'An older label' };
+
+        expect((await persist(stored, prepared)).data).toMatchObject({ nutrition_version: 4, metadata_version: 3 + 1 });
+    });
+
+    it('moves neither counter when only the response cache key differs', async () => {
+        // source_cache_key names the batch response this row was read out of.
+        // Re-fetching the same food in a differently composed batch changes it
+        // and changes no snapshot value, so versioning on it would version the
+        // catalog by how the import grouped its requests.
+        const prepared = preparedFood('#regrouped');
+        const stored = storedFrom(preparedFood(), 6, 6);
+
+        const write = await persist(stored, prepared);
+
+        expect(write.data).toMatchObject({ nutrition_version: 6, metadata_version: 6 });
+        // The new key IS written — the fact is stored, it is simply not
+        // evidence that a frozen snapshot has stopped describing this food. It
+        // is also not a field the comparison can even be handed: it is absent
+        // from `StoredVersionedFacts` by design.
+        expect(write.data.source_cache_key).toBe(prepared.row.source_cache_key);
+        expect(write.data.source_cache_key).not.toBe(preparedFood().row.source_cache_key);
+    });
+
+    it('moves neither counter when only the category differs', async () => {
+        // Category drives the grocery aisle, which is derived live from the
+        // current row, so a recategorised food is already reported correctly and
+        // no frozen snapshot reads it.
+        const prepared = preparedFood();
+        const recategorised: PreparedCatalogFood = { ...prepared, row: { ...prepared.row, category: 'other' } };
+        const stored = storedFrom(prepared, 2, 2);
+
+        const write = await persist(stored, recategorised);
+
+        expect(write.data).toMatchObject({ nutrition_version: 2, metadata_version: 2, category: 'other' });
+    });
+});
+
+
+/**
+ * THE DURABLE BATCH TOTAL (DB-F11).
+ *
+ * `batchesProcessed` lives in `catalog_import_runs.counts`, which
+ * `checkpoint.ts::recordCounts` merges by ADDITION. The checkpoint used to add
+ * the save interval — five — whatever the interval had actually covered, so a
+ * seven-batch run recorded ten and a resumed tail recorded its predecessor's
+ * batches a second time. The overcount is durable: it is what the run row says
+ * that run did, for the rest of the row's life.
+ *
+ * These cases go through the REAL run ledger, because the defect is in what the
+ * row ends up holding and the merge that puts it there is the wiring under test
+ * (this suite's charter names run bookkeeping as database-backed work). The
+ * catalog writes are faked: an empty vendor response leaves the persistence path
+ * with nothing to write, which keeps the cases about batch accounting alone.
+ */
+describe('the durable batch total a checkpoint records (DB-F11)', () => {
+    const FIXED_NOW = new Date('2026-09-14T09:00:00.000Z');
+
+    /** Twenty ids per batch, so a limit is a batch count: 140 → 7, 100 → 5. */
+    const BATCH_SIZE = 20;
+
+    const scopeFor = (limit: number): string => importRunScope(manifest.usdaManifestVersion, options({ limit }));
+
+    /**
+     * A catalog client that can open the per-batch transaction and nothing else.
+     *
+     * The import opens one transaction per batch whether or not the vendor
+     * returned anything, so `$transaction` has to work; every model accessor
+     * fails by name, which is the assertion that no food, alias, portion or
+     * validation record was written while these batches were being accounted.
+     */
+    const transactionOnlyDb = (): ImportDb => {
+        const db = new Proxy(
+            {},
+            {
+                get: (_target, property) => {
+                    if (property === '$transaction') {
+                        return async (work: (tx: ImportDb) => Promise<unknown>) => work(db);
+                    }
+                    throw new Error(`a batch-accounting case reached catalog state: db.${String(property)}`);
+                },
+            },
+        ) as unknown as ImportDb;
+
+        return db;
+    };
+
+    /**
+     * A catalog client that answers every batch with no records.
+     *
+     * The import then writes nothing and counts the ids as missing from the
+     * vendor, which is a real outcome it handles — and it means these cases do
+     * not depend on the shape of a single food. `failOnCall` is the interruption:
+     * it throws on that (1-based) batch, leaving the run open at its last
+     * checkpoint exactly as a vendor outage would.
+     */
+    const emptyVendor = (failOnCall: number | null = null): { calls: number[]; usda: RunImportDeps['usda'] } => {
+        const calls: number[] = [];
+        return {
+            calls,
+            usda: {
+                listFoods: async (): Promise<UsdaFoodSummary[]> => [],
+                getFoodsBatch: async (fdcIds) => {
+                    calls.push(fdcIds.length);
+                    if (failOnCall !== null && calls.length === failOnCall) {
+                        throw new Error('vendor outage mid-run');
+                    }
+                    return [];
+                },
+                describeBatchRetrieval: async (fdcIds) => retrieval(fdcIds),
+            },
+        };
+    };
+
+    const runWith = async (
+        limit: number,
+        vendor: { usda: RunImportDeps['usda'] },
+        db: ImportDb = transactionOnlyDb(),
+    ): Promise<ReturnType<typeof runImport>> => {
+        const deps = {
+            db,
+            runDb: prisma,
+            usda: vendor.usda,
+            manifest,
+            coveragePlan,
+            options: options({ limit }),
+            logger: silentLogger,
+            now: () => FIXED_NOW,
+            installRateLimiter: () => (): void => undefined,
+            writeReport: () => undefined,
+        } as unknown as RunImportDeps;
+
+        return runImport(deps);
+    };
+
+    /**
+     * The scopes these cases claim, cleared before and after each one.
+     *
+     * Before, because a row left behind by an interrupted earlier run would be
+     * resumed instead of opened; after, because a SUCCEEDED row makes the same
+     * scope a permanent no-op and the next run of this suite would assert
+     * against a run that did nothing (checkpoint.ts's THE CLAIM).
+     */
+    const claimedScopes = [scopeFor(140), scopeFor(100)];
+
+    const clearClaimedRuns = async (): Promise<void> => {
+        await prisma.catalog_import_runs.deleteMany({
+            where: { kind: 'usda_import', manifest_version: { in: claimedScopes } },
+        });
+    };
+
+    beforeEach(clearClaimedRuns);
+    afterEach(clearClaimedRuns);
+
+    const durableBatchesProcessed = async (runId: string): Promise<number | undefined> => {
+        const row = await prisma.catalog_import_runs.findUnique({
+            where: { id: runId },
+            select: { counts: true },
+        });
+        return (row?.counts as { batchesProcessed?: number } | null)?.batchesProcessed;
+    };
+
+    it('records what the final partial checkpoint actually covered, not the save interval', async () => {
+        // Seven batches: checkpoints at 5 (covering 5) and at 7 (covering 2).
+        const vendor = emptyVendor();
+        const outcome = await runWith(140, vendor);
+
+        expect(outcome.plannedBatches).toBe(140 / BATCH_SIZE);
+        expect(outcome.processedBatches).toBe(140 / BATCH_SIZE);
+        expect(vendor.calls).toHaveLength(140 / BATCH_SIZE);
+        // Ten was the overcount: 5 + 5, where the tail covered two.
+        expect(await durableBatchesProcessed(outcome.runId as string)).toBe(140 / BATCH_SIZE);
+    });
+
+    it('records only this invocation’s batches when a resumed run finishes the tail', async () => {
+        const interrupted = emptyVendor(6);
+        await expect(runWith(140, interrupted)).rejects.toThrow('vendor outage mid-run');
+
+        const openRunRow = await prisma.catalog_import_runs.findFirst({
+            where: { kind: 'usda_import', manifest_version: scopeFor(140) },
+        });
+        expect(openRunRow?.status).toBe('running');
+        expect(openRunRow?.cursor).toMatchObject({ nextBatchIndex: 5 });
+        expect(await durableBatchesProcessed(openRunRow?.id as string)).toBe(5);
+
+        // The tail: two batches, on the same run row.
+        const resumed = emptyVendor();
+        const outcome = await runWith(140, resumed);
+
+        expect(outcome.runId).toBe(openRunRow?.id);
+        expect(outcome.resumed).toBe(true);
+        expect(outcome.processedBatches).toBe(2);
+        expect(resumed.calls).toHaveLength(2);
+        // Seven, not twelve: the resumed invocation starts its accounting at the
+        // index it resumed from, so it cannot record the five its predecessor
+        // already recorded.
+        expect(await durableBatchesProcessed(outcome.runId as string)).toBe(7);
+    });
+
+    it('records the interval itself when the batch count is an exact multiple of it', async () => {
+        const vendor = emptyVendor();
+        const outcome = await runWith(100, vendor);
+
+        expect(outcome.plannedBatches).toBe(100 / BATCH_SIZE);
+        expect(await durableBatchesProcessed(outcome.runId as string)).toBe(100 / BATCH_SIZE);
+    });
+});
+
+
+/**
+ * VALIDATION'S RUN IDENTITY AND THE FACTS IT JUDGES FROM (DB-F10, DB-F09).
+ *
+ * Two defects met in one function. DB-F10: the claim's `alreadyCompleted` was
+ * discarded, so re-running a succeeded pass rewrote every considered food's
+ * `updated_at`, every record's `reviewed_at` and `history` and the report,
+ * beneath a closed run whose counts never moved — and a `--category` pass shared
+ * the canonical run key, so a partial pass could close it. DB-F09: the verdict
+ * was computed from a set-wide read and written by id, so a concurrent import
+ * could replace the nutrients and metadata in between and the row was
+ * republished on checks derived from facts it no longer had.
+ *
+ * The run ledger is real here, because the claim IS the thing under test. The
+ * catalog side is an in-memory `ValidateDb`, which is what makes the races
+ * deterministic: the "concurrent writer" is a hook that commits at an exact
+ * point instead of a second process that might not land there.
+ */
+const validateOptions = (overrides: Partial<ValidateOptions> = {}): ValidateOptions => ({
+    help: false,
+    categories: [],
+    revalidateQuarantined: false,
+    ...overrides,
+});
+
+/**
+ * WHICH CATALOG A VALIDATION RUN ANSWERS FOR (DB-F10).
+ *
+ * The run key names two things and has to name both. Keyed on the coverage plan
+ * alone, one successful pass answers "validation succeeded for v1" for ever, so
+ * a later import under the same plan is met with the completed-run no-op and its
+ * rows are never judged — which contradicts AAP §0.5.1 ("a refresh re-runs
+ * validation") and, worse, deadlocks the release: catalog-release asks for a
+ * validation newer than the last ingest, and that run can no longer happen.
+ */
+describe('catalogInputIdentity and the canonical run key (DB-F10)', () => {
+    const at = (iso: string): Date => new Date(iso);
+
+    const ingest = (overrides: Partial<CatalogInputRunRow> = {}): CatalogInputRunRow => ({
+        kind: 'usda_import',
+        manifest_version: 'v1',
+        status: 'succeeded',
+        finished_at: at('2026-09-14T08:00:00.000Z'),
+        ...overrides,
+    });
+
+    it('names the graph an empty ledger describes as having no input', () => {
+        expect(catalogInputIdentity([])).toBe(NO_CATALOG_INPUT);
+    });
+
+    it('names the newest completed ingest', () => {
+        expect(
+            catalogInputIdentity([
+                ingest({ finished_at: at('2026-09-14T08:00:00.000Z') }),
+                ingest({ kind: 'release_load', manifest_version: 'v2', finished_at: at('2026-09-14T09:00:00.000Z') }),
+            ]),
+        ).toBe('release_load:v2:2026-09-14T09:00:00.000Z');
+    });
+
+    it.each(['usda_import', 'ai_generation', 'release_load'])('counts a %s run as catalog input', (kind) => {
+        expect(catalogInputIdentity([ingest({ kind })])).toContain(kind);
+    });
+
+    it('does NOT count validation as input, or no pass could ever be complete', () => {
+        // Validation moves publication_status and writes records; it never
+        // changes a food's facts. Were it input, every pass would change the
+        // identity of the catalog it was judging.
+        expect(catalogInputIdentity([ingest({ kind: 'validation' })])).toBe(NO_CATALOG_INPUT);
+    });
+
+    it.each([
+        ['running', 'running'],
+        ['failed', 'failed'],
+    ])('ignores a %s ingest, which left a graph nobody has vouched for', (_label, status) => {
+        expect(catalogInputIdentity([ingest({ status, finished_at: null })])).toBe(NO_CATALOG_INPUT);
+        expect(catalogInputIdentity([ingest({ status })])).toBe(NO_CATALOG_INPUT);
+    });
+
+    it('is a function of the ledger content, not of the order it came back in', () => {
+        const rows = [
+            ingest({ manifest_version: 'a' }),
+            ingest({ kind: 'ai_generation', manifest_version: 'b' }),
+            ingest({ kind: 'release_load', manifest_version: 'c' }),
+        ];
+
+        expect(catalogInputIdentity(rows)).toBe(catalogInputIdentity([...rows].reverse()));
+    });
+
+    it('gives a different canonical key to a different catalog input', () => {
+        const before = canonicalValidationRunKey('v1', catalogInputIdentity([ingest()]));
+        const after = canonicalValidationRunKey(
+            'v1',
+            catalogInputIdentity([ingest(), ingest({ manifest_version: 'v2', finished_at: at('2026-09-14T10:00:00.000Z') })]),
+        );
+
+        expect(after).not.toBe(before);
+    });
+
+    it('gives a different canonical key to a different coverage plan over the same input', () => {
+        const identity = catalogInputIdentity([ingest()]);
+
+        expect(canonicalValidationRunKey('v2', identity)).not.toBe(canonicalValidationRunKey('v1', identity));
+    });
+
+    it('stays short enough for an operator to read in a terminal', () => {
+        const key = canonicalValidationRunKey('v1', catalogInputIdentity([ingest()]));
+
+        expect(key.startsWith('v1@')).toBe(true);
+        expect(key.length).toBeLessThanOrEqual('v1@'.length + 12);
+    });
+
+    it('does not read a canonical key as restricted', () => {
+        expect(isRestrictedValidationRunKey(canonicalValidationRunKey('v1', 'none'))).toBe(false);
+    });
+});
+
+describe('validationRunScope (DB-F10)', () => {
+    const version = coveragePlan.coveragePlanVersion;
+    const INPUT = 'usda_import:v1:2026-09-14T08:00:00.000Z';
+    const canonical = canonicalValidationRunKey(version, INPUT);
+
+    it('claims the canonical key — plan AND catalog input — for the full pass', () => {
+        expect(validationRunScope(version, validateOptions(), INPUT)).toBe(canonical);
+    });
+
+    it('claims a new key when the catalog input changed, so a refresh is judged (AAP 0.5.1)', () => {
+        const afterRefresh = validationRunScope(
+            version,
+            validateOptions(),
+            'usda_import:v1:2026-09-14T11:00:00.000Z',
+        );
+
+        expect(afterRefresh).not.toBe(canonical);
+        expect(isRestrictedValidationRunKey(afterRefresh)).toBe(false);
+    });
+
+    it('claims a separate key for a category-restricted pass, so it cannot close the canonical one', () => {
+        const scoped = validationRunScope(version, validateOptions({ categories: ['protein_poultry'] }), INPUT);
+
+        expect(scoped).not.toBe(canonical);
+        expect(scoped.startsWith(`${canonical}+scope:`)).toBe(true);
+        expect(isRestrictedValidationRunKey(scoped)).toBe(true);
+    });
+
+    it('claims a separate key for --revalidate-quarantined', () => {
+        const scoped = validationRunScope(version, validateOptions({ revalidateQuarantined: true }), INPUT);
+
+        expect(scoped).not.toBe(canonical);
+        expect(scoped).not.toBe(
+            validationRunScope(version, validateOptions({ categories: ['protein_poultry'] }), INPUT),
+        );
+        expect(isRestrictedValidationRunKey(scoped)).toBe(true);
+    });
+
+    it('gives the same restriction the same key however the operator ordered it', () => {
+        expect(validationRunScope(version, validateOptions({ categories: ['dairy', 'grain'] }), INPUT)).toBe(
+            validationRunScope(version, validateOptions({ categories: ['grain', 'dairy'] }), INPUT),
+        );
+    });
+
+    it('gives the same restriction the same key however many times the operator repeated a flag', () => {
+        // `--category dairy --category dairy` considers exactly what
+        // `--category dairy` considers. A second key for the same considered set
+        // would walk straight past the completed-run no-op and re-judge it.
+        expect(validationRunScope(version, validateOptions({ categories: ['dairy', 'dairy'] }), INPUT)).toBe(
+            validationRunScope(version, validateOptions({ categories: ['dairy'] }), INPUT),
+        );
+        expect(
+            validationRunScope(version, validateOptions({ categories: ['grain', 'dairy', 'grain'] }), INPUT),
+        ).toBe(validationRunScope(version, validateOptions({ categories: ['dairy', 'grain'] }), INPUT));
+    });
+
+    it('separates two different restrictions', () => {
+        expect(validationRunScope(version, validateOptions({ categories: ['dairy'] }), INPUT)).not.toBe(
+            validationRunScope(version, validateOptions({ categories: ['grain'] }), INPUT),
+        );
+    });
+
+    it('separates the same restriction over two different catalog inputs', () => {
+        expect(validationRunScope(version, validateOptions({ categories: ['dairy'] }), INPUT)).not.toBe(
+            validationRunScope(
+                version,
+                validateOptions({ categories: ['dairy'] }),
+                'usda_import:v1:2026-09-14T11:00:00.000Z',
+            ),
+        );
+    });
+});
+
+/**
+ * ONE HISTORY ENTRY PER RUN PER FOOD (DB-F10).
+ *
+ * The status write and the history commit together; the cursor that says "done"
+ * commits after them. Something has to be true in that window, and an
+ * unconditional append would leave two entries claiming the same transition —
+ * in the audit trail this stage exists to produce.
+ */
+describe('appendValidationHistory is idempotent per run and food (DB-F10)', () => {
+    const NOW = new Date('2026-09-14T10:15:00.000Z');
+    const LATER = new Date('2026-09-14T10:16:00.000Z');
+    const RUN = 'run-a';
+
+    const verdict = {
+        publicationStatus: 'published',
+        outcome: 'accepted',
+        decidingCheckNames: [],
+        reviewFlags: [],
+        checks: [],
+    } as unknown as Parameters<typeof appendValidationHistory>[2];
+
+    const rowWithHistory = (history: unknown[]): ValidationFoodRow =>
+        ({
+            publication_status: 'candidate',
+            catalog_validation_records: { id: 'r', history, canonical_identity: {}, nutrition_assumptions: null },
+        }) as unknown as ValidationFoodRow;
+
+    it('records the run that judged the food', () => {
+        const history = appendValidationHistory(rowWithHistory([]), 'published', verdict, NOW, RUN);
+
+        expect(history).toHaveLength(1);
+        expect(history[0]).toMatchObject({ run: RUN, from: 'candidate', to: 'published' });
+    });
+
+    it('REPLACES its own earlier entry when the same run judges the food again', () => {
+        const first = appendValidationHistory(rowWithHistory([]), 'quarantined', verdict, NOW, RUN);
+        const second = appendValidationHistory(rowWithHistory(first), 'published', verdict, LATER, RUN);
+
+        expect(second).toHaveLength(1);
+        expect(second[0]).toMatchObject({ run: RUN, to: 'published', at: LATER.toISOString() });
+    });
+
+    it('keeps another run\u2019s entry, because that judgement did happen', () => {
+        const earlier = appendValidationHistory(rowWithHistory([]), 'published', verdict, NOW, 'run-old');
+        const later = appendValidationHistory(rowWithHistory(earlier), 'quarantined', verdict, LATER, RUN);
+
+        expect(later).toHaveLength(2);
+        expect(later.map((entry) => (entry as { run: string }).run)).toEqual(['run-old', RUN]);
+    });
+
+    it('never matches an entry an older release wrote without a run, so existing history survives', () => {
+        const legacy = [{ at: '2026-01-01T00:00:00.000Z', from: 'candidate', to: 'published' }];
+        const history = appendValidationHistory(rowWithHistory(legacy), 'published', verdict, NOW, RUN);
+
+        expect(history).toHaveLength(2);
+        expect(history[0]).toEqual(legacy[0]);
+    });
+
+    it('reports whether a run has judged a food, which is the queue\u2019s own predicate', () => {
+        const judged = appendValidationHistory(rowWithHistory([]), 'published', verdict, NOW, RUN);
+
+        expect(runHasJudgedFood(rowWithHistory(judged), RUN)).toBe(true);
+        expect(runHasJudgedFood(rowWithHistory(judged), 'run-b')).toBe(false);
+        expect(runHasJudgedFood(rowWithHistory([]), RUN)).toBe(false);
+        // A record that does not exist yet cannot have been judged.
+        expect(runHasJudgedFood({ catalog_validation_records: null } as unknown as ValidationFoodRow, RUN)).toBe(false);
+    });
+
+    it.each([
+        ['a non-object entry', 'not-an-entry'],
+        ['null', null],
+        ['an entry with no run', { at: 'x' }],
+        ['an entry whose run is not a string', { run: 7 }],
+    ])('does not read %s as belonging to a run', (_label, entry) => {
+        expect(historyEntryBelongsToRun(entry, RUN)).toBe(false);
+    });
+});
+
+describe('identityGroupMoved (DB-F09)', () => {
+    const facts = {
+        source_key: 'usda:171077',
+        canonical_name: 'chicken breast',
+        food_state: 'raw',
+        identity_source: 'usda',
+    };
+
+    it('is false for the same identity', () => {
+        expect(identityGroupMoved(facts, { ...facts })).toBe(false);
+    });
+
+    it('is false for a purely cosmetic re-spelling, which does not move the group key', () => {
+        expect(identityGroupMoved(facts, { ...facts, canonical_name: '  Chicken   Breast ' })).toBe(false);
+    });
+
+    it.each([
+        ['source_key', { source_key: 'usda:171078' }],
+        ['canonical_name', { canonical_name: 'chicken thigh' }],
+        ['food_state', { food_state: 'cooked' }],
+        ['identity_source', { identity_source: 'ai_generated' }],
+    ])('is true when %s moved', (_field, change) => {
+        expect(identityGroupMoved(facts, { ...facts, ...change })).toBe(true);
+    });
+});
+
+describe('runValidation (DB-F10, DB-F09)', () => {
+    const FIXED_NOW = new Date('2026-09-14T10:15:00.000Z');
+    const CATEGORY = 'protein_poultry';
+    const scopedOptions = validateOptions({ categories: [CATEGORY] });
+    // These cases claim a RESTRICTED key, so they can never close the canonical
+    // one for this database however they end. The ledger they run against holds
+    // no ingest, so the input identity they resolve is NO_CATALOG_INPUT — the
+    // suite deletes its own run rows around every case (below), which keeps that
+    // true whatever else has run.
+    const runScope = validationRunScope(coveragePlan.coveragePlanVersion, scopedOptions, NO_CATALOG_INPUT);
+
+    /** A row every deterministic check passes, so its verdict is `published`. */
+    const validationRow = (overrides: Partial<ValidationFoodRow> = {}): ValidationFoodRow => ({
+        id: '00000000-0000-4000-8000-000000000001',
+        source_key: 'usda:900001',
+        canonical_name: 'chicken breast',
+        display_name: 'Chicken breast',
+        category: CATEGORY,
+        food_state: 'raw',
+        identity_source: 'usda',
+        identity_status: 'verified',
+        nutrition_provenance: 'source_backed',
+        nutrition_basis: 'per_100g',
+        basis_amount: 100,
+        calories: 165,
+        protein_g: 31,
+        carbs_g: 0,
+        fat_g: 3.6,
+        fiber_g: null,
+        density_g_per_ml: null,
+        allergen_status: 'known',
+        allergen_tags: [],
+        publication_status: 'candidate',
+        nutrition_version: 1,
+        metadata_version: 1,
+        catalog_food_aliases: [],
+        catalog_food_portions: [
+            { description: '1 breast', amount: 1, unit: 'each', gram_weight: 174, is_default: true, source: 'usda_food_portion' },
+        ],
+        catalog_validation_records: {
+            id: 'record-1',
+            history: [],
+            canonical_identity: { source_key: 'usda:900001', curator_review_required: false },
+            nutrition_assumptions: null,
+        },
+        ...overrides,
+    });
+
+    /**
+     * A distinct identity per row, because `dedupeIdentity` groups on the
+     * normalized canonical name and the state: three rows sharing one name are
+     * duplicates of each other, which is a different verdict than these cases
+     * are about.
+     */
+    const rowAt = (index: number, overrides: Partial<ValidationFoodRow> = {}): ValidationFoodRow =>
+        validationRow({
+            id: `00000000-0000-4000-8000-00000000000${index}`,
+            source_key: `usda:90000${index}`,
+            canonical_name: `chicken cut ${index}`,
+            display_name: `Chicken cut ${index}`,
+            ...overrides,
+        });
+
+    interface FakeValidateHooks {
+        /**
+         * Commits a change between the set-wide read and the locked re-read,
+         * which is the window DB-F09 is about. Applied where the row lock is
+         * taken, so it lands on exactly the food being judged and on no other.
+         */
+        readonly raceAfterSetRead?: (id: string, store: Map<string, ValidationFoodRow>) => void;
+        /** Commits a change after the locked re-read and before the guarded write. */
+        readonly raceBeforeWrite?: (id: string, store: Map<string, ValidationFoodRow>) => void;
+        /** Ids whose row lock finds nothing, i.e. the row was deleted under the pass. */
+        readonly vanished?: ReadonlySet<string>;
+        /** Throws when that food's transaction opens, which is how a pass is interrupted. */
+        readonly failOnId?: string;
+    }
+
+    interface FakeValidateDb {
+        readonly db: ValidateDb;
+        readonly store: Map<string, ValidationFoodRow>;
+        /** Every `history` array written, by food id, so a second judgement is visible. */
+        readonly historyWrites: Map<string, unknown[][]>;
+        readonly statusWrites: Map<string, string[]>;
+    }
+
+    const inMemoryValidateDb = (rows: readonly ValidationFoodRow[], hooks: FakeValidateHooks = {}): FakeValidateDb => {
+        const store = new Map(rows.map((row) => [row.id, row]));
+        const historyWrites = new Map<string, unknown[][]>();
+        const statusWrites = new Map<string, string[]>();
+
+        const recordHistory = (id: string, history: unknown): void => {
+            const written = historyWrites.get(id) ?? [];
+            const entries = Array.isArray(history) ? (history as unknown[]) : [];
+            written.push(entries);
+            historyWrites.set(id, written);
+
+            // Written BACK into the row, as the database does. Without this the
+            // store would forget every judgement the moment the transaction
+            // returned, and a resumed pass built from it could not tell that
+            // this run had already judged the food — which is the whole
+            // mechanism under test.
+            const row = store.get(id);
+            if (row !== undefined) {
+                const record = row.catalog_validation_records;
+                store.set(id, {
+                    ...row,
+                    catalog_validation_records:
+                        record === null
+                            ? { id: 'record-created', history: entries, canonical_identity: {}, nutrition_assumptions: null }
+                            : { ...record, history: entries },
+                });
+            }
+        };
+
+        const db: ValidateDb = {
+            catalog_foods: {
+                findMany: async (args: unknown) => {
+                    const statuses = (args as { where: { publication_status: { in: string[] } } }).where
+                        .publication_status.in;
+                    return [...store.values()]
+                        .filter((row) => statuses.includes(row.publication_status))
+                        .sort((left, right) => (left.source_key < right.source_key ? -1 : 1));
+                },
+                findUnique: async (args: unknown) => {
+                    const { id } = (args as { where: { id: string } }).where;
+                    return store.get(id) ?? null;
+                },
+                updateMany: async (args: unknown) => {
+                    const { where, data } = args as {
+                        where: {
+                            id: string;
+                            nutrition_version: number;
+                            metadata_version: number;
+                            publication_status: string;
+                        };
+                        data: { publication_status: string };
+                    };
+                    hooks.raceBeforeWrite?.(where.id, store);
+                    const row = store.get(where.id);
+                    if (
+                        row === undefined ||
+                        row.nutrition_version !== where.nutrition_version ||
+                        row.metadata_version !== where.metadata_version ||
+                        row.publication_status !== where.publication_status
+                    ) {
+                        return { count: 0 };
+                    }
+                    store.set(where.id, { ...row, publication_status: data.publication_status });
+                    const written = statusWrites.get(where.id) ?? [];
+                    written.push(data.publication_status);
+                    statusWrites.set(where.id, written);
+                    return { count: 1 };
+                },
+            },
+            catalog_food_aliases: {
+                createMany: async () => ({ count: 0 }),
+                findMany: async () => [],
+            },
+            catalog_validation_records: {
+                create: async (args: unknown) => {
+                    const { data } = args as { data: { catalog_food_id: string; history: unknown } };
+                    recordHistory(data.catalog_food_id, data.history);
+                    return { id: 'record-created' };
+                },
+                update: async (args: unknown) => {
+                    const { where, data } = args as {
+                        where: { catalog_food_id: string };
+                        data: { history: unknown };
+                    };
+                    recordHistory(where.catalog_food_id, data.history);
+                    return { id: 'record-updated' };
+                },
+                updateMany: async () => ({ count: 0 }),
+            },
+            // The row lock is the first statement of the judgement transaction
+            // and it binds the food's id, so this is where a "concurrent writer"
+            // is made exact: the hooks fire against the id actually being
+            // judged, never against a guess at which one that is.
+            $queryRaw: async <TRows>(_query: TemplateStringsArray, ...values: unknown[]): Promise<TRows> => {
+                const id = String(values[0]);
+                if (hooks.failOnId === id) {
+                    throw new Error(`interrupted while judging ${id}`);
+                }
+                hooks.raceAfterSetRead?.(id, store);
+                const present = store.has(id) && !(hooks.vanished?.has(id) ?? false);
+                return (present ? [{ id }] : []) as TRows;
+            },
+            $transaction: async (work) => work(db),
+        };
+
+        return { db, store, historyWrites, statusWrites };
+    };
+
+    const run = async (fake: FakeValidateDb, options = scopedOptions): Promise<{
+        outcome: Awaited<ReturnType<typeof runValidation>>;
+        reports: unknown[];
+    }> => {
+        const reports: unknown[] = [];
+        const deps = {
+            db: fake.db,
+            runDb: prisma,
+            coveragePlan,
+            options,
+            logger: silentLogger,
+            now: () => FIXED_NOW,
+            writeReport: (report: unknown) => {
+                reports.push(report);
+            },
+        } as unknown as RunValidationDeps;
+
+        return { outcome: await runValidation(deps), reports };
+    };
+
+    /**
+     * Leaves the ledger in the one state these cases are written against: no
+     * validation run for the key they claim, and no ingest at all.
+     *
+     * The ingest rows matter because the run key now names the catalog input
+     * (see validationRunScope): a leftover succeeded import would change the key
+     * `runValidation` computes, and the suite would then look up a run row that
+     * the pass never claimed. Deleting them makes the resolved identity
+     * deterministically NO_CATALOG_INPUT rather than a function of which suite
+     * ran first.
+     */
+    const clearClaimedRuns = async (): Promise<void> => {
+        await prisma.catalog_import_runs.deleteMany({
+            where: {
+                OR: [
+                    { kind: 'validation' },
+                    { kind: { in: ['usda_import', 'ai_generation', 'release_load'] } },
+                ],
+            },
+        });
+    };
+
+    beforeEach(clearClaimedRuns);
+    afterEach(clearClaimedRuns);
+
+    const runRow = async (): Promise<{ id: string; status: string; cursor: unknown; counts: unknown } | null> =>
+        prisma.catalog_import_runs.findFirst({
+            where: { kind: 'validation', manifest_version: runScope },
+            select: { id: true, status: true, cursor: true, counts: true },
+        });
+
+    describe('a succeeded run is a no-op (DB-F10)', () => {
+        it('reads nothing and writes nothing when the claim comes back completed', async () => {
+            const settled = await openRun(prisma, { kind: 'validation', manifestVersion: runScope });
+            await finishRun(prisma, settled.id, 'succeeded', { counts: { considered: 12, published: 9 } });
+
+            // Any access at all fails by name. A pass that re-judged would have
+            // to reach this client to read the graph, let alone write it, so
+            // refusing every property IS the zero-write assertion.
+            const forbiddenDb = new Proxy(
+                {},
+                {
+                    get: (_target, property) => {
+                        throw new Error(`a completed validation run reached the catalog: db.${String(property)}`);
+                    },
+                },
+            ) as unknown as ValidateDb;
+
+            const reports: unknown[] = [];
+            const outcome = await runValidation({
+                db: forbiddenDb,
+                runDb: prisma,
+                coveragePlan,
+                options: scopedOptions,
+                logger: silentLogger,
+                now: () => FIXED_NOW,
+                writeReport: (report: unknown) => {
+                    reports.push(report);
+                },
+            } as unknown as RunValidationDeps);
+
+            expect(outcome.alreadyCompleted).toBe(true);
+            expect(outcome.runId).toBe(settled.id);
+            expect(outcome.counts).toMatchObject({ considered: 12, published: 9 });
+            expect(outcome.unjudged).toBe(0);
+            // No report file either: the report describes a pass, and this
+            // invocation did not make one.
+            expect(reports).toEqual([]);
+
+            const after = await prisma.catalog_import_runs.findUnique({
+                where: { id: settled.id },
+                select: { status: true, finished_at: true, counts: true },
+            });
+            expect(after?.status).toBe('succeeded');
+            expect(after?.counts).toEqual({ considered: 12, published: 9 });
+        });
+    });
+
+    describe('an interrupted pass resumes without judging a row twice (DB-F10)', () => {
+        it('picks up at the cursor and appends one history entry per food', async () => {
+            const rows = [rowAt(1), rowAt(2), rowAt(3)];
+
+            const interrupted = inMemoryValidateDb(rows, { failOnId: rows[1].id });
+            await expect(run(interrupted)).rejects.toThrow(`interrupted while judging ${rows[1].id}`);
+
+            const open = await runRow();
+            expect(open?.status).toBe('running');
+            expect(open?.cursor).toMatchObject({ nextIndex: 1 });
+            expect(interrupted.historyWrites.get(rows[0].id)).toHaveLength(1);
+            expect(interrupted.historyWrites.has(rows[1].id)).toBe(false);
+
+            // The resumed pass carries the store forward — the first row is
+            // already judged and published in it — and must start at index 1.
+            const resumed = inMemoryValidateDb([...interrupted.store.values()]);
+            const { outcome, reports } = await run(resumed);
+
+            expect(outcome.alreadyCompleted).toBe(false);
+            expect(outcome.unjudged).toBe(0);
+            expect(resumed.historyWrites.has(rows[0].id)).toBe(false);
+            expect(resumed.historyWrites.get(rows[1].id)).toHaveLength(1);
+            expect(resumed.historyWrites.get(rows[2].id)).toHaveLength(1);
+
+            const closed = await runRow();
+            expect(closed?.status).toBe('succeeded');
+            // One set considered, counted once however many attempts closed it.
+            expect(closed?.counts).toMatchObject({ considered: rows.length, judged: rows.length });
+
+            // WHERE IT RESUMED FROM, asserted on its own.
+            //
+            // Not a duplicate of the history assertions above: those hold even
+            // if the cursor is ignored entirely, because the queue also filters
+            // on "this run already judged this food" (below) and that filter
+            // alone keeps a restart-from-zero correct. What the cursor still
+            // buys is the WORK bound — a pass that restarts at 0 on every
+            // resume re-reads and re-filters the whole considered set, which on
+            // a 10,000-row catalog turns a resumable pass into quadratic work
+            // across its resumes. The report states where it began, so that is
+            // where the property is pinned.
+            expect(reports).toHaveLength(1);
+            expect((reports[0] as { invocation: { resumed: boolean; startIndex: number } }).invocation).toMatchObject({
+                resumed: true,
+                startIndex: 1,
+            });
+        });
+    });
+
+    describe('the verdict is computed from the facts the write locked (DB-F09)', () => {
+        it('re-judges on nutrients a concurrent writer committed after the set-wide read', async () => {
+            const row = rowAt(1);
+            const fake = inMemoryValidateDb([row], {
+                // Physically impossible once committed: the macro mass now
+                // exceeds the basis, which is a reject-tier check. The verdict
+                // from the older read said `published`.
+                raceAfterSetRead: (id, store) => {
+                    const current = store.get(id) as ValidationFoodRow;
+                    store.set(id, { ...current, protein_g: 500 });
+                },
+            });
+
+            const { outcome } = await run(fake);
+
+            expect(fake.statusWrites.get(row.id)).toEqual(['rejected']);
+            expect(outcome.counts.rejected).toBe(1);
+            expect(outcome.counts.published).toBe(0);
+            expect(outcome.unjudged).toBe(0);
+        });
+
+        it('re-applies the identity floor to the locked row', async () => {
+            const row = rowAt(1);
+            const fake = inMemoryValidateDb([row], {
+                raceAfterSetRead: (id, store) => {
+                    const current = store.get(id) as ValidationFoodRow;
+                    store.set(id, { ...current, identity_status: 'ambiguous' });
+                },
+            });
+
+            const { outcome } = await run(fake);
+
+            expect(fake.statusWrites.get(row.id)).toEqual(['quarantined']);
+            expect(outcome.counts.identityNotVerified).toBe(1);
+        });
+
+        it('leaves the row unjudged when the guarded write loses to a racing version bump', async () => {
+            const row = rowAt(1);
+            const fake = inMemoryValidateDb([row], {
+                // Committed between the locked re-read and the guarded write, so
+                // the predicate no longer matches: without it this judgement
+                // would land on facts that had already moved.
+                raceBeforeWrite: (id, store) => {
+                    const current = store.get(id) as ValidationFoodRow;
+                    store.set(id, { ...current, nutrition_version: current.nutrition_version + 1 });
+                },
+            });
+
+            const { outcome, reports } = await run(fake);
+
+            expect(outcome.counts.raced).toBe(1);
+            expect(outcome.unjudged).toBe(1);
+            expect(fake.statusWrites.has(row.id)).toBe(false);
+            expect(fake.historyWrites.has(row.id)).toBe(false);
+            expect((reports[0] as { skipped: { raced: string[] } }).skipped.raced).toEqual([row.source_key]);
+
+            // An incomplete judgement of its set is not a completed run: closing
+            // it succeeded would make the no-op above answer every later
+            // invocation and strand this row at its old status.
+            const closed = await runRow();
+            expect(closed?.status).toBe('failed');
+            expect(closed?.cursor).toMatchObject({ unjudged: [0] });
+        });
+
+        it('leaves the row unjudged when its identity group moved under the duplicate pass', async () => {
+            const row = rowAt(1);
+            const fake = inMemoryValidateDb([row], {
+                raceAfterSetRead: (id, store) => {
+                    const current = store.get(id) as ValidationFoodRow;
+                    store.set(id, { ...current, canonical_name: 'a different food entirely' });
+                },
+            });
+
+            const { outcome } = await run(fake);
+
+            expect(outcome.counts.identityGroupMoved).toBe(1);
+            expect(outcome.unjudged).toBe(1);
+            expect(fake.statusWrites.has(row.id)).toBe(false);
+        });
+
+        it('counts a row deleted under the pass rather than writing it', async () => {
+            const row = rowAt(1);
+            const fake = inMemoryValidateDb([row], { vanished: new Set([row.id]) });
+
+            const { outcome } = await run(fake);
+
+            expect(outcome.counts.vanished).toBe(1);
+            expect(outcome.unjudged).toBe(1);
+            expect(fake.statusWrites.has(row.id)).toBe(false);
+            expect(fake.historyWrites.has(row.id)).toBe(false);
+        });
+    });
+
+    /**
+     * THE WINDOW BETWEEN THE JUDGEMENT AND THE CURSOR (DB-F10).
+     *
+     * The status write, the validation record and the history commit in one
+     * transaction; the cursor that says "this food is done" is a separate write
+     * after it. These cases are the two ways a row ends up judged but not
+     * pointed past — a crash in that window, and a considered list the pass's own
+     * writes reshaped — and both assert the same thing: the food carries exactly
+     * one history entry for the run, because the entry is keyed by run and food
+     * rather than appended blindly.
+     */
+    describe('a row judged but not yet pointed past is not judged twice (DB-F10)', () => {
+        it('leaves one history entry when the pass dies AFTER the judgement commits', async () => {
+            const rows = [rowAt(1), rowAt(2)];
+
+            // The cursor write is what fails, so row 1's judgement is committed
+            // and durable while the pointer still says "start at 0" — precisely
+            // the interval an interruption test that fails at the next
+            // transaction never enters. The wrapper reaches into the transaction
+            // the cursor is written in, because that is where the write is.
+            const firstAttempt = inMemoryValidateDb(rows);
+            const reports: unknown[] = [];
+            let cursorWrites = 0;
+
+            const loseCursorWrites = (base: unknown): unknown =>
+                new Proxy(base as object, {
+                    get: (target, property) => {
+                        if (property === '$transaction') {
+                            const runner = Reflect.get(target, property) as (
+                                work: (tx: unknown) => Promise<unknown>,
+                            ) => Promise<unknown>;
+                            return (work: (tx: unknown) => Promise<unknown>) =>
+                                runner.call(target, (tx: unknown) => work(loseCursorWrites(tx)));
+                        }
+                        if (property === 'catalog_import_runs') {
+                            const model = Reflect.get(target, property) as Record<string, unknown>;
+                            return new Proxy(model, {
+                                get: (modelTarget, modelProperty) => {
+                                    if (modelProperty === 'updateMany') {
+                                        return async (args: { data?: Record<string, unknown> }) => {
+                                            if (args.data !== undefined && 'cursor' in args.data) {
+                                                cursorWrites += 1;
+                                                throw new Error('cursor write lost');
+                                            }
+                                            return (
+                                                Reflect.get(modelTarget, modelProperty) as (
+                                                    a: unknown,
+                                                ) => Promise<unknown>
+                                            ).call(modelTarget, args);
+                                        };
+                                    }
+                                    const value = Reflect.get(modelTarget, modelProperty);
+                                    return typeof value === 'function' ? value.bind(modelTarget) : value;
+                                },
+                            });
+                        }
+                        const value = Reflect.get(target, property);
+                        return typeof value === 'function' ? value.bind(target) : value;
+                    },
+                });
+
+            await expect(
+                runValidation({
+                    db: firstAttempt.db,
+                    runDb: loseCursorWrites(prisma),
+                    coveragePlan,
+                    options: scopedOptions,
+                    logger: silentLogger,
+                    now: () => FIXED_NOW,
+                    writeReport: (report: unknown) => {
+                        reports.push(report);
+                    },
+                } as unknown as RunValidationDeps),
+            ).rejects.toThrow('cursor write lost');
+
+            expect(cursorWrites).toBe(1);
+            // Judged and committed, with no cursor to show for it.
+            expect(firstAttempt.historyWrites.get(rows[0].id)).toHaveLength(1);
+            const open = await runRow();
+            expect(open?.cursor ?? null).toBeNull();
+
+            // The resumed attempt therefore reconsiders row 1 from index 0 — and
+            // must recognise, from the row's own record, that this run already
+            // judged it.
+            const resumed = inMemoryValidateDb([...firstAttempt.store.values()]);
+            const { outcome } = await run(resumed);
+
+            expect(outcome.alreadyCompleted).toBe(false);
+            expect(resumed.historyWrites.has(rows[0].id)).toBe(false);
+            expect(resumed.historyWrites.get(rows[1].id)).toHaveLength(1);
+        });
+
+        it('does not re-judge a row when its own rejection reshaped the considered list', async () => {
+            // Validation moves a candidate to `rejected`, and a rejected row is
+            // NOT in the status filter the considered list is built from. So the
+            // list — and every position in it — shifts as a result of the pass's
+            // own writes, which is what makes a saved index name a different
+            // food and sends an interrupted attempt down the restart branch.
+            const doomed = rowAt(1, { protein_g: 500 });
+            const healthy = rowAt(2);
+            const third = rowAt(3);
+
+            const first = inMemoryValidateDb([doomed, healthy, third], { failOnId: third.id });
+            await expect(run(first)).rejects.toThrow(`interrupted while judging ${third.id}`);
+
+            expect(first.statusWrites.get(doomed.id)).toEqual(['rejected']);
+            expect(first.historyWrites.get(healthy.id)).toHaveLength(1);
+
+            const open = await runRow();
+            const resumed = inMemoryValidateDb([...first.store.values()]);
+            const { outcome } = await run(resumed);
+
+            // The rejected row has dropped out of the considered set, so the
+            // remaining list is shorter and `healthy` now sits where `doomed`
+            // did. It must still not be judged again.
+            expect(resumed.historyWrites.has(healthy.id)).toBe(false);
+            expect(resumed.historyWrites.get(third.id)).toHaveLength(1);
+            expect(outcome.unjudged).toBe(0);
+        });
+    });
+
+    /**
+     * A CATALOG REFRESH IS NEW WORK (DB-F10).
+     *
+     * AAP §0.5.1: "a refresh re-runs validation". Keyed on the coverage plan
+     * alone, the pass that judged the catalog before the refresh would answer
+     * for the one after it, and catalog-release — which wants a validation newer
+     * than the last ingest — would wait on a run that could never happen.
+     */
+    describe('a newer catalog input is judged rather than answered for (DB-F10)', () => {
+        const fullOptions = validateOptions();
+
+        it('no-ops a re-run against the same catalog, and judges again after an import', async () => {
+            const row = rowAt(1);
+
+            // Nothing imported yet: the canonical key names an empty input.
+            const first = inMemoryValidateDb([row]);
+            const initial = await run(first, fullOptions);
+            expect(initial.outcome.alreadyCompleted).toBe(false);
+            expect(first.statusWrites.get(row.id)).toEqual(['published']);
+
+            // Same catalog, same plan: the completed-run no-op answers.
+            const repeat = inMemoryValidateDb([...first.store.values()]);
+            const again = await run(repeat, fullOptions);
+            expect(again.outcome.alreadyCompleted).toBe(true);
+            expect(repeat.statusWrites.size).toBe(0);
+
+            // An import lands. The graph it left is a different catalog, so the
+            // key is different and the rows are judged.
+            await prisma.catalog_import_runs.create({
+                data: {
+                    kind: 'usda_import',
+                    manifest_version: 'refresh-v1',
+                    status: 'succeeded',
+                    started_at: new Date('2026-09-14T11:00:00.000Z'),
+                    finished_at: new Date('2026-09-14T11:05:00.000Z'),
+                },
+            });
+
+            const afterRefresh = inMemoryValidateDb([...first.store.values()]);
+            const refreshed = await run(afterRefresh, fullOptions);
+
+            expect(refreshed.outcome.alreadyCompleted).toBe(false);
+            expect(refreshed.outcome.runId).not.toBe(initial.outcome.runId);
+            expect(afterRefresh.statusWrites.get(row.id)).toEqual(['published']);
+            // A second entry, because this is a second run — which is exactly
+            // what the audit trail should say.
+            expect(afterRefresh.historyWrites.get(row.id)).toHaveLength(1);
+        });
+    });
+
+    /**
+     * A ROW THAT PASSED, AND THEN CHANGED BEFORE THE PASS CAME BACK (DB-F10).
+     *
+     * The judgement-skipping rule is "this run already judged this food", so on
+     * its own it would let a row judged by attempt 1, then rewritten by an
+     * import, be skipped by attempt 2 and published on facts nobody checked.
+     * What stops that is a composition of three things, and these cases are
+     * that composition rather than any one of them:
+     *
+     *   * the exclusive stage lock means an import cannot land DURING a pass,
+     *     only between two invocations of it (proven against PostgreSQL below);
+     *   * an import that SUCCEEDED changes the catalog input, so the next
+     *     invocation claims a different key and judges the row afresh;
+     *   * an import that failed or was abandoned does NOT change the input — so
+     *     the row is skipped — but the release prerequisite refuses on that
+     *     ledger, so the stale judgement cannot be exported.
+     *
+     * Both halves are asserted, because the safety of the second depends
+     * entirely on the refusal and a test of the skip alone would read as a bug.
+     */
+    describe('a row whose facts changed after it passed (DB-F10)', () => {
+        const fullOptions = validateOptions();
+
+        /** The nutrients an import would write back, with the version bump that goes with them. */
+        const rewritten = (row: ValidationFoodRow): ValidationFoodRow => ({
+            ...row,
+            // Impossible per 100 g, so a pass that DOES judge these facts
+            // rejects the row — which is how "were they judged?" is read off
+            // the verdict rather than inferred from a call count.
+            protein_g: 500,
+            nutrition_version: row.nutrition_version + 1,
+            publication_status: 'candidate',
+        });
+
+        it('judges the new facts under a new run when the import that wrote them succeeded', async () => {
+            const row = rowAt(1);
+
+            const first = inMemoryValidateDb([row]);
+            const initial = await run(first, fullOptions);
+            expect(initial.outcome.alreadyCompleted).toBe(false);
+            expect(first.statusWrites.get(row.id)).toEqual(['published']);
+
+            // The import lands between the two invocations, succeeds, and
+            // leaves the food carrying nutrients the earlier verdict never saw.
+            await prisma.catalog_import_runs.create({
+                data: {
+                    kind: 'usda_import',
+                    manifest_version: 'rewrote-the-row',
+                    status: 'succeeded',
+                    started_at: new Date('2026-09-14T11:00:00.000Z'),
+                    finished_at: new Date('2026-09-14T11:05:00.000Z'),
+                },
+            });
+
+            const mutated = rewritten(first.store.get(row.id) as ValidationFoodRow);
+            const second = inMemoryValidateDb([mutated]);
+            const after = await run(second, fullOptions);
+
+            expect(after.outcome.alreadyCompleted).toBe(false);
+            expect(after.outcome.runId).not.toBe(initial.outcome.runId);
+            // Judged again, and on the NEW facts: 500 g of protein per 100 g
+            // fails the mass check, so the row is rejected rather than left
+            // published on the strength of the old verdict.
+            expect(second.historyWrites.get(row.id)).toHaveLength(1);
+            expect(second.statusWrites.get(row.id)).toEqual(['rejected']);
+        });
+
+        it('skips the row when the import left no completed record — and the release then refuses', async () => {
+            const row = rowAt(1);
+
+            const first = inMemoryValidateDb([row, rowAt(2)], { failOnId: rowAt(2).id });
+            await expect(run(first, fullOptions)).rejects.toThrow('interrupted while judging');
+            expect(first.statusWrites.get(row.id)).toEqual(['published']);
+
+            // A crashed import: the row is left 'running', so it names no
+            // completed graph and the catalog input is unchanged.
+            await prisma.catalog_import_runs.create({
+                data: {
+                    kind: 'usda_import',
+                    manifest_version: 'crashed-mid-write',
+                    status: 'running',
+                    started_at: new Date('2026-09-14T11:00:00.000Z'),
+                },
+            });
+
+            const mutated = rewritten(first.store.get(row.id) as ValidationFoodRow);
+            const second = inMemoryValidateDb([mutated, first.store.get(rowAt(2).id) as ValidationFoodRow]);
+            const resumed = await run(second, fullOptions);
+
+            // Same run, so the food this run already judged is skipped. Its
+            // rewritten facts therefore stand on the earlier verdict — which is
+            // safe only because of the assertion that follows.
+            expect(resumed.outcome.runId).toBe(
+                (
+                    await prisma.catalog_import_runs.findFirstOrThrow({
+                        where: {
+                            kind: 'validation',
+                            manifest_version: validationRunScope(
+                                coveragePlan.coveragePlanVersion,
+                                fullOptions,
+                                NO_CATALOG_INPUT,
+                            ),
+                        },
+                        select: { id: true },
+                    })
+                ).id,
+            );
+            expect(second.historyWrites.has(row.id)).toBe(false);
+
+            // THE GUARANTEE. That ledger cannot be released: the import is open,
+            // so the export would freeze a graph mid-write, and the refusal
+            // names the command that settles it.
+            const ledger = (await loadPipelineRuns(prisma as unknown as ReleaseDb)) as ReleaseRunRow[];
+            const reason = releaseStalenessReason(
+                ledger,
+                canonicalValidationRunKey(
+                    coveragePlan.coveragePlanVersion,
+                    catalogInputIdentity(ledger as CatalogInputRunRow[]),
+                ),
+                silentLogger,
+            );
+
+            expect(reason).not.toBeNull();
+            expect(reason).toContain('usda_import run for crashed-mid-write');
+            expect(reason).toContain('still marked running');
+            expect(reason).toContain('npm run catalog:import');
+        });
+    });
+
+    /**
+     * THE DEADLOCK A KEY THAT NAMES ITS INPUT WOULD OTHERWISE CREATE (DB-F10).
+     *
+     * Keying the run on the catalog input is what makes a refresh new work, and
+     * it has one consequence that has to be handled rather than accepted: a
+     * pass interrupted BEFORE an import can never be resumed, because
+     * re-running the stage now claims a different key and nothing will ever
+     * come back for the old one. Left alone that row is 'running' for good — and
+     * catalog-release refuses on any open mutating run, naming
+     * "npm run catalog:validate" as the way to settle it, which is advice that
+     * cannot work if the stage claims a different key every time.
+     *
+     * So the stage settles exactly those rows, and the refusal's remedy holds.
+     * The narrowness is the substance of the rule: settling a row for the
+     * CURRENT input would close a concurrent attempt's work, and settling one
+     * under another coverage plan would reach into a deliberate policy change.
+     */
+    describe('a pass settles validation runs that can never be resumed (DB-F10)', () => {
+        const fullOptions = validateOptions();
+        const currentKey = validationRunScope(coveragePlan.coveragePlanVersion, fullOptions, NO_CATALOG_INPUT);
+        const currentInputPart = validationRunKeyInputPart(currentKey);
+        const otherInputKey = canonicalValidationRunKey(
+            coveragePlan.coveragePlanVersion,
+            'usda_import:manifest-that-was-replaced:2026-01-01T00:00:00.000Z',
+        );
+
+        const openValidationRun = async (manifestVersion: string): Promise<string> =>
+            (await openRun(prisma, { kind: 'validation', manifestVersion })).id;
+
+        const statusOf = async (id: string): Promise<string> =>
+            (await prisma.catalog_import_runs.findFirstOrThrow({ where: { id }, select: { status: true } })).status;
+
+        const settle = async (): Promise<number> =>
+            settleUnresumableValidationRuns({
+                runDb: prisma,
+                coveragePlanVersion: coveragePlan.coveragePlanVersion,
+                currentInputPart,
+                logger: silentLogger,
+                now: () => FIXED_NOW,
+            });
+
+        it('closes an open run whose key names a catalog input that is gone', async () => {
+            const stranded = await openValidationRun(otherInputKey);
+
+            expect(await settle()).toBe(1);
+            expect(await statusOf(stranded)).toBe('failed');
+        });
+
+        it('records WHY on the run it closed, because nobody cancelled it', async () => {
+            const stranded = await openValidationRun(otherInputKey);
+            await settle();
+
+            const { log } = await prisma.catalog_import_runs.findFirstOrThrow({
+                where: { id: stranded },
+                select: { log: true },
+            });
+
+            // An operator meeting a 'failed' row with no explanation has no way
+            // to tell an abandoned pass from a settled one.
+            expect(JSON.stringify(log)).toContain('ValidationRunSupersededError');
+            expect(JSON.stringify(log)).toContain('can never be resumed');
+        });
+
+        it('leaves an open run for the CURRENT input alone, which is resumable work or a live attempt', async () => {
+            const mine = await openValidationRun(currentKey);
+
+            expect(await settle()).toBe(0);
+            expect(await statusOf(mine)).toBe('running');
+        });
+
+        it('leaves an open run under a different coverage plan alone', async () => {
+            const otherPlan = await openValidationRun(
+                canonicalValidationRunKey('some-other-plan-version', 'usda_import:x:2026-01-01T00:00:00.000Z'),
+            );
+
+            expect(await settle()).toBe(0);
+            expect(await statusOf(otherPlan)).toBe('running');
+        });
+
+        it('touches only OPEN runs: a settled one for a gone input keeps its outcome', async () => {
+            const done = await openValidationRun(otherInputKey);
+            await finishRun(prisma, done, 'succeeded', { counts: { considered: 3 } });
+
+            expect(await settle()).toBe(0);
+            expect(await statusOf(done)).toBe('succeeded');
+        });
+
+        it('settles every stranded run, not just the first', async () => {
+            const first = await openValidationRun(otherInputKey);
+            const second = await openValidationRun(
+                canonicalValidationRunKey(
+                    coveragePlan.coveragePlanVersion,
+                    'ai_generation:another-replaced-input:2026-02-01T00:00:00.000Z',
+                ),
+            );
+
+            expect(await settle()).toBe(2);
+            expect(await statusOf(first)).toBe('failed');
+            expect(await statusOf(second)).toBe('failed');
+        });
+
+        it('runs as part of an ordinary pass, so the release refusal names a remedy that works', async () => {
+            const stranded = await openValidationRun(otherInputKey);
+
+            // The refusal an operator is looking at before doing anything.
+            const before = (await loadPipelineRuns(prisma as unknown as ReleaseDb)) as ReleaseRunRow[];
+            expect(
+                releaseStalenessReason(
+                    before,
+                    canonicalValidationRunKey(
+                        coveragePlan.coveragePlanVersion,
+                        catalogInputIdentity(before as CatalogInputRunRow[]),
+                    ),
+                    silentLogger,
+                ),
+            ).toContain('npm run catalog:validate');
+
+            // Which is exactly this — no flag, no argument, the stage as the
+            // message tells them to run it.
+            const fake = inMemoryValidateDb([rowAt(1)]);
+            const { outcome } = await run(fake, fullOptions);
+
+            expect(outcome.alreadyCompleted).toBe(false);
+            expect(await statusOf(stranded)).toBe('failed');
+
+            // And the open-run refusal is gone: what remains is this pass's own
+            // succeeded run, which is the canonical one for this catalog.
+            const after = (await loadPipelineRuns(prisma as unknown as ReleaseDb)) as ReleaseRunRow[];
+            expect(
+                releaseStalenessReason(
+                    after,
+                    canonicalValidationRunKey(
+                        coveragePlan.coveragePlanVersion,
+                        catalogInputIdentity(after as CatalogInputRunRow[]),
+                    ),
+                    silentLogger,
+                ),
+            ).toBeNull();
+        });
+    });
+});
+
+
+/**
+ * THE STAGE LOCK: WHAT ONE PROCESS MAY DO TO THE CATALOG GRAPH WHILE ANOTHER IS
+ * WRITING IT (DB-F09).
+ *
+ * The run claim already stopped two processes from sharing one run row, and
+ * `checkpoint.ts`'s own THE CLAIM said what it could not do: the claim lock is
+ * transaction-scoped, so it "does NOT grant exclusive processing for the run's
+ * lifetime" — and no entry point took a lock that did. Two stages could
+ * therefore write the graph at once under two different run rows, which is the
+ * window every other part of DB-F09 is a symptom of.
+ *
+ * The decisions are pure and are checked with no database at all. Exclusion
+ * itself is not a decision but a PostgreSQL behaviour, so it is checked against
+ * the real test database: a fake that returned `false` from `try_lock` would
+ * prove only that the fake was written to.
+ */
+describe('the stage lock (DB-F09)', () => {
+    describe('the mode each stage takes the graph in', () => {
+        it.each(['usda_import', 'ai_generation', 'validation', 'release_load'] as const)(
+            '%s writes the graph, so it takes the lock exclusively',
+            (stage) => {
+                expect(catalogStageLockMode(stage)).toBe('exclusive');
+            },
+        );
+
+        it('an export reads the graph, so it takes the lock shared and two exports can run together', () => {
+            expect(catalogStageLockMode('release')).toBe('shared');
+        });
+
+        it('assumes an unknown stage writes, which is the safe direction', () => {
+            expect(catalogStageLockMode('a_stage_this_table_has_not_heard_of' as never)).toBe('exclusive');
+        });
+
+        it('states a mode for every stage name, so no stage can reach the graph unclaimed', () => {
+            const stages: readonly string[] = ['usda_import', 'ai_generation', 'validation', 'release_load', 'release'];
+            expect(Object.keys(CATALOG_STAGE_LOCK_MODES).sort()).toEqual([...stages].sort());
+        });
+    });
+
+    describe('the advisory functions a mode maps onto', () => {
+        it('pairs the exclusive try-lock with the exclusive unlock', () => {
+            expect(catalogStageLockFunctions('exclusive')).toEqual({
+                tryLock: 'pg_try_advisory_lock',
+                unlock: 'pg_advisory_unlock',
+            });
+        });
+
+        it('pairs the shared try-lock with the SHARED unlock', () => {
+            // Not interchangeable: `pg_advisory_unlock` against a lock taken
+            // with the shared function releases nothing and only warns, so a
+            // mismatched pair would hold the graph until the process exited.
+            expect(catalogStageLockFunctions('shared')).toEqual({
+                tryLock: 'pg_try_advisory_lock_shared',
+                unlock: 'pg_advisory_unlock_shared',
+            });
+        });
+
+        it('never blocks: every acquisition goes through a try-lock', () => {
+            for (const mode of ['exclusive', 'shared'] as const) {
+                expect(catalogStageLockFunctions(mode).tryLock.startsWith('pg_try_')).toBe(true);
+            }
+        });
+    });
+
+    describe('the key every stage contends on', () => {
+        it('is one class id and one object name for the whole graph', () => {
+            expect(catalogStageLockKey()).toEqual({ classId: 0x434154, objectName: 'catalog-graph' });
+        });
+
+        it('takes no stage argument, because a per-stage key would not exclude anything', () => {
+            expect(catalogStageLockKey.length).toBe(0);
+        });
+    });
+
+    describe('the bounds on how long acquisition may wait', () => {
+        it.each([
+            ['undefined', undefined],
+            ['zero', 0],
+            ['negative', -1],
+            ['NaN, which compares false against every bound', Number.NaN],
+        ])('refuses at once for %s', (_label, waitMs) => {
+            expect(normalizeStageLockWaitMs(waitMs as number | undefined)).toBe(0);
+        });
+
+        it('honours a requested wait', () => {
+            expect(normalizeStageLockWaitMs(1_500)).toBe(1_500);
+        });
+
+        it('floors a fractional wait to whole milliseconds', () => {
+            expect(normalizeStageLockWaitMs(1_500.9)).toBe(1_500);
+        });
+
+        it('caps an hour, and refuses to honour Infinity as "wait forever"', () => {
+            expect(normalizeStageLockWaitMs(Number.POSITIVE_INFINITY)).toBe(3_600_000);
+            expect(normalizeStageLockWaitMs(9_999_999)).toBe(3_600_000);
+        });
+
+        it.each([
+            ['undefined', undefined],
+            ['zero, which would be a busy loop', 0],
+            ['a sub-millisecond interval', 0.4],
+            ['Infinity', Number.POSITIVE_INFINITY],
+            ['NaN', Number.NaN],
+        ])('falls back to the default poll interval for %s', (_label, pollIntervalMs) => {
+            expect(normalizeStageLockPollMs(pollIntervalMs as number | undefined)).toBe(500);
+        });
+
+        it('honours a requested poll interval', () => {
+            expect(normalizeStageLockPollMs(50)).toBe(50);
+        });
+    });
+
+    describe('acquisition drives the injected connection', () => {
+        interface FakeConnection extends CatalogStageLockConnection {
+            readonly statements: { text: string; values: readonly unknown[] }[];
+            readonly ended: () => number;
+        }
+
+        /** @param results one entry per try-lock attempt, in order. */
+        const fakeConnection = (results: readonly (boolean | null)[]): FakeConnection => {
+            const statements: { text: string; values: readonly unknown[] }[] = [];
+            let attempt = 0;
+            let ends = 0;
+
+            return {
+                statements,
+                ended: () => ends,
+                connect: async () => undefined,
+                query: async <TRow>(text: string, values?: readonly unknown[]) => {
+                    statements.push({ text, values: values ?? [] });
+                    if (text.includes('pg_try_advisory_lock')) {
+                        const locked = results[Math.min(attempt, results.length - 1)] ?? null;
+                        attempt += 1;
+                        return { rows: [{ locked }] as unknown as TRow[] };
+                    }
+                    return { rows: [{ released: true }] as unknown as TRow[] };
+                },
+                end: async () => {
+                    ends += 1;
+                },
+            };
+        };
+
+        it('binds the class id and the name, and computes the object id with hashtext IN PostgreSQL', async () => {
+            const connection = fakeConnection([true]);
+            const lock = await acquireCatalogStageLock({
+                stage: 'usda_import',
+                openConnection: () => connection,
+            });
+
+            const [attempt] = connection.statements;
+            expect(attempt.text).toContain('pg_try_advisory_lock($1::int4, hashtext($2::text))');
+            // Two arguments, not one: the one-argument advisory keyspace is
+            // where the request path's per-user lock lives, and an hours-long
+            // stage lock colliding with it would block a user's own write.
+            expect(attempt.values).toEqual([0x434154, 'catalog-graph']);
+            expect(lock.stage).toBe('usda_import');
+            expect(lock.mode).toBe('exclusive');
+
+            await lock.release();
+        });
+
+        it('releases with the matching function and closes the connection', async () => {
+            const connection = fakeConnection([true]);
+            const lock = await acquireCatalogStageLock({ stage: 'release', openConnection: () => connection });
+
+            expect(lock.mode).toBe('shared');
+            await lock.release();
+
+            expect(connection.statements.some(({ text }) => text.includes('pg_advisory_unlock_shared'))).toBe(true);
+            expect(connection.ended()).toBe(1);
+        });
+
+        it('is safe to release twice, and unlocks only once', async () => {
+            const connection = fakeConnection([true]);
+            const lock = await acquireCatalogStageLock({ stage: 'validation', openConnection: () => connection });
+
+            await lock.release();
+            await expect(lock.release()).resolves.toBeUndefined();
+
+            const unlocks = connection.statements.filter(({ text }) => text.includes('pg_advisory_unlock'));
+            expect(unlocks).toHaveLength(1);
+            expect(connection.ended()).toBe(1);
+        });
+
+        it('refuses at once when the lock is held and the default wait applies', async () => {
+            const connection = fakeConnection([false]);
+            const sleep = jest.fn(async () => undefined);
+
+            await expect(
+                acquireCatalogStageLock({ stage: 'validation', openConnection: () => connection, sleep }),
+            ).rejects.toMatchObject({ code: 'catalog_stage_locked' });
+
+            // One attempt, no sleep, and the connection closed: a refused lock
+            // must not leave a session behind.
+            expect(connection.statements.filter(({ text }) => text.includes('pg_try_advisory_lock'))).toHaveLength(1);
+            expect(sleep).not.toHaveBeenCalled();
+            expect(connection.ended()).toBe(1);
+        });
+
+        it('throws CheckpointError, so the entry point reports a code rather than matching a message', async () => {
+            const connection = fakeConnection([false]);
+
+            const error = await acquireCatalogStageLock({
+                stage: 'usda_import',
+                openConnection: () => connection,
+            }).catch((thrown: unknown) => thrown);
+
+            expect(error).toBeInstanceOf(CheckpointError);
+            expect((error as CheckpointError).code).toBe('catalog_stage_locked');
+        });
+
+        it('polls while a bounded wait is left, then gives up on the deadline', async () => {
+            const connection = fakeConnection([false, false, true]);
+            let clock = 0;
+            const sleep = jest.fn(async (ms: number) => {
+                clock += ms;
+            });
+
+            const lock = await acquireCatalogStageLock({
+                stage: 'validation',
+                waitMs: 1_000,
+                pollIntervalMs: 100,
+                openConnection: () => connection,
+                now: () => new Date(clock),
+                sleep,
+            });
+
+            expect(sleep).toHaveBeenCalledTimes(2);
+            expect(sleep).toHaveBeenLastCalledWith(100);
+            await lock.release();
+        });
+
+        it('stops on the deadline rather than polling forever against a clock that never moves', async () => {
+            // A fake clock that does not advance is exactly the case an
+            // elapsed-time deadline alone cannot terminate, so the attempt
+            // count is the second bound.
+            const connection = fakeConnection([false]);
+            const sleep = jest.fn(async () => undefined);
+
+            await expect(
+                acquireCatalogStageLock({
+                    stage: 'validation',
+                    waitMs: 1_000,
+                    pollIntervalMs: 100,
+                    openConnection: () => connection,
+                    now: () => new Date(0),
+                    sleep,
+                }),
+            ).rejects.toMatchObject({ code: 'catalog_stage_locked' });
+
+            expect(sleep.mock.calls.length).toBeLessThanOrEqual(11);
+            expect(connection.ended()).toBe(1);
+        });
+
+        it('treats a null answer from the lock function as "not acquired"', async () => {
+            const connection = fakeConnection([null]);
+
+            await expect(
+                acquireCatalogStageLock({ stage: 'validation', openConnection: () => connection }),
+            ).rejects.toMatchObject({ code: 'catalog_stage_locked' });
+        });
+
+        it('closes the connection when connecting fails, and reports the connection error', async () => {
+            const connection = fakeConnection([true]);
+            const failing: CatalogStageLockConnection = {
+                ...connection,
+                connect: async () => {
+                    throw new Error('connection refused');
+                },
+            };
+
+            await expect(
+                acquireCatalogStageLock({ stage: 'validation', openConnection: () => failing }),
+            ).rejects.toThrow('connection refused');
+        });
+    });
+
+    describe('withCatalogStageLock', () => {
+        const alwaysAcquires = (): CatalogStageLockConnection & { unlocks: () => number } => {
+            let unlocks = 0;
+            return {
+                unlocks: () => unlocks,
+                connect: async () => undefined,
+                query: async <TRow>(text: string) => {
+                    if (text.includes('pg_advisory_unlock')) {
+                        unlocks += 1;
+                    }
+                    return { rows: [{ locked: true, released: true }] as unknown as TRow[] };
+                },
+                end: async () => undefined,
+            };
+        };
+
+        it('runs the work while holding the lock and returns its value', async () => {
+            const connection = alwaysAcquires();
+            const held: string[] = [];
+
+            const result = await withCatalogStageLock(
+                { stage: 'usda_import', openConnection: () => connection },
+                async (lock) => {
+                    held.push(`${lock.stage}:${lock.mode}`);
+                    return 'imported';
+                },
+            );
+
+            expect(result).toBe('imported');
+            expect(held).toEqual(['usda_import:exclusive']);
+            expect(connection.unlocks()).toBe(1);
+        });
+
+        it('releases the lock when the work throws, so a failed stage does not hold the graph', async () => {
+            const connection = alwaysAcquires();
+
+            await expect(
+                withCatalogStageLock({ stage: 'validation', openConnection: () => connection }, async () => {
+                    throw new Error('the stage failed');
+                }),
+            ).rejects.toThrow('the stage failed');
+
+            expect(connection.unlocks()).toBe(1);
+        });
+
+        it('does not run the work at all when the lock is refused', async () => {
+            const refuses: CatalogStageLockConnection = {
+                connect: async () => undefined,
+                query: async <TRow>() => ({ rows: [{ locked: false }] as unknown as TRow[] }),
+                end: async () => undefined,
+            };
+            const work = jest.fn(async () => 'should not run');
+
+            await expect(
+                withCatalogStageLock({ stage: 'validation', openConnection: () => refuses }, work),
+            ).rejects.toMatchObject({ code: 'catalog_stage_locked' });
+
+            expect(work).not.toHaveBeenCalled();
+        });
+    });
+
+    /**
+     * EXCLUSION ITSELF, against PostgreSQL.
+     *
+     * Everything above drives an injected connection, which can prove what
+     * statements are issued but not that the database refuses the second
+     * caller. These take the real lock on the test database. They are the
+     * WIRING case the file's own rules allow a database for: the guarantee is
+     * PostgreSQL's, and no fake can stand in for it.
+     */
+    describe('exclusion, against PostgreSQL', () => {
+        const held: { release(): Promise<void> }[] = [];
+
+        const take = async (
+            stage: 'usda_import' | 'validation' | 'release' | 'release_load',
+        ): Promise<{ release(): Promise<void> }> => {
+            const lock = await acquireCatalogStageLock({ stage });
+            held.push(lock);
+            return lock;
+        };
+
+        const refused = async (stage: 'usda_import' | 'validation' | 'release'): Promise<unknown> =>
+            acquireCatalogStageLock({ stage }).catch((error: unknown) => error);
+
+        afterEach(async () => {
+            while (held.length > 0) {
+                await held.pop()?.release();
+            }
+        });
+
+        const advisoryLockCount = async (): Promise<number> => {
+            // `count(*)::int` rather than the bigint PostgreSQL returns by
+            // default: the build targets below ES2020, where a BigInt literal
+            // is not available to compare against.
+            const rows = await prisma.$queryRaw<{ count: number }[]>`
+                SELECT count(*)::int AS count
+                FROM pg_locks
+                WHERE locktype = 'advisory' AND classid = ${0x434154}::int4
+            `;
+            return Number(rows[0]?.count ?? 0);
+        };
+
+        it('refuses a second mutating stage while one holds the graph exclusively', async () => {
+            await take('usda_import');
+
+            expect(await refused('validation')).toMatchObject({ code: 'catalog_stage_locked' });
+        });
+
+        it('refuses an export while a mutating stage is writing the graph', async () => {
+            await take('validation');
+
+            expect(await refused('release')).toMatchObject({ code: 'catalog_stage_locked' });
+        });
+
+        it('lets two exports read the graph at the same time', async () => {
+            await take('release');
+
+            const second = await acquireCatalogStageLock({ stage: 'release' });
+            held.push(second);
+            expect(second.mode).toBe('shared');
+        });
+
+        it('refuses a mutating stage while an export is reading the graph', async () => {
+            await take('release');
+
+            expect(await refused('usda_import')).toMatchObject({ code: 'catalog_stage_locked' });
+        });
+
+        it('frees the graph when the holder releases', async () => {
+            const first = await acquireCatalogStageLock({ stage: 'usda_import' });
+            await first.release();
+
+            const second = await acquireCatalogStageLock({ stage: 'validation' });
+            held.push(second);
+            expect(second.stage).toBe('validation');
+        });
+
+        it('leaves no advisory lock behind once every holder has released', async () => {
+            const lock = await acquireCatalogStageLock({ stage: 'validation' });
+            expect(await advisoryLockCount()).toBeGreaterThan(0);
+
+            await lock.release();
+            expect(await advisoryLockCount()).toBe(0);
+        });
+
+        it('does not contend with the request path, which locks in the ONE-argument keyspace', async () => {
+            // §0.5.1's per-user lock is `pg_advisory_xact_lock(hashtext(...))`.
+            // The two keyspaces are distinct in PostgreSQL, and this is what
+            // keeps an hours-long catalog stage from blocking a user's write
+            // through a hashtext collision.
+            await take('usda_import');
+
+            const granted = await prisma.$queryRaw<{ locked: boolean }[]>`
+                SELECT pg_try_advisory_lock(hashtext('catalog-graph')) AS locked
+            `;
+            expect(granted[0]?.locked).toBe(true);
+            await prisma.$queryRaw`SELECT pg_advisory_unlock(hashtext('catalog-graph'))`;
+        });
+
+        it('surfaces the connection failure when the lock cannot reach a database, never "locked"', async () => {
+            const error = await acquireCatalogStageLock({
+                stage: 'validation',
+                connectionString: 'postgresql://soh:soh@127.0.0.1:1/definitely-not-there',
+            }).catch((thrown: unknown) => thrown);
+
+            // The driver's own error, reported as itself. Reading an
+            // unreachable database as `catalog_stage_locked` would tell an
+            // operator to go and find a holder that does not exist. The class
+            // is the driver's, so the assertion is on the substance rather than
+            // on `instanceof Error`, which compares unequal across realms.
+            expect(typeof (error as { message?: unknown }).message).toBe('string');
+            expect((error as { code?: string }).code).not.toBe('catalog_stage_locked');
+        });
+
+        it('refuses a lock it has no connection string for, rather than letting the driver choose one', async () => {
+            // `new Client({connectionString: undefined})` falls back to the
+            // libpq environment and can connect somewhere nobody named, which
+            // for an exclusive catalog-graph lock is the worst possible
+            // silent success.
+            const error = await acquireCatalogStageLock({
+                stage: 'validation',
+                connectionString: '   ',
+            }).catch((thrown: unknown) => thrown);
+
+            expect(error).toBeInstanceOf(CheckpointError);
+            expect((error as CheckpointError).code).toBe('catalog_stage_lock_unavailable');
+        });
+    });
+});
+
+/**
+ * THE EXPORT'S OWN REFUSAL (DB-F09, NEW-01).
+ *
+ * The shared lock keeps a live mutator from overlapping an export. It cannot
+ * speak for two other situations, and both would ship a catalog nobody has
+ * fully judged:
+ *
+ *   * a stage that CRASHED and left its run row marked running — that work is
+ *     genuinely half-done; and
+ *   * a validation row that is not the canonical one for THIS catalog. A run key
+ *     names the coverage plan and the catalog input it judged, and a restricted
+ *     pass carries a `+scope:` suffix precisely because it judged a fraction of
+ *     the plan. Choosing "the newest validation row" lets an old full pass, then
+ *     an import, then a category-only pass read as ready — the release then
+ *     freezes a catalog most of which was judged before the import touched it,
+ *     stamped with the current coverage plan version.
+ *
+ * Pure over the ledger rows, so every rule is checkable with no database.
+ */
+/**
+ * WHICH ROWS THE REFUSAL GETS TO SEE (NEW-01).
+ *
+ * The rules below are pure over the rows they are handed, so a row the query
+ * filters out is a rule that cannot fire. A FAILED validation attempt of the
+ * current catalog is the most important row in the ledger — without it, an
+ * earlier success for the same key reads as "validation passed" — so the read
+ * is asserted against the real table rather than assumed.
+ */
+describe('loadPipelineRuns (NEW-01)', () => {
+    const MARKER = 'load-pipeline-runs-test';
+
+    const clear = async (): Promise<void> => {
+        await prisma.catalog_import_runs.deleteMany({ where: { manifest_version: { startsWith: MARKER } } });
+    };
+
+    beforeEach(clear);
+    afterEach(clear);
+
+    it('returns failed runs as well as succeeded and running ones', async () => {
+        const seed = async (kind: string, status: string, finishedAt: Date | null): Promise<void> => {
+            await prisma.catalog_import_runs.create({
+                data: {
+                    kind,
+                    manifest_version: `${MARKER}:${kind}:${status}`,
+                    status,
+                    started_at: new Date('2026-09-14T08:00:00.000Z'),
+                    finished_at: finishedAt,
+                },
+            });
+        };
+
+        await seed('validation', 'succeeded', new Date('2026-09-14T09:00:00.000Z'));
+        await seed('validation', 'failed', new Date('2026-09-14T10:00:00.000Z'));
+        await seed('usda_import', 'running', null);
+
+        const rows = (await loadPipelineRuns(prisma as unknown as ReleaseDb)).filter((row) =>
+            row.manifest_version.startsWith(MARKER),
+        );
+
+        expect(rows.map((row) => `${row.kind}:${row.status}`).sort()).toEqual([
+            'usda_import:running',
+            'validation:failed',
+            'validation:succeeded',
+        ]);
+    });
+});
+
+describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
+    const at = (iso: string): Date => new Date(iso);
+
+    const INPUT_AT = '2026-09-14T08:00:00.000Z';
+    const PLAN = 'v1';
+
+    /** The ledger row for the ingest that produced the catalog being released. */
+    const ingestRow = (overrides: Partial<ReleaseRunRow> = {}): ReleaseRunRow => ({
+        kind: 'usda_import',
+        manifest_version: 'v1',
+        status: 'succeeded',
+        finished_at: at(INPUT_AT),
+        ...overrides,
+    });
+
+    const run = (overrides: Partial<ReleaseRunRow> = {}): ReleaseRunRow => ({
+        kind: 'validation',
+        manifest_version: 'v1',
+        status: 'succeeded',
+        finished_at: at('2026-09-14T09:00:00.000Z'),
+        ...overrides,
+    });
+
+    /**
+     * Resolves the expected canonical key from the ledger exactly as runRelease
+     * does, so these cases exercise the pairing rather than a key written down
+     * beside them.
+     */
+    const expectedKeyFor = (runs: readonly ReleaseRunRow[]): string =>
+        canonicalValidationRunKey(PLAN, catalogInputIdentity(runs as CatalogInputRunRow[]));
+
+    const decide = (runs: readonly ReleaseRunRow[]): string | null =>
+        releaseStalenessReason(runs, expectedKeyFor(runs), silentLogger);
+
+    /** The canonical validation row for a ledger — the one that should satisfy the prerequisite. */
+    const canonicalValidation = (runs: readonly ReleaseRunRow[], overrides: Partial<ReleaseRunRow> = {}): ReleaseRunRow =>
+        run({ manifest_version: expectedKeyFor(runs), ...overrides });
+
+    it('releases a database whose canonical validation is the last thing that ran', () => {
+        const ledger = [ingestRow()];
+
+        expect(decide([...ledger, canonicalValidation(ledger)])).toBeNull();
+    });
+
+    it('releases a validated database with no ingest of its own (a loaded bundle)', () => {
+        const ledger: ReleaseRunRow[] = [];
+
+        expect(decide([...ledger, canonicalValidation(ledger)])).toBeNull();
+    });
+
+    it.each(['usda_import', 'ai_generation', 'validation', 'release_load'])(
+        'refuses while a %s run is still marked running',
+        (kind) => {
+            const ledger = [ingestRow()];
+            const reason = decide([
+                ...ledger,
+                canonicalValidation(ledger),
+                run({ kind, status: 'running', finished_at: null }),
+            ]);
+
+            expect(reason).not.toBeNull();
+            expect(reason).toContain(kind);
+            expect(reason).toContain('still marked running');
+        },
+    );
+
+    it.each([
+        ['usda_import', 'npm run catalog:import'],
+        ['ai_generation', 'npm run catalog:generate'],
+        ['validation', 'npm run catalog:validate'],
+        ['release_load', 'npm run catalog:load -- --release <release>'],
+    ])('names the command that settles an abandoned %s run', (kind, command) => {
+        const reason = decide([run({ kind, status: 'running', finished_at: null })]);
+
+        // Without a stated remedy an abandoned row blocks every future release
+        // and the operator's only visible option is editing the table by hand.
+        expect(reason).toContain(command);
+    });
+
+    it('checks the open run BEFORE everything else, because a moving graph makes the rest unanswerable', () => {
+        const ledger = [ingestRow()];
+        const reason = decide([
+            ...ledger,
+            canonicalValidation(ledger),
+            run({ kind: 'ai_generation', status: 'running', finished_at: null }),
+        ]);
+
+        expect(reason).toContain('still marked running');
+    });
+
+    it('names the same run every time, whatever order the ledger came back in', () => {
+        const open = [
+            run({ kind: 'validation', manifest_version: 'v2', status: 'running', finished_at: null }),
+            run({ kind: 'usda_import', manifest_version: 'v1', status: 'running', finished_at: null }),
+            run({ kind: 'usda_import', manifest_version: 'v0', status: 'running', finished_at: null }),
+        ];
+
+        const forwards = releaseStalenessReason(open, 'irrelevant', silentLogger);
+        const backwards = releaseStalenessReason([...open].reverse(), 'irrelevant', silentLogger);
+
+        expect(forwards).toBe(backwards);
+        expect(forwards).toContain('usda_import run for v0');
+        expect(forwards).toContain('3 mutating runs are open');
+    });
+
+    it('refuses a database nothing has ever judged', () => {
+        expect(decide([ingestRow()])).toContain('no successful catalog:validate run is on record');
+    });
+
+    describe('only the canonical validation for this catalog counts (NEW-01)', () => {
+        it('refuses when the only validation is a category-restricted pass', () => {
+            const ledger = [ingestRow()];
+            const scopedKey = `${expectedKeyFor(ledger)}+scope:abc123abc123abc1`;
+
+            const reason = decide([...ledger, run({ manifest_version: scopedKey })]);
+
+            expect(reason).not.toBeNull();
+            expect(reason).toContain('restricted run');
+            expect(reason).toContain('only part of the plan');
+            expect(reason).toContain('no --category');
+        });
+
+        it('refuses the exact sequence that used to pass: old full pass, newer import, category-only pass', () => {
+            // The reproduction from the review. The category-only row is the
+            // NEWEST validation and is newer than the import, so an
+            // order-only rule sees nothing wrong.
+            const oldIngest = ingestRow({ finished_at: at('2026-09-10T08:00:00.000Z') });
+            const oldValidation = run({
+                manifest_version: canonicalValidationRunKey(PLAN, catalogInputIdentity([oldIngest] as CatalogInputRunRow[])),
+                finished_at: at('2026-09-10T09:00:00.000Z'),
+            });
+            const newIngest = ingestRow({ manifest_version: 'v2', finished_at: at('2026-09-12T08:00:00.000Z') });
+            const ledger = [oldIngest, oldValidation, newIngest];
+            const categoryOnly = run({
+                manifest_version: `${expectedKeyFor(ledger)}+scope:0123456789abcdef`,
+                finished_at: at('2026-09-13T09:00:00.000Z'),
+            });
+
+            const reason = decide([...ledger, categoryOnly]);
+
+            expect(reason).not.toBeNull();
+            expect(reason).toContain('restricted run');
+        });
+
+        it('refuses when the only full pass judged a different catalog input', () => {
+            const oldIngest = ingestRow({ finished_at: at('2026-09-10T08:00:00.000Z') });
+            const oldValidation = run({
+                manifest_version: canonicalValidationRunKey(PLAN, catalogInputIdentity([oldIngest] as CatalogInputRunRow[])),
+                finished_at: at('2026-09-10T09:00:00.000Z'),
+            });
+            const newIngest = ingestRow({ manifest_version: 'v2', finished_at: at('2026-09-12T08:00:00.000Z') });
+
+            const reason = decide([oldIngest, oldValidation, newIngest]);
+
+            expect(reason).not.toBeNull();
+            expect(reason).toContain('different catalog input');
+        });
+
+        it('says a pre-identity run is SILENT about the catalog, not that an import has run since', () => {
+            // A validation row recorded before the key named the input. The
+            // remedy is one more validation run; telling the operator an import
+            // has happened when none has would be a lie the tool tells about
+            // its own history.
+            const ledger = [ingestRow()];
+            const reason = decide([...ledger, run({ manifest_version: PLAN })]);
+
+            expect(reason).not.toBeNull();
+            expect(reason).toContain('predate validation runs naming the catalog');
+            expect(reason).not.toContain('an import or load has run since');
+            expect(reason).toContain('no-op thereafter');
+        });
+
+        it('refuses a full pass taken under an older coverage plan, and says so precisely', () => {
+            const ledger = [ingestRow()];
+            const olderPlan = canonicalValidationRunKey(
+                'v0',
+                catalogInputIdentity(ledger as CatalogInputRunRow[]),
+            );
+
+            const reason = decide([...ledger, run({ manifest_version: olderPlan })]);
+
+            expect(reason).not.toBeNull();
+            // Same catalog, different bounds — a different remedy from "an
+            // import has run since", so the message must not say that.
+            expect(reason).toContain('different coverage plan');
+            expect(reason).not.toContain('an import or load has run since');
+        });
+
+        it('names the key it wanted, so the operator can see which run is missing', () => {
+            const ledger = [ingestRow()];
+
+            expect(decide([...ledger, run({ manifest_version: `${expectedKeyFor(ledger)}+scope:aaaaaaaaaaaaaaaa` })])).toContain(
+                expectedKeyFor(ledger),
+            );
+        });
+    });
+
+    describe('a later failed attempt of the canonical run is not hidden (NEW-01)', () => {
+        it('refuses when the canonical run failed after succeeding', () => {
+            const ledger = [ingestRow()];
+            const key = expectedKeyFor(ledger);
+            const reason = decide([
+                ...ledger,
+                run({ manifest_version: key, status: 'succeeded', finished_at: at('2026-09-14T09:00:00.000Z') }),
+                run({ manifest_version: key, status: 'failed', finished_at: at('2026-09-14T10:00:00.000Z') }),
+            ]);
+
+            expect(reason).not.toBeNull();
+            expect(reason).toContain('FAILED');
+            expect(reason).toContain('kept the status they');
+            expect(reason).toContain('catalog:validate again');
+        });
+
+        it('releases when the failure came BEFORE the success, which is a retry that worked', () => {
+            const ledger = [ingestRow()];
+            const key = expectedKeyFor(ledger);
+
+            expect(
+                decide([
+                    ...ledger,
+                    run({ manifest_version: key, status: 'failed', finished_at: at('2026-09-14T09:00:00.000Z') }),
+                    run({ manifest_version: key, status: 'succeeded', finished_at: at('2026-09-14T10:00:00.000Z') }),
+                ]),
+            ).toBeNull();
+        });
+
+        it('ignores a failed attempt of a DIFFERENT run, which says nothing about this catalog', () => {
+            const ledger = [ingestRow()];
+            const key = expectedKeyFor(ledger);
+
+            expect(
+                decide([
+                    ...ledger,
+                    run({ manifest_version: key, status: 'succeeded', finished_at: at('2026-09-14T09:00:00.000Z') }),
+                    run({
+                        manifest_version: `${key}+scope:ffffffffffffffff`,
+                        status: 'failed',
+                        finished_at: at('2026-09-14T10:00:00.000Z'),
+                    }),
+                ]),
+            ).toBeNull();
+        });
+    });
+
+    it('still refuses when an ingest finished after the canonical validation', () => {
+        // Belt and braces: the key check above already refuses, because a newer
+        // ingest changes the expected key. This states the ordering in the terms
+        // an operator recognises for the case where it is the identity that ties.
+        const ledger = [ingestRow()];
+        const key = expectedKeyFor(ledger);
+        const reason = releaseStalenessReason(
+            [
+                run({ manifest_version: key, finished_at: at('2026-09-14T09:00:00.000Z') }),
+                ingestRow({ finished_at: at('2026-09-14T10:00:00.000Z') }),
+            ],
+            key,
+            silentLogger,
+        );
+
+        expect(reason).toContain('after the last');
+        expect(reason).toContain('catalog:validate');
+    });
+
+    it('ignores an unfinished run when judging ORDER, which is why the open-run rule is separate', () => {
+        // `finished_at: null` says nothing about order. Were the two rules
+        // folded together, this row would be read as an ingest that finished
+        // at the epoch.
+        const ledger = [ingestRow()];
+        const key = expectedKeyFor(ledger);
+
+        expect(
+            releaseStalenessReason(
+                [
+                    run({ manifest_version: key, finished_at: at('2026-09-14T09:00:00.000Z') }),
+                    ingestRow({ status: 'succeeded', finished_at: null }),
+                ],
+                key,
+                silentLogger,
+            ),
+        ).toBeNull();
+    });
+
+    /**
+     * A GRAPH MUTATOR THAT FAILED AFTER THE VALIDATION (NEW-01).
+     *
+     * `catalogInputIdentity` counts SUCCEEDED runs only, and says why: a failed
+     * ingest left a graph nobody vouched for, so naming it would mint a run key
+     * for a half-written catalog. It states outright that the release
+     * prerequisite refuses on such a row separately — so this is that rule, and
+     * without it the delegation lands nowhere. A run that failed partway still
+     * wrote back everything it reached before it died, as candidates.
+     */
+    describe('a graph mutator that failed after the validation still blocks the release (NEW-01)', () => {
+        it.each(['usda_import', 'ai_generation', 'release_load'])(
+            'refuses when a %s run FAILED after the canonical validation succeeded',
+            (kind) => {
+                // The failed row does not change the input identity, so the key
+                // check passes and this is the only rule left to catch it.
+                const ledger = [ingestRow()];
+                const key = expectedKeyFor(ledger);
+                const withFailure: ReleaseRunRow[] = [
+                    ...ledger,
+                    run({ manifest_version: key, finished_at: at('2026-09-14T09:00:00.000Z') }),
+                    run({
+                        kind,
+                        manifest_version: 'half-written',
+                        status: 'failed',
+                        finished_at: at('2026-09-14T10:00:00.000Z'),
+                    }),
+                ];
+
+                // Pinned: the failure really is invisible to the identity, so
+                // the expected key is unchanged and rule 2 cannot be what fires.
+                expect(expectedKeyFor(withFailure)).toBe(key);
+
+                const reason = releaseStalenessReason(withFailure, key, silentLogger);
+
+                expect(reason).not.toBeNull();
+                expect(reason).toContain(kind);
+                expect(reason).toContain('FAILED');
+                expect(reason).toContain('wrote back everything it reached before it died');
+                expect(reason).toContain('catalog:validate');
+            },
+        );
+
+        it('releases when the failed mutator finished BEFORE the validation, which is what a retry looks like', () => {
+            const ledger = [ingestRow({ finished_at: at('2026-09-14T09:00:00.000Z') })];
+            const key = expectedKeyFor(ledger);
+
+            expect(
+                releaseStalenessReason(
+                    [
+                        ingestRow({
+                            manifest_version: 'first-attempt',
+                            status: 'failed',
+                            finished_at: at('2026-09-14T08:00:00.000Z'),
+                        }),
+                        ...ledger,
+                        run({ manifest_version: key, finished_at: at('2026-09-14T10:00:00.000Z') }),
+                    ],
+                    key,
+                    silentLogger,
+                ),
+            ).toBeNull();
+        });
+
+        it('does not read a failed VALIDATION as a mutator, which would compare the canonical run with itself', () => {
+            // Validation is absent from GRAPH_MUTATING_RUN_KINDS on purpose. A
+            // failed validation attempt is judged by its own rule (above); read
+            // as a mutator it would make every successful pass look stale.
+            const ledger = [ingestRow()];
+            const key = expectedKeyFor(ledger);
+
+            expect(
+                releaseStalenessReason(
+                    [
+                        ...ledger,
+                        run({
+                            manifest_version: `${key}+scope:ffffffffffffffff`,
+                            status: 'failed',
+                            finished_at: at('2026-09-14T10:00:00.000Z'),
+                        }),
+                        run({ manifest_version: key, finished_at: at('2026-09-14T09:00:00.000Z') }),
+                    ],
+                    key,
+                    silentLogger,
+                ),
+            ).toBeNull();
+        });
+    });
+});
+
+/**
+ * THE PAIRING INSIDE runRelease (NEW-01).
+ *
+ * `releaseStalenessReason` is pure and exhaustively covered above, but it is
+ * only as good as the key it is HANDED — and the defect NEW-01 named was
+ * precisely that the caller never worked out which run it should be looking
+ * for. That pairing is three lines inside `runRelease`
+ * (`canonicalValidationRunKey(plan, catalogInputIdentity(snapshot.pipelineRuns))`),
+ * they are not reachable from any pure test, and a version of them that passed
+ * a hard-coded plan version would leave every test above green. So the function
+ * is driven: real ledger rows in the test database, a real Repeatable Read
+ * snapshot, in-memory files, and the refusal read off what it throws.
+ */
+describe('runRelease resolves the validation it demands from its own snapshot (NEW-01)', () => {
+    const RELEASE = 'v-newneg01';
+    const INGEST_FINISHED = new Date('2026-09-14T08:00:00.000Z');
+
+    /** Files stay in memory: this exercises the prerequisite, not the filesystem. */
+    const releaseDeps = (): RunReleaseDeps & { readonly files: Map<string, string> } => {
+        const files = new Map<string, string>();
+        return {
+            db: prisma as unknown as ReleaseDb,
+            coveragePlan,
+            release: RELEASE,
+            logger: silentLogger,
+            now: () => new Date('2026-09-14T12:00:00.000Z'),
+            releaseDir: (release: string) => `/tmp/blitzy-unused-release/${release}`,
+            writeFile: (absolutePath: string, contents: string) => {
+                files.set(absolutePath, contents);
+            },
+            readFileBytes: (absolutePath: string) => Buffer.from(files.get(absolutePath) ?? '', 'utf-8'),
+            ensureDir: () => undefined,
+            files,
+        };
+    };
+
+    const clearLedger = async (): Promise<void> => {
+        await prisma.catalog_import_runs.deleteMany({
+            where: { kind: { in: ['validation', 'usda_import', 'ai_generation', 'release_load'] } },
+        });
+    };
+
+    beforeEach(clearLedger);
+    afterEach(clearLedger);
+
+    const recordRun = async (input: {
+        kind: string;
+        manifestVersion: string;
+        status: string;
+        finishedAt: Date | null;
+    }): Promise<void> => {
+        await prisma.catalog_import_runs.create({
+            data: {
+                kind: input.kind,
+                manifest_version: input.manifestVersion,
+                status: input.status,
+                started_at: new Date('2026-09-14T07:00:00.000Z'),
+                finished_at: input.finishedAt,
+            },
+        });
+    };
+
+    /** The key runRelease must derive, computed here from the same two facts. */
+    const canonicalKey = (): string =>
+        canonicalValidationRunKey(
+            coveragePlan.coveragePlanVersion,
+            catalogInputIdentity([
+                {
+                    kind: 'usda_import',
+                    manifest_version: 'the-import',
+                    status: 'succeeded',
+                    finished_at: INGEST_FINISHED,
+                } as CatalogInputRunRow,
+            ]),
+        );
+
+    it('refuses when the only validation is scoped, naming the canonical run it wanted', async () => {
+        await recordRun({
+            kind: 'usda_import',
+            manifestVersion: 'the-import',
+            status: 'succeeded',
+            finishedAt: INGEST_FINISHED,
+        });
+        await recordRun({
+            kind: 'validation',
+            manifestVersion: `${canonicalKey()}+scope:aaaaaaaaaaaaaaaa`,
+            status: 'succeeded',
+            finishedAt: new Date('2026-09-14T09:00:00.000Z'),
+        });
+
+        const deps = releaseDeps();
+        await expect(runRelease(deps)).rejects.toThrow(ReleaseIntegrityError);
+        // The key in the message is the one derived from the ledger, so a
+        // caller that guessed it would be visible here.
+        await expect(runRelease(deps)).rejects.toThrow(canonicalKey());
+        // Nothing written: the refusal precedes every export byte.
+        expect(deps.files.size).toBe(0);
+    });
+
+    it('gets past the prerequisite once the canonical run for that same input has succeeded', async () => {
+        await recordRun({
+            kind: 'usda_import',
+            manifestVersion: 'the-import',
+            status: 'succeeded',
+            finishedAt: INGEST_FINISHED,
+        });
+        await recordRun({
+            kind: 'validation',
+            manifestVersion: canonicalKey(),
+            status: 'succeeded',
+            finishedAt: new Date('2026-09-14T09:00:00.000Z'),
+        });
+
+        // Asserted as "not this refusal" rather than as success: the database
+        // holds no published food, so what the export does next is not this
+        // rule's business and pinning it here would couple the two.
+        const deps = releaseDeps();
+        await runRelease(deps).catch((error: unknown) => {
+            expect(String((error as Error).message)).not.toContain('catalog:validate run is on record');
+        });
+        expect(deps.files.size).toBeGreaterThan(0);
+    });
+});
+
+/**
+ * THE SEAM ITSELF: EVERY CLI ENTRY POINT TAKES THE CLAIM (DB-F09).
+ *
+ * The lock's behaviour is proven above, but a lock nothing calls excludes
+ * nothing — and that was precisely the defect: `checkpoint.ts` said the run
+ * claim "does NOT grant exclusive processing for the run's lifetime" and named
+ * the CLI entry point as where such a lock belongs, while no entry point took
+ * one. Whether `main()` takes it cannot be asserted by importing the module —
+ * every script guards `main()` behind `require.main === module` — so it is
+ * asserted the only way it can be: the parent holds the graph, a real CLI
+ * process is launched, and its exit status and reported code are read.
+ *
+ * A missing wrapper is visible rather than silent. Each stage would get past
+ * this point and fail, or succeed, for some entirely different reason; the
+ * assertion is on `catalog_stage_locked` specifically, which only the wrapper
+ * produces. The four children cost about half a second each and make no vendor
+ * call: every one of them refuses before reaching its work.
+ */
+describe('every catalog CLI refuses to run while another stage holds the graph (DB-F09)', () => {
+    /**
+     * A child over one of the pipeline's CLI entry points, with the environment
+     * it needs to reach `main()` and nothing more.
+     *
+     * Separate from `runChildProcess` above on purpose: that harness withholds
+     * `DATABASE_URL` because the rate-ledger children must not reach a
+     * database, and these children must. `CATALOG_MODEL_CALL_BUDGET` is set
+     * because validation's prerequisite check runs before the lock and would
+     * otherwise stop the child short of the thing under test — the budget is
+     * never spent, since the lock refuses first.
+     */
+    const runStageCli = (script: string, args: readonly string[]): Promise<ChildOutcome> =>
+        new Promise((resolve, reject) => {
+            const child = spawn(
+                process.execPath,
+                ['--require', TS_NODE_REGISTER, path.join(BACKEND_ROOT, 'scripts', script), ...args],
+                {
+                    cwd: BACKEND_ROOT,
+                    timeout: CHILD_TIMEOUT_MS,
+                    env: {
+                        PATH: process.env.PATH,
+                        HOME: process.env.HOME,
+                        NODE_ENV: 'test',
+                        DATABASE_URL: process.env.DATABASE_URL,
+                        CATALOG_MODEL_CALL_BUDGET: '1',
+                        TS_NODE_PROJECT: SCRIPTS_TSCONFIG,
+                        TS_NODE_TRANSPILE_ONLY: '1',
+                    },
+                },
+            );
+
+            let stdout = '';
+            let stderr = '';
+            child.stdout.setEncoding('utf8');
+            child.stderr.setEncoding('utf8');
+            child.stdout.on('data', (chunk: string) => {
+                stdout += chunk;
+            });
+            child.stderr.on('data', (chunk: string) => {
+                stderr += chunk;
+            });
+            child.on('error', reject);
+            child.on('close', (status) => {
+                resolve({ status, stdout, stderr });
+            });
+        });
+
+    let graph: { release(): Promise<void> } | null = null;
+
+    beforeAll(async () => {
+        // One mutating stage, holding the graph for the duration, exactly as a
+        // long import would.
+        graph = await acquireCatalogStageLock({ stage: 'usda_import' });
+    });
+
+    afterAll(async () => {
+        await graph?.release();
+        graph = null;
+    });
+
+    /**
+     * The database `--confirm-target` has to name, read from the URL the suite
+     * is pointed at rather than written down: the name differs per checkout and
+     * per environment (a clone-scoped `soh_test_<n>` locally, `ci` in CI), and a
+     * literal would pass in exactly one of them.
+     */
+    const targetDatabaseName = (): string => {
+        const url = process.env.DATABASE_URL ?? '';
+        const name = url.slice(url.lastIndexOf('/') + 1).split('?')[0];
+        expect(name.length).toBeGreaterThan(0);
+        return name;
+    };
+
+    it.each([
+        // `--release v99` is deliberately an id that does not exist: the lock
+        // refuses before the export reads or writes anything, so no release
+        // directory is created by this test.
+        ['catalog-import-usda.ts', [], 'usda_import cannot take it exclusively'],
+        ['catalog-validate.ts', [], 'validation cannot take it exclusively'],
+        ['catalog-release.ts', ['--release', 'v99'], 'release cannot take it shared'],
+        ['catalog-load.ts', ['--release', 'v1', '--confirm-target'], 'release_load cannot take it exclusively'],
+    ] as [string, string[], string][])('%s refuses, and says which lock it could not take', async (
+        script,
+        argTemplate,
+        expectedMode,
+    ) => {
+        // The loader is the one stage that must be told which database it is
+        // writing, so its flag takes the value from the environment.
+        const args =
+            argTemplate[argTemplate.length - 1] === '--confirm-target'
+                ? [...argTemplate, targetDatabaseName()]
+                : argTemplate;
+
+        const outcome = await runStageCli(script, args);
+        const output = `${outcome.stdout}${outcome.stderr}`;
+
+        expect(outcome.status).not.toBe(0);
+        // The machine-readable code an operator's tooling reads, not the prose.
+        expect(output).toContain('"code":"catalog_stage_locked"');
+        // And the mode, because an export taking the lock exclusively would
+        // serialise two harmless reads while a mutator taking it shared would
+        // run beside another writer — the two mistakes this names apart.
+        expect(output).toContain(expectedMode);
+    });
+
+    it('leaves the graph lock with its one holder, so a refused CLI released what it opened', async () => {
+        const rows = await prisma.$queryRaw<{ count: number }[]>`
+            SELECT count(*)::int AS count
+            FROM pg_locks
+            WHERE locktype = 'advisory' AND classid = ${0x434154}::int4
+        `;
+
+        expect(Number(rows[0]?.count ?? 0)).toBe(1);
     });
 });

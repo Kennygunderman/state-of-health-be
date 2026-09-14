@@ -74,6 +74,7 @@ import {
     selectSwapCandidate,
     selectSwapCandidates,
     selectSwapPortion,
+    swapMealWhere,
     swapMealWrite,
 } from '../swap.logic';
 import {
@@ -1241,6 +1242,100 @@ describe('swapMealWrite', () => {
         expect(
             inputErrorField(() => swapMealWrite({ ...currentLunch(), revision: 1.5 }, candidate, now)),
         ).toBe('revision');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The predicate that write is addressed by
+ *
+ * Its own describe because it answers a different question from
+ * `swapMealWrite`: not "what does a swap store" but "which row is allowed to
+ * receive it". Rule backend-architecture §5.1 and §0.5.1 answer that with four
+ * columns — the row, its owner, its parent plan and the revision the selection
+ * read — and the fourth is the one a reader has to be able to see is there,
+ * because a meal's revision moves independently of its plan's and the
+ * plan-level compare-and-swap in `swap.service.ts::applySwap` cannot detect a
+ * change confined to one meal.
+ * ------------------------------------------------------------------------- */
+
+describe('swapMealWhere', () => {
+    const owner = { userId: 'user-swapping', planId: 'plan-under-edit' };
+    /** The commit's own instant, for the cases that pair this with the write. */
+    const now = new Date('2026-07-08T12:30:00.000Z');
+
+    it('addresses the row by its id, its owner, its parent plan and its stored revision', () => {
+        expect(swapMealWhere(currentLunch(), owner)).toEqual({
+            id: LUNCH_MEAL_ID,
+            user_id: 'user-swapping',
+            meal_plan_id: 'plan-under-edit',
+            revision: 1,
+        });
+    });
+
+    it('pins the revision the write advances FROM, whatever the meal has reached', () => {
+        // The pairing is the contract: `swapMealWrite` sets `revision + 1` and
+        // this matches `revision`, so the statement lands only on the row
+        // generation the whole selection was computed against. A predicate
+        // carrying the ADVANCED value — the natural slip when the two shapes
+        // are assembled separately — would match nothing and fail every swap,
+        // and one carrying a constant would only ever match an untouched meal.
+        const context = makeContext({ recipes: [ALT_ALPHA] });
+        const candidate = selectSwapCandidate(context, ALT_ALPHA.recipe_version_id);
+
+        for (const revision of [1, 7, 4096]) {
+            const meal = { ...currentLunch(), revision };
+
+            expect(swapMealWhere(meal, owner).revision).toBe(revision);
+            expect(swapMealWrite(meal, candidate, now).revision).toBe(
+                swapMealWhere(meal, owner).revision + 1,
+            );
+        }
+    });
+
+    it('describes the same row the write describes, so the two cannot drift apart', () => {
+        // Both are built from ONE `SwapDayMeal`, which is what makes this
+        // assertion possible: the outgoing version the write records as
+        // `previous_recipe_version_id` belongs to the row the predicate names.
+        const context = makeContext({ recipes: [ALT_HALF] });
+        const candidate = selectSwapCandidate(context, ALT_HALF.recipe_version_id);
+        const meal = currentLunch();
+
+        expect(swapMealWhere(meal, owner).id).toBe(meal.id);
+        expect(swapMealWrite(meal, candidate, now).previous_recipe_version_id).toBe(
+            meal.recipeVersionId,
+        );
+    });
+
+    it('refuses a revision the write itself would refuse', () => {
+        // One rule for both, so a value that could never have been stored
+        // cannot reach the predicate and turn an input fault into a row count
+        // of zero — which reads as a lost race rather than as a bug.
+        expect(inputErrorField(() => swapMealWhere({ ...currentLunch(), revision: 0 }, owner))).toBe(
+            'revision',
+        );
+        expect(inputErrorField(() => swapMealWhere({ ...currentLunch(), revision: 1.5 }, owner))).toBe(
+            'revision',
+        );
+        expect(
+            inputErrorField(() => swapMealWhere({ ...currentLunch(), revision: Number.NaN }, owner)),
+        ).toBe('revision');
+    });
+
+    it('refuses an owner, a parent or a row it could not address anything by', () => {
+        // The §5.1 failure the type system cannot catch: an empty `user_id` is a
+        // `string` and compiles, and the write it produces is scoped to nobody.
+        expect(inputErrorField(() => swapMealWhere(currentLunch(), { ...owner, userId: '' }))).toBe(
+            'userId',
+        );
+        expect(inputErrorField(() => swapMealWhere(currentLunch(), { ...owner, userId: '   ' }))).toBe(
+            'userId',
+        );
+        expect(inputErrorField(() => swapMealWhere(currentLunch(), { ...owner, planId: '' }))).toBe(
+            'planId',
+        );
+        expect(inputErrorField(() => swapMealWhere({ ...currentLunch(), id: '' }, owner))).toBe(
+            'mealId',
+        );
     });
 });
 

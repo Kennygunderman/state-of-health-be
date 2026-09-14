@@ -98,13 +98,22 @@
 // instrument: the handler is driven with a minimal request/response pair, and a
 // refusal must be the 400 body naming the field with NO recorded database call.
 //
-// ONE ENTRY POINT IS DELIBERATELY ABSENT. `mealPlan.service.ts::generatePlan`
-// reads the preferences row BEFORE it parses, because its parse needs a
-// `StartDateWindow` derived from today in the user's stored zone — §0.5.1
-// ordering, stated in that function's own docblock. A "no database call"
-// assertion there would assert a bug, so it is excluded and said so here.
-// `regeneratePlan` needs no database state to parse and is therefore included,
-// as the anchor case for the ordering the rest of the routes follow.
+// EVERY USER-SCOPED ENTRY POINT IS HERE, `generatePlan` INCLUDED. Its parse is
+// in two halves, because the range of its start date is a property of the clock
+// in the user's stored zone rather than of the request: `parseGeneratePlanSyntax`
+// judges the request against itself with no I/O, and `checkStartDateWindow`
+// judges it against the window afterwards. Only the SYNTAX half can be proven
+// here, and it is the half that matters for this file's claim — a body with no
+// idempotency key, a malformed key or an unusable revision is refused before
+// Prisma is touched and before the idempotency ledger reserves anything. The
+// window half deliberately runs LATER than the ledger's replay gate (§0.5.1, so
+// that a same-key retry sent after the user's local midnight replays its stored
+// `201` instead of being refused for a start date that has fallen behind
+// `window.earliest`), which means a SYNTACTICALLY VALID generate request does
+// reach the database by design; `api/concurrency.test.ts` owns that ordering,
+// and the positive case below asserts only that such a request gets that far.
+// `regeneratePlan` needs no database state to parse at all and remains the
+// anchor case for the ordering the rest of the routes follow.
 
 /**
  * The recording stub, built entirely inside the factory.
@@ -138,7 +147,12 @@ import {
     getCatalogSuggestionsController,
     getRecipeVersionController,
 } from '../../controllers/catalog.controller';
-import { getAffectedMeals, getMealPlanDay, regeneratePlan } from '../../services/mealPlan.service';
+import {
+    generatePlan,
+    getAffectedMeals,
+    getMealPlanDay,
+    regeneratePlan,
+} from '../../services/mealPlan.service';
 import { logPlannedMeal } from '../../services/plannedMealLog.service';
 import { savePreferences, saveSetupStep } from '../../services/preferences.service';
 import { commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
@@ -160,6 +174,13 @@ const DIARY_MEAL_ID = 'e6fca504-7a8d-4e9f-9a0b-2c3d4e5f6071';
 const IDEMPOTENCY_KEY = 'f70db615-8b9e-4fa0-ab1c-3d4e5f607182';
 const DAY_KEY = '2026-07-05';
 const TIME_ZONE = 'America/New_York';
+
+/**
+ * The clock the day read accepts, fixed. Its value is irrelevant to every
+ * assertion below — what matters is that supplying one changes neither the
+ * position of the parse nor the order of the reads.
+ */
+const INJECTED_NOW = new Date('2026-07-05T12:00:00.000Z');
 
 /** A well-formed `goal` step body, with the one override each case needs. */
 const stepBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -532,6 +553,35 @@ describe('plan read entry points parse before any I/O (F22)', () => {
             'meal_plans.findFirst',
         );
     });
+
+    /**
+     * The day read reports whether the plan may still be written to, which is a
+     * comparison against the caller's calendar day, so it takes a clock
+     * (`F14`). These two cases hold that clock to the same ordering the rest of
+     * this suite proves of the path parse.
+     *
+     * An injected date must not pull any read forward: the parse still comes
+     * first, so a malformed path is refused with no database call even though
+     * "today" was supplied. And on the well-formed side the FIRST recorded call
+     * must still be the owner-scoped plan read — if the zone lookup
+     * (`meal_plan_preferences.findUnique`, inside `resolveUserToday`) were
+     * reached first, a request for a plan that is not the caller's would pay for
+     * a preferences read before its 404, and the ownership check would sit
+     * behind an unrelated query.
+     */
+    it('refuses a malformed day read before any I/O even with a clock supplied', async () => {
+        await expectRefusedBeforeIo(
+            () => getMealPlanDay(USER_ID, 'plan-1', 'yesterday', INJECTED_NOW),
+            'planId',
+            'invalid_id',
+        );
+    });
+
+    it('reads the caller’s plan before the zone its writeability is judged in', async () => {
+        expect(await expectReachesDatabase(() => getMealPlanDay(USER_ID, PLAN_ID, DAY_KEY, INJECTED_NOW))).toBe(
+            'meal_plans.findFirst',
+        );
+    });
 });
 
 describe('planned-meal logging parses path and body before the ledger (F22, F09)', () => {
@@ -803,6 +853,75 @@ describe('preference saves parse their envelope before any I/O (SVC-09)', () => 
     it('lets a well-formed full save reach the database', async () => {
         expect(await expectReachesDatabase(() => savePreferences(USER_ID, updateBody()))).toBe(
             'meal_plan_preferences.findUnique',
+        );
+    });
+});
+
+describe('generatePlan parses its request’s own syntax before any I/O (DB-F03)', () => {
+    /** A well-formed generate body, with the one override each case needs. */
+    const generateBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        startDate: DAY_KEY,
+        idempotencyKey: IDEMPOTENCY_KEY,
+        expectedPreferencesRevision: 1,
+        expectedTargetsRevision: 1,
+        ...overrides,
+    });
+
+    it('refuses a body with no idempotency key, so the ledger is never asked about a key it has not got', async () => {
+        // The order this pins: syntax parse, then the replay preflight, then
+        // every stateful check. A body with nothing to fingerprint must not
+        // reach the preflight's transaction at all.
+        await expectRefusedBeforeIo(
+            () => generatePlan(USER_ID, generateBody({ idempotencyKey: undefined })),
+            'idempotencyKey',
+            'required',
+        );
+    });
+
+    it('refuses a malformed idempotency key with no database call', async () => {
+        await expectRefusedBeforeIo(
+            () => generatePlan(USER_ID, generateBody({ idempotencyKey: 'plan-please' })),
+            'idempotencyKey',
+            'invalid_id',
+        );
+    });
+
+    it('refuses a start date that is not a real calendar day with no database call', async () => {
+        // `2026-02-30` would otherwise become an Invalid Date that queries as
+        // NULL. This is the SHAPE half of the start-date rule, which is exactly
+        // the half that belongs before any I/O.
+        await expectRefusedBeforeIo(
+            () => generatePlan(USER_ID, generateBody({ startDate: '2026-02-30' })),
+            'startDate',
+            'invalid_date',
+        );
+    });
+
+    it('refuses a revision no Int column can hold before the reservation', async () => {
+        await expectRefusedBeforeIo(
+            () => generatePlan(USER_ID, generateBody({ expectedPreferencesRevision: 1e30 })),
+            'expectedPreferencesRevision',
+        );
+    });
+
+    it('refuses an absent body, naming both fields it should have carried', async () => {
+        const verdict = await expectRefusedBeforeIo(
+            () => generatePlan(USER_ID, undefined),
+            'idempotencyKey',
+            'required',
+        );
+
+        expect(fieldsOf(verdict)).toEqual(['startDate', 'idempotencyKey']);
+    });
+
+    it('lets a well-formed request reach the ledger preflight, which is where its I/O starts', async () => {
+        // The converse, and the reason the window is NOT asserted here: a
+        // syntactically valid generate request is supposed to reach the
+        // database, and the FIRST thing it reaches is the idempotency ledger's
+        // preflight transaction — not the preferences row the stateful half
+        // needs. That ordering is §0.5.1's and is what DB-F03 changed.
+        expect(await expectReachesDatabase(() => generatePlan(USER_ID, generateBody()))).toBe(
+            '$transaction',
         );
     });
 });

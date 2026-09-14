@@ -36,6 +36,9 @@
  * in for the database with a model of it.
  */
 
+import { readFileSync } from 'fs';
+import { join } from 'path';
+
 import type { Prisma, PrismaClient } from '../../generated/prisma';
 import {
     LogPlannedMealResponse,
@@ -1431,6 +1434,70 @@ describe('the replay equality contract across the jsonb round trip', () => {
         expect(replayed.isLocked).toBe(false);
         expect(replayed.wasRegenerated).toBe(true);
         expect(days.map((day) => day.date)).toEqual(['2026-07-05', '2026-07-06']);
+    });
+});
+
+describe('the column’s documented replay contract', () => {
+    // WHY A TEST READS A COMMENT. `meal_plan_actions.response_snapshot` is a
+    // `jsonb` column, and what a replay guarantees about it is not visible in
+    // the schema: the guarantee is produced by `canonicalizeResponseBody`
+    // writing and reading the column in jsonb's own key order. The model's doc
+    // comment is therefore the only place a maintainer reading the schema
+    // learns it — and it once said the opposite, that only the parsed VALUE is
+    // preserved and "a test of it must compare the parsed body rather than its
+    // JSON text", which is a maintainer's licence to weaken exactly the
+    // assertions above. So the comment is held to the code here: the byte
+    // guarantee is stated, the function that produces it is named, and the
+    // withdrawn claim cannot come back.
+    const SCHEMA_PATH = join(__dirname, '..', '..', '..', 'prisma', 'schema.prisma');
+
+    /** The doc comment immediately above `model meal_plan_actions`. */
+    const ledgerComment = (): string => {
+        const schema = readFileSync(SCHEMA_PATH, 'utf8');
+        const model = schema.indexOf('model meal_plan_actions {');
+
+        expect(model).toBeGreaterThan(-1);
+
+        const lines = schema.slice(0, model).split('\n').reverse();
+        const comment: string[] = [];
+
+        for (const line of lines.slice(1)) {
+            if (!line.startsWith('//')) {
+                break;
+            }
+
+            comment.push(line);
+        }
+
+        expect(comment.length).toBeGreaterThan(0);
+
+        return comment.reverse().join('\n');
+    };
+
+    it('states the byte guarantee this module produces', () => {
+        const comment = ledgerComment();
+
+        expect(comment).toMatch(/SAME BYTES/);
+        expect(comment).toMatch(/§0\.9\.2/);
+    });
+
+    it('names the function that makes the guarantee, and both equality assertions a test may make', () => {
+        const comment = ledgerComment();
+
+        expect(comment).toContain('canonicalizeResponseBody');
+        expect(comment).toContain('shapeStoredResponse');
+        expect(comment).toContain('readStoredResponse');
+        // The two assertions the describe above actually makes, so the comment
+        // invites both rather than ruling one out.
+        expect(comment).toMatch(/parsed value AND JSON\.stringify/);
+    });
+
+    it('no longer claims a replay is only deep-equal, or that the served text may differ', () => {
+        const comment = ledgerComment();
+
+        expect(comment).not.toMatch(/deep-equal/);
+        expect(comment).not.toMatch(/the text can differ/);
+        expect(comment).not.toMatch(/must compare the parsed body rather than/);
     });
 });
 

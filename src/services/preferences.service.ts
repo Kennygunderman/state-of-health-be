@@ -83,9 +83,12 @@ import { startDateWindow } from './mealPlan.logic';
 import { PlanningPreferences, PREFERENCE_FLAG_CODES, isMealSlot } from './recipe.logic';
 import { getPlanningRecipeVersionsByIds } from './recipe.service';
 // The pure rule that decides whether a write moves the energy equation's own
-// inputs. It lives in the targets domain because that is whose truth it serves
-// — `TargetsResponse.stale` — and this service is the only thing that advances
-// the counter it guards.
+// inputs. It lives in the targets domain because the seven answers it inspects
+// are the equation's terms, and this service is the only thing that advances
+// the counter it guards — `meal_plan_preferences.estimate_inputs_revision`, a
+// write-side diagnostic. It is NOT what `TargetsResponse.stale` is derived
+// from: that is the ancestry check on `revision` (AAP §0.5.2), and
+// `targets.logic.ts::deriveTargetsResponse` is never even given this counter.
 import { estimateInputsChanged } from './targets.logic';
 
 /**
@@ -203,13 +206,30 @@ export interface PreferencesRow {
     confirmed_targets: unknown;
     targets_input_revision: number | null;
     /**
-     * The counter behind `TargetsResponse.stale`, advanced by this service and
-     * read by `targets.logic.ts::deriveTargetsResponse`. It is NOT `revision`:
-     * `revision` moves on every save of any preference, while this one moves
-     * only when one of the seven answers the energy equation reads changes
-     * value, so an unrelated edit cannot mark a confirmed estimate stale.
+     * A WRITE-SIDE DIAGNOSTIC ONLY, and NOT the counter behind
+     * `TargetsResponse.stale` — `revision`, below, is. This one is advanced by
+     * this service alone, and only when one of the seven answers the energy
+     * equation actually reads changes value (`targets.logic.ts`'s
+     * `ESTIMATE_INPUT_COLUMNS`, via `estimateInputsChanged`), so it records when
+     * a user's calculable details last moved. That is a different question from
+     * whether a confirmed figure still matches the answers on file, which is
+     * what staleness asks. No query reads it:
+     * `targets.logic.ts::TargetsPreferencesRow` does not carry the column, so
+     * `deriveTargetsResponse` cannot reach it even by accident.
      */
     estimate_inputs_revision: number;
+    /**
+     * THE SINGLE INPUT-ANCESTRY COUNTER, advanced by every preference save of
+     * any kind — diet, allergens, dislikes, schedule, budget, review date, unit
+     * preferences and time zone included — and doing two jobs at once: a client
+     * pins it to detect a lost update, and comparing it with
+     * `targets_input_revision` is what `TargetsResponse.stale` means (AAP
+     * §0.5.2: stale when `source === 'estimated'` and
+     * `targets_input_revision ≠ revision`). One counter for both is what makes
+     * "confirmed against revision N" and "derived from revision N" the same
+     * statement, so EVERY saved edit makes a confirmed estimate stale, whatever
+     * it touched.
+     */
     revision: number;
 }
 
@@ -1355,12 +1375,20 @@ const setupStateOf = (row: PreferencesRow | null): SetupStateSnapshot => ({
  * it moves none of the estimate's inputs.
  *
  * `undefined` is Prisma's "do not write this column", so an unrelated save
- * leaves the counter exactly where it stood — and that is the whole point. A
- * diet, allergy, dislike, schedule, budget, review-date, unit-preference or
- * time-zone edit bumps `revision` (a client pins it to detect a lost update)
- * but must NOT make a confirmed estimate stale, because none of those answers
- * can move the figure the equation produces. On creation `undefined` falls
- * through to the column's own `DEFAULT 0`.
+ * leaves the counter exactly where it stood — and that is the whole point. The
+ * column is a WRITE-SIDE DIAGNOSTIC whose only job is to stay truthful about the
+ * equation's own inputs: it must answer "when did this user's calculable details
+ * last move?", so a diet, allergy, dislike, schedule, budget, review-date,
+ * unit-preference or time-zone edit has to leave it alone, none of those answers
+ * being a term the equation reads. On creation `undefined` falls through to the
+ * column's own `DEFAULT 0`.
+ *
+ * STALENESS IS NOT DECIDED HERE, and moving this counter cannot affect it.
+ * `TargetsResponse.stale` is the ancestry check AAP §0.5.2 defines —
+ * `targets_input_revision` against the preferences `revision` — so it is the
+ * `revision` bump that every save carries, on the same statement as this write,
+ * that makes a confirmed estimate stale, whatever the save touched.
+ * `deriveTargetsResponse` is not given this counter at all.
  *
  * The decision is `targets.logic.ts::estimateInputsChanged` — a pure, tested
  * rule read in Prisma's own write semantics (absent or `undefined` is not a
@@ -1802,9 +1830,13 @@ export const savePreferences = async (
                 data: {
                     time_zone: timeZone,
                     revision: current.revision + 1,
-                    // A settings edit that moves an estimate input advances this
-                    // counter and so flips `TargetsResponse.stale`; one that
-                    // moves anything else leaves it alone.
+                    // What flips `TargetsResponse.stale` for a confirmed
+                    // estimate is the `revision` bump on the line above, which
+                    // this save carries whatever it edited (AAP §0.5.2 compares
+                    // `targets_input_revision` against it). This counter is a
+                    // write-side diagnostic: it advances only where a settings
+                    // edit moves an estimate input, and no query reads it — see
+                    // `nextEstimateInputsRevision`.
                     estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
                     ...(targetRoute === undefined ? {} : { target_route: targetRoute }),
                     ...(reconciliation === undefined
