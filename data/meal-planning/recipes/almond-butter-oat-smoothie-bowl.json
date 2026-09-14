@@ -1,0 +1,81 @@
+{
+  "slug": "almond-butter-oat-smoothie-bowl",
+  "name": "Almond oat smoothie bowl",
+  "description": "A no-cook breakfast bowl of almonds blended with rolled oats and banana until it is thick enough to eat with a spoon, finished with strawberries.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Blend the almonds with the almond milk until no pieces remain.",
+    "Add the rolled oats and the banana and blend again until the mixture is thick enough to hold a spoon upright.",
+    "Spoon into a bowl, top with the strawberries and eat straight away."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 6,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "tree_nuts"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:170567",
+      "quantity": 1,
+      "unit": "oz",
+      "gramWeight": 28.35,
+      "displayText": "1 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 40.5,
+      "displayText": "½ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173944",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 118,
+      "displayText": "1 banana",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174832",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 262,
+      "displayText": "1 cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 76,
+      "displayText": "½ cup",
+      "sortOrder": 4,
+      "isOptional": false
+    }
+  ]
+}

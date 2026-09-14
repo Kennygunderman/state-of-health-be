@@ -1,0 +1,89 @@
+{
+  "slug": "tofu-broccoli-stir-fry",
+  "name": "Tofu and broccoli stir-fry",
+  "description": "Seared firm tofu tossed with broccoli, carrot and garlic in a soy sauce glaze, served over warm brown rice.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Press the tofu dry and cut it into bite-size cubes.",
+    "Heat the canola oil in a wide pan over medium-high heat.",
+    "Sear the tofu for 6 to 7 minutes, turning once, then lift it onto a plate.",
+    "Add the broccoli, carrot and garlic, and stir-fry for 4 to 5 minutes until crisp-tender.",
+    "Return the tofu, pour in the soy sauce and toss for 1 minute to glaze.",
+    "Divide the warm brown rice between two bowls and spoon the stir-fry over the top."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": ["lunch", "dinner"],
+  "dietTags": ["pescatarian", "pescatarian_ok", "vegan", "vegetarian"],
+  "allergenTags": ["soy", "wheat"],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": ["dairy_free", "vegan"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 10.5,
+      "unit": "oz",
+      "gramWeight": 297.67,
+      "displayText": "10½ oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 3,
+      "unit": "cups",
+      "gramWeight": 264,
+      "displayText": "3 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122,
+      "displayText": "2",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.5,
+      "unit": "cups",
+      "gramWeight": 303,
+      "displayText": "1½ cups",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174277",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 32,
+      "displayText": "2 tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "cloves",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172336",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 14,
+      "displayText": "1 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

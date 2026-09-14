@@ -1,0 +1,70 @@
+{
+  "slug": "veggie-egg-scramble-toast",
+  "name": "Veggie egg scramble with skillet toast",
+  "description": "Soft scrambled eggs with wilted spinach and tomato, served with a thin flour round toasted in the same pan.",
+  "iconKey": "crosshair",
+  "instructions": [
+    "Stir the flour into a soft dough, then press it into a thin round.",
+    "Toast the round in a dry skillet over medium heat until it blisters, about 2 minutes per side, then set it aside.",
+    "Warm the oil in the same skillet, add the spinach and tomato, and cook until the spinach wilts.",
+    "Pour in the beaten eggs and stir gently until they set in soft curds.",
+    "Season to taste and serve the scramble with the warm toast."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": ["breakfast"],
+  "dietTags": ["pescatarian", "pescatarian_ok", "vegetarian"],
+  "allergenTags": ["eggs", "wheat"],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": ["dairy_free", "quick"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171287",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 100,
+      "displayText": "2",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168894",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 31.25,
+      "displayText": "¼ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 30,
+      "displayText": "1 cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 61.5,
+      "displayText": "½",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    }
+  ]
+}

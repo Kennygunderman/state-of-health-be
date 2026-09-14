@@ -1,0 +1,70 @@
+{
+  "slug": "greek-yogurt-berry-bowl",
+  "name": "Greek yogurt berry bowl",
+  "description": "A no-cook breakfast bowl that leans on thick plain Greek yogurt for protein, finished with halved strawberries, rolled oats for bite and a thread of honey.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Spoon the Greek yogurt into a bowl and level the top.",
+    "Hull and halve the strawberries, then scatter them over the yogurt.",
+    "Sprinkle the rolled oats across the top and drizzle the honey over the bowl."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 245,
+      "displayText": "1 cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 152,
+      "displayText": "1 cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 20.25,
+      "displayText": "¼ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169640",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 21,
+      "displayText": "1 tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

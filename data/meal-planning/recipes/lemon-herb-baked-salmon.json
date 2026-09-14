@@ -1,0 +1,88 @@
+{
+  "slug": "lemon-herb-baked-salmon",
+  "name": "Lemon herb baked salmon",
+  "description": "A one-pan dinner of salmon fillets baked over roasted potato and broccoli, finished with lemon and fresh dill.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Heat the oven to 425°F and cut the potato into thin wedges.",
+    "Toss the potato and broccoli with the olive oil and garlic, then spread them across a sheet pan.",
+    "Roast the potato and broccoli for 10 minutes, then move them to the edges and set the salmon skin-side down in the middle.",
+    "Squeeze half the lemon over the salmon, scatter the dill across the fillets, and tuck the rest of the lemon between them.",
+    "Bake 12 minutes more, until the salmon is opaque at its thickest point and gives easily under a fork."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 fillet with potato and broccoli",
+  "prepMinutes": 10,
+  "cookMinutes": 22,
+  "mealSlots": ["dinner"],
+  "dietTags": ["gluten_free", "pescatarian_ok"],
+  "allergenTags": ["fish"],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": ["gluten_free", "dairy_free"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:175167",
+      "quantity": 12,
+      "unit": "oz",
+      "gramWeight": 340,
+      "displayText": "12 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170027",
+      "quantity": 1.5,
+      "unit": "each",
+      "gramWeight": 319.5,
+      "displayText": "1½",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 264,
+      "displayText": "3 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 27,
+      "displayText": "2 tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 84,
+      "displayText": "1",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6,
+      "displayText": "2 cloves",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172233",
+      "quantity": 8,
+      "unit": "g",
+      "gramWeight": 8,
+      "displayText": "8 g",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

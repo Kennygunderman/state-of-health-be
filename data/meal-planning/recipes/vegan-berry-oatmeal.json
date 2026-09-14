@@ -1,0 +1,89 @@
+{
+  "slug": "vegan-berry-oatmeal",
+  "name": "Berry oatmeal",
+  "description": "Rolled oats simmered until thick and tender, then topped with strawberries, sliced banana, sunflower seeds and a spoon of maple syrup.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Simmer the rolled oats and salt over medium heat until thick and tender, about 8 minutes.",
+    "Slice the banana and halve the strawberries while the oats cook.",
+    "Spoon the oats into a bowl and top with the sliced banana and strawberries.",
+    "Scatter the sunflower seeds over the top and finish with the maple syrup."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 8,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 40.5,
+      "displayText": "½ cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173468",
+      "quantity": 1,
+      "unit": "g",
+      "gramWeight": 1,
+      "displayText": "1 g",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173944",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 118,
+      "displayText": "1",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 76,
+      "displayText": "½ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 15,
+      "unit": "g",
+      "gramWeight": 15,
+      "displayText": "15 g",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169661",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 20,
+      "displayText": "1 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "slug": "chickpea-spinach-skillet",
+  "name": "Chickpea and spinach skillet",
+  "description": "A fast one-pan dinner of canned chickpeas and spinach, cooked down with garlic and tomato in olive oil and finished with a squeeze of lemon.",
+  "iconKey": "pot",
+  "instructions": [
+    "Warm the olive oil in a large skillet over medium-high heat, then add the garlic and cook for a minute until fragrant.",
+    "Stir in the chickpeas, the chopped tomato and the chili powder, and cook for 5 minutes, pressing some of the chickpeas flat against the skillet.",
+    "Add the spinach in handfuls and turn it until just wilted, about 3 minutes.",
+    "Squeeze the lemon over everything and serve straight from the skillet."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173800",
+      "quantity": 320,
+      "unit": "g",
+      "gramWeight": 320,
+      "displayText": "2 cups, drained",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 5,
+      "unit": "cup",
+      "gramWeight": 150,
+      "displayText": "5 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 123,
+      "displayText": "1 tomato, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "clove",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42,
+      "displayText": "½ lemon",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.7,
+      "displayText": "1 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

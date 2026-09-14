@@ -1,0 +1,82 @@
+{
+  "slug": "salmon-spinach-frittata",
+  "name": "Salmon and spinach frittata",
+  "description": "Eggs baked with flaked salmon, wilted spinach and softened onion, then cut into four portions.",
+  "iconKey": "pot",
+  "instructions": [
+    "Warm the olive oil in an ovenproof pan over a medium heat and soften the onion for 3 to 4 minutes.",
+    "Add the spinach a handful at a time and let it wilt, then spread it evenly across the pan.",
+    "Sear the salmon fillet for 3 to 4 minutes a side, then flake it into large pieces over the spinach.",
+    "Whisk the eggs until even, pour them over the pan and cook undisturbed until the edges set.",
+    "Finish in a low oven until the middle is just firm, then cut into four wedges and lift out one slice per serving."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "1 slice",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian_ok"
+  ],
+  "allergenTags": [
+    "eggs",
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171287",
+      "quantity": 8,
+      "unit": "each",
+      "gramWeight": 400,
+      "displayText": "8",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175167",
+      "quantity": 7.5,
+      "unit": "oz",
+      "gramWeight": 212.5,
+      "displayText": "7.5 oz",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "4 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 60,
+      "unit": "g",
+      "gramWeight": 60,
+      "displayText": "60 g",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    }
+  ]
+}

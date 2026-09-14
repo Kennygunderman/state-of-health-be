@@ -1,0 +1,71 @@
+{
+  "slug": "steak-and-eggs-plate",
+  "name": "Seared beef and eggs plate",
+  "description": "A hearty breakfast plate of seared beef, fried eggs and quickly wilted spinach.",
+  "iconKey": "fork_knife",
+  "instructions": [
+    "Shape the ground beef into one thick patty about an inch thick.",
+    "Sear the patty in the olive oil over medium-high heat for 4 to 5 minutes per side, then move it to a warm plate.",
+    "Crack the eggs into the same pan and cook them until the edges crisp and the centres are just set.",
+    "Add the spinach beside the eggs and turn it for about a minute, until it wilts.",
+    "Slide the eggs and spinach onto the plate beside the beef and serve."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 plate",
+  "prepMinutes": 5,
+  "cookMinutes": 15,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free"
+  ],
+  "allergenTags": [
+    "eggs"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173110",
+      "quantity": 5,
+      "unit": "oz",
+      "gramWeight": 141.25,
+      "displayText": "5 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171287",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 100,
+      "displayText": "2",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60,
+      "displayText": "2 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 6.75,
+      "displayText": "½ tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

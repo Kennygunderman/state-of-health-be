@@ -1,0 +1,71 @@
+{
+  "slug": "banana-oat-energy-bites",
+  "name": "Banana oat energy bites",
+  "description": "Mashed banana and maple syrup bind rolled oats and sunflower seeds into no-bake bites that come together in one bowl.",
+  "iconKey": "dome",
+  "instructions": [
+    "Peel the bananas and mash them in a bowl until no large lumps remain, then stir in the maple syrup.",
+    "Add the rolled oats and sunflower seeds, and mix until every oat is coated.",
+    "Press and roll the mixture firmly into 12 equal bites.",
+    "Serve three bites per portion and keep the rest covered in the refrigerator."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "3 bites",
+  "prepMinutes": 10,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173904",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 121.5,
+      "displayText": "1½ cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173944",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 236,
+      "displayText": "2",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170562",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 35,
+      "displayText": "¼ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169661",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 40,
+      "displayText": "2 tbsp",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

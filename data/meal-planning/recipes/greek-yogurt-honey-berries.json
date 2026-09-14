@@ -1,0 +1,63 @@
+{
+  "slug": "greek-yogurt-honey-berries",
+  "name": "Greek yogurt with honey and berries",
+  "description": "A cold, no-cook snack of thick plain Greek yogurt with honey stirred through and halved strawberries spooned over the top.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Stir the honey through the Greek yogurt until it runs in even streaks.",
+    "Halve the strawberries and pile them over the yogurt.",
+    "Serve straight away, while the strawberries are still cold."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 4,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 183.75,
+      "displayText": "¾ cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167762",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 76,
+      "displayText": "½ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169640",
+      "quantity": 0.5,
+      "unit": "tbsp",
+      "gramWeight": 10.5,
+      "displayText": "½ tbsp",
+      "sortOrder": 2,
+      "isOptional": false
+    }
+  ]
+}

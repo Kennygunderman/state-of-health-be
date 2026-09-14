@@ -1,0 +1,118 @@
+{
+  "slug": "chana-masala-brown-rice",
+  "name": "Chana masala with brown rice",
+  "description": "Canned chickpeas simmered with onion, garlic and tomato in toasted cumin and chili powder, then folded through cooked brown rice for an easy weeknight dinner.",
+  "iconKey": "pot",
+  "instructions": [
+    "Warm the canola oil in a wide pan over medium heat and cook the onion until soft and golden, about 5 minutes.",
+    "Add the garlic, ground cumin and chili powder, and stir for 1 minute until fragrant.",
+    "Stir in the tomato and cook until it breaks down and thickens, about 4 minutes.",
+    "Add the chickpeas and simmer for 10 minutes, stirring occasionally, until they are glossy and well coated.",
+    "Fold the cooked brown rice through the pan and finish with the cilantro just before serving."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 20,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173800",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 506,
+      "displayText": "2 cans, drained",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 3,
+      "unit": "each",
+      "gramWeight": 369,
+      "displayText": "3 medium",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 1.25,
+      "unit": "cup",
+      "gramWeight": 200,
+      "displayText": "1¼ cups, chopped",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 4,
+      "unit": "clove",
+      "gramWeight": 12,
+      "displayText": "4 cloves",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 606,
+      "displayText": "3 cups",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172336",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 28,
+      "displayText": "2 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 4.2,
+      "displayText": "2 tsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 5.4,
+      "displayText": "2 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169997",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 8,
+      "displayText": "½ cup, chopped",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

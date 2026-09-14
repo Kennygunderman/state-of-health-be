@@ -1,0 +1,56 @@
+{
+  "slug": "apple-almond-butter-slices",
+  "name": "Apple slices with almonds",
+  "description": "Crisp apple wedges with a handful of almonds for a fast, crunchy snack that needs no cooking.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Core the apple and cut it into thin wedges.",
+    "Coarsely chop the almonds and scatter them over the wedges.",
+    "Serve right away so the apple stays crisp."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 plate",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "tree_nuts"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:168202",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 169,
+      "displayText": "1",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170567",
+      "quantity": 1,
+      "unit": "oz",
+      "gramWeight": 28.35,
+      "displayText": "1 oz",
+      "sortOrder": 1,
+      "isOptional": false
+    }
+  ]
+}

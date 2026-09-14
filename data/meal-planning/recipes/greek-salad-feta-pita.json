@@ -1,0 +1,116 @@
+{
+  "slug": "greek-salad-feta-pita",
+  "name": "Greek salad with feta and pasta",
+  "description": "A no-cook lunch bowl of cucumber, tomato and olives tossed with cooked pasta, lemon and olive oil, finished with crumbled feta.",
+  "iconKey": "salad",
+  "instructions": [
+    "Slice the cucumber and tomato into bite-sized pieces and cut the onion into thin slivers.",
+    "Toss them in a large bowl with the cooked pasta and the olives.",
+    "Squeeze the lemon over the bowl, pour in the olive oil and turn everything over gently until it is coated.",
+    "Crumble the feta on top and scatter the dill over it just before serving."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 12,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "lunch"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk",
+    "wheat"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:168409",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 208,
+      "displayText": "2 cups",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 246,
+      "displayText": "2",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.33,
+      "unit": "cup",
+      "gramWeight": 52.8,
+      "displayText": "⅓ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169094",
+      "quantity": 14,
+      "unit": "each",
+      "gramWeight": 61.6,
+      "displayText": "14",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173420",
+      "quantity": 3.5,
+      "unit": "oz",
+      "gramWeight": 99.225,
+      "displayText": "3½ oz",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169737",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 186,
+      "displayText": "1½ cups",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42,
+      "displayText": "½",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172233",
+      "quantity": 2,
+      "unit": "g",
+      "gramWeight": 2,
+      "displayText": "2 g",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

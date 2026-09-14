@@ -1,0 +1,93 @@
+{
+  "slug": "tofu-veggie-scramble",
+  "name": "Tofu veggie scramble",
+  "description": "Crumbled firm tofu browned in a skillet with onion, red bell pepper and wilted spinach for a savory plant-based start to the morning.",
+  "iconKey": "crosshair",
+  "instructions": [
+    "Press the tofu to draw off excess moisture, then crumble it into rough, bite-sized pieces.",
+    "Warm the oil in a wide skillet over medium heat, add the onion and bell pepper, and cook until they soften, about 4 minutes.",
+    "Add the crumbled tofu and the ground cumin, then cook undisturbed for 3 minutes so the edges brown.",
+    "Fold in the spinach and cook just until it wilts, about 2 minutes.",
+    "Divide between two warm plates and serve right away."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 plate",
+  "prepMinutes": 10,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:172448",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 189,
+      "displayText": "¾ cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 40,
+      "displayText": "¼ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 74.5,
+      "displayText": "½ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 1,
+      "unit": "g",
+      "gramWeight": 1,
+      "displayText": "1 g",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 60,
+      "displayText": "2 cups",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

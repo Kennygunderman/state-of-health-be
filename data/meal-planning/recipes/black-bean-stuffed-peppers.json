@@ -1,0 +1,118 @@
+{
+  "slug": "black-bean-stuffed-peppers",
+  "name": "Black bean stuffed peppers",
+  "description": "Bell pepper halves baked with a lightly spiced filling of black beans, brown rice, and zucchini.",
+  "iconKey": "dome",
+  "instructions": [
+    "Heat the oven to 400°F and halve the bell peppers lengthwise, hollowing out each half.",
+    "Warm the olive oil in a skillet over medium heat, then soften the chopped onion and diced zucchini for about 5 minutes.",
+    "Stir in the black beans, cooked brown rice, diced tomato, ground cumin, and chili powder, and cook 2 minutes more to draw out the aroma.",
+    "Spoon the filling into the bell pepper halves and arrange them snugly in a baking dish.",
+    "Bake for 25 minutes, until the bell peppers are tender and the filling is heated through."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "1 stuffed bell pepper (2 halves)",
+  "prepMinutes": 15,
+  "cookMinutes": 25,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 480,
+      "unit": "g",
+      "gramWeight": 480,
+      "displayText": "480 g (4 medium)",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 360,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 303,
+      "displayText": "1½ cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169291",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 124,
+      "displayText": "1 cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 246,
+      "displayText": "2",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "¾ cup",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 27,
+      "displayText": "2 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 4.2,
+      "displayText": "2 tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 5.4,
+      "displayText": "2 tsp",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

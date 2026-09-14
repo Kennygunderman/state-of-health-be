@@ -1,0 +1,96 @@
+{
+  "slug": "black-bean-corn-salad-bowl",
+  "name": "Black bean and avocado salad bowl",
+  "description": "A cold, no-cook bowl that leans on canned black beans and crisp raw vegetables, dressed simply with lime and olive oil.",
+  "iconKey": "salad",
+  "instructions": [
+    "Rinse and drain the black beans, then tip them into a large bowl.",
+    "Dice the bell pepper, tomato and onion, and add them to the beans.",
+    "Squeeze the lime over the bowl, pour in the olive oil, and toss until everything is evenly coated.",
+    "Fold in the diced avocado and the chopped cilantro, then divide between two bowls."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 12,
+  "cookMinutes": 0,
+  "mealSlots": ["lunch"],
+  "dietTags": ["gluten_free", "pescatarian", "pescatarian_ok", "vegan", "vegetarian"],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": ["gluten_free", "dairy_free", "vegan", "quick"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:175238",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 240,
+      "displayText": "1 cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 149,
+      "displayText": "1 cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 123,
+      "displayText": "1",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 60,
+      "unit": "g",
+      "gramWeight": 60,
+      "displayText": "60 g",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171705",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 100.5,
+      "displayText": "½",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168155",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 33.5,
+      "displayText": "½",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169997",
+      "quantity": 10,
+      "unit": "g",
+      "gramWeight": 10,
+      "displayText": "10 g",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

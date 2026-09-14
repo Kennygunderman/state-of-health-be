@@ -1,0 +1,97 @@
+{
+  "slug": "egg-salad-lettuce-cups",
+  "name": "Egg salad cabbage cups",
+  "description": "Hard-boiled eggs folded into Greek yogurt, mayonnaise and mustard with finely chopped celery and onion, then spooned into crisp cabbage leaves.",
+  "iconKey": "dome",
+  "instructions": [
+    "Boil the eggs for 12 minutes, then cool and peel them.",
+    "Finely chop the celery and the onion while the eggs cool.",
+    "Mash the peeled eggs with the Greek yogurt, the mayonnaise and the mustard until the mixture just holds together.",
+    "Fold the chopped celery and onion through the egg mixture.",
+    "Separate the cabbage into large cup-shaped leaves and spoon the egg mixture into each one."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "4 filled cabbage leaves",
+  "prepMinutes": 8,
+  "cookMinutes": 12,
+  "mealSlots": [
+    "lunch"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs",
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171287",
+      "quantity": 6,
+      "unit": "each",
+      "gramWeight": 300,
+      "displayText": "6",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 61.25,
+      "displayText": "¼ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171009",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 27.6,
+      "displayText": "2 tbsp",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172234",
+      "quantity": 2,
+      "unit": "tsp",
+      "gramWeight": 10,
+      "displayText": "2 tsp",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169988",
+      "quantity": 1.5,
+      "unit": "each",
+      "gramWeight": 60,
+      "displayText": "1½ stalks",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 20,
+      "unit": "g",
+      "gramWeight": 20,
+      "displayText": "20 g",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169975",
+      "quantity": 120,
+      "unit": "g",
+      "gramWeight": 120,
+      "displayText": "120 g",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "slug": "garlic-shrimp-zucchini-noodles",
+  "name": "Garlic shrimp with zucchini noodles",
+  "description": "Shrimp seared with sliced garlic and chili powder, then tossed off the heat through spiralized zucchini, tomato, lemon and torn basil.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Spiralize the zucchini into long ribbons and halve the tomato.",
+    "Warm the olive oil in a wide skillet over medium-high heat, then add the garlic and chili powder and cook until fragrant, about 30 seconds.",
+    "Add the shrimp in a single layer and sear 2 to 3 minutes per side, until opaque and just firm.",
+    "Toss the zucchini ribbons and tomato through the pan for 1 minute, then finish off the heat with a squeeze of lemon and the torn basil."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 8,
+  "cookMinutes": 7,
+  "mealSlots": ["lunch", "dinner"],
+  "dietTags": ["gluten_free", "pescatarian_ok"],
+  "allergenTags": ["shellfish"],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": ["high_protein", "gluten_free", "dairy_free", "quick"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174210",
+      "quantity": 12,
+      "unit": "oz",
+      "gramWeight": 340,
+      "displayText": "12 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169291",
+      "quantity": 3.25,
+      "unit": "cup",
+      "gramWeight": 403,
+      "displayText": "3¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 123,
+      "displayText": "1 medium",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 4,
+      "unit": "clove",
+      "gramWeight": 12,
+      "displayText": "4 cloves",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42,
+      "displayText": "½",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 6,
+      "displayText": "¼ cup",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 0.5,
+      "unit": "tsp",
+      "gramWeight": 1.35,
+      "displayText": "½ tsp",
+      "sortOrder": 7,
+      "isOptional": false
+    }
+  ]
+}

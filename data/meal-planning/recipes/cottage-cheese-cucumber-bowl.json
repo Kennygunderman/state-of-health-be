@@ -1,0 +1,72 @@
+{
+  "slug": "cottage-cheese-cucumber-bowl",
+  "name": "Savoury yogurt and cucumber bowl",
+  "description": "Thick plain yogurt under sliced cucumber and tomato, finished with a generous grind of black pepper.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Spoon the Greek yogurt into a bowl and spread it level.",
+    "Slice the cucumber and the tomato and pile them over the yogurt.",
+    "Finish with the black pepper and serve cold."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:2705424",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 122.5,
+      "displayText": "½ cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168409",
+      "quantity": 1,
+      "unit": "cup",
+      "gramWeight": 104,
+      "displayText": "1 cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 61.5,
+      "displayText": "½",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 1,
+      "unit": "g",
+      "gramWeight": 1,
+      "displayText": "1 g",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

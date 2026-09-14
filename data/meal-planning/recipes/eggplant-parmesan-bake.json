@@ -1,0 +1,116 @@
+{
+  "slug": "eggplant-parmesan-bake",
+  "name": "Baked eggplant with tomato and cheddar",
+  "description": "Rounds of eggplant are dredged in flour and roasted, then layered with a garlicky tomato sauce and two cheeses and baked until the top browns.",
+  "iconKey": "dome",
+  "instructions": [
+    "Heat the oven to 400°F and cut the eggplant crosswise into rounds about half an inch thick.",
+    "Turn the rounds in the flour to coat both sides, brush them with half of the olive oil, and roast on a baking sheet for 20 minutes, turning once.",
+    "While the eggplant roasts, soften the chopped garlic in the remaining olive oil, then add the chopped tomato and the black pepper and simmer until thick.",
+    "Spread a thin layer of the tomato mixture in a baking dish, then alternate the roasted eggplant, the rest of the mixture and most of the grated cheddar cheese.",
+    "Top with the remaining cheddar cheese and the crumbled feta cheese, then bake for 20 minutes, until the cheese is browned at the edges.",
+    "Let it stand for 5 minutes, tear the basil over the top, and cut into four squares."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "1 square",
+  "prepMinutes": 15,
+  "cookMinutes": 40,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk",
+    "wheat"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": [],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169228",
+      "quantity": 800,
+      "unit": "g",
+      "gramWeight": 800,
+      "displayText": "800 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168894",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 62.5,
+      "displayText": "½ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 27,
+      "displayText": "2 tbsp",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 3,
+      "unit": "each",
+      "gramWeight": 369,
+      "displayText": "3",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 3,
+      "unit": "cloves",
+      "gramWeight": 9,
+      "displayText": "3 cloves",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170931",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.3,
+      "displayText": "1 tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:328637",
+      "quantity": 6,
+      "unit": "oz",
+      "gramWeight": 170.1,
+      "displayText": "6 oz",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173420",
+      "quantity": 1.5,
+      "unit": "oz",
+      "gramWeight": 42.5,
+      "displayText": "1.5 oz",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 12,
+      "displayText": "½ cup",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

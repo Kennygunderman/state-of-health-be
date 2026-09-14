@@ -1,0 +1,80 @@
+{
+  "slug": "chicken-sweet-potato-hash",
+  "name": "Chicken and sweet potato hash",
+  "description": "A hearty one-skillet breakfast of sweet potato, onion, and red bell pepper cooked in olive oil and finished with chili powder and seared chicken breast.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Peel the sweet potato and cut it into small cubes, then dice the onion and the bell pepper.",
+    "Warm the olive oil in a large skillet over medium heat, add the sweet potato in a single layer, and cook undisturbed for 8 minutes.",
+    "Stir in the onion and the bell pepper and cook for 5 minutes more, until they soften.",
+    "Cut the chicken breast into bite-sized pieces, toss them with the chili powder, and add them to the skillet.",
+    "Cook, stirring every few minutes, until the chicken is cooked through and the sweet potato is tender, about 12 minutes.",
+    "Divide the hash between two bowls and serve warm."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 25,
+  "mealSlots": ["breakfast"],
+  "dietTags": ["gluten_free"],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 2,
+  "badges": ["high_protein", "gluten_free", "dairy_free"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171077",
+      "quantity": 10,
+      "unit": "oz",
+      "gramWeight": 282.5,
+      "displayText": "10 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168482",
+      "quantity": 2.25,
+      "unit": "cups",
+      "gramWeight": 299.25,
+      "displayText": "2¼ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 111.75,
+      "displayText": "¾ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 1,
+      "unit": "tsp",
+      "gramWeight": 2.7,
+      "displayText": "1 tsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

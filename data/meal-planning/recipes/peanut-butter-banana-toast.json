@@ -1,0 +1,60 @@
+{
+  "slug": "peanut-butter-banana-toast",
+  "name": "Toasted bulgur with peanut butter and banana",
+  "description": "Dry-toasted bulgur softened in oat milk, stirred with peanut butter and finished with sliced banana for a warm weekday breakfast.",
+  "iconKey": "dome",
+  "instructions": [
+    "Toast the bulgur in a dry pan over medium heat until it smells fragrant, about 3 minutes.",
+    "Pour in the oat milk, cover the pan, and leave it off the heat until the bulgur is tender.",
+    "Stir the peanut butter through the warm bulgur until it turns glossy.",
+    "Slice the banana over the top and serve warm."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 3,
+  "mealSlots": ["breakfast"],
+  "dietTags": ["pescatarian", "pescatarian_ok", "vegan", "vegetarian"],
+  "allergenTags": ["peanuts", "wheat"],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": ["dairy_free", "vegan", "quick"],
+  "ingredients": [
+    {
+      "sourceKey": "usda:170688",
+      "quantity": 0.25,
+      "unit": "cup",
+      "gramWeight": 35,
+      "displayText": "¼ cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:2705412",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 122,
+      "displayText": "½ cup",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172470",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 32,
+      "displayText": "2 tbsp",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173944",
+      "quantity": 1,
+      "unit": "each",
+      "gramWeight": 118,
+      "displayText": "1",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

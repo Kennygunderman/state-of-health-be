@@ -1,0 +1,65 @@
+{
+  "slug": "hummus-carrot-sticks",
+  "name": "Hummus with carrot and cucumber sticks",
+  "description": "A no-cook snack plate of crisp carrot and cucumber sticks with a bowl of hummus for dipping.",
+  "iconKey": "bowl",
+  "instructions": [
+    "Peel the carrot and cut it into finger-length sticks.",
+    "Slice the cucumber into thin rounds.",
+    "Spoon the hummus into a small bowl and serve it alongside for dipping."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 plate",
+  "prepMinutes": 5,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "sesame"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174289",
+      "quantity": 4,
+      "unit": "tbsp",
+      "gramWeight": 60,
+      "displayText": "4 tbsp",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170393",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 122,
+      "displayText": "2",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168409",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 78,
+      "displayText": "¾ cup",
+      "sortOrder": 2,
+      "isOptional": false
+    }
+  ]
+}

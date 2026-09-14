@@ -1,0 +1,100 @@
+{
+  "slug": "mushroom-spinach-frittata",
+  "name": "Mushroom and spinach frittata",
+  "description": "Eggs baked with mushrooms, spinach and onion, finished with sharp cheddar cheese.",
+  "iconKey": "crosshair",
+  "instructions": [
+    "Warm the olive oil in a 10-inch ovenproof skillet over medium heat and cook the onion until soft, about 3 minutes.",
+    "Add the mushrooms and cook until browned and their liquid has evaporated, about 6 minutes.",
+    "Stir in the spinach and cook just until wilted, then spread the filling evenly across the pan.",
+    "Beat the eggs with the milk until smooth, pour them over the filling, and cook undisturbed until the edges set, about 8 minutes.",
+    "Scatter the cheddar cheese over the top, slide the skillet under a hot broiler, and broil until the center is just firm, about 5 minutes."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "1 wedge",
+  "prepMinutes": 10,
+  "cookMinutes": 25,
+  "mealSlots": [
+    "dinner"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "eggs",
+    "milk"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171287",
+      "quantity": 8,
+      "unit": "each",
+      "gramWeight": 400,
+      "displayText": "8",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169251",
+      "quantity": 3,
+      "unit": "cup",
+      "gramWeight": 210,
+      "displayText": "3 cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:168462",
+      "quantity": 4,
+      "unit": "cup",
+      "gramWeight": 120,
+      "displayText": "4 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171267",
+      "quantity": 60,
+      "unit": "g",
+      "gramWeight": 60,
+      "displayText": "60 g",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:328637",
+      "quantity": 4,
+      "unit": "slice",
+      "gramWeight": 68,
+      "displayText": "4 slices",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}

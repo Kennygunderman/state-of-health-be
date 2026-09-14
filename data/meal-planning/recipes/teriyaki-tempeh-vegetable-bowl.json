@@ -1,0 +1,121 @@
+{
+  "slug": "teriyaki-tempeh-vegetable-bowl",
+  "name": "Teriyaki tempeh and vegetable bowl",
+  "description": "Seared tempeh and crisp vegetables tossed in a fast soy sauce and maple syrup glaze, spooned over warm brown rice.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Stir the soy sauce, maple syrup and garlic together to make the glaze.",
+    "Heat the canola oil in a wide pan over medium-high heat, then sear the tempeh for 3 to 4 minutes, turning once.",
+    "Add the broccoli, bell pepper and onion and stir-fry for 4 minutes, until the broccoli is bright and just tender.",
+    "Pour in the glaze and toss for 1 minute, until it thickens and coats everything in the pan.",
+    "Serve the tempeh and vegetables over the warm brown rice."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 5,
+  "cookMinutes": 10,
+  "mealSlots": [
+    "lunch",
+    "dinner"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "soy",
+    "wheat"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "dairy_free",
+    "vegan",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:174272",
+      "quantity": 240,
+      "unit": "g",
+      "gramWeight": 240,
+      "displayText": "240 g",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 1.5,
+      "unit": "cup",
+      "gramWeight": 303,
+      "displayText": "1½ cups",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170379",
+      "quantity": 2,
+      "unit": "cup",
+      "gramWeight": 176,
+      "displayText": "2 cups",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170108",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 111.75,
+      "displayText": "¾ cup",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 0.5,
+      "unit": "cup",
+      "gramWeight": 80,
+      "displayText": "½ cup",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174277",
+      "quantity": 2,
+      "unit": "tbsp",
+      "gramWeight": 32,
+      "displayText": "2 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169661",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 20,
+      "displayText": "1 tbsp",
+      "sortOrder": 6,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172336",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 14,
+      "displayText": "1 tbsp",
+      "sortOrder": 7,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:169230",
+      "quantity": 2,
+      "unit": "clove",
+      "gramWeight": 6,
+      "displayText": "2 cloves",
+      "sortOrder": 8,
+      "isOptional": false
+    }
+  ]
+}

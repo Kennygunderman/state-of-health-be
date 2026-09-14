@@ -1,0 +1,71 @@
+{
+  "slug": "smoked-salmon-avocado-toast",
+  "name": "Tuna and avocado breakfast bowl",
+  "description": "A no-cook breakfast bowl that layers flaked tuna and sliced avocado over cooked brown rice, finished with a squeeze of lemon.",
+  "iconKey": "dome",
+  "instructions": [
+    "Spoon the cooked brown rice into a shallow bowl and spread it level.",
+    "Drain the tuna well, then flake it over one half of the rice.",
+    "Halve the avocado, slice one half thinly and fan it over the remaining rice.",
+    "Squeeze the lemon over the bowl and serve right away."
+  ],
+  "yieldServings": 1,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 8,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "breakfast"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian_ok"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:169704",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 151.5,
+      "displayText": "¾ cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171986",
+      "quantity": 3,
+      "unit": "oz",
+      "gramWeight": 85,
+      "displayText": "3 oz",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171705",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 100.5,
+      "displayText": "½",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.25,
+      "unit": "each",
+      "gramWeight": 21,
+      "displayText": "¼ lemon",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

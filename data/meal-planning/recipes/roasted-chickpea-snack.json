@@ -1,0 +1,73 @@
+{
+  "slug": "roasted-chickpea-snack",
+  "name": "Crispy roasted chickpeas",
+  "description": "A crunchy one-pan snack that roasts in a single batch and portions out for the week.",
+  "iconKey": "bowl_dash",
+  "instructions": [
+    "Heat the oven to 400°F and line a baking sheet with parchment.",
+    "Drain and rinse the chickpeas, then pat them completely dry so they crisp.",
+    "Toss the chickpeas with the olive oil, chili powder, and ground cumin until evenly coated.",
+    "Roast 25 minutes, shaking the pan once halfway through, until deeply golden and crunchy.",
+    "Cool briefly, then divide the batch into four equal portions."
+  ],
+  "yieldServings": 4,
+  "servingDescription": "¾ cup",
+  "prepMinutes": 5,
+  "cookMinutes": 25,
+  "mealSlots": [
+    "snack"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian",
+    "pescatarian_ok",
+    "vegan",
+    "vegetarian"
+  ],
+  "allergenTags": [],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "gluten_free",
+    "dairy_free",
+    "vegan"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:173800",
+      "quantity": 2,
+      "unit": "each",
+      "gramWeight": 506,
+      "displayText": "2 cans",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171319",
+      "quantity": 3,
+      "unit": "g",
+      "gramWeight": 3,
+      "displayText": "3 g",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170923",
+      "quantity": 2,
+      "unit": "g",
+      "gramWeight": 2,
+      "displayText": "2 g",
+      "sortOrder": 3,
+      "isOptional": false
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "slug": "caprese-farro-salad",
+  "name": "Tomato, basil and feta bulgur salad",
+  "description": "Chewy bulgur tossed with ripe tomato, torn basil and crumbled feta, finished with olive oil and balsamic vinegar.",
+  "iconKey": "salad",
+  "instructions": [
+    "Cook the bulgur until tender, then drain it and let it cool to room temperature.",
+    "Whisk the olive oil and balsamic vinegar together in a large bowl.",
+    "Halve the tomatoes, tear the basil leaves, and add both to the bowl.",
+    "Fold in the cooled bulgur until it is evenly coated.",
+    "Crumble the feta over the top and serve."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 25,
+  "mealSlots": [
+    "lunch"
+  ],
+  "dietTags": [
+    "pescatarian",
+    "pescatarian_ok",
+    "vegetarian"
+  ],
+  "allergenTags": [
+    "milk",
+    "wheat"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [],
+  "ingredients": [
+    {
+      "sourceKey": "usda:170688",
+      "quantity": 0.75,
+      "unit": "cup",
+      "gramWeight": 105,
+      "displayText": "¾ cup",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:173420",
+      "quantity": 4,
+      "unit": "oz",
+      "gramWeight": 113.4,
+      "displayText": "4 oz",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 1.5,
+      "unit": "each",
+      "gramWeight": 184.5,
+      "displayText": "1½ tomatoes",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172232",
+      "quantity": 10,
+      "unit": "g",
+      "gramWeight": 10,
+      "displayText": "10 g",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 13.5,
+      "displayText": "1 tbsp",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172241",
+      "quantity": 1,
+      "unit": "tbsp",
+      "gramWeight": 16,
+      "displayText": "1 tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    }
+  ]
+}

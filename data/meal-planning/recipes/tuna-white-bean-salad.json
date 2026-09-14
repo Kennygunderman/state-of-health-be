@@ -1,0 +1,99 @@
+{
+  "slug": "tuna-white-bean-salad",
+  "name": "Tuna and bean salad",
+  "description": "A no-cook lunch bowl of drained tuna and canned beans tossed with tomato, onion, dill, lemon and olive oil.",
+  "iconKey": "salad",
+  "instructions": [
+    "Drain the tuna and the canned kidney beans, then rinse the beans and shake them dry.",
+    "Dice the tomato, slice the onion thinly and chop the dill.",
+    "Squeeze the lemon into the olive oil and whisk until it thickens slightly.",
+    "Add the tuna, beans, tomato, onion and dill, then toss everything together and serve."
+  ],
+  "yieldServings": 2,
+  "servingDescription": "1 bowl",
+  "prepMinutes": 10,
+  "cookMinutes": 0,
+  "mealSlots": [
+    "lunch"
+  ],
+  "dietTags": [
+    "gluten_free",
+    "pescatarian_ok"
+  ],
+  "allergenTags": [
+    "fish"
+  ],
+  "allergenStatus": "known",
+  "budgetTier": 1,
+  "badges": [
+    "high_protein",
+    "gluten_free",
+    "dairy_free",
+    "quick"
+  ],
+  "ingredients": [
+    {
+      "sourceKey": "usda:171986",
+      "quantity": 6,
+      "unit": "oz",
+      "gramWeight": 170,
+      "displayText": "6 oz",
+      "sortOrder": 0,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:174285",
+      "quantity": 250,
+      "unit": "g",
+      "gramWeight": 250,
+      "displayText": "250 g",
+      "sortOrder": 1,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170457",
+      "quantity": 150,
+      "unit": "g",
+      "gramWeight": 150,
+      "displayText": "150 g",
+      "sortOrder": 2,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:170000",
+      "quantity": 50,
+      "unit": "g",
+      "gramWeight": 50,
+      "displayText": "50 g",
+      "sortOrder": 3,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:172233",
+      "quantity": 4,
+      "unit": "g",
+      "gramWeight": 4,
+      "displayText": "4 g",
+      "sortOrder": 4,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:171413",
+      "quantity": 1.5,
+      "unit": "tbsp",
+      "gramWeight": 20.25,
+      "displayText": "1½ tbsp",
+      "sortOrder": 5,
+      "isOptional": false
+    },
+    {
+      "sourceKey": "usda:167746",
+      "quantity": 0.5,
+      "unit": "each",
+      "gramWeight": 42,
+      "displayText": "½",
+      "sortOrder": 6,
+      "isOptional": false
+    }
+  ]
+}
