@@ -1376,3 +1376,294 @@ describe('the diary entries endpoint', () => {
         });
     });
 });
+
+// ==========================================================================
+// The idempotent-replay ledger, against real PostgreSQL.
+//
+// §0.5.1 requires a repeated keyed write to return "the stored first-response
+// status and body … unchanged … so a client can never distinguish a replay
+// from the original response", and §0.9.2 states the same row as "the same key
+// and body replayed without the header returns the stored 201/200 body
+// BYTE-FOR-BYTE". `mealPlanningAction.logic.test.ts` pins the rules that make
+// that true with no database; what it cannot do is read the column. This suite
+// is the column: it commits one keyed action through
+// `withMealPlanningTransaction`/`runKeyedAction`, replays it, and asserts the
+// stored `meal_plan_actions` row, the bytes of `response_snapshot` itself and
+// the key order PostgreSQL holds them in.
+//
+// WHY HERE. The HTTP-level comparison of an original and a replayed response —
+// the request aborted after commit with `x-test-abort-after-commit`, then
+// replayed over the wire — belongs to `src/__tests__/api/fault.test.ts`, and
+// the lock/reserve races belong to `src/__tests__/api/concurrency.test.ts`
+// (§0.9.2). Those two suites own that evidence; neither exists in this
+// checkpoint, and this file is the only PostgreSQL-backed home available, so
+// the ledger's persistence is proven here at the service seam rather than left
+// modelled inside a unit test. This is a statement of ownership: when those
+// suites land, the wire-level byte comparison is theirs and this describe stays
+// what it is — the column-level proof underneath it.
+// ==========================================================================
+
+import { IdempotencyConflictError } from '../../services/mealPlanning.errors';
+import { buildRequestFingerprint } from '../../services/mealPlanningAction.logic';
+import {
+    KeyedActionResult,
+    runKeyedAction,
+    withMealPlanningTransaction,
+} from '../../services/mealPlanningAction.service';
+import { MealPlanResponse } from '../../types/mealPlanning';
+import { makePlan } from '../setup/factories';
+
+/** The `meal_plan_actions` columns this suite reads, in database spelling. */
+interface LedgerRowColumns {
+    response_status: number | null;
+    plan_revision_after: number | null;
+    meal_plan_id: string | null;
+    meal_plan_meal_id: string | null;
+    meal_entry_id: string | null;
+}
+
+/** `response_snapshot` rendered by PostgreSQL itself, not by Prisma. */
+interface SnapshotTextRow {
+    snapshot_text: string;
+}
+
+/** One key per row, in the column's own order. */
+interface SnapshotKeyRow {
+    key: string;
+}
+
+/**
+ * A generate response written the way a mapper assembling a DTO field by field
+ * produces one: NOT in the order `jsonb` holds keys in. That is the whole point
+ * of the fixture — if the ledger stored it as it arrived, the column would
+ * reorder it and no replay could reproduce the first response's bytes.
+ *
+ * It carries one of every scalar class a keyed body can hold: a two-decimal
+ * float (`65.5`, `610.4`), Number.MAX_SAFE_INTEGER + 1, `null`, both booleans,
+ * a multi-byte string with an astral-plane emoji, and a two-element array whose
+ * order is meaning. Cast because the ledger stores a response body without
+ * inspecting it, and assembling a whole 7-day `MealPlanResponse` would make the
+ * fixture about the plan mapper instead of about the column.
+ */
+const NON_CANONICAL_GENERATE_BODY = {
+    id: 'plan-1',
+    revision: 2,
+    targets: { calories: 1940, protein: 146, fat: 65.5 },
+    days: [
+        { date: '2026-07-05', meals: [{ slot: 'lunch', planned: { calories: 610.4, protein: 45 } }] },
+        { date: '2026-07-06', meals: [{ slot: 'dinner', planned: { calories: 720, protein: 52 } }] },
+    ],
+    note: 'café — crème brûlée 🥗',
+    big: 9007199254740992,
+    nothing: null,
+    isLocked: false,
+    wasRegenerated: true,
+} as unknown as MealPlanResponse;
+
+/** A body that differs from the one above, for the conflicting-request case. */
+const OTHER_GENERATE_BODY = { ...NON_CANONICAL_GENERATE_BODY, id: 'plan-2' } as unknown as MealPlanResponse;
+
+describe('the meal-planning action ledger', () => {
+    const owner = { uid: '' };
+    let planId = '';
+    let workRuns = 0;
+
+    /** The §0.5.2 generate request this suite keys and fingerprints. */
+    const generateRequest = (startDate: string) => ({
+        startDate,
+        idempotencyKey: '0f9d5b1e-4c4a-4c2e-9f1a-6b2d7e8c9a10',
+        expectedPreferencesRevision: 1,
+        expectedTargetsRevision: 1,
+    });
+
+    /**
+     * One keyed write, run exactly as a service runs it: the transaction from
+     * `withMealPlanningTransaction`, the sequence from `runKeyedAction`, the
+     * fingerprint from the real `buildRequestFingerprint`.
+     *
+     * `work` bumps `meal_plans.revision` and returns the new value, which is
+     * what §0.5.1's "write, bump, record" does — and it makes "did the work run
+     * twice" measurable in the database rather than only in a counter: a second
+     * execution would leave the plan at revision 3.
+     */
+    const runGenerate = async (body: MealPlanResponse, startDate: string): Promise<KeyedActionResult> => {
+        const request = generateRequest(startDate);
+
+        return withMealPlanningTransaction((tx) =>
+            runKeyedAction(
+                tx,
+                {
+                    userId: owner.uid,
+                    actionType: 'generate',
+                    idempotencyKey: request.idempotencyKey,
+                    fingerprint: buildRequestFingerprint('POST', 'generate', {}, request),
+                },
+                async (lockedTx) => {
+                    workRuns += 1;
+
+                    const bumped = await lockedTx.meal_plans.update({
+                        where: { id_user_id: { id: planId, user_id: owner.uid } },
+                        data: { revision: { increment: 1 } },
+                        select: { revision: true },
+                    });
+
+                    return { body, planRevisionAfter: bumped.revision, mealPlanId: planId };
+                },
+            ),
+        );
+    };
+
+    const ledgerRows = async (): Promise<LedgerRowColumns[]> =>
+        prisma.meal_plan_actions.findMany({
+            where: { user_id: owner.uid, idempotency_key: generateRequest('2026-07-05').idempotencyKey },
+            select: {
+                response_status: true,
+                plan_revision_after: true,
+                meal_plan_id: true,
+                meal_plan_meal_id: true,
+                meal_entry_id: true,
+            },
+        });
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+        workRuns = 0;
+
+        const user = await makeUser();
+        owner.uid = user.id;
+
+        // A real plan, because the ledger row's `meal_plan_id` carries a
+        // composite foreign key to `meal_plans(id, user_id)`: a completion
+        // naming a plan that does not exist is rejected by the database, which
+        // is exactly the guard that makes the stored row traceable. One day is
+        // enough — nothing here reads the plan's contents.
+        const plan = await makePlan(owner.uid, { dayCount: 1 });
+        planId = plan.id;
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('commits one action row carrying the status and the revision it recorded', async () => {
+        const first = await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+        const rows = await ledgerRows();
+
+        expect(rows).toHaveLength(1);
+        // 201 for a generate (§0.5.2), persisted rather than derived at read
+        // time, and the revision the bump produced.
+        expect(rows[0].response_status).toBe(201);
+        expect(rows[0].plan_revision_after).toBe(2);
+        expect(rows[0].meal_plan_id).toBe(planId);
+        // A generate records the plan it published and nothing else.
+        expect(rows[0].meal_plan_meal_id).toBeNull();
+        expect(rows[0].meal_entry_id).toBeNull();
+        expect(first.status).toBe(201);
+        expect(first.planRevisionAfter).toBe(2);
+    });
+
+    it('replays the stored response without running the work again', async () => {
+        await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+        const replay = await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+
+        expect(workRuns).toBe(1);
+        // The database agrees: a second execution would have bumped the plan
+        // again. This is the guarantee the ledger exists for — at most once,
+        // however many times the client retries.
+        const plan = await prisma.meal_plans.findUnique({ where: { id: planId }, select: { revision: true } });
+
+        expect(plan?.revision).toBe(2);
+        expect(replay.status).toBe(201);
+        expect(replay.planRevisionAfter).toBe(2);
+        expect((await ledgerRows())).toHaveLength(1);
+    });
+
+    it('replays the body BYTE-FOR-BYTE, which is §0.9.2 read literally', async () => {
+        const first = await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+        const replay = await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+
+        // The first answer came from memory and the replay came out of a `jsonb`
+        // column that reorders object keys at rest. They agree to the byte
+        // because both serialise a canonically ordered value — the ledger stores
+        // the body in the order the column would impose anyway.
+        expect(JSON.stringify(replay.body)).toBe(JSON.stringify(first.body));
+        expect(replay.body).toEqual(first.body);
+        expect(replay.body).toEqual(NON_CANONICAL_GENERATE_BODY);
+    });
+
+    it('holds the served bytes in the column itself, in the column\'s own key order', async () => {
+        const first = await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+
+        const [stored] = await prisma.$queryRaw<SnapshotTextRow[]>`
+            SELECT response_snapshot::text AS snapshot_text
+            FROM meal_plan_actions
+            WHERE user_id = ${owner.uid}
+        `;
+
+        // Parsed before it is compared, deliberately: `jsonb::text` renders a
+        // space after every `:` and `,` while `JSON.stringify` renders none, so
+        // a raw string comparison would fail over whitespace rather than over
+        // ORDER, which is the only thing at issue. Parsing normalises the
+        // whitespace and preserves the key order, so this asserts exactly what
+        // it means to.
+        expect(JSON.stringify(JSON.parse(stored.snapshot_text))).toBe(JSON.stringify(first.body));
+
+        // And the order directly from PostgreSQL, with no JavaScript object in
+        // between: `jsonb_object_keys` returns the keys in the order the column
+        // holds them, which is the measurement the deleted in-test model used
+        // to stand in for.
+        const keys = await prisma.$queryRaw<SnapshotKeyRow[]>`
+            SELECT key FROM meal_plan_actions, jsonb_object_keys(response_snapshot) AS key
+            WHERE user_id = ${owner.uid}
+        `;
+
+        expect(keys.map((row) => row.key)).toEqual([
+            'id',
+            'big',
+            'days',
+            'note',
+            'nothing',
+            'targets',
+            'isLocked',
+            'revision',
+            'wasRegenerated',
+        ]);
+        expect(keys.map((row) => row.key)).toEqual(Object.keys(first.body as Record<string, unknown>));
+    });
+
+    it('preserves every scalar class in the column, not only the key order', async () => {
+        await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+
+        const [stored] = await prisma.$queryRaw<SnapshotTextRow[]>`
+            SELECT response_snapshot::text AS snapshot_text
+            FROM meal_plan_actions
+            WHERE user_id = ${owner.uid}
+        `;
+        const snapshot = JSON.parse(stored.snapshot_text) as Record<string, unknown>;
+        const days = snapshot.days as Record<string, unknown>[];
+        const lunch = (days[0].meals as Record<string, unknown>[])[0].planned as Record<string, number>;
+
+        expect((snapshot.targets as Record<string, number>).fat).toBe(65.5);
+        expect(lunch.calories).toBe(610.4);
+        expect(snapshot.big).toBe(9007199254740992);
+        expect(snapshot.nothing).toBeNull();
+        expect(snapshot.note).toBe('café — crème brûlée 🥗');
+        expect(snapshot.isLocked).toBe(false);
+        expect(snapshot.wasRegenerated).toBe(true);
+        expect(days.map((day) => day.date)).toEqual(['2026-07-05', '2026-07-06']);
+    });
+
+    it('refuses the same key with a different request, so the guarantee is not "any body replays"', async () => {
+        await runGenerate(NON_CANONICAL_GENERATE_BODY, '2026-07-05');
+
+        // A different start date is a different request: the fingerprint moves,
+        // the stored response no longer answers it, and §0.5.1 answers
+        // `409 idempotency_conflict` rather than replaying a result the client
+        // did not ask for. Byte-for-byte replay applies to the SAME request
+        // only.
+        await expect(runGenerate(OTHER_GENERATE_BODY, '2026-07-12')).rejects.toThrow(IdempotencyConflictError);
+
+        expect(workRuns).toBe(1);
+        expect(await ledgerRows()).toHaveLength(1);
+    });
+});

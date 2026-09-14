@@ -300,8 +300,8 @@ export interface CatalogSearchResult {
  *    used no index at all, while binding it into each branch — which is what the
  *    two branches below do — produced the index scan.
  *
- * Both conditions are asserted, not asserted-to: `catalog.service.test.ts` pins
- * the operator class out of `pg_opclass`, pins the plan under
+ * Both conditions are asserted, not asserted-to: `src/__tests__/api/catalog.test.ts`
+ * pins the operator class out of `pg_opclass`, pins the plan under
  * `enable_seqscan = off`, and reads the `pg_stat_user_indexes.idx_scan` delta
  * across a real `searchPublishedFoods` call. The cost direction they protect,
  * measured on a 10,000-alias corpus at 1% selectivity: ~2.5-3.0 ms for the

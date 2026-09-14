@@ -50,7 +50,6 @@ import {
     CatalogIdentitySource,
     CatalogNutritionBasis,
     CatalogNutritionProvenance,
-    CatalogPortionNutritionResponse,
     CatalogStatusResponse,
     CatalogSuggestionResponse,
 } from '../types/catalog';
@@ -61,6 +60,7 @@ import {
     isCatalogIdentitySource,
     isCatalogNutritionBasis,
     isCatalogNutritionProvenance,
+    normalizeToPer100g,
 } from './catalog.logic';
 
 /* ---------------------------------------------------------------------------
@@ -133,11 +133,11 @@ export interface CatalogFoodRow {
     carbs_g: number | null;
     fat_g: number | null;
     fiber_g: number | null;
-    // Read because the default-portion projection needs it: a `per_100ml` food
+    // Read because restating the basis as a mass needs it: a `per_100ml` food
     // states its nutrients against a volume, and density is the only thing that
     // turns that volume into the grams a portion is measured in. Nullable
     // because the column is, and null is a fault on a `per_100ml` row rather
-    // than a value to substitute — see {@link deriveDefaultPortionNutrition}.
+    // than a value to substitute — see {@link resolveMassBasis}.
     density_g_per_ml: number | null;
     // Non-null, because the column is `TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]`
     // and the response declares `allergenTags: string[]`. It is still read
@@ -372,121 +372,109 @@ const resolveDefaultPortion = (
 };
 
 /* ---------------------------------------------------------------------------
- * The default-portion nutrition projection
+ * Restating the BASIS as the mass it describes — never the values
  * ------------------------------------------------------------------------- */
 
 /**
- * A row value the projection multiplies or divides a mass by.
+ * The mass basis of one row: the code the response declares, and the grams the
+ * row's STORED nutrient values describe.
  *
- * Stricter than {@link requireCoreNutrient} in one way that matters: zero and
- * negative are rejected as well as null and non-finite, because these are
- * factors, not measurements. A zero basis amount or a zero density makes the
- * basis mass zero, and dividing by it yields an `Infinity` the rounding would
- * then hand to the client as a nutrition claim. Every such value is positive by
- * validation, so arriving here at all is a data-integrity fault — and the one
- * alternative, inventing a density, is the fabricated number the catalog's
- * nutrition-integrity policy exists to prevent.
+ * `basisGrams` is `basis_amount` itself for a gram basis, `basis_amount ×
+ * density_g_per_ml` for a volume one, and `basis_amount × the default portion's
+ * gram weight` for a serving one — so `{nutritionBasis: 'per_100g',
+ * basisGrams: 91.8}` beside a stored 275.4 kcal reads as "275.4 kcal per
+ * 91.8 g", which is exactly what the source record states. `basis_amount` is
+ * already documented as "how much of the food the stated values describe, in
+ * the basis's own unit", and `normalizeToPer100g` accepts (and
+ * `catalog.logic.test.ts` pins) a `per_100g` row whose `basis_amount` is 50, so
+ * a mass basis other than 100 is this codebase's own vocabulary rather than a
+ * new convention.
  */
-const requirePositiveFactor = (value: number | null, table: string, column: string, foodId: string): number => {
-    if (value === null || !Number.isFinite(value) || value <= 0) {
-        throw new CatalogMappingError(
-            `${table}.${column} is ${value === null ? 'null' : String(value)} for published food ${foodId}; ` +
-                'the default-portion projection requires a positive, finite value and never substitutes one',
-        );
-    }
-
-    return value;
-};
+interface CatalogMassBasis {
+    /**
+     * Always the mass basis code, and read off the conversion rather than
+     * written here, so exactly one place decides what basis the wire declares.
+     */
+    nutritionBasis: CatalogNutritionBasis;
+    /** What the row's stated basis weighs, in grams. */
+    basisGrams: number;
+}
 
 /**
- * The mass the food's stated nutrient values describe, in grams.
+ * The mass the food's stored nutrition describes, or the data-integrity fault
+ * that stops it.
  *
- * `per_100g` states them against a mass already; `per_100ml` states them
- * against a volume, which only `density_g_per_ml` can turn into a mass; and
- * `per_serving` states them against `basis_amount` of the food's own default
- * portion.
+ * THE VALUES ARE NOT SCALED — only the basis is restated — and that is the
+ * whole point of this shape, so it must not be "simplified" back into a
+ * per-100 g rescale. A client reads one portion as
+ * `round(storedValue × (gramWeight / basisAmount))`, and the diary snapshot
+ * `nutrition.logic.ts::resolveCatalogEntrySnapshot` stores
+ * `round(storedValue × (portionGrams / basisGrams))` from the same row, with
+ * `basisGrams` from this same `normalizeToPer100g` call on the same inputs and
+ * the same default portion weight. Emitting `storedValue × 100 / basisGrams`
+ * with `basisAmount: 100` instead would make the client convert an already
+ * converted number: algebraically equal, but a ULP apart, which lands on the
+ * wrong side of a half-rounding boundary — 275.4 kcal per 100 ml at 0.918 g/ml
+ * travelled as 299.99999999999994 and gave a 13.5 g tablespoon 40 kcal on the
+ * card against the diary row's 41. Passing the stored values through means both
+ * sides evaluate ONE multiplication and ONE `Math.round` over identical
+ * doubles, so they are bit-identical by construction for every basis and every
+ * row, which is what AAP §0.7.3 requires of the Add Food card and the diary row
+ * it produces. It also means the response carries the catalog's own numbers,
+ * with only the basis restated.
+ *
+ * The basis rule is NOT written here. `catalog.logic.ts`'s
+ * `normalizeToPer100g` already owns it — grams as stated, millilitres through
+ * the food's own `density_g_per_ml`, servings times the default portion's gram
+ * weight, plus the overflow cases that arithmetic can reach — and it is tested
+ * there. This boundary only supplies the portion weight that rule needs and
+ * translates the verdict it returns into {@link CatalogMappingError}, which is
+ * the same delegation `nutrition.logic.ts` performs for the diary snapshot, so
+ * the two can never disagree about what a basis means. Its integrity checks are
+ * needed here in full, not just its arithmetic: a missing, zero, negative or
+ * non-finite density, an absent serving gram weight, a non-positive basis
+ * amount, and a basis mass or factor that overflows all reach this mapper as a
+ * refusal rather than as a number on the wire.
+ *
+ * A failed check is a fault rather than a value to substitute: the alternatives
+ * are assuming a density or a serving weight, which is exactly the fabricated
+ * number the catalog's nutrition-integrity policy exists to prevent.
  */
-const basisGrams = (food: CatalogFoodRow, defaultPortion: CatalogFoodPortionResponse): number => {
-    const basisAmount = requirePositiveFactor(food.basis_amount, 'catalog_foods', 'basis_amount', food.id);
-    const basis = narrowColumn<CatalogNutritionBasis>(
-        food.nutrition_basis,
-        isCatalogNutritionBasis,
-        'catalog_foods',
-        'nutrition_basis',
-        food.id,
-    );
-
-    switch (basis) {
-        case 'per_100g':
-            return basisAmount;
-        case 'per_100ml':
-            return (
-                basisAmount * requirePositiveFactor(food.density_g_per_ml, 'catalog_foods', 'density_g_per_ml', food.id)
-            );
-        case 'per_serving':
-            return (
-                basisAmount *
-                requirePositiveFactor(
-                    defaultPortion.gramWeight,
-                    'catalog_food_portions',
-                    'gram_weight',
-                    food.id,
-                )
-            );
-    }
-};
-
-/**
- * The four macros of ONE default portion, as `defaultPortionNutrition` carries
- * them.
- *
- * THE SAME FORMULA RUNS IN `nutrition.service.ts` (`basisGrams` /
- * `catalogPortionSnapshot`, presently being extracted into `nutrition.logic.ts`
- * under review finding F05), where it produces the per-serving snapshot stored
- * on `meal_entries` when a catalog food is logged. The two must stay
- * NUMERICALLY IDENTICAL — same basis rules, same scale, same single rounding —
- * because this projection's whole promise is that the pre-log card equals the
- * diary row it produces to the integer. Whoever merges the two implementations
- * is merging one rule, not reconciling two.
- *
- * Rounded to integers exactly ONCE, after scaling, for the same reason the
- * stored snapshot is: `meal_entries` holds the per-serving macros as `Int`, and
- * the read path multiplies that snapshot by the eaten servings, so rounding an
- * intermediate value would round twice and drift away from the stored numbers.
- *
- * Fiber is not projected: `meal_entries` has no fiber column, so no stored
- * value exists for a fiber projection to equal.
- */
-export const deriveDefaultPortionNutrition = (
+const resolveMassBasis = (
     food: CatalogFoodRow,
     defaultPortion: CatalogFoodPortionResponse,
-): CatalogPortionNutritionResponse => {
-    const portionGrams = requirePositiveFactor(
-        defaultPortion.gramWeight,
-        'catalog_food_portions',
-        'gram_weight',
-        food.id,
-    );
-    const scale = portionGrams / basisGrams(food, defaultPortion);
+): CatalogMassBasis => {
+    const conversion = normalizeToPer100g({
+        nutrition_basis: narrowColumn<CatalogNutritionBasis>(
+            food.nutrition_basis,
+            isCatalogNutritionBasis,
+            'catalog_foods',
+            'nutrition_basis',
+            food.id,
+        ),
+        basis_amount: food.basis_amount,
+        calories: food.calories,
+        protein_g: food.protein_g,
+        carbs_g: food.carbs_g,
+        fat_g: food.fat_g,
+        fiber_g: food.fiber_g,
+        density_g_per_ml: food.density_g_per_ml,
+        serving_gram_weight: defaultPortion.gramWeight,
+    });
 
-    // Finite inputs can still overflow — a denormal basis mass under a real
-    // portion weight divides to `Infinity` — and a scale that is not a real
-    // number makes every value derived from it meaningless. It stops here
-    // rather than reaching the client as an `Infinity` macro, which
-    // `JSON.stringify` would emit as the `null` this member promises never to
-    // be.
-    if (!Number.isFinite(scale)) {
+    if (conversion.kind === 'error') {
+        const { name, observed, bound } = conversion.check;
+
         throw new CatalogMappingError(
-            `default-portion scale for published food ${food.id} is ${String(scale)}; a portion of ` +
-                `${String(portionGrams)} g against a ${food.nutrition_basis} basis is not a usable ratio`,
+            `published food ${food.id} fails ${name}: observed ${JSON.stringify(observed)}, expected ` +
+                `${JSON.stringify(bound)}; the response states its nutrition on the mass basis and never ` +
+                'substitutes a density or a portion weight',
         );
     }
 
     return {
-        calories: Math.round(requireCoreNutrient(food.calories, 'calories', food.id) * scale),
-        protein: Math.round(requireCoreNutrient(food.protein_g, 'protein_g', food.id) * scale),
-        carbs: Math.round(requireCoreNutrient(food.carbs_g, 'carbs_g', food.id) * scale),
-        fat: Math.round(requireCoreNutrient(food.fat_g, 'fat_g', food.id) * scale),
+        nutritionBasis: conversion.normalized.nutrition_basis,
+        basisGrams: conversion.normalized.basisGrams,
     };
 };
 
@@ -499,24 +487,33 @@ export const deriveDefaultPortionNutrition = (
  * responses carry it.
  *
  * `portions` is the food's own portion set — the caller includes it with the
- * row; only the default is projected, because the response exposes one portion
+ * row; only the default is reported, because the response exposes one portion
  * and the rest inform conversions the server performs.
  *
- * The four macros and `fiber` are stated per `basisAmount` of `nutritionBasis`
- * (100 for `per_100g`), never per `defaultPortion`. `defaultPortionNutrition`
- * is the projection of those macros onto one default portion, so the client has
- * an unambiguous per-portion figure without needing the basis metadata or the
- * density the conversion would require.
+ * The four macros and `fiber` are the row's STORED values, read through the
+ * guards below and never scaled here. What is restated is the BASIS they are
+ * stated against: {@link resolveMassBasis} converts it into the grams those
+ * stored values describe, so `basisAmount` is a mass and `nutritionBasis` the
+ * mass-basis code. That is what makes the response projectable without
+ * fabricating anything: `density_g_per_ml` is a column no response carries, so
+ * a volume basis on the wire would leave the client holding millilitres it
+ * cannot convert, while a mass basis and `defaultPortion.gramWeight` are all a
+ * client needs to scale by `gramWeight / basisAmount`. The conversion happens
+ * where the density column is available: here. Scaling the values as well would
+ * convert them twice and break the integer equality with the diary row —
+ * {@link resolveMassBasis} has that argument in full.
  *
  * The default portion is resolved once and used twice — as the reported portion
- * and as the projection's divisor — so the response cannot report one portion
- * while its nutrition describes another.
+ * and as the serving weight a `per_serving` basis is read against — so the
+ * response cannot report one portion while its basis mass was derived from
+ * another.
  */
 export const mapCatalogFood = (
     food: CatalogFoodRow,
     portions: readonly CatalogFoodPortionRow[],
 ): CatalogFoodResponse => {
     const defaultPortion = resolveDefaultPortion(food.id, portions);
+    const massBasis = resolveMassBasis(food, defaultPortion);
 
     return {
         id: food.id,
@@ -543,14 +540,11 @@ export const mapCatalogFood = (
             'nutrition_provenance',
             food.id,
         ),
-        nutritionBasis: narrowColumn<CatalogNutritionBasis>(
-            food.nutrition_basis,
-            isCatalogNutritionBasis,
-            'catalog_foods',
-            'nutrition_basis',
-            food.id,
-        ),
-        basisAmount: food.basis_amount,
+        nutritionBasis: massBasis.nutritionBasis,
+        // A mass, in grams: what the stored values below describe. 100 for the
+        // published rows stated per 100 g, 91.8 for 100 ml of a 0.918 g/ml oil,
+        // and the serving's weight for a per-serving label.
+        basisAmount: massBasis.basisGrams,
         calories: requireCoreNutrient(food.calories, 'calories', food.id),
         protein: requireCoreNutrient(food.protein_g, 'protein_g', food.id),
         carbs: requireCoreNutrient(food.carbs_g, 'carbs_g', food.id),
@@ -562,7 +556,6 @@ export const mapCatalogFood = (
         // row — which is why it alone is nullable in the contract.
         fiber: optionalNutrient(food.fiber_g),
         defaultPortion,
-        defaultPortionNutrition: deriveDefaultPortionNutrition(food, defaultPortion),
         // Read, never defaulted: an absent list would otherwise reach the client as
         // "contains no allergens" on a food nothing established that about.
         allergenTags: requireTagArray(food.allergen_tags, 'catalog_foods', 'allergen_tags', food.id),

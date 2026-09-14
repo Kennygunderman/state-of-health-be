@@ -24,6 +24,22 @@
 // `process.env` here — a mapper that fetched would be a service. That is also
 // what keeps the import graph acyclic: nothing below imports a service.
 //
+// THE THREE PIECES BELOW THAT ARE NOT DTO BUILDERS are here for the same
+// reason and no other: each is the pure half of a read all three services
+// perform, so sharing it is what keeps their answers identical while each keeps
+// its own owner-scoped query.
+//
+//  * `groupLoggedPlannedEntries` — linked diary rows grouped by planned meal,
+//    with entries a user has detached by editing dropped.
+//  * `toPlanLifecycleState` — a plan row as the facts `mealPlan.logic.ts`'s
+//    lifecycle rules judge, dates read as day keys and the successor flattened.
+//  * `readPlannedTotals` — stored planned macros as the integers a card renders.
+//
+// What they are NOT is rules: which status may be written to, and which targets
+// a week is judged against, are `mealPlan.logic.ts`'s (`requireWritablePlan`,
+// `resolveReportedTargets`), and an orchestration fault is the raising
+// service's own error class, never this file's `MealPlanMappingError`.
+//
 // The row types are structural snake_case interfaces rather than Prisma's
 // generated models, matching `recipe.mapper.ts` and `catalog.mapper.ts`: a
 // caller reading through `$queryRaw` has no model type to offer, and a mapper
@@ -52,15 +68,18 @@
 //  * A BROKEN PROMISE IS A FAULT, NOT A DEFAULT. Every field the contract
 //    declares non-optional is backed by a NOT NULL column, so a row that cannot
 //    supply one is drift rather than a client condition and this file throws
-//    `MealPlanDataError`. `flags` is the one exception and it is deliberate: a
+//    `MealPlanMappingError`. `flags` is the one exception and it is deliberate: a
 //    malformed flag ENTRY is dropped rather than failing the read, because the
 //    alternative is a plan screen that cannot load and therefore cannot be used
 //    to fix anything.
 //
-//  * NOTHING IS RECOMPUTED AND NOTHING IS ROUNDED. See the note on
-//    `toMealPlanDayResponse` — the stored `planned_*` columns are reported as
-//    they are, because rounding them here would be a second rounding site and
-//    would break two invariants the rest of the module relies on.
+//  * NOTHING IS RECOMPUTED, AND ROUNDING FOR DISPLAY HAPPENS EXACTLY HERE. The
+//    stored `planned_*` columns are reported as stored in every respect but
+//    one: they are rounded per value, once, on their way onto the wire, because
+//    this is the display boundary and the client is forbidden from rounding.
+//    `readPlannedTotals` is that step and delegates to the codebase's single
+//    display round; nothing else in the module is re-derived, re-summed or
+//    re-ordered from anything but the rows handed in.
 //
 //  * CODES GO ON THE WIRE, NEVER PROSE. `slot`, `status`, the flag codes, the
 //    recipe's `iconKey` and `badges` all travel as the values the database
@@ -105,9 +124,9 @@ import {
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
 import { formatQuarters, pluralizeCount } from '../utils/units';
-import { isDayKey } from './mealPlan.logic';
+import { PlanLifecycleState, derivePortionUnit, isDayKey, sameMacroTotals } from './mealPlan.logic';
 import { isClockTime } from './preferences.logic';
-import { isMealSlot } from './recipe.logic';
+import { isMealSlot, roundNutritionForDisplay } from './recipe.logic';
 import { RecipeVersionRow, mapPlannedRecipeSummary } from './recipe.mapper';
 
 /* ---------------------------------------------------------------------------
@@ -115,20 +134,31 @@ import { RecipeVersionRow, mapPlannedRecipeSummary } from './recipe.mapper';
  * ------------------------------------------------------------------------- */
 
 /**
- * A stored column contradicting the response contract.
+ * A stored column contradicting the response contract, raised while a row is
+ * being shaped into a response.
  *
  * Its own class rather than a bare `Error` so the message says which column of
  * which row could not be read, and deliberately NOT a member of
- * `mealPlanning.errors.ts`: that vocabulary exists for failures the CLIENT must
- * distinguish and act on, and there is no client action for "the plan row this
- * server wrote is not readable". It reaches the controller as a 500, exactly as
+ * `mealPlanning.errors.ts`: that vocabulary is the closed set of failures the
+ * CLIENT must distinguish and act on — one class per §0.5.2 machine code — and
+ * there is no client action for "the plan row this server wrote is not
+ * readable". It reaches the controller as a 500, exactly as
  * `grocery.service.ts`'s and `mealPlanningAction.service.ts`'s own invariant
  * faults do.
+ *
+ * NAMED FOR MAPPING, and scoped to it: `GroceryMappingError` and
+ * `RecipeMappingError` are the sibling mappers' equivalents, and a service's own
+ * invariant fault is that service's class — `mealPlan.service.ts` declares
+ * `MealPlanDataError` for its reads, writes and lifecycle, `swap.service.ts`
+ * `SwapDataError`, `plannedMealLog.service.ts` `PlannedMealLogWriteError`. A
+ * service must never reach into this file for an orchestration error: that would
+ * make the mapper the owner of its caller's error vocabulary and invert the
+ * dependency the layering exists to fix.
  */
-export class MealPlanDataError extends Error {
+export class MealPlanMappingError extends Error {
     constructor(message: string) {
         super(message);
-        this.name = 'MealPlanDataError';
+        this.name = 'MealPlanMappingError';
     }
 }
 
@@ -139,14 +169,11 @@ export class MealPlanDataError extends Error {
 /** Characters of a `YYYY-MM-DD` day key — the ISO prefix `toDayKey` slices. */
 const DAY_KEY_LENGTH = 10;
 
-/** The noun a portion is counted in. Inflected by `utils/units.ts::pluralizeCount`. */
-const PORTION_NOUN = 'serving';
-
 /**
- * The four macro keys a stored targets snapshot must carry, in wire order.
+ * The four macro keys every stored macro column must carry, in wire order.
  *
- * Read from one list rather than spelled out per key so the check below and the
- * object it builds cannot disagree about which four they are.
+ * Read from one list rather than spelled out per key so the checks below and the
+ * objects they build cannot disagree about which four they are.
  */
 const MACRO_KEYS = ['calories', 'protein', 'carbs', 'fat'] as const;
 
@@ -203,13 +230,13 @@ const asMember = <T extends string>(set: Readonly<Record<T, true>>, value: unkno
  */
 export const toDayKey = (date: Date, column: string, rowId: string): string => {
     if (!Number.isFinite(date.getTime())) {
-        throw new MealPlanDataError(`${column} on row ${rowId} is not a valid date`);
+        throw new MealPlanMappingError(`${column} on row ${rowId} is not a valid date`);
     }
 
     const dayKey = date.toISOString().slice(0, DAY_KEY_LENGTH);
 
     if (!isDayKey(dayKey)) {
-        throw new MealPlanDataError(
+        throw new MealPlanMappingError(
             `${column} on row ${rowId} is ${date.toISOString()}, which is not a YYYY-MM-DD calendar date`,
         );
     }
@@ -262,6 +289,51 @@ export const readStoredFlags = (stored: unknown): MealFlag[] => {
 };
 
 /**
+ * What kind of value a key holds, WITHOUT the value itself.
+ *
+ * `'a string'`, `'absent'`, `'a non-finite number'` — enough for an engineer to
+ * see why a column would not read, and nothing a log must not hold.
+ */
+const describeValueKind = (value: unknown): string => {
+    if (value === undefined) {
+        return 'absent';
+    }
+
+    if (value === null) {
+        return 'null';
+    }
+
+    if (typeof value === 'number') {
+        return 'a non-finite number';
+    }
+
+    return `a ${typeof value}`;
+};
+
+/**
+ * Which of the four macro keys are unreadable, and how — never what they hold.
+ *
+ * A STORED TARGETS SNAPSHOT IS USER DATA: it is the calorie and macro figures
+ * this person eats to. Serialising the column into the exception message put
+ * those figures — and, for a corrupted column, whatever else the JSON held —
+ * into every log line the controller writes for the fault (CWE-532: insertion of
+ * sensitive information into log output). The diagnosis does not need them. The
+ * plan id locates the row for anyone authorised to read it, and the key names
+ * with their value kinds say what is wrong, which is what a fix starts from.
+ */
+const describeMacroDefects = (record: Record<string, unknown> | null): string => {
+    if (record === null) {
+        return 'the column is not a JSON object';
+    }
+
+    const defects = MACRO_KEYS.filter(
+        (key) => !(typeof record[key] === 'number' && Number.isFinite(record[key])),
+    ).map((key) => `${key} is ${describeValueKind(record[key])}`);
+
+    return defects.length === 0 ? 'no macro key is unreadable' : defects.join(', ');
+};
+
+/**
  * The stored `meal_plans.targets_snapshot` column as four macro values.
  *
  * THROWS rather than defaulting, and that is the right trade here even though
@@ -277,15 +349,57 @@ export const readTargetsSnapshot = (stored: unknown, planId: string): MealPlanMa
     const values = MACRO_KEYS.map((key) => record?.[key]);
 
     if (!values.every((value): value is number => typeof value === 'number' && Number.isFinite(value))) {
-        throw new MealPlanDataError(
+        throw new MealPlanMappingError(
             `meal_plans.targets_snapshot on plan ${planId} does not carry four finite macro values ` +
-                `(${JSON.stringify(stored)}); the plan it was built against cannot be reported without them`,
+                `(${describeMacroDefects(record)}); the plan it was built against cannot be reported without them`,
         );
     }
 
     const [calories, protein, carbs, fat] = values;
 
     return { calories, protein, carbs, fat };
+};
+
+/**
+ * Stored planned macros as the four integers a card renders.
+ *
+ * STEP 2 OF THE ROUNDING CONTRACT (§0.7.3), and the reason it is this file's
+ * job: `recipe.logic.ts::scalePlannedNutrition` computes a planned portion at
+ * full precision, the columns store it that way, `mealPlan.logic.ts
+ * ::computeDayTotals` sums it that way — and the only place a number becomes
+ * something a person reads is here, on its way onto the wire. The client is
+ * forbidden from rounding (its converter schema bans `Math.round` outright), so
+ * a fractional value on the wire is a fractional value on the screen, where
+ * Figma's plan card reads "420 cal".
+ *
+ * It is also what keeps the client's arithmetic and the server's agreeing to the
+ * integer. The diary snapshot is rounded once on insert and consumed totals are
+ * `round(snapshot × servings)`; a card carrying 419.6 at 1½ servings would show
+ * 629 while the entry the server writes says 630. Rounded here, both say 630.
+ *
+ * The rounding itself is delegated to `recipe.logic.ts::roundNutritionForDisplay`
+ * — the ONE display round in the codebase — so the plan card, the swap preview
+ * and the alternatives list cannot each round differently. Finiteness is checked
+ * HERE first so the fault names the column and the row that hold the bad value,
+ * rather than surfacing as a recipe-derivation error about an anonymous number.
+ *
+ * PER-VALUE AND INDEPENDENT: a meal is rounded as a meal and a day as a day, so
+ * a day total may differ by up to a unit or two from adding up the rounded meals
+ * beside it. That is the correct trade — the day is the sum of what was actually
+ * planned rather than the sum of four display strings — and it is stated here so
+ * the next reader does not "fix" it by rounding the day out of the meals.
+ */
+export const readPlannedTotals = (stored: MealPlanMacroTotals, column: string, rowId: string): MealPlanMacroTotals => {
+    const offending = MACRO_KEYS.filter((key) => !Number.isFinite(stored[key]));
+
+    if (offending.length > 0) {
+        throw new MealPlanMappingError(
+            `${column} on row ${rowId} is not four finite numbers — ${offending.join(', ')} cannot be rounded ` +
+                'for display',
+        );
+    }
+
+    return roundNutritionForDisplay(stored);
 };
 
 /**
@@ -302,7 +416,7 @@ export const readPlanStatus = (stored: string, planId: string): PlanStatus => {
     const status = asMember(PLAN_STATUSES, stored);
 
     if (status === null) {
-        throw new MealPlanDataError(
+        throw new MealPlanMappingError(
             `meal_plans.status on plan ${planId} is "${stored}", which is neither "active" nor "superseded"`,
         );
     }
@@ -320,7 +434,9 @@ export const readPlanStatus = (stored: string, planId: string): PlanStatus => {
  */
 export const readMealSlot = (stored: string, mealId: string): MealSlot => {
     if (!isMealSlot(stored)) {
-        throw new MealPlanDataError(`meal_plan_meals.slot on meal ${mealId} is "${stored}", which is not a meal slot`);
+        throw new MealPlanMappingError(
+            `meal_plan_meals.slot on meal ${mealId} is "${stored}", which is not a meal slot`,
+        );
     }
 
     return stored;
@@ -341,7 +457,7 @@ export const readMealSlot = (stored: string, mealId: string): MealSlot => {
  */
 const readSlotTime = (stored: string, mealId: string): string => {
     if (!isClockTime(stored)) {
-        throw new MealPlanDataError(
+        throw new MealPlanMappingError(
             `meal_plan_meals.slot_time on meal ${mealId} is "${stored}", which is not an HH:mm time`,
         );
     }
@@ -349,20 +465,14 @@ const readSlotTime = (stored: string, mealId: string): string => {
     return stored;
 };
 
-/** Whether two macro sets are the same four numbers. */
-export const sameMacroTotals = (left: MealPlanMacroTotals, right: MealPlanMacroTotals): boolean =>
-    left.calories === right.calories &&
-    left.protein === right.protein &&
-    left.carbs === right.carbs &&
-    left.fat === right.fat;
-
 /* ---------------------------------------------------------------------------
  * Portion text — ONE definition
  * ------------------------------------------------------------------------- */
 
 /**
  * A portion multiplier as the string the plan card and the swap preview render,
- * e.g. `'1 serving'`, `'½ serving'`, `'1¼ servings'`.
+ * in the recipe's OWN serving unit: `'1 bowl'`, `'½ wrap'`, `'1¼ plates'`, and
+ * `'1 serving'` only for a recipe whose serving description gives no usable unit.
  *
  * THE ONE DEFINITION, exported for that reason: `MealPlanMealResponse
  * .portionText` and `SwapPreviewAlternative.portionText` describe the same
@@ -370,27 +480,34 @@ export const sameMacroTotals = (left: MealPlanMacroTotals, right: MealPlanMacroT
  * end up with. A second spelling in `swap.service.ts` is how the two come to
  * disagree over three quarters of a serving.
  *
+ * THE UNIT IS THE RECIPE'S, not this module's. `serving_description` is what the
+ * recipe states one serving is — a bowl, a plate, a wrap — and rendering every
+ * recipe as an anonymous "serving" would throw that away on the two screens
+ * where the user is deciding how much to eat. Which descriptions yield a usable
+ * unit is `mealPlan.logic.ts::derivePortionUnit`'s rule, not a formatting
+ * detail; this function only composes the string from it, so a caller that has
+ * the recipe row hands over the column and gets the recipe's own noun back.
+ *
  * The glyph comes from `utils/units.ts::formatQuarters` — the same renderer the
  * grocery list uses for cups and tablespoons — because every allowed multiplier
  * (`{0.5, 0.75, 1, 1.25, 1.5, 1.75, 2}`, snacks `{0.5 … 1.5}`) is an exact
  * quarter, so nothing is rounded away. The noun is inflected by that module's
- * `pluralizeCount`, so "serving" has one plural in the codebase.
+ * `pluralizeCount`, so every unit has one plural in the codebase.
  *
- * Singular AT OR BELOW one and plural above it: "½ serving" is the English a
+ * Singular AT OR BELOW one and plural above it: "½ bowl" is the English a
  * reader expects, while `pluralizeCount`'s own numeric rule (plural for anything
- * but exactly one) would render "½ servings". The count handed to it is
- * therefore the INFLECTION, not the quantity — the quantity is already in the
- * glyph.
+ * but exactly one) would render "½ bowls". The count handed to it is therefore
+ * the INFLECTION, not the quantity — the quantity is already in the glyph.
  */
-export const formatPortionText = (portionMultiplier: number): string => {
+export const formatPortionText = (portionMultiplier: number, servingDescription: string | null): string => {
     if (!Number.isFinite(portionMultiplier) || portionMultiplier <= 0) {
-        throw new MealPlanDataError(
+        throw new MealPlanMappingError(
             `portion_multiplier must be a finite number greater than 0 to render, received ` +
                 `${String(portionMultiplier)}`,
         );
     }
 
-    const noun = pluralizeCount(portionMultiplier > 1 ? 2 : 1, PORTION_NOUN);
+    const noun = pluralizeCount(portionMultiplier > 1 ? 2 : 1, derivePortionUnit(servingDescription));
 
     return `${formatQuarters(portionMultiplier)} ${noun}`;
 };
@@ -503,6 +620,112 @@ export interface PlanRow {
  * below defaults to an empty list rather than treating absence as unknown.
  */
 export type LoggedEntriesByMealId = ReadonlyMap<string, readonly LoggedPlannedEntry[]>;
+
+/**
+ * One linked diary entry as the read that fetched it returns it.
+ *
+ * `meal_plan_meal_id`, `recipe_version_id` and the joined `recipe_versions` are
+ * nullable because the COLUMNS are: `nutrition.service.ts::updateMealEntry`
+ * clears the links when a user edits an entry's name or macros, detaching it
+ * from the plan. {@link groupLoggedPlannedEntries} drops such a row.
+ */
+export interface LoggedPlannedEntryRow {
+    id: string;
+    date: Date;
+    servings: number;
+    logged_at: Date;
+    meal_plan_meal_id: string | null;
+    recipe_version_id: string | null;
+    meals: { name: string };
+    recipe_versions: { name: string } | null;
+}
+
+/**
+ * Linked diary rows grouped by the planned meal they belong to.
+ *
+ * THE ROW→SHAPE HALF of the plan's logged state, and the half that is pure: the
+ * read itself is owner-scoped I/O and belongs to whichever service is
+ * performing it — the plan reads, the swap's read-back and the planned-log's
+ * read-back all need this same grouping, and three copies of it are three
+ * chances to order or detach differently.
+ *
+ * A DETACHED ENTRY IS DROPPED, not defaulted. An entry whose plan link was
+ * cleared is no longer evidence that this meal was eaten, so including it with
+ * a placeholder recipe would light the LOGGED badge for a meal the user has
+ * since rewritten by hand. The three nullable fields are checked together
+ * because `updateMealEntry` clears them together.
+ *
+ * Ordering is NOT established here — {@link toMealPlanMealResponse} sorts each
+ * meal's list through `byLoggedAt`, so the contract's order is a property of the
+ * DTO rather than of whichever query produced the rows.
+ */
+export const groupLoggedPlannedEntries = (
+    entries: readonly LoggedPlannedEntryRow[],
+): Map<string, LoggedPlannedEntry[]> => {
+    const byMealId = new Map<string, LoggedPlannedEntry[]>();
+
+    for (const entry of entries) {
+        if (entry.meal_plan_meal_id === null || entry.recipe_version_id === null || entry.recipe_versions === null) {
+            continue;
+        }
+
+        const logged: LoggedPlannedEntry = {
+            entryId: entry.id,
+            date: toDayKey(entry.date, 'meal_entries.date', entry.id),
+            mealName: entry.meals.name,
+            servings: entry.servings,
+            loggedAt: entry.logged_at.toISOString(),
+            recipeVersionId: entry.recipe_version_id,
+            recipeName: entry.recipe_versions.name,
+        };
+
+        const existing = byMealId.get(entry.meal_plan_meal_id);
+
+        if (existing) {
+            existing.push(logged);
+        } else {
+            byMealId.set(entry.meal_plan_meal_id, [logged]);
+        }
+    }
+
+    return byMealId;
+};
+
+/**
+ * One `meal_plans` row with its replacement, as a lifecycle read returns it.
+ *
+ * `replaced_by_plans` is the relation ordered and taken to one by the caller;
+ * an empty array means nothing superseded this plan.
+ */
+export interface PlanLifecycleRow {
+    id: string;
+    status: string;
+    start_date: Date;
+    end_date: Date;
+    replaced_by_plans: readonly { id: string }[];
+}
+
+/**
+ * A stored plan row as the facts `mealPlan.logic.ts`'s lifecycle rules turn on.
+ *
+ * The snake_case→day-key translation and nothing else: `status` is passed
+ * through as stored (an ENDED plan is still `'active'` in the column, and which
+ * status makes a plan unwritable is `requireWritablePlan`'s rule, not this
+ * file's), and the replacement id is flattened out of the relation.
+ *
+ * Shared because THREE services need one plan's writability — the plan service,
+ * the swap and the planned log — and each performs its own owner-scoped read
+ * (§5.1). What they must not each own is the reading of the dates: a plan whose
+ * `start_date` were read in local time on a server west of UTC would be judged
+ * against yesterday's calendar, and that decision belongs in one place.
+ */
+export const toPlanLifecycleState = (plan: PlanLifecycleRow): PlanLifecycleState => ({
+    id: plan.id,
+    status: plan.status,
+    start_date: toDayKey(plan.start_date, 'meal_plans.start_date', plan.id),
+    end_date: toDayKey(plan.end_date, 'meal_plans.end_date', plan.id),
+    replacement_plan_id: plan.replaced_by_plans[0]?.id ?? null,
+});
 
 /** What `toMealPlanDayResponse` needs beyond the day's own rows. */
 export interface MealPlanDayContext {
@@ -648,13 +871,17 @@ export const toMealPlanMealResponse = (
     sortOrder: meal.sort_order,
     recipe: mapPlannedRecipeSummary(recipeVersion),
     portionMultiplier: meal.portion_multiplier,
-    portionText: formatPortionText(meal.portion_multiplier),
-    planned: {
-        calories: meal.planned_calories,
-        protein: meal.planned_protein_g,
-        carbs: meal.planned_carbs_g,
-        fat: meal.planned_fat_g,
-    },
+    portionText: formatPortionText(meal.portion_multiplier, recipeVersion.serving_description),
+    planned: readPlannedTotals(
+        {
+            calories: meal.planned_calories,
+            protein: meal.planned_protein_g,
+            carbs: meal.planned_carbs_g,
+            fat: meal.planned_fat_g,
+        },
+        'meal_plan_meals.planned_*',
+        meal.id,
+    ),
     flags: readStoredFlags(meal.flags),
     loggedEntries: byLoggedAt(loggedEntries),
     previousRecipe: mapPreviousRecipe(meal),
@@ -669,20 +896,29 @@ export const toMealPlanMealResponse = (
  * column is what makes that agreement checkable: a day whose stored total had
  * drifted would be visible, where a re-sum would silently paper over it.
  *
- * NOTHING IS ROUNDED, here or on the meals. The columns hold full precision by
- * design and this file reports them as they are, for three reasons that all
- * point the same way. (1) Rounding each meal and the day independently would
- * break `plannedTotals === computeDayTotals(meals)`, the invariant
- * `mealPlan.logic.ts` maintains and its tests pin. (2) The swap preview reports
- * the same quantity — `dayTotalsIfSwapped`, which the commit then STORES — so
- * rounding on this path and not on that one is how the preview a user approved
- * comes to differ from the day they get. (3) Rounding is a DISPLAY concern owned
- * by one function, `recipe.logic.ts::roundNutritionForDisplay`, which callers
- * apply to values that are never summed (the alternatives meta line); the only
- * rounding that reaches storage is the diary snapshot's, applied exactly once by
- * `insertPlannedMealEntry`. A second rounding site here is precisely the
- * double-rounding that would put the client's "This adds" card a unit away from
- * the server.
+ * THE COLUMNS HOLD FULL PRECISION AND THE WIRE CARRIES INTEGERS. Both the day's
+ * totals and each meal's go through {@link readPlannedTotals}, which is step 2
+ * of the rounding contract (§0.7.3) and is documented there. The three
+ * objections that argue for reporting the stored floats all dissolve on
+ * inspection:
+ *
+ *  - `plannedTotals === computeDayTotals(meals)` is a STORAGE invariant, held
+ *    over the full-precision values `mealPlan.logic.ts` sums and the transaction
+ *    writes. Rounding at the wire boundary does not touch either side of it, and
+ *    `mealPlan.logic.ts`'s tests assert it where it lives.
+ *  - the swap preview reports the same quantity, so it rounds the same way
+ *    (`swap.service.ts::getSwapPreview`) while the COMMIT keeps storing the
+ *    full-precision total it computed. Preview and day therefore agree to the
+ *    integer, which is exactly what "the day you approved" means to a reader.
+ *  - rounding is a display concern owned by ONE function,
+ *    `recipe.logic.ts::roundNutritionForDisplay` — and this is the display
+ *    boundary. Calling it here is what stops the client rounding, which its
+ *    converter is forbidden to do, and what makes the client's
+ *    `round(snapshot × servings)` land on the integer the server stores.
+ *
+ * Each value is rounded once, and meals and days are rounded independently, so a
+ * day total can sit a unit or two away from the sum of the rounded meals shown
+ * beside it. See {@link readPlannedTotals}.
  *
  * `isLastDay` is `date === endDate`, the plan's seventh day, which is where the
  * client offers the next week. Derived from the plan's own end date rather than
@@ -700,12 +936,16 @@ export const toMealPlanDayResponse = (
         id: day.id,
         date,
         dayIndex: day.day_index,
-        plannedTotals: {
-            calories: day.planned_calories,
-            protein: day.planned_protein_g,
-            carbs: day.planned_carbs_g,
-            fat: day.planned_fat_g,
-        },
+        plannedTotals: readPlannedTotals(
+            {
+                calories: day.planned_calories,
+                protein: day.planned_protein_g,
+                carbs: day.planned_carbs_g,
+                fat: day.planned_fat_g,
+            },
+            'meal_plan_days.planned_*',
+            day.id,
+        ),
         isLastDay: date === context.endDate,
         meals: byClockTime(meals).map((meal) =>
             toMealPlanMealResponse(meal, meal.recipe_versions, context.loggedByMealId.get(meal.id) ?? []),

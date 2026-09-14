@@ -63,11 +63,10 @@
 // choosing a status code (the controller).
 
 import { PlanNotFoundError } from './mealPlanning.errors';
-import { MAX_REVISION } from './preferences.logic';
+import { isCalendarDayKey, MAX_REVISION } from './preferences.logic';
 import { scalePlannedNutrition } from './recipe.logic';
 import { InvalidRequestDetail, LogPlannedMealPayload } from '../types/mealPlanning';
 import { MacroTotals, NutritionProvenance } from '../types/nutrition';
-import { isCalendarDayKey } from '../utils/calendarDay';
 
 /* ---------------------------------------------------------------------------
  * The stored facts, and the local failure class
@@ -172,8 +171,8 @@ const SERVINGS_SCALE = 10 ** EATEN_SERVINGS_DECIMALS;
 const SERVINGS_SCALE_TOLERANCE = 1e-9;
 
 // The day-key shape is NOT declared here. It lives once in
-// `utils/calendarDay.ts` with the predicate that applies it, which is also why
-// this module no longer needs a capturing variant of it.
+// `preferences.logic.ts` with the predicate that applies it, which is also why
+// this module needs no capturing variant of it.
 
 /** Characters of an ISO timestamp that make up its day key. */
 const DAY_KEY_LENGTH = 10;
@@ -198,14 +197,14 @@ const isUuidV4 = (value: unknown): value is string => typeof value === 'string' 
  * forward to 2 March — so a shape-only check would let a request store an entry
  * on a day the user never chose.
  *
- * THE implementation is shared — `utils/calendarDay.ts` — and re-exported here
- * as the same binding, so this route and the preference steps cannot disagree
- * about the calendar. They did: the round trip this module used to perform went
- * through `Date.UTC(year, month - 1, day)`, which maps years 0–99 to 1900–1999,
- * so `'0004-02-29'` was refused here and accepted by
- * `preferences.logic.ts` — one request contradicting another about whether a
- * day exists. The shared rule reads a month-length table and the leap rule, so
- * it needs no round trip and has no year mapping to be caught by.
+ * THE implementation is shared — `preferences.logic.ts::isCalendarDayKey` — and
+ * re-exported here as the same binding, so this route and the preference steps
+ * cannot disagree about the calendar. A local round trip through
+ * `Date.UTC(year, month - 1, day)` is the spelling to avoid: it maps years 0–99
+ * to 1900–1999, so `'0004-02-29'` would be refused here while the review step
+ * accepted it as a plan's `startDate` — one request contradicting another about
+ * whether a day exists. The shared rule reads a month-length table and the leap
+ * rule, so it needs no round trip and has no year mapping to be caught by.
  */
 export { isCalendarDayKey };
 

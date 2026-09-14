@@ -1,18 +1,44 @@
-// The enforcing proof for the two properties of the canonical target path that
-// only a real PostgreSQL can establish.
+// The targets area's database-backed suite: the planned home for every proof
+// about the canonical target path — `GET /meal-planning/targets`,
+// `PUT /meal-planning/targets` and the publication gate the planner reads
+// through — that needs a real PostgreSQL to make. AAP §0.9.2's "Targets truth"
+// row names this file for exactly these properties, and §0.3.3 lists it in the
+// suite inventory. The pure halves of the same subject — the estimate equation,
+// the factors, the clamps and the `deriveTargetsResponse` comparison — are
+// unit-tested with no database in `src/services/__tests__/targets.logic.test.ts`.
+//
+// It is the enforcing proof for the properties of the canonical target path
+// that only a real PostgreSQL can establish.
 //
 // WHAT IS BEING PROVEN, AND WHY A UNIT TEST CANNOT DO IT.
 //
-// 1. STALENESS FOLLOWS THE ESTIMATE'S OWN INPUTS. `targets.logic.test.ts` pins
-//    the pure halves — which columns the equation reads, and the comparison
+// 1. STALENESS IS ANCESTRY AGAINST THE PREFERENCES REVISION.
+//    `targets.logic.test.ts` pins the pure half — the comparison
 //    `deriveTargetsResponse` makes — but the user-visible claim is a property of
-//    the two halves TOGETHER with the writers that advance the counter. Only a
+//    that comparison TOGETHER with the writers that advance the counter. Only a
 //    real save can show that `PUT /meal-planning/preferences/steps/:step` and
-//    `PUT /meal-planning/preferences` bump the all-purpose revision without
-//    touching the estimate-input counter, so a diet or schedule edit leaves a
-//    confirmed estimate fresh while an activity edit makes it stale.
+//    `PUT /meal-planning/preferences` bump the all-purpose `revision`, so a
+//    confirmed estimate whose `targets_input_revision` was recorded at an
+//    earlier revision reads stale after ANY preference save — a diet or schedule
+//    edit as much as an activity one (AAP 0.5.2) — and reads fresh again only
+//    once the user reconfirms at the current revision. A manual target is never
+//    stale, whatever the revision does.
 //
-// 2. THE CANONICAL TARGET READ IS COHERENT, AND THE PUBLICATION GATE HOLDS ITS
+// 2. A PERSISTED MANUAL ROUTE REFUSES AN ESTIMATE. Skip writes
+//    `target_route = 'manual'` while deliberately RETAINING the measurements it
+//    was answered over, so the refusal cannot be demonstrated from the
+//    measurement columns: it needs the real step writer to produce a row that
+//    is complete and manual at the same time, and then both estimate paths to
+//    refuse it and persist nothing.
+//
+// 3. THE PINNED TARGETS REVISION TRAVELS IN THE WRITE. An application-level
+//    check cannot be distinguished from a database predicate in TypeScript —
+//    both refuse the same request in isolation. The difference only appears in
+//    an interleaving, so the proof holds the row in a second session with
+//    `SELECT … FOR UPDATE`, lets the save block at its own UPDATE, bumps
+//    `targets_revision` from the holder, and requires the save to be refused.
+//
+// 4. THE CANONICAL TARGET READ IS COHERENT, AND THE PUBLICATION GATE HOLDS ITS
 //    ROW. The hazard is a race between two sessions, so it does not exist in
 //    TypeScript at all: it is the difference between one statement and two under
 //    READ COMMITTED, and between a row lock held to COMMIT and no lock. The
@@ -20,8 +46,16 @@
 //    advisory lock by design, so nothing but the row lock stands between it and
 //    a week published against values it has already replaced.
 //
-// Both properties are asserted in both directions, which is what makes the
+// Every property is asserted in both directions, which is what makes the
 // assertions load-bearing rather than decorative:
+//   * a save must make a confirmed estimate stale, and a reconfirmation must
+//     make it fresh again — otherwise "stale" could pass by being constant;
+//   * the manual route must refuse the estimate, and re-answering the body step
+//     must restore it, so the refusal is a route decision and not a dead end;
+//   * the revision predicate must refuse the save when the holder bumps the
+//     revision, and must NOT refuse it when the holder merely locks and
+//     releases the row — without the second case the first would also pass for
+//     a save that refuses whenever it ever had to wait;
 //   * the read must issue exactly ONE statement — and that statement must
 //     mention both tables, so the count cannot pass by reading one of them;
 //   * the locked gate must BLOCK a concurrent legacy write until COMMIT, and
@@ -29,10 +63,11 @@
 //     first could pass because of something incidental to the transaction.
 //
 // Everything here runs against the ambient test database and truncates only the
-// feature tables through the shared guard, exactly as the other service suites
-// do. The two extra Prisma clients are a genuine requirement rather than a
-// convenience: a lock test needs a session that is not the one holding the lock,
-// and a statement count needs a client whose query events are observable.
+// feature tables through the shared guard, exactly as the other suites in this
+// directory do. The two extra Prisma clients are a genuine requirement rather
+// than a convenience: a lock test needs a session that is not the one holding
+// the lock, and a statement count needs a client whose query events are
+// observable.
 
 import { randomUUID } from 'node:crypto';
 
@@ -47,17 +82,23 @@ import {
     makeRecipeVersion,
     makeUser,
     utcTodayDayKey,
-} from '../../__tests__/setup/factories';
-import { truncateFeatureTables } from '../../__tests__/setup/testDb';
-import { generatePlan, regeneratePlan } from '../mealPlan.service';
-import { TargetsUnconfirmedError } from '../mealPlanning.errors';
-import { withMealPlanningTransaction, withUserLock } from '../mealPlanningAction.service';
-import { updateTargets } from '../nutrition.service';
-import { savePreferences, saveSetupStep } from '../preferences.service';
-import { PlanningPreferences, evaluatePlanningEligibility } from '../recipe.logic';
-import * as groceryService from '../grocery.service';
-import * as recipeService from '../recipe.service';
-import { getTargets, previewConfirmedTargets, requireConfirmedTargets } from '../targets.service';
+} from '../setup/factories';
+import { truncateFeatureTables } from '../setup/testDb';
+import { generatePlan, regeneratePlan } from '../../services/mealPlan.service';
+import { TargetsUnconfirmedError } from '../../services/mealPlanning.errors';
+import { withMealPlanningTransaction, withUserLock } from '../../services/mealPlanningAction.service';
+import { updateTargets } from '../../services/nutrition.service';
+import { savePreferences, saveSetupStep } from '../../services/preferences.service';
+import { PlanningPreferences, evaluatePlanningEligibility } from '../../services/recipe.logic';
+import * as groceryService from '../../services/grocery.service';
+import * as recipeService from '../../services/recipe.service';
+import {
+    getTargetEstimate,
+    getTargets,
+    previewConfirmedTargets,
+    requireConfirmedTargets,
+    saveTargets,
+} from '../../services/targets.service';
 
 const USER_ID = 'targets-service-suite-user';
 const TIME_ZONE = 'America/New_York';
@@ -104,7 +145,13 @@ const saveStep = async (step: string, body: Record<string, unknown>): Promise<vo
     }
 };
 
-/** `savePreferences`, likewise. */
+/**
+ * `savePreferences`, likewise.
+ *
+ * Every body passed here carries `timeZone`: it is a REQUIRED field of the
+ * full-save envelope, because the server resolves the user's "today" from the
+ * zone the request carried rather than from the stored one.
+ */
 const saveFull = async (body: Record<string, unknown>): Promise<void> => {
     const result = await savePreferences(USER_ID, body);
 
@@ -138,7 +185,13 @@ afterAll(async () => {
 });
 
 /* ---------------------------------------------------------------------------
- * Staleness follows the estimate's inputs, not the all-purpose revision
+ * Staleness is an ancestry check on the preferences revision
+ *
+ * AAP §0.5.2: a confirmed estimate is stale when `targets_input_revision`
+ * differs from `preferences.revision`. Every preference save advances that
+ * revision, so the claim under test is that a confirmed figure is reported as
+ * behind the answers on file the moment those answers are saved again — and
+ * that only a reconfirmation brings it back, never a silent recalculation.
  * ------------------------------------------------------------------------- */
 
 describe('a confirmed estimate across real preference saves', () => {
@@ -150,9 +203,13 @@ describe('a confirmed estimate across real preference saves', () => {
             stale: false,
             revision: 1,
         });
+
+        // Fresh BECAUSE the two revisions agree, which is the rule rather than
+        // an accident of the fixture.
+        expect(await storedRevisions()).toMatchObject({ revision: 1, targetsInput: 1 });
     });
 
-    it('stays fresh through a diet edit, which moves only the all-purpose revision', async () => {
+    it('goes stale on a diet edit, because that save advances the revision it was confirmed at', async () => {
         await saveStep('diet', {
             diet: 'vegan',
             allergens: ['milk'],
@@ -163,15 +220,19 @@ describe('a confirmed estimate across real preference saves', () => {
         const revisions = await storedRevisions();
 
         // The client's own counter advanced — a concurrent save must still be
-        // detected — while the estimate's inputs did not move, so the confirmed
-        // figure is still exactly what this user's details produce.
+        // detected — and the confirmed figure was derived from revision 1, so
+        // it no longer describes the answers on file.
         expect(revisions.revision).toBe(2);
-        expect(revisions.estimateInputs).toBe(1);
         expect(revisions.targetsInput).toBe(1);
-        expect(await getTargets(USER_ID)).toMatchObject({ source: 'estimated', stale: false, revision: 1 });
+        expect(await getTargets(USER_ID)).toMatchObject({ source: 'estimated', stale: true, revision: 1 });
+
+        // The write-side diagnostic counter did NOT move, because a diet is not
+        // a term in the energy equation. It is a different question from the
+        // one `stale` answers, and nothing reads it.
+        expect(revisions.estimateInputs).toBe(1);
     });
 
-    it('stays fresh through schedule, cooking, dislike and time-zone edits', async () => {
+    it('goes stale through schedule, cooking, dislike and time-zone edits', async () => {
         await saveStep('schedule', {
             mealSchedule: 'three_plus_snack',
             mealTimes: [
@@ -196,13 +257,11 @@ describe('a confirmed estimate across real preference saves', () => {
         const revisions = await storedRevisions();
 
         expect(revisions.revision).toBe(5);
-        expect(revisions.estimateInputs).toBe(1);
-        expect(await getTargets(USER_ID)).toMatchObject({ stale: false });
+        expect(revisions.targetsInput).toBe(1);
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
     });
 
-    it('stays fresh when the body step is re-saved with the same measurements', async () => {
-        // Revisiting a wizard screen and pressing Continue is not a change of
-        // details, so it cannot be a reason to recalculate.
+    it('goes stale when the body step is re-saved with the same measurements, which is still a save', async () => {
         await saveStep('body', {
             age: 34,
             heightCm: 178,
@@ -216,9 +275,11 @@ describe('a confirmed estimate across real preference saves', () => {
 
         const revisions = await storedRevisions();
 
+        // Nothing the equation reads moved — the diagnostic stands still — and
+        // the revision advanced all the same, so the ancestry no longer holds.
         expect(revisions.revision).toBe(2);
         expect(revisions.estimateInputs).toBe(1);
-        expect(await getTargets(USER_ID)).toMatchObject({ stale: false });
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
     });
 
     it('goes stale on an activity change, and keeps the confirmed numbers', async () => {
@@ -226,6 +287,7 @@ describe('a confirmed estimate across real preference saves', () => {
 
         const revisions = await storedRevisions();
 
+        expect(revisions.revision).toBe(2);
         expect(revisions.estimateInputs).toBe(2);
         expect(revisions.targetsInput).toBe(1);
         expect(await getTargets(USER_ID)).toEqual({
@@ -241,7 +303,7 @@ describe('a confirmed estimate across real preference saves', () => {
     });
 
     it('goes stale on a body change made through the full save', async () => {
-        await saveFull({ weightKg: 82, expectedRevision: 1 });
+        await saveFull({ weightKg: 82, timeZone: TIME_ZONE, expectedRevision: 1 });
 
         expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
     });
@@ -255,21 +317,368 @@ describe('a confirmed estimate across real preference saves', () => {
         });
     });
 
-    it('does not go stale merely because many unrelated saves have happened', async () => {
-        // The all-purpose revision runs far ahead of the estimate-input counter
-        // here, which is precisely the state that used to report stale.
-        // `['none']` and not `[]`: "no allergies" has its own explicit answer,
-        // and an empty array is refused so a dropped selection can never read
-        // as a declared absence of allergies.
-        await saveStep('diet', { diet: 'vegan', allergens: ['none'], timeZone: TIME_ZONE, expectedRevision: 1 });
-        await saveStep('dislikes', { dislikedFoodIds: [], timeZone: TIME_ZONE, expectedRevision: 2 });
-        await saveFull({ cookingTimeLimitMin: 45, expectedRevision: 3 });
-        await saveFull({ noBudgetPreference: true, expectedRevision: 4 });
+    it('is fresh again once the user reconfirms, and behind again on the next save', async () => {
+        await saveStep('activity', { activityLevel: 'active', timeZone: TIME_ZONE, expectedRevision: 1 });
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
 
-        const revisions = await storedRevisions();
+        // The recalculation the review screen offers, taken: the server
+        // recomputes from the stored answers and records the revision it
+        // computed them at.
+        const estimate = await getTargetEstimate(USER_ID);
+        const saved = await saveTargets(USER_ID, {
+            source: 'estimated',
+            estimateRevision: estimate.estimateRevision,
+            expectedTargetsRevision: 1,
+        });
 
-        expect(revisions.revision).toBeGreaterThan(revisions.estimateInputs);
-        expect(await getTargets(USER_ID)).toMatchObject({ stale: false });
+        expect(saved.kind).toBe('ok');
+        expect(estimate.estimateRevision).toBe(2);
+        expect(await getTargets(USER_ID)).toEqual({
+            targets: {
+                calories: estimate.calories,
+                protein: estimate.protein,
+                carbs: estimate.carbs,
+                fat: estimate.fat,
+            },
+            complete: true,
+            source: 'estimated',
+            stale: false,
+            revision: 2,
+        });
+        expect(await storedRevisions()).toMatchObject({ revision: 2, targetsInput: 2 });
+
+        // And the next unrelated save puts it behind again, which is what makes
+        // the flag a live statement about the row rather than a one-off.
+        await saveStep('diet', { diet: 'vegan', allergens: ['none'], timeZone: TIME_ZONE, expectedRevision: 2 });
+
+        expect(await getTargets(USER_ID)).toMatchObject({ stale: true, revision: 2 });
+    });
+
+    it('never reports manual targets as stale, however many saves follow', async () => {
+        const saved = await saveTargets(USER_ID, {
+            source: 'manual',
+            calories: 1800,
+            protein: 140,
+            carbs: 180,
+            fat: 60,
+            expectedTargetsRevision: 1,
+        });
+
+        expect(saved.kind).toBe('ok');
+
+        await saveStep('activity', { activityLevel: 'active', timeZone: TIME_ZONE, expectedRevision: 1 });
+        await saveFull({ weightKg: 82, timeZone: TIME_ZONE, expectedRevision: 2 });
+
+        // The user typed these numbers, so a change of inputs says nothing
+        // about them — and no ancestry was recorded to compare against.
+        expect(await storedRevisions()).toMatchObject({ revision: 3, targetsInput: null });
+        expect(await getTargets(USER_ID)).toEqual({
+            targets: { calories: 1800, protein: 140, carbs: 180, fat: 60 },
+            complete: true,
+            source: 'manual',
+            stale: false,
+            revision: 2,
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The manual route refuses an estimate, whatever the row still holds
+ *
+ * The Skip branch of the body step is the case only a real save can produce:
+ * it sends no measurements and CLEARS NOTHING, so the row keeps a complete set
+ * of them while `target_route` records that the user asked to type their own
+ * numbers. A route-blind availability rule reads that row as estimable, and
+ * then both the estimate GET and the estimated confirmation answer a question
+ * the user declined to ask.
+ * ------------------------------------------------------------------------- */
+
+describe('the estimate paths against a persisted manual route', () => {
+    /** The stored preferences row, read whole. */
+    const storedRow = async () =>
+        prisma.meal_plan_preferences.findUniqueOrThrow({ where: { user_id: USER_ID } });
+
+    /** Skip, as frame 03's tertiary action saves it. */
+    const skipBodyStep = async (expectedRevision: number): Promise<void> =>
+        saveStep('body', { skipped: true, timeZone: TIME_ZONE, expectedRevision });
+
+    it('records the route and keeps every measurement, which is why the route is the only signal', async () => {
+        await skipBodyStep(1);
+
+        const row = await storedRow();
+
+        expect(row.target_route).toBe('manual');
+        expect([row.age, row.height_cm, row.weight_kg, row.sex_for_estimate]).toEqual([
+            34,
+            178,
+            79,
+            'male',
+        ]);
+    });
+
+    it('refuses to calculate an estimate after Skip', async () => {
+        await skipBodyStep(1);
+
+        await expect(getTargetEstimate(USER_ID)).rejects.toMatchObject({
+            name: 'EstimateUnavailableError',
+            reason: 'missing_inputs',
+        });
+    });
+
+    it('refuses to confirm an estimated target after Skip, and stores nothing', async () => {
+        await skipBodyStep(1);
+
+        const { revision } = await storedRevisions();
+
+        await expect(
+            saveTargets(USER_ID, {
+                source: 'estimated',
+                estimateRevision: revision,
+                expectedTargetsRevision: 1,
+            }),
+        ).rejects.toMatchObject({ name: 'EstimateUnavailableError', reason: 'missing_inputs' });
+
+        // Neither half of the canonical write landed, so the previously
+        // confirmed values stand exactly as they were.
+        expect(await getTargets(USER_ID)).toEqual({
+            targets: { ...FIXTURE_TARGETS },
+            complete: true,
+            source: 'estimated',
+            stale: true,
+            revision: 1,
+        });
+        expect(await storedRevisions()).toMatchObject({ revision: 2, targetsInput: 1 });
+    });
+
+    it("reports prefer-not-to-say as itself, not as the route it set", async () => {
+        await saveStep('body', {
+            age: 34,
+            heightCm: 178,
+            weightKg: 79,
+            sexForEstimate: 'prefer_not_to_say',
+            heightUnitPref: 'ft_in',
+            weightUnitPref: 'lb',
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        const row = await storedRow();
+
+        expect(row.target_route).toBe('manual');
+        await expect(getTargetEstimate(USER_ID)).rejects.toMatchObject({
+            name: 'EstimateUnavailableError',
+            reason: 'prefer_not_to_say',
+        });
+    });
+
+    it('still accepts the manual save the route sends the user to', async () => {
+        await skipBodyStep(1);
+
+        const saved = await saveTargets(USER_ID, {
+            source: 'manual',
+            calories: 1800,
+            protein: 140,
+            carbs: 180,
+            fat: 60,
+            expectedTargetsRevision: 1,
+        });
+
+        expect(saved.kind).toBe('ok');
+        expect(await getTargets(USER_ID)).toMatchObject({
+            targets: { calories: 1800, protein: 140, carbs: 180, fat: 60 },
+            source: 'manual',
+            stale: false,
+        });
+    });
+
+    it('lets the user back onto the estimated route by answering the body step again', async () => {
+        await skipBodyStep(1);
+        await saveStep('body', {
+            age: 35,
+            heightCm: 178,
+            weightKg: 79,
+            sexForEstimate: 'male',
+            heightUnitPref: 'ft_in',
+            weightUnitPref: 'lb',
+            timeZone: TIME_ZONE,
+            expectedRevision: 2,
+        });
+
+        const row = await storedRow();
+
+        // The refusal is the route, so it lifts the moment the route changes —
+        // a user who pressed Skip is not locked out of the calculation.
+        expect(row.target_route).toBe('estimated');
+        await expect(getTargetEstimate(USER_ID)).resolves.toMatchObject({
+            source: 'estimated',
+            estimateRevision: 3,
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The pinned targets revision travels in the UPDATE's own predicate
+ *
+ * `saveTargets` checks `expectedTargetsRevision` against the row it read under
+ * the per-user advisory lock. That check is correct and it is not sufficient:
+ * it is an application-level comparison, so a write that reached the row
+ * without taking the lock would leave it looking exactly as safe while the
+ * pinned revision decided nothing at all.
+ *
+ * These two tests drive that state deterministically rather than racing for it.
+ * A second session holds a ROW LOCK (no advisory lock, which is what makes it
+ * possible), so the save reads the row, reaches its UPDATE and blocks; the
+ * second session then commits, and PostgreSQL re-evaluates the waiting UPDATE's
+ * predicate against the row as it now is. The pair is the proof: with the
+ * revision changed the write must be refused, and with the row merely locked
+ * and released it must succeed — without the second assertion the first could
+ * pass because of the blocking rather than because of the predicate.
+ * ------------------------------------------------------------------------- */
+
+describe('the pinned targets revision as a write predicate', () => {
+    const MANUAL_SAVE = {
+        source: 'manual',
+        calories: 1800,
+        protein: 140,
+        carbs: 180,
+        fat: 60,
+        expectedTargetsRevision: 1,
+    } as const;
+
+    /**
+     * Hold the preferences row locked on another session until `release` is
+     * called, then optionally move `targets_revision` before committing.
+     */
+    const holdRowLock = (
+        bumpRevisionBeforeCommit: boolean,
+    ): { locked: Promise<void>; release: () => void; committed: Promise<void> } => {
+        let markLocked = (): void => {};
+        let release = (): void => {};
+        const locked = new Promise<void>((resolve) => {
+            markLocked = () => resolve();
+        });
+        const gate = new Promise<void>((resolve) => {
+            release = () => resolve();
+        });
+
+        const committed = legacyWriterClient
+            .$transaction(
+                async (tx) => {
+                    await tx.$queryRaw`SELECT targets_revision FROM meal_plan_preferences WHERE user_id = ${USER_ID} FOR UPDATE`;
+                    markLocked();
+                    await gate;
+
+                    if (bumpRevisionBeforeCommit) {
+                        await tx.$executeRaw`UPDATE meal_plan_preferences SET targets_revision = targets_revision + 1 WHERE user_id = ${USER_ID}`;
+                    }
+                },
+                { timeout: 20_000 },
+            )
+            .then(() => undefined);
+
+        return { locked, release, committed };
+    };
+
+    it('refuses the save when the revision it pinned no longer matches at the write', async () => {
+        const holder = holdRowLock(true);
+        await holder.locked;
+
+        // Started, not awaited: it takes the advisory lock, reads revision 1,
+        // and then waits on the row lock the holder is sitting on. The outcome
+        // is captured so a rejection is never unhandled while we drive the
+        // holder.
+        const outcome = saveTargets(USER_ID, { ...MANUAL_SAVE }).then(
+            (response) => ({ response }),
+            (error: unknown) => ({ error }),
+        );
+
+        await sleep(BLOCK_OBSERVATION_MS);
+        holder.release();
+        await holder.committed;
+
+        expect(await outcome).toEqual({
+            error: expect.objectContaining({ name: 'StaleTargetsError', currentRevision: 2 }),
+        });
+
+        // Refused, and refused BEFORE anything was written: the other write
+        // survives, the confirmed snapshot and the four user columns are
+        // untouched, and the manual values never reached the row. The read is
+        // still `estimated` and fresh, because the other session moved only the
+        // targets counter — which is precisely what the pin exists to notice.
+        expect(await getTargets(USER_ID)).toEqual({
+            targets: { ...FIXTURE_TARGETS },
+            complete: true,
+            source: 'estimated',
+            stale: false,
+            revision: 2,
+        });
+        expect(
+            await prisma.meal_plan_preferences.findUniqueOrThrow({
+                where: { user_id: USER_ID },
+                select: { target_source: true, confirmed_targets: true, targets_revision: true },
+            }),
+        ).toEqual({
+            target_source: 'estimated',
+            confirmed_targets: { ...FIXTURE_TARGETS },
+            targets_revision: 2,
+        });
+    });
+
+    it('completes the save when the row is merely locked and released', async () => {
+        // The counter-proof. The save waits on exactly the same row lock for
+        // the same duration; only the revision differs, so the refusal above is
+        // the predicate and nothing else.
+        const holder = holdRowLock(false);
+        await holder.locked;
+
+        const outcome = saveTargets(USER_ID, { ...MANUAL_SAVE }).then(
+            (response) => ({ response }),
+            (error: unknown) => ({ error }),
+        );
+
+        await sleep(BLOCK_OBSERVATION_MS);
+        holder.release();
+        await holder.committed;
+
+        expect(await outcome).toMatchObject({ response: { kind: 'ok' } });
+        expect(await getTargets(USER_ID)).toEqual({
+            targets: { calories: 1800, protein: 140, carbs: 180, fat: 60 },
+            complete: true,
+            source: 'manual',
+            stale: false,
+            revision: 2,
+        });
+    });
+
+    it('creates the row, rather than pinning a revision that cannot exist, for a legacy user', async () => {
+        // The other arm of the same write. A user editing targets from Account
+        // before any onboarding has no row to pin, so the save creates one —
+        // with `not_started` status, because a target is not onboarding
+        // progress — and a client that pins a revision anyway is refused.
+        await prisma.meal_plan_preferences.delete({ where: { user_id: USER_ID } });
+
+        await expect(saveTargets(USER_ID, { ...MANUAL_SAVE })).rejects.toMatchObject({
+            name: 'StaleTargetsError',
+            currentRevision: 0,
+        });
+
+        const saved = await saveTargets(USER_ID, {
+            source: 'manual',
+            calories: 1800,
+            protein: 140,
+            carbs: 180,
+            fat: 60,
+            expectedTargetsRevision: null,
+        });
+
+        expect(saved.kind).toBe('ok');
+        expect(
+            await prisma.meal_plan_preferences.findUniqueOrThrow({
+                where: { user_id: USER_ID },
+                select: { setup_status: true, revision: true, targets_revision: true },
+            }),
+        ).toEqual({ setup_status: 'not_started', revision: 1, targets_revision: 1 });
+        expect(await getTargets(USER_ID)).toMatchObject({ source: 'manual', revision: 1 });
     });
 });
 

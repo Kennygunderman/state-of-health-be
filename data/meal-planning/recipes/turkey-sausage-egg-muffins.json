@@ -5,8 +5,8 @@
   "iconKey": "pot",
   "instructions": [
     "Heat the oven to 375°F and brush a 12-cup muffin tin with the olive oil.",
-    "Cook the turkey breast in a nonstick skillet over medium heat until browned through, breaking it into small pieces as it cooks.",
-    "Add the bell pepper and spinach, cook just until the spinach wilts, then set the skillet aside to cool slightly.",
+    "Cook the turkey breast in a nonstick skillet over medium heat until browned through, about 8 minutes, breaking it into small pieces as it cooks.",
+    "Add the bell pepper and spinach and cook about 2 minutes more, just until the spinach wilts, then set the skillet aside to cool slightly.",
     "Whisk the eggs with the black pepper in a large bowl, then stir in the turkey mixture.",
     "Divide the egg mixture evenly among the 12 cups and bake for about 22 minutes, until the centers are set.",
     "Cool the muffins in the tin for 5 minutes, lift them out, and serve two per person."
@@ -14,7 +14,7 @@
   "yieldServings": 6,
   "servingDescription": "2 muffins",
   "prepMinutes": 10,
-  "cookMinutes": 22,
+  "cookMinutes": 32,
   "mealSlots": ["breakfast"],
   "dietTags": ["gluten_free"],
   "allergenTags": ["eggs"],

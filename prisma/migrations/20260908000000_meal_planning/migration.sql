@@ -492,7 +492,7 @@ CREATE INDEX "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("se
 -- `text_pattern_ops` still serves `=`, so nothing is lost by replacing
 -- `text_ops` here and no second `text_ops` index is needed: no caller compares
 -- lower(alias) with `=`, `<` or `>`, and the equality path is proven in
--- src/services/__tests__/catalog.service.test.ts rather than assumed.
+-- src/__tests__/api/catalog.test.ts rather than assumed.
 CREATE INDEX "idx_catalog_food_aliases_lower_alias" ON "catalog_food_aliases"(lower("alias") text_pattern_ops);
 
 -- CreateIndex

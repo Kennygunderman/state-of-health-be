@@ -306,8 +306,9 @@ describe('isCalendarDayKey', () => {
     });
 
     /**
-     * This name now resolves to the shared rule in `utils/calendarDay.ts`,
-     * which is the same binding `preferences.logic.ts` exposes.
+     * This name resolves to the shared rule declared in `preferences.logic.ts`
+     * — the same binding the preference review step applies, which
+     * `preferences.logic.test.ts` asserts by identity.
      *
      * It replaces a round trip through `Date.UTC(year, month - 1, day)`. That
      * constructor maps a year of 0-99 to 1900-1999, so this route read

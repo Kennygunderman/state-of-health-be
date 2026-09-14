@@ -15,7 +15,7 @@
   "prepMinutes": 10,
   "cookMinutes": 22,
   "mealSlots": ["dinner"],
-  "dietTags": ["gluten_free", "pescatarian_ok"],
+  "dietTags": ["gluten_free", "pescatarian"],
   "allergenTags": ["fish"],
   "allergenStatus": "known",
   "budgetTier": 2,

@@ -44,6 +44,7 @@ import {
     NutritionTargetValues,
     SaveTargetsResponse,
     TargetEstimateResponse,
+    TargetRoute,
     TargetsResponse,
 } from '../types/mealPlanning';
 import {
@@ -135,7 +136,7 @@ interface TargetsJoinRow {
     targets_revision: number | null;
     confirmed_targets: unknown;
     targets_input_revision: number | null;
-    estimate_inputs_revision: number | null;
+    revision: number | null;
 }
 
 /** The two rows `deriveTargetsResponse` judges, read together. */
@@ -188,7 +189,7 @@ const readStoredTargets = async (
             p.targets_revision,
             p.confirmed_targets,
             p.targets_input_revision,
-            p.estimate_inputs_revision
+            p.revision
         FROM users u
         LEFT JOIN meal_plan_preferences p ON p.user_id = u.id
         WHERE u.id = ${userId}
@@ -226,7 +227,7 @@ const readPreferencesHalf = (row: TargetsJoinRow): TargetsPreferencesRow | null 
         return null;
     }
 
-    if (row.targets_revision === null || row.estimate_inputs_revision === null) {
+    if (row.targets_revision === null || row.revision === null) {
         throw new Error(
             `meal_plan_preferences row for ${row.preferences_user_id} returned NULL in a NOT NULL revision column`,
         );
@@ -237,7 +238,7 @@ const readPreferencesHalf = (row: TargetsJoinRow): TargetsPreferencesRow | null 
         targets_revision: row.targets_revision,
         confirmed_targets: row.confirmed_targets,
         targets_input_revision: row.targets_input_revision,
-        estimate_inputs_revision: row.estimate_inputs_revision,
+        revision: row.revision,
     };
 };
 
@@ -292,6 +293,14 @@ export const getTargets = async (
  * other reason, `prefer_not_to_say`, is an answer rather than a gap and
  * `resolveEstimateInputs` reports it as itself so the client can distinguish the
  * user's own choice from a form they have not finished.
+ *
+ * A USER ON THE MANUAL ROUTE GETS NO ESTIMATE, whatever their row still holds.
+ * The whole preferences row is handed to `resolveEstimateInputs` — never a
+ * measurements-only projection — so the persisted `target_route` is part of the
+ * availability decision it makes. That matters because Skip stores no
+ * measurements and leaves the previous ones in place (AAP §0.5.2), so a row that
+ * has taken the manual route can look perfectly estimable; calculating from it
+ * would answer a question the user declined to ask.
  *
  * THROWS rather than returning null: `EstimateUnavailableError` carries the
  * reason the client routes on, and 409 with a machine-readable reason is the
@@ -354,18 +363,15 @@ const FIRST_REVISION = 1;
 const NOT_STARTED_SETUP_STATUS = 'not_started';
 
 /**
- * The values a save will store, and the estimate input revision that produced
+ * The values a save will store, and the preferences revision that produced
  * them.
  *
  * `targetsInputRevision` is non-null only for a confirmed ESTIMATE: it is the
- * `estimate_inputs_revision` whose goal, body, activity and pace produced the
- * figure, and `TargetsResponse.stale` is exactly its inequality with the
- * CURRENT `estimate_inputs_revision`. That counter — not the all-purpose
- * `revision` — is what makes staleness mean "your details no longer produce
- * this figure": `revision` advances on every preference save, so recording it
- * here would make the next diet or schedule edit ask the user to recalculate a
- * number nothing had moved (`targets.logic.ts::estimateInputsChanged` holds the
- * rule that advances the right one).
+ * `meal_plan_preferences.revision` whose goal, body, activity and pace produced
+ * the figure (AAP §0.5.1), and `TargetsResponse.stale` is exactly its
+ * inequality with the CURRENT `revision` (§0.5.2). It is the same number the
+ * request's `estimateRevision` pins, so what the client confirmed against and
+ * what is recorded as the figure's ancestry cannot diverge.
  *
  * Manual targets carry null, because the user typed them and a later change of
  * inputs says nothing about them — leaving a previous estimate's input revision
@@ -386,10 +392,17 @@ interface ResolvedTargetValues {
  * then derived from answers that have since changed and confirming it would
  * store a number nobody reviewed.
  *
- * Availability is checked BEFORE staleness: `prefer_not_to_say` and missing
- * measurements route the user to manual entry, which is a different destination
- * from "recalculate and confirm again", and the more fundamental fork should be
- * the one reported.
+ * Availability is checked BEFORE staleness: `prefer_not_to_say`, a persisted
+ * manual route and missing measurements all route the user to manual entry,
+ * which is a different destination from "recalculate and confirm again", and the
+ * more fundamental fork should be the one reported.
+ *
+ * THE ROUTE CHECK IS WHAT STOPS A DECLINED ESTIMATE BEING CONFIRMED. The
+ * estimated arm of this save recomputes from the stored row, so without it a
+ * user who pressed Skip — whose earlier measurements are deliberately retained
+ * (AAP §0.5.2) — could have a calculated figure written to `users.target_*` and
+ * attributed to the estimated route. The whole row is passed to
+ * `resolveEstimateInputs`, which owns that decision.
  */
 const resolveEstimatedValues = (
     row: PreferencesRow | null,
@@ -418,13 +431,121 @@ const resolveEstimatedValues = (
             carbs: estimate.carbs,
             fat: estimate.fat,
         },
-        // `row.revision` is what `estimateRevision` pins — the wire check a few
-        // lines above, which refuses an estimate computed from answers that have
-        // since changed at all. What is RECORDED is the estimate-input counter,
-        // because that is what staleness is later judged against. Two revisions,
-        // two jobs; storing the wrong one is the whole of finding F02.
-        targetsInputRevision: row.estimate_inputs_revision,
+        // `row.revision` is both what `estimateRevision` pins — the wire check a
+        // few lines above, which refuses an estimate computed from answers that
+        // have since changed — and what is RECORDED as this figure's ancestry,
+        // because AAP §0.5.2 judges staleness as `targets_input_revision`
+        // against the current `preferences.revision`. One counter for both jobs
+        // is what makes "confirmed against revision N" and "derived from
+        // revision N" the same statement.
+        targetsInputRevision: row.revision,
     };
+};
+
+/** The targets record one save writes, beyond the state it writes it against. */
+interface ConfirmedTargetsWrite {
+    /** The route the request declared, stored as `target_source`. */
+    source: TargetRoute;
+    /** The four values and their ancestry, from {@link resolveEstimatedValues}. */
+    resolved: ResolvedTargetValues;
+    /** Whether the locked read found a row — the create/update fork. */
+    rowExists: boolean;
+    /** The `targets_revision` that read returned, which the UPDATE pins. */
+    storedRevision: number;
+}
+
+/**
+ * The current `targets_revision`, or 0 when the row is gone.
+ *
+ * Read only to answer a refused write truthfully: the client resolves
+ * `StaleTargetsError` by comparing the authoritative revision with its own
+ * draft, so reporting the revision this transaction *expected* would send it to
+ * compare against a number that never existed. A deleted row reads as 0, which
+ * is the same revision a user with no row has.
+ */
+const readTargetsRevision = async (
+    db: Prisma.TransactionClient,
+    userId: string,
+): Promise<number> => {
+    const row = await db.meal_plan_preferences.findUnique({
+        where: { user_id: userId },
+        select: { targets_revision: true },
+    });
+
+    return row?.targets_revision ?? 0;
+};
+
+/**
+ * Store the confirmed targets record — and make the pinned revision part of the
+ * statement rather than a promise the caller made a moment earlier.
+ *
+ * WHY THIS IS NOT AN UPSERT. `upsert({where: {user_id}})` writes whatever the
+ * row currently holds, so the `expectedTargetsRevision` check would live only
+ * in the application: correct while the lock holds, and silently unenforced the
+ * moment anything writes `targets_revision` without taking it. Rule
+ * `backend-architecture` §5.1 and AAP §0.5.1 require the owner AND the expected
+ * revision in the predicate, so an existing row is updated through
+ * `updateMany({user_id, targets_revision: storedRevision})` and the affected
+ * count is checked: one row is the write this caller pinned, zero is a row that
+ * moved or vanished, and the count makes the difference observable instead of
+ * assumed. The increment then has a guaranteed starting value, because the same
+ * predicate that authorised the write established it.
+ *
+ * Zero affected rows is REACHABLE, which is why the count is checked rather
+ * than assumed. The advisory lock serialises this feature's own writes and
+ * nothing else — the same asymmetry that makes `PUT /api/user/targets` a hazard
+ * for the publication gate — so any statement that reaches this row without
+ * taking it can move `targets_revision` between the locked read and this
+ * update, and PostgreSQL then re-evaluates the waiting update against the row
+ * as it has become. `StaleTargetsError` is the answer the contract already
+ * defines for that (§0.5.2), so refusing costs the client no new behaviour:
+ * it re-reads, compares with its draft, and resolves. The pair of tests in
+ * `__tests__/targets.service.test.ts` drives exactly that interleaving, and the
+ * counter-test shows a merely-locked row still saves.
+ *
+ * A missing row is CREATED rather than upserted for the same reason in reverse:
+ * there is no revision to pin, the lock makes a concurrent meal-planning create
+ * impossible, and stating the two cases separately is what lets the update arm
+ * carry a predicate the create arm cannot have.
+ */
+const writeConfirmedTargets = async (
+    locked: MealPlanningTransactionClient,
+    userId: string,
+    write: ConfirmedTargetsWrite,
+): Promise<void> => {
+    const record = {
+        target_source: write.source,
+        confirmed_targets: asSnapshotColumnValue(write.resolved.values),
+        targets_input_revision: write.resolved.targetsInputRevision,
+    };
+
+    if (!write.rowExists) {
+        await locked.meal_plan_preferences.create({
+            data: {
+                user_id: userId,
+                setup_status: NOT_STARTED_SETUP_STATUS,
+                revision: FIRST_REVISION,
+                targets_revision: write.storedRevision + 1,
+                ...record,
+            },
+        });
+
+        return;
+    }
+
+    const updated = await locked.meal_plan_preferences.updateMany({
+        where: { user_id: userId, targets_revision: write.storedRevision },
+        data: {
+            // Incremented rather than assigned: one atomic statement, and the
+            // predicate above has already established what it increments from.
+            targets_revision: { increment: 1 },
+            ...record,
+        },
+    });
+
+    if (updated.count !== 1) {
+        throw new StaleTargetsError(await readTargetsRevision(locked, userId));
+    }
 };
 
 /**
@@ -447,12 +568,16 @@ const resolveEstimatedValues = (
  *     agree. A pinned value that does not match a stored 0 is refused for the
  *     same reason: the client pinned a revision that never existed.
  *  4. For `estimated`, recompute (see {@link resolveEstimatedValues}).
- *  5. UPSERT the preferences row. A legacy user editing targets from Account
- *     before any onboarding gets a row with `setup_status: 'not_started'` and
- *     nothing else set — a target is not onboarding progress, so generation
- *     still answers `preferences_incomplete` until the wizard actually runs.
- *     `revision: 1` on creation, per §0.5.2, is what the client then pins on its
- *     first preference save.
+ *  5. Create or update the preferences row — and THE PINNED REVISION TRAVELS IN
+ *     THE UPDATE'S OWN PREDICATE (see {@link writeConfirmedTargets}), because a
+ *     check in TypeScript followed by an owner-only write is not an enforced
+ *     revision (Rule `backend-architecture` §5.1, AAP §0.5.1). A legacy user
+ *     editing targets from Account before any onboarding gets a row created with
+ *     `setup_status: 'not_started'` and nothing else set — a target is not
+ *     onboarding progress, so generation still answers
+ *     `preferences_incomplete` until the wizard actually runs. `revision: 1` on
+ *     creation, per §0.5.2, is what the client then pins on its first preference
+ *     save.
  *  6. Write `users.target_*` through `updateTargets(..., tx)` and record the
  *     snapshot, the source and the bumped revision — the pair that makes the
  *     canonical read truthful.
@@ -497,26 +622,11 @@ export const saveTargets = async (
                     ? resolveEstimatedValues(row, request)
                     : { values: request.values, targetsInputRevision: null };
 
-            await locked.meal_plan_preferences.upsert({
-                where: { user_id: userId },
-                create: {
-                    user_id: userId,
-                    setup_status: NOT_STARTED_SETUP_STATUS,
-                    revision: FIRST_REVISION,
-                    target_source: request.source,
-                    targets_revision: storedRevision + 1,
-                    confirmed_targets: asSnapshotColumnValue(resolved.values),
-                    targets_input_revision: resolved.targetsInputRevision,
-                },
-                update: {
-                    target_source: request.source,
-                    // Incremented rather than assigned: one atomic statement,
-                    // and the lock has already established what it increments
-                    // from.
-                    targets_revision: { increment: 1 },
-                    confirmed_targets: asSnapshotColumnValue(resolved.values),
-                    targets_input_revision: resolved.targetsInputRevision,
-                },
+            await writeConfirmedTargets(locked, userId, {
+                source: request.source,
+                resolved,
+                rowExists: row !== null,
+                storedRevision,
             });
 
             const written = await updateTargets(userId, resolved.values, locked);
@@ -526,10 +636,12 @@ export const saveTargets = async (
                 // created through POST /api/user. Thrown rather than returned,
                 // so the transaction rolls back and NEITHER half of the write
                 // lands — the preferences row must never claim a confirmed
-                // target the users row does not hold. There is no error class
-                // for it in the shared vocabulary (`mealPlanning.errors.ts`
-                // belongs to another unit at this checkpoint), so this surfaces
-                // as the controller's 500 rather than the legacy route's 404.
+                // target the users row does not hold. It gets no typed class in
+                // `mealPlanning.errors.ts` because AAP §0.5.2 defines no code
+                // for it on this route: inventing one would put a
+                // machine-readable code on the wire that no client maps, so it
+                // surfaces as the controller's 500, which is the honest answer
+                // for an account that cannot exist on an authenticated request.
                 throw new Error(`cannot write nutrition targets: no users row for ${userId}`);
             }
 

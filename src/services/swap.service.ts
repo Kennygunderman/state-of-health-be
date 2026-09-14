@@ -29,17 +29,37 @@
 //    preview and the commit inherit, because `selectSwapCandidate` picks one of
 //    the LISTED rows (§0.7.3) — the preview binding (`requireBoundPortion`) and
 //    the columns a commit writes (`swapMealWrite`).
-//  * `mealPlan.service.ts` owns the plan: its lifecycle states, its targets,
-//    its meal and day DTOs, its portion-text rendering and the grocery
-//    projection of its meals. This module never maps a plan row itself, which
-//    is what keeps one meal shape and one day shape in the codebase.
-//  * `mealPlan.logic.ts` owns `requireWritablePlan` — a superseded or ended plan
-//    cannot be COMMITTED to, which is why only {@link commitSwap} applies it —
-//    and `computeDayTotals`, whose output a commit stores.
-//  * `grocery.service.ts` owns the list: `rebuildPlanGroceries` diffs the week
-//    against what is stored and reports what changed.
-//  * `recipe.service.ts` owns every recipe read, including the plannable
-//    candidate set and the preview's full recipe detail.
+//  * `mealPlan.mapper.ts` owns the plan's SHAPE: the meal and day DTOs,
+//    portion-text rendering, the reading of stored day keys, flags and targets
+//    snapshots, the grouping of linked diary entries, and the one display
+//    rounding a planned figure gets. This module never maps a plan row itself,
+//    which is what keeps one meal shape and one day shape in the codebase —
+//    while the READS that fetch those rows are this module's own, owner-scoped
+//    as §5.1 requires, because a service does not borrow another service's I/O.
+//  * `mealPlan.logic.ts` owns the plan's RULES: `requireWritablePlan` — a
+//    superseded or ended plan cannot be COMMITTED to, which is why only
+//    {@link commitSwap} applies it — `computeDayTotals`, whose output a commit
+//    stores, `toPlanningPreferences`, the one narrowing of a preferences row
+//    into the restrictions eligibility is judged by, and
+//    `resolveReportedTargets`, which decides whether a week is judged against
+//    its snapshot or the user's current confirmed targets.
+//  * `grocery.service.ts` owns the list: `loadPlannedMealsForGroceries` is the
+//    one projection of a plan's meals into shopping input, and
+//    `rebuildPlanGroceries` diffs the week against what is stored and reports
+//    what changed.
+//  * `recipe.service.ts` owns every recipe read — the plannable candidate set,
+//    the preview's full recipe detail, and the whole rows behind the
+//    alternatives list. This module issues no `recipe_versions` query of its
+//    own.
+//  * `targets.service.ts` owns the canonical target read (`getTargets`), which
+//    the plan card reads through as well.
+//
+// `mealPlan.service.ts` IS DELIBERATELY ABSENT FROM THAT LIST. Nothing here
+// imports it: a swap needs the plan's shape, its rules, its grocery projection
+// and its targets, and each of those has an owner above that is not the plan's
+// own orchestrator. Depending on it would make this module's reads wait on the
+// module that generates weeks, and would put a second service between a swap
+// and its own database.
 //  * `mealPlanningAction.service.ts` owns the keyed-write sequence.
 //
 // WHY THE COMMIT IS ONE TRANSACTION. §0.5.2's 13e copy promises that a failed
@@ -109,7 +129,9 @@
 import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
 import {
+    LoggedPlannedEntry,
     MealPlanDayResponse,
+    MealPlanMacroTotals,
     MealPlanMealResponse,
     SwapAlternativesResponse,
     SwapMealPayload,
@@ -117,17 +139,22 @@ import {
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
 import { mealPlanningFault } from '../utils/featureFlags';
-import { rebuildPlanGroceries } from './grocery.service';
-import { PlanLifecycleState, requireWritablePlan } from './mealPlan.logic';
-import { formatPortionText } from './mealPlan.mapper';
+import { loadPlannedMealsForGroceries, rebuildPlanGroceries } from './grocery.service';
 import {
-    loadMealPlanDayResponse,
-    loadMealPlanMealResponse,
-    loadPlanLifecycleStates,
-    loadPlanTargets,
-    loadPlannedMealsForGroceries,
+    PlanLifecycleState,
+    requireWritablePlan,
+    resolveReportedTargets,
     toPlanningPreferences,
-} from './mealPlan.service';
+} from './mealPlan.logic';
+import {
+    LoggedPlannedEntryRow,
+    formatPortionText,
+    groupLoggedPlannedEntries,
+    readTargetsSnapshot,
+    toMealPlanDayResponse,
+    toMealPlanMealResponse,
+    toPlanLifecycleState,
+} from './mealPlan.mapper';
 import {
     PlanNotFoundError,
     RecipeIneligibleError,
@@ -139,7 +166,7 @@ import { KeyedActionResult, runKeyedAction } from './mealPlanningAction.service'
 import { dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
 import { isMealSlot, roundNutritionForDisplay } from './recipe.logic';
 import { RecipeVersionRow, mapSwapAlternative } from './recipe.mapper';
-import { getRecipeVersionDetail, getRecipeVersionsForPlanning } from './recipe.service';
+import { getRecipeVersionDetail, getRecipeVersionRowsByIds, getRecipeVersionsForPlanning } from './recipe.service';
 import {
     ParsedSwapCommitRequest,
     SwapCandidate,
@@ -154,6 +181,7 @@ import {
     selectSwapCandidates,
     swapMealWrite,
 } from './swap.logic';
+import { getTargets } from './targets.service';
 
 /* ---------------------------------------------------------------------------
  * Row projections
@@ -276,6 +304,79 @@ const toSwapWeekMeal = (row: SwapMealRow): SwapWeekMeal => ({
 /** A `@db.Date` day key, matching `mealPlan.service.ts`'s own conversion. */
 const toStoredDate = (dayKey: string): Date => new Date(`${dayKey}T00:00:00.000Z`);
 
+/* ---------------------------------------------------------------------------
+ * Reading the plan back as the wire shape
+ *
+ * A swap answers with `MealPlanMealResponse` and `MealPlanDayResponse`, so it
+ * reads the meal and the day it just resolved or wrote and hands the rows to
+ * `mealPlan.mapper.ts`. THE MAPPING IS SHARED AND THE READS ARE THIS MODULE'S:
+ * the DTO shapes, the day-key reading, the logged-entry grouping and the display
+ * rounding all live in the mapper, so a swap's day cannot be shaped differently
+ * from the same day read through `GET …/days/:date` — while the queries stay
+ * here, owner-scoped, as §5.1 requires of every service's own I/O.
+ *
+ * The projections below are checked against the mapper's row contracts at the
+ * call sites: a column omitted here stops `toMealPlanMealResponse` compiling,
+ * which is what keeps the three services that perform this read in agreement
+ * without any of them borrowing another's function.
+ * ------------------------------------------------------------------------- */
+
+/** What the planned-meal DTO needs joined — `mealPlan.mapper.ts::PlanMealWithRecipeRow`. */
+const DTO_MEAL_INCLUDE = {
+    recipe_versions: true,
+    previous_recipe_versions: { select: { id: true, name: true } },
+} satisfies Prisma.meal_plan_mealsInclude;
+
+/** Meals of one day in the order the day is READ: the clock order generation stored. */
+const DTO_MEAL_ORDER: Prisma.meal_plan_mealsOrderByWithRelationInput[] = [{ sort_order: 'asc' }, { id: 'asc' }];
+
+/** One day with its meals and its plan's end date, which `isLastDay` is derived from. */
+const DTO_DAY_INCLUDE = {
+    meal_plan_meals: { include: DTO_MEAL_INCLUDE, orderBy: DTO_MEAL_ORDER },
+    meal_plans: { select: { id: true, end_date: true } },
+} satisfies Prisma.meal_plan_daysInclude;
+
+/** What a linked diary entry must supply — `mealPlan.mapper.ts::LoggedPlannedEntryRow`. */
+const LOGGED_ENTRY_SELECT = {
+    id: true,
+    date: true,
+    servings: true,
+    logged_at: true,
+    meal_plan_meal_id: true,
+    recipe_version_id: true,
+    meals: { select: { name: true } },
+    recipe_versions: { select: { name: true } },
+} satisfies Prisma.meal_entriesSelect;
+
+/**
+ * The non-deleted diary entries linked to the given planned meals, grouped by
+ * meal.
+ *
+ * The two predicates that make them truthful are this read's responsibility —
+ * `deleted_at IS NULL` and the owner's `user_id` — and the grouping, including
+ * the dropping of entries a user has since detached by editing, is
+ * `mealPlan.mapper.ts::groupLoggedPlannedEntries`'s.
+ *
+ * No ids means no query: a day with no meals cannot have logged entries.
+ */
+const loadLoggedEntries = async (
+    db: Prisma.TransactionClient,
+    userId: string,
+    mealIds: readonly string[],
+): Promise<Map<string, LoggedPlannedEntry[]>> => {
+    if (mealIds.length === 0) {
+        return new Map<string, LoggedPlannedEntry[]>();
+    }
+
+    const entries: LoggedPlannedEntryRow[] = await db.meal_entries.findMany({
+        where: { user_id: userId, deleted_at: null, meal_plan_meal_id: { in: [...new Set(mealIds)] } },
+        select: LOGGED_ENTRY_SELECT,
+        orderBy: [{ logged_at: 'asc' }, { id: 'asc' }],
+    });
+
+    return groupLoggedPlannedEntries(entries);
+};
+
 /**
  * A decided value as a JSON column value.
  *
@@ -297,25 +398,74 @@ const asJsonValue = (value: unknown): Prisma.InputJsonValue => value as Prisma.I
  * The plan's lifecycle state, with its replacement resolved — the input
  * `requireWritablePlan` judges, and read by the COMMIT alone.
  *
- * Read through `mealPlan.service.ts::loadPlanLifecycleStates` rather than with a
- * query of its own, so the "newest successor wins" resolution has one
- * implementation: a plan replaced and then replaced again must send a stale
- * screen to the current week rather than to an intermediate one, and that is a
- * decision, not a join.
+ * THIS MODULE'S OWN READ (§5.1: `{id, user_id}`, never an id alone), because a
+ * service does not borrow another service's I/O. What it does NOT own is the two
+ * decisions inside the answer: `mealPlan.mapper.ts::toPlanLifecycleState` reads
+ * the `@db.Date` columns into day keys and flattens the successor, and
+ * `mealPlan.logic.ts::requireWritablePlan` decides which status may be written
+ * to. Those live in one place each, so a plan replaced and then replaced again
+ * sends a stale screen to the CURRENT week here exactly as it does everywhere
+ * else — "newest successor wins" is a decision, not a join.
+ *
+ * One plan rather than the user's whole list: the successor is resolved by the
+ * ordered relation take, so nothing here needs the other weeks.
  */
 const loadSwapPlanState = async (
     db: Prisma.TransactionClient,
     userId: string,
     planId: string,
 ): Promise<PlanLifecycleState> => {
-    const state = (await loadPlanLifecycleStates(db, userId)).find((plan) => plan.id === planId);
+    const plan = await db.meal_plans.findFirst({
+        where: { id: planId, user_id: userId },
+        select: {
+            id: true,
+            status: true,
+            start_date: true,
+            end_date: true,
+            replaced_by_plans: {
+                where: { user_id: userId },
+                orderBy: [{ published_at: 'desc' }, { id: 'desc' }],
+                take: 1,
+                select: { id: true },
+            },
+        },
+    });
 
-    if (state === undefined) {
+    if (plan === null) {
         throw new PlanNotFoundError();
     }
 
-    return state;
+    return toPlanLifecycleState(plan);
 };
+
+/**
+ * The targets this plan is judged against: the caller's current confirmed
+ * targets when they are complete, otherwise the snapshot the week was generated
+ * from.
+ *
+ * THE SWAP'S ONE SOURCE FOR THEM, and the same two steps the day card takes —
+ * `targets_snapshot` narrowed by `mealPlan.mapper.ts::readTargetsSnapshot`, then
+ * reconciled with the confirmed targets by
+ * `mealPlan.logic.ts::resolveReportedTargets`. Sharing the RULE rather than the
+ * read is what makes it impossible for the alternatives list, the preview and
+ * the day card to disagree about what the day is aiming at: a swap that scored
+ * against the snapshot while the card showed the current targets would offer a
+ * meal that visibly misses the number printed beside it.
+ *
+ * `targets.service.ts::getTargets` is the product's canonical target read and is
+ * called here directly, with this transaction's client, so a commit scores
+ * against the targets as they stand inside its own lock.
+ *
+ * The plan row is the one {@link loadSwapContext} has already read — the column
+ * rides along on that statement rather than taking a second round trip for it,
+ * which matters inside an interactive transaction holding one connection.
+ */
+const resolveSwapTargets = async (
+    db: Prisma.TransactionClient,
+    userId: string,
+    plan: { id: string; targets_snapshot: unknown },
+): Promise<MealPlanMacroTotals> =>
+    resolveReportedTargets(await getTargets(userId, db), readTargetsSnapshot(plan.targets_snapshot, plan.id));
 
 /** The user's own calendar day, from the zone their last save stored. */
 const resolveToday = async (userId: string, now: Date, db: Prisma.TransactionClient): Promise<string> =>
@@ -352,7 +502,10 @@ interface SwapContext {
  *
  *  1. THE PLAN, by `{id, user_id}`. A miss is `PlanNotFoundError` — "no such
  *     plan" and "not your plan" are one answer (§8), so a foreign or invented id
- *     is a `404` on every one of the three routes and existence never leaks.
+ *     is a `404` on every one of the three routes and existence never leaks. Its
+ *     `targets_snapshot` is selected on this statement because step 3 needs it;
+ *     a separate read for one column would be a second round trip on the single
+ *     connection a transaction holds.
  *  2. THE MEAL, matched on `{id, meal_plan_id, user_id}` — the plan's own
  *     owner-scoped meal set, filtered by id, so the predicate is the same one a
  *     direct lookup would use without a second round trip (§5.1). An absent id
@@ -375,7 +528,7 @@ const loadSwapContext = async (
 ): Promise<SwapContext> => {
     const plan = await db.meal_plans.findFirst({
         where: { id: planId, user_id: userId },
-        select: { id: true, revision: true },
+        select: { id: true, revision: true, targets_snapshot: true },
     });
 
     if (plan === null) {
@@ -399,7 +552,7 @@ const loadSwapContext = async (
 
     // Sequential rather than concurrent: `db` may be an interactive transaction
     // client, which is one connection.
-    const targets = await loadPlanTargets(db, userId, planId);
+    const targets = await resolveSwapTargets(db, userId, plan);
     const preferences = toPlanningPreferences(await loadPreferencesRow(userId, db));
     const recipes = await getRecipeVersionsForPlanning(db);
 
@@ -424,31 +577,26 @@ const loadSwapContext = async (
 /**
  * The recipe version rows behind a set of candidates, keyed by version id.
  *
- * Read WHOLE rather than projected: `recipe.mapper.ts::RecipeVersionRow` needs
- * twenty-four of this table's columns, so an explicit select would restate the
- * table with one more way to fall behind it. At most eight rows are ever asked
- * for, because the list is truncated before this runs.
+ * THROUGH `recipe.service.ts`, NEVER `db.recipe_versions` DIRECTLY. That file is
+ * the single owner of recipe reads — the guarantee its header states and the
+ * reason the planner and the planned-log service call in as well — so the
+ * projection and the bounds of this read live there and exist once. Querying the
+ * table here would be a second projection of the same rows and a second place
+ * for it to drift from `recipe.mapper.ts::RecipeVersionRow`, which is the shape
+ * `mapSwapAlternative` consumes.
  *
- * NO TENANT PREDICATE, and this is the sanctioned §5.1 exception
- * `recipe.service.ts` and `catalog.service.ts` both document: `recipe_versions`
- * holds no `user_id` at all — recipes are shared reference data — so there is no
- * owner to scope to. The ids arrive from a selection run against the caller's
- * own plan, so nothing here can be turned into a probe.
+ * At most eight ids are ever asked for, because the list is truncated before
+ * this runs. Nothing else about the read is this module's concern, including the
+ * §5.1 exception that recipes are shared reference data with no owner column.
  */
 const loadCandidateVersions = async (
     db: Prisma.TransactionClient,
     candidates: readonly SwapCandidate[],
-): Promise<Map<string, RecipeVersionRow>> => {
-    if (candidates.length === 0) {
-        return new Map();
-    }
-
-    const versions = await db.recipe_versions.findMany({
-        where: { id: { in: [...new Set(candidates.map((candidate) => candidate.recipe.recipe_version_id))] } },
-    });
-
-    return new Map(versions.map((version) => [version.id, version]));
-};
+): Promise<Map<string, RecipeVersionRow>> =>
+    getRecipeVersionRowsByIds(
+        candidates.map((candidate) => candidate.recipe.recipe_version_id),
+        db,
+    );
 
 /**
  * The row behind one candidate, or the fault of it having vanished.
@@ -488,7 +636,10 @@ const requireMealResponse = async (
     planId: string,
     mealId: string,
 ): Promise<MealPlanMealResponse> => {
-    const meal = await loadMealPlanMealResponse(db, userId, planId, mealId);
+    const meal = await db.meal_plan_meals.findFirst({
+        where: { id: mealId, meal_plan_id: planId, user_id: userId },
+        include: DTO_MEAL_INCLUDE,
+    });
 
     if (meal === null) {
         throw new SwapDataError(
@@ -496,7 +647,9 @@ const requireMealResponse = async (
         );
     }
 
-    return meal;
+    const logged = await loadLoggedEntries(db, userId, [meal.id]);
+
+    return toMealPlanMealResponse(meal, meal.recipe_versions, logged.get(meal.id) ?? []);
 };
 
 /** The day DTO, absent for the same impossible reason as the meal above. */
@@ -506,7 +659,10 @@ const requireDayResponse = async (
     planId: string,
     date: string,
 ): Promise<MealPlanDayResponse> => {
-    const day = await loadMealPlanDayResponse(db, userId, planId, date);
+    const day = await db.meal_plan_days.findFirst({
+        where: { meal_plan_id: planId, user_id: userId, date: toStoredDate(date) },
+        include: DTO_DAY_INCLUDE,
+    });
 
     if (day === null) {
         throw new SwapDataError(
@@ -514,7 +670,16 @@ const requireDayResponse = async (
         );
     }
 
-    return day;
+    const logged = await loadLoggedEntries(
+        db,
+        userId,
+        day.meal_plan_meals.map((meal) => meal.id),
+    );
+
+    return toMealPlanDayResponse(day, day.meal_plan_meals, {
+        endDate: toSwapDayKey(day.meal_plans.end_date, day.meal_plans.id),
+        loggedByMealId: logged,
+    });
 };
 
 /* ---------------------------------------------------------------------------
@@ -647,11 +812,28 @@ export const getSwapAlternatives = async (
  * non-current version. That callee's own docblock names this call site as the
  * one qualifying caller.
  *
- * Every number is reported at FULL PRECISION, matching §0.7.3's rounding
- * contract and `MealPlanDayResponse.plannedTotals`: the client applies
- * `Math.round` for display, so the preview's figures are directly comparable
- * with the day card's, and the integer it shows for this candidate is the same
- * integer the alternatives row showed.
+ * EVERY FIGURE IS DISPLAY-ROUNDED, which is what makes the preview's numbers
+ * directly comparable with the day card's. §0.7.3 rounds for display once, at
+ * the wire boundary, and the client is forbidden from rounding at all, so the
+ * three paths that describe this candidate have to round in the same place:
+ * `getSwapAlternatives` already rounds each row's meta line,
+ * `mealPlan.mapper.ts::readPlannedTotals` rounds the meal and the day, and this
+ * envelope rounds its own. A preview reporting 1834.6 beside a day card
+ * reporting 1835 would be the same day quoted two ways.
+ *
+ * ROUNDING STOPS AT THE RESPONSE. The commit stores
+ * `candidate.dayTotalsIfSwapped` at full precision (`applySwap`), as generation
+ * does, so the stored column and `mealPlan.logic.ts::computeDayTotals` stay
+ * exact and the day the user gets is the day they approved to the integer.
+ *
+ * `calorieDelta` is rounded on its own rather than recomputed from the rounded
+ * totals: it is a signed difference the sheet shows as a pill ("−70 cal") and
+ * the day's CURRENT total is not on that screen, so there is nothing for a
+ * reader to subtract it from. Rounding the difference is therefore the more
+ * accurate of the two — it cannot inherit both totals' rounding error.
+ *
+ * `targets` are not rounded because they are integers already: confirmed
+ * targets are whole kilocalories and whole grams by §0.7.3.
  *
  * `nutrition` IS THE PORTION'S; `alternative.recipe.ingredients` ARE THE WHOLE
  * RECIPE'S. That asymmetry is inherent to the envelope rather than an
@@ -724,12 +906,12 @@ export const getSwapPreview = async (
             alternative: {
                 recipe,
                 portionMultiplier: candidate.portionMultiplier,
-                portionText: formatPortionText(candidate.portionMultiplier),
-                nutrition: candidate.nutrition,
+                portionText: formatPortionText(candidate.portionMultiplier, recipe.servingDescription),
+                nutrition: roundNutritionForDisplay(candidate.nutrition),
             },
-            dayTotalsIfSwapped: candidate.dayTotalsIfSwapped,
+            dayTotalsIfSwapped: roundNutritionForDisplay(candidate.dayTotalsIfSwapped),
             targets: context.selection.targets,
-            calorieDelta: candidate.calorieDelta,
+            calorieDelta: Math.round(candidate.calorieDelta),
             planRevision: context.planRevision,
         },
     };

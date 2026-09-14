@@ -1,5 +1,46 @@
-// The enforcing proof that the meal-planning request parsers are WIRED, not
-// merely written.
+// The request-parser wiring suite: every user-scoped meal-planning entry point
+// answers a MALFORMED request before it reaches Prisma.
+//
+// AAP §0.5.2 requires "server-side validation applied before any Prisma or
+// planning work (`*.logic.ts` parsers, 400 with field codes)". Every parser in
+// this feature is pure and separately unit-tested in its own `*.logic.test.ts`,
+// so those suites establish that the RULES are right. They cannot establish
+// that anything CALLS them, and a correct parser no entry point invokes leaves a
+// malformed request travelling exactly as far as it did before it was written:
+//
+//   * a non-UUID `planId` reaches a `where: { id, user_id }` predicate, where
+//     PostgreSQL rejects the uuid cast and the client is told `500`;
+//   * `2026-02-30` reaches `new Date('2026-02-30T00:00:00.000Z')` and becomes
+//     an Invalid Date that queries as `NULL`, so a real calendar error looks
+//     like an empty day;
+//   * `expectedPlanRevision: 1e30` passes `Number.isInteger` and reaches
+//     `buildRequestFingerprint`'s canonicaliser or the `Int` column, again a
+//     `500`;
+//   * `portionMultiplier: 2.5` reaches `requireBoundPortion`, which answers
+//     `409 preview_stale` — telling the user their preview went stale when the
+//     request was never well formed in the first place.
+//
+// WHY IT IS ITS OWN FILE, BESIDE `ownership.test.ts` RATHER THAN INSIDE IT.
+// The malformed-id class of AAP §0.9.2's ownership matrix is proven here, while
+// the foreign-id and nonexistent-id classes — which need real rows to
+// distinguish — are proven against a real PostgreSQL in `ownership.test.ts` in
+// this same directory. The two cannot share a module: this one replaces the
+// Prisma singleton for the whole file with a recording stub (below), which is
+// exactly what makes "no call was made" observable, and exactly what a
+// row-backed case cannot work against.
+//
+// THIS FILE INSTALLS A MODULE-LEVEL PRISMA RECORDING STUB, WHICH CONSTRAINS
+// WHAT MAY BE ADDED TO IT. The `jest.mock('../../prisma/client')` below replaces
+// the singleton EVERY service imports, for the whole file, with a proxy that
+// records each call and throws; there is no live database connection anywhere in
+// this module. A case added here that needs real rows — a foreign-user `404`,
+// say — therefore cannot use the stubbed singleton or the shared
+// `../setup/factories` helpers that sit on it. It has to bring its own client:
+// `new PrismaClient()` from `../../generated/prisma`, or the real module through
+// `jest.requireActual('../../prisma/client')`, kept in its own `describe` with
+// its own setup and teardown. Reaching for the stubbed singleton instead does
+// not fail loudly; it records a call path and throws the sentinel, which reads
+// like an unrelated assertion failure.
 //
 // WHAT IS BEING PROVEN. AAP §0.5.2 requires "server-side validation applied
 // before any Prisma or planning work (`*.logic.ts` parsers, 400 with field
@@ -21,9 +62,9 @@
 //     `409 preview_stale` — telling the user their preview went stale when the
 //     request was never well formed in the first place.
 //
-// Those four are the four findings this unit was assigned. Each is now
-// impossible, and this file is the only place that is visible, because it is
-// the only place that exercises the entry points rather than the parsers.
+// Each of those four failure modes is impossible while this suite is green, and
+// this file is the only place that is visible, because it is the only place that
+// exercises the entry points rather than the parsers.
 //
 // HOW IT PROVES IT. The Prisma singleton every service imports is replaced by a
 // recording stub whose properties are all reachable and whose every CALL
@@ -45,13 +86,25 @@
 // that refused everything, which is the one way a validation gate can be wrong
 // in the opposite direction.
 //
+// TWO PROOFS ARE MADE AT THE CONTROLLER, NOT THE SERVICE, because that is
+// where those two parses live. `GET /catalog/foods/suggestions` and
+// `GET /recipes/:recipeVersionId` are parsed by
+// `catalog.controller.ts::getCatalogSuggestionsController` and
+// `::getRecipeVersionController` before either calls its service
+// (§0.7.2: `getUserId` → parse → one service call), and the services behind
+// them take already-validated values and answer with a DTO or `null` rather
+// than a verdict — so a "the service returns the refusal" assertion would now
+// assert an arrangement the Rule forbids. The claim is unchanged and so is the
+// instrument: the handler is driven with a minimal request/response pair, and a
+// refusal must be the 400 body naming the field with NO recorded database call.
+//
 // ONE ENTRY POINT IS DELIBERATELY ABSENT. `mealPlan.service.ts::generatePlan`
 // reads the preferences row BEFORE it parses, because its parse needs a
 // `StartDateWindow` derived from today in the user's stored zone — §0.5.1
 // ordering, stated in that function's own docblock. A "no database call"
 // assertion there would assert a bug, so it is excluded and said so here.
-// `regeneratePlan` needs no database state to parse and is included, as the
-// anchor showing this arrangement predates this work.
+// `regeneratePlan` needs no database state to parse and is therefore included,
+// as the anchor case for the ordering the rest of the routes follow.
 
 /**
  * The recording stub, built entirely inside the factory.
@@ -79,11 +132,17 @@ jest.mock('../../prisma/client', () => {
     return { prisma: node(''), __prismaCalls: calls, __sentinel: sentinel };
 });
 
-import { getAffectedMeals, getMealPlanDay, regeneratePlan } from '../mealPlan.service';
-import { logPlannedMeal } from '../plannedMealLog.service';
-import { getRecipeVersionForUser } from '../recipe.service';
-import { commitSwap, getSwapAlternatives, getSwapPreview } from '../swap.service';
-import { saveTargets } from '../targets.service';
+import type { Request, Response } from 'express';
+
+import {
+    getCatalogSuggestionsController,
+    getRecipeVersionController,
+} from '../../controllers/catalog.controller';
+import { getAffectedMeals, getMealPlanDay, regeneratePlan } from '../../services/mealPlan.service';
+import { logPlannedMeal } from '../../services/plannedMealLog.service';
+import { savePreferences, saveSetupStep } from '../../services/preferences.service';
+import { commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
+import { saveTargets } from '../../services/targets.service';
 
 /** The live recorder and stub, read back from the module the services imported. */
 const mockedClient = jest.requireMock('../../prisma/client') as {
@@ -100,6 +159,24 @@ const RECIPE_VERSION_ID = 'd5ebf4f3-6f7c-4d8e-8f9a-1b2c3d4e5f60';
 const DIARY_MEAL_ID = 'e6fca504-7a8d-4e9f-9a0b-2c3d4e5f6071';
 const IDEMPOTENCY_KEY = 'f70db615-8b9e-4fa0-ab1c-3d4e5f607182';
 const DAY_KEY = '2026-07-05';
+const TIME_ZONE = 'America/New_York';
+
+/** A well-formed `goal` step body, with the one override each case needs. */
+const stepBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    goal: 'lose',
+    paceLbPerWeek: 1,
+    timeZone: TIME_ZONE,
+    expectedRevision: 1,
+    ...overrides,
+});
+
+/** A well-formed full-save body, likewise. */
+const updateBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    diet: 'vegan',
+    timeZone: TIME_ZONE,
+    expectedRevision: 1,
+    ...overrides,
+});
 
 /** A well-formed swap commit body, with the one override each case needs. */
 const commitBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -176,6 +253,114 @@ const expectReachesDatabase = async (call: () => Promise<unknown>): Promise<stri
         () => undefined,
         () => undefined,
     );
+
+    expect(prismaCalls.length).toBeGreaterThan(0);
+
+    return prismaCalls[0];
+};
+
+/* ---------------------------------------------------------------------------
+ * The two entry points whose parse lives in the controller
+ * ------------------------------------------------------------------------- */
+
+/** What a handler answered with, recorded off the response double. */
+interface RecordedResponse {
+    statusCode: number | null;
+    body: unknown;
+}
+
+/** The chainable half of `Response` these handlers use: `status().json()`. */
+interface ResponseDouble {
+    status: (code: number) => ResponseDouble;
+    json: (body: unknown) => ResponseDouble;
+}
+
+/**
+ * The minimal Express pair the two catalog handlers actually touch: `req.user`
+ * (all `getUserId` reads), the `params`/`query` the parser is handed, and a
+ * `status().json()` recorder.
+ *
+ * Built and cast rather than constructed for real, because what is being proven
+ * is the ORDER of a handler's first statements — resolve the caller, parse,
+ * then call the service — and a real `Request` would add a socket and a router
+ * without adding anything to that claim. `user` is set directly for the same
+ * reason `jestSetup.ts` has the auth mock write it: the handler must learn the
+ * caller only through `getUserId(req)`.
+ */
+const handlerDoubles = (
+    request: { params?: Record<string, unknown>; query?: Record<string, unknown> } = {},
+): { req: Request; res: Response; recorded: RecordedResponse } => {
+    const recorded: RecordedResponse = { statusCode: null, body: null };
+    const res: ResponseDouble = {
+        status: (code: number) => {
+            recorded.statusCode = code;
+
+            return res;
+        },
+        json: (body: unknown) => {
+            recorded.body = body;
+
+            return res;
+        },
+    };
+
+    return {
+        req: {
+            user: { uid: USER_ID },
+            params: request.params ?? {},
+            query: request.query ?? {},
+        } as unknown as Request,
+        res: res as unknown as Response,
+        recorded,
+    };
+};
+
+/**
+ * Asserts a handler refused the request with `400 invalid_request` naming
+ * `field`, and did so without a single database call.
+ *
+ * The service-level sibling of this helper reads a RETURNED verdict; here the
+ * verdict has already been mapped, so the proof is the wire body itself — which
+ * is the stronger statement for a route whose parse is the controller's job.
+ */
+const expectHandlerRefusedBeforeIo = async (
+    handler: (req: Request, res: Response) => Promise<unknown>,
+    request: { params?: Record<string, unknown>; query?: Record<string, unknown> },
+    field: string,
+    code: string,
+): Promise<void> => {
+    prismaCalls.length = 0;
+
+    const { req, res, recorded } = handlerDoubles(request);
+
+    await handler(req, res);
+
+    expect(recorded.statusCode).toBe(400);
+    expect(recorded.body).toEqual({ error: 'invalid_request', details: [{ field, code }] });
+    expect(prismaCalls).toEqual([]);
+};
+
+/**
+ * The converse for a handler: a WELL-FORMED request does reach the database.
+ *
+ * The stub's throw lands in the handler's own `catch`, which logs before
+ * answering 500, so `console.error` is silenced for the duration — a passing
+ * run stays readable and the recorder, not the log, is the evidence.
+ */
+const expectHandlerReachesDatabase = async (
+    handler: (req: Request, res: Response) => Promise<unknown>,
+    request: { params?: Record<string, unknown>; query?: Record<string, unknown> },
+): Promise<string> => {
+    prismaCalls.length = 0;
+
+    const { req, res } = handlerDoubles(request);
+    const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+        await handler(req, res);
+    } finally {
+        logged.mockRestore();
+    }
 
     expect(prismaCalls.length).toBeGreaterThan(0);
 
@@ -395,10 +580,13 @@ describe('planned-meal logging parses path and body before the ledger (F22, F09)
     });
 });
 
-describe('recipe read entry point parses before any I/O (F22)', () => {
-    it('refuses a malformed recipeVersionId', async () => {
-        await expectRefusedBeforeIo(
-            () => getRecipeVersionForUser(USER_ID, 'recipe-1'),
+describe('the recipe read parses in its controller, before any I/O (F22)', () => {
+    // `jestSetup.ts` sets MEAL_PLANNING_ENABLED=true, so the handler's feature
+    // gate passes and the parse is what these two cases are about.
+    it('refuses a malformed recipeVersionId with no database call', async () => {
+        await expectHandlerRefusedBeforeIo(
+            getRecipeVersionController,
+            { params: { recipeVersionId: 'recipe-1' } },
             'recipeVersionId',
             'invalid_id',
         );
@@ -406,8 +594,216 @@ describe('recipe read entry point parses before any I/O (F22)', () => {
 
     it('lets a well-formed read reach the database', async () => {
         expect(
-            await expectReachesDatabase(() => getRecipeVersionForUser(USER_ID, RECIPE_VERSION_ID)),
+            await expectHandlerReachesDatabase(getRecipeVersionController, {
+                params: { recipeVersionId: RECIPE_VERSION_ID },
+            }),
         ).toMatch(/^recipe_versions\./);
+    });
+});
+
+describe('the suggestions read parses in its controller, before any I/O (F22)', () => {
+    // The kind used to be coerced and checked inline in the handler, which left
+    // the allowed-value rule untestable without HTTP. Both cases below are
+    // refused by the same `unsupported` detail, because the contract defines
+    // one kind and sending none is sending the wrong one.
+    it('refuses an absent kind with no database call', async () => {
+        await expectHandlerRefusedBeforeIo(
+            getCatalogSuggestionsController,
+            { query: {} },
+            'kind',
+            'unsupported',
+        );
+    });
+
+    it('refuses a kind this endpoint does not answer with no database call', async () => {
+        await expectHandlerRefusedBeforeIo(
+            getCatalogSuggestionsController,
+            { query: { kind: 'favourite' } },
+            'kind',
+            'unsupported',
+        );
+    });
+
+    // The converse. `getSuggestions` reads through `prisma.$queryRaw`, which the
+    // stub records like any other call.
+    it('lets kind=dislike reach the database', async () => {
+        expect(
+            await expectHandlerReachesDatabase(getCatalogSuggestionsController, {
+                query: { kind: 'dislike' },
+            }),
+        ).toBe('$queryRaw');
+    });
+});
+
+describe('preference saves parse their envelope before any I/O (SVC-09)', () => {
+    // Both saves used to read the preferences row INSIDE the argument list of
+    // their own parser — `parseSetupStep(step, body, stepContext(await
+    // loadPreferencesRow(userId)))` — so the read was awaited first and an
+    // unknown step, a non-object body, an unknown zone or a server-owned key
+    // reached Prisma before its deterministic 400. The context-free envelope
+    // parse is now the first statement of each, and "no recorded call" is the
+    // only way to see the difference.
+    //
+    // The well-formed cases below record `meal_plan_preferences.findUnique`
+    // rather than `$transaction`: the unlocked preflight parse against the
+    // stored row is retained deliberately, so a body whose FIELDS are wrong
+    // still never takes the user's advisory lock.
+
+    it('refuses a step segment that names no payload-bearing step', async () => {
+        await expectRefusedBeforeIo(
+            () => saveSetupStep(USER_ID, 'goals', stepBody()),
+            'step',
+            'unknown_step',
+        );
+    });
+
+    it('refuses a step body that is not an object', async () => {
+        await expectRefusedBeforeIo(() => saveSetupStep(USER_ID, 'goal', undefined), 'body', 'invalid_type');
+    });
+
+    it('refuses a step save with no time zone', async () => {
+        await expectRefusedBeforeIo(
+            () => saveSetupStep(USER_ID, 'goal', stepBody({ timeZone: undefined })),
+            'timeZone',
+            'required',
+        );
+    });
+
+    it('refuses a step save whose zone this runtime does not know', async () => {
+        await expectRefusedBeforeIo(
+            () => saveSetupStep(USER_ID, 'goal', stepBody({ timeZone: 'Mars/Phobos' })),
+            'timeZone',
+            'invalid_time_zone',
+        );
+    });
+
+    it('refuses a server-owned key in a step body', async () => {
+        await expectRefusedBeforeIo(
+            () => saveSetupStep(USER_ID, 'goal', stepBody({ setupStatus: 'completed' })),
+            'setupStatus',
+            'read_only_field',
+        );
+    });
+
+    it('refuses a step revision no Int column can hold', async () => {
+        await expectRefusedBeforeIo(
+            () => saveSetupStep(USER_ID, 'goal', stepBody({ expectedRevision: 1e30 })),
+            'expectedRevision',
+            'above_maximum',
+        );
+    });
+
+    it('refuses a full save body that is not an object', async () => {
+        await expectRefusedBeforeIo(() => savePreferences(USER_ID, undefined), 'body', 'invalid_type');
+    });
+
+    it('refuses a full save with no time zone (SVC-05)', async () => {
+        // The zone is a required envelope field on this endpoint, so its absence
+        // is settled here rather than silently resolved to the stored zone.
+        await expectRefusedBeforeIo(
+            () => savePreferences(USER_ID, updateBody({ timeZone: undefined })),
+            'timeZone',
+            'required',
+        );
+    });
+
+    it('refuses a server-owned key in a full save body', async () => {
+        await expectRefusedBeforeIo(
+            () => savePreferences(USER_ID, updateBody({ targetRoute: 'manual' })),
+            'targetRoute',
+            'read_only_field',
+        );
+    });
+
+    it('refuses a full save that edits nothing but its envelope', async () => {
+        await expectRefusedBeforeIo(
+            () => savePreferences(USER_ID, { timeZone: TIME_ZONE, expectedRevision: 1 }),
+            'body',
+            'required',
+        );
+    });
+
+    it('reports every envelope problem of one request in a single verdict', async () => {
+        const verdict = await expectRefusedBeforeIo(
+            () => savePreferences(USER_ID, { nickname: 'x', expectedRevision: 4.5 }),
+            'nickname',
+            'read_only_field',
+        );
+
+        expect(fieldsOf(verdict).sort()).toEqual(['expectedRevision', 'nickname', 'timeZone']);
+    });
+
+    // AAP 0.5.2 puts FIELD validation before any Prisma work too, not only the
+    // envelope's. These are the cases that distinguish a preflight that checks
+    // the wrapper from one that checks the request: every value below is
+    // refusable from the request alone, so none of them may reach the database.
+
+    it('refuses an unknown goal and an out-of-range pace with no database call', async () => {
+        const verdict = await expectRefusedBeforeIo(
+            () => saveSetupStep(USER_ID, 'goal', stepBody({ goal: 'shrink', paceLbPerWeek: 9 })),
+            'goal',
+            'unknown_value',
+        );
+
+        // Both controls in one answer, which is what the screen shows at once.
+        expect(fieldsOf(verdict)).toEqual(['goal', 'paceLbPerWeek']);
+    });
+
+    it.each([
+        ['activity', { activityLevel: 'sprinting' }, 'activityLevel', 'unknown_value'],
+        ['diet', { diet: 'carnivore', allergens: [] }, 'diet', 'unknown_value'],
+        ['diet', { diet: 'none', allergens: ['none', 'milk'] }, 'allergens', 'mutually_exclusive'],
+        ['cooking', { cookingTimeLimitMin: 37, noBudgetPreference: true }, 'cookingTimeLimitMin', 'unknown_value'],
+    ])('refuses the %s step field %s before any I/O', async (step, body, field, code) => {
+        await expectRefusedBeforeIo(
+            () => saveSetupStep(USER_ID, step, { ...body, timeZone: TIME_ZONE, expectedRevision: 1 }),
+            field,
+            code,
+        );
+    });
+
+    it.each([
+        [{ diet: 'carnivore' }, 'diet', 'unknown_value'],
+        [{ age: 7 }, 'age', 'below_minimum'],
+        [{ activityLevel: 'sprinting' }, 'activityLevel', 'unknown_value'],
+        [{ cookingTimeLimitMin: 37 }, 'cookingTimeLimitMin', 'unknown_value'],
+    ])('refuses the full-save value %p before any I/O', async (edit, field, code) => {
+        await expectRefusedBeforeIo(() => savePreferences(USER_ID, updateBody(edit)), field, code);
+    });
+
+    it('answers an envelope problem and a field problem together, before any I/O', async () => {
+        // The mixed case. A verdict naming only the zone here would send the
+        // screen back for the diet on a second round trip.
+        const verdict = await expectRefusedBeforeIo(
+            () => savePreferences(USER_ID, { diet: 'carnivore', expectedRevision: 1 }),
+            'diet',
+            'unknown_value',
+        );
+
+        expect(fieldsOf(verdict)).toEqual(['diet', 'timeZone']);
+    });
+
+    it('reads the row for a body whose other half is stored, rather than answer short', async () => {
+        // `goal: 'lose'` with no pace is judged against the STORED pace, so the
+        // request stage cannot produce the complete answer and must not produce
+        // a partial one — it yields, and the row-backed parse answers.
+        expect(
+            await expectReachesDatabase(() =>
+                savePreferences(USER_ID, updateBody({ goal: 'lose', diet: 'carnivore' })),
+            ),
+        ).toBe('meal_plan_preferences.findUnique');
+    });
+
+    it('lets a well-formed step save reach the database', async () => {
+        expect(await expectReachesDatabase(() => saveSetupStep(USER_ID, 'goal', stepBody()))).toBe(
+            'meal_plan_preferences.findUnique',
+        );
+    });
+
+    it('lets a well-formed full save reach the database', async () => {
+        expect(await expectReachesDatabase(() => savePreferences(USER_ID, updateBody()))).toBe(
+            'meal_plan_preferences.findUnique',
+        );
     });
 });
 

@@ -38,11 +38,16 @@
  * Who calls what:
  *
  *   withMealPlanningTransaction — every service that writes through this
- *     ledger, to OPEN the transaction. It is the sanctioned source of the
- *     client the functions below accept: their parameter type refuses the
- *     global Prisma client, because on an autocommit client the lock and the
+ *     ledger, to OPEN the transaction, AND every service that needs only the
+ *     per-user lock (the revisioned preference and target saves, and the
+ *     state-setting grocery writes). It is the sanctioned source of the client
+ *     the functions below accept: their parameter type refuses the global
+ *     Prisma client, because on an autocommit client the lock and the
  *     reservation would each commit alone and none of the guarantees above
- *     would hold.
+ *     would hold. The same branded type is what a multi-write helper inside
+ *     one of those services asks for when it must run under the lock —
+ *     `MealPlanningTransactionClient` is the only way a signature can say
+ *     "an open interactive transaction, never the global client".
  *   runKeyedAction — exactly three services: `mealPlan.service.ts` (generate,
  *     regenerate), `swap.service.ts` (commit), `plannedMealLog.service.ts`
  *     (log). There are deliberately no per-action wrappers: four thin wrappers
@@ -242,19 +247,29 @@ export type KeyedActionCompletion<TAction extends KeyedActionType = KeyedActionT
  * `unknown` and this module propagates that rather than asserting a shape it
  * did not verify. The controller only forwards it.
  *
- * **The two attempts agree by VALUE, and the paths they take are why they
- * cannot agree byte for byte.** A fresh action answers from the body held in
- * memory ({@link runKeyedAction} returns what `shapeStoredResponse` froze); only
- * a replay reads `meal_plan_actions.response_snapshot` back, and that column is
- * `jsonb`, which has normalised the object's key order at rest. So `status` and
- * `planRevisionAfter` are exactly equal across attempts and every value in the
- * body is preserved exactly, while the body's serialised key order may differ —
- * invisible to a JSON client, and the reason anything comparing the two must
- * compare parsed bodies rather than JSON text. `readStoredResponse` in
- * `mealPlanningAction.logic.ts` states that contract in full; storing the
- * snapshot in a `json` column instead would be the only way to make the texts
- * identical, and §0.5.1 asks for an indistinguishable response, not identical
- * bytes.
+ * **The two attempts agree on the status, on the revision, and on the BYTES the
+ * body serialises to.** They reach the body by different routes — a fresh action
+ * answers from memory ({@link runKeyedAction} returns what `shapeStoredResponse`
+ * froze), while only a replay reads `meal_plan_actions.response_snapshot` back —
+ * and what makes the two routes agree is that both serialise a CANONICALLY
+ * ORDERED value. `shapeStoredResponse` stores the body with its object keys
+ * already in the order `jsonb` would impose (UTF-8 byte length, then bytes), so
+ * the column holds the same key order it was given, and `readStoredResponse`
+ * hands that order straight back. `JSON.stringify` of a replayed body therefore
+ * equals `JSON.stringify` of the first one exactly, which is §0.9.2's
+ * "byte-for-byte" read literally rather than approximated — no `json`-column
+ * change and no schema change was needed to get there.
+ *
+ * Two things ride on that and are worth knowing before touching either
+ * function. A body carrying a value with no faithful JSON representation — a
+ * non-finite number, a `Date` or a Prisma `Decimal` a mapper forgot to convert,
+ * a `bigint`, a cycle — is REFUSED by `canonicalizeResponseBody` rather than
+ * written in a form the replay could not reproduce, so the transaction rolls
+ * back and the key stays retryable. And a key whose value is `undefined` is
+ * dropped on the way in, exactly as `JSON.stringify` drops it, so the stored
+ * text and the served text cannot disagree about whether the field was there.
+ * `readStoredResponse` in `mealPlanningAction.logic.ts` states the whole
+ * contract.
  *
  * `planRevisionAfter` is a plain `number` in both directions. A fresh action
  * knows the revision it produced, and a replay is only ever answered from a row
@@ -340,8 +355,10 @@ const toActionRecord = (row: MealPlanningActionRow): MealPlanningActionRecord =>
  * The response DTOs in `types/mealPlanning.ts` are interfaces, and a TypeScript
  * interface has no implicit index signature, so it is not structurally
  * assignable to `Prisma.InputJsonValue` however JSON-safe its members are.
- * `shapeStoredResponse` has already tied the body to its action type, so the
- * value is checked before it reaches here; this only restates it for the column.
+ * `shapeStoredResponse` has already tied the body to its action type AND walked
+ * it through `canonicalizeResponseBody`, which refuses anything a JSON column
+ * cannot hold faithfully — so by the time a value reaches here it is plain JSON
+ * data in the column's own key order, and this only restates that for Prisma.
  */
 const asJsonColumnValue = (body: KeyedActionResponseBody): Prisma.InputJsonValue =>
     body as unknown as Prisma.InputJsonValue;
@@ -483,10 +500,10 @@ const readReservedAction = async (
  *
  * The stored status and body are returned unchanged — never re-derived from the
  * action type — so every replay of a committed action answers with the same
- * status, revision and values as every other. (`jsonb` normalises key order at
- * rest, so assert on the value rather than on the serialized text; see
- * {@link KeyedActionResult}.) A row's age is never consulted: rows are kept
- * indefinitely and a committed action replays for as long as its row exists.
+ * status, the same revision and a body that serialises to the same bytes as
+ * every other, the first response included (see {@link KeyedActionResult}). A
+ * row's age is never consulted: rows are kept indefinitely and a committed
+ * action replays for as long as its row exists.
  *
  * Two abnormal shapes are reported rather than answered. A PENDING row is
  * handled below; a HALF-COMPLETED one raises `ActionLedgerIntegrityError` out
@@ -711,10 +728,12 @@ export const runKeyedAction = async <TAction extends KeyedActionType>(
 
         await completeAction(lockedTx, reservation, response, completion);
 
-        // The stored values, so the first response and every later replay of it
-        // carry the same status, revision and body values. This is the in-memory
-        // body — the column is read only on the replay path, which is the
-        // asymmetry KeyedActionResult describes.
+        // The stored values, never the caller's own object, so the first
+        // response serialises from the same canonically ordered value the column
+        // now holds. That is the half of the byte guarantee that lives on this
+        // path: the replay path reads the column back, and the two texts can
+        // only agree if this one answers from what was frozen (see
+        // KeyedActionResult).
         return {
             status: response.responseStatus,
             body: response.responseSnapshot,

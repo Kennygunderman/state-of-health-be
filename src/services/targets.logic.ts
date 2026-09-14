@@ -263,6 +263,32 @@ export interface EstimateInputsRow {
     activity_level: string | null;
 }
 
+/**
+ * Everything {@link resolveEstimateInputs} needs to decide whether an estimate
+ * may be produced AT ALL: the seven measurements above, plus the route the user
+ * is actually on.
+ *
+ * THE ROUTE IS NOT OPTIONAL, and that is the point of the separate interface.
+ * `target_route` is server-owned and written by exactly one thing — a body-step
+ * save resolving it (AAP §0.5.2) — and it has two entrances to `'manual'`:
+ * "Prefer not to say", which sends a COMPLETE set of measurements, and Skip,
+ * which sends none and DELIBERATELY LEAVES THE PREVIOUS ONES IN PLACE. So a
+ * row on the manual route can satisfy every measurement check while the user
+ * has explicitly asked to type their own numbers, and an availability rule that
+ * reads only the measurements will calculate — and then confirm — an estimate
+ * they never asked for. Requiring the column here means that rule cannot be
+ * evaluated without it.
+ *
+ * It is deliberately NOT a member of {@link EstimateInputsRow}: that interface
+ * is the key space of {@link ESTIMATE_INPUT_COLUMNS} and the argument shape of
+ * {@link estimateInputsChanged}, which is about which answers move the
+ * EQUATION. The route moves no term in the equation; it decides whether the
+ * equation is asked at all.
+ */
+export interface EstimateAvailabilityRow extends EstimateInputsRow {
+    target_route: string | null;
+}
+
 /** The four `users` columns that hold the confirmed targets. */
 export interface TargetsUserRow {
     target_calories: number | null;
@@ -277,25 +303,29 @@ export interface TargetsUserRow {
  * `confirmed_targets` is `unknown` because the column is `Json?`: it is data
  * this module must inspect defensively, never a shape it may assume.
  *
- * THE ALL-PURPOSE `revision` COLUMN IS DELIBERATELY NOT HERE. It advances on
- * every preference save, so anything that compared against it would report a
- * confirmed estimate as stale after a diet, allergy, dislike, schedule, budget,
- * review-date or time-zone edit. Staleness is the inequality of the two
- * ESTIMATE-INPUT counters below, and leaving `revision` out of the shape this
- * read accepts is what stops that comparison being written again by accident —
- * `deriveTargetsResponse` cannot reach a column it is never given. The revision
- * that pins an estimate's inputs for `PUT /meal-planning/targets`
- * (`estimateRevision`, AAP §0.5.2) is a separate concern and is read by
- * `targets.service.ts` straight from the row.
+ * TWO REVISIONS ARE HERE AND THEY ARE NOT INTERCHANGEABLE. `targets_revision`
+ * is the optimistic-concurrency token for the targets RECORD — what a client
+ * pins on `PUT /meal-planning/targets` and what `TargetsResponse.revision`
+ * reports. `revision` is the PREFERENCES counter, which advances on every
+ * preference save, and it is the one staleness is judged against: AAP §0.5.2
+ * defines `stale` as `targets_input_revision ≠ preferences.revision`, and
+ * §0.5.1 defines `targets_input_revision` as "the `revision` whose
+ * goal/body/activity/pace produced the confirmed estimate". So the pair is a
+ * single ancestry check — the preferences revision the confirmed figure was
+ * computed at, against the preferences revision the row is at now — and both
+ * halves must read the same counter or a confirmed estimate can claim an
+ * ancestry it does not have. `estimateRevision` on the save envelope pins the
+ * same `revision`, which is why the number recorded here and the number the
+ * wire check compares are one and the same.
  */
 export interface TargetsPreferencesRow {
     target_source: string | null;
     targets_revision: number;
     confirmed_targets: unknown;
-    /** The `estimate_inputs_revision` the confirmed estimate was computed at. */
+    /** The preferences `revision` the confirmed estimate was computed at. */
     targets_input_revision: number | null;
-    /** Advanced only by a real change to one of {@link ESTIMATE_INPUT_COLUMNS}. */
-    estimate_inputs_revision: number;
+    /** The preferences counter, advanced by every preference save. */
+    revision: number;
 }
 
 /**
@@ -515,8 +545,29 @@ const asRecord = (value: unknown): Record<string, unknown> | null =>
  *
  * 'prefer_not_to_say' is checked first and reported as itself. It is an
  * intentional answer that routes the user to manual entry, so it must not be
- * masked by an unrelated gap such as a missing height — the two reasons lead to
- * the same screen but only one of them is the user's own choice.
+ * masked by an unrelated gap such as a missing height — or by the manual route
+ * that same answer put the user on — because the two reasons lead to the same
+ * screen but only one of them is the user's own choice.
+ *
+ * THE PERSISTED ROUTE IS THEN DECISIVE, whatever the measurements say. A
+ * `target_route` of 'manual' is the user having chosen to type their own
+ * numbers, and the row can still carry a complete set of measurements when they
+ * chose it: Skip sends no measurements and leaves the previous ones in place
+ * (AAP §0.5.2's `{skipped: true}` body payload), so "the columns are all
+ * populated" says nothing about whether an estimate was asked for. Reading the
+ * measurements alone is how a user who pressed Skip would be shown — and, on
+ * `PUT /meal-planning/targets`, have CONFIRMED — a calculated figure they
+ * declined. The reason is `missing_inputs` rather than a route-specific code,
+ * because the wire vocabulary has exactly two reasons (§0.5.2) and both send
+ * the client to the same manual-entry screen; `prefer_not_to_say` is reserved
+ * for the answer itself, which the check above has already reported.
+ *
+ * A route column that is neither 'manual' nor 'estimated' and not null is a
+ * corrupt row — the only writer sets one of the two — and is refused for the
+ * same reason an out-of-envelope measurement is: we cannot tell which route the
+ * user is on, so we must not calculate one for them. A NULL route is the body
+ * step being unanswered, which is not a refusal in itself; the measurement
+ * checks below then decide, and they refuse an unanswered body step anyway.
  *
  * An input outside the supported envelope is reported as unusable rather than
  * clamped into range: `preferences.logic.ts` rejects such a value with a 400 at
@@ -528,9 +579,13 @@ const asRecord = (value: unknown): Record<string, unknown> | null =>
  * maintenance would show a maintenance target on a weight-loss plan, which is
  * the one failure this check exists to prevent.
  */
-export const resolveEstimateInputs = (row: EstimateInputsRow): ResolvedEstimateInputs => {
+export const resolveEstimateInputs = (row: EstimateAvailabilityRow): ResolvedEstimateInputs => {
     if (row.sex_for_estimate === 'prefer_not_to_say') {
         return { kind: 'unavailable', reason: 'prefer_not_to_say' };
+    }
+
+    if (row.target_route !== null && row.target_route !== 'estimated') {
+        return { kind: 'unavailable', reason: 'missing_inputs' };
     }
 
     if (!isCalculableSex(row.sex_for_estimate) || !isActivityLevel(row.activity_level) || !isGoal(row.goal)) {
@@ -629,21 +684,23 @@ export const computeTargetEstimate = (
  * ------------------------------------------------------------------------- */
 
 /**
- * The seven stored answers the energy equation reads — and therefore the
- * complete set whose change can make a confirmed estimate stale.
+ * The seven stored answers the energy equation reads — the complete set whose
+ * change moves the figure {@link computeTargetEstimate} produces.
  *
  * Typed as keys of {@link EstimateInputsRow}, so a column added to that shape
  * stops this list compiling until it has been classified. The alternative is a
- * silent omission, and an omitted input is one whose change never flips
- * `stale`: a confirmed estimate presented as fresh against details that no
- * longer produce it.
+ * silent omission, and an omitted input is one whose change is never recorded
+ * as a change of the user's calculable details.
  *
  * `goal_weight_kg` IS DELIBERATELY ABSENT, and it is not an oversight. It is a
  * destination the user typed, not a term in the equation — `calculateBmr` reads
  * weight, height, age and sex, `calculateTdee` the activity level, and
  * `calculateGoalAdjustment` the goal and the pace; nothing reads the goal
- * weight. Changing "I'd like to reach 170 lb" moves no target, so it must not
- * ask the user to recalculate one.
+ * weight. Changing "I'd like to reach 170 lb" moves no target.
+ *
+ * `target_route` is absent for the same reason and a stronger one: it decides
+ * whether the equation is evaluated at all rather than what it evaluates to,
+ * which is why it lives on {@link EstimateAvailabilityRow} instead.
  */
 export const ESTIMATE_INPUT_COLUMNS: readonly (keyof EstimateInputsRow)[] = [
     'goal',
@@ -659,22 +716,26 @@ export const ESTIMATE_INPUT_COLUMNS: readonly (keyof EstimateInputsRow)[] = [
  * Whether a pending column write actually changes one of the estimate's inputs.
  *
  * This is the rule behind `meal_plan_preferences.estimate_inputs_revision`, the
- * counter `TargetsResponse.stale` is derived from, and it exists because the
- * all-purpose `revision` column cannot answer the question: `revision` advances
- * on EVERY preference save, so comparing against it reports a confirmed
- * estimate as stale after a diet, allergy, dislike, schedule, budget,
- * review-date, unit-preference or time-zone edit and asks the user to
- * recalculate a number nothing has moved.
+ * write-side counter `preferences.service.ts` maintains: it advances only where
+ * a save moves one of the seven answers the energy equation actually reads, so
+ * the column records "when did this user's calculable details last change?".
+ *
+ * IT IS NOT `TargetsResponse.stale`, and must not be made to be. Staleness is
+ * the ancestry check AAP §0.5.2 defines — `targets_input_revision` against
+ * `preferences.revision` — and {@link deriveTargetsResponse} is not even given
+ * this counter, so the two cannot be conflated by editing one of them. What
+ * this rule is good for is diagnosing the difference between the two questions
+ * ("did anything change?" versus "did a term of the equation change?") without
+ * either answer being inferred from the other.
  *
  * `writes` is the patch a save is about to apply, read in PRISMA'S OWN
  * SEMANTICS so that this rule and the statement it guards cannot disagree: a
  * key that is absent or `undefined` is not being written and is ignored, while
  * an explicit `null` is a clear and counts as a change when a value was stored.
  *
- * EQUALITY, NOT MENTION. Re-saving the body step with the same measurements is
- * not a change, because the user's details still produce the confirmed figure
- * and there is nothing to recalculate. Keying this off which step was saved
- * instead would flip `stale` on every revisit of a wizard screen.
+ * EQUALITY, NOT MENTION. Re-saving the body step with the same measurements
+ * moves no input, so the counter stands still. Keying this off which step was
+ * saved instead would advance it on every revisit of a wizard screen.
  *
  * `current === null` is the row's creation: writing an input then is a change
  * (there was no answer before it), writing an explicit null is not.
@@ -1166,16 +1227,21 @@ const resolveTargetSource = (
  *    says nothing about them — and `legacy` needs no staleness because those
  *    surfaces already treat it as "review your targets".
  *
- *    ONLY THE ESTIMATE'S OWN INPUTS COUNT, which is why the comparison is
- *    between `targets_input_revision` (the `estimate_inputs_revision` the
- *    confirmed figure was computed at) and the CURRENT
- *    `estimate_inputs_revision` — a counter `preferences.service.ts` advances
- *    only when one of {@link ESTIMATE_INPUT_COLUMNS} actually changes value.
- *    Comparing against the all-purpose `revision` instead would mark a
- *    confirmed estimate stale after a diet, allergy, dislike, schedule, budget,
- *    review-date, unit-preference or time-zone edit, and send the user to
- *    recalculate a figure that none of those edits can move; `revision` is
- *    therefore not even a member of {@link TargetsPreferencesRow}.
+ *    THE COMPARISON IS AN ANCESTRY CHECK ON THE PREFERENCES REVISION, exactly
+ *    as AAP §0.5.2 defines it: `targets_input_revision ≠ preferences.revision`.
+ *    `targets_input_revision` is the preferences `revision` the confirmed
+ *    figure was computed at (§0.5.1), and `revision` is where the row stands
+ *    now, so the flag answers "was this figure derived from the answers this
+ *    user currently has on file?" — one counter, recorded by the canonical
+ *    writer and advanced by every preference save. It is deliberately the SAME
+ *    number `estimateRevision` pins on the save envelope, so the revision a
+ *    client confirmed against is the revision stored as the ancestry.
+ *
+ *    A narrower counter that moved only when a term of the equation changed
+ *    would answer a different and more flattering question, and it is not the
+ *    contract: two surfaces read this flag as "review your targets", and the
+ *    §0.5.2 rule is what they were specified against. Nothing recalculates
+ *    either way — `stale` offers a recalculation, it never performs one.
  *  - `revision` is the targets counter, and 0 when there is no preferences row.
  */
 export const deriveTargetsResponse = (
@@ -1211,7 +1277,7 @@ export const deriveTargetsResponse = (
     const stale =
         source === 'estimated' &&
         preferencesRow !== null &&
-        preferencesRow.targets_input_revision !== preferencesRow.estimate_inputs_revision;
+        preferencesRow.targets_input_revision !== preferencesRow.revision;
 
     return {
         targets: values,

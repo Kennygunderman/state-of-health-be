@@ -21,11 +21,19 @@
  *  - a status re-derived at read time would retroactively rewrite what an
  *    already-stored action replays, so the read-back is checked with a status
  *    no derivation would ever produce;
- *  - a replay asserted as identical JSON TEXT would fail against correct code,
- *    because `response_snapshot` is a `jsonb` column and PostgreSQL reorders an
- *    object's keys at rest, so the equality the ledger really guarantees — a
- *    deep-equal body, an exactly equal status and revision — is pinned in that
- *    form and the textual difference is pinned with it.
+ *  - a replay that returned the same VALUES in a different key order would
+ *    break §0.9.2's byte-for-byte requirement, so `canonicalizeResponseBody` is
+ *    pinned key by key against the order PostgreSQL's `jsonb` measurably uses,
+ *    and the replay is asserted as identical serialised TEXT — from a freshly
+ *    stored row and from a row whose snapshot arrived in a non-canonical order,
+ *    which is what a row written by an earlier build yields.
+ *
+ * The one thing this suite cannot do is read the column itself. The actual
+ * persistence — one committed `meal_plan_actions` row, its stored status and
+ * revision, `response_snapshot::text` out of real PostgreSQL, and a second
+ * attempt that replays it without re-running the work — is proven against a
+ * live database in `src/__tests__/api/compat.test.ts`, so nothing here stands
+ * in for the database with a model of it.
  */
 
 import type { Prisma, PrismaClient } from '../../generated/prisma';
@@ -51,6 +59,7 @@ import {
     assertInteractiveTransactionClient,
     buildRequestFingerprint,
     canonicalizeRequestBody,
+    canonicalizeResponseBody,
     classifyActionCompletion,
     decideReplay,
     diagnoseTransactionClient,
@@ -710,12 +719,18 @@ describe('shapeStoredResponse', () => {
         expect(shapeStoredResponse('swap', swapBody, 5).responseStatus).toBe(200);
     });
 
-    it('stores the body unchanged and beside the revision the action produced', () => {
+    it('stores the body\'s every value beside the revision the action produced', () => {
         expect(shapeStoredResponse('swap', swapBody, 5)).toEqual({
             responseStatus: 200,
             responseSnapshot: swapBody,
             planRevisionAfter: 5,
         });
+        // The stored snapshot is a canonical COPY, not the caller's object: the
+        // key order it carries is the one the `jsonb` column imposes, which is
+        // what makes the first response and every replay of it serialise to the
+        // same bytes. Mutating the caller's body afterwards therefore cannot
+        // reach the ledger row.
+        expect(shapeStoredResponse('swap', swapBody, 5).responseSnapshot).not.toBe(swapBody);
     });
 
     it('refuses a revision that is not a non-negative integer', () => {
@@ -848,12 +863,14 @@ describe('readStoredResponse', () => {
         const stored = shapeStoredResponse('log', logBody, 6);
 
         expect(readStoredResponse(stored)).toEqual({ status: 201, body: logBody, planRevisionAfter: 6 });
-        // The stored body itself, not a copy of it, which is what makes a
-        // replay indistinguishable from the original response.
-        expect(readStoredResponse(stored)?.body).toBe(logBody);
+        // Byte equality, not object identity: the body is stored canonicalised
+        // and read back canonicalised, so what a replay serialises is
+        // indistinguishable from the first response without being the same
+        // object — which is exactly what survives the `jsonb` column.
+        expect(JSON.stringify(readStoredResponse(stored)?.body)).toBe(JSON.stringify(stored.responseSnapshot));
     });
 
-    it('passes a nested plan snapshot through untouched — the caller\'s own object, not a copy of it', () => {
+    it('passes a nested plan snapshot through with every value intact and the caller\'s object unmodified', () => {
         const nested = {
             id: 'plan-1',
             revision: 2,
@@ -865,21 +882,23 @@ describe('readStoredResponse', () => {
                 },
             ],
         } as unknown as MealPlanResponse;
+        const asWritten = JSON.stringify(nested);
 
         const stored = shapeStoredResponse('generate', nested, 3);
         const replayed = readStoredResponse(stored);
 
-        // Identity, not serialised text. This layer is a pass-through — the body
-        // is stored by reference and read back by reference — so `toBe` pins the
-        // whole of what it guarantees at once: no copy, no re-derivation, and no
-        // rounding drift, which is what keeps the two-decimal rounding the
-        // fingerprint applies to a REQUEST out of a stored response. A
-        // JSON-text comparison here would compare one object with itself and
-        // prove none of that; run through the real `jsonb` column it would fail
-        // on key order alone, which is the contract pinned further down.
-        expect(stored.responseSnapshot).toBe(nested);
-        expect(replayed?.body).toBe(nested);
+        // Values, not identity. The stored snapshot is a canonical copy, so the
+        // assertions that matter are that nothing was re-derived, rounded or
+        // dropped on the way in or out — `1905.5`, `142.25`, `1.25` and `610.4`
+        // are exactly the values a REQUEST's two-decimal fingerprint token
+        // would have rewritten, and a stored response is reproduced rather than
+        // renormalised. The caller's own object is left as it was: the copy is
+        // what the ledger holds, so a later mutation of `nested` cannot reach
+        // the row.
+        expect(replayed?.body).toEqual(nested);
         expect(replayed?.planRevisionAfter).toBe(3);
+        expect(JSON.stringify(nested)).toBe(asWritten);
+        expect(stored.responseSnapshot).not.toBe(nested);
     });
 
     it('replays a generate row, which records a plan id and no diary entry', () => {
@@ -951,68 +970,305 @@ describe('readStoredResponse', () => {
     });
 });
 
+describe('canonicalizeResponseBody', () => {
+    describe('the key order it imposes', () => {
+        it('orders keys by UTF-8 byte length, then by bytes — the order jsonb itself uses', () => {
+            // Measured, not assumed: `SELECT '{"ab":1,"é":2,"zzz":3,"b":4}'::jsonb`
+            // on the PostgreSQL 16 this service runs against returns
+            // `b, ab, é, zzz`. `é` is ONE JavaScript character and TWO UTF-8
+            // bytes, so a `String.prototype.length` ordering would have put it
+            // first and the stored text would then disagree with the served
+            // text — the single failure that would make the byte guarantee
+            // false for any body carrying a non-ASCII key.
+            const canonical = canonicalizeResponseBody({ ab: 1, 'é': 2, zzz: 3, b: 4 });
+
+            expect(Object.keys(canonical)).toEqual(['b', 'ab', 'é', 'zzz']);
+        });
+
+        it('orders every nesting level, not just the top one', () => {
+            const canonical = canonicalizeResponseBody({
+                revision: 1,
+                id: 'plan-1',
+                targets: { calories: 1940, protein: 146, fat: 65.5 },
+            });
+
+            expect(Object.keys(canonical)).toEqual(['id', 'targets', 'revision']);
+            expect(Object.keys(canonical.targets)).toEqual(['fat', 'protein', 'calories']);
+        });
+
+        it('leaves array order alone, because order is meaning in an array', () => {
+            // The plan's days are in date order and its meals in slot order, so
+            // an ordering applied to an array would rewrite the response rather
+            // than normalise it.
+            const canonical = canonicalizeResponseBody({
+                days: ['2026-07-06', '2026-07-05', '2026-07-04'],
+                meals: [{ slot: 'dinner' }, { slot: 'breakfast' }],
+            });
+
+            expect(canonical.days).toEqual(['2026-07-06', '2026-07-05', '2026-07-04']);
+            expect(canonical.meals.map((meal) => meal.slot)).toEqual(['dinner', 'breakfast']);
+        });
+
+        it('is IDEMPOTENT, which is what lets it run on both the write and the read path', () => {
+            // `shapeStoredResponse` canonicalises on the way in and
+            // `readStoredResponse` canonicalises on the way out. If the second
+            // pass could move a key, a row written by this build would replay
+            // in a different order than it was served in.
+            const once = canonicalizeResponseBody({
+                revision: 2,
+                id: 'plan-1',
+                days: [{ meals: [{ planned: { protein: 45, calories: 610.4 } }], date: '2026-07-05' }],
+            });
+            const twice = canonicalizeResponseBody(once);
+
+            expect(JSON.stringify(twice)).toBe(JSON.stringify(once));
+        });
+
+        it('returns a deep copy, leaving the caller\'s own body unmodified', () => {
+            const body = { revision: 1, id: 'plan-1', targets: { protein: 146, calories: 1940 } };
+            const asWritten = JSON.stringify(body);
+
+            const canonical = canonicalizeResponseBody(body);
+
+            expect(JSON.stringify(body)).toBe(asWritten);
+            expect(canonical).not.toBe(body);
+            expect(canonical.targets).not.toBe(body.targets);
+        });
+    });
+
+    describe('the values it reproduces', () => {
+        it('reproduces every scalar class exactly, with no rounding', () => {
+            // The two-decimal token the FINGERPRINT applies is a request rule.
+            // Applying it here would rewrite the numbers the client is owed, so
+            // `610.4` and `65.5` are asserted unchanged alongside
+            // Number.MAX_SAFE_INTEGER + 1 and an astral-plane emoji.
+            const canonical = canonicalizeResponseBody({
+                fat: 65.5,
+                calories: 610.4,
+                big: 9007199254740992,
+                nothing: null,
+                note: 'café — crème brûlée 🥗',
+                isLocked: false,
+                wasRegenerated: true,
+                zero: 0,
+                empty: '',
+            });
+
+            expect(canonical).toEqual({
+                fat: 65.5,
+                calories: 610.4,
+                big: 9007199254740992,
+                nothing: null,
+                note: 'café — crème brûlée 🥗',
+                isLocked: false,
+                wasRegenerated: true,
+                zero: 0,
+                empty: '',
+            });
+        });
+
+        it('returns a primitive body as it is', () => {
+            expect(canonicalizeResponseBody(0)).toBe(0);
+            expect(canonicalizeResponseBody('')).toBe('');
+            expect(canonicalizeResponseBody(false)).toBe(false);
+            expect(canonicalizeResponseBody(null)).toBeNull();
+        });
+
+        it('drops a key whose value is undefined, exactly as JSON.stringify drops it', () => {
+            // The stored text and the served text must not be able to disagree
+            // about whether the field was there: `JSON.stringify` omits such a
+            // key, so a column holding it would replay a field the first
+            // response never sent.
+            const body = { id: 'plan-1', note: undefined, revision: 1 };
+
+            const canonical = canonicalizeResponseBody(body);
+
+            expect(Object.keys(canonical)).toEqual(['id', 'revision']);
+            expect(JSON.stringify(canonical)).toBe(JSON.stringify(canonicalizeResponseBody({ id: 'plan-1', revision: 1 })));
+        });
+
+        it('renders an undefined array element as the null JSON.stringify renders it', () => {
+            // An array's length is part of its value — dropping the element
+            // would shift every index after it — so it becomes the `null` the
+            // column will hold.
+            const canonical = canonicalizeResponseBody({ days: ['2026-07-05', undefined, '2026-07-07'] });
+
+            expect(canonical.days).toEqual(['2026-07-05', null, '2026-07-07']);
+            expect(JSON.stringify(canonical)).toBe('{"days":["2026-07-05",null,"2026-07-07"]}');
+        });
+    });
+
+    describe('what it refuses, naming the path', () => {
+        // Each of these would make the byte guarantee silently false: the value
+        // in memory and the value the column can hold would differ, so the
+        // first response and its replay would serialise differently. Refusing
+        // rolls the transaction back and leaves the key retryable, which is the
+        // honest outcome — and the message names the field so the mapper that
+        // produced it is found without a debugger.
+        it('refuses a non-finite number', () => {
+            expect(() =>
+                canonicalizeResponseBody({ days: [{ planned: { calories: Number.POSITIVE_INFINITY } }] }),
+            ).toThrow(TypeError);
+            expect(() =>
+                canonicalizeResponseBody({ days: [{ planned: { calories: Number.POSITIVE_INFINITY } }] }),
+            ).toThrow('$.days[0].planned.calories is Infinity');
+            expect(() => canonicalizeResponseBody({ planRevision: Number.NaN })).toThrow(
+                '$.planRevision is NaN',
+            );
+        });
+
+        it('refuses a bigint', () => {
+            expect(() => canonicalizeResponseBody({ revision: BigInt(2) })).toThrow(TypeError);
+            expect(() => canonicalizeResponseBody({ revision: BigInt(2) })).toThrow('$.revision is a bigint');
+        });
+
+        it('refuses a function and a symbol, which JSON.stringify would silently drop', () => {
+            expect(() => canonicalizeResponseBody({ onDone: () => undefined })).toThrow('$.onDone is a function');
+            expect(() => canonicalizeResponseBody({ marker: Symbol('plan') })).toThrow('$.marker is a symbol');
+        });
+
+        it('refuses a Date, a Map and a class instance a mapper failed to convert', () => {
+            // The one realistic case: `@db.Date` columns and `NUMERIC` columns
+            // arrive from Prisma as `Date` and `Decimal`, and the mappers
+            // convert both (`toDayKey`, `decimalToNumber`). A mapper that
+            // stopped doing so is caught here rather than at the column.
+            expect(() => canonicalizeResponseBody({ entry: { loggedAt: new Date('2026-07-05T12:00:00.000Z') } })).toThrow(
+                '$.entry.loggedAt is a Date instance',
+            );
+            expect(() => canonicalizeResponseBody({ items: new Map([['milk', 1]]) })).toThrow(
+                '$.items is a Map instance',
+            );
+            expect(() => canonicalizeResponseBody({ slots: new Set(['lunch']) })).toThrow('$.slots is a Set instance');
+        });
+
+        it('still names a non-plain object that has no constructor', () => {
+            // An object whose prototype is itself prototype-less is neither
+            // plain nor constructor-bearing, the same edge
+            // `canonicalizeRequestBody` handles: the message must degrade
+            // rather than throw a second error while reporting the first.
+            const exotic = Object.create(Object.create(null)) as object;
+
+            expect(() => canonicalizeResponseBody({ meal: exotic })).toThrow('$.meal is a non-plain instance');
+        });
+
+        it('refuses a cycle', () => {
+            interface CyclicDay {
+                date: string;
+                plan?: unknown;
+            }
+            const cyclic: { id: string; days: CyclicDay[] } = {
+                id: 'plan-1',
+                days: [{ date: '2026-07-05' }],
+            };
+            cyclic.days[0].plan = cyclic;
+
+            expect(() => canonicalizeResponseBody(cyclic)).toThrow(TypeError);
+            expect(() => canonicalizeResponseBody(cyclic)).toThrow('$.days[0].plan is a circular reference');
+        });
+
+        it('accepts the same object referenced twice, which is not a cycle', () => {
+            const shared = { calories: 610.4, protein: 45 };
+            const canonical = canonicalizeResponseBody({ lunch: shared, dinner: shared });
+
+            expect(canonical).toEqual({ lunch: shared, dinner: shared });
+        });
+
+        it('refuses an undefined body, which Prisma would store as "leave the column alone"', () => {
+            // Not a theoretical refusal: `undefined` in a Prisma `data` block
+            // means "do not set this column", so the completion would fill the
+            // status and the revision and leave `response_snapshot` NULL —
+            // exactly the half-completed row `classifyActionCompletion` calls
+            // corrupt and `readStoredResponse` refuses to answer from.
+            expect(() => canonicalizeResponseBody(undefined)).toThrow(TypeError);
+            expect(() => canonicalizeResponseBody(undefined)).toThrow('$ is undefined');
+        });
+    });
+
+    describe('a key that names an inherited accessor', () => {
+        /**
+         * `__proto__` is ordinary JSON. `JSON.parse` makes it an OWN property,
+         * and `jsonb` stores and orders it like any other key — by the same
+         * byte-length rule, so it sorts after `id` and `revision` rather than
+         * being special-cased. What is not ordinary is copying it: `copy[key] =
+         * value` reaches the inherited `Object.prototype.__proto__` SETTER for
+         * that name, which defines no own property at all. The key would vanish
+         * from the copy and, for an object value, silently become the copy's
+         * prototype — so a boundary that stores and serves the copy would store
+         * and serve a body the caller never sent, and §0.9.2's byte equality
+         * would hold over the wrong bytes. That is why the canonical copy is
+         * built by DEFINING its keys.
+         *
+         * Every body below comes from `JSON.parse`, because that is the only
+         * way the key arrives as own data in production: a literal
+         * `{__proto__: …}` sets the prototype at parse time and never creates
+         * the property these cases are about.
+         */
+        it('keeps it as an own enumerable key carrying its own value', () => {
+            const canonical = canonicalizeResponseBody(
+                JSON.parse('{"__proto__":"kept","id":"plan-1"}') as Record<string, unknown>,
+            );
+
+            expect(Object.keys(canonical)).toEqual(['id', '__proto__']);
+            expect(Object.prototype.hasOwnProperty.call(canonical, '__proto__')).toBe(true);
+            expect(Object.getOwnPropertyDescriptor(canonical, '__proto__')).toEqual({
+                value: 'kept',
+                enumerable: true,
+                writable: true,
+                configurable: true,
+            });
+        });
+
+        it('leaves the copy an ordinary object instead of reparenting it', () => {
+            const canonical = canonicalizeResponseBody(
+                JSON.parse('{"__proto__":{"polluted":true},"ok":1}') as Record<string, unknown>,
+            );
+
+            // The three things the setter would have done, each denied: the
+            // prototype is untouched, the value is not reachable THROUGH the
+            // prototype, and it is still there as data.
+            expect(Object.getPrototypeOf(canonical)).toBe(Object.prototype);
+            expect(canonical.polluted).toBeUndefined();
+            expect(Object.getOwnPropertyDescriptor(canonical, '__proto__')?.value).toEqual({ polluted: true });
+        });
+
+        it('does the same at depth, so a nested one cannot reparent its parent', () => {
+            const canonical = canonicalizeResponseBody(
+                JSON.parse('{"day":{"__proto__":{"polluted":true},"ok":1}}') as {
+                    day: Record<string, unknown>;
+                },
+            );
+
+            expect(Object.keys(canonical.day)).toEqual(['ok', '__proto__']);
+            expect(Object.getPrototypeOf(canonical.day)).toBe(Object.prototype);
+            expect(canonical.day.polluted).toBeUndefined();
+            expect(Object.getOwnPropertyDescriptor(canonical.day, '__proto__')?.value).toEqual({
+                polluted: true,
+            });
+        });
+
+        it('serialises it in jsonb order, so the stored and served bytes still agree', () => {
+            const canonical = canonicalizeResponseBody(
+                JSON.parse('{"__proto__":"kept","id":"plan-1","revision":2}') as Record<string, unknown>,
+            );
+
+            // Exactly the order PostgreSQL returns for these three keys, by
+            // byte length: `id` (2), `revision` (8), `__proto__` (9).
+            expect(JSON.stringify(canonical)).toBe('{"id":"plan-1","revision":2,"__proto__":"kept"}');
+            // And re-canonicalising is still a no-op, so a row written by one
+            // build replays identically through another.
+            expect(JSON.stringify(canonicalizeResponseBody(canonical))).toBe(JSON.stringify(canonical));
+        });
+    });
+
+});
+
 describe('the replay equality contract across the jsonb round trip', () => {
-    /**
-     * Orders two keys the way `jsonb` does: by length first, then by bytes.
-     *
-     * `Buffer` rather than string comparison because the length that orders keys
-     * is the UTF-8 BYTE length. Measured against PostgreSQL 16:
-     * `SELECT '{"ab":1,"é":2,"zzz":3}'::jsonb` returns `ab, é, zzz` — `é` is one
-     * JS character but two bytes, so it ties with `ab` on length and loses on
-     * bytes (`0xC3` > `0x62`).
-     */
-    const jsonbKeyOrder = (left: string, right: string): number => {
-        const leftKey = Buffer.from(left, 'utf8');
-        const rightKey = Buffer.from(right, 'utf8');
-
-        return leftKey.length - rightKey.length || Buffer.compare(leftKey, rightKey);
-    };
-
-    /**
-     * A MODEL of what `meal_plan_actions.response_snapshot` does to a body at
-     * rest — this suite has no database, so the column's one observable effect is
-     * reproduced here rather than measured here.
-     *
-     * PostgreSQL stores a `jsonb` object with its keys sorted, at every nesting
-     * level, and leaves array order untouched. Ground truth for the model, also
-     * measured against PostgreSQL 16: a body whose keys were written
-     * `id, revision, targets{calories, protein, fat}, days, note, big, nothing,
-     * dup` came back as `id, big, dup, days, note, nothing, targets, revision`
-     * with `targets` as `fat, protein, calories` and the `days` array in its
-     * original order. Key order is the ONLY deviation the round trip produces:
-     * `65.5`, `610.4`, `9007199254740992`, `null` and a unicode/emoji string all
-     * came back unchanged, which is why the model reorders and does nothing else.
-     * The body below was also driven through the real ledger against
-     * PostgreSQL 16, and `runKeyedAction`'s replay of it serialised
-     * byte-identically to this model's output — so what follows pins the
-     * ordering rule itself, not an approximation of it.
-     *
-     * The equality of a real committed action's replay is
-     * `src/__tests__/api/concurrency.test.ts`'s to assert against the database;
-     * what is pinned here is the FORM those assertions have to take.
-     */
-    const storeLikeJsonbColumn = (value: unknown): unknown => {
-        if (Array.isArray(value)) {
-            return value.map(storeLikeJsonbColumn);
-        }
-
-        if (value === null || typeof value !== 'object') {
-            return value;
-        }
-
-        const object = value as Record<string, unknown>;
-
-        return Object.fromEntries(
-            Object.keys(object)
-                .sort(jsonbKeyOrder)
-                .map((key) => [key, storeLikeJsonbColumn(object[key])]),
-        );
-    };
-
     /**
      * A first response with differing-length keys at three nesting levels, one
      * of every scalar class a keyed body can hold, and a two-element array whose
-     * order matters.
+     * order matters. The keys are written in the order a mapper assembling a DTO
+     * field by field produces them — which is NOT the order `jsonb` holds them
+     * in, and is the reason the canonical pass exists.
      */
     const firstResponse = {
         id: 'plan-1',
@@ -1029,71 +1285,128 @@ describe('the replay equality contract across the jsonb round trip', () => {
         wasRegenerated: true,
     } as unknown as MealPlanResponse;
 
-    /** The same action, answered from the column instead of from memory. */
+    /**
+     * The key order PostgreSQL 16 reports for the body above, measured rather
+     * than derived: `SELECT string_agg(k, ',') FROM jsonb_object_keys(…)`
+     * returns `id,big,days,note,nothing,targets,isLocked,revision,wasRegenerated`,
+     * with `targets` as `fat,protein,calories` and `planned` as
+     * `protein,calories`. The column's own content is asserted against the real
+     * database in `src/__tests__/api/compat.test.ts`; what is pinned here is
+     * that the production canonicaliser produces that same order with no
+     * database at all.
+     */
+    const COLUMN_KEY_ORDER = [
+        'id',
+        'big',
+        'days',
+        'note',
+        'nothing',
+        'targets',
+        'isLocked',
+        'revision',
+        'wasRegenerated',
+    ];
+
+    /** What the FIRST attempt answers with: exactly what the ledger froze. */
+    const firstAttempt = (): ReturnType<typeof readStoredResponse> => {
+        const stored = shapeStoredResponse('generate', firstResponse, 1);
+
+        return { status: stored.responseStatus, body: stored.responseSnapshot, planRevisionAfter: stored.planRevisionAfter };
+    };
+
+    /**
+     * The same action answered from the column instead of from memory.
+     *
+     * The stored snapshot is already in the column's order, so `jsonb`'s at-rest
+     * reordering is the identity on it and the value read back is the value
+     * stored — which is why this suite can hand `readStoredResponse` the stored
+     * snapshot itself and still be describing the round trip. That equivalence
+     * is not assumed: `compat.test.ts` reads `response_snapshot::text` out of
+     * real PostgreSQL for a committed action and compares it with the served
+     * body.
+     */
     const replayFromColumn = (): ReturnType<typeof readStoredResponse> => {
         const stored = shapeStoredResponse('generate', firstResponse, 1);
 
         return readStoredResponse({
             responseStatus: stored.responseStatus,
-            responseSnapshot: storeLikeJsonbColumn(stored.responseSnapshot),
+            responseSnapshot: stored.responseSnapshot,
             planRevisionAfter: stored.planRevisionAfter,
         });
     };
 
-    it('models the column the way the measured column behaves: by key length, then bytes, at every level', () => {
-        // The model is what the assertions below rest on, so it is pinned
-        // against the measurement rather than trusted.
-        const normalized = storeLikeJsonbColumn({
-            id: 'plan-1',
-            revision: 1,
-            targets: { calories: 1940, protein: 146, fat: 65.5 },
-            days: ['2026-07-05', '2026-07-06'],
-            note: 'n',
-            big: 1,
-            nothing: null,
-            dup: 2,
-        }) as Record<string, unknown>;
+    it('stores the body in the column\'s own key order, at every nesting level', () => {
+        const stored = shapeStoredResponse('generate', firstResponse, 1).responseSnapshot as unknown as Record<
+            string,
+            unknown
+        >;
+        const days = stored.days as Record<string, unknown>[];
+        const lunch = (days[0].meals as Record<string, unknown>[])[0];
 
-        expect(Object.keys(normalized)).toEqual([
-            'id',
-            'big',
-            'dup',
-            'days',
-            'note',
-            'nothing',
-            'targets',
-            'revision',
-        ]);
-        expect(Object.keys(normalized.targets as Record<string, unknown>)).toEqual(['fat', 'protein', 'calories']);
-        expect(normalized.days).toEqual(['2026-07-05', '2026-07-06']);
+        expect(Object.keys(stored)).toEqual(COLUMN_KEY_ORDER);
+        expect(Object.keys(stored.targets as Record<string, unknown>)).toEqual(['fat', 'protein', 'calories']);
+        expect(Object.keys(lunch.planned as Record<string, unknown>)).toEqual(['protein', 'calories']);
+        // The mapper's order is not the column's order, which is the whole
+        // reason the pass exists: without it the first response would serialise
+        // in this order and no replay could reproduce it.
+        expect(Object.keys(firstResponse)).not.toEqual(COLUMN_KEY_ORDER);
+        // Arrays are untouched at every level.
+        expect(days.map((day) => day.date)).toEqual(['2026-07-05', '2026-07-06']);
+        expect(Object.keys(days[0])).toEqual(['date', 'meals']);
     });
 
     it('replays a body DEEP-EQUAL to the first response', () => {
-        // AAP §0.9.2's replay row — "returns the stored 201/200 body
-        // byte-for-byte" — is achievable in exactly this form, and this is the
-        // assertion every test of it must make: `toEqual` on the parsed body.
         expect(replayFromColumn()?.body).toEqual(firstResponse);
     });
 
-    it('does NOT replay the same JSON text, because jsonb reorders object keys at rest', () => {
-        // Pinned as a known property, not left to be rediscovered as a bug: an
-        // implementer who writes §0.9.2's row as a JSON-text or
-        // `toMatchInlineSnapshot` comparison gets a failing test against
-        // correct code. The reordering is asserted where it happens — the top
-        // level and two nested levels — so this cannot pass for some other
-        // reason.
-        const replayed = replayFromColumn()?.body as Record<string, unknown>;
+    it('replays the stored body BYTE-FOR-BYTE, which is what §0.9.2 requires', () => {
+        // The finding this assertion replaces expected the opposite — that the
+        // two texts differ because `jsonb` reorders keys at rest. They no
+        // longer can: both attempts serialise a value already in the column's
+        // order, so the bytes are identical and §0.9.2's row is met literally
+        // rather than reinterpreted as deep equality.
+        const first = firstAttempt();
+        const replayed = replayFromColumn();
 
-        expect(JSON.stringify(replayed)).not.toBe(JSON.stringify(firstResponse));
-        expect(Object.keys(replayed)).not.toEqual(Object.keys(firstResponse));
-        expect(Object.keys(replayed.targets as Record<string, unknown>)).toEqual(['fat', 'protein', 'calories']);
-
-        const replayedMeal = (replayed.days as Record<string, unknown>[])[0].meals as Record<string, unknown>[];
-
-        expect(Object.keys(replayedMeal[0].planned as Record<string, unknown>)).toEqual(['protein', 'calories']);
+        expect(JSON.stringify(replayed?.body)).toBe(JSON.stringify(first?.body));
+        expect(Object.keys(replayed?.body as Record<string, unknown>)).toEqual(COLUMN_KEY_ORDER);
     });
 
-    it('replays the status and the revision exactly — the parts that really are identical', () => {
+    it('replays byte-identically from a row written by an EARLIER build, whose insertion order was arbitrary', () => {
+        // A row stored before the canonical pass existed went into the column
+        // in whatever order its mapper produced — and `jsonb` normalised THAT to
+        // the same canonical order at rest. So the value a read returns is
+        // canonical however it was written, and `readStoredResponse`
+        // canonicalising on the way out is what makes an old row replay
+        // byte-identically to a freshly shaped response rather than to
+        // "whatever it was stored as". The non-canonical snapshot below is that
+        // old row.
+        const legacyRow = {
+            responseStatus: 201,
+            responseSnapshot: {
+                revision: 1,
+                wasRegenerated: true,
+                targets: { protein: 146, fat: 65.5, calories: 1940 },
+                id: 'plan-1',
+                nothing: null,
+                days: [
+                    { meals: [{ planned: { protein: 45, calories: 610.4 }, slot: 'lunch' }], date: '2026-07-05' },
+                    { meals: [{ planned: { protein: 52, calories: 720 }, slot: 'dinner' }], date: '2026-07-06' },
+                ],
+                isLocked: false,
+                big: 9007199254740992,
+                note: 'café — crème brûlée 🥗',
+            },
+            planRevisionAfter: 1,
+        };
+
+        const replayed = readStoredResponse(legacyRow);
+
+        expect(JSON.stringify(replayed?.body)).toBe(JSON.stringify(firstAttempt()?.body));
+        expect(replayed?.body).toEqual(firstResponse);
+    });
+
+    it('replays the status and the revision exactly', () => {
         const replayed = replayFromColumn();
 
         expect(replayed?.status).toBe(201);
@@ -1101,9 +1414,8 @@ describe('the replay equality contract across the jsonb round trip', () => {
     });
 
     it('preserves every scalar class and every array order across the round trip', () => {
-        // The other half of "deep-equal is exact": a reordered body would be
-        // harmless, a rounded, truncated or reordered VALUE would not. `65.5`
-        // and `610.4` are the rounding cases, `9007199254740992` is
+        // Byte equality would be worthless if a VALUE had moved: `65.5` and
+        // `610.4` are the rounding cases, `9007199254740992` is
         // Number.MAX_SAFE_INTEGER + 1 (a bigint-adjacent magnitude), and the
         // note carries multi-byte characters and an astral-plane emoji.
         const replayed = replayFromColumn()?.body as Record<string, unknown>;

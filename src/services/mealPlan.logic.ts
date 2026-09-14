@@ -86,7 +86,7 @@ import {
     PlanOverlapError,
     UpcomingExistsError,
 } from './mealPlanning.errors';
-import { MAX_REVISION } from './preferences.logic';
+import { isCalendarDayKey, MAX_REVISION } from './preferences.logic';
 import {
     isEligibleForPlanning,
     PlanningPreferences,
@@ -96,19 +96,20 @@ import {
 import type {
     BudgetPreference,
     BudgetTier,
+    Diet,
     GeneratePlanPayload,
     InvalidRequestDetail,
     LimitingConstraint,
     MealPlanMacroTotals,
     MealSchedule,
     MealTimeEntry,
+    NutritionTargetValues,
     PlanEndedErrorData,
     PlanStatus,
     RegeneratePlanPayload,
     SetupStep,
 } from '../types/mealPlanning';
 import type { MealSlot, RecipePerServingNutrition } from '../types/recipe';
-import { isCalendarDayKey } from '../utils/calendarDay';
 import { mulberry32 } from '../utils/seededRandom';
 
 /* ---------------------------------------------------------------------------
@@ -247,7 +248,7 @@ const ACTIVE_PLAN_STATUS: PlanStatus = 'active';
 const ENDED_REASON: PlanEndedErrorData['reason'] = 'ended';
 
 // The day-key shape is NOT declared here: it lives once in
-// `utils/calendarDay.ts` beside the predicate that applies it.
+// `preferences.logic.ts` beside the predicate that applies it.
 const TIME_OF_DAY_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -426,6 +427,109 @@ export interface PlanLifecycleState {
     replacement_plan_id?: string | null;
 }
 
+/**
+ * The five `meal_plan_preferences` columns eligibility is judged from, as Prisma
+ * returns them.
+ *
+ * Structural on purpose: a service's own `PreferencesRow` satisfies it without
+ * this module importing one, which keeps a pure rule free of the service layer
+ * (§10) and lets a test hand over five fields instead of a whole row.
+ */
+export interface PlanningPreferencesRow {
+    diet: string | null;
+    allergens: readonly string[];
+    disliked_food_ids: readonly string[];
+    disliked_food_groups: readonly string[];
+    cooking_time_limit_min: number | null;
+}
+
+/** The diets the contract admits, keyed off its own union so widening it fails here first. */
+const DIETS: Readonly<Record<Diet, true>> = { none: true, vegetarian: true, vegan: true, pescatarian: true };
+
+/**
+ * A stored TEXT code as a member of a closed set, or `null`.
+ *
+ * `Object.prototype.hasOwnProperty.call` AND NOT THE `in` OPERATOR, which is
+ * the whole reason this is a named helper rather than an inline comparison:
+ * `in` walks the prototype chain, so `'toString' in DIETS` and
+ * `'constructor' in DIETS` are both true and a stored `toString` would be cast
+ * to `Diet` and handed to the eligibility rules as a diet code no recipe
+ * carries — every candidate refused, and a week reported as infeasible for a
+ * row that merely holds a bad string. Own-property lookup is the only test that
+ * matches the set's four members and nothing else.
+ *
+ * Identical in shape to the private helpers `mealPlan.mapper.ts` and
+ * `preferences.service.ts` keep for the same purpose; each module owns its own
+ * copy because a pure rule module does not import a service (§10) and a
+ * four-line narrowing is not worth a shared module of its own.
+ */
+const asMember = <T extends string>(set: Readonly<Record<T, true>>, value: unknown): T | null =>
+    typeof value === 'string' && Object.prototype.hasOwnProperty.call(set, value) ? (value as T) : null;
+
+/**
+ * The five preference columns `recipe.logic.ts::evaluatePlanningEligibility`
+ * reads, narrowed out of the stored row.
+ *
+ * ONE NARROWING FOR EVERY PATH THAT JUDGES ELIGIBILITY, which is the whole
+ * point of it living here: generation narrows this way, and so does
+ * `swap.service.ts`'s candidate selection. Two narrowings are how a swap comes
+ * to admit a recipe the generator would have refused — and since this is the
+ * rule that decides what "the user's restrictions" are, it is a planning rule
+ * rather than a row-to-wire mapping.
+ *
+ * `diet` goes through {@link asMember} over a closed set keyed off the
+ * contract's own union, so EVERY value that is not one of the four reads as "no
+ * diet restriction" rather than reaching the eligibility rules as an unknown
+ * code — including the prototype-member names an `in` test would have admitted.
+ * A null row reads as "nothing restricted", which is what a user who has saved
+ * no preference has said.
+ */
+export const toPlanningPreferences = (row: PlanningPreferencesRow | null): PlanningPreferences => ({
+    diet: row === null ? null : asMember(DIETS, row.diet),
+    allergens: row?.allergens ?? [],
+    disliked_food_ids: row?.disliked_food_ids ?? [],
+    disliked_food_groups: row?.disliked_food_groups ?? [],
+    cooking_time_limit_min: row?.cooking_time_limit_min ?? null,
+});
+
+/**
+ * The targets a plan is REPORTED against: the user's current confirmed targets
+ * when they are complete, otherwise the snapshot the week was generated from.
+ *
+ * The rule, not the read. `MealPlanResponse.targets` is what the plan card,
+ * Account and the diary all show, and `swap.service.ts` scores every candidate
+ * against the same values — so the question "which numbers is this week judged
+ * by?" has to be answered in one place or the alternatives list will offer a
+ * meal that visibly misses the figure printed beside it.
+ *
+ * Incomplete confirmed targets fall back to the generation snapshot rather than
+ * reporting nulls: a plan cannot be generated without four confirmed values
+ * (§0.5.2 answers `422 targets_missing` first), so the snapshot is always four
+ * real numbers, while a user who has since cleared a target would otherwise
+ * blank the figure on a week that was built against something. Reporting the
+ * snapshot keeps `targetsStale` meaningful — it is exactly
+ * {@link sameMacroTotals} over these two values.
+ */
+export const resolveReportedTargets = (
+    confirmed: { complete: boolean; targets: NutritionTargetValues | null },
+    generationTargets: MealPlanMacroTotals,
+): MealPlanMacroTotals => {
+    const values = confirmed.targets;
+
+    if (
+        !confirmed.complete ||
+        values === null ||
+        values.calories === null ||
+        values.protein === null ||
+        values.carbs === null ||
+        values.fat === null
+    ) {
+        return generationTargets;
+    }
+
+    return { calories: values.calories, protein: values.protein, carbs: values.carbs, fat: values.fat };
+};
+
 /* ---------------------------------------------------------------------------
  * Day keys — arithmetic in the user's calendar, never in the server's
  * ------------------------------------------------------------------------- */
@@ -437,11 +541,12 @@ export interface PlanLifecycleState {
  * a plan that silently started on a non-existent date would put six of its
  * seven days somewhere the user never asked for.
  *
- * THE implementation is shared — `utils/calendarDay.ts` — and this is an alias
- * of it rather than a wrapper, so the binding is identical to the one
- * `preferences.logic.ts` and `plannedMealLog.logic.ts` expose and the three
- * cannot answer differently. The name stays `isDayKey` because that is what
- * this module's rules and `swap.logic.ts` already call it.
+ * THE implementation is shared — `preferences.logic.ts::isCalendarDayKey`, the
+ * parser that first admits a date into the system — and this is an alias of it
+ * rather than a wrapper, so the binding is identical to the one
+ * `plannedMealLog.logic.ts` exposes and the three cannot answer differently.
+ * The name stays `isDayKey` because that is what this module's rules and
+ * `swap.logic.ts` already call it.
  *
  * It replaces a round trip through `Date.UTC(year, month - 1, day)`, which was
  * subtly wrong rather than merely duplicated: that constructor maps years 0–99
@@ -676,6 +781,72 @@ export const portionMultipliersForSlot = (
 /** Every multiplier any slot may use, ascending — the set candidates are built over. */
 const allPortionMultipliers = (policy: PortionPolicy): number[] =>
     [...new Set([...policy.mainSlot, ...policy.snack])].sort((left, right) => left - right);
+
+/** The noun a portion is counted in when the recipe's own serving unit cannot be used. */
+const GENERIC_PORTION_UNIT = 'serving';
+
+/**
+ * A serving description that is exactly `1` followed by one inflectable word.
+ *
+ * Anchored, single-word and letters-only (internal hyphens allowed, for a
+ * "1 half-wrap"): the leading `1 ` is what makes the rest of the string the unit
+ * ONE serving is measured in, which is the only reading that lets a multiplier
+ * be applied to it.
+ */
+const SINGLE_UNIT_SERVING_DESCRIPTION = /^1\s+([a-z][a-z-]*)$/i;
+
+/** A word already in the plural, which `pluralizeCount` would inflect a second time. */
+const ALREADY_PLURAL_WORD = /s$/i;
+
+/**
+ * The noun a portion of this recipe is counted in, from the recipe's own
+ * `recipe_versions.serving_description`.
+ *
+ * `'1 bowl'` yields `'bowl'`, so the plan card reads "1 bowl" and a portion and
+ * a half reads "1½ bowls" — the serving unit the recipe was written and
+ * photographed in, rather than the generic noun every recipe would otherwise
+ * share. Of the seeded corpus's serving descriptions, the great majority are of
+ * exactly this shape (`1 bowl`, `1 plate`, `1 wrap`, `1 wedge`, `1 slice`,
+ * `1 square`, `1 omelette`).
+ *
+ * TOTAL, and falls back to `'serving'` rather than guessing, in four cases the
+ * corpus really contains:
+ *
+ *  - no description at all (`null`, or blank after trimming);
+ *  - a description that is not one serving — `'4 meatballs with sauce'`,
+ *    `'3 bites'`, `'2 muffins'`, `'¾ cup'`. Its number is part of the recipe's
+ *    yield statement, so treating the remainder as a per-serving unit would
+ *    multiply an already-multiplied quantity;
+ *  - a phrase rather than a unit — `'1 fillet with potato and broccoli'`,
+ *    `'1 stuffed bell pepper (2 halves)'`. `pluralizeCount` inflects the LAST
+ *    word, which would produce "2 fillet with potato and broccolis";
+ *  - a word already plural. `pluralizeCount` would append to it again
+ *    ("halves" → "halveses"), so an `s` ending is refused outright. The cost is
+ *    a generic noun for a recipe served in, say, "1 couscous"; the alternative
+ *    is a visibly broken word.
+ *
+ * The word is returned VERBATIM, not lower-cased: `utils/units.ts` restores the
+ * original casing when it inflects, so a capitalised unit stays capitalised.
+ *
+ * A rule and not a format, which is why it is here and not in the mapper: what
+ * counts as a usable serving unit is a property of the recipe corpus, it is the
+ * same question for the plan card and the swap preview, and it is worth pinning
+ * case by case in `__tests__/mealPlan.logic.test.ts`. The mapper composes the
+ * display string from it.
+ */
+export const derivePortionUnit = (servingDescription: string | null): string => {
+    if (servingDescription === null) {
+        return GENERIC_PORTION_UNIT;
+    }
+
+    const match = SINGLE_UNIT_SERVING_DESCRIPTION.exec(servingDescription.trim());
+
+    if (match === null || ALREADY_PLURAL_WORD.test(match[1])) {
+        return GENERIC_PORTION_UNIT;
+    }
+
+    return match[1];
+};
 
 const timeOfDayMinutes = (time: string, slot: MealSlot): number => {
     const match = TIME_OF_DAY_PATTERN.exec(time);
@@ -1376,6 +1547,33 @@ export const computeDayTotals = (
 
     return totals;
 };
+
+/**
+ * Whether two macro sets are the same four numbers.
+ *
+ * A BUSINESS INVARIANT, not a formatting detail, which is why it lives beside
+ * the rest of the planning rules rather than in the mapper. It decides two
+ * things the user sees and one the server refuses:
+ *
+ *  - `MealPlanResponse.targetsStale` — the plan was built against numbers the
+ *    user has since changed, so the day card says so instead of silently
+ *    showing a week aimed at a target that no longer exists.
+ *  - the publication gate in `mealPlan.service.ts`, where what is about to be
+ *    written as `targets_snapshot` must equal what the locked targets gate just
+ *    certified as confirmed; a mismatch is `targets_unconfirmed` and no plan is
+ *    published.
+ *
+ * Exact equality on purpose, with no tolerance: all four values are integers
+ * confirmed by the user or copied from that confirmation, so "close enough"
+ * would mean publishing a week against numbers nobody confirmed. Comparing the
+ * four keys explicitly rather than by key iteration keeps the comparison
+ * exhaustive at compile time — a fifth macro would not silently go unchecked.
+ */
+export const sameMacroTotals = (left: MealPlanMacroTotals, right: MealPlanMacroTotals): boolean =>
+    left.calories === right.calories &&
+    left.protein === right.protein &&
+    left.carbs === right.carbs &&
+    left.fat === right.fat;
 
 /* ---------------------------------------------------------------------------
  * The search — depth-first, best-first move order, first feasible, bounded

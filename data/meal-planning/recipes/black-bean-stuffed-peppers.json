@@ -13,14 +13,13 @@
   "yieldServings": 4,
   "servingDescription": "1 stuffed bell pepper (2 halves)",
   "prepMinutes": 15,
-  "cookMinutes": 25,
+  "cookMinutes": 32,
   "mealSlots": [
     "dinner"
   ],
   "dietTags": [
     "gluten_free",
     "pescatarian",
-    "pescatarian_ok",
     "vegan",
     "vegetarian"
   ],

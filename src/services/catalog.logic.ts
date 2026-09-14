@@ -65,6 +65,7 @@ import {
     CatalogValidationOutcome,
 } from '../types/catalog';
 import { NutritionProvenance } from '../types/nutrition';
+import { parsePagination } from '../utils/pagination';
 import { millilitersToGrams, UnitConversionError, unitFamily } from '../utils/units';
 
 /* ---------------------------------------------------------------------------
@@ -933,6 +934,142 @@ export const parseCatalogSearchQuery = (query: unknown): ParsedCatalogSearchQuer
     }
 
     return { kind: 'ok', q };
+};
+
+/* ---------------------------------------------------------------------------
+ * The suggestions query parser
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The page policy of `GET /catalog/foods/suggestions`: twelve rows by default,
+ * thirty at most (§0.5.2).
+ *
+ * Named and exported HERE rather than held in the controller for the reason
+ * every other bound in this module is a value it owns — a limit is a rule about
+ * how much of the catalog one request may draw, and a rule that only exists
+ * inside an HTTP adapter cannot be unit-tested or asserted against. The pair is
+ * deliberately tighter than the search route's 25/50: these rows are the
+ * suggestion chips frame 06 renders all at once, not a page the user scrolls.
+ */
+export const CATALOG_SUGGESTIONS_DEFAULT_LIMIT = 12;
+export const CATALOG_SUGGESTIONS_MAX_LIMIT = 30;
+
+/**
+ * The suggestion kinds this endpoint answers — one, `dislike` (§0.5.2:
+ * `kind ∈ {'dislike'}`).
+ *
+ * Declared LOCALLY and deliberately, the same trade `recipe.logic.ts` states
+ * for its own field-code vocabulary. `catalog.service.ts` publishes an
+ * identical `CatalogSuggestionKind`, but a pure module may not import a service
+ * (Rule backend-architecture §2: the dependency runs service → logic and never
+ * the reverse), and an import here would additionally put a Prisma-bound module
+ * behind every unit test of this file. Both are one-member literal unions over
+ * the same word, so what this parser returns is assignable to what
+ * `getSuggestions` accepts, and a second kind is a wire contract change that
+ * has to be made on both sides whichever way round they are declared.
+ */
+export type CatalogSuggestionKindRequest = 'dislike';
+
+const SUGGESTION_KIND: CatalogSuggestionKindRequest = 'dislike';
+const SUGGESTION_KIND_FIELD = 'kind';
+
+/**
+ * The wire vocabulary for a suggestions `details[].code`. Machine-readable
+ * only — the client maps the code to its own copy:
+ *  - `unsupported` — `kind` is absent, or names something this endpoint does
+ *    not answer.
+ *
+ * One member, because one field on this route can fail and one correction
+ * answers every way it can: the contract defines a single kind, so "you sent
+ * the wrong one" and "you sent none" ask the caller for the same thing.
+ */
+const UNSUPPORTED_KIND_CODE = 'unsupported';
+
+/**
+ * The refusal branch {@link parseCatalogSearchQuery} already produces, derived
+ * rather than re-declared so both of this module's request parsers answer with
+ * ONE body shape. A hand-written copy would be free to drift from the `details`
+ * the client renders beside its fields, which is why
+ * `recipe.logic.ts::RecipeVersionPathRefusal` derives its own the same way.
+ */
+type CatalogQueryRefusal = Exclude<ParsedCatalogSearchQuery, { kind: 'ok' }>;
+
+export type ParsedCatalogSuggestionsQuery =
+    | { kind: 'ok'; suggestionKind: CatalogSuggestionKindRequest; limit: number }
+    | CatalogQueryRefusal;
+
+/**
+ * A query that is not a readable object becomes an EMPTY record rather than a
+ * refusal of its own: a request with no query string and one carrying no `kind`
+ * are the same request here, and both are refused below for the kind. Keeping
+ * the narrowing total is also what lets the limit delegation be unconditional —
+ * `parsePagination` never has to be reached with something it would guard
+ * again.
+ */
+const asQueryRecord = (query: unknown): Record<string, unknown> =>
+    typeof query === 'object' && query !== null && !Array.isArray(query)
+        ? (query as Record<string, unknown>)
+        : {};
+
+/**
+ * `qs` yields an array when a parameter repeats (`?kind=dislike&kind=x`); the
+ * first occurrence wins, exactly as {@link parseCatalogSearchQuery} treats a
+ * repeated `q` and `parsePagination` a repeated `page`.
+ */
+const firstOccurrence = (value: unknown): unknown => (Array.isArray(value) ? value[0] : value);
+
+/**
+ * Validates `?kind=` and `?limit=` for `GET /catalog/foods/suggestions`.
+ *
+ * A RETURNED VERDICT, never a throw, like every other answer in this module:
+ * the caller is `catalog.controller.ts::getCatalogSuggestionsController`, which
+ * owes the client `400 invalid_request` naming the field that failed (§0.5.2),
+ * and no status code appears in this layer (Rule backend-architecture §8). The
+ * judgement belongs to a pure function at that boundary rather than inline in
+ * the handler for two reasons: the controller has to stay
+ * `getUserId` → parse → one service call (§0.7.2), and this rule is only
+ * testable without HTTP once it lives here.
+ *
+ * IT MUST PRECEDE THE SERVICE CALL. `getSuggestions` indexes a
+ * `Record<CatalogSuggestionKind, Prisma.Sql>` with this value to build its
+ * `WHERE` fragment, so a kind nobody checked arrives as an `undefined`
+ * fragment — a malformed statement for what is really a bad query string.
+ *
+ * `kind` is the one refusable field, and everything that is not exactly
+ * `dislike` is the same single `unsupported` detail: absent, a different word,
+ * a non-string, or a repeated parameter whose first occurrence is not
+ * `dislike`.
+ *
+ * `limit` is DELEGATED to `parsePagination` rather than clamped again here. That
+ * helper already treats an unreadable value as absent (so the default applies),
+ * floors the result at one row and caps it at the maximum it is handed, so this
+ * parser states the bounds and owns no arithmetic that could disagree with the
+ * search route's. `page` is not part of this endpoint's contract — the
+ * suggestion set is one capped page — so it is neither read nor returned.
+ */
+export const parseCatalogSuggestionsQuery = (query: unknown): ParsedCatalogSuggestionsQuery => {
+    const record = asQueryRecord(query);
+
+    if (firstOccurrence(record[SUGGESTION_KIND_FIELD]) !== SUGGESTION_KIND) {
+        return {
+            kind: 'error',
+            code: 'invalid_request',
+            // A server-side diagnostic; the client renders `details`, never
+            // this string.
+            message: `${SUGGESTION_KIND_FIELD} must be ${SUGGESTION_KIND}`,
+            details: [{ field: SUGGESTION_KIND_FIELD, code: UNSUPPORTED_KIND_CODE }],
+        };
+    }
+
+    const { limit } = parsePagination(
+        { limit: record.limit },
+        {
+            defaultLimit: CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
+            maxLimit: CATALOG_SUGGESTIONS_MAX_LIMIT,
+        },
+    );
+
+    return { kind: 'ok', suggestionKind: SUGGESTION_KIND, limit };
 };
 
 /* ---------------------------------------------------------------------------
@@ -2645,3 +2782,115 @@ export const computeCoverageShortfall = (
         unknownCategories,
     };
 };
+
+/* ---------------------------------------------------------------------------
+ * Component coverage — what makes an EMPTY components export an asserted fact
+ * ------------------------------------------------------------------------- */
+
+/**
+ * `ingredient_derived`, tied to the union rather than written as a bare
+ * literal, so renaming the member is a compile error here instead of a rule
+ * that quietly stops matching anything — which is the exact failure mode this
+ * section exists to make impossible.
+ */
+const DERIVES_FROM_COMPOSITION: NutritionProvenance = 'ingredient_derived';
+
+/**
+ * The per-food facts the component-coverage rule turns on.
+ *
+ * `nutrition_provenance` is a plain `string` and not {@link NutritionProvenance}
+ * on purpose. It arrives from a TEXT column — the schema declares no enums, so
+ * every enumeration in this domain is validated here rather than by the
+ * database — and a parameter demanding the union would be satisfied by a cast
+ * at the call site, which is precisely where a value the database really holds
+ * gets asserted out of existence. Read as text, an unrecognised value declares
+ * no composition, and needing none is the correct answer for it.
+ */
+export interface CatalogComponentCoverageFacts {
+    /**
+     * The portable identity, repeated verbatim in the verdict: a refusal has to
+     * name a food the operator can find in the release, and a local uuid means
+     * nothing in another database.
+     */
+    readonly source_key: string;
+    readonly nutrition_provenance: string;
+    /**
+     * How many of this food's component rows RESOLVE to a component food. A row
+     * pointing at a food the set does not contain is not a composition —
+     * nothing can be derived from it — so an unresolved row must not be counted
+     * here, and the caller is the only layer that can tell the difference.
+     */
+    readonly resolvable_component_count: number;
+}
+
+/** The verdict of {@link assessComponentCoverage}. */
+export interface CatalogComponentCoverage {
+    /** True when no derived food is missing its composition. */
+    readonly ok: boolean;
+    /**
+     * The `source_key` of every derived food carrying no resolvable
+     * composition, sorted, so a refusal message reads the same whatever order
+     * the rows were supplied in.
+     */
+    readonly derivedWithoutComponents: readonly string[];
+    /**
+     * How many of the supplied foods derive their nutrition from a stored
+     * composition. This is the number a release manifest publishes beside its
+     * component row count, and taking both from one verdict is what makes the
+     * two incapable of disagreeing.
+     */
+    readonly derivedCount: number;
+}
+
+/**
+ * Whether every food that DERIVES its nutrition carries a composition to derive
+ * it from — the rule that turns a zero-row component export into an asserted
+ * fact rather than a blank.
+ *
+ * A component row is the composition of an ingredient-derived food, so the set
+ * of component rows is empty exactly when no supplied food derives its
+ * nutrition. Stated the other way round: a derived food with no composition has
+ * nothing its nutrient totals could have been computed FROM, so those totals
+ * are unsourced and whatever was about to consume them must refuse.
+ *
+ * Why the rule is needed at all. An empty component export and an export that
+ * silently dropped every row are indistinguishable on disk and in a manifest,
+ * because the digest of an empty file verifies either way. That is the one
+ * ambiguity a reviewer cannot resolve by reading the artefact. This predicate
+ * resolves it by making the count a derived consequence — 0 rows is provably
+ * correct when, and only when, no derived food is present — and
+ * {@link CatalogComponentCoverage.derivedCount} is the companion number that
+ * says so out loud.
+ *
+ * The opposite repair is forbidden and deliberately not offered here: inventing
+ * a composition so the export has rows would fabricate a nutrient total, which
+ * the catalog policy and the feature's nutrition-integrity requirement both
+ * rule out outright.
+ *
+ * Matching is EXACT on the canonical provenance spelling. Loosening it to
+ * tolerate variants is not a safety net — it is how a mis-spelled stored value
+ * stops being visible, and this domain has already paid once for a tag that
+ * only one spelling matched. A non-finite or non-positive component count is
+ * read as no composition, so a miscount can only ever make the rule stricter.
+ */
+export const assessComponentCoverage = (
+    foods: readonly CatalogComponentCoverageFacts[],
+): CatalogComponentCoverage => {
+    const derived = foods.filter((food) => food.nutrition_provenance === DERIVES_FROM_COMPOSITION);
+
+    const derivedWithoutComponents = derived
+        .filter(
+            (food) =>
+                !Number.isFinite(food.resolvable_component_count) ||
+                food.resolvable_component_count <= 0,
+        )
+        .map((food) => food.source_key)
+        .sort();
+
+    return {
+        ok: derivedWithoutComponents.length === 0,
+        derivedWithoutComponents,
+        derivedCount: derived.length,
+    };
+};
+

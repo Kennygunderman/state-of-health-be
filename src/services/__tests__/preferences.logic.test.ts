@@ -14,18 +14,23 @@
  * `recipe.logic.ts` emits.
  */
 
+import { isDayKey as mealPlanIsDayKey } from '../mealPlan.logic';
+import { isCalendarDayKey as plannedMealLogIsCalendarDayKey } from '../plannedMealLog.logic';
 import {
     ALLERGEN_NONE,
     ALLERGEN_VALUES,
     BODY_INPUT_RANGES,
+    BodyAnswerFacts,
     BUDGET_AMOUNT_RANGE,
     BUDGET_CURRENCY,
     BUDGET_PER_MEAL_THRESHOLDS,
+    DAY_KEY_PATTERN,
     deriveBudgetTier,
     deriveDislikedFoodGroups,
     evaluateMealAgainstPreferences,
     feetAndInchesToCentimeters,
     INCHES_TO_CENTIMETERS,
+    isBodyAnswerComplete,
     isCalendarDayKey,
     isClockTime,
     isNoAllergenSelection,
@@ -43,14 +48,18 @@ import {
     parseBudgetAnswer,
     parseDislikedFoodIds,
     parsePreferencesUpdate,
+    parsePreferencesUpdateRequest,
     parseSetupStep,
+    parseSetupStepRequest,
     PlannedMealForFlagging,
     POUNDS_TO_KILOGRAMS,
     PREFERENCE_FIELD_CODES,
     PreferencesUpdateContext,
     poundsToKilograms,
+    reconcileSetupStateForRoute,
     requiredSetupSteps,
     resolveTargetRouteForBodyStep,
+    resolveTargetRouteForUpdate,
     routeStepOrder,
     SetupAnswerFacts,
     SetupStateSnapshot,
@@ -307,53 +316,229 @@ const flagCodes = (flags: { code: MealFlagCode }[]): MealFlagCode[] => flags.map
  * Calendar and clock primitives
  * ------------------------------------------------------------------------- */
 
+/**
+ * Day keys that name a day the calendar contains, with the reason each one is
+ * here. Every entry must be accepted.
+ */
+const REAL_DAYS: readonly string[] = [
+    '0000-01-01', // year zero exists in the proleptic Gregorian calendar this rule writes out
+    '0001-01-01',
+    '0004-02-29', // a leap year by the rule, and the input a Date round trip reads as 1904
+    '0050-06-15',
+    '0099-12-31', // the last day before the band a round-trip implementation could reach
+    '0100-01-01', // the first day it could reach: the two answers meet here and nowhere below
+    '0999-12-31',
+    '1000-01-01',
+    '1970-01-01', // the epoch, which is not special to a calendar rule and must not be
+    '2000-02-29', // a century divisible by 400
+    '2024-02-29',
+    '2026-07-11',
+    '2026-12-31',
+    '9999-12-31',
+];
+
+/** Well-shaped keys naming a day that does not exist. Every entry must be refused. */
+const IMPOSSIBLE_DAYS: readonly string[] = [
+    '1900-02-29', // a century NOT divisible by 400, so not a leap year
+    '2023-02-29',
+    '2026-02-30',
+    '2026-04-31',
+    '2026-06-31',
+    '2026-09-31',
+    '2026-11-31',
+    '2026-13-01', // month above the year
+    '2026-00-10', // month below it
+    '2026-01-00', // day below the month
+    '2026-01-32',
+    '2026-12-32',
+];
+
+/** Strings that are not the day-key shape at all. Every entry must be refused. */
+const MALFORMED_SHAPES: readonly string[] = [
+    '2026-7-11', // unpadded month
+    '2026-07-1', // unpadded day
+    '26-07-11', // two-digit year
+    '2026/07/11',
+    '2026-07-11 ', // trailing space
+    ' 2026-07-11', // leading space
+    '2026-07-11T00:00:00Z', // an instant, not a day
+    '2026-07-111',
+    '20260711',
+    '11-07-2026', // day first
+    '+2026-07-11',
+    '-0001-01-01', // the expanded ISO form for a year before zero
+    '2026-ab-11',
+    '2026-07-1a',
+    'today',
+    '',
+];
+
+/** Values that are not strings. Every entry must be refused rather than coerced. */
+const NON_STRINGS: readonly unknown[] = [null, undefined, 20260711, Number.NaN, {}, [], true, new Date()];
+
+describe('DAY_KEY_PATTERN', () => {
+    it('matches the day-key shape and nothing around it', () => {
+        expect(DAY_KEY_PATTERN.test('2026-07-11')).toBe(true);
+        expect(DAY_KEY_PATTERN.test('2026-07-11T00:00:00Z')).toBe(false);
+        expect(DAY_KEY_PATTERN.test(' 2026-07-11')).toBe(false);
+    });
+
+    it('is anchored at both ends, so it cannot match a fragment of a longer string', () => {
+        expect(DAY_KEY_PATTERN.source.startsWith('^')).toBe(true);
+        expect(DAY_KEY_PATTERN.source.endsWith('$')).toBe(true);
+    });
+
+    it('carries no global flag, so repeated tests cannot depend on lastIndex', () => {
+        // A shared exported regex with /g would answer differently on its second
+        // call for the same input, which is the kind of fault a single shared
+        // declaration is supposed to remove rather than introduce.
+        expect(DAY_KEY_PATTERN.global).toBe(false);
+        expect(DAY_KEY_PATTERN.test('2026-07-11')).toBe(true);
+        expect(DAY_KEY_PATTERN.test('2026-07-11')).toBe(true);
+    });
+
+    it('accepts a shape whose day the calendar does not contain', () => {
+        // The reason every caller asks the predicate instead: shape and calendar
+        // are two different questions.
+        expect(DAY_KEY_PATTERN.test('2026-02-30')).toBe(true);
+        expect(isCalendarDayKey('2026-02-30')).toBe(false);
+    });
+});
+
 describe('isCalendarDayKey', () => {
-    it.each([
-        ['2026-07-05', true],
-        ['2024-02-29', true],
-        ['2000-02-29', true],
-        ['2026-01-31', true],
-        ['2026-12-31', true],
-    ])('accepts the real day %s', (value, expected) => {
-        expect(isCalendarDayKey(value)).toBe(expected);
-    });
-
-    it.each([
-        ['2026-02-30', 'a February day that does not exist'],
-        ['2023-02-29', 'February 29 of a common year'],
-        ['1900-02-29', 'February 29 of a century that is not a leap year'],
-        ['2026-04-31', 'a 31st in a 30-day month'],
-        ['2026-13-01', 'month 13'],
-        ['2026-00-10', 'month 0'],
-        ['2026-07-00', 'day 0'],
-        ['2026-7-05', 'an unpadded month'],
-        ['26-07-05', 'a two-digit year'],
-        ['2026-07-05T00:00:00Z', 'a timestamp'],
-    ])('refuses %s (%s)', (value) => {
-        expect(isCalendarDayKey(value)).toBe(false);
-    });
-
-    it.each([undefined, null, 20260705, {}, ['2026-07-05']])('refuses the non-string %p', (value) => {
-        expect(isCalendarDayKey(value)).toBe(false);
-    });
-
-    /**
-     * This module's implementation is now THE implementation, shared from
-     * `utils/calendarDay.ts` with `mealPlan.logic.ts` and
-     * `plannedMealLog.logic.ts`.
-     *
-     * It won because it was the correct one. The other two round-tripped
-     * through `Date.UTC(year, month - 1, day)`, which maps a year of 0-99 to
-     * 1900-1999 and so refused every day before 0100 — while this table-driven
-     * rule accepted them. The visible split was between two requests: a
-     * `startDate` of `0004-02-29` was accepted by the review step here and
-     * refused as a `date` by the log route. The band is pinned at this name so
-     * the answer cannot quietly change back.
-     */
-    it.each(['0000-01-01', '0001-01-01', '0004-02-29', '0050-06-15', '0099-12-31'])(
-        'accepts %s, which the two Date-based implementations refused',
-        (value) => {
+    describe('days the calendar contains', () => {
+        it.each(REAL_DAYS)('accepts %s', (value) => {
             expect(isCalendarDayKey(value)).toBe(true);
+        });
+
+        it('accepts the last day of every month of a common year', () => {
+            const lastDays = [
+                '2026-01-31',
+                '2026-02-28',
+                '2026-03-31',
+                '2026-04-30',
+                '2026-05-31',
+                '2026-06-30',
+                '2026-07-31',
+                '2026-08-31',
+                '2026-09-30',
+                '2026-10-31',
+                '2026-11-30',
+                '2026-12-31',
+            ];
+
+            expect(lastDays.filter((day) => !isCalendarDayKey(day))).toEqual([]);
+        });
+    });
+
+    describe('the leap rule, written out rather than asked of a Date', () => {
+        it('accepts 29 February in a year divisible by 4 but not 100', () => {
+            expect(isCalendarDayKey('2024-02-29')).toBe(true);
+        });
+
+        it('refuses 29 February in a year not divisible by 4', () => {
+            expect(isCalendarDayKey('2023-02-29')).toBe(false);
+        });
+
+        it('refuses 29 February in a century not divisible by 400', () => {
+            expect(isCalendarDayKey('1900-02-29')).toBe(false);
+            expect(isCalendarDayKey('2100-02-29')).toBe(false);
+        });
+
+        it('accepts 29 February in a century divisible by 400', () => {
+            expect(isCalendarDayKey('2000-02-29')).toBe(true);
+            expect(isCalendarDayKey('1600-02-29')).toBe(true);
+        });
+
+        it('applies the same rule below year 100, where a Date-based check cannot', () => {
+            // Date.UTC(4, 1, 29) means 1904, not year 4 — the legacy two-digit-year
+            // mapping that makes a round trip refuse this whole band, and the reason
+            // the rule is written out here. The rule itself has no such special
+            // case: year 4 is divisible by 4 and not by 100, exactly like 2024.
+            // The band matters because a `startDate` of `0004-02-29` must be the
+            // same day to the review step and to the log route.
+            expect(isCalendarDayKey('0004-02-29')).toBe(true);
+            expect(isCalendarDayKey('0003-02-29')).toBe(false);
+            expect(isCalendarDayKey('0100-02-29')).toBe(false);
+            expect(isCalendarDayKey('0000-02-29')).toBe(true);
+        });
+    });
+
+    describe('days the calendar does not contain', () => {
+        it.each(IMPOSSIBLE_DAYS)('refuses %s', (value) => {
+            expect(isCalendarDayKey(value)).toBe(false);
+        });
+
+        it('refuses a day that a Date would roll forward instead of rejecting', () => {
+            // new Date('2026-02-30') is 2 March. A rolled-over date is the failure
+            // mode this predicate exists to prevent: it is well shaped, it sorts
+            // inside a late-February plan week, and nothing downstream would notice.
+            expect(new Date('2026-02-30').toISOString().startsWith('2026-03')).toBe(true);
+            expect(isCalendarDayKey('2026-02-30')).toBe(false);
+        });
+    });
+
+    describe('values that are not day keys', () => {
+        it.each(MALFORMED_SHAPES)('refuses the malformed shape %p', (value) => {
+            expect(isCalendarDayKey(value)).toBe(false);
+        });
+
+        it.each(NON_STRINGS)('refuses the non-string %p', (value) => {
+            expect(isCalendarDayKey(value)).toBe(false);
+        });
+
+        it('refuses a Date, rather than reading a day key out of it', () => {
+            // A caller holding a Date wants localDayKey, which needs a zone. Coercing
+            // one here would silently answer in whatever zone the runtime is in.
+            expect(isCalendarDayKey(new Date('2026-07-11T00:00:00.000Z'))).toBe(false);
+        });
+    });
+
+    describe('narrowing', () => {
+        it('narrows unknown to string for the caller', () => {
+            const value: unknown = '2026-07-11';
+
+            if (!isCalendarDayKey(value)) {
+                throw new Error('expected the fixture to be a day key');
+            }
+
+            // Reached only if the guard narrowed: .slice is not available on unknown.
+            expect(value.slice(0, 4)).toBe('2026');
+        });
+    });
+});
+
+/**
+ * `mealPlan.logic.ts::isDayKey` and `plannedMealLog.logic.ts::isCalendarDayKey`
+ * ARE `preferences.logic.ts::isCalendarDayKey` — the binding this suite imports
+ * at the top.
+ *
+ * Asserted by IDENTITY rather than by comparing answers over a matrix, because
+ * identity is the only form that cannot drift: an edit that gives either name
+ * its own body again fails here immediately, which is the whole point of one
+ * declaration. The matrix is still run once below, on the band where a local
+ * `Date` round trip would answer differently from the rule.
+ */
+describe('the services share this predicate', () => {
+    it('mealPlan.logic.isDayKey IS this predicate', () => {
+        expect(mealPlanIsDayKey).toBe(isCalendarDayKey);
+    });
+
+    it('plannedMealLog.logic.isCalendarDayKey IS this predicate', () => {
+        expect(plannedMealLogIsCalendarDayKey).toBe(isCalendarDayKey);
+    });
+
+    it.each(['0000-01-01', '0001-01-01', '0004-02-29', '0050-06-15', '0099-12-31'])(
+        'answers %s identically everywhere, where a Date round trip would not',
+        (value) => {
+            const answers = [
+                isCalendarDayKey(value),
+                mealPlanIsDayKey(value),
+                plannedMealLogIsCalendarDayKey(value),
+            ];
+
+            expect(new Set(answers).size).toBe(1);
+            expect(answers[0]).toBe(true);
         },
     );
 });
@@ -2279,22 +2464,55 @@ describe('parseSetupStep', () => {
  * ------------------------------------------------------------------------- */
 
 describe('parsePreferencesUpdate', () => {
-    const payloadOf = (verdict: ReturnType<typeof parsePreferencesUpdate>): Record<string, unknown> => {
+    /**
+     * The parser with the REQUIRED envelope zone supplied, so each case below
+     * states only the keys it is about.
+     *
+     * `timeZone` is part of a full save's envelope rather than one of its
+     * edits, and the endpoint refuses a body without one — the zone's own rules
+     * are asserted in `the envelope zone` below, and a case that needs to omit
+     * or corrupt it calls `parsePreferencesUpdate` directly. A non-object body
+     * is passed through untouched, because there is nothing to spread into.
+     */
+    const parseUpdate = (
+        body: unknown,
+        context: PreferencesUpdateContext,
+    ): ReturnType<typeof parsePreferencesUpdate> =>
+        parsePreferencesUpdate(
+            typeof body === 'object' && body !== null && !Array.isArray(body)
+                ? { timeZone: ZONE, ...body }
+                : body,
+            context,
+        );
+
+    /**
+     * The accepted payload MINUS the envelope zone, which every accepted full
+     * save carries and which is asserted here rather than repeated in each
+     * case's expected object.
+     */
+    const payloadOf = (
+        verdict: ReturnType<typeof parsePreferencesUpdate>,
+        expectedTimeZone: string | null = ZONE,
+    ): Record<string, unknown> => {
         if (verdict.kind !== 'ok') {
             throw new Error(`expected an accepted update, received ${JSON.stringify(verdict)}`);
         }
 
-        return verdict.payload as unknown as Record<string, unknown>;
+        const { timeZone, ...rest } = verdict.payload as unknown as Record<string, unknown>;
+
+        expect(timeZone).toBe(expectedTimeZone);
+
+        return rest;
     };
 
     it('accepts a valid partial and echoes the pinned revision', () => {
-        const verdict = parsePreferencesUpdate({ diet: 'vegan', expectedRevision: 4 }, updateContext());
+        const verdict = parseUpdate({ diet: 'vegan', expectedRevision: 4 }, updateContext());
 
         expect(payloadOf(verdict)).toEqual({ diet: 'vegan', expectedRevision: 4 });
     });
 
     it.each([undefined, null, 'diet', [1]])('refuses the body %p', (body) => {
-        expect(codesFor(parsePreferencesUpdate(body, updateContext()), 'body')).toEqual([
+        expect(codesFor(parseUpdate(body, updateContext()), 'body')).toEqual([
             PREFERENCE_FIELD_CODES.INVALID_TYPE,
         ]);
     });
@@ -2303,7 +2521,7 @@ describe('parsePreferencesUpdate', () => {
         it.each(['setupStatus', 'setupStep', 'revision', 'budgetTier', 'hasActivePlan', 'targetRoute'])(
             'refuses the server-owned key %s rather than ignoring it',
             (key) => {
-                const verdict = parsePreferencesUpdate(
+                const verdict = parseUpdate(
                     { [key]: 'completed', expectedRevision: 4 },
                     updateContext(),
                 );
@@ -2318,7 +2536,7 @@ describe('parsePreferencesUpdate', () => {
         it.each(['nickname', 'userId', 'allergen', 'activityLevell'])(
             'refuses the unknown key %s',
             (key) => {
-                const verdict = parsePreferencesUpdate(
+                const verdict = parseUpdate(
                     { [key]: 'x', expectedRevision: 4 },
                     updateContext(),
                 );
@@ -2328,7 +2546,7 @@ describe('parsePreferencesUpdate', () => {
         );
 
         it('names every offending key at once', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { setupStatus: 'completed', revision: 9, nickname: 'x', expectedRevision: 4 },
                 updateContext(),
             );
@@ -2337,28 +2555,87 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses a save that edits nothing, which would bump the revision for no change', () => {
-            expect(codesFor(parsePreferencesUpdate({ expectedRevision: 4 }, updateContext()), 'body')).toEqual([
+            expect(codesFor(parseUpdate({ expectedRevision: 4 }, updateContext()), 'body')).toEqual([
                 PREFERENCE_FIELD_CODES.REQUIRED,
             ]);
+        });
+    });
+
+    describe('the envelope zone', () => {
+        // The zone is REQUIRED on this endpoint (AAP §0.5.1, §0.5.2): the client
+        // sends the device's zone on every full save, and the server resolves
+        // the "today" its plan-ended, start-date-bound and flag rules read from
+        // the value THIS request carried. Accepting an omission as "keep the
+        // stored zone" left `today` computed from a zone the user may have left.
+        it('refuses a full save that carries no zone at all', () => {
+            const verdict = parsePreferencesUpdate({ diet: 'vegan', expectedRevision: 4 }, updateContext());
+
+            expect(codesFor(verdict, 'timeZone')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+        });
+
+        it('refuses an explicit null zone as required rather than as an unknown name', () => {
+            const verdict = parsePreferencesUpdate(
+                { diet: 'vegan', timeZone: null, expectedRevision: 4 },
+                updateContext(),
+            );
+
+            expect(codesFor(verdict, 'timeZone')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+        });
+
+        it('refuses a name this runtime does not know', () => {
+            const verdict = parsePreferencesUpdate(
+                { diet: 'vegan', timeZone: 'Mars/Phobos', expectedRevision: 4 },
+                updateContext(),
+            );
+
+            expect(codesFor(verdict, 'timeZone')).toEqual([PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE]);
+        });
+
+        it('canonicalises the accepted zone, so an alias is stored under one name', () => {
+            const verdict = parsePreferencesUpdate(
+                { diet: 'vegan', timeZone: 'Etc/UTC', expectedRevision: 4 },
+                updateContext(),
+            );
+
+            expect(payloadOf(verdict, normalizeTimeZone('UTC'))).toEqual({
+                diet: 'vegan',
+                expectedRevision: 4,
+            });
+        });
+
+        it('treats a zone-only body as the envelope rather than as an edit', () => {
+            // Refusing it is the point: the zone and the pinned revision are what
+            // every full save carries, so a body holding nothing else would bump
+            // the revision — invalidating every other client's pinned value — for
+            // no change at all.
+            const verdict = parsePreferencesUpdate({ timeZone: ZONE, expectedRevision: 4 }, updateContext());
+
+            expect(codesFor(verdict, 'body')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+        });
+
+        it('reports a missing zone together with a field problem, in one refusal', () => {
+            const verdict = parsePreferencesUpdate({ diet: 'keto', expectedRevision: 4 }, updateContext());
+
+            expect(fieldsOf(verdict).sort()).toEqual(['diet', 'timeZone']);
         });
     });
 
     describe('expectedRevision', () => {
         it('refuses a mismatch', () => {
             expect(
-                parsePreferencesUpdate({ diet: 'vegan', expectedRevision: 3 }, updateContext()),
+                parseUpdate({ diet: 'vegan', expectedRevision: 3 }, updateContext()),
             ).toMatchObject({ kind: 'stale_revision', currentRevision: 4 });
         });
 
         it('refuses its absence, because a full save only ever edits an existing row', () => {
-            expect(parsePreferencesUpdate({ diet: 'vegan' }, updateContext())).toMatchObject({
+            expect(parseUpdate({ diet: 'vegan' }, updateContext())).toMatchObject({
                 kind: 'stale_revision',
                 currentRevision: 4,
             });
         });
 
         it('reports a malformed revision as a field detail, not as a lost race', () => {
-            const verdict = parsePreferencesUpdate({ diet: 'vegan', expectedRevision: '4' }, updateContext());
+            const verdict = parseUpdate({ diet: 'vegan', expectedRevision: '4' }, updateContext());
 
             expect(codesFor(verdict, 'expectedRevision')).toEqual([PREFERENCE_FIELD_CODES.INVALID_TYPE]);
         });
@@ -2371,7 +2648,7 @@ describe('parsePreferencesUpdate', () => {
             // zero here compares equal to what an absent row reads back, so
             // without this rule a full save could materialise setup state that
             // the wizard never produced.
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { diet: 'vegan', expectedRevision },
                 updateContext({ currentRevision: null }),
             );
@@ -2384,12 +2661,12 @@ describe('parsePreferencesUpdate', () => {
 
         it('refuses a full save against no row even with no revision pinned at all', () => {
             expect(
-                parsePreferencesUpdate({ diet: 'vegan' }, updateContext({ currentRevision: null })),
+                parseUpdate({ diet: 'vegan' }, updateContext({ currentRevision: null })),
             ).toMatchObject({ kind: 'stale_revision', currentRevision: NO_PREFERENCES_REVISION });
         });
 
         it('still reports field problems before the missing row, because a field error is fixable', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { diet: 'keto', expectedRevision: NO_PREFERENCES_REVISION },
                 updateContext({ currentRevision: null }),
             );
@@ -2399,7 +2676,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('reports an unsafe-integer revision as malformed rather than as a lost race', () => {
-            const verdict = parsePreferencesUpdate({ diet: 'vegan', expectedRevision: 1e30 }, updateContext());
+            const verdict = parseUpdate({ diet: 'vegan', expectedRevision: 1e30 }, updateContext());
 
             expect(codesFor(verdict, 'expectedRevision')).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
         });
@@ -2407,7 +2684,7 @@ describe('parsePreferencesUpdate', () => {
 
     describe('omitted is not null', () => {
         it('clears a goal weight on an explicit null', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goalWeightKg: null, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose' }),
             );
@@ -2416,7 +2693,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('clears a pace on an explicit null once the goal no longer needs one', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { paceLbPerWeek: null, expectedRevision: 4 },
                 updateContext({ currentGoal: 'maintain' }),
             );
@@ -2427,7 +2704,7 @@ describe('parsePreferencesUpdate', () => {
         it('refuses to clear the pace of a goal that still has a direction', () => {
             // An explicit null is a real edit, so it is judged as one: 'lose'
             // with no pace cannot be estimated from at all.
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { paceLbPerWeek: null, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1 }),
             );
@@ -2436,7 +2713,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('leaves an omitted key out of the payload entirely', () => {
-            const verdict = parsePreferencesUpdate({ diet: 'vegan', expectedRevision: 4 }, updateContext());
+            const verdict = parseUpdate({ diet: 'vegan', expectedRevision: 4 }, updateContext());
 
             expect(Object.keys(payloadOf(verdict)).sort()).toEqual(['diet', 'expectedRevision']);
         });
@@ -2444,7 +2721,7 @@ describe('parsePreferencesUpdate', () => {
 
     describe('switching to maintenance', () => {
         it('normalises the pace and goal weight away, so no row holds a maintained pace', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'maintain', expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentWeightKg: 82.6 }),
             );
@@ -2458,7 +2735,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses maintenance sent WITH a pace, a contradiction inside one request', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'maintain', paceLbPerWeek: 1, expectedRevision: 4 },
                 updateContext(),
             );
@@ -2467,7 +2744,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses maintenance sent WITH a goal weight', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'maintain', goalWeightKg: 77, expectedRevision: 4 },
                 updateContext(),
             );
@@ -2476,7 +2753,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses a pace edited while the STORED goal is maintenance', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { paceLbPerWeek: 1, expectedRevision: 4 },
                 updateContext({ currentGoal: 'maintain' }),
             );
@@ -2485,7 +2762,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('accepts a pace once the same body moves the goal off maintenance', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'lose', paceLbPerWeek: 1.5, expectedRevision: 4 },
                 updateContext({ currentGoal: 'maintain' }),
             );
@@ -2496,7 +2773,7 @@ describe('parsePreferencesUpdate', () => {
 
     describe('the goal weight is judged against whichever weight ends up in force', () => {
         it('uses the stored weight when the body changes only the target', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goalWeightKg: 90, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentWeightKg: 82.6 }),
             );
@@ -2507,7 +2784,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('uses the weight in the same body when it changes too', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goalWeightKg: 90, weightKg: 95, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentWeightKg: 82.6 }),
             );
@@ -2520,7 +2797,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('uses the goal in the same body when it changes too', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'gain', goalWeightKg: 90, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentWeightKg: 82.6, currentPaceLbPerWeek: 1 }),
             );
@@ -2529,7 +2806,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses a target on the wrong side while gaining', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goalWeightKg: 70, expectedRevision: 4 },
                 updateContext({ currentGoal: 'gain', currentWeightKg: 82.6 }),
             );
@@ -2544,7 +2821,7 @@ describe('parsePreferencesUpdate', () => {
             // side check has nothing to compare with, so the value is stored as
             // given; refusing it would block an answer the screen allows, and
             // guessing a weight would refuse a legitimate target.
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goalWeightKg: 90, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentWeightKg: null }),
             );
@@ -2566,7 +2843,7 @@ describe('parsePreferencesUpdate', () => {
                 // The body never mentions the target, which is exactly why this
                 // has to be checked here: 77 kg was a valid losing target at
                 // 82.6 kg and is not one at 70 kg.
-                const verdict = parsePreferencesUpdate({ weightKg: 70, expectedRevision: 4 }, losing());
+                const verdict = parseUpdate({ weightKg: 70, expectedRevision: 4 }, losing());
 
                 expect(codesFor(verdict, 'goalWeightKg')).toEqual([
                     PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT,
@@ -2574,13 +2851,13 @@ describe('parsePreferencesUpdate', () => {
             });
 
             it('accepts a new current weight the stored target still sits below', () => {
-                const verdict = parsePreferencesUpdate({ weightKg: 95, expectedRevision: 4 }, losing());
+                const verdict = parseUpdate({ weightKg: 95, expectedRevision: 4 }, losing());
 
                 expect(payloadOf(verdict)).toEqual({ weightKg: 95, expectedRevision: 4 });
             });
 
             it('refuses a change of direction that leaves the stored target on the wrong side', () => {
-                const verdict = parsePreferencesUpdate(
+                const verdict = parseUpdate(
                     { goal: 'gain', paceLbPerWeek: 1, expectedRevision: 4 },
                     losing(),
                 );
@@ -2591,7 +2868,7 @@ describe('parsePreferencesUpdate', () => {
             });
 
             it('accepts a change of direction that sends the same body a fresh target', () => {
-                const verdict = parsePreferencesUpdate(
+                const verdict = parseUpdate(
                     { goal: 'gain', paceLbPerWeek: 1, goalWeightKg: 90, expectedRevision: 4 },
                     losing(),
                 );
@@ -2600,7 +2877,7 @@ describe('parsePreferencesUpdate', () => {
             });
 
             it('accepts a change of direction that clears the target outright', () => {
-                const verdict = parsePreferencesUpdate(
+                const verdict = parseUpdate(
                     { goal: 'gain', paceLbPerWeek: 1, goalWeightKg: null, expectedRevision: 4 },
                     losing(),
                 );
@@ -2617,7 +2894,7 @@ describe('parsePreferencesUpdate', () => {
                 // A row written before this rule existed must not block an
                 // unrelated edit: the diet save has nothing to do with the
                 // target, and refusing it would strand the settings screen.
-                const verdict = parsePreferencesUpdate(
+                const verdict = parseUpdate(
                     { diet: 'vegan', expectedRevision: 4 },
                     losing({ currentWeightKg: 70 }),
                 );
@@ -2626,25 +2903,25 @@ describe('parsePreferencesUpdate', () => {
             });
 
             it('reports one detail for one mistake, not two', () => {
-                const verdict = parsePreferencesUpdate({ weightKg: 70, expectedRevision: 4 }, losing());
+                const verdict = parseUpdate({ weightKg: 70, expectedRevision: 4 }, losing());
 
                 expect(detailsOf(verdict)).toHaveLength(1);
             });
 
             it('does not re-judge a weight the envelope already refused', () => {
-                const verdict = parsePreferencesUpdate({ weightKg: 10, expectedRevision: 4 }, losing());
+                const verdict = parseUpdate({ weightKg: 10, expectedRevision: 4 }, losing());
 
                 expect(fieldsOf(verdict)).toEqual(['weightKg']);
             });
 
             it('does not re-judge a target the envelope already refused', () => {
-                const verdict = parsePreferencesUpdate({ goalWeightKg: 400, expectedRevision: 4 }, losing());
+                const verdict = parseUpdate({ goalWeightKg: 400, expectedRevision: 4 }, losing());
 
                 expect(codesFor(verdict, 'goalWeightKg')).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
             });
 
             it('leaves maintenance alone, whose target is cleared rather than compared', () => {
-                const verdict = parsePreferencesUpdate({ goal: 'maintain', expectedRevision: 4 }, losing());
+                const verdict = parseUpdate({ goal: 'maintain', expectedRevision: 4 }, losing());
 
                 expect(payloadOf(verdict)).toEqual({
                     goal: 'maintain',
@@ -2662,7 +2939,7 @@ describe('parsePreferencesUpdate', () => {
             // sending one stores a goal no estimate can be computed from — which
             // surfaces later as an unexplained estimate_unavailable on the
             // review screen rather than as a rejected save.
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'lose', expectedRevision: 4 },
                 updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
             );
@@ -2671,7 +2948,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it.each([0.5, 1, 1.5] as const)('accepts a switch that supplies the pace %p', (paceLbPerWeek) => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'gain', paceLbPerWeek, expectedRevision: 4 },
                 updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
             );
@@ -2680,7 +2957,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('accepts a switch that keeps a pace already stored', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'gain', expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1.5 }),
             );
@@ -2689,7 +2966,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('accepts a pace edit on its own, which changes the pair\u2019s other half not at all', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { paceLbPerWeek: 0.5, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1 }),
             );
@@ -2698,7 +2975,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('leaves a pace-less directional row alone when the body changes neither half', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { diet: 'vegan', expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: null }),
             );
@@ -2707,7 +2984,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('reports one detail for a pace that is present but unknown, not two', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'lose', paceLbPerWeek: 2, expectedRevision: 4 },
                 updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
             );
@@ -2716,7 +2993,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('says nothing about the pace when the goal itself was refused', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'shrink', expectedRevision: 4 },
                 updateContext({ currentGoal: 'maintain', currentPaceLbPerWeek: null }),
             );
@@ -2725,7 +3002,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('accepts maintenance with no pace, which is the one goal that needs none', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { goal: 'maintain', expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose', currentPaceLbPerWeek: 1 }),
             );
@@ -2747,7 +3024,7 @@ describe('parsePreferencesUpdate', () => {
         ];
 
         it('judges times against the stored schedule when the body omits one', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealTimes: times, expectedRevision: 4 },
                 updateContext({ currentMealSchedule: 'three' }),
             );
@@ -2756,7 +3033,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses times when no schedule is known either way', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealTimes: times, expectedRevision: 4 },
                 updateContext(),
             );
@@ -2765,7 +3042,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('judges times against the schedule in the same body', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealSchedule: 'three_plus_snack', mealTimes: times, expectedRevision: 4 },
                 updateContext({ currentMealSchedule: 'three' }),
             );
@@ -2774,7 +3051,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('requires new times when the schedule CHANGES, since the stored set is the wrong size', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealSchedule: 'three_plus_snack', expectedRevision: 4 },
                 updateContext({ currentMealSchedule: 'three' }),
             );
@@ -2783,7 +3060,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('accepts a schedule re-sent unchanged without times', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealSchedule: 'three', expectedRevision: 4 },
                 updateContext({ currentMealSchedule: 'three' }),
             );
@@ -2792,7 +3069,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses an unknown schedule', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealSchedule: 'five', expectedRevision: 4 },
                 updateContext(),
             );
@@ -2801,7 +3078,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('reports a cleared schedule as required, not as an unknown value', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealSchedule: null, expectedRevision: 4 },
                 updateContext({ currentMealSchedule: 'three' }),
             );
@@ -2810,7 +3087,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('requires times on a first schedule save, when there is no stored set to keep', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { mealSchedule: 'three', expectedRevision: 4 },
                 updateContext({ currentMealSchedule: null }),
             );
@@ -2821,7 +3098,7 @@ describe('parsePreferencesUpdate', () => {
 
     describe('the budget pair', () => {
         it('clears a stored amount when no preference becomes the answer', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { noBudgetPreference: true, expectedRevision: 4 },
                 updateContext({ currentBudget: { amount: 120, currency: 'USD' } }),
             );
@@ -2834,7 +3111,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('requires an amount when no preference is switched off with nothing stored', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { noBudgetPreference: false, expectedRevision: 4 },
                 updateContext({ currentBudget: null, currentNoBudgetPreference: true }),
             );
@@ -2847,7 +3124,7 @@ describe('parsePreferencesUpdate', () => {
             // "an amount", and the amount the row already holds is that answer —
             // so the settings screen does not have to re-send a figure the user
             // never edited.
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { noBudgetPreference: false, expectedRevision: 4 },
                 updateContext({
                     currentBudget: { amount: 120, currency: 'USD' },
@@ -2863,7 +3140,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('accepts an amount against a stored "no preference" of false', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { budget: { amount: 150, currency: 'USD' }, expectedRevision: 4 },
                 updateContext({ currentNoBudgetPreference: false }),
             );
@@ -2876,7 +3153,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses an amount while the stored answer is "no preference"', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { budget: { amount: 150, currency: 'USD' }, expectedRevision: 4 },
                 updateContext({ currentNoBudgetPreference: true }),
             );
@@ -2885,7 +3162,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('accepts both halves changing together', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { budget: { amount: 210, currency: 'USD' }, noBudgetPreference: false, expectedRevision: 4 },
                 updateContext({ currentNoBudgetPreference: true }),
             );
@@ -2896,7 +3173,7 @@ describe('parsePreferencesUpdate', () => {
 
     describe('the remaining editable keys', () => {
         it('accepts every measurement, selection and preference at once', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 {
                     age: 34,
                     heightCm: 177.8,
@@ -2915,7 +3192,9 @@ describe('parsePreferencesUpdate', () => {
                 updateContext(),
             );
 
-            expect(payloadOf(verdict)).toEqual({
+            // The body's own 'Etc/UTC' overrides the helper's zone and comes back
+            // canonicalised, which is what the second argument asserts.
+            expect(payloadOf(verdict, normalizeTimeZone('UTC'))).toEqual({
                 age: 34,
                 heightCm: 177.8,
                 weightKg: 82.6,
@@ -2927,7 +3206,6 @@ describe('parsePreferencesUpdate', () => {
                 dislikedFoodIds: [UUIDS[0]],
                 dislikedFoodGroups: ['Mushroom', 'olive'],
                 cookingTimeLimitMin: 45,
-                timeZone: normalizeTimeZone('UTC'),
                 expectedRevision: 4,
             });
         });
@@ -2953,7 +3231,7 @@ describe('parsePreferencesUpdate', () => {
             ['paceLbPerWeek', 2, PREFERENCE_FIELD_CODES.UNKNOWN_VALUE],
             ['goalWeightKg', 400, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
         ])('reports %s of %p as %s', (field, value, code) => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { [field]: value, expectedRevision: 4 },
                 updateContext({ currentGoal: 'lose' }),
             );
@@ -2962,7 +3240,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('carries an allergen contradiction through from the shared rule', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { allergens: ['none', 'milk'], expectedRevision: 4 },
                 updateContext(),
             );
@@ -2971,7 +3249,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('carries a malformed dislike id through from the shared rule', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { dislikedFoodIds: ['mushrooms'], expectedRevision: 4 },
                 updateContext(),
             );
@@ -2984,7 +3262,7 @@ describe('parsePreferencesUpdate', () => {
             [[7], PREFERENCE_FIELD_CODES.INVALID_TYPE],
             [['  '], PREFERENCE_FIELD_CODES.INVALID_TYPE],
         ])('reports the food-group list %p', (dislikedFoodGroups, code) => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { dislikedFoodGroups, expectedRevision: 4 },
                 updateContext(),
             );
@@ -2993,7 +3271,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('bounds the food-group list', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 {
                     dislikedFoodGroups: Array.from({ length: MAX_DISLIKED_FOOD_IDS + 1 }, (_, i) => `g${i}`),
                     expectedRevision: 4,
@@ -3009,14 +3287,14 @@ describe('parsePreferencesUpdate', () => {
                 Array.from({ length: count }, (_, index) => `group-${index}`);
 
             expect(
-                parsePreferencesUpdate(
+                parseUpdate(
                     { dislikedFoodGroups: groups(100), expectedRevision: 4 },
                     updateContext(),
                 ).kind,
             ).toBe('ok');
             expect(
                 codesFor(
-                    parsePreferencesUpdate(
+                    parseUpdate(
                         { dislikedFoodGroups: groups(101), expectedRevision: 4 },
                         updateContext(),
                     ),
@@ -3026,7 +3304,7 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('reports a read-only key and a field error in the same refusal', () => {
-            const verdict = parsePreferencesUpdate(
+            const verdict = parseUpdate(
                 { revision: 9, diet: 'keto', expectedRevision: 4 },
                 updateContext(),
             );
@@ -3039,6 +3317,548 @@ describe('parsePreferencesUpdate', () => {
 /* ---------------------------------------------------------------------------
  * The setup state machine
  * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * The context-free envelope
+ *
+ * These two parsers exist so a service can refuse a structurally malformed
+ * request BEFORE it reads the stored row (AAP §0.5.2, "validation applied
+ * before any Prisma or planning work"). What makes them worth their own tests
+ * is the pair of properties they must hold at once: they must catch everything
+ * that needs no context, and they must judge nothing that does — an envelope
+ * that "helpfully" reported a stale revision or an incoherent goal weight would
+ * be answering a question it cannot see the data for.
+ * ------------------------------------------------------------------------- */
+
+describe('parseSetupStepRequest', () => {
+    const goalEnvelopeBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        goal: 'lose',
+        paceLbPerWeek: 1,
+        timeZone: ZONE,
+        expectedRevision: 4,
+        ...overrides,
+    });
+
+    it('accepts a well-formed body', () => {
+        expect(parseSetupStepRequest('goal', goalEnvelopeBody())).toEqual({ kind: 'ok' });
+    });
+
+    it('accepts a first save that pins no revision, which only the row can judge', () => {
+        expect(
+            parseSetupStepRequest('goal', goalEnvelopeBody({ expectedRevision: undefined })),
+        ).toEqual({ kind: 'ok' });
+    });
+
+    it('refuses a step segment that names no payload-bearing step', () => {
+        expect(codesFor(parseSetupStepRequest('goals', goalEnvelopeBody()), 'step')).toEqual([
+            PREFERENCE_FIELD_CODES.UNKNOWN_STEP,
+        ]);
+    });
+
+    it('refuses the resume-marker-only step, which saves through the targets endpoint', () => {
+        expect(codesFor(parseSetupStepRequest('targets_manual', { timeZone: ZONE }), 'step')).toEqual([
+            PREFERENCE_FIELD_CODES.UNKNOWN_STEP,
+        ]);
+    });
+
+    it.each([undefined, null, 'goal', [1], 7])('refuses the body %p', (body) => {
+        expect(codesFor(parseSetupStepRequest('goal', body), 'body')).toEqual([
+            PREFERENCE_FIELD_CODES.INVALID_TYPE,
+        ]);
+    });
+
+    it('refuses a server-owned key', () => {
+        expect(
+            codesFor(parseSetupStepRequest('goal', goalEnvelopeBody({ setupStatus: 'completed' })), 'setupStatus'),
+        ).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+    });
+
+    it('refuses a key that belongs to another step', () => {
+        expect(
+            codesFor(parseSetupStepRequest('goal', goalEnvelopeBody({ activityLevel: 'active' })), 'activityLevel'),
+        ).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+    });
+
+    it('refuses a missing zone', () => {
+        expect(
+            codesFor(parseSetupStepRequest('goal', goalEnvelopeBody({ timeZone: undefined })), 'timeZone'),
+        ).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+    });
+
+    it('refuses an unknown zone', () => {
+        expect(
+            codesFor(parseSetupStepRequest('goal', goalEnvelopeBody({ timeZone: 'Mars/Phobos' })), 'timeZone'),
+        ).toEqual([PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE]);
+    });
+
+    it.each([
+        ['4', PREFERENCE_FIELD_CODES.INVALID_TYPE],
+        [Number.NaN, PREFERENCE_FIELD_CODES.INVALID_TYPE],
+        [4.5, PREFERENCE_FIELD_CODES.NOT_AN_INTEGER],
+        [-1, PREFERENCE_FIELD_CODES.BELOW_MINIMUM],
+        [MAX_REVISION + 1, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
+        [1e30, PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM],
+    ])('refuses the revision token %p as %s', (expectedRevision, code) => {
+        expect(
+            codesFor(parseSetupStepRequest('goal', goalEnvelopeBody({ expectedRevision })), 'expectedRevision'),
+        ).toEqual([code]);
+    });
+
+    it('names every envelope problem at once, in the order this endpoint has always used', () => {
+        const verdict = parseSetupStepRequest(
+            'goal',
+            goalEnvelopeBody({ setupStatus: 'completed', timeZone: 'Mars/Phobos', expectedRevision: 4.5 }),
+        );
+
+        expect(fieldsOf(verdict).sort()).toEqual(['expectedRevision', 'setupStatus', 'timeZone']);
+        // Unsorted, because this refusal is the one a client reads for a
+        // malformed envelope: the service answers with it before the row is
+        // read, so the authoritative parse never gets to reply. Lifting these
+        // checks out of that parse moved them; it must not have resequenced
+        // them.
+        expect(fieldsOf(verdict)).toEqual(['setupStatus', 'timeZone', 'expectedRevision']);
+    });
+
+    it('judges nothing that needs the stored row: a stale revision passes the envelope', () => {
+        // The comparison against the stored counter is a 409 the row decides, and
+        // the envelope has no row. Reporting it here would turn a lost race into
+        // a malformed request.
+        expect(parseSetupStepRequest('goal', goalEnvelopeBody({ expectedRevision: 99 }))).toEqual({
+            kind: 'ok',
+        });
+    });
+
+    it('judges the field rules too, which need no row at all', () => {
+        // AAP 0.5.2 puts field validation before any Prisma work, so an unknown
+        // goal and an out-of-range pace are answered here — and together, which
+        // is what lets the screen show both controls at once (AAP 0.7.4).
+        const verdict = parseSetupStepRequest('goal', goalEnvelopeBody({ goal: 'shrink', paceLbPerWeek: 9 }));
+
+        expect(verdict).toEqual(
+            parseSetupStep(
+                'goal',
+                goalEnvelopeBody({ goal: 'shrink', paceLbPerWeek: 9 }),
+                stepContext({ currentRevision: 4 }),
+            ),
+        );
+        expect(codesFor(verdict, 'goal')).toEqual([PREFERENCE_FIELD_CODES.UNKNOWN_VALUE]);
+        expect(codesFor(verdict, 'paceLbPerWeek')).toEqual([PREFERENCE_FIELD_CODES.UNKNOWN_VALUE]);
+    });
+
+    it.each([
+        ['activity', { activityLevel: 'sprinting' }, 'activityLevel'],
+        ['diet', { diet: 'carnivore', allergens: [] }, 'diet'],
+        ['diet', { diet: 'none', allergens: ['none', 'milk'] }, 'allergens'],
+        ['schedule', { mealSchedule: 'three', mealTimes: [{ slot: 'breakfast', time: '25:00' }] }, 'mealTimes'],
+        ['cooking', { cookingTimeLimitMin: 37, noBudgetPreference: true }, 'cookingTimeLimitMin'],
+        ['dislikes', { dislikedFoodIds: ['not-a-uuid'] }, 'dislikedFoodIds[0]'],
+    ])('refuses the %s step field %s without a row', (step, body, field) => {
+        expect(
+            codesFor(parseSetupStepRequest(step, { ...body, timeZone: ZONE, expectedRevision: 4 }), field),
+        ).not.toEqual([]);
+    });
+
+    it('names an envelope problem and a field problem in the same complete 400', () => {
+        // The mixed case: without this the extraction would have answered with
+        // the zone alone and left the screen to discover the diet on a second
+        // round trip.
+        const body = { activityLevel: 'sprinting', setupStatus: 'completed', expectedRevision: 4 };
+
+        expect(fieldsOf(parseSetupStepRequest('activity', body))).toEqual([
+            'setupStatus',
+            'timeZone',
+            'activityLevel',
+        ]);
+        // And it is exactly what the row-backed parse would have said.
+        expect(parseSetupStepRequest('activity', body)).toEqual(
+            parseSetupStep('activity', body, stepContext({ currentRevision: 4 })),
+        );
+    });
+
+    it('yields instead of answering when a rule that needs the row was also applicable', () => {
+        // `goalWeightKg` is judged against the STORED current weight, so a
+        // refusal from this stage could be missing that detail. Rather than
+        // report a shorter list than the screen must show, the stage defers the
+        // whole answer to the row-backed parse.
+        expect(
+            parseSetupStepRequest('goal', goalEnvelopeBody({ goal: 'shrink', goalWeightKg: 70 })),
+        ).toEqual({ kind: 'ok' });
+        // The same body without the row-dependent answer is refused here.
+        expect(codesFor(parseSetupStepRequest('goal', goalEnvelopeBody({ goal: 'shrink' })), 'goal')).toEqual([
+            PREFERENCE_FIELD_CODES.UNKNOWN_VALUE,
+        ]);
+    });
+});
+
+describe('parsePreferencesUpdateRequest', () => {
+    it('accepts a well-formed partial', () => {
+        expect(
+            parsePreferencesUpdateRequest({ diet: 'vegan', timeZone: ZONE, expectedRevision: 4 }),
+        ).toEqual({ kind: 'ok' });
+    });
+
+    it.each([undefined, null, 'diet', [1]])('refuses the body %p', (body) => {
+        expect(codesFor(parsePreferencesUpdateRequest(body), 'body')).toEqual([
+            PREFERENCE_FIELD_CODES.INVALID_TYPE,
+        ]);
+    });
+
+    it.each(['setupStatus', 'setupStep', 'revision', 'budgetTier', 'hasActivePlan', 'targetRoute'])(
+        'refuses the server-owned key %s',
+        (key) => {
+            expect(
+                codesFor(
+                    parsePreferencesUpdateRequest({ [key]: 'x', timeZone: ZONE, expectedRevision: 4 }),
+                    key,
+                ),
+            ).toEqual([PREFERENCE_FIELD_CODES.READ_ONLY_FIELD]);
+        },
+    );
+
+    it('refuses a body that edits nothing but the envelope', () => {
+        expect(codesFor(parsePreferencesUpdateRequest({ timeZone: ZONE, expectedRevision: 4 }), 'body')).toEqual(
+            [PREFERENCE_FIELD_CODES.REQUIRED],
+        );
+    });
+
+    it('refuses a missing zone', () => {
+        expect(
+            codesFor(parsePreferencesUpdateRequest({ diet: 'vegan', expectedRevision: 4 }), 'timeZone'),
+        ).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+    });
+
+    it('refuses an unknown zone', () => {
+        expect(
+            codesFor(
+                parsePreferencesUpdateRequest({ diet: 'vegan', timeZone: 'Mars/Phobos', expectedRevision: 4 }),
+                'timeZone',
+            ),
+        ).toEqual([PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE]);
+    });
+
+    it('refuses a revision token no integer column could hold', () => {
+        expect(
+            codesFor(
+                parsePreferencesUpdateRequest({ diet: 'vegan', timeZone: ZONE, expectedRevision: 1e30 }),
+                'expectedRevision',
+            ),
+        ).toEqual([PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM]);
+    });
+
+    it('reports every envelope problem together, in the order this endpoint has always used', () => {
+        // Pinned for the same reason as the step envelope's: this refusal is
+        // what a client reads for a malformed envelope, because the service
+        // answers with it before reading the row. Note the sequence differs
+        // from the step endpoint's (revision before zone here, after it there)
+        // — each endpoint keeps the order it already had rather than being
+        // harmonised, which would change an answer no finding asked about.
+        expect(
+            fieldsOf(
+                parsePreferencesUpdateRequest({
+                    nickname: 'x',
+                    expectedRevision: 'four',
+                    timeZone: 'Mars/Phobos',
+                }),
+            ),
+        ).toEqual(['nickname', 'expectedRevision', 'timeZone']);
+    });
+
+    it('judges nothing that needs the stored row', () => {
+        // Both of these are refusals the row decides — a revision that lost the
+        // race, and a target weight on the wrong side of a stored current weight
+        // — so this stage must let them through.
+        expect(
+            parsePreferencesUpdateRequest({ diet: 'vegan', timeZone: ZONE, expectedRevision: 99 }),
+        ).toEqual({ kind: 'ok' });
+        expect(
+            parsePreferencesUpdateRequest({ goalWeightKg: 200, timeZone: ZONE, expectedRevision: 4 }),
+        ).toEqual({ kind: 'ok' });
+    });
+
+    it('names every envelope problem at once', () => {
+        const verdict = parsePreferencesUpdateRequest({ nickname: 'x', expectedRevision: 4.5 });
+
+        expect(fieldsOf(verdict).sort()).toEqual(['expectedRevision', 'nickname', 'timeZone']);
+    });
+
+    it.each([
+        [{ diet: 'carnivore' }, 'diet'],
+        [{ age: 7 }, 'age'],
+        [{ activityLevel: 'sprinting' }, 'activityLevel'],
+        [{ allergens: ['none', 'milk'] }, 'allergens'],
+        [{ cookingTimeLimitMin: 37 }, 'cookingTimeLimitMin'],
+        [{ weightKg: 500, goal: 'lose', goalWeightKg: 400, paceLbPerWeek: 1 }, 'weightKg'],
+        [{ heightCm: 400 }, 'heightCm'],
+        [{ sexForEstimate: 'other' }, 'sexForEstimate'],
+        [{ dislikedFoodIds: ['not-a-uuid'] }, 'dislikedFoodIds[0]'],
+        [{ mealSchedule: 'four', mealTimes: [] }, 'mealSchedule'],
+    ])('refuses %p on the field itself, with no row (AAP 0.5.2)', (edit, field) => {
+        expect(
+            codesFor(parsePreferencesUpdateRequest({ ...edit, timeZone: ZONE, expectedRevision: 4 }), field),
+        ).not.toEqual([]);
+    });
+
+    it('names an envelope problem and a field problem in the same complete 400', () => {
+        // The case the extraction had narrowed: a missing zone AND an invalid
+        // diet came back as the zone alone, leaving the screen to discover the
+        // diet on a second round trip.
+        const body = { diet: 'carnivore', expectedRevision: 4 };
+        const verdict = parsePreferencesUpdateRequest(body);
+
+        expect(fieldsOf(verdict)).toEqual(['diet', 'timeZone']);
+        // Identical to what the row-backed parse answers, detail for detail and
+        // in the same order — this stage narrows nothing.
+        expect(verdict).toEqual(parsePreferencesUpdate(body, { currentRevision: 4 }));
+    });
+
+    it.each([
+        ['the goal without its pace', { goal: 'lose' }],
+        ['a target weight without the current one', { goalWeightKg: 70 }],
+        ['meal times without the schedule', { mealTimes: [] }],
+        ['a budget amount without the checkbox', { budget: { amount: 0, currency: 'USD' } }],
+    ])('yields on %s, because the row holds the other half', (_label, edit) => {
+        // Each of these bodies ALSO carries a refusable field, and the stage
+        // still yields: answering would name fewer controls than the row-backed
+        // parse will.
+        expect(
+            parsePreferencesUpdateRequest({ ...edit, diet: 'carnivore', timeZone: ZONE, expectedRevision: 4 }),
+        ).toEqual({ kind: 'ok' });
+    });
+
+    it('does not invent a refusal the stored half would have cleared', () => {
+        // The regression this staging must not cause: a user whose stored pace
+        // is 1 lb/week switching to `lose` sends no pace, and that is correct.
+        expect(
+            parsePreferencesUpdateRequest({ goal: 'lose', timeZone: ZONE, expectedRevision: 4 }),
+        ).toEqual({ kind: 'ok' });
+        expect(
+            parsePreferencesUpdateRequest({ budget: null, timeZone: ZONE, expectedRevision: 4 }),
+        ).toEqual({ kind: 'ok' });
+        expect(
+            parsePreferencesUpdateRequest({ mealTimes: [], timeZone: ZONE, expectedRevision: 4 }),
+        ).toEqual({ kind: 'ok' });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The target route a full save leaves behind
+ *
+ * `target_route` is server-owned, and before this rule existed only a body-STEP
+ * save could resolve it — so the settings screens, which edit the same answers
+ * through the full save, could leave the column contradicting the answers: the
+ * estimated route for a user who now declines to state a sex (whose targets
+ * would then be calculated from an assumed one), or the manual route for a user
+ * whose measurements are now complete.
+ * ------------------------------------------------------------------------- */
+
+describe('isBodyAnswerComplete', () => {
+    const complete: BodyAnswerFacts = { age: 34, heightCm: 177.8, weightKg: 82.6, sexForEstimate: 'male' };
+
+    it('accepts the four measurements the measured body step stores', () => {
+        expect(isBodyAnswerComplete(complete)).toBe(true);
+    });
+
+    it.each(['age', 'heightCm', 'weightKg', 'sexForEstimate'] as const)(
+        'refuses an answer missing %s',
+        (key) => {
+            expect(isBodyAnswerComplete({ ...complete, [key]: null })).toBe(false);
+        },
+    );
+
+    it('counts "prefer not to say" as an answer, because it is one', () => {
+        expect(isBodyAnswerComplete({ ...complete, sexForEstimate: 'prefer_not_to_say' })).toBe(true);
+    });
+});
+
+describe('resolveTargetRouteForUpdate', () => {
+    const measured: BodyAnswerFacts = { age: 34, heightCm: 177.8, weightKg: 82.6, sexForEstimate: 'male' };
+
+    it('moves an estimated user to manual when they decline to state a sex', () => {
+        expect(
+            resolveTargetRouteForUpdate('estimated', { ...measured, sexForEstimate: 'prefer_not_to_say' }),
+        ).toBe('manual');
+    });
+
+    it('moves a manual user to estimated once a measured answer is complete', () => {
+        expect(resolveTargetRouteForUpdate('manual', measured)).toBe('estimated');
+    });
+
+    it.each(['female', 'male'] as const)('reads %s as calculable', (sexForEstimate) => {
+        expect(resolveTargetRouteForUpdate('manual', { ...measured, sexForEstimate })).toBe('estimated');
+    });
+
+    it('writes nothing when the body answer is not mentioned at all', () => {
+        expect(resolveTargetRouteForUpdate('estimated', { ...measured, sexForEstimate: null })).toBeUndefined();
+    });
+
+    it('writes nothing when the derived route is the stored one', () => {
+        expect(resolveTargetRouteForUpdate('estimated', measured)).toBeUndefined();
+        expect(
+            resolveTargetRouteForUpdate('manual', { ...measured, sexForEstimate: 'prefer_not_to_say' }),
+        ).toBeUndefined();
+    });
+
+    it('keeps a manual route while a measured answer is still incomplete', () => {
+        // Skip stores no measurements, so a settings edit that supplies a sex
+        // alone has not made the estimate calculable and must not claim it has.
+        expect(resolveTargetRouteForUpdate('manual', { ...measured, weightKg: null })).toBeUndefined();
+    });
+
+    it('never writes a route for a user whose body step is unanswered', () => {
+        // The route doubles as the server's proof THAT the body step was
+        // answered, so writing one from a partial settings edit would fabricate
+        // onboarding progress for measurements never given.
+        expect(
+            resolveTargetRouteForUpdate(null, { age: null, heightCm: null, weightKg: null, sexForEstimate: 'male' }),
+        ).toBeUndefined();
+        expect(
+            resolveTargetRouteForUpdate(null, {
+                age: null,
+                heightCm: null,
+                weightKg: null,
+                sexForEstimate: 'prefer_not_to_say',
+            }),
+        ).toBeUndefined();
+    });
+
+    it('resolves the route for an unanswered body step once the whole answer arrives', () => {
+        expect(resolveTargetRouteForUpdate(null, measured)).toBe('estimated');
+        expect(
+            resolveTargetRouteForUpdate(null, { ...measured, sexForEstimate: 'prefer_not_to_say' }),
+        ).toBe('manual');
+    });
+
+    it('agrees with the body step on the same answer', () => {
+        // One model of which answers are calculable, reachable through two
+        // endpoints: a disagreement here is a user whose targets change meaning
+        // depending on which screen they edited.
+        expect(resolveTargetRouteForUpdate(null, measured)).toBe(
+            resolveTargetRouteForBodyStep({
+                timeZone: ZONE,
+                age: measured.age as number,
+                heightCm: measured.heightCm as number,
+                weightKg: measured.weightKg as number,
+                sexForEstimate: 'male',
+                heightUnitPref: 'cm',
+                weightUnitPref: 'kg',
+            }),
+        );
+    });
+});
+
+describe('reconcileSetupStateForRoute', () => {
+    it('pulls a ready-for-review user back to an answer their new route requires', () => {
+        // The manual route never asks for an activity level, so a manual user who
+        // supplies a measured sex from the settings screen becomes an estimated
+        // user who is missing a required answer — and `ready_for_review` would
+        // otherwise promise a plan could be generated from it.
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({
+                    setupStatus: 'ready_for_review',
+                    setupStep: 'review',
+                    targetRoute: 'manual',
+                    answers: allAnswers({ activityLevel: null }),
+                }),
+                'estimated',
+            ),
+        ).toEqual({ setupStatus: 'in_progress', setupStep: 'activity' });
+    });
+
+    it('never touches a completed user, who already has a plan', () => {
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({
+                    setupStatus: 'completed',
+                    setupStep: 'review',
+                    targetRoute: 'manual',
+                    answers: allAnswers({ activityLevel: null }),
+                }),
+                'estimated',
+            ),
+        ).toBeUndefined();
+    });
+
+    it('never touches a not-started row, which records no progress to reconcile', () => {
+        // That row exists for the legacy user whose first meal-planning write was
+        // a target save; it holds targets, not onboarding progress.
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({ setupStatus: 'not_started', answers: noAnswers() }),
+                'estimated',
+            ),
+        ).toBeUndefined();
+    });
+
+    it('leaves a user alone when every required answer of the new route is on record', () => {
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({
+                    setupStatus: 'ready_for_review',
+                    setupStep: 'review',
+                    targetRoute: 'estimated',
+                    answers: allAnswers(),
+                }),
+                'manual',
+            ),
+        ).toBeUndefined();
+    });
+
+    it('leaves a user alone when the marker already sits at or before the missing answer', () => {
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({
+                    setupStatus: 'in_progress',
+                    setupStep: 'activity',
+                    targetRoute: 'manual',
+                    answers: allAnswers({ activityLevel: null }),
+                }),
+                'estimated',
+            ),
+        ).toBeUndefined();
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({
+                    setupStatus: 'in_progress',
+                    setupStep: 'body',
+                    targetRoute: 'manual',
+                    answers: allAnswers({ activityLevel: null }),
+                }),
+                'estimated',
+            ),
+        ).toBeUndefined();
+    });
+
+    it('reconciles a marker the new route does not contain at all', () => {
+        // `targets_manual` is a stop of the manual route only, so an estimated
+        // route leaves it as a marker nothing can answer.
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({
+                    setupStatus: 'in_progress',
+                    setupStep: 'targets_manual',
+                    targetRoute: 'manual',
+                    answers: allAnswers({ activityLevel: null }),
+                }),
+                'estimated',
+            ),
+        ).toEqual({ setupStatus: 'in_progress', setupStep: 'activity' });
+    });
+
+    it('names the FIRST missing answer of the new route', () => {
+        expect(
+            reconcileSetupStateForRoute(
+                snapshot({
+                    setupStatus: 'ready_for_review',
+                    setupStep: 'review',
+                    targetRoute: 'manual',
+                    answers: allAnswers({ goal: null, activityLevel: null }),
+                }),
+                'estimated',
+            ),
+        ).toEqual({ setupStatus: 'in_progress', setupStep: 'goal' });
+    });
+});
 
 describe('routeStepOrder and requiredSetupSteps', () => {
     it('walks the estimated route through all seven counted steps', () => {

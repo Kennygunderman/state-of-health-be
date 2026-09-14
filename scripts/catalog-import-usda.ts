@@ -751,7 +751,13 @@ export const deriveSafetyTags = (
     if (animalCategory || hasMarker(derivation.animalMarkers)) {
         dietTags.delete('vegan');
         dietTags.delete('vegetarian');
-        dietTags.delete('pescatarian_ok');
+        // Meat and poultry are not pescatarian either, so the third tag goes
+        // too. Spelled 'pescatarian' to match dietTagVocabulary in
+        // usda-manifest.v1.json and the only spelling
+        // recipe.logic.ts::isDietCompatible matches: were this literal to drift
+        // from the vocabulary the delete would silently miss, and every meat
+        // food would be published as pescatarian-admissible.
+        dietTags.delete('pescatarian');
     } else if (category === 'protein_seafood' || hasMarker(derivation.seafoodMarkers)) {
         dietTags.delete('vegan');
         dietTags.delete('vegetarian');

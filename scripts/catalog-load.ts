@@ -11,10 +11,25 @@
 // row counts after the load equal the manifest's (Agent Action Plan §0.7.1
 // Group 3). Rerunning it is a no-op.
 //
-// WHAT IT DOES IN THIS REVISION. No release has been produced:
-// data/meal-planning/catalog/releases/ does not exist in this checkout, and the
-// release artefact is an Agent Action Plan §0.7.1 Group 3 deliverable. This
-// entry point is therefore the stage's input contract: it parses its flags,
+// THE EMPTY components.jsonl IS LOADED, NOT SKIPPED. A release whose catalog is
+// entirely source-backed single-ingredient records carries zero component rows,
+// and that empty set is an assertion the loader must apply rather than ignore:
+// because each food's components are replaced WHOLESALE, loading a release with
+// no rows for a food is what removes a composition the previous release had, so
+// treating the empty member as "nothing to do" would leave a stale composition
+// behind and let a food's stored nutrition disagree with what it is derived
+// from. The row-count reconciliation covers the member for the same reason — 0
+// expected against 0 observed is a check that passed, not a check that was
+// absent — and it is the load-time counterpart of the export-time invariant in
+// catalog-release.ts: a published `ingredient_derived` food must carry at least
+// one component row, so an empty components.jsonl is only ever valid alongside
+// an empty published ingredient-derived set.
+//
+// WHAT IT DOES IN THIS REVISION. The reviewed release
+// data/meal-planning/catalog/releases/v1/ is present — five checksummed JSONL
+// members and their manifest — but the reconciliation that applies it is still
+// an Agent Action Plan §0.7.1 Group 3 deliverable. This entry point is
+// therefore the stage's input contract: it parses its flags,
 // reports the accepted database origin, checks the release it was asked to load
 // — the id, its manifest, and the presence of every file that manifest lists —
 // and refuses, naming either the unsatisfied inputs and their remedies or the

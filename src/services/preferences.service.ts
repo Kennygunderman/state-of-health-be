@@ -49,10 +49,16 @@ import {
     WeightUnitPref,
 } from '../types/mealPlanning';
 import { StaleRevisionError } from './mealPlanning.errors';
-import { withUserLock } from './mealPlanningAction.service';
+import {
+    MealPlanningTransactionClient,
+    withMealPlanningTransaction,
+    withUserLock,
+} from './mealPlanningAction.service';
 import {
     BUDGET_CURRENCY,
+    NO_PREFERENCES_REVISION,
     ParsedSetupStepPayload,
+    PreferenceRequestVerdict,
     PreferenceErrorVerdict,
     PreferenceRefusal,
     PREFERENCE_FIELD_CODES,
@@ -63,8 +69,12 @@ import {
     mealsPerDayForSchedule,
     nextSetupState,
     parsePreferencesUpdate,
+    parsePreferencesUpdateRequest,
     parseSetupStep,
+    parseSetupStepRequest,
+    reconcileSetupStateForRoute,
     resolveTargetRouteForBodyStep,
+    resolveTargetRouteForUpdate,
     SetupStateSnapshot,
     SetupStepContext,
     PreferencesUpdateContext,
@@ -753,7 +763,7 @@ interface PlanFlagRecomputation {
  * written by generation from a closed set, so this is unreachable in practice.
  */
 const recomputePlanFlags = async (
-    tx: Prisma.TransactionClient,
+    tx: MealPlanningTransactionClient,
     userId: string,
     planId: string,
     preferences: PlanningPreferences,
@@ -839,10 +849,21 @@ const recomputePlanFlags = async (
  * preference edit that affects nothing cannot invalidate every other client's
  * pinned plan revision.
  *
- * `tx` is REQUIRED, not defaulted: the recomputation must commit with the
- * preference write that caused it, and it runs under the per-user advisory lock
- * the caller already took, so a generation cannot interleave with it. A
- * `prisma`-shaped default would silently give up both properties.
+ * `tx` is REQUIRED, not defaulted, and is the BRANDED
+ * {@link MealPlanningTransactionClient} rather than Prisma's own
+ * `TransactionClient`: the recomputation is several writes that must commit with
+ * the preference write that caused it, under the per-user advisory lock the
+ * caller already took. `Prisma.TransactionClient` is structurally WIDER than
+ * `PrismaClient`, so the global autocommit client satisfies it — and on that
+ * client each of these statements would commit alone, with the lock already
+ * released, which is exactly the misuse the branded type makes a compile error.
+ * `withMealPlanningTransaction` is the sanctioned source of such a client.
+ *
+ * MODULE-PRIVATE for the same reason. Its only callers are the two saves below,
+ * which take the lock first; there is no lock-safe way for another module to
+ * call it, so exporting it would publish an API whose contract cannot be
+ * expressed in its signature. A future caller gets a lock-taking orchestration
+ * boundary here rather than this function.
  *
  * `today` is the user's own calendar day, so an ended plan is excluded exactly
  * as every other rule excludes it. The meal's own `revision` is deliberately not
@@ -850,8 +871,8 @@ const recomputePlanFlags = async (
  * change to what was planned, and the revision clients pin for a write is the
  * plan's.
  */
-export const recomputeActivePlanFlags = async (
-    tx: Prisma.TransactionClient,
+const recomputeActivePlanFlags = async (
+    tx: MealPlanningTransactionClient,
     userId: string,
     today: string,
 ): Promise<number> => {
@@ -1361,17 +1382,53 @@ const nextEstimateInputsRevision = (
 };
 
 /**
+ * The freshly stored revision, read for the one purpose of telling a client
+ * which revision is authoritative after its own pinned one turned out not to be.
+ *
+ * Read inside the transaction that is about to abort, and therefore before the
+ * throw: the read is valid while the transaction is still live, and the throw is
+ * what rolls it back and releases the lock. A row that has vanished reports
+ * {@link NO_PREFERENCES_REVISION}, which is what the client reads back from a
+ * user with no row.
+ */
+const staleRevisionAfterLostWrite = async (
+    userId: string,
+    tx: MealPlanningTransactionClient,
+): Promise<never> => {
+    const fresh = await loadPreferencesRow(userId, tx);
+
+    throw new StaleRevisionError({ currentRevision: fresh?.revision ?? NO_PREFERENCES_REVISION });
+};
+
+/**
  * `PUT /api/meal-planning/preferences/steps/:step` — one setup answer.
  *
- * THE PARSE HAPPENS TWICE, DELIBERATELY. The first call rejects a malformed body
- * before any transaction is opened, so a client sending nonsense cannot take the
- * user's advisory lock and serialise their real writes behind it. The second
- * runs INSIDE the lock against the row as it then is, and it is the
- * authoritative one: the revision check is only meaningful against a row nobody
- * can change underneath it, and a save that parsed against a pre-lock snapshot
- * would let two concurrent clients both appear to succeed while one update
- * vanished. `parseSetupStep` is pure and does no I/O, so the second call costs
- * nothing but correctness.
+ * VALIDATION HAPPENS IN THREE STAGES, and the order is the contract's, not a
+ * convenience:
+ *
+ *  1. THE REQUEST ALONE, WITH NO DATABASE WORK AT ALL. `parseSetupStepRequest`
+ *     is the first statement, and the row read that used to sit inside the
+ *     parse's own argument list now happens after it. It runs the real parse
+ *     against a "row not read" context, so an unknown `:step`, a non-object
+ *     body, a server-owned or misspelled key, a missing or unknown IANA zone, a
+ *     pinned revision no `integer` column could hold AND every field rule of
+ *     the step's own payload — an unknown goal, an out-of-range age, a
+ *     malformed meal time — are answered as one `400 invalid_request` before
+ *     Prisma is touched, which is what AAP §0.5.2's "validation applied before
+ *     any Prisma or planning work" requires. Previously all of it reached the
+ *     database first. Where a rule that needs the row was also applicable, this
+ *     stage yields rather than answer with fewer details than the screen must
+ *     show at once — see `parseSetupStepRequest`.
+ *  2. THE UNLOCKED PARSE, against the row as it stands. This is what keeps a
+ *     client sending nonsense from taking the user's advisory lock and
+ *     serialising their real writes behind it, and it reports every field-level
+ *     problem in one 400.
+ *  3. THE AUTHORITATIVE PARSE, INSIDE THE LOCK, against the row as it then is.
+ *     The revision check is only meaningful against a row nobody can change
+ *     underneath it, and a save that parsed against a pre-lock snapshot would
+ *     let two concurrent clients both appear to succeed while one update
+ *     vanished. `parseSetupStep` is pure and does no I/O, so running it again
+ *     costs nothing but correctness.
  *
  * The transaction does, in order (AAP §0.5.1): take the per-user lock, re-read
  * the row, parse, create the row as the state machine's first state or update
@@ -1395,13 +1452,19 @@ export const saveSetupStep = async (
     body: unknown,
     now: Date = new Date(),
 ): Promise<SavePreferencesResult> => {
+    const requestOnly: PreferenceRequestVerdict = parseSetupStepRequest(step, body);
+
+    if (requestOnly.kind !== 'ok') {
+        return requestOnly;
+    }
+
     const preflight = parseSetupStep(step, body, stepContext(await loadPreferencesRow(userId)));
 
     if (preflight.kind !== 'ok') {
         return refuse(preflight);
     }
 
-    return prisma.$transaction((tx) =>
+    return withMealPlanningTransaction((tx) =>
         withUserLock(tx, userId, async (locked) => {
             const current = await loadPreferencesRow(userId, locked);
             const verdict = parseSetupStep(step, body, stepContext(current));
@@ -1449,9 +1512,18 @@ export const saveSetupStep = async (
                     },
                 });
             } else {
-                await locked.meal_plan_preferences.update({
-                    // `user_id` IS the owner key and the unique index (§5.1).
-                    where: { user_id: userId },
+                // OWNER AND EXPECTED REVISION ARE BOTH IN THE PREDICATE (AAP
+                // §0.5.1, Rule §5.1): `user_id` is the owner key and the unique
+                // index, and `revision` is the value this request pinned, so the
+                // optimistic check is enforced by the MUTATION rather than only
+                // by the comparison the parser made a few statements earlier.
+                // `updateMany` is what allows a predicate wider than the unique
+                // key — `update` would take `user_id` alone and become the
+                // id-only write §5.1 forbids — and its row count is the answer:
+                // one row means the revision still held, none means it moved
+                // under us and nothing was written.
+                const written = await locked.meal_plan_preferences.updateMany({
+                    where: { user_id: userId, revision: current.revision },
                     data: {
                         // Refreshed on every step save, by contract: a user who
                         // has moved sees plan days in the zone of their most
@@ -1468,6 +1540,16 @@ export const saveSetupStep = async (
                         ...columns.writes,
                     },
                 });
+
+                if (written.count !== 1) {
+                    // Unreachable while the advisory lock holds — every writer of
+                    // this row takes it first — which is precisely why it is a
+                    // guard rather than a branch with behaviour of its own: it
+                    // reports the lost race the same way the parser does, so a
+                    // future writer that forgets the lock cannot silently
+                    // overwrite a revision it never pinned.
+                    await staleRevisionAfterLostWrite(userId, locked);
+                }
             }
 
             const affectedMealCount = await recomputeActivePlanFlags(locked, userId, today);
@@ -1594,12 +1676,22 @@ const updateContext = (row: PreferencesRow | null): PreferencesUpdateContext => 
  * `PUT /api/meal-planning/preferences` — a partial edit of the twenty editable
  * keys.
  *
- * The transaction shape is {@link saveSetupStep}'s exactly: preflight parse,
- * then lock, re-read, authoritative parse, write, bump the revision, recompute
- * every active plan's flags, and answer with the freshly re-read preferences.
- * One flag lifecycle for both saves is the requirement (AAP §0.5.2, "recomputes
- * incompatibility flags in the same transaction exactly as the full save does"),
- * so the two share every step that decides anything.
+ * The shape is {@link saveSetupStep}'s exactly: the request-only parse with no
+ * database work, the unlocked parse against the stored row, then
+ * lock, re-read, authoritative parse, write under the owner-and-revision
+ * predicate, bump the revision, recompute every active plan's flags, and answer
+ * with the freshly re-read preferences. One flag lifecycle for both saves is
+ * the requirement (AAP §0.5.2, "recomputes incompatibility flags in the same
+ * transaction exactly as the full save does"), so the two share every step that
+ * decides anything.
+ *
+ * TWO SERVER-OWNED COLUMNS ARE DERIVED HERE, both from the row as it will be
+ * once this save lands rather than from the body alone. `target_route` follows
+ * the body answer ({@link resolveTargetRouteForUpdate}), because the settings
+ * screens edit the very answers that decide whether an estimate can be
+ * calculated and the DTO has no key for the route itself; and the setup state
+ * is reconciled ({@link reconcileSetupStateForRoute}) when — and only when —
+ * that route changed, because the two routes require different steps.
  *
  * SERVER-OWNED KEYS COME BACK AS `read_only_field` DETAILS, and this file does
  * not throw `ReadOnlyFieldError` for them. `parsePreferencesUpdate` reports
@@ -1608,10 +1700,14 @@ const updateContext = (row: PreferencesRow | null): PreferencesUpdateContext => 
  * trips to learn what it sent wrong. The class stays available for a caller that
  * has a single field to report; this path has a list.
  *
- * THE SETUP STATE MACHINE IS NOT TOUCHED, AND NO ROW IS CREATED. A full save is
- * a settings edit rather than a wizard step: it never advances `setupStep` and
- * never promotes `setupStatus`, so generation keeps refusing with
- * `preferences_incomplete` until the wizard actually runs. It also never
+ * THE SETUP STATE MACHINE IS NEVER ADVANCED, AND NO ROW IS CREATED. A full save
+ * is a settings edit rather than a wizard step: it never moves `setupStep`
+ * forward and never promotes `setupStatus`, so generation keeps refusing with
+ * `preferences_incomplete` until the wizard actually runs. The one way it
+ * touches either column is the reconciliation above, which can only pull a
+ * not-yet-completed user BACK to an answer their new route requires and the row
+ * proves is missing — never forward, and never for a `completed` user. It also
+ * never
  * creates — `parsePreferencesUpdate` refuses a user who has no row at all ("this
  * endpoint EDITS; it never creates"), because a partial has nothing to apply to
  * and creating here would materialise the setup state the first `goal` step
@@ -1626,13 +1722,19 @@ export const savePreferences = async (
     body: unknown,
     now: Date = new Date(),
 ): Promise<SavePreferencesResult> => {
+    const requestOnly: PreferenceRequestVerdict = parsePreferencesUpdateRequest(body);
+
+    if (requestOnly.kind !== 'ok') {
+        return requestOnly;
+    }
+
     const preflight = parsePreferencesUpdate(body, updateContext(await loadPreferencesRow(userId)));
 
     if (preflight.kind !== 'ok') {
         return refuse(preflight);
     }
 
-    return prisma.$transaction((tx) =>
+    return withMealPlanningTransaction((tx) =>
         withUserLock(tx, userId, async (locked) => {
             const current = await loadPreferencesRow(userId, locked);
             const verdict = parsePreferencesUpdate(body, updateContext(current));
@@ -1640,15 +1742,6 @@ export const savePreferences = async (
             if (verdict.kind !== 'ok') {
                 return refuse(verdict);
             }
-
-            const columns = await updateColumnWrites(verdict.payload, current, locked);
-
-            if (columns.kind !== 'ok') {
-                return columns;
-            }
-
-            const timeZone = verdict.payload.timeZone ?? current?.time_zone ?? null;
-            const today = dayKeyInTimeZone(now, timeZone);
 
             if (current === null) {
                 // Unreachable: the parse above refuses a body from a user with
@@ -1658,9 +1751,54 @@ export const savePreferences = async (
                 throw new Error('preferences update parsed against a missing row');
             }
 
-            await locked.meal_plan_preferences.update({
-                // `user_id` IS the owner key and the unique index (§5.1).
-                where: { user_id: userId },
+            // THE ZONE THIS REQUEST CARRIED, not the stored one. It is a
+            // required envelope field (AAP §0.5.2), canonicalised by the parser,
+            // and resolved BEFORE the dislike pair's catalog reads below so that
+            // every date this save derives — the start-date window, the ended-plan
+            // boundary the flag recomputation applies, and the `hasActivePlan`
+            // the response carries — comes from the calendar the user is in now.
+            const timeZone = verdict.payload.timeZone;
+            const today = dayKeyInTimeZone(now, timeZone);
+            const columns = await updateColumnWrites(verdict.payload, current, locked);
+
+            if (columns.kind !== 'ok') {
+                return columns;
+            }
+
+            // The row as it will be once this save lands, which is what both
+            // server-owned derivations below are judged against: a body that
+            // supplies an activity level in the same request counts, and one
+            // that supplies only a sex answer is read together with the
+            // measurements already stored.
+            const afterWrites: PreferencesRow = { ...current, ...columns.writes };
+            // `target_route` is server-owned — the editable DTO has no such key
+            // — so a full save that moves the body answer must derive it here or
+            // leave the row claiming a route the answers contradict (the
+            // estimated route for a user who now declines to state a sex, or the
+            // manual route for one whose measurements are now complete).
+            const targetRoute = resolveTargetRouteForUpdate(
+                asMember(TARGET_ROUTES, current.target_route),
+                {
+                    age: afterWrites.age,
+                    heightCm: afterWrites.height_cm,
+                    weightKg: afterWrites.weight_kg,
+                    sexForEstimate: asMember(SEXES_FOR_ESTIMATE, afterWrites.sex_for_estimate),
+                },
+            );
+            // A route change moves which steps the route requires, so a
+            // not-yet-completed user whose new route needs an answer the row
+            // does not hold is pulled back to it. Nothing is reconciled when the
+            // route stands still, and a `completed` user is never touched.
+            const reconciliation =
+                targetRoute === undefined
+                    ? undefined
+                    : reconcileSetupStateForRoute(setupStateOf(afterWrites), targetRoute);
+
+            const written = await locked.meal_plan_preferences.updateMany({
+                // Owner key AND pinned revision, for the reason the step save
+                // states: the optimistic check belongs in the mutation, not only
+                // in the comparison a few statements earlier (AAP §0.5.1).
+                where: { user_id: userId, revision: current.revision },
                 data: {
                     time_zone: timeZone,
                     revision: current.revision + 1,
@@ -1668,9 +1806,20 @@ export const savePreferences = async (
                     // counter and so flips `TargetsResponse.stale`; one that
                     // moves anything else leaves it alone.
                     estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
+                    ...(targetRoute === undefined ? {} : { target_route: targetRoute }),
+                    ...(reconciliation === undefined
+                        ? {}
+                        : {
+                              setup_status: reconciliation.setupStatus,
+                              setup_step: reconciliation.setupStep,
+                          }),
                     ...columns.writes,
                 },
             });
+
+            if (written.count !== 1) {
+                await staleRevisionAfterLostWrite(userId, locked);
+            }
 
             const affectedMealCount = await recomputeActivePlanFlags(locked, userId, today);
             const saved = await loadPreferencesRow(userId, locked);

@@ -246,7 +246,18 @@ export interface PreferencesUpdatePayload {
     cookingTimeLimitMin?: CookingTimeLimitMin;
     budget?: BudgetPreference | null;
     noBudgetPreference?: boolean;
-    timeZone?: string;
+    // REQUIRED, like expectedRevision and unlike every answer above: the two of
+    // them are this endpoint's envelope rather than an edit. The client sends
+    // the device's IANA zone on every step save AND on every full save, and the
+    // server resolves the "today" its plan-ended, start-date-bound and
+    // flag-recomputation rules read from the value THIS request carried — so a
+    // user who has moved sees plan days in the zone of their most recent edit.
+    // Accepting an omission as "keep the stored zone" made that refresh
+    // optional in practice and computed `today` from a zone the user may have
+    // left; an absent or unknown name is now 400 invalid_request with a
+    // timeZone detail. A body carrying only these two keys edits nothing and is
+    // refused with a `body` detail rather than bumping the revision.
+    timeZone: string;
     // Required on this endpoint, unlike the per-step saves below: a full save
     // only ever edits an existing row. A mismatch is 409 stale_revision.
     expectedRevision: number;
@@ -404,9 +415,12 @@ export interface MealPlanMacroTotals {
 //   source   — 'legacy' means the stored values no longer match the confirmed
 //              snapshot, so the planner refuses them with
 //              409 targets_unconfirmed until the user reconfirms.
-//   stale    — a confirmed estimate whose goal, body, activity or pace inputs
-//              have changed since. Nothing recalculates on its own: the review
-//              and settings screens offer a recalculation instead.
+//   stale    — a confirmed estimate whose inputs are no longer the ones it was
+//              derived from, i.e. `targets_input_revision` (the preferences
+//              revision it was confirmed at) differs from the preferences
+//              revision now. Nothing recalculates on its own: the review and
+//              settings screens offer a recalculation instead, and generation
+//              keeps using the confirmed values until the user takes it.
 export interface TargetsResponse {
     // null only when all four stored values are null, i.e. the user never set
     // targets at all. Doubly nullable: the object may be null, and each member
@@ -584,8 +598,20 @@ export interface MealPlanMealResponse {
     // 409 preview_stale on a mismatch; the allowed sets live in
     // mealPlan.logic.ts and swap.logic.ts.
     portionMultiplier: number;
-    // The portion rendered for display, e.g. '1 serving'.
+    // The portion rendered for display, in the recipe's OWN serving unit:
+    // '1 bowl', '½ wrap', '1¼ plates'. '1 serving' is the fallback for a recipe
+    // whose serving description gives no usable unit, not the usual case.
+    // Rendered by mealPlan.mapper.ts::formatPortionText from the multiplier and
+    // recipe_versions.serving_description; the client displays it verbatim and
+    // never composes its own.
     portionText: string;
+    // DISPLAY-ROUNDED: four integers, rounded per value on the way onto the
+    // wire (step 2 of the rounding contract, mealPlan.mapper.ts
+    // ::readPlannedTotals). The stored columns hold full precision; the client
+    // renders these as they arrive and must not round again, which is also what
+    // makes its round(snapshot x servings) agree with the entry the server
+    // writes. Meals and days are rounded independently, so a day total can
+    // differ by a unit or two from adding up the rounded meals beside it.
     planned: MealPlanMacroTotals;
     // Empty when the meal matches every saved preference.
     flags: MealFlag[];
@@ -602,7 +628,10 @@ export interface MealPlanDayResponse {
     // 0-based offset from the plan's start date.
     dayIndex: number;
     // The sum of the day's planned meals. Planned, never consumed — the diary
-    // owns what was eaten.
+    // owns what was eaten. DISPLAY-ROUNDED, exactly as
+    // MealPlanMealResponse.planned is and for the same reasons: summed at full
+    // precision from the stored columns, then rounded per value once, here at
+    // the wire boundary.
     plannedTotals: MealPlanMacroTotals;
     // True on the plan's last date, which is where the client offers the next
     // week.
@@ -739,18 +768,25 @@ export interface SwapPreviewAlternative {
     // Recomputed server-side and bound to this preview: committing a different
     // portion is 409 preview_stale.
     portionMultiplier: number;
+    // In the recipe's own serving unit, exactly as MealPlanMealResponse
+    // .portionText is: the portion a user approves reads as the meal they get.
     portionText: string;
-    // This candidate at this portion, not the whole day.
+    // This candidate at this portion, not the whole day. DISPLAY-ROUNDED, as
+    // every planned figure on the wire is.
     nutrition: MealPlanMacroTotals;
 }
 
 export interface SwapPreviewResponse {
     alternative: SwapPreviewAlternative;
-    // The day's totals with the swap applied.
+    // The day's totals with the swap applied. DISPLAY-ROUNDED, so they are
+    // directly comparable with MealPlanDayResponse.plannedTotals; the commit
+    // stores the full-precision values it computed.
     dayTotalsIfSwapped: MealPlanMacroTotals;
+    // Already whole kilocalories and whole grams, so not rounded.
     targets: MealPlanMacroTotals;
     // Signed: negative when the swap lowers the day's calories, positive when it
-    // raises them.
+    // raises them. Rounded as the difference rather than recomputed from the
+    // rounded totals, so it carries neither total's rounding error.
     calorieDelta: number;
     // The revision the preview was computed against; send it back as
     // expectedPlanRevision to commit.

@@ -55,7 +55,7 @@ import type {
     users,
 } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
-import { DAY_KEY_PATTERN, isCalendarDayKey } from '../../utils/calendarDay';
+import { DAY_KEY_PATTERN, isCalendarDayKey } from '../../services/preferences.logic';
 
 /** Reserved by RFC 2606, so no fixture address can belong to anyone. */
 const FIXTURE_EMAIL_DOMAIN = 'test.invalid';
@@ -222,11 +222,11 @@ const DAY_KEY_LENGTH = 10;
  *
  * Shape and calendar are asked as two questions so the failure names which one
  * the fixture got wrong, and the calendar question goes to the shared rule in
- * `utils/calendarDay.ts` — the same rule the services apply, so a fixture can
- * never be built on a date a service would refuse. It is asked instead of a
- * `Date` round trip because V8 does not reject an out-of-range day in an ISO
- * string, it rolls it over ("2026-02-30" parses as 2 March), which would leave
- * a fixture sitting on a date its caller never wrote.
+ * `services/preferences.logic.ts` — the same rule the services apply, so a
+ * fixture can never be built on a date a service would refuse. It is asked
+ * instead of a `Date` round trip because V8 does not reject an out-of-range day
+ * in an ISO string, it rolls it over ("2026-02-30" parses as 2 March), which
+ * would leave a fixture sitting on a date its caller never wrote.
  */
 const toUtcMidnight = (dayKey: string): Date => {
     if (!DAY_KEY_PATTERN.test(dayKey)) {
@@ -809,15 +809,17 @@ export type MakePreferencesOptions = Omit<
  * matches them field for field. So the plan-ready pairing is
  * `makeUser({ ...FIXTURE_USER_TARGET_COLUMNS })` with this factory's defaults;
  * overriding `confirmed_targets` (or `target_source`) alone is how a suite
- * reaches the `legacy` verdict, and lowering `targets_input_revision` below
- * `estimate_inputs_revision` is how it reaches `stale`.
+ * reaches the `legacy` verdict, and moving `targets_input_revision` off
+ * `revision` — either value, in either direction — is how it reaches `stale`.
  *
- * `estimate_inputs_revision` matches `targets_input_revision` here, which is
- * what makes the default a FRESH confirmed estimate. It is deliberately NOT
- * `revision`: the all-purpose revision moves on every preference save, while
- * this counter moves only when goal, pace, age, height, weight, sex or activity
- * changes, so a suite that saves an unrelated preference and then reads the
- * targets must still see `stale: false`.
+ * `targets_input_revision` EQUALS `revision` here, which is what makes the
+ * default a FRESH confirmed estimate: staleness is the inequality of those two
+ * (AAP §0.5.2), so a suite that saves any preference and then reads the targets
+ * sees `stale: true` because every save advances `revision`.
+ *
+ * `estimate_inputs_revision` is set in step with them for coherence only. No
+ * query reads it (see `prisma/schema.prisma`), so a suite never needs to state
+ * it and no assertion should depend on it.
  */
 export const makePreferences = async (
     userId: string,

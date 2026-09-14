@@ -73,6 +73,7 @@ import {
     mapCategoryToGroceryCategory,
 } from './catalog.logic';
 import { PlanNotActiveError, PlanNotFoundError } from './mealPlanning.errors';
+import { isCalendarDayKey } from './preferences.logic';
 import {
     GroceryBanner,
     GroceryChangeSummary,
@@ -82,7 +83,6 @@ import {
     ToggleGroceryItemPayload,
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
-import { isCalendarDayKey } from '../utils/calendarDay';
 import {
     UnitFamily,
     formatCount,
@@ -148,7 +148,7 @@ const RAW_FOOD_STATE = 'raw';
 /** Separates the two halves of an aggregation key; neither half can contain it. */
 const IDENTITY_KEY_SEPARATOR = '\u0000';
 
-// The day-key shape is NOT declared here: `utils/calendarDay.ts` owns it and
+// The day-key shape is NOT declared here: `preferences.logic.ts` owns it and
 // the calendar rule that applies it.
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

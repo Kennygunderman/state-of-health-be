@@ -701,21 +701,36 @@ model meal_plan_preferences {
   target_source            String? // 'estimated' | 'manual'
   targets_revision         Int       @default(0)
   confirmed_targets        Json?
-  targets_input_revision   Int? // the estimate_inputs_revision whose goal/body/activity/pace produced the confirmed estimate
+  // The `revision` whose goal/body/activity/pace produced the confirmed
+  // estimate (AAP 0.5.1). Written only by targets.service.ts, which records the
+  // same number the request's estimateRevision pinned; null for manual targets,
+  // which have no calculated ancestry.
+  targets_input_revision   Int?
   estimated_targets        Json?
+  // THE SINGLE INPUT-ANCESTRY COUNTER. `revision` advances on every preference
+  // save - diet, allergens, dislikes, schedule, budget, review date, unit
+  // preferences, time zone included - and does two jobs: a client pins it to
+  // detect a lost update, and comparing it with targets_input_revision is what
+  // TargetsResponse.stale means (AAP 0.5.2: stale when source is 'estimated'
+  // and targets_input_revision != revision). One counter for both is what makes
+  // "confirmed against revision N" and "derived from revision N" the same
+  // statement, and it is the revision GET /meal-planning/targets/estimate
+  // echoes as estimateRevision.
   revision                 Int       @default(0)
-  // Two counters, two jobs, and they must not be conflated. `revision` advances
-  // on EVERY preference save - diet, allergens, dislikes, schedule, budget,
-  // review date, unit preferences, time zone included - and is what a client
-  // pins to detect a lost update. `estimate_inputs_revision` advances only when
-  // one of the seven answers the energy equation actually reads changes value
-  // (goal, pace_lb_per_week, age, height_cm, weight_kg, sex_for_estimate,
+  // A WRITE-SIDE DIAGNOSTIC ONLY, and NOT the basis of TargetsResponse.stale -
+  // see `revision` above, which is. This counter advances only when one of the
+  // seven answers the energy equation actually reads changes value (goal,
+  // pace_lb_per_week, age, height_cm, weight_kg, sex_for_estimate,
   // activity_level - never goal_weight_kg, which the equation never reads), so
-  // comparing it with targets_input_revision is what makes
-  // TargetsResponse.stale mean "your estimate no longer matches your details"
-  // rather than "you edited something". Written only by preferences.service.ts
-  // through the pure rule targets.logic.ts::estimateInputsChanged;
-  // targets_input_revision is written only by targets.service.ts.
+  // it records when a user's calculable details last moved, which is a
+  // different question from whether a confirmed figure still matches the
+  // answers on file. Written by preferences.service.ts through the pure rule
+  // targets.logic.ts::estimateInputsChanged and read by no query:
+  // TargetsPreferencesRow does not carry it, so the staleness comparison cannot
+  // reach it. It is retained rather than dropped because preferences.service.ts
+  // still maintains it and the migration's recorded checksum is what the test
+  // harness verifies the database against; removing both together is a
+  // follow-up in that service, not a change this column can carry alone.
   estimate_inputs_revision Int       @default(0)
   users                    users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 }

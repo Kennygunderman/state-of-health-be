@@ -58,6 +58,11 @@
 // write. `createHash` is synchronous and deterministic, so it keeps the
 // functions below pure under Rule 7 §7.
 import { createHash } from 'node:crypto';
+// Imported rather than taken from the global scope, for the same reason and
+// with the same specifier: it decides the key order a stored response is
+// replayed in, and `Buffer` is the one measurement — UTF-8 byte length — that
+// `String.prototype.length` gets wrong for any non-ASCII key.
+import { Buffer } from 'node:buffer';
 
 import { LogPlannedMealResponse, MealPlanResponse, SwapMealResponse } from '../types/mealPlanning';
 
@@ -390,6 +395,240 @@ const canonicalize = (value: unknown, path: string, ancestors: Set<object>): str
 export const canonicalizeRequestBody = (body: unknown): string => canonicalize(body, '$', new Set<object>());
 
 /* ---------------------------------------------------------------------------
+ * Canonicalisation — what makes a REPLAY byte-for-byte
+ *
+ * The section above answers "are these two requests the same request". This one
+ * answers the other half of the ledger's promise: §0.5.1 requires the stored
+ * first-response status and body to come back "unchanged … so a client can
+ * never distinguish a replay from the original response", and §0.9.2 states it
+ * as "returns the stored 201/200 body BYTE-FOR-BYTE". The obstacle is that
+ * `meal_plan_actions.response_snapshot` is a `jsonb` column, and `jsonb`
+ * re-orders an object's keys at rest — so a body stored in one order is served
+ * back in another, and the two texts differ.
+ *
+ * `jsonb`'s order is not arbitrary, though: it is deterministic and knowable.
+ * So the fix is not a column change but a canonical form — order the keys the
+ * way the column will order them BEFORE storing, and the column's reordering
+ * becomes the identity. The first response then serialises from a value ordered
+ * exactly as the column holds it, and every later replay serialises the same
+ * bytes.
+ * ------------------------------------------------------------------------- */
+
+const CANONICALIZE_RESPONSE_ERROR_PREFIX = 'Cannot canonicalise a meal-planning action response: ';
+
+/**
+ * Orders two object keys exactly as `jsonb` orders them at rest: by UTF-8 BYTE
+ * length first, then by the bytes themselves.
+ *
+ * Measured against the PostgreSQL 16 this service runs on rather than inferred:
+ * `SELECT '{"ab":1,"é":2,"zzz":3,"b":4}'::jsonb::text` returns
+ * `{"b": 4, "ab": 1, "é": 2, "zzz": 3}`. `é` is ONE JavaScript character and
+ * TWO UTF-8 bytes, so it ties with `ab` on length and loses to it on bytes
+ * (`0xC3` > `0x62`). `String.prototype.length` would have ordered it first, and
+ * the stored text would then disagree with the served text for every body
+ * carrying a non-ASCII key — the exact failure this ordering exists to remove.
+ *
+ * Lengths are compared through `Buffer.byteLength`, which measures without
+ * allocating; the bytes are materialised only for the ties.
+ *
+ * A genuine three-way comparator, unlike {@link byCodeUnit} above: `Buffer`
+ * comparison has an equality case, and the keys of one object are unique, so it
+ * simply never fires.
+ */
+const byJsonbKeyOrder = (left: string, right: string): number => {
+    const byteLengthDifference = Buffer.byteLength(left, 'utf8') - Buffer.byteLength(right, 'utf8');
+
+    if (byteLengthDifference !== 0) {
+        return byteLengthDifference;
+    }
+
+    return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+};
+
+/**
+ * The recursive worker behind {@link canonicalizeResponseBody}.
+ *
+ * It returns `unknown` because it walks arbitrary JSON data; every branch either
+ * returns the value it was handed or a structural copy of it carrying the same
+ * members, which is what lets the exported function restate the caller's own
+ * type (see there). `ancestors` is the current recursion path, so an object
+ * legitimately referenced twice in one body is fine and only a true cycle is
+ * refused — the same rule, and the same mechanics, as {@link canonicalize}.
+ */
+const canonicalizeResponse = (value: unknown, path: string, ancestors: Set<object>): unknown => {
+    if (value === null) {
+        return null;
+    }
+
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            throw new TypeError(
+                `${CANONICALIZE_RESPONSE_ERROR_PREFIX}${path} is ${String(value)}, which JSON has no ` +
+                    'representation for. `JSON.stringify` renders it as `null` while the value in memory stays ' +
+                    'non-finite, so the first response and its replay would disagree about it. Refusing to ' +
+                    'store a body whose bytes cannot be reproduced.',
+            );
+        }
+
+        // Returned as the number it is, NOT rounded. The two-decimal token
+        // above is a FINGERPRINT rule — it exists so `1`, `1.0` and `"1"` hash
+        // alike — and applying it to a response would rewrite the values the
+        // client is owed. A stored response is reproduced, never renormalised.
+        return value;
+    }
+
+    if (typeof value === 'boolean' || typeof value === 'string') {
+        return value;
+    }
+
+    if (value === undefined) {
+        // Only the body ITSELF can reach this branch: an object property
+        // holding `undefined` is dropped below (as `JSON.stringify` drops it)
+        // and an array element holding it becomes `null` (as `JSON.stringify`
+        // renders it). An `undefined` body is refused rather than stored,
+        // because Prisma treats `undefined` as "leave this column alone": the
+        // completion would then fill the status and the revision and leave
+        // `response_snapshot` NULL, which is precisely the half-completed row
+        // {@link classifyActionCompletion} calls corrupt.
+        throw new TypeError(
+            `${CANONICALIZE_RESPONSE_ERROR_PREFIX}${path} is undefined, which is not a JSON value and is not a ` +
+                'response body. Storing it would leave response_snapshot NULL beside a filled status and ' +
+                'revision, which is a corrupt ledger row rather than a replayable one.',
+        );
+    }
+
+    if (typeof value !== 'object') {
+        // `bigint`, `function` and `symbol`. None can survive a JSON round
+        // trip: `JSON.stringify` throws on a bigint and silently drops the
+        // other two, so a body carrying one could never replay as its own bytes.
+        throw new TypeError(
+            `${CANONICALIZE_RESPONSE_ERROR_PREFIX}${path} is a ${typeof value}, which has no JSON ` +
+                'representation. Convert it at the boundary that produced it.',
+        );
+    }
+
+    if (ancestors.has(value)) {
+        throw new TypeError(
+            `${CANONICALIZE_RESPONSE_ERROR_PREFIX}${path} is a circular reference, which cannot be serialised ` +
+                'at all.',
+        );
+    }
+
+    ancestors.add(value);
+
+    try {
+        if (Array.isArray(value)) {
+            // ARRAY ORDER IS SEMANTIC and is preserved — the plan's seven days
+            // are in date order — so only object keys are reordered. Indexed
+            // rather than `map`, so a sparse hole is emitted as the `null`
+            // `JSON.stringify` renders it instead of staying a hole `map`
+            // would skip.
+            const elements: unknown[] = [];
+
+            for (let index = 0; index < value.length; index += 1) {
+                const element: unknown = value[index];
+
+                elements.push(
+                    element === undefined ? null : canonicalizeResponse(element, `${path}[${index}]`, ancestors),
+                );
+            }
+
+            return elements;
+        }
+
+        if (!isPlainObject(value)) {
+            // A `Date`, a `Map`, a Prisma `Decimal` or any other class instance.
+            // `JSON.stringify` would either call a `toJSON` this module cannot
+            // see or write `{}`, and either way the stored text would stop
+            // being a function of the value served. The mappers already convert
+            // both cases the meal-planning DTOs could produce — `@db.Date`
+            // columns become `YYYY-MM-DD` day keys and `NUMERIC` columns become
+            // numbers — so reaching here means a mapper stopped doing that.
+            throw new TypeError(
+                `${CANONICALIZE_RESPONSE_ERROR_PREFIX}${path} is a ${value.constructor?.name ?? 'non-plain'} ` +
+                    'instance, not plain JSON data. Serialise it in the mapper that produced the response.',
+            );
+        }
+
+        // Insertion order IS the serialisation order for a plain object, so
+        // writing the keys in `jsonb`'s order is what makes the served text
+        // match the stored text. `undefined`-valued keys are dropped exactly as
+        // `JSON.stringify` drops them, so the two cannot disagree over whether
+        // the key was there.
+        const entries = Object.entries(value as Record<string, unknown>)
+            .filter(([, nested]) => nested !== undefined)
+            .sort(([leftKey], [rightKey]) => byJsonbKeyOrder(leftKey, rightKey));
+
+        // `Object.fromEntries` DEFINES each key as an own data property, which
+        // is why the keys are not assigned one by one. `canonical[key] = …`
+        // would reach the inherited `Object.prototype.__proto__` setter for a
+        // key spelled `__proto__`: the key would silently vanish from the copy
+        // and, for an object value, become the copy's prototype instead. That
+        // key is ordinary JSON — `JSON.parse` makes it an own property and
+        // `jsonb` stores and orders it like any other, by the same byte-length
+        // rule — so a body carrying one has to round-trip unchanged rather than
+        // come back a key short with a mutated prototype. Defining the keys
+        // also keeps this a faithful copy for every other inherited accessor
+        // name a future response could legitimately contain.
+        return Object.fromEntries(
+            entries.map(([key, nested]) => [key, canonicalizeResponse(nested, `${path}.${key}`, ancestors)]),
+        );
+    } finally {
+        ancestors.delete(value);
+    }
+};
+
+/**
+ * A response body as the value `jsonb` will hold — a deep copy whose every
+ * plain object carries its keys in the column's own order.
+ *
+ * This is what makes §0.9.2's "byte-for-byte" replay TRUE rather than
+ * approximated. Both attempts serialise a canonically ordered value: the first
+ * response is the value {@link shapeStoredResponse} froze, and a replay is that
+ * same value read back out of a column whose at-rest reordering is, for this
+ * order, the identity. So `JSON.stringify` of the two agrees exactly.
+ *
+ * The rules, each pinned by `__tests__/mealPlanningAction.logic.test.ts`:
+ *
+ *  - object keys are ordered recursively by {@link byJsonbKeyOrder} — UTF-8
+ *    byte length, then bytes;
+ *  - ARRAY ORDER IS PRESERVED, because order is meaning in an array;
+ *  - numbers, strings, booleans and `null` are reproduced as they are; no
+ *    rounding, no renormalisation (the fingerprint's two-decimal token is a
+ *    request rule and has no business rewriting a stored response);
+ *  - a key whose value is `undefined` is DROPPED, exactly as `JSON.stringify`
+ *    drops it, so the stored text and the served text cannot disagree over it;
+ *  - the function is IDEMPOTENT: canonicalising a canonical body returns the
+ *    same shape again, which is what lets {@link readStoredResponse} apply it
+ *    to a row without caring which build wrote it.
+ *
+ * Anything with no faithful JSON representation is REFUSED, naming the path
+ * (`$.days[0].planned.calories`) so the offending field is found without a
+ * debugger: a non-finite number, a `bigint`/`function`/`symbol`, an `undefined`
+ * body, a non-plain object such as a `Date`, `Map`, `Set` or Prisma `Decimal`,
+ * and a cycle. Refusing is the point — storing any of them would make the
+ * byte guarantee false, and a guarantee that silently does not hold is worse
+ * than an error the caller can see. Non-enumerable and symbol-keyed properties
+ * are ignored, as `JSON.stringify` ignores them.
+ *
+ * One JavaScript detail rides along and is harmless: an object's array-index
+ * keys (`'0'`, `'10'`) are hoisted ahead of its string keys by the language
+ * itself, in both this copy and the `JSON.parse` of the column, so the two
+ * SERVED texts still agree even though the column's own text would order such a
+ * key differently. No meal-planning DTO carries one.
+ *
+ * The generic restates the caller's type instead of widening to `unknown`: the
+ * copy carries the same members as its input, so it inhabits the same type, and
+ * a key dropped for holding `undefined` was optional by definition. That keeps
+ * {@link StoredActionResponse}'s `responseSnapshot` typed as the action's own
+ * response body, and keeps the one cast in this function rather than at every
+ * call site. Reading a stored row passes `unknown` in and gets `unknown` back,
+ * which is exactly what a `jsonb` column is worth.
+ */
+export const canonicalizeResponseBody = <TBody>(body: TBody): TBody =>
+    canonicalizeResponse(body, '$', new Set<object>()) as TBody;
+
+/* ---------------------------------------------------------------------------
  * Fingerprinting
  * ------------------------------------------------------------------------- */
 
@@ -474,8 +713,8 @@ export const buildRequestFingerprint = (
  *  - `proceed` — the key is new; do the work.
  *  - `replay`  — the key and the request both match; return the stored response
  *                as {@link readStoredResponse} hands it back — the recorded
- *                status and revision exactly, the body deep-equal to the first
- *                one rather than byte-identical to it.
+ *                status and revision exactly, and a body that serialises to the
+ *                same bytes as the first response.
  *  - `conflict` — the key matches but the request does not; the service throws
  *                 `IdempotencyConflictError` (409).
  */
@@ -569,8 +808,9 @@ export interface StoredActionResponse {
 
 /**
  * A stored response, ready to be sent again — the status and revision exactly as
- * they were recorded, the body deep-equal to the first one (see
- * {@link readStoredResponse}).
+ * they were recorded, and a body that serialises to the same bytes as the first
+ * response because both are canonically ordered (see
+ * {@link readStoredResponse} and {@link canonicalizeResponseBody}).
  *
  * `planRevisionAfter` is a plain `number`, not `number | null`: a response is
  * only replayable once all three completion columns are filled (see
@@ -698,6 +938,22 @@ const isCompletedActionRow = (
  * accepts only a `SwapMealResponse`, so a mismatch is a compile error rather
  * than a replay that returns the wrong shape. Every body carries the new plan
  * revision, which is why `plan_revision_after` is stored beside it.
+ *
+ * **The body is stored CANONICALISED, and that is what makes §0.9.2's
+ * byte-for-byte replay hold.** {@link canonicalizeResponseBody} orders every
+ * object's keys the way the `jsonb` column will order them anyway, so the
+ * column's at-rest reordering has nothing left to do. The value this returns is
+ * also exactly what `runKeyedAction` answers the FIRST attempt with — it returns
+ * what was frozen here rather than the caller's own object — so the first
+ * response and every replay of it serialise from the same ordered value and
+ * therefore to the same bytes. Storing the caller's object as it arrived would
+ * make the first response's key order an accident of how a mapper happened to
+ * build it, and no later replay could reproduce it.
+ *
+ * A body that cannot be represented faithfully is refused here rather than
+ * written: the transaction rolls back, the reservation disappears with it, and
+ * the key is free to be retried once the mapper is fixed. See
+ * {@link canonicalizeResponseBody} for the closed list of what that covers.
  */
 export const shapeStoredResponse = <TAction extends KeyedActionType>(
     actionType: TAction,
@@ -714,7 +970,7 @@ export const shapeStoredResponse = <TAction extends KeyedActionType>(
 
     return {
         responseStatus: KEYED_ACTION_RESPONSE_STATUS[actionType],
-        responseSnapshot: body,
+        responseSnapshot: canonicalizeResponseBody(body),
         planRevisionAfter,
     };
 };
@@ -727,25 +983,30 @@ export const shapeStoredResponse = <TAction extends KeyedActionType>(
  * endpoint's success status retroactively rewrite what an already-stored action
  * replays. Both are integers and both come back exactly as they were recorded.
  *
- * **The body comes back as the stored VALUE: deep-equal to the first response,
- * with no guarantee of identical text.** `meal_plan_actions.response_snapshot`
- * is a `jsonb` column, and PostgreSQL normalises an object's key order at rest —
- * keys sorted by length, then by bytes, at every nesting level — so a replay
- * serialises its keys in THAT order whatever order they were written in, while
- * every value it carries is preserved exactly. Each of the three keyed response
- * types is reordered somewhere in its tree, so the text does differ in practice;
- * what holds either way is the VALUE, and the value is the only thing to assert
- * on. A client still cannot distinguish the two, which is what §0.5.1 requires:
- * key order carries no meaning in a JSON object, and the mobile io-ts decoders
- * read by key rather than by position.
+ * **The body comes back in canonical key order, so it serialises to the same
+ * BYTES as the first response.** `meal_plan_actions.response_snapshot` is a
+ * `jsonb` column, and PostgreSQL normalises an object's key order at rest —
+ * keys sorted by UTF-8 byte length, then by bytes, at every nesting level.
+ * {@link shapeStoredResponse} stores the body in exactly that order, so the
+ * column has nothing to reorder and the value read back is ordered identically
+ * to the value served the first time. §0.9.2's replay row — "returns the stored
+ * 201/200 body byte-for-byte" — therefore holds literally, and a test of it may
+ * compare `JSON.stringify` of the two bodies as well as the parsed values.
  *
- * So the achievable form of §0.9.2's replay row — "returns the stored 201/200
- * body byte-for-byte" — is a DEEP-EQUAL parsed body with an exactly equal status
- * and revision, and anything that tests it must compare the PARSED body
- * (`toEqual`), never the serialised JSON text and never a stored snapshot of it.
- * A text comparison there fails against correct code, which is why this
- * module's own suite pins the textual difference as a known property instead of
- * leaving it to be rediscovered as a bug.
+ * {@link canonicalizeResponseBody} is applied HERE as well, and not out of
+ * distrust of the column: it is a no-op for a row this build wrote, and it is
+ * what keeps the guarantee true for a row written by an EARLIER build, whose
+ * arbitrary insertion order `jsonb` already normalised to this same canonical
+ * order at rest. Such a row replays byte-identically to a freshly shaped
+ * response rather than "byte-identically to whatever it was stored as". The
+ * pass is idempotent, so applying it on both the write and the read path costs
+ * one walk of a small object and removes the only case where the two paths
+ * could disagree.
+ *
+ * Key order was never client-visible meaning — a JSON object is unordered and
+ * the mobile io-ts decoders read by key — but §0.5.1 requires a response a
+ * client "can never distinguish" from the original, and identical bytes is the
+ * form of that which cannot be argued with.
  *
  * Age is not consulted, and there is nothing to consult it with: a committed
  * action replays for as long as its row exists (see the file header).
@@ -772,7 +1033,7 @@ export const readStoredResponse = (
     if (isCompletedActionRow(row)) {
         return {
             status: row.responseStatus,
-            body: row.responseSnapshot,
+            body: canonicalizeResponseBody(row.responseSnapshot),
             planRevisionAfter: row.planRevisionAfter,
         };
     }

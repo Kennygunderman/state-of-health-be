@@ -18,6 +18,7 @@ import {
     GROCERY_EPSILON_G,
     COUNT_DISPLAY_UNIT,
     GROCERY_FIELD_CODES,
+    GroceryConversionFacts,
     GroceryDataError,
     GroceryDefaultPortion,
     GroceryFoodFacts,
@@ -291,6 +292,44 @@ const eggFacts = (overrides: Partial<GroceryFoodFacts> = {}): GroceryFoodFacts =
         ...overrides,
     });
 
+/**
+ * Every pluralisation rule a count row's portion description can meet, as
+ * `[singular, plural]` pairs: a plain noun, a sibilant ending taking `-es`, a
+ * consonant followed by `y` becoming `-ies`, and each of the four irregulars
+ * `utils/units.ts` commits to its exceptions map.
+ *
+ * The rules themselves belong to `utils/units.ts` and are pinned there. What
+ * this table adds is the layer: the grocery row's own `display_text` and the
+ * three strings of its flag are what the shopper reads, and only `egg` ever
+ * reached them — an exception dropped from the map, or a description that
+ * stopped being pluralised on the way through the grocery rules, would still
+ * have left this suite green.
+ */
+const PLURAL_DESCRIPTION_CASES: readonly (readonly [string, string])[] = [
+    ['carrot', 'carrots'],
+    ['squash', 'squashes'],
+    ['berry', 'berries'],
+    ['egg', 'eggs'],
+    ['tomato', 'tomatoes'],
+    ['leaf', 'leaves'],
+    ['loaf', 'loaves'],
+];
+
+/**
+ * How much one counted item weighs in the cases above.
+ *
+ * The module's own ounce factor rather than a decimal, and every quantity those
+ * cases pass is a multiple of it, so the item count is exact arithmetic on the
+ * portion's stated weight instead of a number that happens to divide.
+ */
+const COUNTED_PORTION_GRAMS = GRAMS_PER_OUNCE;
+
+/** Count-family facts whose default portion is described by one given word. */
+const countedFacts = (description: string): GroceryConversionFacts => ({
+    density_g_per_ml: null,
+    default_portion: portion({ description, unit: 'each', gram_weight: COUNTED_PORTION_GRAMS }),
+});
+
 const meal = (
     ingredients: readonly { catalog_food_id: string; food_state?: string; gram_weight: number }[],
     overrides: Partial<Omit<PlannedMealForGroceries, 'ingredients'>> = {},
@@ -437,6 +476,185 @@ describe('aggregatePlannedGrams', () => {
     it('returns nothing for a week with no meals', () => {
         expect(aggregatePlannedGrams([])).toEqual([]);
     });
+
+    /* -----------------------------------------------------------------------
+     * The committed recipe that carries an optional ingredient
+     *
+     * `roasted-carrot-and-lentil-salad` v1 is the one version in the corpus
+     * with an `is_optional` row (the Greek yogurt), which is why both the
+     * optional-ingredient case and the immutability case below are built from
+     * it rather than from an invented recipe.
+     * --------------------------------------------------------------------- */
+
+    const OPTIONAL_SLUG = 'roasted-carrot-and-lentil-salad';
+    const OPTIONAL_VERSION = 1;
+    /** `usda:9200115` — Greek yogurt, plain: the corpus's only optional ingredient. */
+    const OPTIONAL_FOOD_KEY = 'usda:9200115';
+    const OPTIONAL_PORTION_MULTIPLIER = 1.5;
+
+    /** That optional row, or a failure naming what the fixture no longer carries. */
+    const optionalIngredientRow = (): FixtureRecipeIngredient => {
+        const ingredient = fixtureIngredientRows(OPTIONAL_SLUG, OPTIONAL_VERSION).find(
+            (candidate) => candidate.food_source_key === OPTIONAL_FOOD_KEY,
+        );
+        if (!ingredient) {
+            throw new Error(
+                `recipes.fixture.json carries no ${OPTIONAL_FOOD_KEY} ingredient on ${OPTIONAL_SLUG} v${OPTIONAL_VERSION}`,
+            );
+        }
+
+        return ingredient;
+    };
+
+    /** The whole recipe as one planned meal, straight off the fixture rows. */
+    const optionalRecipeMeal = (): PlannedMealForGroceries => ({
+        yield_servings: recipeVersionRow(OPTIONAL_SLUG, OPTIONAL_VERSION).yield_servings,
+        portion_multiplier: OPTIONAL_PORTION_MULTIPLIER,
+        ingredients: fixtureIngredientRows(OPTIONAL_SLUG, OPTIONAL_VERSION).map((ingredient) => ({
+            catalog_food_id: ingredient.catalog_food_id,
+            food_state: catalogFood(ingredient.food_source_key).food_state,
+            gram_weight: ingredient.gram_weight,
+        })),
+    });
+
+    /** The grams one planned portion of a fixture ingredient contributes. */
+    const optionalRecipeGramsOf = (ingredient: FixtureRecipeIngredient): number =>
+        (ingredient.gram_weight / recipeVersionRow(OPTIONAL_SLUG, OPTIONAL_VERSION).yield_servings) *
+        OPTIONAL_PORTION_MULTIPLIER;
+
+    /**
+     * An OPTIONAL ingredient is shopped for exactly like a required one.
+     *
+     * AAP §0.7.3 lists every nutritive ingredient — oils, dressings and the
+     * optional ones alike — and counts them for eligibility and for groceries
+     * alike, so the aggregation takes `recipe_ingredients` rows with no
+     * `is_optional` filter at all. A filter added here would drop the yogurt
+     * from the shop while the recipe still cooks with it, which is the
+     * regression these cases pin.
+     */
+    describe('an optional nutritive ingredient', () => {
+        it('is genuinely optional in the committed corpus', () => {
+            // Read off the row itself, so this case cannot quietly stop being
+            // about an optional ingredient if the corpus is regenerated.
+            expect(optionalIngredientRow().is_optional).toBe(true);
+            expect(optionalIngredientRow().snapshot_name).toBe('Greek yogurt, plain');
+        });
+
+        it('contributes its planned grams under its own identity', () => {
+            const ingredient = optionalIngredientRow();
+            const total = aggregatePlannedGrams([optionalRecipeMeal()]).find(
+                (candidate) => candidate.catalog_food_id === ingredient.catalog_food_id,
+            );
+
+            // 170 g over a yield of 3, at 1.5 planned portions. Stated as that
+            // arithmetic over the fixture's own numbers rather than as a
+            // decimal, so the case cannot disagree with the corpus it reads.
+            expect(total).toEqual({
+                catalog_food_id: ingredient.catalog_food_id,
+                food_state: AS_PURCHASED,
+                quantity_grams: optionalRecipeGramsOf(ingredient),
+            });
+        });
+
+        it('reaches a real shopping line, in its own aisle and under its own name', () => {
+            const ingredient = optionalIngredientRow();
+            const recipeFoodFacts = fixtureIngredientRows(OPTIONAL_SLUG, OPTIONAL_VERSION).map((candidate) =>
+                groceryFacts(candidate.food_source_key),
+            );
+            const rows = buildGroceryRows([optionalRecipeMeal()], recipeFoodFacts);
+
+            // `dairy` is the catalog category; `dairy_alternatives` is the aisle
+            // `catalog.logic.ts` collapses it onto. The line renders in the mass
+            // family because the food's default portion is the 170 g container,
+            // and 85 g lands on the column's two decimals with nothing to round.
+            expect(catalogFood(OPTIONAL_FOOD_KEY).category).toBe('dairy');
+            expect(rows.find((line) => line.catalog_food_id === ingredient.catalog_food_id)).toMatchObject({
+                food_state: AS_PURCHASED,
+                category: 'dairy_alternatives',
+                name: 'Greek yogurt, plain, as purchased',
+                quantity_grams: optionalRecipeGramsOf(ingredient),
+                display_unit: 'oz',
+                display_text: '3 oz',
+            });
+            // Every ingredient the recipe lists is shopped for, the optional one
+            // included — a dropped line would shorten this list.
+            expect(rows).toHaveLength(fixtureIngredientRows(OPTIONAL_SLUG, OPTIONAL_VERSION).length);
+        });
+    });
+
+    /**
+     * The aggregation never writes to the caller's data.
+     *
+     * The meals it receives are the rows the service has just read, and an
+     * "optimisation" that accumulated into a caller's ingredient row would
+     * corrupt the very plan it is summing — invisibly, because the first pass
+     * would still add up. `Object.freeze` is deliberate rather than
+     * decorative: the emitted test module is strict-mode, so an in-place write
+     * to a frozen input throws `TypeError` instead of passing unnoticed. The
+     * structural clone catches everything freezing cannot state — a key added,
+     * a row reordered, an array pushed to.
+     */
+    describe('the caller\u2019s meals and ingredients', () => {
+        /** Freezes the whole graph: each ingredient, each ingredient list, each meal, the list of meals. */
+        const deepFreezeMeals = (meals: PlannedMealForGroceries[]): readonly PlannedMealForGroceries[] => {
+            for (const plannedMeal of meals) {
+                for (const ingredient of plannedMeal.ingredients) {
+                    Object.freeze(ingredient);
+                }
+
+                Object.freeze(plannedMeal.ingredients);
+                Object.freeze(plannedMeal);
+            }
+
+            return Object.freeze(meals);
+        };
+
+        it('come back unmodified, and twice over the same input gives the same totals', () => {
+            const meals = [
+                meal([{ catalog_food_id: CHICKEN, gram_weight: 400 }, { catalog_food_id: EGG, gram_weight: 50 }], {
+                    yield_servings: 2,
+                    portion_multiplier: 1.5,
+                }),
+                meal([{ catalog_food_id: CHICKEN, gram_weight: 200 }]),
+            ];
+            const beforeAggregating = structuredClone(meals);
+            const frozen = deepFreezeMeals(meals);
+
+            const first = aggregatePlannedGrams(frozen);
+            const second = aggregatePlannedGrams(frozen);
+
+            expect(first).toEqual([
+                { catalog_food_id: CHICKEN, food_state: RAW, quantity_grams: 500 },
+                { catalog_food_id: EGG, food_state: RAW, quantity_grams: 37.5 },
+            ]);
+            expect(second).toEqual(first);
+            expect(meals).toEqual(beforeAggregating);
+        });
+
+        it('come back unmodified for the committed recipe too, optional row included', () => {
+            const meals = [optionalRecipeMeal()];
+            const beforeAggregating = structuredClone(meals);
+            const frozen = deepFreezeMeals(meals);
+
+            const first = aggregatePlannedGrams(frozen);
+            const second = aggregatePlannedGrams(frozen);
+
+            // Every identity is distinct and every id is a uuid of one length,
+            // so ordering these by `catalog_food_id` is the same order the
+            // module's own identity sort produces.
+            const expected = fixtureIngredientRows(OPTIONAL_SLUG, OPTIONAL_VERSION)
+                .map((ingredient) => ({
+                    catalog_food_id: ingredient.catalog_food_id,
+                    food_state: catalogFood(ingredient.food_source_key).food_state,
+                    quantity_grams: optionalRecipeGramsOf(ingredient),
+                }))
+                .sort((a, b) => (a.catalog_food_id < b.catalog_food_id ? -1 : 1));
+
+            expect(first).toEqual(expected);
+            expect(second).toEqual(first);
+            expect(meals).toEqual(beforeAggregating);
+        });
+    });
 });
 
 /* ---------------------------------------------------------------------------
@@ -576,6 +794,26 @@ describe('buildGroceryDisplay', () => {
 
         it('never shows a positive amount as none', () => {
             expect(buildGroceryDisplay(25, 'count', countFacts).text).toBe('1 egg');
+        });
+
+        describe('the portion description carries the row\u2019s plural', () => {
+            it.each(PLURAL_DESCRIPTION_CASES)('renders exactly one as "1 %s"', (singular) => {
+                expect(buildGroceryDisplay(COUNTED_PORTION_GRAMS, 'count', countedFacts(singular))).toEqual({
+                    family: 'count',
+                    quantity: 1,
+                    unit: COUNT_DISPLAY_UNIT,
+                    text: `1 ${singular}`,
+                });
+            });
+
+            it.each(PLURAL_DESCRIPTION_CASES)('renders more than one %s as "4 %s"', (singular, plural) => {
+                expect(buildGroceryDisplay(4 * COUNTED_PORTION_GRAMS, 'count', countedFacts(singular))).toEqual({
+                    family: 'count',
+                    quantity: 4,
+                    unit: COUNT_DISPLAY_UNIT,
+                    text: `4 ${plural}`,
+                });
+            });
         });
 
         it('rejects a portion with no usable gram weight', () => {
@@ -1210,6 +1448,124 @@ describe('diffGroceryList', () => {
 
             expect(plan.updates[0]).toMatchObject({ display_unit: 'lb', display_text: '1.3 lb' });
         });
+
+        /**
+         * A food whose `food_state` changes is a DIFFERENT line, because the
+         * aggregation identity is `(catalog_food_id, food_state)`: the raw row
+         * is REMOVED and the cooked one INSERTED. Treating the new state as an
+         * in-place increase on the old row is the regression these cases exist
+         * to catch, and it is a distinct rule from the two above —
+         * `storedRowFamily` locks the family of a row that ALREADY EXISTS, so
+         * it must not reach across a state change and impose the raw row's
+         * family, its check, its standing flag or its acknowledged baseline on
+         * a row the shopper has never seen.
+         */
+        describe('a food whose state changes from raw to cooked', () => {
+            /**
+             * The cooked identity counts its portions, so the family it implies
+             * is not the raw row's. Its weight is the module's own ounce factor
+             * rather than a decimal, and every quantity below is a multiple of
+             * it, which is what keeps the counting arithmetic exact.
+             */
+            const COOKED_PORTION_GRAMS = 4 * GRAMS_PER_OUNCE;
+
+            const cookedFacts = facts({
+                food_state: COOKED,
+                default_portion: portion({
+                    description: 'cooked breast',
+                    unit: 'each',
+                    gram_weight: COOKED_PORTION_GRAMS,
+                }),
+            });
+
+            /** Three cooked portions, named, numbered and rendered by the module itself. */
+            const cookedDrafts = buildGroceryRows(
+                [meal([{ catalog_food_id: CHICKEN, food_state: COOKED, gram_weight: 3 * COOKED_PORTION_GRAMS }])],
+                [cookedFacts],
+            );
+
+            /** Checked, acknowledged at 2.5 lb and already flagged — none of that may travel. */
+            const rawRow = acknowledgedRow({ flagged_at: EARLIER });
+
+            const plan = diffGroceryList([rawRow], cookedDrafts, [facts(), cookedFacts], NOW);
+
+            it('removes the raw row instead of updating it in place', () => {
+                expect(plan.removals).toEqual([{ id: 'r1', name: 'Chicken breast', is_checked: true }]);
+                expect(plan.updates).toEqual([]);
+                expect(plan.unchangedItemIds).toEqual([]);
+            });
+
+            it('inserts the cooked line as a row of its own', () => {
+                expect(cookedDrafts).toHaveLength(1);
+                expect(plan.inserts).toEqual(cookedDrafts);
+            });
+
+            it('counts one addition and one removal, and no increase', () => {
+                expect(plan.summary).toEqual({ added: 1, removed: 1, increased: 0 });
+            });
+
+            /**
+             * `GroceryRowDraft` declares no `is_checked`, `flagged_at` or
+             * `previous_quantity_grams` member, so the proof is the insert's OWN
+             * key set: the check the shopper had ticked, the flag standing since
+             * `EARLIER` and the 2.5 lb they acknowledged all die with the raw row
+             * rather than leaking onto its replacement.
+             */
+            it('carries no check, no flag and no acknowledged baseline onto the new row', () => {
+                expect(Object.keys(plan.inserts[0]).sort()).toEqual([
+                    'catalog_food_id',
+                    'category',
+                    'display_quantity',
+                    'display_text',
+                    'display_unit',
+                    'food_state',
+                    'name',
+                    'quantity_grams',
+                    'sort_order',
+                ]);
+                expect(Object.keys(plan.inserts[0])).not.toContain('is_checked');
+                expect(Object.keys(plan.inserts[0])).not.toContain('flagged_at');
+                expect(Object.keys(plan.inserts[0])).not.toContain('previous_quantity_grams');
+            });
+
+            it('renders the new row in the family the new identity\u2019s own portion implies', () => {
+                expect(rawRow.display_unit).toBe('lb');
+                expect(storedRowFamily(rawRow)).toBe('mass');
+                expect(plan.inserts[0]).toMatchObject({
+                    catalog_food_id: CHICKEN,
+                    food_state: COOKED,
+                    name: 'Chicken breast, cooked',
+                    display_quantity: 3,
+                    display_unit: COUNT_DISPLAY_UNIT,
+                    display_text: '3 cooked breasts',
+                });
+                expect(unitFamily(plan.inserts[0].display_unit)).toBe('count');
+            });
+
+            /**
+             * Both states can also be on one list at once, which is the reason
+             * the transition above is a new line rather than an increase. With
+             * both present `buildGroceryName` suffixes BOTH: the cooked line
+             * because its state is not `raw`, and the raw line because another
+             * state of the same base name is on the list.
+             */
+            it('shops the two states of one catalog food as two distinctly named lines', () => {
+                const rows = buildGroceryRows(
+                    [
+                        meal([
+                            { catalog_food_id: CHICKEN, food_state: RAW, gram_weight: GRAMS_PER_POUND },
+                            { catalog_food_id: CHICKEN, food_state: COOKED, gram_weight: 3 * COOKED_PORTION_GRAMS },
+                        ]),
+                    ],
+                    [facts(), cookedFacts],
+                );
+
+                expect(rows.map((line) => [line.food_state, line.name])).toEqual([
+                    [COOKED, 'Chicken breast, cooked'],
+                    [RAW, 'Chicken breast, raw'],
+                ]);
+            });
+        });
     });
 
     describe('lines arriving and leaving', () => {
@@ -1339,6 +1695,55 @@ describe('buildGroceryFlag', () => {
         it('keeps the singular for a delta of one', () => {
             expect(buildGroceryFlag(eggRow({ previous_quantity_grams: 550 }), eggFacts())).toMatchObject({
                 deltaDisplayText: '+1 egg',
+            });
+        });
+
+        /**
+         * All three strings of a count flag are pre-formatted here and rendered
+         * verbatim by the client, so each of them has to pluralise the portion
+         * description on its own: "was 2 loaves", "Now 4 loaves", "+2 loaves".
+         * The rows are built through `buildGroceryDisplay`, so the text the flag
+         * is read against is the module's own rendering rather than a string
+         * this test invented.
+         */
+        describe('the portion description carries the plural in every string', () => {
+            /** A flagged count row of `items` portions, acknowledged at `baselineItems`. */
+            const countedRow = (description: string, items: number, baselineItems: number): StoredGroceryRow => {
+                const display = buildGroceryDisplay(
+                    items * COUNTED_PORTION_GRAMS,
+                    'count',
+                    countedFacts(description),
+                );
+
+                return row({
+                    quantity_grams: items * COUNTED_PORTION_GRAMS,
+                    display_quantity: display.quantity,
+                    display_unit: display.unit,
+                    display_text: display.text,
+                    previous_quantity_grams: baselineItems * COUNTED_PORTION_GRAMS,
+                    flagged_at: NOW,
+                });
+            };
+
+            it.each(PLURAL_DESCRIPTION_CASES)('pluralises %s as %s in was, now and the delta', (singular, plural) => {
+                expect(buildGroceryFlag(countedRow(singular, 4, 2), countedFacts(singular))).toEqual({
+                    previousDisplayText: `2 ${plural}`,
+                    newDisplayText: `4 ${plural}`,
+                    deltaDisplayText: `+2 ${plural}`,
+                    flaggedAt: NOW.toISOString(),
+                });
+            });
+
+            // One item more than one item: the "was" is the singular the shopper
+            // acknowledged, the delta is one whole item, and only the new amount
+            // is plural — the same rule the egg case above shows.
+            it.each(PLURAL_DESCRIPTION_CASES)('keeps %s singular for a delta of one', (singular, plural) => {
+                expect(buildGroceryFlag(countedRow(singular, 2, 1), countedFacts(singular))).toEqual({
+                    previousDisplayText: `1 ${singular}`,
+                    newDisplayText: `2 ${plural}`,
+                    deltaDisplayText: `+1 ${singular}`,
+                    flaggedAt: NOW.toISOString(),
+                });
             });
         });
     });

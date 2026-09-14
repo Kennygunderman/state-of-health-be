@@ -66,6 +66,7 @@ import {
     computeDayTotals,
     daysBetweenDayKeys,
     derivePlanSeed,
+    derivePortionUnit,
     eligibleRecipeCountForSlot,
     evaluateDayTolerance,
     findOverlappingActivePlan,
@@ -92,17 +93,36 @@ import {
     requireNonConflictingWeek,
     requireWritablePlan,
     resolveCurrentAndUpcoming,
+    resolveReportedTargets,
     resolveSlotSchedule,
     resolveUserBudgetTier,
     reuseBonus,
+    sameMacroTotals,
     scoreCandidate,
     scheduleCumulativeShares,
     scheduleSlots,
     searchPlanWeek,
     startDateWindow,
     targetProximity,
+    toPlanningPreferences,
     violatesRepetitionRule,
 } from '../mealPlan.logic';
+// The DTO boundary these rules feed: the mapper composes `derivePortionUnit`
+// into `portionText` and delegates the display round, so the rule and the
+// string or number it produces are asserted together at the end of this file.
+// Both modules are pure, so nothing is mocked.
+import {
+    MealPlanMappingError,
+    PlanMealRow,
+    formatPortionText,
+    groupLoggedPlannedEntries,
+    readPlannedTotals,
+    readTargetsSnapshot,
+    toMealPlanDayResponse,
+    toMealPlanMealResponse,
+    toPlanLifecycleState,
+} from '../mealPlan.mapper';
+import { RecipeVersionRow } from '../recipe.mapper';
 // The grocery side of the plan -> grocery gram hop asserted at the end of this
 // file. Both modules are pure, so nothing is mocked.
 import { plannedIngredientGrams } from '../grocery.logic';
@@ -1275,8 +1295,8 @@ describe('isDayKey', () => {
      * step and not a real day to the log route.
      *
      * It is now an alias of the shared rule, so the band is accepted and the
-     * three names cannot diverge again. `utils/__tests__/calendarDay.test.ts`
-     * asserts the identity; these cases pin the behaviour at this name.
+     * three names cannot diverge again. `preferences.logic.test.ts` asserts the
+     * identity; these cases pin the behaviour at this name.
      */
     it.each(['0000-01-01', '0001-01-01', '0004-02-29', '0050-06-15', '0099-12-31'])(
         'accepts %s, which a Date-based check placed in the twentieth century',
@@ -4197,5 +4217,539 @@ describe('the committed catalog and recipe graph', () => {
             expect(admitted.has('herbed-yogurt-and-kale-dip-plate')).toBe(false);
             expect(admitted.has('spinach-egg-white-scramble')).toBe(true);
         });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The rules the DTO boundary is built on
+ *
+ * Four pure rules of this module, plus the `mealPlan.mapper.ts` functions that
+ * compose them. The mapper is asserted from here rather than from a suite of
+ * its own for the reason the grocery import at the top of this file gives: both
+ * modules are pure, nothing is mocked, and the behaviour worth pinning is the
+ * AGREEMENT between the rule and the string or number it produces — which a
+ * second file could only assert by restating half of it.
+ * ------------------------------------------------------------------------- */
+
+describe('derivePortionUnit', () => {
+    it('takes the unit out of a one-serving description', () => {
+        expect(derivePortionUnit('1 bowl')).toBe('bowl');
+        expect(derivePortionUnit('1 plate')).toBe('plate');
+        expect(derivePortionUnit('1 wrap')).toBe('wrap');
+        expect(derivePortionUnit('1 wedge')).toBe('wedge');
+        expect(derivePortionUnit('1 omelette')).toBe('omelette');
+    });
+
+    it('tolerates surrounding and repeated whitespace', () => {
+        expect(derivePortionUnit('  1 bowl  ')).toBe('bowl');
+        expect(derivePortionUnit('1\tbowl')).toBe('bowl');
+    });
+
+    it('keeps an internal hyphen and the original casing', () => {
+        expect(derivePortionUnit('1 half-wrap')).toBe('half-wrap');
+        expect(derivePortionUnit('1 Bowl')).toBe('Bowl');
+    });
+
+    /**
+     * The six shapes the seeded corpus really contains that must NOT become a
+     * unit. Each would be wrong in its own way: a yield count multiplied a
+     * second time, a phrase whose LAST word `pluralizeCount` would inflect, or
+     * a word already plural that it would inflect again ("halves" ->
+     * "halveses").
+     */
+    it.each([
+        ['¾ cup'],
+        ['4 meatballs with sauce'],
+        ['4 filled cabbage leaves'],
+        ['3 bites'],
+        ['2 muffins'],
+        ['1 stuffed bell pepper (2 halves)'],
+        ['1 fillet with potato and broccoli'],
+    ])('falls back to the generic noun for %s', (description) => {
+        expect(derivePortionUnit(description)).toBe('serving');
+    });
+
+    it('falls back for a word already in the plural, which would inflect twice', () => {
+        expect(derivePortionUnit('1 halves')).toBe('serving');
+        expect(derivePortionUnit('1 couscous')).toBe('serving');
+    });
+
+    it('falls back for no description and for a blank one', () => {
+        expect(derivePortionUnit(null)).toBe('serving');
+        expect(derivePortionUnit('')).toBe('serving');
+        expect(derivePortionUnit('   ')).toBe('serving');
+    });
+
+    /**
+     * TOTAL: no input produces an empty or unusable noun, because the string
+     * reaches the plan card and the swap preview with no further guard. The
+     * inputs below are the shapes the seeded corpus contains plus the ones a
+     * future recipe file could plausibly introduce.
+     */
+    it.each([
+        ['1 bowl'],
+        ['1 plate'],
+        ['¾ cup'],
+        ['2 muffins'],
+        ['1 stuffed bell pepper (2 halves)'],
+        ['1 fillet with potato and broccoli'],
+        ['1'],
+        ['1 '],
+        ['1  2'],
+        ['one bowl'],
+        ['11 bowl'],
+        ['1 bowl of soup'],
+        ['1 BOWL'],
+        ['1 crème'],
+        ['1 ½ bowls'],
+    ])('yields a non-empty noun for %s', (description) => {
+        expect(derivePortionUnit(description).length).toBeGreaterThan(0);
+    });
+});
+
+describe('formatPortionText', () => {
+    it('renders the recipe’s own unit, singular at or below one portion', () => {
+        expect(formatPortionText(1, '1 bowl')).toBe('1 bowl');
+        expect(formatPortionText(0.5, '1 bowl')).toBe('½ bowl');
+        expect(formatPortionText(0.75, '1 wrap')).toBe('¾ wrap');
+    });
+
+    it('pluralises the recipe’s own unit above one portion', () => {
+        expect(formatPortionText(1.25, '1 plate')).toBe('1¼ plates');
+        expect(formatPortionText(2, '1 bowl')).toBe('2 bowls');
+        expect(formatPortionText(1.5, '1 sandwich')).toBe('1½ sandwiches');
+    });
+
+    it('renders the generic noun when the description gives no usable unit', () => {
+        expect(formatPortionText(1, '4 meatballs with sauce')).toBe('1 serving');
+        expect(formatPortionText(1.75, null)).toBe('1¾ servings');
+    });
+
+    it('refuses a multiplier it cannot render, naming the column', () => {
+        expect(() => formatPortionText(0, '1 bowl')).toThrow(MealPlanMappingError);
+        expect(() => formatPortionText(Number.NaN, '1 bowl')).toThrow(/portion_multiplier/);
+        expect(() => formatPortionText(-1, '1 bowl')).toThrow(MealPlanMappingError);
+    });
+});
+
+describe('sameMacroTotals', () => {
+    it('is true only for the same four numbers', () => {
+        expect(sameMacroTotals(TARGETS, { ...TARGETS })).toBe(true);
+    });
+
+    it.each(['calories', 'protein', 'carbs', 'fat'] as const)('is false when %s differs', (key) => {
+        expect(sameMacroTotals(TARGETS, { ...TARGETS, [key]: TARGETS[key] + 1 })).toBe(false);
+    });
+
+    it('is exact rather than tolerant — a fraction apart is not the same', () => {
+        expect(sameMacroTotals(TARGETS, { ...TARGETS, calories: TARGETS.calories + 0.4 })).toBe(false);
+    });
+});
+
+describe('resolveReportedTargets', () => {
+    const generationTargets = proportional(1800);
+    const confirmed = { calories: 2000, protein: 150, carbs: 200, fat: 65 };
+
+    it('reports the current confirmed targets when they are complete', () => {
+        expect(resolveReportedTargets({ complete: true, targets: confirmed }, generationTargets)).toEqual(TARGETS);
+    });
+
+    it('falls back to the generation snapshot when the confirmed read is incomplete', () => {
+        expect(resolveReportedTargets({ complete: false, targets: confirmed }, generationTargets)).toEqual(
+            generationTargets,
+        );
+        expect(resolveReportedTargets({ complete: true, targets: null }, generationTargets)).toEqual(
+            generationTargets,
+        );
+    });
+
+    it.each(['calories', 'protein', 'carbs', 'fat'] as const)(
+        'falls back when the confirmed %s is null despite the complete flag',
+        (key) => {
+            const partial = { ...confirmed, [key]: null };
+
+            expect(resolveReportedTargets({ complete: true, targets: partial }, generationTargets)).toEqual(
+                generationTargets,
+            );
+        },
+    );
+
+    /**
+     * The pair the plan card's `targetsStale` is derived from, asserted
+     * together: the fallback must make the two EQUAL, so a week whose confirmed
+     * targets went incomplete is not captioned as having moved.
+     */
+    it('keeps targetsStale false when it falls back', () => {
+        const reported = resolveReportedTargets({ complete: false, targets: null }, generationTargets);
+
+        expect(sameMacroTotals(reported, generationTargets)).toBe(true);
+    });
+});
+
+describe('toPlanningPreferences', () => {
+    const row = {
+        diet: 'vegan',
+        allergens: ['milk'],
+        disliked_food_ids: ['11111111-1111-4111-8111-111111111111'],
+        disliked_food_groups: ['mushroom'],
+        cooking_time_limit_min: 30,
+    };
+
+    it('narrows the five columns eligibility is judged from', () => {
+        expect(toPlanningPreferences(row)).toEqual({
+            diet: 'vegan',
+            allergens: ['milk'],
+            disliked_food_ids: ['11111111-1111-4111-8111-111111111111'],
+            disliked_food_groups: ['mushroom'],
+            cooking_time_limit_min: 30,
+        });
+    });
+
+    it('admits each of the four diets the contract names', () => {
+        for (const diet of ['none', 'vegetarian', 'vegan', 'pescatarian']) {
+            expect(toPlanningPreferences({ ...row, diet }).diet).toBe(diet);
+        }
+    });
+
+    it('reads an unrecognised stored diet as no diet restriction', () => {
+        expect(toPlanningPreferences({ ...row, diet: 'carnivore' }).diet).toBeNull();
+        expect(toPlanningPreferences({ ...row, diet: null }).diet).toBeNull();
+        expect(toPlanningPreferences({ ...row, diet: '' }).diet).toBeNull();
+        expect(toPlanningPreferences({ ...row, diet: 'Vegan' }).diet).toBeNull();
+    });
+
+    /**
+     * The narrowing must be an OWN-property test, not `in`: the prototype-member
+     * names below are all `in` an ordinary object, so an `in` guard would cast
+     * them to `Diet` and hand the eligibility rules a diet code no recipe
+     * carries — refusing every candidate and reporting a feasible week as
+     * `no_matching_meals` because one stored string was malformed.
+     */
+    it.each(['toString', 'constructor', 'hasOwnProperty', 'valueOf', 'isPrototypeOf', '__proto__', '__defineGetter__'])(
+        'reads the prototype-member name %p as no diet restriction',
+        (diet) => {
+            expect(toPlanningPreferences({ ...row, diet }).diet).toBeNull();
+        },
+    );
+
+    it('reads a missing row as nothing restricted', () => {
+        expect(toPlanningPreferences(null)).toEqual({
+            diet: null,
+            allergens: [],
+            disliked_food_ids: [],
+            disliked_food_groups: [],
+            cooking_time_limit_min: null,
+        });
+    });
+});
+
+describe('readPlannedTotals', () => {
+    it('rounds each value once for display', () => {
+        expect(readPlannedTotals({ calories: 419.6, protein: 31.4, carbs: 43.5, fat: 10.49 }, 'col', 'row-1')).toEqual({
+            calories: 420,
+            protein: 31,
+            carbs: 44,
+            fat: 10,
+        });
+    });
+
+    it('leaves stored integers untouched', () => {
+        expect(readPlannedTotals(TARGETS, 'col', 'row-1')).toEqual(TARGETS);
+    });
+
+    /**
+     * The integer agreement the contract depends on: the diary snapshot is the
+     * rounded per-serving figure and consumed totals are
+     * `round(snapshot × servings)`, so the card must report the same rounded
+     * figure the server will store — otherwise "This adds" sits a unit away
+     * from the entry that gets written.
+     */
+    it('agrees with the diary snapshot the server writes for the same portion', () => {
+        const stored = { calories: 419.6, protein: 31.4, carbs: 43.5, fat: 10.49 };
+        const shown = readPlannedTotals(stored, 'col', 'row-1');
+        const servings = 1.5;
+
+        expect(Math.round(shown.calories * servings)).toBe(Math.round(Math.round(stored.calories) * servings));
+    });
+
+    it.each(['calories', 'protein', 'carbs', 'fat'] as const)(
+        'refuses a non-finite stored %s, naming the column and the row',
+        (key) => {
+            const stored = { ...TARGETS, [key]: Number.NaN };
+
+            expect(() => readPlannedTotals(stored, 'meal_plan_meals.planned_*', 'meal-7')).toThrow(
+                MealPlanMappingError,
+            );
+            expect(() => readPlannedTotals(stored, 'meal_plan_meals.planned_*', 'meal-7')).toThrow(
+                /meal_plan_meals\.planned_\*.*meal-7.*calories|protein|carbs|fat/,
+            );
+        },
+    );
+});
+
+describe('readTargetsSnapshot', () => {
+    it('reads the four stored macro values', () => {
+        expect(readTargetsSnapshot(TARGETS, 'plan-1')).toEqual(TARGETS);
+    });
+
+    /**
+     * A stored snapshot is the user's own calorie and macro targets, so the
+     * exception message names the plan and the offending KEYS — never the
+     * values, which the controller's error logging would otherwise write out
+     * (CWE-532).
+     */
+    it('names the offending keys and their kinds without disclosing any stored value', () => {
+        const corrupted = { calories: 1940, protein: '146', carbs: null, notes: 'secret-note' };
+
+        expect(() => readTargetsSnapshot(corrupted, 'plan-7')).toThrow(MealPlanMappingError);
+
+        try {
+            readTargetsSnapshot(corrupted, 'plan-7');
+            throw new Error('readTargetsSnapshot accepted a corrupted snapshot');
+        } catch (error) {
+            const message = (error as Error).message;
+
+            expect(message).toContain('plan-7');
+            expect(message).toContain('protein is a string');
+            expect(message).toContain('carbs is null');
+            expect(message).toContain('fat is absent');
+            expect(message).not.toContain('1940');
+            expect(message).not.toContain('146');
+            expect(message).not.toContain('secret-note');
+        }
+    });
+
+    it('reports a column that is not an object without serialising it', () => {
+        try {
+            readTargetsSnapshot('unexpected-string', 'plan-8');
+            throw new Error('readTargetsSnapshot accepted a non-object snapshot');
+        } catch (error) {
+            const message = (error as Error).message;
+
+            expect(message).toContain('not a JSON object');
+            expect(message).not.toContain('unexpected-string');
+        }
+    });
+});
+
+describe('toPlanLifecycleState', () => {
+    const planRow = {
+        id: 'plan-1',
+        status: 'active',
+        start_date: new Date('2026-07-05T00:00:00.000Z'),
+        end_date: new Date('2026-07-11T00:00:00.000Z'),
+        replaced_by_plans: [],
+    };
+
+    it('reads the stored dates as day keys and passes the status through', () => {
+        expect(toPlanLifecycleState(planRow)).toEqual({
+            id: 'plan-1',
+            status: 'active',
+            start_date: '2026-07-05',
+            end_date: '2026-07-11',
+            replacement_plan_id: null,
+        });
+    });
+
+    it('flattens the successor the caller resolved', () => {
+        expect(
+            toPlanLifecycleState({ ...planRow, status: 'superseded', replaced_by_plans: [{ id: 'plan-2' }] })
+                .replacement_plan_id,
+        ).toBe('plan-2');
+    });
+
+    /**
+     * The output is `requireWritablePlan`'s input, so the two are asserted
+     * together: shaping a row and judging it are different jobs in different
+     * modules, and this is the seam between them.
+     */
+    it('produces exactly what the writability rule judges', () => {
+        expect(requireWritablePlan(toPlanLifecycleState(planRow), '2026-07-07')).toMatchObject({ id: 'plan-1' });
+        expect(() => requireWritablePlan(toPlanLifecycleState(planRow), '2026-07-12')).toThrow();
+    });
+});
+
+describe('groupLoggedPlannedEntries', () => {
+    const entryRow = (overrides: Record<string, unknown> = {}) => ({
+        id: 'entry-1',
+        date: new Date('2026-07-05T00:00:00.000Z'),
+        servings: 1,
+        logged_at: new Date('2026-07-05T08:30:00.000Z'),
+        meal_plan_meal_id: 'meal-1',
+        recipe_version_id: 'version-1',
+        meals: { name: 'Breakfast' },
+        recipe_versions: { name: 'Greek yogurt bowl' },
+        ...overrides,
+    });
+
+    it('groups entries under the planned meal they belong to', () => {
+        const grouped = groupLoggedPlannedEntries([
+            entryRow(),
+            entryRow({ id: 'entry-2', meal_plan_meal_id: 'meal-2' }),
+            entryRow({ id: 'entry-3' }),
+        ]);
+
+        expect(grouped.get('meal-1')?.map((entry) => entry.entryId)).toEqual(['entry-1', 'entry-3']);
+        expect(grouped.get('meal-2')?.map((entry) => entry.entryId)).toEqual(['entry-2']);
+    });
+
+    it('reads the entry date as a day key and the timestamp as ISO-8601', () => {
+        const [entry] = groupLoggedPlannedEntries([entryRow()]).get('meal-1') ?? [];
+
+        expect(entry).toMatchObject({
+            date: '2026-07-05',
+            loggedAt: '2026-07-05T08:30:00.000Z',
+            mealName: 'Breakfast',
+            recipeName: 'Greek yogurt bowl',
+            recipeVersionId: 'version-1',
+            servings: 1,
+        });
+    });
+
+    /**
+     * A user who edits a logged entry's name or macros detaches it from the
+     * plan (`nutrition.service.ts::updateMealEntry` clears all three links).
+     * Such a row is no longer evidence the meal was eaten, so including it
+     * would light the LOGGED badge for a meal the user has rewritten by hand.
+     */
+    it.each([['meal_plan_meal_id'], ['recipe_version_id'], ['recipe_versions']])(
+        'drops an entry detached by a %s of null',
+        (field) => {
+            expect(groupLoggedPlannedEntries([entryRow({ [field]: null })]).size).toBe(0);
+        },
+    );
+
+    it('is an empty map for no entries', () => {
+        expect(groupLoggedPlannedEntries([]).size).toBe(0);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The composed DTOs, at the boundary the client actually reads
+ *
+ * The two mappers above are asserted directly because the two properties the
+ * contract turns on are properties of the COMPOSITION, not of a helper: a plan
+ * card's figures are integers, and its portion is stated in the recipe's own
+ * serving unit. Asserting `readPlannedTotals` alone would leave a mapper free to
+ * stop calling it.
+ * ------------------------------------------------------------------------- */
+
+const recipeVersionRowFor = (overrides: Partial<RecipeVersionRow> = {}): RecipeVersionRow => ({
+    id: 'version-1',
+    recipe_id: 'recipe-1',
+    version: 1,
+    name: 'Chicken burrito bowl',
+    description: null,
+    icon_key: 'bowl',
+    instructions: ['Season the chicken.'],
+    yield_servings: 2,
+    serving_description: '1 bowl',
+    prep_minutes: 10,
+    cook_minutes: 15,
+    total_minutes: 25,
+    meal_slots: ['lunch'],
+    diet_tags: [],
+    allergen_tags: [],
+    allergen_status: 'known',
+    budget_tier: 2,
+    badges: ['high_protein'],
+    nutrition_provenance: 'source_backed',
+    per_serving_calories: 610,
+    per_serving_protein_g: 45,
+    per_serving_carbs_g: 58,
+    per_serving_fat_g: 21,
+    status: 'current',
+    ...overrides,
+});
+
+const planMealRowFor = (overrides: Partial<PlanMealRow> = {}): PlanMealRow => ({
+    id: 'meal-1',
+    revision: 1,
+    slot: 'lunch',
+    slot_time: '12:30',
+    sort_order: 1,
+    portion_multiplier: 1,
+    planned_calories: 609.6,
+    planned_protein_g: 44.5,
+    planned_carbs_g: 58.4,
+    planned_fat_g: 21.49,
+    flags: [],
+    previous_recipe_versions: null,
+    ...overrides,
+});
+
+describe('toMealPlanMealResponse', () => {
+    it('reports the stored planned macros as integers', () => {
+        const response = toMealPlanMealResponse(planMealRowFor(), recipeVersionRowFor(), []);
+
+        expect(response.planned).toEqual({ calories: 610, protein: 45, carbs: 58, fat: 21 });
+    });
+
+    it('states the portion in the recipe’s own serving unit', () => {
+        expect(toMealPlanMealResponse(planMealRowFor(), recipeVersionRowFor(), []).portionText).toBe('1 bowl');
+        expect(
+            toMealPlanMealResponse(
+                planMealRowFor({ portion_multiplier: 1.5 }),
+                recipeVersionRowFor({ serving_description: '1 plate' }),
+                [],
+            ).portionText,
+        ).toBe('1½ plates');
+    });
+
+    it('falls back to the generic noun for a serving description that is not one unit', () => {
+        expect(
+            toMealPlanMealResponse(
+                planMealRowFor(),
+                recipeVersionRowFor({ serving_description: '4 meatballs with sauce' }),
+                [],
+            ).portionText,
+        ).toBe('1 serving');
+    });
+});
+
+describe('toMealPlanDayResponse', () => {
+    const dayRow = {
+        id: 'day-1',
+        date: new Date('2026-07-05T00:00:00.000Z'),
+        day_index: 0,
+        planned_calories: 1904.7,
+        planned_protein_g: 141.5,
+        planned_carbs_g: 188.2,
+        planned_fat_g: 60.6,
+    };
+
+    const mealWithRecipe = { ...planMealRowFor(), recipe_versions: recipeVersionRowFor() };
+
+    it('reports the stored day totals as integers', () => {
+        const response = toMealPlanDayResponse(dayRow, [mealWithRecipe], {
+            endDate: '2026-07-11',
+            loggedByMealId: new Map(),
+        });
+
+        expect(response.plannedTotals).toEqual({ calories: 1905, protein: 142, carbs: 188, fat: 61 });
+    });
+
+    /**
+     * Meals and the day are rounded independently, so the day total is the sum
+     * of what was PLANNED rather than the sum of four display strings. Stated
+     * as a test so nobody "fixes" the difference by rounding the day out of the
+     * meals.
+     */
+    it('rounds the day from its own stored column, not from the rounded meals', () => {
+        const response = toMealPlanDayResponse(
+            { ...dayRow, planned_calories: 1219.2 },
+            [mealWithRecipe, { ...mealWithRecipe, id: 'meal-2' }],
+            { endDate: '2026-07-11', loggedByMealId: new Map() },
+        );
+        const sumOfRoundedMeals = response.meals.reduce((total, meal) => total + meal.planned.calories, 0);
+
+        expect(response.plannedTotals.calories).toBe(1219);
+        expect(sumOfRoundedMeals).toBe(1220);
+    });
+
+    it('marks the plan’s last date', () => {
+        const context = { endDate: '2026-07-05', loggedByMealId: new Map() };
+
+        expect(toMealPlanDayResponse(dayRow, [mealWithRecipe], context).isLastDay).toBe(true);
     });
 });

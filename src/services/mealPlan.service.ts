@@ -1,8 +1,20 @@
 // The I/O half of the weekly meal plan: the five `/meal-planning/plans*` use
 // cases — publish a week, replace one, read the current and upcoming weeks,
-// read one day, list the meals a preference change made incompatible — plus the
-// plan/day/meal DTO assembly and the two transaction-scoped loaders the swap and
-// planned-log services build their own writes from.
+// read one day, list the meals a preference change made incompatible — and
+// nothing else. Those five and the two typed values they answer with are the
+// whole export surface (§5, one use case per exported function); every read
+// below them is private to this file.
+//
+// THIS FILE IS IMPORTED BY NO OTHER SERVICE, deliberately. It once exported its
+// transaction-scoped loaders so `swap.service.ts` and
+// `plannedMealLog.service.ts` could build their meal and day responses from
+// them, and that import was the defect: a service the AAP sequences AFTER both
+// of them cannot be a dependency of either. The shape those three services
+// share now lives in `mealPlan.mapper.ts` and the rules in `mealPlan.logic.ts`,
+// so each service issues its own owner-scoped query and hands the rows to the
+// same mapper — one DTO shape, no dependency between services. Anything here
+// that a second caller needs belongs in the mapper or the logic module, never
+// in an export from this file.
 //
 // Orchestration only (Rule backend-architecture §5). Every DECISION already
 // belongs to a neighbour and is delegated to it, because a rule re-decided here
@@ -87,13 +99,11 @@ import {
     AffectedMealsResponse,
     BudgetPreference,
     CurrentMealPlanResponse,
-    Diet,
     GeneratePlanPayload,
     LoggedPlannedEntry,
     MealPlanDayEnvelopeResponse,
     MealPlanDayResponse,
     MealPlanMacroTotals,
-    MealPlanMealResponse,
     MealPlanResponse,
     MealPlanSummary,
     MealSchedule,
@@ -101,8 +111,12 @@ import {
     PlanStatus,
     RegeneratePlanPayload,
 } from '../types/mealPlanning';
-import { PlannedMealForGroceries } from './grocery.logic';
-import { buildPlanGroceryDrafts, loadStoredGroceryRows, writePlanGroceryRows } from './grocery.service';
+import {
+    buildPlanGroceryDrafts,
+    loadPlannedMealsForGroceries,
+    loadStoredGroceryRows,
+    writePlanGroceryRows,
+} from './grocery.service';
 import {
     GeneratedPlan,
     ParsedGeneratePlanRequest,
@@ -117,19 +131,21 @@ import {
     requireNonConflictingWeek,
     requireWritablePlan,
     resolveCurrentAndUpcoming,
+    resolveReportedTargets,
+    sameMacroTotals,
     startDateWindow,
+    toPlanningPreferences,
 } from './mealPlan.logic';
 import {
-    MealPlanDataError,
+    groupLoggedPlannedEntries,
     readMealSlot,
     readPlanStatus,
     readStoredFlags,
     readTargetsSnapshot,
-    sameMacroTotals,
     toDayKey,
     toMealPlanDayResponse,
-    toMealPlanMealResponse,
     toMealPlanResponse,
+    toPlanLifecycleState,
 } from './mealPlan.mapper';
 import {
     PlanNotFoundError,
@@ -147,7 +163,7 @@ import {
 } from './mealPlanningAction.service';
 import { isClockTime } from './preferences.logic';
 import { PreferencesRow, dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
-import { PlanningPreferences, isMealSlot } from './recipe.logic';
+import { isMealSlot } from './recipe.logic';
 import { getRecipeVersionsForPlanning } from './recipe.service';
 import { getTargets, previewConfirmedTargets, requireConfirmedTargets } from './targets.service';
 
@@ -193,6 +209,41 @@ const COMPLETED_SETUP_STATUS = 'completed';
 
 
 /* ---------------------------------------------------------------------------
+ * The one untyped fault this file raises
+ * ------------------------------------------------------------------------- */
+
+/**
+ * A stored column or a write result contradicting an invariant this module
+ * depends on: a preferences row whose schedule is not a schedule, a plan this
+ * transaction inserted that cannot be read back, a plan absent from its own
+ * owner's plan list, or a compare-and-swap under the per-user lock that wrote a
+ * row count other than one.
+ *
+ * Its own class rather than a bare `Error` so the message names the row and the
+ * column, and declared HERE rather than in `mealPlanning.errors.ts` on purpose:
+ * that module is the closed vocabulary of failures the CLIENT distinguishes and
+ * acts on, one class per §0.5.2 machine code, and a class mapping to no code
+ * would be dead weight in it. There is no client action for "the plan row this
+ * server just wrote is not readable", so it reaches the controller as a 500 —
+ * the same arrangement `swap.service.ts::SwapDataError` and
+ * `plannedMealLog.service.ts::PlannedMealLogWriteError` document for their own
+ * invariant faults.
+ *
+ * DISTINCT FROM `mealPlan.mapper.ts::MealPlanMappingError`, which is raised
+ * while a stored row is being shaped into a response and is named for that job
+ * (as `GroceryMappingError` and `RecipeMappingError` are for theirs). This one
+ * is raised by orchestration: reads, writes and lifecycle, none of which a
+ * mapper performs. Keeping them apart is what stops a mapper from owning the
+ * error vocabulary of the service that calls it.
+ */
+export class MealPlanDataError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'MealPlanDataError';
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Stored columns and the two naming worlds
  *
  * The database is snake_case and the wire is camelCase; that translation belongs
@@ -226,8 +277,6 @@ const asJsonValue = (value: MealPlanMacroTotals): Prisma.InputJsonValue =>
 const asRecord = (value: unknown): Record<string, unknown> | null =>
     typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 
-
-const DIETS: Readonly<Record<Diet, true>> = { none: true, vegetarian: true, vegan: true, pescatarian: true };
 
 const MEAL_SCHEDULES: Readonly<Record<MealSchedule, true>> = { three: true, three_plus_snack: true };
 
@@ -327,15 +376,13 @@ const PLAN_COLUMNS = {
  * entry's name or macros: it references no recipe, so it is neither this meal
  * logged nor an earlier one, and the DTO has nowhere truthful to put it.
  */
-export const loadLoggedEntriesForMeals = async (
+const loadLoggedEntriesForMeals = async (
     db: Prisma.TransactionClient,
     userId: string,
     mealIds: readonly string[],
 ): Promise<Map<string, LoggedPlannedEntry[]>> => {
-    const byMealId = new Map<string, LoggedPlannedEntry[]>();
-
     if (mealIds.length === 0) {
-        return byMealId;
+        return new Map<string, LoggedPlannedEntry[]>();
     }
 
     const entries = await db.meal_entries.findMany({
@@ -357,70 +404,13 @@ export const loadLoggedEntriesForMeals = async (
         orderBy: [{ logged_at: 'asc' }, { id: 'asc' }],
     });
 
-    for (const entry of entries) {
-        if (entry.meal_plan_meal_id === null || entry.recipe_version_id === null || entry.recipe_versions === null) {
-            continue;
-        }
-
-        const logged: LoggedPlannedEntry = {
-            entryId: entry.id,
-            date: toDayKey(entry.date, 'meal_entries.date', entry.id),
-            mealName: entry.meals.name,
-            servings: entry.servings,
-            loggedAt: entry.logged_at.toISOString(),
-            recipeVersionId: entry.recipe_version_id,
-            recipeName: entry.recipe_versions.name,
-        };
-
-        const existing = byMealId.get(entry.meal_plan_meal_id);
-
-        if (existing) {
-            existing.push(logged);
-        } else {
-            byMealId.set(entry.meal_plan_meal_id, [logged]);
-        }
-    }
-
-    return byMealId;
+    return groupLoggedPlannedEntries(entries);
 };
 
 
 /* ---------------------------------------------------------------------------
- * The three composed reads every caller shares
+ * The two composed reads this file's own use cases are built from
  * ------------------------------------------------------------------------- */
-
-/**
- * One planned meal as the wire shape, or `null` when it is not the caller's.
- *
- * ONE PREDICATE, `{id, meal_plan_id, user_id}` — never an ownership read
- * followed by a lookup by id (§5.1) — so a caller cannot probe another user's
- * meal ids, and "no such meal", "not in that plan" and "not your plan" are the
- * same answer. `null` rather than a throw, because who turns a miss into a 404
- * differs: a plain read answers 404 while a keyed write has already established
- * the plan and treats a missing meal as the fault it would be.
- *
- * This is the function `swap.service.ts` and `plannedMealLog.service.ts` return
- * their meal DTO from, which is what keeps one meal shape in the codebase.
- */
-export const loadMealPlanMealResponse = async (
-    db: Prisma.TransactionClient,
-    userId: string,
-    planId: string,
-    mealId: string,
-): Promise<MealPlanMealResponse | null> => {
-    const meal = await db.meal_plan_meals.findFirst({
-        where: { id: mealId, meal_plan_id: planId, user_id: userId },
-        include: PLAN_MEAL_INCLUDE,
-    });
-
-    if (meal === null) {
-        return null;
-    }
-
-    const logged = await loadLoggedEntriesForMeals(db, userId, [meal.id]);
-
-    return toMealPlanMealResponse(meal, meal.recipe_versions, logged.get(meal.id) ?? []);
-};
 
 /**
  * One day of a plan as the wire shape, or `null` when the plan is not the
@@ -431,7 +421,7 @@ export const loadMealPlanMealResponse = async (
  * one day. A date outside the week matches nothing and is therefore the same
  * `null` an unowned plan gives.
  */
-export const loadMealPlanDayResponse = async (
+const loadMealPlanDayResponse = async (
     db: Prisma.TransactionClient,
     userId: string,
     planId: string,
@@ -503,77 +493,23 @@ const loadPlanSummary = async (
  * `targetsStale` from these values and `targets_snapshot`, so the inequality has
  * one definition beside the two fields it explains.
  *
- * THE FALLBACK IS FOR AN INCOMPLETE CURRENT READ ONLY. When the stored targets
- * are not all four present the plan reports its snapshot as its current targets,
- * which keeps the derived `targetsStale` false and the card truthful: the
- * alternative is
- * showing a plan against `null` calories, and a plan that EXISTS was necessarily
- * built against four confirmed values. A `legacy` source is deliberately NOT
- * treated as incomplete — those four values are what the user's other surfaces
- * show today, so reporting them here (and flagging the difference) is the honest
- * answer, and refusing them is a decision `requireConfirmedTargets` makes on the
- * WRITE path, where a new week is at stake.
+ * WHICH of the two it reports is `mealPlan.logic.ts::resolveReportedTargets`'s
+ * rule — the same rule `swap.service.ts` applies, so the day card and the
+ * candidate scoring cannot aim at different numbers. This function is the READ
+ * around it: one `getTargets` call, and nothing else.
+ *
+ * A `legacy` source is deliberately NOT treated as incomplete — those four
+ * values are what the user's other surfaces show today, so reporting them here
+ * (and flagging the difference) is the honest answer, and refusing them is a
+ * decision `requireConfirmedTargets` makes on the WRITE path, where a new week
+ * is at stake.
  */
 const resolvePlanTargets = async (
     db: Prisma.TransactionClient,
     userId: string,
     generationTargets: MealPlanMacroTotals,
-): Promise<MealPlanMacroTotals> => {
-    const stored = await getTargets(userId, db);
-    const values = stored.targets;
-
-    if (
-        !stored.complete ||
-        values === null ||
-        values.calories === null ||
-        values.protein === null ||
-        values.carbs === null ||
-        values.fat === null
-    ) {
-        return generationTargets;
-    }
-
-    return {
-        calories: values.calories,
-        protein: values.protein,
-        carbs: values.carbs,
-        fat: values.fat,
-    };
-};
-
-/**
- * The targets a plan is judged against, for a caller that needs them without
- * the whole plan response.
- *
- * THE SWAP'S ONE SOURCE FOR THEM. `swap.service.ts` scores every candidate
- * against these values and the day card reports them through
- * {@link loadMealPlanResponse}; reading them through the same two steps —
- * `targets_snapshot` narrowed, then reconciled with the current confirmed
- * targets by {@link resolvePlanTargets} — is what makes it impossible for the
- * alternatives list, the preview and the day card to disagree about what the
- * day is aiming at. A swap that scored against the snapshot while the card
- * showed the current targets would offer a meal that visibly misses the number
- * beside it.
- *
- * `PlanNotFoundError` for a plan that is absent or not the caller's, because
- * every caller of this is on a path that has to answer 404 for exactly that.
- */
-export const loadPlanTargets = async (
-    db: Prisma.TransactionClient,
-    userId: string,
-    planId: string,
-): Promise<MealPlanMacroTotals> => {
-    const plan = await db.meal_plans.findFirst({
-        where: { id: planId, user_id: userId },
-        select: { id: true, targets_snapshot: true },
-    });
-
-    if (plan === null) {
-        throw new PlanNotFoundError();
-    }
-
-    return resolvePlanTargets(db, userId, readTargetsSnapshot(plan.targets_snapshot, plan.id));
-};
+): Promise<MealPlanMacroTotals> =>
+    resolveReportedTargets(await getTargets(userId, db), generationTargets);
 
 /**
  * A whole plan as the wire shape, or `null` when it is not the caller's.
@@ -595,7 +531,7 @@ export const loadPlanTargets = async (
  * re-establishes both orderings from the rows themselves, so the response's
  * order is a property of the contract rather than of this query.
  */
-export const loadMealPlanResponse = async (
+const loadMealPlanResponse = async (
     db: Prisma.TransactionClient,
     userId: string,
     planId: string,
@@ -626,7 +562,7 @@ export const loadMealPlanResponse = async (
 };
 
 /* ---------------------------------------------------------------------------
- * Lifecycle state and the grocery projection — shared with the write services
+ * Lifecycle state, read for this file's own current/upcoming resolution
  * ------------------------------------------------------------------------- */
 
 /**
@@ -644,7 +580,7 @@ export const loadMealPlanResponse = async (
  * status makes a plan unwritable is `requireWritablePlan`'s rule, and a loader
  * that branched on `status` to save a join would own half of it.
  */
-export const loadPlanLifecycleStates = async (
+const loadPlanLifecycleStates = async (
     db: Prisma.TransactionClient,
     userId: string,
 ): Promise<PlanLifecycleState[]> => {
@@ -665,72 +601,7 @@ export const loadPlanLifecycleStates = async (
         orderBy: [{ start_date: 'asc' }, { id: 'asc' }],
     });
 
-    return plans.map((plan) => ({
-        id: plan.id,
-        status: plan.status,
-        start_date: toDayKey(plan.start_date, 'meal_plans.start_date', plan.id),
-        end_date: toDayKey(plan.end_date, 'meal_plans.end_date', plan.id),
-        replacement_plan_id: plan.replaced_by_plans[0]?.id ?? null,
-    }));
-};
-
-/**
- * The plan's meals as the grocery rules consume them.
- *
- * The projection `grocery.logic.ts::PlannedMealForGroceries` declares and
- * nothing more: the yield the ingredient gram weights are stated per, the slot's
- * portion multiplier, and each ingredient's `(catalog_food_id, food_state,
- * gram_weight)`. `food_state` is joined from `catalog_foods` because it is the
- * FOOD's property and half of the aggregation identity — raw, dry and cooked
- * amounts of one food must never merge into one shopping line — while
- * `gram_weight` is the recipe's.
- *
- * OPTIONAL INGREDIENTS ARE INCLUDED. They are part of the recipe's nutrition
- * (`recipe.logic.ts` sums every ingredient) and of its allergen derivation, so
- * omitting them from the list would hand the user a week whose shopping does not
- * make the meals the plan promises.
- *
- * Exported because a swap's grocery reconciliation needs the plan's meals AFTER
- * its write, and this is the one projection of them. Ordered by day then slot so
- * the aggregation walks the week in plan order — the sum is float addition,
- * which is not associative, and a stable order is what keeps two reads of one
- * plan producing the same grams.
- */
-export const loadPlannedMealsForGroceries = async (
-    db: Prisma.TransactionClient,
-    userId: string,
-    planId: string,
-): Promise<PlannedMealForGroceries[]> => {
-    const meals = await db.meal_plan_meals.findMany({
-        where: { meal_plan_id: planId, user_id: userId },
-        select: {
-            portion_multiplier: true,
-            recipe_versions: {
-                select: {
-                    yield_servings: true,
-                    recipe_ingredients: {
-                        select: {
-                            catalog_food_id: true,
-                            gram_weight: true,
-                            catalog_foods: { select: { food_state: true } },
-                        },
-                        orderBy: [{ sort_order: 'asc' }, { catalog_food_id: 'asc' }],
-                    },
-                },
-            },
-        },
-        orderBy: [{ meal_plan_days: { date: 'asc' } }, { sort_order: 'asc' }, { id: 'asc' }],
-    });
-
-    return meals.map((meal) => ({
-        yield_servings: meal.recipe_versions.yield_servings,
-        portion_multiplier: meal.portion_multiplier,
-        ingredients: meal.recipe_versions.recipe_ingredients.map((ingredient) => ({
-            catalog_food_id: ingredient.catalog_food_id,
-            food_state: ingredient.catalog_foods.food_state,
-            gram_weight: ingredient.gram_weight,
-        })),
-    }));
+    return plans.map(toPlanLifecycleState);
 };
 
 /* ---------------------------------------------------------------------------
@@ -1116,32 +987,6 @@ const readBudget = (row: PreferencesRow): BudgetPreference | null =>
     row.budget_amount === null || row.budget_currency === null
         ? null
         : { amount: row.budget_amount, currency: row.budget_currency };
-
-/**
- * The five preference columns `recipe.logic.ts::evaluatePlanningEligibility`
- * reads, narrowed out of the stored row.
- *
- * Narrowed here rather than imported because `preferences.service.ts` keeps its
- * own equivalent private, and exported here because BOTH write paths that judge
- * eligibility need it: the generator, through
- * {@link toPlanGenerationPreferences} below, which adds the schedule and the
- * budget only a search needs; and `swap.service.ts`, whose candidate selection
- * needs exactly these five and nothing more. ONE narrowing rather than two is
- * what stops a swap from admitting a recipe the generator would have refused.
- *
- * `diet` goes through a closed set keyed off the contract's own union (see
- * `MEAL_FLAG_CODES` above), so an unrecognised stored value reads as "no diet
- * restriction" rather than reaching the eligibility rules as an unknown code.
- * A null row reads as "nothing restricted", which is what a user who has saved
- * no preference has said.
- */
-export const toPlanningPreferences = (row: PreferencesRow | null): PlanningPreferences => ({
-    diet: row === null ? null : asMember(DIETS, row.diet),
-    allergens: row?.allergens ?? [],
-    disliked_food_ids: row?.disliked_food_ids ?? [],
-    disliked_food_groups: row?.disliked_food_groups ?? [],
-    cooking_time_limit_min: row?.cooking_time_limit_min ?? null,
-});
 
 /**
  * The preference row as everything the GENERATOR reads about a user: the five

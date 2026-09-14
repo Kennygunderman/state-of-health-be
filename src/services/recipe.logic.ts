@@ -1962,9 +1962,13 @@ export type ParsedRecipeVersionPath =
  * The refusal branch of {@link parseRecipeVersionPath}, named so a caller can
  * declare it in its own return type without re-declaring the shape.
  *
- * `recipe.service.ts::getRecipeVersionForUser` is that caller: it is the
- * route-facing read, so its result is "the version (or `null`)" or "this id
- * could never denote a version", and the second half is exactly this type.
+ * `catalog.controller.ts::getRecipeVersionController` is the caller that acts
+ * on it: it parses `req.params` before any service call, and this is the half
+ * of the verdict it answers with `400 invalid_request` rather than passing on.
+ * The read behind it takes an already-validated id and returns the version or
+ * `null`, so no service declares this type — which is the point of naming it
+ * anyway: a controller, a test or a future route can state "the parser's
+ * refusal" without copying the body the client renders.
  * Derived with `Exclude` rather than written out, so it stays the shape this
  * module produces by construction — a hand-written copy would be free to drift
  * from the `details` the client renders beside its fields, and
@@ -1975,9 +1979,11 @@ export type RecipeVersionPathRefusal = Exclude<ParsedRecipeVersionPath, { kind: 
 /**
  * Validates `:recipeVersionId` for `GET /recipes/:recipeVersionId`.
  *
- * JUDGED BEFORE ANY I/O, which is the point of the parser: the id goes straight
- * into a PostgreSQL `uuid` predicate in
- * `recipe.service.ts::getRecipeVersionForUser`, so a malformed segment would
+ * JUDGED BEFORE ANY I/O, at the controller boundary:
+ * `catalog.controller.ts::getRecipeVersionController` calls this over
+ * `req.params` and only then calls
+ * `recipe.service.ts::getRecipeVersionForUser`, whose id goes straight into a
+ * PostgreSQL `uuid` predicate — so a malformed segment that got past here would
  * become a Prisma failure and a generic 500 where §0.5.2 promises a
  * `400 invalid_request` naming the field. A WELL-FORMED id that names nothing,
  * or names a version this caller may not read, is still the route's 404 — this

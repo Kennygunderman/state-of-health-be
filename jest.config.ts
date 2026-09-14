@@ -44,10 +44,10 @@ const SERVICES_DIRECTORY = 'src/services';
 const LOGIC_MODULE_SUFFIX = '.logic.ts';
 
 /**
- * The pure utility modules held to the bar, as repo-relative paths: the four
- * §0.7.1 names explicitly, plus `calendarDay.ts`, which was extracted from
- * three services that had each grown their own copy of the calendar rule and
- * had drifted apart on years before 0100.
+ * The pure utility modules held to the bar, as repo-relative paths: exactly the
+ * four §0.7.1 names, and no others. A pure rule several services share is not a
+ * fifth entry here — it belongs to the `*.logic.ts` parser that owns the input
+ * it validates, where the derived services inventory above already gates it.
  *
  * Listed rather than derived because `src/utils/` also holds I/O boundaries
  * (`firebase.ts`, `getUserId.ts`) that the plan excludes from coverage; the
@@ -59,7 +59,6 @@ export const COVERED_UTIL_MODULES: readonly string[] = [
     'src/utils/seededRandom.ts',
     'src/utils/pagination.ts',
     'src/utils/featureFlags.ts',
-    'src/utils/calendarDay.ts',
 ];
 
 /**

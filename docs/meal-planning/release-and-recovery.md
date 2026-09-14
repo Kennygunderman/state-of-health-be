@@ -115,22 +115,29 @@ everywhere else, so it can neither be used in production nor silently ignored.
 Generate, regenerate, swap and log each carry an idempotency key. A client whose
 response never arrived retries with the same key, and the `meal_plan_actions`
 ledger answers that retry from the row it already wrote rather than doing the
-work a second time: the same status, the same plan revision and the same values
-the first response carried, for as long as the row exists. To produce that case
+work a second time: the same status, the same plan revision and the same body the
+first response carried, for as long as the row exists. To produce that case
 deliberately, set `MEAL_PLANNING_FAULT=log` in a development or test environment
 and log a planned meal — the write commits and the response is dropped at the
 socket — then repeat the request with the same key and the same body. The
 `generation` and `swap` values are decoded failures instead: they persist
 nothing, so there is no ledger row and nothing to replay.
 
-Expect the two bodies to be **equal by value, not identical byte for byte.**
-`response_snapshot` is a `jsonb` column, so PostgreSQL keeps the stored body with
-its object keys sorted and a replay serialises those keys in a different order
-than the first response did. No value changes, and key order means nothing to a
-JSON client. So compare the two as parsed JSON — `diff <(jq -S . first.json)
-<(jq -S . replay.json)` — and read a difference reported by `diff` or `cmp` on
-the raw response text as an artefact of the column, not a fault. Confirm the
-other half against the database: exactly one row for that key
+Expect the two bodies to be **identical byte for byte**, which is what §0.9.2
+asks for read literally. `response_snapshot` is a `jsonb` column and PostgreSQL
+does keep a stored object's keys in its own order — by UTF-8 byte length, then
+by bytes — so the ledger stores the body in exactly that order before the column
+can impose it (`canonicalizeResponseBody` in
+`src/services/mealPlanningAction.logic.ts`). The first response is served from
+that same canonically ordered value, so the column has nothing left to reorder
+and the two texts agree. Compare them directly — `cmp first.json replay.json`,
+or `diff` on the raw text — and read any difference as a **regression to
+investigate**, not as an artefact of the column; `diff <(jq -S . first.json)
+<(jq -S . replay.json)` remains a useful second check that isolates a value
+difference from an ordering one. The column can be read the same way:
+`SELECT jsonb_object_keys(response_snapshot) FROM meal_plan_actions WHERE
+idempotency_key = '<key>'` returns the keys in the order the response carried
+them. Confirm the other half against the database: exactly one row for that key
 (`SELECT count(*) FROM meal_plan_actions WHERE user_id = '<uuid>' AND
 idempotency_key = '<key>'` returns 1) with `response_status` and
 `plan_revision_after` both filled. A repeated key with a *different* body is not

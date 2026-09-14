@@ -57,7 +57,10 @@ import {
     CATALOG_QUARANTINE_CHECK_NAMES,
     CATALOG_REJECT_CHECK_NAMES,
     CATALOG_REVIEW_CHECK_NAMES,
+    CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
+    CATALOG_SUGGESTIONS_MAX_LIMIT,
     CatalogCategoryBounds,
+    CatalogComponentCoverageFacts,
     CatalogFoodCandidate,
     CatalogFoodPortionCandidate,
     CatalogGlobalValidationBounds,
@@ -78,6 +81,7 @@ import {
     MAX_SEARCH_QUERY_LENGTH,
     MIN_SEARCH_QUERY_LENGTH,
     PER_100G_BASIS_AMOUNT,
+    assessComponentCoverage,
     buildSourceKey,
     catalogCheckTier,
     computeCoverageShortfall,
@@ -100,12 +104,20 @@ import {
     normalizeToPer100g,
     parseCanonicalFdcId,
     parseCatalogSearchQuery,
+    parseCatalogSuggestionsQuery,
     resolveCatalogDisposition,
     resolveCategoryBounds,
     validateCatalogCandidate,
 } from '../catalog.logic';
 import {
+    CatalogFoodPortionRow,
+    CatalogFoodRow,
+    CatalogMappingError,
+    mapCatalogFood,
+} from '../catalog.mapper';
+import {
     CatalogAllergenStatus,
+    CatalogFoodResponse,
     CatalogFoodState,
     CatalogIdentitySource,
     CatalogIdentityStatus,
@@ -115,6 +127,7 @@ import {
     CatalogValidationCheck,
     CatalogValidationOutcome,
 } from '../../types/catalog';
+import { CatalogEntryFood, resolveCatalogEntrySnapshot } from '../nutrition.logic';
 
 /* ---------------------------------------------------------------------------
  * Fixtures — a deliberately synthetic policy, kept beside the shipped one
@@ -851,6 +864,154 @@ describe('parseCatalogSearchQuery', () => {
         ['a well-formed emoji', 'salad \ud83e\udd57 bowl'],
     ])('accepts %s unchanged', (_label, raw) => {
         expect(parseCatalogSearchQuery(raw)).toEqual({ kind: 'ok', q: raw });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * parseCatalogSuggestionsQuery
+ * ------------------------------------------------------------------------- */
+
+describe('parseCatalogSuggestionsQuery', () => {
+    /** The one refusal this endpoint can produce, asserted whole once below. */
+    const UNSUPPORTED_KIND_VERDICT = {
+        kind: 'error',
+        code: 'invalid_request',
+        message: 'kind must be dislike',
+        details: [{ field: 'kind', code: 'unsupported' }],
+    };
+
+    it('accepts the one supported kind at the default limit', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike' })).toEqual({
+            kind: 'ok',
+            suggestionKind: 'dislike',
+            limit: CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
+        });
+    });
+
+    // The contract defines a single kind, so every way of not sending it — a
+    // different word, no word at all, a value that is not even a string — is
+    // the same one correction, and the whole body is pinned here because it is
+    // what the controller returns as `400 invalid_request`.
+    it.each([
+        ['an absent kind', {}],
+        ['a kind nobody defined', { kind: 'favourite' }],
+        ['an empty kind', { kind: '' }],
+        ['a number', { kind: 7 }],
+        ['null', { kind: null }],
+        ['an object', { kind: {} }],
+        ['an empty repeated parameter', { kind: [] }],
+    ])('refuses %s', (_label, query) => {
+        expect(parseCatalogSuggestionsQuery(query)).toEqual(UNSUPPORTED_KIND_VERDICT);
+    });
+
+    // A closed value set is matched exactly: neither case-folded nor trimmed,
+    // because `dislike` is a wire token the client sends verbatim and a value
+    // this parser "helped" would be a value `getSuggestions` cannot index.
+    it.each([
+        ['a different case', { kind: 'Dislike' }],
+        ['surrounding whitespace', { kind: 'dislike ' }],
+    ])('refuses %s rather than repairing it', (_label, query) => {
+        expect(parseCatalogSuggestionsQuery(query)).toMatchObject({
+            kind: 'error',
+            details: [{ field: 'kind', code: 'unsupported' }],
+        });
+    });
+
+    // `qs` yields an array when a parameter repeats; the first occurrence wins,
+    // in both directions, exactly as parsePagination treats a repeated `page`.
+    it('takes the first occurrence of a repeated kind', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: ['dislike', 'favourite'] })).toEqual({
+            kind: 'ok',
+            suggestionKind: 'dislike',
+            limit: CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
+        });
+        expect(parseCatalogSuggestionsQuery({ kind: ['favourite', 'dislike'] })).toEqual(
+            UNSUPPORTED_KIND_VERDICT,
+        );
+    });
+
+    // A query object that is not readable is the same request as one carrying
+    // no `kind`, so the narrowing stays total instead of growing a second
+    // refusal for a case no client can distinguish.
+    it.each([
+        ['undefined', undefined],
+        ['null', null],
+        ['a bare string', 'dislike'],
+        ['an array', ['dislike']],
+    ])('refuses %s as a query object', (_label, query) => {
+        expect(parseCatalogSuggestionsQuery(query)).toEqual(UNSUPPORTED_KIND_VERDICT);
+    });
+
+    // `invalid_request` with exactly one detail, even when a second field is
+    // present and could plausibly have been blamed as well.
+    it('names only kind, never the limit beside it', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'favourite', limit: '9' })).toEqual(
+            UNSUPPORTED_KIND_VERDICT,
+        );
+    });
+
+    // The limit rules are parsePagination's, exercised here through the bounds
+    // this endpoint declares: a request may not draw more than the maximum, an
+    // unreadable value falls back to the default, and nothing can produce a
+    // non-positive page of chips.
+    it('caps the limit at the maximum this endpoint declares', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: '31' })).toEqual({
+            kind: 'ok',
+            suggestionKind: 'dislike',
+            limit: CATALOG_SUGGESTIONS_MAX_LIMIT,
+        });
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: '1000' })).toMatchObject({
+            limit: CATALOG_SUGGESTIONS_MAX_LIMIT,
+        });
+    });
+
+    it('accepts a limit inside the band unchanged', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: '5' })).toEqual({
+            kind: 'ok',
+            suggestionKind: 'dislike',
+            limit: 5,
+        });
+        expect(
+            parseCatalogSuggestionsQuery({
+                kind: 'dislike',
+                limit: String(CATALOG_SUGGESTIONS_MAX_LIMIT),
+            }),
+        ).toMatchObject({ limit: CATALOG_SUGGESTIONS_MAX_LIMIT });
+    });
+
+    it.each([
+        ['zero', '0', 1],
+        ['a negative limit', '-5', 1],
+        ['free text', 'twelve', CATALOG_SUGGESTIONS_DEFAULT_LIMIT],
+        ['an empty limit', '', CATALOG_SUGGESTIONS_DEFAULT_LIMIT],
+        ['a fractional limit', '7.9', 7],
+    ])('resolves %s to %s rows', (_label, limit, expected) => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit })).toMatchObject({
+            kind: 'ok',
+            limit: expected,
+        });
+    });
+
+    it('takes the first occurrence of a repeated limit', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', limit: ['4', '25'] })).toMatchObject({
+            limit: 4,
+        });
+    });
+
+    // `page` is not part of this endpoint's contract — the suggestion set is one
+    // capped page — so it is neither read nor reported, and a client sending it
+    // gets the same single page rather than a silent second one.
+    it('neither reads nor returns a page', () => {
+        expect(parseCatalogSuggestionsQuery({ kind: 'dislike', page: '4' })).toEqual({
+            kind: 'ok',
+            suggestionKind: 'dislike',
+            limit: CATALOG_SUGGESTIONS_DEFAULT_LIMIT,
+        });
+    });
+
+    it('declares the bounds AAP §0.5.2 fixes for this endpoint', () => {
+        expect(CATALOG_SUGGESTIONS_DEFAULT_LIMIT).toBe(12);
+        expect(CATALOG_SUGGESTIONS_MAX_LIMIT).toBe(30);
     });
 });
 
@@ -4698,5 +4859,797 @@ describe('bounds are parameters, not constants', () => {
         expect(underSmallPolicy.publicationStatus).toBe('rejected');
         expect(underSmallPolicy.decidingCheckNames).toEqual([CATALOG_CHECK_NAMES.UNKNOWN_CATEGORY]);
         expect(POLICY.categories.map((entry) => entry.category)).not.toContain('protein_egg');
+    });
+});
+
+/**
+ * The rule that makes a zero-row `components.jsonl` an ASSERTED empty set
+ * rather than a blank.
+ *
+ * This is the pinned half of a release refusal. `catalog-release.ts` maps its
+ * published rows onto these facts, refuses the export when the verdict is not
+ * ok, and publishes `derivedCount` in the manifest beside the component row
+ * count — from this same verdict, so the two cannot disagree. The cases below
+ * are therefore the whole justification for shipping a release whose component
+ * member is empty, and the third one IS the shipped v1 release: a catalog built
+ * entirely from source-backed single-ingredient USDA records.
+ *
+ * What goes unnoticed without the rule: an empty component export and an export
+ * that silently dropped every row verify identically against a manifest, since
+ * the digest of an empty file matches an empty file either way.
+ */
+describe('assessComponentCoverage', () => {
+    const food = (
+        source_key: string,
+        nutrition_provenance: string,
+        resolvable_component_count: number,
+    ): CatalogComponentCoverageFacts => ({
+        source_key,
+        nutrition_provenance,
+        resolvable_component_count,
+    });
+
+    it('refuses a derived food carrying no composition, and names it', () => {
+        const verdict = assessComponentCoverage([
+            food('ai:prepared_meal:lentil stew:prepared', 'ingredient_derived', 0),
+        ]);
+
+        expect(verdict.ok).toBe(false);
+        expect(verdict.derivedWithoutComponents).toEqual(['ai:prepared_meal:lentil stew:prepared']);
+        expect(verdict.derivedCount).toBe(1);
+    });
+
+    it('accepts a derived food with one resolvable component', () => {
+        const verdict = assessComponentCoverage([
+            food('ai:prepared_meal:lentil stew:prepared', 'ingredient_derived', 1),
+        ]);
+
+        expect(verdict.ok).toBe(true);
+        expect(verdict.derivedWithoutComponents).toEqual([]);
+        expect(verdict.derivedCount).toBe(1);
+    });
+
+    // The shipped v1 release in miniature: every row source-backed, no
+    // composition anywhere, so 0 component rows is the correct count rather
+    // than the symptom of a truncated export.
+    it('accepts a wholly source-backed set carrying no components at all', () => {
+        const verdict = assessComponentCoverage([
+            food('usda:1104647', 'source_backed', 0),
+            food('usda:171077', 'source_backed', 0),
+        ]);
+
+        expect(verdict.ok).toBe(true);
+        expect(verdict.derivedWithoutComponents).toEqual([]);
+        expect(verdict.derivedCount).toBe(0);
+    });
+
+    // `ai_estimated` is an estimate too — isEstimatedNutrition admits both —
+    // and that is exactly why this rule keys on the provenance rather than on
+    // estimatedness: an AI-estimated food has no stored composition BY
+    // DEFINITION, so demanding one of it would refuse a release over a
+    // composition that was never meant to exist.
+    it('does not require a composition of an ai_estimated food', () => {
+        const verdict = assessComponentCoverage([food('ai:snack:kale crisps:prepared', 'ai_estimated', 0)]);
+
+        expect(isEstimatedNutrition('ai_estimated')).toBe(true);
+        expect(verdict.ok).toBe(true);
+        expect(verdict.derivedCount).toBe(0);
+    });
+
+    it('names every offender once, sorted, whatever order they arrived in', () => {
+        const verdict = assessComponentCoverage([
+            food('ai:c', 'ingredient_derived', 0),
+            food('usda:1', 'source_backed', 0),
+            food('ai:a', 'ingredient_derived', 0),
+            food('ai:b', 'ingredient_derived', 2),
+        ]);
+
+        expect(verdict.derivedWithoutComponents).toEqual(['ai:a', 'ai:c']);
+        expect(verdict.derivedCount).toBe(3);
+    });
+
+    // A miscount can only ever make the rule stricter: no count that is not a
+    // positive finite number is a composition, and reading one as "some" is how
+    // an unsourced nutrient total would reach a release.
+    it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+        'reads %p resolvable components as no composition',
+        (count) => {
+            expect(assessComponentCoverage([food('ai:x', 'ingredient_derived', count)]).ok).toBe(false);
+        },
+    );
+
+    // Exact match, deliberately. None of the near misses below is a derived
+    // food to any other layer either, and loosening this comparison is how a
+    // mis-spelled stored value stops being visible — a cost this domain has
+    // already paid once, for a diet tag only one spelling matched.
+    it.each(['ingredient-derived', 'Ingredient_Derived', 'ingredient derived', ''])(
+        'does not read the near-miss provenance %p as a derived food',
+        (provenance) => {
+            const verdict = assessComponentCoverage([food('ai:x', provenance, 0)]);
+
+            expect(verdict.derivedCount).toBe(0);
+            expect(verdict.ok).toBe(true);
+        },
+    );
+
+    it('is ok over an empty set', () => {
+        expect(assessComponentCoverage([])).toEqual({
+            ok: true,
+            derivedWithoutComponents: [],
+            derivedCount: 0,
+        });
+    });
+
+    it('does not reorder or otherwise mutate the supplied array', () => {
+        const foods = [food('ai:c', 'ingredient_derived', 0), food('ai:a', 'ingredient_derived', 0)];
+
+        assessComponentCoverage(foods);
+
+        expect(foods.map((entry) => entry.source_key)).toEqual(['ai:c', 'ai:a']);
+    });
+});
+
+/**
+ * `catalog.mapper.ts` is the row -> DTO boundary of the internal food catalog,
+ * and this suite exists for the one decision on that boundary a reader cannot
+ * check by inspection: what `mapCatalogFood` emits is the row's STORED nutrient
+ * values with its BASIS restated as the mass those values describe — never the
+ * values restated onto a 100 g basis.
+ *
+ * What it pins, and why each is a decision someone could break:
+ *
+ *  - **The response is projectable by a client that has no density.** AAP 0.5.2
+ *    gives `CatalogFoodResponse` the per-basis macros and `defaultPortion` and
+ *    nothing else — no `density_g_per_ml`, and no server-computed per-portion
+ *    figure. A volume basis on the wire would therefore leave the client
+ *    holding millilitres it cannot convert, so the basis is converted here,
+ *    where the density column is available, and the client scales by
+ *    `gramWeight / basisAmount` — grams over grams.
+ *  - **Only the basis is converted, and that is what makes the card equal the
+ *    diary row.** `nutrition.logic.ts`'s `resolveCatalogEntrySnapshot` is the
+ *    only server-side portion projection there is, and the authoritative one,
+ *    because what it computes is what `meal_entries` stores: it evaluates
+ *    `round(storedValue × (portionGrams / basisGrams))`. Since this mapper
+ *    emits that same stored value against that same basis mass, the client's
+ *    `round(wireValue × (gramWeight / basisAmount))` is not an equivalent
+ *    formula but the SAME arithmetic over the same doubles — one scale, one
+ *    rounding (0.7.3) — so the two are two readings of one computation and
+ *    agree bit for bit rather than usually. Rescaling the values on the wire
+ *    loses a ULP instead, which is how 275.4 kcal per 100 ml at 0.918 g/ml
+ *    travelled as 299.99999999999994 and showed 40 kcal on the card against
+ *    the diary row's 41. The last describe below runs BOTH production
+ *    functions on that row and on every other basis to hold it.
+ *  - **The rule is delegated, never rewritten.** `catalog.logic.ts`'s
+ *    `normalizeToPer100g` owns what a basis weighs and is tested there; this
+ *    boundary supplies the default portion's weight and turns a failed check
+ *    into `CatalogMappingError`. The assertions below are about the
+ *    translation, and about the round trip a client completes.
+ *  - **A `per_100g` row at basis 100 is untouched.** Every published row today
+ *    is one, and its basis mass is the 100 it already states, so its numbers
+ *    must travel byte-identical rather than through a rounding or a rescale.
+ *  - **A broken promise is a fault, not a default.** Validation quarantines a
+ *    candidate with a missing density, a non-positive basis amount, no default
+ *    portion or a null core macro, so a published row that has one is a
+ *    data-integrity fault: it raises `CatalogMappingError` naming the food and
+ *    the failed check. Inventing a density or defaulting a macro to 0 would
+ *    publish numbers nobody measured under a source-backed label.
+ *
+ * Pure and synchronous: no database, no Prisma client, no clock.
+ *
+ * Folded into this suite from a dedicated `catalog.mapper.test.ts`: the backend
+ * test inventory (Agent Action Plan §0.3.3, §0.8.1) gives each domain exactly
+ * one pure suite, `__tests__/<domain>.logic.test.ts`, and §0.5.1/§0.7.1 place
+ * `catalog.mapper.ts` inside the catalog domain that suite covers. Every title,
+ * fixture and assertion below is the one that was written for it; only the file
+ * they live in moved.
+ */
+describe('catalog.mapper.ts — the catalog row -> DTO boundary', () => {
+    /* ---------------------------------------------------------------------------
+     * Fixtures — rows exactly as stored, snake_case
+     * ------------------------------------------------------------------------- */
+
+    const portionRow = (overrides: Partial<CatalogFoodPortionRow> = {}): CatalogFoodPortionRow => ({
+        description: '1 cup',
+        amount: 1,
+        unit: 'cup',
+        gram_weight: 195,
+        is_default: true,
+        ...overrides,
+    });
+
+    /** Brown rice, cooked — the per-100 g case, stated per 100 g. */
+    const foodRow = (overrides: Partial<CatalogFoodRow> = {}): CatalogFoodRow => ({
+        id: 'catalog-food-rice',
+        display_name: 'Brown rice, cooked',
+        category: 'grain_rice',
+        food_state: 'cooked',
+        identity_source: 'usda',
+        nutrition_provenance: 'source_backed',
+        nutrition_basis: 'per_100g',
+        basis_amount: 100,
+        calories: 123,
+        protein_g: 2.7,
+        carbs_g: 26,
+        fat_g: 1,
+        fiber_g: 1.6,
+        density_g_per_ml: null,
+        allergen_tags: [],
+        allergen_status: 'known',
+        food_group: 'rice',
+        ...overrides,
+    });
+
+    /**
+     * The same food as stated on a HALF-SIZE mass basis — 61.5 kcal per 50 g.
+     * `basis_amount` is not assumed to be 100 anywhere: `normalizeToPer100g`
+     * supports this record and `catalog.logic.test.ts` pins it, so it is a real
+     * shape rather than a contrived one.
+     */
+    const perFiftyGramsRow = (overrides: Partial<CatalogFoodRow> = {}): CatalogFoodRow =>
+        foodRow({
+            basis_amount: 50,
+            calories: 61.5,
+            protein_g: 1.35,
+            carbs_g: 13,
+            fat_g: 0.5,
+            fiber_g: 0.8,
+            ...overrides,
+        });
+
+    /** Olive oil — the per-100 ml case, which only density can turn into grams. */
+    const oliveOilRow = (overrides: Partial<CatalogFoodRow> = {}): CatalogFoodRow =>
+        foodRow({
+            id: 'catalog-food-olive-oil',
+            display_name: 'Olive oil',
+            category: 'fat_oil',
+            food_state: 'as_purchased',
+            nutrition_basis: 'per_100ml',
+            basis_amount: 100,
+            calories: 884,
+            protein_g: 0,
+            carbs_g: 0,
+            fat_g: 100,
+            fiber_g: 0,
+            density_g_per_ml: 0.918,
+            food_group: 'oil',
+            ...overrides,
+        });
+
+    const oliveOilPortion = portionRow({ description: '1 tbsp', amount: 1, unit: 'tbsp', gram_weight: 13.5 });
+
+    /**
+     * The row CAT-04 was reported on: a volume basis whose tablespoon lands exactly
+     * on a half-rounding boundary. 275.4 kcal describe 100 ml, which weighs 91.8 g,
+     * so 13.5 g of it is exactly 40.5 kcal and 30.6 g of fat is exactly 4.5 g —
+     * the two values `Math.round` takes up, and the two a lost ULP takes down.
+     */
+    const boundaryOilRow = (overrides: Partial<CatalogFoodRow> = {}): CatalogFoodRow =>
+        oliveOilRow({
+            id: 'catalog-food-boundary-oil',
+            display_name: 'Boundary oil',
+            calories: 275.4,
+            fat_g: 30.6,
+            ...overrides,
+        });
+
+    /** A label stated per serving rather than per mass — a 210 kcal, 30 g bar. */
+    const perServingFood = (overrides: Partial<CatalogFoodRow> = {}): CatalogFoodRow =>
+        foodRow({
+            id: 'catalog-food-bar',
+            display_name: 'Protein bar',
+            nutrition_basis: 'per_serving',
+            basis_amount: 1,
+            calories: 210,
+            protein_g: 20,
+            carbs_g: 21,
+            fat_g: 7,
+            fiber_g: 3,
+            ...overrides,
+        });
+
+    const thirtyGramBar = portionRow({ description: '1 bar', amount: 1, unit: 'bar', gram_weight: 30 });
+
+    const responseOf = (food: CatalogFoodRow, portion: CatalogFoodPortionRow): CatalogFoodResponse =>
+        mapCatalogFood(food, [portion]);
+
+    interface PortionMacros {
+        calories: number;
+        protein: number;
+        carbs: number;
+        fat: number;
+    }
+
+    /**
+     * What a client does with this response — the expression
+     * `AddFood/index.util.ts::catalogServingPresentation` applies to a mass basis:
+     * one scale, one rounding, in that association order (0.7.3).
+     *
+     * Asserted against, rather than asserted about: the wire figures describe
+     * `basisAmount` grams, and this is the figure a user actually reads.
+     */
+    const projectedOntoDefaultPortion = (response: CatalogFoodResponse): PortionMacros => {
+        const scale = response.defaultPortion.gramWeight / response.basisAmount;
+
+        return {
+            calories: Math.round(response.calories * scale),
+            protein: Math.round(response.protein * scale),
+            carbs: Math.round(response.carbs * scale),
+            fat: Math.round(response.fat * scale),
+        };
+    };
+
+    /**
+     * The same row, in the column subset `resolveCatalogEntrySnapshot` reads.
+     *
+     * A field-for-field adapter between two structural row types, deliberately not
+     * a second fixture: the equality below is only meaningful if both production
+     * functions are handed the same stored numbers and the same portions.
+     */
+    const entryFoodOf = (food: CatalogFoodRow, portions: readonly CatalogFoodPortionRow[]): CatalogEntryFood => ({
+        id: food.id,
+        nutrition_basis: food.nutrition_basis,
+        basis_amount: food.basis_amount,
+        calories: food.calories,
+        protein_g: food.protein_g,
+        carbs_g: food.carbs_g,
+        fat_g: food.fat_g,
+        density_g_per_ml: food.density_g_per_ml,
+        nutrition_provenance: food.nutrition_provenance,
+        catalog_food_portions: portions.map((portion) => ({
+            description: portion.description,
+            gram_weight: portion.gram_weight,
+            is_default: portion.is_default,
+        })),
+    });
+
+    /**
+     * The 0.7.3 guarantee: the Add Food pre-log card equals the diary row that
+     * logging the food produces, TO THE INTEGER.
+     *
+     * It deliberately runs BOTH production functions — `mapCatalogFood` for the
+     * numbers the client receives, `resolveCatalogEntrySnapshot` for the numbers
+     * `meal_entries` stores — instead of restating either side's formula, which is
+     * the only way this can fail when one of them moves. The equality is not a
+     * coincidence to be re-derived per basis: the mapper emits the stored value and
+     * the basis mass, the snapshot reads the same stored value and computes the same
+     * basis mass from the same `normalizeToPer100g` call, so both sides apply ONE
+     * multiplication and ONE `Math.round` to identical doubles.
+     *
+     * Returns the projected macros so a caller pins the actual integers too —
+     * agreement at the wrong number is still a regression.
+     */
+    const expectCardEqualsDiaryRow = (food: CatalogFoodRow, portion: CatalogFoodPortionRow): PortionMacros => {
+        const projected = projectedOntoDefaultPortion(responseOf(food, portion));
+
+        expect(projected).toEqual(resolveCatalogEntrySnapshot(entryFoodOf(food, [portion]), undefined).perServing);
+
+        return projected;
+    };
+
+    /* ---------------------------------------------------------------------------
+     * per_100g — the basis that needs no conversion
+     * ------------------------------------------------------------------------- */
+
+    describe('mapCatalogFood — a per_100g row', () => {
+        it('emits a row already stated per 100 g unchanged, to the last bit', () => {
+            // The basis mass IS the 100 the row states, and no value is scaled: the
+            // 11,046 published rows keep the numbers the release loaded.
+            const response = responseOf(foodRow(), portionRow());
+
+            expect(response.nutritionBasis).toBe('per_100g');
+            expect(response.basisAmount).toBe(100);
+            expect(response.calories).toBe(123);
+            expect(response.protein).toBe(2.7);
+            expect(response.carbs).toBe(26);
+            expect(response.fat).toBe(1);
+            expect(response.fiber).toBe(1.6);
+        });
+
+        it('reports a row stated per 50 g on its own 50 g basis mass', () => {
+            // The same food, half the basis: the stored values travel as stored and
+            // `basisAmount` says what they describe, so nothing is doubled here and
+            // the client's single scale (195 / 50) does the whole conversion.
+            const response = responseOf(perFiftyGramsRow(), portionRow());
+
+            expect(response.nutritionBasis).toBe('per_100g');
+            expect(response.basisAmount).toBe(50);
+            expect(response.calories).toBe(61.5);
+            expect(response.protein).toBe(1.35);
+            expect(response.carbs).toBe(13);
+            expect(response.fat).toBe(0.5);
+            expect(response.fiber).toBe(0.8);
+        });
+
+        it('gives a client enough to reach the 195 g cup the row is served in', () => {
+            // 123 x 1.95 = 239.85, 2.7 x 1.95 = 5.265, 26 x 1.95 = 50.7, 1 x 1.95 = 1.95
+            expect(projectedOntoDefaultPortion(responseOf(foodRow(), portionRow()))).toEqual({
+                calories: 240,
+                protein: 5,
+                carbs: 51,
+                fat: 2,
+            });
+        });
+
+        it('reaches the same portion figure from the per-50 g row, because the basis travels with it', () => {
+            // 61.5 x (195 / 50) = 239.85 — the same portion, reached from half the
+            // stated figures over half the basis mass.
+            expect(projectedOntoDefaultPortion(responseOf(perFiftyGramsRow(), portionRow()))).toEqual(
+                projectedOntoDefaultPortion(responseOf(foodRow(), portionRow())),
+            );
+        });
+
+        it('keeps a genuinely zero macro at zero rather than treating it as unknown', () => {
+            const response = responseOf(foodRow({ carbs_g: 0, fat_g: 0 }), portionRow());
+
+            expect(response.carbs).toBe(0);
+            expect(response.fat).toBe(0);
+        });
+
+        it('ignores the density on a per_100g row, where it is not part of the conversion', () => {
+            const withDensity = foodRow({ density_g_per_ml: 0.5 });
+
+            expect(responseOf(withDensity, portionRow())).toEqual(responseOf(foodRow(), portionRow()));
+        });
+    });
+
+    /* ---------------------------------------------------------------------------
+     * per_100ml — the basis the client could not convert
+     * ------------------------------------------------------------------------- */
+
+    describe('mapCatalogFood — a per_100ml row', () => {
+        it('states the volume basis as the mass it weighs, through the density the food itself stores', () => {
+            // basisGrams = 100 ml x 0.918 g/ml = 91.8 g, so the stored 884 kcal are
+            // reported as describing 91.8 g — which is what the source record says.
+            const response = responseOf(oliveOilRow(), oliveOilPortion);
+
+            expect(response.nutritionBasis).toBe('per_100g');
+            expect(response.basisAmount).toBe(91.8);
+            expect(response.calories).toBe(884);
+            expect(response.fat).toBe(100);
+            expect(response.protein).toBe(0);
+            expect(response.carbs).toBe(0);
+        });
+
+        it('does not leave a client holding millilitres it has no density to convert', () => {
+            // The figures are the stored ones, but the basis beside them is a MASS:
+            // 91.8 g, not the 100 ml the row states. That is what makes the client's
+            // `gramWeight / basisAmount` grams over grams rather than grams over
+            // millilitres — the unit mismatch this conversion removes.
+            const response = responseOf(oliveOilRow(), oliveOilPortion);
+
+            expect(response.nutritionBasis).not.toBe('per_100ml');
+            expect(response.basisAmount).not.toBe(100);
+        });
+
+        it('leaves a client able to reach the tablespoon figure the diary will store', () => {
+            // 884 x (13.5 / 91.8) = 130.0 — the number `resolveCatalogEntrySnapshot`
+            // computes for this portion, reached from the response alone.
+            expect(projectedOntoDefaultPortion(responseOf(oliveOilRow(), oliveOilPortion))).toEqual({
+                calories: 130,
+                protein: 0,
+                carbs: 0,
+                fat: 15,
+            });
+        });
+
+        it('would report a different number if millilitres were read as grams', () => {
+            // Treating 100 ml as 100 g gives round(884 x 0.135) = 119 kcal, not 130.
+            expect(projectedOntoDefaultPortion(responseOf(oliveOilRow(), oliveOilPortion)).calories).not.toBe(119);
+        });
+
+        it('raises rather than assuming 1 g/ml when the density is null', () => {
+            expect(() => responseOf(oliveOilRow({ density_g_per_ml: null }), oliveOilPortion)).toThrow(
+                CatalogMappingError,
+            );
+        });
+
+        it('names the food and the failed check when the density is missing', () => {
+            expect(() => responseOf(oliveOilRow({ density_g_per_ml: null }), oliveOilPortion)).toThrow(
+                /published food catalog-food-olive-oil fails missing_density/,
+            );
+        });
+
+        it('raises for a zero density, which would make the basis mass zero', () => {
+            expect(() => responseOf(oliveOilRow({ density_g_per_ml: 0 }), oliveOilPortion)).toThrow(
+                /fails missing_density/,
+            );
+        });
+
+        it('raises for a negative density', () => {
+            expect(() => responseOf(oliveOilRow({ density_g_per_ml: -0.918 }), oliveOilPortion)).toThrow(
+                CatalogMappingError,
+            );
+        });
+
+        it('raises for a non-finite density', () => {
+            expect(() => responseOf(oliveOilRow({ density_g_per_ml: Number.NaN }), oliveOilPortion)).toThrow(
+                CatalogMappingError,
+            );
+        });
+    });
+
+    /* ---------------------------------------------------------------------------
+     * per_serving — the basis measured in the food's own portions
+     * ------------------------------------------------------------------------- */
+
+    describe('mapCatalogFood — a per_serving row', () => {
+        it('states the serving basis as a mass, through the gram weight of the default portion', () => {
+            // basisGrams = 1 serving x 30 g = 30 g, so the label's 210 kcal are
+            // reported unchanged as describing 30 g.
+            const response = responseOf(perServingFood(), thirtyGramBar);
+
+            expect(response.nutritionBasis).toBe('per_100g');
+            expect(response.basisAmount).toBe(30);
+            expect(response.calories).toBe(210);
+            expect(response.carbs).toBe(21);
+            expect(response.protein).toBe(20);
+            expect(response.fat).toBe(7);
+        });
+
+        it('reads basis_amount as a count of servings, so a two-serving label is not halved twice', () => {
+            // basisGrams = 2 servings x 30 g = 60 g. The stated values describe both
+            // servings, so the only division is the client's single 30 / 60 — reading
+            // `basis_amount` as one serving would leave a 30 g basis and report a
+            // 30 g bar as the whole label.
+            const response = responseOf(perServingFood({ basis_amount: 2 }), thirtyGramBar);
+
+            expect(response.basisAmount).toBe(60);
+            expect(response.calories).toBe(210);
+            expect(response.carbs).toBe(21);
+        });
+
+        it('returns the stated serving when a client projects back onto the same portion', () => {
+            expect(projectedOntoDefaultPortion(responseOf(perServingFood(), thirtyGramBar))).toEqual({
+                calories: 210,
+                protein: 20,
+                carbs: 21,
+                fat: 7,
+            });
+        });
+
+        it('projects a two-serving label down to one portion', () => {
+            expect(projectedOntoDefaultPortion(responseOf(perServingFood({ basis_amount: 2 }), thirtyGramBar))).toEqual({
+                calories: 105,
+                protein: 10,
+                carbs: 11,
+                fat: 4,
+            });
+        });
+
+        it('states a heavier serving as a heavier basis mass, and still projects back to it', () => {
+            // The same 210 kcal label on a 60 g bar describes twice the mass, which
+            // the basis says rather than the values — and either way one portion of
+            // it is still the 210 kcal the label states.
+            const sixtyGramBar = portionRow({ description: '1 bar', amount: 1, unit: 'bar', gram_weight: 60 });
+            const response = responseOf(perServingFood(), sixtyGramBar);
+
+            expect(response.basisAmount).toBe(60);
+            expect(response.calories).toBe(210);
+            expect(projectedOntoDefaultPortion(response).calories).toBe(210);
+        });
+
+        it('raises rather than inventing a serving weight when the portion has none', () => {
+            // The portion guard fires first — a gram weight of 0 never reaches the
+            // restatement — and either way no number is fabricated from it.
+            const weightlessBar = portionRow({ description: '1 bar', amount: 1, unit: 'bar', gram_weight: 0 });
+
+            expect(() => responseOf(perServingFood(), weightlessBar)).toThrow(
+                /catalog food catalog-food-bar has a default portion with gram weight 0/,
+            );
+        });
+
+        it('raises when the basis mass overflows instead of publishing an Infinity', () => {
+            expect(() => responseOf(perServingFood({ basis_amount: Number.MAX_VALUE }), thirtyGramBar)).toThrow(
+                /published food catalog-food-bar fails non_finite_computed_value/,
+            );
+        });
+    });
+
+    /* ---------------------------------------------------------------------------
+     * Faults — the guarantees the response type makes
+     * ------------------------------------------------------------------------- */
+
+    describe('mapCatalogFood — data-integrity faults', () => {
+        it('raises for a zero basis amount', () => {
+            expect(() => responseOf(foodRow({ basis_amount: 0 }), portionRow())).toThrow(
+                /published food catalog-food-rice fails invalid_basis_amount/,
+            );
+        });
+
+        it('raises for a negative basis amount', () => {
+            expect(() => responseOf(foodRow({ basis_amount: -100 }), portionRow())).toThrow(CatalogMappingError);
+        });
+
+        it('raises for a non-finite basis amount', () => {
+            expect(() => responseOf(foodRow({ basis_amount: Number.POSITIVE_INFINITY }), portionRow())).toThrow(
+                CatalogMappingError,
+            );
+        });
+
+        it('raises when a denormal basis mass would scale every nutrient to Infinity', () => {
+            expect(() => responseOf(foodRow({ basis_amount: Number.MIN_VALUE }), portionRow())).toThrow(
+                /published food catalog-food-rice fails non_finite_computed_value/,
+            );
+        });
+
+        it('raises for a null core macro rather than reporting it as 0', () => {
+            expect(() => responseOf(foodRow({ protein_g: null }), portionRow())).toThrow(
+                /catalog_foods\.protein_g is null for published food catalog-food-rice/,
+            );
+        });
+
+        it('raises for a non-finite core macro', () => {
+            expect(() => responseOf(foodRow({ calories: Number.NaN }), portionRow())).toThrow(CatalogMappingError);
+        });
+
+        it('raises when the food has no default portion to be read against', () => {
+            expect(() => responseOf(foodRow(), portionRow({ is_default: false }))).toThrow(
+                /catalog food catalog-food-rice has no default portion/,
+            );
+        });
+
+        it('raises for a default portion whose gram weight is zero', () => {
+            expect(() => responseOf(foodRow(), portionRow({ gram_weight: 0 }))).toThrow(CatalogMappingError);
+        });
+
+        it('raises for a nutrition basis outside the closed set', () => {
+            expect(() => responseOf(foodRow({ nutrition_basis: 'per_ounce' }), portionRow())).toThrow(
+                /catalog_foods\.nutrition_basis holds unsupported value 'per_ounce'/,
+            );
+        });
+    });
+
+    /* ---------------------------------------------------------------------------
+     * The response as a whole — exactly the contract AAP 0.5.2 froze
+     * ------------------------------------------------------------------------- */
+
+    /**
+     * The field list AAP 0.5.2 defines for `CatalogFoodResponse`, sorted.
+     *
+     * Written out rather than derived from the type: this suite's job here is to
+     * fail when the implementation grows a member the frozen contract does not
+     * define — which is exactly what `defaultPortionNutrition` was — and a list
+     * derived from the code could never notice that.
+     */
+    const AAP_CATALOG_FOOD_FIELDS = [
+        'allergenStatus',
+        'allergenTags',
+        'basisAmount',
+        'calories',
+        'carbs',
+        'category',
+        'defaultPortion',
+        'fat',
+        'fiber',
+        'foodGroup',
+        'foodState',
+        'id',
+        'identitySource',
+        'name',
+        'nutritionBasis',
+        'nutritionProvenance',
+        'protein',
+    ];
+
+    describe('mapCatalogFood — the response shape', () => {
+        it('emits exactly the members AAP 0.5.2 defines, and no others', () => {
+            expect(Object.keys(responseOf(foodRow(), portionRow())).sort()).toEqual(AAP_CATALOG_FOOD_FIELDS);
+        });
+
+        it('carries no server-computed per-portion nutrition, which the contract does not define', () => {
+            expect(responseOf(foodRow(), portionRow())).not.toHaveProperty('defaultPortionNutrition');
+        });
+
+        it('carries the identity, provenance and safety members through unchanged', () => {
+            const response = responseOf(foodRow(), portionRow());
+
+            expect(response.id).toBe('catalog-food-rice');
+            expect(response.name).toBe('Brown rice, cooked');
+            expect(response.category).toBe('grain_rice');
+            expect(response.foodState).toBe('cooked');
+            expect(response.identitySource).toBe('usda');
+            expect(response.nutritionProvenance).toBe('source_backed');
+            expect(response.allergenTags).toEqual([]);
+            expect(response.allergenStatus).toBe('known');
+            expect(response.foodGroup).toBe('rice');
+        });
+
+        it('reports the same portion the nutrition was read against', () => {
+            const response = mapCatalogFood(foodRow(), [portionRow(), portionRow({ is_default: false, gram_weight: 98 })]);
+
+            expect(response.defaultPortion).toEqual({ description: '1 cup', amount: 1, unit: 'cup', gramWeight: 195 });
+        });
+
+        it('keeps an unknown fiber value null rather than restating it as 0', () => {
+            const response = responseOf(foodRow({ fiber_g: null }), portionRow());
+
+            expect(response.fiber).toBeNull();
+            expect(response.calories).toBe(123);
+        });
+
+        it('keeps fiber null through a basis that is actually converted', () => {
+            const response = responseOf(oliveOilRow({ fiber_g: null }), oliveOilPortion);
+
+            expect(response.fiber).toBeNull();
+        });
+
+        it('reports a known fiber value as stored, like any other nutrient', () => {
+            // Stated per 50 g, fiber is 0.8 g, and it travels as 0.8 g against the
+            // 50 g basis — the same treatment the four macros get, so a client that
+            // projects fiber uses the one scale it already computed.
+            const response = responseOf(perFiftyGramsRow(), portionRow());
+
+            expect(response.fiber).toBe(0.8);
+            expect(response.basisAmount).toBe(50);
+        });
+    });
+
+    /* ---------------------------------------------------------------------------
+     * The 0.7.3 promise — the card and the diary row are one computation
+     * ------------------------------------------------------------------------- */
+
+    describe('mapCatalogFood — the pre-log card equals the diary row it produces', () => {
+        it('agrees at the half-rounding boundary a rescaled wire value got wrong', () => {
+            // 275.4 kcal per 100 ml at 0.918 g/ml is 275.4 per 91.8 g, and 13.5 g of
+            // that is exactly 40.5 kcal — so Math.round takes it up to 41, which is
+            // what the diary stores. Restated onto a 100 g basis the same figure
+            // travelled as 299.99999999999994, and 299.99999999999994 x 0.135 is
+            // 40.49999999999999, which rounds DOWN: the card read 40 against the
+            // diary row's 41. The numbers are asserted as well as the equality,
+            // because agreeing at 40 would satisfy the equality and still be wrong.
+            expect(expectCardEqualsDiaryRow(boundaryOilRow(), oliveOilPortion)).toEqual({
+                calories: 41,
+                protein: 0,
+                carbs: 0,
+                fat: 5,
+            });
+        });
+
+        it('agrees on a volume basis', () => {
+            expect(expectCardEqualsDiaryRow(oliveOilRow(), oliveOilPortion)).toEqual({
+                calories: 130,
+                protein: 0,
+                carbs: 0,
+                fat: 15,
+            });
+        });
+
+        it('agrees on a one-serving label', () => {
+            expect(expectCardEqualsDiaryRow(perServingFood(), thirtyGramBar)).toEqual({
+                calories: 210,
+                protein: 20,
+                carbs: 21,
+                fat: 7,
+            });
+        });
+
+        it('agrees on a two-serving label, where both sides halve exactly once', () => {
+            // 21 / 2 = 10.5 and 7 / 2 = 3.5 are both half-rounding boundaries, so
+            // this case fails on any divergence in the two sides' arithmetic.
+            expect(expectCardEqualsDiaryRow(perServingFood({ basis_amount: 2 }), thirtyGramBar)).toEqual({
+                calories: 105,
+                protein: 10,
+                carbs: 11,
+                fat: 4,
+            });
+        });
+
+        it('agrees on a mass basis that is not 100', () => {
+            expect(expectCardEqualsDiaryRow(perFiftyGramsRow(), portionRow())).toEqual({
+                calories: 240,
+                protein: 5,
+                carbs: 51,
+                fat: 2,
+            });
+        });
+
+        it('agrees on the plain per-100 g row every published food is today', () => {
+            expect(expectCardEqualsDiaryRow(foodRow(), portionRow())).toEqual({
+                calories: 240,
+                protein: 5,
+                carbs: 51,
+                fat: 2,
+            });
+        });
     });
 });

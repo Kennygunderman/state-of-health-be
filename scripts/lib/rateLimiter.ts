@@ -53,13 +53,17 @@
 // host does (read `defaultUsdaRateLedgerDirectory` for why the default is
 // host-wide and not per-checkout). Two importers on two MACHINES sharing one
 // API key are still not serialised against each other, and no
-// filesystem-backed ledger can close that. Two things address it. Outside this
-// module, `scripts/lib/importClaim.ts` holds a session-scoped PostgreSQL
-// advisory lock for the lifetime of an importer process, so only one importer
-// runs at a time wherever it is launched from. And the port itself is the seam
-// for a shared ledger: a `createDatabaseUsdaRateLedger` satisfying the same
-// single `reserve` contract drops in through `UsdaRateLimiterOptions.ledger`
-// with no other change here.
+// filesystem-backed ledger can close that — neither process can see state that
+// lives on the other's disk. The seam for closing it is this module's own
+// `ledger` port: a `createDatabaseUsdaRateLedger` satisfying the same single
+// `reserve` contract drops in through `UsdaRateLimiterOptions.ledger` with no
+// other change here. What such a ledger needs is storage this module cannot
+// create for itself — one shared rolling-window table of admitted attempts,
+// which the Prisma schema does not define — so it is a schema proposal rather
+// than something the limiter can arrange alone. Until that table exists the
+// cross-host half of the cap is held by configuration, and the operating
+// instruction is exactly that: run the importer from ONE host per rolling
+// hour.
 //
 // The rate is a constructor argument, never an environment read inside the
 // flow (§1.6/§5): `getUsdaImportRateLimitPerHour` is the single accessor that
@@ -912,8 +916,8 @@ const ledgerFileNameFor = (scope: string): string => {
  * file is exactly the first-run case that already reads as "nothing spent".
  * What it costs is the record of an hour nobody was importing through —
  * reapers age files out over days and a reboot ends every importer on the
- * host — so the cases the finding names, a restart inside the hour and a
- * second concurrent importer, both still read the same file.
+ * host — so the two cases this ledger exists for, a restart inside the hour
+ * and a second concurrent importer, both still read the same file.
  *
  * The directory is created 0700 and the state and lock files 0600, so every
  * importer sharing one ledger must run as the same OS user. A second user's
@@ -936,12 +940,15 @@ const ledgerFileNameFor = (scope: string): string => {
  *
  * WHAT IS STILL NOT COVERED is cross-HOST: two importers on two machines
  * sharing one key cannot see each other's file, and no filesystem-backed
- * ledger can close that. That gap is closed outside this module, by the
- * process-lifetime claim that ships beside it as `scripts/lib/importClaim.ts`
- * — a session-scoped PostgreSQL advisory lock that lets only one importer hold
- * the pipeline at a time, wherever it runs. This module deliberately does not
- * import it (it touches no database, which is why it can be unit tested with
- * no Prisma client); the two are composed by the script that owns the run.
+ * ledger can close that. Closing it means giving `reserve` state both hosts
+ * can read, which is precisely what the `ledger` port is for — a
+ * `createDatabaseUsdaRateLedger` honouring the same single `reserve` contract
+ * is injected through `UsdaRateLimiterOptions.ledger` and nothing else here
+ * changes — and the shared rolling-window table it would read is not in the
+ * Prisma schema, so it stays a schema proposal rather than a default this
+ * module can ship. While the ledger is file-backed, the accounting holds only
+ * as far as the filesystem reaches, and the operating instruction that keeps
+ * the key's hour intact is one importer host per rolling hour.
  */
 export const defaultUsdaRateLedgerDirectory = (): string =>
     path.join(os.tmpdir(), LEDGER_HOST_DIRECTORY_NAME);

@@ -12,9 +12,13 @@
 //    food IS, with each macro rounded exactly once).
 //  * `mealPlan.logic.ts` owns `requireWritablePlan`: a superseded or ended plan
 //    cannot be logged against.
-//  * `mealPlan.service.ts` owns the plan's lifecycle states and the meal DTO
-//    this response carries, so the card the client redraws from a log result is
-//    the same shape every other plan read produces.
+//  * `mealPlan.mapper.ts` owns the SHAPE of the meal DTO this response carries
+//    — `toMealPlanMealResponse`, the grouping of the diary entries its logged
+//    state is derived from, and the reading of the plan row the writability
+//    rule judges — so the card the client redraws from a log result is the same
+//    shape every other plan read produces. The READS are this module's own and
+//    owner-scoped (§5.1): a service does not borrow another service's I/O, and
+//    nothing here imports `mealPlan.service.ts`.
 //  * `nutrition.service.ts::insertPlannedMealEntry` owns the insert AND the
 //    single rounding in the planned-meal contract.
 //  * `mealPlanningAction.service.ts` owns the keyed-write sequence.
@@ -76,7 +80,12 @@ import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
 import { LogPlannedMealPayload, MealPlanMealResponse } from '../types/mealPlanning';
 import { requireWritablePlan } from './mealPlan.logic';
-import { loadMealPlanMealResponse, loadPlanLifecycleStates } from './mealPlan.service';
+import {
+    LoggedPlannedEntryRow,
+    groupLoggedPlannedEntries,
+    toMealPlanMealResponse,
+    toPlanLifecycleState,
+} from './mealPlan.mapper';
 import { PlanNotFoundError, StalePlanError } from './mealPlanning.errors';
 import { buildRequestFingerprint } from './mealPlanningAction.logic';
 import { KeyedActionResult, runKeyedAction } from './mealPlanningAction.service';
@@ -147,13 +156,19 @@ interface LoggablePlan {
 /**
  * The plan, judged writable, or the answer the client gets.
  *
- * The lifecycle state comes from `mealPlan.service.ts::loadPlanLifecycleStates`
- * so the replacement id a superseded plan reports is resolved in one place —
- * "newest successor wins", which sends a stale screen to the current week rather
- * than to an intermediate one. "Today" is resolved from the user's stored IANA
- * zone INSIDE the transaction, against the same snapshot the write will commit
- * in, so an `end_date` comparison cannot be decided by a preferences row that
- * changed a statement later.
+ * THIS MODULE'S OWN READ, owner-scoped as §5.1 requires, shaped by
+ * `mealPlan.mapper.ts::toPlanLifecycleState` and judged by
+ * `mealPlan.logic.ts::requireWritablePlan`. Those two are shared and the query
+ * is not: the replacement id a superseded plan reports is resolved in one place
+ * — "newest successor wins", which sends a stale screen to the current week
+ * rather than to an intermediate one — while the statement that fetches it
+ * belongs to the service holding the lock.
+ *
+ * One plan rather than the user's whole list, since the successor comes from the
+ * ordered relation take. "Today" is resolved from the user's stored IANA zone
+ * INSIDE the transaction, against the same snapshot the write will commit in, so
+ * an `end_date` comparison cannot be decided by a preferences row that changed a
+ * statement later.
  */
 const requireWritablePlanForLog = async (
     tx: Prisma.TransactionClient,
@@ -163,21 +178,27 @@ const requireWritablePlanForLog = async (
 ): Promise<LoggablePlan> => {
     const plan = await tx.meal_plans.findFirst({
         where: { id: planId, user_id: userId },
-        select: { id: true, revision: true },
+        select: {
+            id: true,
+            revision: true,
+            status: true,
+            start_date: true,
+            end_date: true,
+            replaced_by_plans: {
+                where: { user_id: userId },
+                orderBy: [{ published_at: 'desc' }, { id: 'desc' }],
+                take: 1,
+                select: { id: true },
+            },
+        },
     });
 
     if (plan === null) {
         throw new PlanNotFoundError();
     }
 
-    const state = (await loadPlanLifecycleStates(tx, userId)).find((candidate) => candidate.id === planId);
-
-    if (state === undefined) {
-        throw new PlanNotFoundError();
-    }
-
     const today = dayKeyInTimeZone(now, (await loadPreferencesRow(userId, tx))?.time_zone ?? null);
-    const writable = requireWritablePlan(state, today);
+    const writable = requireWritablePlan(toPlanLifecycleState(plan), today);
 
     return { revision: plan.revision, startDate: writable.start_date, endDate: writable.end_date };
 };
@@ -220,11 +241,41 @@ const bumpPlanRevision = async (
     return expectedPlanRevision + 1;
 };
 
+/** What the planned-meal DTO needs joined — `mealPlan.mapper.ts::PlanMealWithRecipeRow`. */
+const DTO_MEAL_INCLUDE = {
+    recipe_versions: true,
+    previous_recipe_versions: { select: { id: true, name: true } },
+} satisfies Prisma.meal_plan_mealsInclude;
+
+/** What a linked diary entry must supply — `mealPlan.mapper.ts::LoggedPlannedEntryRow`. */
+const LOGGED_ENTRY_SELECT = {
+    id: true,
+    date: true,
+    servings: true,
+    logged_at: true,
+    meal_plan_meal_id: true,
+    recipe_version_id: true,
+    meals: { select: { name: true } },
+    recipe_versions: { select: { name: true } },
+} satisfies Prisma.meal_entriesSelect;
+
 /**
  * The planned meal DTO, which cannot be absent here: the meal was read in this
  * transaction one statement ago. Reported rather than defaulted, because the
  * alternative is completing a ledger row with a fabricated body that every later
  * replay would return verbatim.
+ *
+ * TWO OWNER-SCOPED READS OF THIS MODULE'S OWN (§5.1), shaped by the shared
+ * mapper: `toMealPlanMealResponse` builds the DTO and
+ * `groupLoggedPlannedEntries` groups the diary rows the card derives its logged
+ * state from — which is what makes the meal this response returns identical to
+ * the same meal read through `GET …/days/:date` a moment later. The entry this
+ * transaction has just inserted is included, because it is committed to this
+ * snapshot and is precisely what the client needs to see.
+ *
+ * The mapper's row contracts check both projections at the call site, so a
+ * column omitted here fails to compile rather than silently shipping a
+ * differently-shaped meal.
  */
 const requireMealResponse = async (
     tx: Prisma.TransactionClient,
@@ -232,7 +283,10 @@ const requireMealResponse = async (
     planId: string,
     mealId: string,
 ): Promise<MealPlanMealResponse> => {
-    const meal = await loadMealPlanMealResponse(tx, userId, planId, mealId);
+    const meal = await tx.meal_plan_meals.findFirst({
+        where: { id: mealId, meal_plan_id: planId, user_id: userId },
+        include: DTO_MEAL_INCLUDE,
+    });
 
     if (meal === null) {
         throw new PlannedMealLogWriteError(
@@ -240,7 +294,13 @@ const requireMealResponse = async (
         );
     }
 
-    return meal;
+    const entries: LoggedPlannedEntryRow[] = await tx.meal_entries.findMany({
+        where: { user_id: userId, deleted_at: null, meal_plan_meal_id: meal.id },
+        select: LOGGED_ENTRY_SELECT,
+        orderBy: [{ logged_at: 'asc' }, { id: 'asc' }],
+    });
+
+    return toMealPlanMealResponse(meal, meal.recipe_versions, groupLoggedPlannedEntries(entries).get(meal.id) ?? []);
 };
 
 /* ---------------------------------------------------------------------------

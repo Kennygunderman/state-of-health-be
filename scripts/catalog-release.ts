@@ -17,13 +17,24 @@
 // writes anything, so a truncated or hand-edited member is refused instead of
 // half-loaded.
 //
-// components.jsonl IS WRITTEN EVEN WHEN EMPTY. A release built entirely from
-// source-backed single-ingredient records has no derived compositions, so the
-// file has no rows. It is still written, and the manifest still records its
-// digest, its row count of 0 and its size of 0: that is what makes an empty
-// member an asserted empty set rather than a missing file, and it keeps the
-// loader's six-digest check total. Inventing a composition to fill it would
-// fabricate a nutrient total, which the catalog policy forbids outright.
+// components.jsonl IS WRITTEN EVEN WHEN EMPTY, AND ITS EMPTINESS IS CHECKED. A
+// release built entirely from source-backed single-ingredient records has no
+// derived compositions, so the file has no rows. It is still written, and the
+// manifest still records its digest, its row count of 0 and its size of 0: that
+// is what makes an empty member an asserted empty set rather than a missing
+// file, and it keeps the loader's six-digest check total. Inventing a
+// composition to fill it would fabricate a nutrient total, which the catalog
+// policy forbids outright.
+//
+// Presence alone would not settle it, though: a zero-row member and a
+// components export that silently dropped every row are indistinguishable on
+// disk, because the digest of an empty file verifies either way. So the export
+// asserts the invariant that makes the count meaningful — every published
+// `ingredient_derived` food must carry at least one component row, since
+// otherwise its nutrient totals have no stored composition to have been derived
+// from — and raises ReleaseIntegrityError when one does not. An empty
+// components.jsonl is therefore a PROVEN consequence of publishing no
+// ingredient-derived food, and never an unexplained blank.
 //
 // A RELEASE IS REFUSED RATHER THAN SHIPPED INCOMPLETE. Every published food
 // must carry a validation record — that record is the machine-readable
@@ -57,6 +68,7 @@ import { ModelBudgetError } from './lib/budget';
 import { RateLimitConfigError } from './lib/rateLimiter';
 import { CheckpointError } from './lib/checkpoint';
 import type { ScriptLogger } from './lib/logger';
+import { assessComponentCoverage } from '../src/services/catalog.logic';
 import crypto from 'crypto';
 
 const STAGE = 'catalog-release';
@@ -795,6 +807,55 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         );
     }
 
+    // WHAT MAKES AN EMPTY components.jsonl AN ASSERTED FACT RATHER THAN A BLANK.
+    // A component row is the composition of an INGREDIENT-DERIVED food, so the
+    // member is empty exactly when no published food derives its nutrition from
+    // one. Stated the other way round: a published `ingredient_derived` food
+    // with no composition has nothing its nutrient totals could have been
+    // computed FROM, so those totals are unsourced and the release is refused.
+    //
+    // Without this check a zero-row components.jsonl and a components export
+    // that silently dropped every row look identical on disk and in the
+    // manifest — the digest of an empty file verifies either way — which is
+    // precisely the ambiguity a reviewer cannot resolve by reading the
+    // artefact. The check turns the count into a derived consequence: 0 rows is
+    // provably correct when, and only when, no ingredient-derived food is
+    // published.
+    //
+    // The opposite repair is forbidden: inventing a composition so the file has
+    // rows would fabricate a nutrient total, which the catalog policy and the
+    // feature's nutrition-integrity requirement both rule out outright.
+    //
+    // The rule itself is pure and lives in catalog.logic.ts, beside the
+    // `empty_component_set` validation check and `deriveComponentNutrition`
+    // (which already refuses a zero-component derivation) and under unit tests.
+    // This function decides nothing: it maps rows onto the facts the rule
+    // reads, and turns a refusal into the operator's next command.
+    const componentCoverage = assessComponentCoverage(
+        rows.map((row) => ({
+            source_key: row.source_key,
+            nutrition_provenance: row.nutrition_provenance,
+            // Only components that RESOLVE to a food count: a row pointing at a
+            // food this release does not carry is not something a nutrient
+            // total could have been derived from.
+            resolvable_component_count: row.catalog_food_components.filter(
+                (component) => component.component_catalog_foods !== null,
+            ).length,
+        })),
+    );
+    if (!componentCoverage.ok) {
+        const missing = componentCoverage.derivedWithoutComponents;
+        throw new ReleaseIntegrityError(
+            `${missing.length} published food(s) declare nutrition_provenance 'ingredient_derived' but carry no component rows, so their nutrient totals have no stored composition to derive from: ${missing
+                .slice(0, 5)
+                .join(', ')}${missing.length > 5 ? ', …' : ''}. Run catalog:validate before catalog:release.`,
+        );
+    }
+    logger.info('components_asserted', {
+        components: components.length,
+        published_ingredient_derived: componentCoverage.derivedCount,
+    });
+
     // Sorted by (parent, child) so the file is byte-reproducible whatever order
     // the database returned the parents' children in.
     const bySourceKeyThen = (secondKey: string) => (left: Record<string, unknown>, right: Record<string, unknown>): number => {
@@ -898,6 +959,15 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
             aliases: aliases.length,
             portions: portions.length,
             components: components.length,
+            // Written beside `components` so the component count is readable on
+            // its own terms: a composition belongs to an ingredient-derived
+            // food, so zero components is a fact about this release's
+            // composition rather than a gap. Taken from the SAME verdict the
+            // invariant above was checked with, which is what makes "the two
+            // can never disagree" structural instead of a promise — two
+            // independent counts of one thing are exactly how a manifest starts
+            // describing a release nobody checked.
+            published_ingredient_derived: componentCoverage.derivedCount,
             validation_records: validationRecords.length,
         },
         source_datasets: Array.from(sourceVersions.entries())

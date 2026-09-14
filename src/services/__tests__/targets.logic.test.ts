@@ -16,11 +16,19 @@
 //  * the four ways stored targets stop being attributable to a route;
 //  * the complete × source matrix the planner gates generation on, so that gate
 //    is readable off the tests without consulting the planner;
-//  * which stored answers can make a confirmed estimate stale, asserted from
-//    both sides — every column the equation reads, and every column it does
-//    not — because comparing against the wrong revision is how an unrelated
-//    diet or schedule edit came to ask a user to recalculate an unchanged
-//    figure.
+//  * that a persisted manual route refuses an estimate even when every
+//    measurement is still on the row, because Skip retains the measurements it
+//    was answered over and only the route records the user's choice;
+//  * staleness as ANCESTRY, which is the whole of the rule: a confirmed
+//    estimate is stale exactly when `targets_input_revision` no longer equals
+//    the preferences `revision` it was derived from (AAP 0.5.2). `revision` is
+//    the all-purpose preferences counter, so EVERY save advances it and any
+//    save — a diet or schedule edit as much as an activity one — can make a
+//    confirmed estimate stale. That is the contract, not a defect: the user is
+//    asked to recalculate, and the figure only changes if they do.
+//    `estimateInputsChanged` is asserted separately, over the equation's own
+//    columns, purely as the write-side diagnostic it is; no part of the stale
+//    derivation reads it or the column it maintains.
 //
 // No database, no mocks, no clock: every function under test is pure, and the
 // determinism group asserts that directly.
@@ -40,6 +48,7 @@ import {
     deriveTargetsResponse,
     ESTIMATE_INPUT_COLUMNS,
     ESTIMATED_SAVE_KEYS,
+    EstimateAvailabilityRow,
     EstimateInputsRow,
     estimateInputsChanged,
     KCAL_PER_POUND_PER_WEEK_PER_DAY,
@@ -72,8 +81,13 @@ import { ActivityLevel, TargetsResponse } from '../../types/mealPlanning';
  * 1 lb a week. Chosen because every step of her derivation is an awkward
  * number — a 1606.25 kcal basal rate and a 2208.59 kcal maintenance rate — so
  * any change to the rounding order moves the result.
+ *
+ * `target_route: 'estimated'` is part of the fixture, not decoration: a row on
+ * the manual route yields no estimate however complete its measurements are,
+ * so every "usable preferences" case has to state the route it is usable on.
  */
-const REFERENCE_ROW: EstimateInputsRow = {
+const REFERENCE_ROW: EstimateAvailabilityRow = {
+    target_route: 'estimated',
     goal: 'lose',
     pace_lb_per_week: 1,
     age: 34,
@@ -84,7 +98,8 @@ const REFERENCE_ROW: EstimateInputsRow = {
 };
 
 /** The low corner of the supported envelope: a 389 kcal basal rate. */
-const LOW_CORNER: EstimateInputsRow = {
+const LOW_CORNER: EstimateAvailabilityRow = {
+    target_route: 'estimated',
     goal: 'maintain',
     pace_lb_per_week: null,
     age: 100,
@@ -95,7 +110,8 @@ const LOW_CORNER: EstimateInputsRow = {
 };
 
 /** The high corner: a 4477.5 kcal basal rate and a 7723.69 kcal maintenance rate. */
-const HIGH_CORNER: EstimateInputsRow = {
+const HIGH_CORNER: EstimateAvailabilityRow = {
+    target_route: 'estimated',
     goal: 'maintain',
     pace_lb_per_week: null,
     age: 18,
@@ -105,7 +121,7 @@ const HIGH_CORNER: EstimateInputsRow = {
     activity_level: 'very_active',
 };
 
-const readyInputs = (row: EstimateInputsRow): CalculableEstimateInputs => {
+const readyInputs = (row: EstimateAvailabilityRow): CalculableEstimateInputs => {
     const resolved = resolveEstimateInputs(row);
 
     if (resolved.kind !== 'ready') {
@@ -115,7 +131,7 @@ const readyInputs = (row: EstimateInputsRow): CalculableEstimateInputs => {
     return resolved.inputs;
 };
 
-const estimateFrom = (row: EstimateInputsRow, estimateRevision = 0) =>
+const estimateFrom = (row: EstimateAvailabilityRow, estimateRevision = 0) =>
     computeTargetEstimate(readyInputs(row), estimateRevision);
 
 const CONFIRMED = { calories: 1940, protein: 146, carbs: 194, fat: 65 };
@@ -135,12 +151,18 @@ const EMPTY_USER_ROW: TargetsUserRow = {
     target_fat_g: null,
 };
 
+/**
+ * A confirmed estimate, fresh. `targets_input_revision` equals `revision`,
+ * which is what "fresh" means (AAP §0.5.2): the figure was confirmed at the
+ * preferences revision the row still stands at. Moving either of the two apart
+ * is how a case reaches `stale`.
+ */
 const preferencesRow = (overrides: Partial<TargetsPreferencesRow> = {}): TargetsPreferencesRow => ({
     target_source: 'estimated',
     targets_revision: 3,
     confirmed_targets: { ...CONFIRMED },
     targets_input_revision: 9,
-    estimate_inputs_revision: 9,
+    revision: 9,
     ...overrides,
 });
 
@@ -670,6 +692,71 @@ describe('resolveEstimateInputs', () => {
                 }),
             ).toEqual({ kind: 'unavailable', reason: 'prefer_not_to_say' });
         });
+
+        it('is still reported as itself once the answer has put the row on the manual route', () => {
+            // The body-step save that stores this answer also sets the route
+            // (AAP §0.5.2). Reporting the route instead would tell the client
+            // "you have not finished the form" about an answer the user gave.
+            expect(
+                resolveEstimateInputs({
+                    ...REFERENCE_ROW,
+                    sex_for_estimate: 'prefer_not_to_say',
+                    target_route: 'manual',
+                }),
+            ).toEqual({ kind: 'unavailable', reason: 'prefer_not_to_say' });
+        });
+    });
+
+    describe('the persisted target route', () => {
+        // The Skip branch of the body step: no measurements are sent and the
+        // PREVIOUS ones are deliberately retained, so the row still satisfies
+        // every measurement check while the user has asked to type their own
+        // numbers. Reading the measurements alone is what let the server
+        // calculate — and, through PUT /meal-planning/targets, confirm — an
+        // estimate the user declined.
+        it('refuses a manual route even when every measurement is present', () => {
+            expect(resolveEstimateInputs({ ...REFERENCE_ROW, target_route: 'manual' })).toEqual({
+                kind: 'unavailable',
+                reason: 'missing_inputs',
+            });
+        });
+
+        it('refuses a manual route for every otherwise-estimable fixture', () => {
+            for (const row of [REFERENCE_ROW, LOW_CORNER, HIGH_CORNER]) {
+                expect(resolveEstimateInputs({ ...row, target_route: 'manual' }).kind).toBe('unavailable');
+                expect(resolveEstimateInputs(row).kind).toBe('ready');
+            }
+        });
+
+        it('refuses a route column it cannot read, rather than assuming the estimated one', () => {
+            // The only writer stores one of the two known routes, so anything
+            // else is a corrupt row: we cannot tell which route the user is on,
+            // and calculating one for them is the failure to avoid.
+            for (const route of ['estimate', 'Manual', 'targets_manual', '']) {
+                expect(resolveEstimateInputs({ ...REFERENCE_ROW, target_route: route })).toEqual({
+                    kind: 'unavailable',
+                    reason: 'missing_inputs',
+                });
+            }
+        });
+
+        it('does not treat an unanswered body step as a refusal in itself', () => {
+            // A null route is the body step unanswered. It needs no special
+            // refusal, because the measurements it would have written are
+            // missing and the checks below refuse those — asserted from both
+            // sides so the null case cannot quietly start blocking a row that
+            // is genuinely estimable.
+            expect(resolveEstimateInputs({ ...REFERENCE_ROW, target_route: null }).kind).toBe('ready');
+            expect(
+                resolveEstimateInputs({
+                    ...REFERENCE_ROW,
+                    target_route: null,
+                    age: null,
+                    height_cm: null,
+                    weight_kg: null,
+                }),
+            ).toEqual({ kind: 'unavailable', reason: 'missing_inputs' });
+        });
     });
 
     describe('missing or unusable inputs', () => {
@@ -789,7 +876,7 @@ describe('computeTargetEstimate', () => {
     });
 
     describe('bounds across every goal and both envelope corners', () => {
-        const cases: [string, EstimateInputsRow, number, string | null][] = [
+        const cases: [string, EstimateAvailabilityRow, number, string | null][] = [
             // The low corner: a 389 kcal basal rate and a 467 kcal maintenance
             // rate. Maintenance binding the floor is why the clamp is not
             // gated on weight loss.
@@ -839,6 +926,7 @@ describe('computeTargetEstimate', () => {
             [
                 'a deficit below the user basal rate',
                 {
+                    target_route: 'estimated',
                     goal: 'lose',
                     pace_lb_per_week: 1.5,
                     age: 30,
@@ -860,6 +948,7 @@ describe('computeTargetEstimate', () => {
             [
                 'maintaining in the interior',
                 {
+                    target_route: 'estimated',
                     goal: 'maintain',
                     pace_lb_per_week: null,
                     age: 30,
@@ -874,6 +963,7 @@ describe('computeTargetEstimate', () => {
             [
                 'gaining in the interior',
                 {
+                    target_route: 'estimated',
                     goal: 'gain',
                     pace_lb_per_week: 0.5,
                     age: 30,
@@ -1734,19 +1824,17 @@ describe('deriveTargetsResponse', () => {
             });
         });
 
-        it('is not stale while the inputs it came from are unchanged', () => {
+        it('is not stale while the preferences revision it was confirmed at still stands', () => {
             expect(
-                deriveTargetsResponse(
-                    userRow(),
-                    preferencesRow({ targets_input_revision: 9, estimate_inputs_revision: 9 }),
-                ).stale,
+                deriveTargetsResponse(userRow(), preferencesRow({ targets_input_revision: 9, revision: 9 }))
+                    .stale,
             ).toBe(false);
         });
 
-        it('becomes stale once the inputs move on, without being recalculated', () => {
+        it('becomes stale once the preferences revision moves on, without being recalculated', () => {
             const response = deriveTargetsResponse(
                 userRow(),
-                preferencesRow({ targets_input_revision: 8, estimate_inputs_revision: 9 }),
+                preferencesRow({ targets_input_revision: 8, revision: 9 }),
             );
 
             // The stored numbers are untouched: staleness is a flag the review
@@ -1777,7 +1865,7 @@ describe('deriveTargetsResponse', () => {
             expect(
                 deriveTargetsResponse(
                     userRow(),
-                    preferencesRow({ target_source: 'manual', targets_input_revision: 1, estimate_inputs_revision: 9 }),
+                    preferencesRow({ target_source: 'manual', targets_input_revision: 1, revision: 9 }),
                 ).stale,
             ).toBe(false);
         });
@@ -1845,7 +1933,7 @@ describe('deriveTargetsResponse', () => {
             expect(
                 deriveTargetsResponse(
                     userRow({ target_calories: 2100 }),
-                    preferencesRow({ targets_input_revision: 1, estimate_inputs_revision: 9 }),
+                    preferencesRow({ targets_input_revision: 1, revision: 9 }),
                 ).stale,
             ).toBe(false);
         });
@@ -1904,7 +1992,7 @@ describe('deriveTargetsResponse', () => {
         it('admits a stale estimate, which generation uses as confirmed until the user recalculates', () => {
             const response = deriveTargetsResponse(
                 userRow(),
-                preferencesRow({ targets_input_revision: 8, estimate_inputs_revision: 9 }),
+                preferencesRow({ targets_input_revision: 8, revision: 9 }),
             );
 
             expect([response.complete, response.source, response.stale]).toEqual([true, 'estimated', true]);
@@ -1957,7 +2045,7 @@ describe('deriveTargetsResponse', () => {
     it('reports the targets revision rather than the preferences revision', () => {
         const response = deriveTargetsResponse(
             userRow(),
-            preferencesRow({ targets_revision: 2, estimate_inputs_revision: 11, targets_input_revision: 11 }),
+            preferencesRow({ targets_revision: 2, revision: 11, targets_input_revision: 11 }),
         );
 
         expect(response.revision).toBe(2);
@@ -1979,11 +2067,12 @@ describe('deriveTargetsResponse', () => {
 /* ---------------------------------------------------------------------------
  * estimateInputsChanged
  *
- * The rule behind `estimate_inputs_revision`, and therefore behind `stale`.
- * Asserted from both sides: every column the equation reads must count, and
- * every column it does not read must not. The second half is the one that
- * matters — treating an unrelated edit as an input change is what made a
- * confirmed estimate go stale after a diet or schedule save.
+ * The rule behind `meal_plan_preferences.estimate_inputs_revision`, the
+ * write-side counter that records when a user's CALCULABLE details last moved.
+ * It is not `TargetsResponse.stale` — that is the ancestry check on
+ * `revision` asserted above and below — so these cases pin the rule's own
+ * question and nothing else. Asserted from both sides: every column the
+ * equation reads must count, and every column it does not read must not.
  * ------------------------------------------------------------------------- */
 
 describe('estimateInputsChanged', () => {
@@ -2115,35 +2204,49 @@ describe('estimateInputsChanged', () => {
 });
 
 /* ---------------------------------------------------------------------------
- * The staleness rule, composed with the counter that drives it
+ * The staleness rule, composed with the saves that drive it
  *
- * `deriveTargetsResponse` reads a counter; `estimateInputsChanged` decides when
- * that counter moves. Neither half proves the user-visible claim on its own, so
- * this group applies the real rule to a stored row the way
- * `preferences.service.ts` applies it, and then reads the verdict.
+ * `deriveTargetsResponse` compares two revisions; `preferences.service.ts`
+ * advances one of them and `targets.service.ts` records the other. Neither half
+ * proves the user-visible claim on its own, so this group evolves a stored row
+ * exactly as those two writers evolve it — every preference save advances
+ * `revision`, and confirming an estimate records the `revision` it was
+ * confirmed at — and then reads the verdict off the result.
+ *
+ * The write-side `estimate_inputs_revision` is carried along so the two
+ * QUESTIONS stay distinguishable in one place: "has anything changed since this
+ * figure was confirmed?" (the AAP's staleness rule, §0.5.2) and "have the
+ * user's calculable details changed?" (`estimateInputsChanged`). Only the first
+ * one is `stale`.
  * ------------------------------------------------------------------------- */
 
 describe('a confirmed estimate through a sequence of preference saves', () => {
-    /** The stored row, as the two halves together see it. */
+    /** The stored row, as the writers and the read together see it. */
     interface StoredRow extends EstimateInputsRow, TargetsPreferencesRow {
-        revision: number;
+        /** The write-side diagnostic counter; no read consults it. */
+        estimate_inputs_revision: number;
     }
 
+    /**
+     * A freshly confirmed estimate: `targets_input_revision` equals `revision`,
+     * which is exactly what "the figure still describes the answers on file"
+     * means.
+     */
     const confirmedRow = (): StoredRow => ({
         ...REFERENCE_ROW,
         target_source: 'estimated',
         targets_revision: 4,
         confirmed_targets: { ...CONFIRMED },
-        targets_input_revision: 7,
+        targets_input_revision: 12,
         estimate_inputs_revision: 7,
         revision: 12,
     });
 
     /**
-     * One preference save, applying exactly the two rules
-     * `preferences.service.ts` applies: the all-purpose revision always
-     * advances, and the estimate-input counter advances only when the pure rule
-     * says an input moved.
+     * One preference save, applying exactly what `preferences.service.ts`
+     * applies: `revision` ALWAYS advances — that is what a client pins to
+     * detect a lost update, so every save has to move it — and the write-side
+     * diagnostic advances only when the pure rule says an equation input moved.
      */
     const save = (row: StoredRow, writes: Partial<EstimateInputsRow>): StoredRow => ({
         ...row,
@@ -2152,6 +2255,17 @@ describe('a confirmed estimate through a sequence of preference saves', () => {
         estimate_inputs_revision: estimateInputsChanged(row, writes)
             ? row.estimate_inputs_revision + 1
             : row.estimate_inputs_revision,
+    });
+
+    /**
+     * Re-confirming the estimate, as `targets.service.ts::saveTargets` does:
+     * the ancestry becomes the revision the row is at now, and the targets
+     * counter advances because the record was written.
+     */
+    const reconfirm = (row: StoredRow): StoredRow => ({
+        ...row,
+        targets_input_revision: row.revision,
+        targets_revision: row.targets_revision + 1,
     });
 
     const staleAfter = (...writes: Partial<EstimateInputsRow>[]): boolean =>
@@ -2167,37 +2281,6 @@ describe('a confirmed estimate through a sequence of preference saves', () => {
         });
     });
 
-    it('survives a diet, schedule or budget edit, however many of them there are', () => {
-        expect(staleAfter({ diet: 'vegan' } as Partial<EstimateInputsRow>)).toBe(false);
-        expect(staleAfter({ meal_schedule: 'three_plus_snack' } as Partial<EstimateInputsRow>)).toBe(false);
-        expect(staleAfter({ cooking_time_limit_min: 15 } as Partial<EstimateInputsRow>)).toBe(false);
-        expect(
-            staleAfter(
-                { diet: 'vegan' } as Partial<EstimateInputsRow>,
-                { allergens: ['milk'] } as Partial<EstimateInputsRow>,
-                { disliked_food_groups: ['mushroom'] } as Partial<EstimateInputsRow>,
-                { meal_schedule: 'three_plus_snack' } as Partial<EstimateInputsRow>,
-                { cooking_time_limit_min: 60 } as Partial<EstimateInputsRow>,
-                { budget_amount: 90 } as Partial<EstimateInputsRow>,
-                { review_start_date: new Date('2026-07-05T00:00:00.000Z') } as Partial<EstimateInputsRow>,
-                { goal_weight_kg: 70 } as Partial<EstimateInputsRow>,
-            ),
-        ).toBe(false);
-    });
-
-    it('survives a body step re-saved with the same measurements', () => {
-        const row = confirmedRow();
-
-        expect(
-            staleAfter({
-                age: row.age,
-                height_cm: row.height_cm,
-                weight_kg: row.weight_kg,
-                sex_for_estimate: row.sex_for_estimate,
-            }),
-        ).toBe(false);
-    });
-
     it('goes stale on a goal, pace, body or activity change', () => {
         expect(staleAfter({ goal: 'maintain' })).toBe(true);
         expect(staleAfter({ pace_lb_per_week: 0.5 })).toBe(true);
@@ -2208,10 +2291,89 @@ describe('a confirmed estimate through a sequence of preference saves', () => {
         expect(staleAfter({ activity_level: 'active' })).toBe(true);
     });
 
+    it('goes stale on any other preference save too, because every save advances the revision', () => {
+        // AAP §0.5.2 states the rule as `targets_input_revision !==
+        // preferences.revision`, and every preference save advances
+        // `revision`. So a diet or schedule edit also puts the confirmed figure
+        // behind the answers on file, and the review and settings screens offer
+        // "Recalculate". That is the specified behaviour, not an accident of
+        // the counter: what the flag claims is "this figure was derived from an
+        // earlier state of your answers", which is true here.
+        expect(staleAfter({ diet: 'vegan' } as Partial<EstimateInputsRow>)).toBe(true);
+        expect(staleAfter({ meal_schedule: 'three_plus_snack' } as Partial<EstimateInputsRow>)).toBe(true);
+        expect(staleAfter({ cooking_time_limit_min: 15 } as Partial<EstimateInputsRow>)).toBe(true);
+    });
+
+    it('distinguishes the two questions: unrelated saves move the revision but not the diagnostic', () => {
+        const afterUnrelated = [
+            { diet: 'vegan' } as Partial<EstimateInputsRow>,
+            { allergens: ['milk'] } as Partial<EstimateInputsRow>,
+            { meal_schedule: 'three_plus_snack' } as Partial<EstimateInputsRow>,
+            { budget_amount: 90 } as Partial<EstimateInputsRow>,
+            { goal_weight_kg: 70 } as Partial<EstimateInputsRow>,
+        ].reduce(save, confirmedRow());
+        const afterAnInput = save(confirmedRow(), { activity_level: 'active' });
+
+        // Five saves, five revisions, and the user's calculable details never
+        // moved — which is what the diagnostic records and `stale` does not.
+        expect(afterUnrelated.revision).toBe(17);
+        expect(afterUnrelated.estimate_inputs_revision).toBe(7);
+        expect(afterAnInput.estimate_inputs_revision).toBe(8);
+
+        // Both are stale, because both are figures confirmed at revision 12
+        // against rows that have moved past it.
+        expect(deriveTargetsResponse(userRow(), afterUnrelated).stale).toBe(true);
+        expect(deriveTargetsResponse(userRow(), afterAnInput).stale).toBe(true);
+    });
+
+    it('goes stale on a body step re-saved with the same measurements, which is still a save', () => {
+        const row = confirmedRow();
+        const rewritten = save(row, {
+            age: row.age,
+            height_cm: row.height_cm,
+            weight_kg: row.weight_kg,
+            sex_for_estimate: row.sex_for_estimate,
+        });
+
+        // Nothing the equation reads moved, so the diagnostic stands still —
+        // and the revision still advanced, so the ancestry no longer matches.
+        expect(rewritten.estimate_inputs_revision).toBe(7);
+        expect(deriveTargetsResponse(userRow(), rewritten).stale).toBe(true);
+    });
+
     it('stays stale once it is stale, whatever is edited afterwards', () => {
         expect(
             staleAfter({ activity_level: 'active' }, { diet: 'vegan' } as Partial<EstimateInputsRow>),
         ).toBe(true);
+    });
+
+    it('is fresh again once the user reconfirms, and only then', () => {
+        // The recalculation the review screen offers is the ONLY thing that
+        // clears the flag: nothing recomputes on its own.
+        const edited = save(confirmedRow(), { activity_level: 'active' });
+        const reconfirmed = reconfirm(edited);
+
+        expect(deriveTargetsResponse(userRow(), edited).stale).toBe(true);
+        expect(deriveTargetsResponse(userRow(), reconfirmed).stale).toBe(false);
+        expect(deriveTargetsResponse(userRow(), reconfirmed).revision).toBe(5);
+
+        // And one more unrelated save puts it behind again.
+        expect(
+            deriveTargetsResponse(userRow(), save(reconfirmed, { diet: 'vegan' } as Partial<EstimateInputsRow>))
+                .stale,
+        ).toBe(true);
+    });
+
+    it('never goes stale on the manual route, however many saves follow', () => {
+        const manual: StoredRow = { ...confirmedRow(), target_source: 'manual', targets_input_revision: null };
+        const edited = [
+            { activity_level: 'active' },
+            { weight_kg: 80 },
+            { diet: 'vegan' } as Partial<EstimateInputsRow>,
+        ].reduce(save, manual);
+
+        expect(deriveTargetsResponse(userRow(), edited).stale).toBe(false);
+        expect(deriveTargetsResponse(userRow(), edited).source).toBe('manual');
     });
 
     it('keeps the confirmed numbers and the targets revision throughout', () => {

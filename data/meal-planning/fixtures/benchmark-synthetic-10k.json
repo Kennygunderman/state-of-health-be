@@ -110,7 +110,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -137,7 +137,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -164,7 +164,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -237,7 +237,7 @@
         ],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok"
+          "pescatarian"
         ],
         "is_common_dislike": false,
         "portionAmount": 140,
@@ -262,7 +262,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -289,7 +289,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -317,7 +317,7 @@
           "wheat"
         ],
         "diet_tags": [
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -346,7 +346,7 @@
         ],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegetarian"
         ],
         "is_common_dislike": false,
@@ -374,7 +374,7 @@
         ],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -403,7 +403,7 @@
         ],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -430,7 +430,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -459,7 +459,7 @@
         ],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegetarian"
         ],
         "is_common_dislike": false,
@@ -485,7 +485,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -512,7 +512,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -539,7 +539,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -566,7 +566,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -593,7 +593,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegetarian"
         ],
         "is_common_dislike": false,
@@ -619,7 +619,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -646,7 +646,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -675,7 +675,7 @@
         ],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegetarian"
         ],
         "is_common_dislike": false,
@@ -703,7 +703,7 @@
         ],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -730,7 +730,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -757,7 +757,7 @@
         "allergen_tags": [],
         "diet_tags": [
           "gluten_free",
-          "pescatarian_ok",
+          "pescatarian",
           "vegan",
           "vegetarian"
         ],
@@ -846,7 +846,7 @@
           "allergen_tags": [],
           "diet_tags": [
             "gluten_free",
-            "pescatarian_ok",
+            "pescatarian",
             "vegan",
             "vegetarian"
           ],
@@ -907,7 +907,7 @@
           "allergen_tags": [],
           "diet_tags": [
             "gluten_free",
-            "pescatarian_ok",
+            "pescatarian",
             "vegan",
             "vegetarian"
           ],

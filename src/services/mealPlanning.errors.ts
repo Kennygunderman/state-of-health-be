@@ -108,7 +108,17 @@ export class EstimateStaleError extends Error {
 }
 
 // The authoritative revision travels back so the client can re-read, compare
-// against its own draft, and resolve silently when the two already agree.
+// against its own draft, and resolve silently when the two already agree. It is
+// therefore always READ, never the revision the refused write expected: a
+// client sent to compare against a number that never existed cannot resolve
+// anything.
+//
+// `targets.service.ts` throws this from two places, and both are the same rule
+// at two depths. The pinned revision is checked against the row read under the
+// per-user lock, AND it travels in the UPDATE's own predicate — an affected
+// count other than one raises this error too, so the revision the request
+// pinned is enforced by the statement that writes rather than by the check that
+// preceded it (Rule backend-architecture §5.1, AAP §0.5.1).
 export class StaleTargetsError extends Error implements StaleTargetsErrorData {
     constructor(public readonly currentRevision: number) {
         super('Nutrition targets changed since this request was prepared');

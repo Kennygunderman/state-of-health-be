@@ -16,7 +16,7 @@
   "prepMinutes": 10,
   "cookMinutes": 30,
   "mealSlots": ["lunch", "dinner"],
-  "dietTags": ["gluten_free", "pescatarian", "pescatarian_ok", "vegan", "vegetarian"],
+  "dietTags": ["gluten_free", "pescatarian", "vegan", "vegetarian"],
   "allergenTags": [],
   "allergenStatus": "known",
   "budgetTier": 1,

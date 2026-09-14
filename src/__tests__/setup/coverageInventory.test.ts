@@ -30,7 +30,6 @@ const COVERED_UTILS: readonly string[] = [
     'src/utils/seededRandom.ts',
     'src/utils/pagination.ts',
     'src/utils/featureFlags.ts',
-    'src/utils/calendarDay.ts',
 ];
 
 const EXCLUDED_UTILS: readonly string[] = ['src/utils/firebase.ts', 'src/utils/getUserId.ts'];

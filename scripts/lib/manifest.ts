@@ -1210,6 +1210,19 @@ export interface CatalogReleaseCounts {
     readonly aliases: number;
     readonly portions: number;
     readonly components: number;
+    /**
+     * How many published foods declare `nutrition_provenance`
+     * `ingredient_derived` — the foods a component row can belong to.
+     *
+     * It sits beside `components` because it is what makes that count
+     * readable. A component row is a composition, so `components: 0` is
+     * correct exactly when no published food derives its nutrition from one,
+     * and indistinguishable from a components export that dropped every row
+     * when read on its own. The pair states the fact and its reason together,
+     * and `catalog-release.ts` refuses a release where the two disagree.
+     * Optional: only a manifest written after this field existed carries it.
+     */
+    readonly published_ingredient_derived?: number;
     readonly validation_records: number;
 }
 

@@ -99,7 +99,6 @@ import {
     WeightUnitPref,
 } from '../types/mealPlanning';
 import { evaluatePlanningEligibility, PlanningPreferences, PlanningRecipeVersion } from './recipe.logic';
-import { isCalendarDayKey } from '../utils/calendarDay';
 
 /* ---------------------------------------------------------------------------
  * Closed vocabularies
@@ -260,9 +259,21 @@ export const MAX_DISLIKED_FOOD_IDS = 100;
 
 const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-// The day-key shape is NOT declared here. It lives once, with the predicate that
-// uses it, in `utils/calendarDay.ts` — a second copy is how three services came
-// to disagree about the calendar.
+/**
+ * The day-key SHAPE: four digits, two, two, separated by hyphens, and nothing
+ * else in the string.
+ *
+ * Exported because several modules need to judge the shape in a message or a
+ * slice, and a second declaration is how one calendar rule turns into several
+ * that disagree. Strict on both ends on purpose: `2026-7-11` and
+ * `2026-07-11T00:00:00Z` are not day keys, and accepting either would put two
+ * spellings of one day into a comparison that sorts keys as strings.
+ *
+ * Shape alone is never enough — it admits `2026-02-30` and `2026-13-01` — so
+ * every caller that can reach the calendar question asks
+ * {@link isCalendarDayKey} instead.
+ */
+export const DAY_KEY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
  * A 24-hour wall-clock time, zero-padded.
@@ -425,22 +436,83 @@ const comparisonKey = (value: string): string =>
         .replace(WHITESPACE_RUN_PATTERN, ' ')
         .trim();
 
+/* ---------------------------------------------------------------------------
+ * THE calendar-day rule
+ *
+ * A day key is the unit every meal-planning rule speaks in — a plan's start and
+ * end, a plan day, the date an entry is logged against, the `today` a plan's
+ * lifecycle is judged by. It is a CALENDAR day rather than a moment: no zone,
+ * no clock, no locale (Rule backend-architecture §7). Deriving a key from an
+ * instant is a different job and stays where it belongs, in
+ * `mealPlan.logic.ts::localDayKey`, which needs the user's stored zone.
+ *
+ * The rule lives HERE, once, because this module owns the per-step parsers that
+ * first admit a date into the system — the `review` step's `startDate` — and
+ * `mealPlan.logic.ts` (as `isDayKey`), `plannedMealLog.logic.ts` and
+ * `grocery.logic.ts` take this exact binding rather than declaring their own.
+ * One implementation is the only arrangement in which "the plan route and the
+ * log route agree about the calendar" is a property rather than a coincidence
+ * that has to be re-checked: a per-service copy is how `PUT
+ * /meal-planning/preferences/steps/review` and `POST …/meals/:mealId/log` come
+ * to contradict each other about whether a day exists.
+ *
+ * The implementation is table-driven and consults no `Date`. The obvious
+ * alternative — a round trip through `Date.UTC(year, month - 1, day)` — is not
+ * merely slower but wrong over part of the range a bare `YYYY-MM-DD` denotes:
+ * that constructor applies the legacy two-digit-year mapping, reading year 4 as
+ * 1904, so the round trip cannot match and every day before 0100 is refused.
+ * Writing the proleptic Gregorian calendar out has no such mapping, no rollover
+ * to trip over, and no runtime behaviour to depend on.
+ *
+ * NOT in scope here, deliberately: whether a real day is a day the caller may
+ * USE. A plan's permitted start window, a log date inside the plan week and a
+ * plan's end against today all need today's date in the user's zone, which no
+ * pure function can know; each caller holds its own bound. This rule answers
+ * only whether the calendar contains the day.
+ * ------------------------------------------------------------------------- */
+
+/** Days per month in a common year, January first. February is corrected for leap years. */
+const DAYS_IN_MONTH: readonly number[] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/**
+ * The proleptic Gregorian leap rule: every fourth year, except centuries, except
+ * every fourth century.
+ *
+ * Applied to the written year with no era handling, which is what makes year
+ * 0004 a leap year here. That is the same answer the rule gives for 2024, and
+ * the point of writing the rule out rather than asking a `Date`.
+ */
+const isLeapYear = (year: number): boolean =>
+    (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+
 /**
  * Whether a value is a real `YYYY-MM-DD` calendar day.
  *
- * THE implementation, which this module used to own, now lives in
- * `utils/calendarDay.ts` and is shared with `mealPlan.logic.ts` and
- * `plannedMealLog.logic.ts`. It is re-exported here — the same binding, not a
- * wrapper — because this module's callers and its test have always asked it
- * this question and the name is part of its surface.
+ * {@link DAY_KEY_PATTERN} alone accepts `2026-02-30` and `2026-13-01`, and a
+ * plan that silently started on a day that does not exist would put six of its
+ * seven days somewhere the user never asked for — while an entry logged against
+ * one would sit on a date the user never chose, sorting inside a plan week it is
+ * not in. So the month length is computed from the calendar rules: `2026-02-30`
+ * is refused, `2024-02-29` and `2000-02-29` are accepted, `1900-02-29` is not.
  *
- * The month length is computed from the proleptic Gregorian rules rather than
- * from a `Date`, so `2026-02-30` is refused, `2024-02-29` is accepted, and no
- * clock, zone or locale is consulted (Rule 7 §7). Whether such a day is IN
- * RANGE for a plan is a different question, and not this module's: it needs
- * today's date in the user's zone, which only the caller can establish.
+ * Takes `unknown` and narrows, because every caller is validating input that
+ * arrived as JSON or was read from a row written by an older parser.
  */
-export { isCalendarDayKey };
+export const isCalendarDayKey = (value: unknown): value is string => {
+    if (typeof value !== 'string' || !DAY_KEY_PATTERN.test(value)) {
+        return false;
+    }
+
+    const [year, month, day] = value.split('-').map(Number);
+
+    if (month < 1 || month > 12 || day < 1) {
+        return false;
+    }
+
+    const lastDay = month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
+
+    return day <= lastDay;
+};
 
 /** Whether a value is a zero-padded 24-hour `HH:mm` wall-clock time. */
 export const isClockTime = (value: unknown): value is string =>
@@ -1144,6 +1216,52 @@ type ResolvedRevision =
     | { kind: 'stale'; currentRevision: number };
 
 /**
+ * Why a pinned revision TOKEN cannot denote a stored revision at all, or null
+ * when its shape is usable.
+ *
+ * Split out of {@link resolveExpectedRevision} because these four checks need
+ * NOTHING but the value itself: not a number, not finite, not whole, negative,
+ * or outside the exact range the `integer` column holds. That makes them part
+ * of the context-free envelope ({@link parseSetupStepRequest},
+ * {@link parsePreferencesUpdateRequest}) — judgeable before a single database
+ * read — while the comparison against the stored counter, which decides `ok`
+ * from `stale`, necessarily is not. One implementation serves both, so the
+ * preflight and the authoritative parse cannot disagree about which tokens are
+ * malformed.
+ *
+ * An ABSENT token is not judged here: whether omitting it is acceptable depends
+ * on whether a row exists, which is context.
+ */
+const revisionTokenShape = (value: unknown): InvalidRequestDetail | null => {
+    if (isAbsent(value)) {
+        return null;
+    }
+
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return detail('expectedRevision', PREFERENCE_FIELD_CODES.INVALID_TYPE);
+    }
+
+    if (!Number.isInteger(value)) {
+        return detail('expectedRevision', PREFERENCE_FIELD_CODES.NOT_AN_INTEGER);
+    }
+
+    if (value < NO_PREFERENCES_REVISION) {
+        return detail('expectedRevision', PREFERENCE_FIELD_CODES.BELOW_MINIMUM);
+    }
+
+    // `Number.isInteger(1e30)` is true, so the integer check above lets through
+    // values that are whole but not exactly representable and cannot be a
+    // stored revision. Both halves are one bound: above `MAX_REVISION` the
+    // column cannot hold it, and above `Number.MAX_SAFE_INTEGER` the comparison
+    // itself would be unsound.
+    if (!Number.isSafeInteger(value) || value > MAX_REVISION) {
+        return detail('expectedRevision', PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM);
+    }
+
+    return null;
+};
+
+/**
  * The expected-revision rule, whose asymmetry is deliberate.
  *
  * `expectedRevision` is optional ONLY while no preferences row exists AND the
@@ -1177,38 +1295,17 @@ const resolveExpectedRevision = (
             : { kind: 'stale', currentRevision: effectiveCurrent };
     }
 
-    if (typeof value !== 'number' || !Number.isFinite(value)) {
-        return { kind: 'invalid', detail: detail('expectedRevision', PREFERENCE_FIELD_CODES.INVALID_TYPE) };
-    }
+    // The shape rule is {@link revisionTokenShape}, shared with the envelope
+    // parsers so a token the preflight calls malformed is not re-classified as
+    // a lost race here.
+    const malformed = revisionTokenShape(value);
 
-    if (!Number.isInteger(value)) {
-        return {
-            kind: 'invalid',
-            detail: detail('expectedRevision', PREFERENCE_FIELD_CODES.NOT_AN_INTEGER),
-        };
-    }
-
-    if (value < NO_PREFERENCES_REVISION) {
-        return {
-            kind: 'invalid',
-            detail: detail('expectedRevision', PREFERENCE_FIELD_CODES.BELOW_MINIMUM),
-        };
-    }
-
-    // `Number.isInteger(1e30)` is true, so the integer check above lets through
-    // values that are whole but not exactly representable and cannot be a
-    // stored revision. Both halves are one bound: above `MAX_REVISION` the
-    // column cannot hold it, and above `Number.MAX_SAFE_INTEGER` the comparison
-    // itself would be unsound.
-    if (!Number.isSafeInteger(value) || value > MAX_REVISION) {
-        return {
-            kind: 'invalid',
-            detail: detail('expectedRevision', PREFERENCE_FIELD_CODES.ABOVE_MAXIMUM),
-        };
+    if (malformed !== null) {
+        return { kind: 'invalid', detail: malformed };
     }
 
     return value === effectiveCurrent
-        ? { kind: 'ok', expectedRevision: value }
+        ? { kind: 'ok', expectedRevision: value as number }
         : { kind: 'stale', currentRevision: effectiveCurrent };
 };
 
@@ -1405,8 +1502,31 @@ const unacceptedStepKeys = (
     );
 };
 
+/**
+ * Which of the two stages of a preference save is parsing.
+ *
+ * `'request'` is the stage that runs BEFORE any database work (AAP §0.5.2):
+ * every rule whose inputs the request itself carries is judged, and the handful
+ * that need a stored value are skipped — not judged against a missing one,
+ * which would invent refusals the row would have cleared (a `lose` goal whose
+ * pace is already stored is not a body missing its pace).
+ *
+ * `'stored'` is the authoritative stage, run against the row inside the
+ * per-user lock, where every rule applies.
+ */
+export type ParseStage = 'request' | 'stored';
+
 /** What the parser must know about the stored row to judge a step payload. */
 export interface SetupStepContext {
+    /**
+     * `'request'` when the stored row has NOT been read, so every rule below
+     * that needs it is skipped rather than judged against an absence.
+     *
+     * Omitted means `'stored'`, which is the safe default in the only direction
+     * that matters: a caller who forgets it gets the FULL set of rules, never a
+     * reduced one. See {@link parseSetupStepRequest}.
+     */
+    stage?: ParseStage;
     /** The row's revision, or null when the user has no preferences row yet. */
     currentRevision: number | null;
     /**
@@ -1776,6 +1896,152 @@ const parseReviewStep = (
     return { ...envelope, startDate: record.startDate };
 };
 
+/* ---------------------------------------------------------------------------
+ * The context-free envelope
+ *
+ * WHY THIS IS A SEPARATE STAGE. AAP §0.5.2 requires server-side validation
+ * "before any Prisma or planning work", and the stored row is the one thing a
+ * parser cannot judge without a read. So the checks are split by what they
+ * need: the envelope — the `:step` segment, the body's JSON type, the closed
+ * key set, the IANA zone, and the SHAPE of the pinned revision — needs nothing
+ * but the request, while the revision COMPARISON and the four coherence rules
+ * (a target weight against the stored current weight, a direction against the
+ * stored pace, meal times against the stored schedule, a budget amount against
+ * the stored no-preference answer) need the row. A service therefore refuses a
+ * structurally malformed request without touching the database, and reads the
+ * row only once the request is worth reading it for.
+ *
+ * The AUTHORITATIVE parsers below still run the envelope checks and MERGE their
+ * details with the field-level ones, rather than returning early on an envelope
+ * problem. That is what keeps the contract's "one 400 naming every offending
+ * field" true for a body that gets both wrong — a read-only key AND an
+ * out-of-range age come back together, as they did before this split.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Either the request is worth reading the stored row for, or here is the
+ * complete 400 it earns without one.
+ */
+export type PreferenceRequestVerdict = { kind: 'ok' } | PreferenceErrorVerdict;
+
+/**
+ * A step envelope whose step and body are usable, with every context-free
+ * problem found inside it.
+ *
+ * The members are narrowed — `step` is a real step and `record` a real object —
+ * so the authoritative parse continues from here without re-deriving either.
+ */
+interface InspectedStepEnvelope {
+    /** Every context-free problem, in report order. */
+    details: InvalidRequestDetail[];
+    step: PayloadBearingSetupStep;
+    record: Record<string, unknown>;
+    /** The canonical zone, or null when it is absent or not a name this runtime knows. */
+    timeZone: string | null;
+}
+
+/**
+ * What inspecting a step envelope establishes without reading the stored row:
+ * either nothing further can be judged, or here is the usable envelope.
+ */
+type StepEnvelopeInspection =
+    | { kind: 'unusable'; details: InvalidRequestDetail[] }
+    | ({ kind: 'inspected' } & InspectedStepEnvelope);
+
+/**
+ * The context-free half of one per-step save.
+ *
+ * An unknown step and a non-object body each end the inspection, because
+ * neither leaves anything further to judge: the accepted key set is a property
+ * of the step, and a non-object has no keys. Everything after that accumulates.
+ */
+const inspectSetupStepEnvelope = (step: unknown, body: unknown): StepEnvelopeInspection => {
+    if (!isPayloadBearingSetupStep(step)) {
+        return { kind: 'unusable', details: [detail('step', PREFERENCE_FIELD_CODES.UNKNOWN_STEP)] };
+    }
+
+    const record = asRecord(body);
+
+    if (record === null) {
+        return { kind: 'unusable', details: [detail('body', PREFERENCE_FIELD_CODES.INVALID_TYPE)] };
+    }
+
+    const details: InvalidRequestDetail[] = [];
+
+    for (const key of unacceptedStepKeys(step, record)) {
+        details.push(detail(key, PREFERENCE_FIELD_CODES.READ_ONLY_FIELD));
+    }
+
+    const timeZone = normalizeTimeZone(record.timeZone);
+
+    if (timeZone === null) {
+        details.push(
+            detail(
+                'timeZone',
+                isAbsent(record.timeZone)
+                    ? PREFERENCE_FIELD_CODES.REQUIRED
+                    : PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE,
+            ),
+        );
+    }
+
+    const malformedRevision = revisionTokenShape(record.expectedRevision);
+
+    if (malformedRevision !== null) {
+        details.push(malformedRevision);
+    }
+
+    return { kind: 'inspected', details, step, record, timeZone };
+};
+
+/**
+ * One per-step save, judged as far as the REQUEST alone allows — with no
+ * database access whatsoever.
+ *
+ * This is the stage a service runs before any Prisma work (AAP §0.5.2), and it
+ * runs the real parse, not a reduced one: the envelope (unknown step, non-object
+ * body, server-owned or misspelled key, missing or unknown IANA zone, a pinned
+ * revision no `integer` column could hold) AND every field rule of the step's
+ * own payload — an unknown goal, an out-of-range age, an allergen list that is
+ * not the nine-item set, a malformed meal time. All of them come back in ONE
+ * 400, in the order this endpoint has always produced.
+ *
+ * WHEN IT RETURNS `ok`, IT MEANS ONE OF TWO THINGS, and the caller treats them
+ * alike — proceed to the row:
+ *
+ *  * nothing the request can be judged on is wrong; or
+ *  * something is wrong, but a rule that needs the stored row was also
+ *    applicable, so this stage's answer could be INCOMPLETE and returning it
+ *    would name fewer offending controls than the screen must show at once
+ *    (AAP §0.7.4). The two goal-weight coherence rules are the only such rules
+ *    here, and each is applicable only when the body carries the answer that
+ *    can conflict with a stored one. The authoritative parse then produces the
+ *    whole answer from the row, exactly as it did before this stage existed.
+ *
+ * So a refusal from here is always the same refusal {@link parseSetupStep}
+ * would have given, and never a subset of it.
+ */
+export const parseSetupStepRequest = (step: unknown, body: unknown): PreferenceRequestVerdict => {
+    const verdict = parseSetupStep(step, body, { stage: 'request', currentRevision: null });
+
+    if (verdict.kind !== 'error') {
+        // 'ok' needs no answer here, and a stale revision is the row's verdict to
+        // give, never this stage's.
+        return { kind: 'ok' };
+    }
+
+    const record = asRecord(body);
+    // `goalWeightKg` is judged against the STORED current weight, and the body
+    // step's `weightKg` against the stored goal and target — so a refusal for a
+    // body carrying either may be missing that rule's detail.
+    const coherenceDeferred =
+        record !== null &&
+        ((step === 'goal' && Object.prototype.hasOwnProperty.call(record, 'goalWeightKg')) ||
+            (step === 'body' && Object.prototype.hasOwnProperty.call(record, 'weightKg')));
+
+    return coherenceDeferred ? { kind: 'ok' } : verdict;
+};
+
 /**
  * Validates one per-step save and returns the answer it stores.
  *
@@ -1808,50 +2074,59 @@ export const parseSetupStep = (
     body: unknown,
     context: SetupStepContext,
 ): ParsedSetupStep => {
-    if (!isPayloadBearingSetupStep(step)) {
-        return invalidRequest([detail('step', PREFERENCE_FIELD_CODES.UNKNOWN_STEP)]);
+    // The context-free half, shared with the preflight a service runs before
+    // any database read ({@link parseSetupStepRequest}). An unknown step or a
+    // non-object body ends the parse here, exactly as it did before the split —
+    // there is nothing else to judge. Every other envelope problem is MERGED
+    // with the field-level ones below, so a body carrying both still comes back
+    // as one 400 naming both.
+    const inspection = inspectSetupStepEnvelope(step, body);
+
+    if (inspection.kind === 'unusable') {
+        return invalidRequest(inspection.details);
     }
 
-    const record = asRecord(body);
+    return parseInspectedSetupStep(inspection, context);
+};
 
-    if (record === null) {
-        return invalidRequest([detail('body', PREFERENCE_FIELD_CODES.INVALID_TYPE)]);
-    }
-
-    const details: InvalidRequestDetail[] = [];
-
-    for (const key of unacceptedStepKeys(step, record)) {
-        details.push(detail(key, PREFERENCE_FIELD_CODES.READ_ONLY_FIELD));
-    }
-
-    const timeZone = normalizeTimeZone(record.timeZone);
-
-    if (timeZone === null) {
-        details.push(
-            detail(
-                'timeZone',
-                isAbsent(record.timeZone)
-                    ? PREFERENCE_FIELD_CODES.REQUIRED
-                    : PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE,
-            ),
-        );
-    }
+/**
+ * The authoritative half of one per-step save: everything that needs the stored
+ * row, judged against the already-inspected envelope.
+ *
+ * Separate from {@link parseSetupStep} only so `step` and `record` arrive
+ * narrowed, rather than being re-derived after the guard.
+ */
+const parseInspectedSetupStep = (
+    { step, record, timeZone, details: envelopeDetails }: InspectedStepEnvelope,
+    context: SetupStepContext,
+): ParsedSetupStep => {
+    const details: InvalidRequestDetail[] = [...envelopeDetails];
+    // At the request stage the row has not been read, so the two rules below
+    // have nothing to read. Skipping them is not a relaxation: both are re-run
+    // by the authoritative stage against the locked row, which is the only
+    // snapshot either is meaningful against.
+    const requestStage = context.stage === 'request';
 
     // A legitimate step, but not as the first write this user makes: `goal`
     // creates the row. Reported as a 400 on `step` rather than as a stale
     // revision, because no revision the client could have pinned would make it
     // acceptable.
-    if (context.currentRevision === null && step !== 'goal') {
+    if (!requestStage && context.currentRevision === null && step !== 'goal') {
         details.push(detail('step', PREFERENCE_FIELD_CODES.NOT_ALLOWED));
     }
 
-    const revision = resolveExpectedRevision(record.expectedRevision, context.currentRevision, {
-        optionalBeforeCreation: step === 'goal',
-    });
+    const revision: ResolvedRevision = requestStage
+        ? // The token's SHAPE is context-free and has already been judged by the
+          // inspection above; only the comparison against the stored counter
+          // needs the row, and a lost race is never reported from this stage.
+          { kind: 'ok', expectedRevision: null }
+        : resolveExpectedRevision(record.expectedRevision, context.currentRevision, {
+              optionalBeforeCreation: step === 'goal',
+          });
 
-    if (revision.kind === 'invalid') {
-        details.push(revision.detail);
-    }
+    // A malformed token already travels as an envelope detail, so it is not
+    // pushed a second time here; `revision.kind === 'invalid'` is exactly the
+    // case `revisionTokenShape` reported above.
 
     // The placeholder zone is unreachable by a caller: a null zone has already
     // added its detail above, and a non-empty `details` returns the 400 before
@@ -1953,6 +2228,8 @@ const ACCEPTED_UPDATE_KEYS: Readonly<Record<keyof PreferencesUpdatePayload, true
 
 /** What the parser must know about the stored row to judge a PARTIAL body. */
 export interface PreferencesUpdateContext {
+    /** As {@link SetupStepContext.stage}. See {@link parsePreferencesUpdateRequest}. */
+    stage?: ParseStage;
     currentRevision: number | null;
     /** For the goal-weight side check when the body changes only the goal. */
     currentWeightKg?: number | null;
@@ -2017,6 +2294,152 @@ const parseFoodGroupList = (value: unknown, field: string): string[] | Preferenc
 };
 
 /**
+ * The two keys a full save's envelope carries, which are therefore not an edit
+ * of anything.
+ *
+ * `expectedRevision` pins the row the edit applies to and `timeZone` refreshes
+ * the user's stored calendar on every save (AAP §0.5.2). Neither is an answer,
+ * so a body carrying nothing else edits nothing and is refused rather than
+ * committed as a revision bump for no change.
+ */
+const UPDATE_ENVELOPE_KEYS: Readonly<Record<'expectedRevision' | 'timeZone', true>> = {
+    expectedRevision: true,
+    timeZone: true,
+};
+
+/** A full-save envelope whose body is usable, with every context-free problem in it. */
+interface InspectedUpdateEnvelope {
+    details: InvalidRequestDetail[];
+    record: Record<string, unknown>;
+    /** The canonical zone, or null when it is absent or not a name this runtime knows. */
+    timeZone: string | null;
+    /**
+     * Why the zone is unusable, kept OUT of `details` so the parse can report it
+     * in the position this endpoint has always reported it: last, after the
+     * field rules. Lifting the check into the inspection moved when it runs, and
+     * this keeps it from also moving where it appears.
+     */
+    zoneDetail: InvalidRequestDetail | null;
+}
+
+type UpdateEnvelopeInspection =
+    | { kind: 'unusable'; details: InvalidRequestDetail[] }
+    | ({ kind: 'inspected' } & InspectedUpdateEnvelope);
+
+/**
+ * The context-free half of a full save: the body's JSON type, the closed key
+ * set, whether anything is actually being edited, the IANA zone, and the shape
+ * of the pinned revision.
+ *
+ * THE ZONE IS REQUIRED HERE, unlike every other key on this endpoint. The
+ * contract has the client send it on every step save AND on every full save, so
+ * that a user who has moved sees plan days in the zone of their most recent
+ * edit (AAP §0.5.1, §0.5.2), and the service resolves the `today` its
+ * plan-ended and flag rules read from the value this request carried. Treating
+ * an omission as "keep the old zone" made that refresh optional in practice and
+ * left `today` computed from a zone the user may have left months ago, which is
+ * the whole of finding SVC-05.
+ */
+const inspectPreferencesUpdateEnvelope = (body: unknown): UpdateEnvelopeInspection => {
+    const record = asRecord(body);
+
+    if (record === null) {
+        return { kind: 'unusable', details: [detail('body', PREFERENCE_FIELD_CODES.INVALID_TYPE)] };
+    }
+
+    const details: InvalidRequestDetail[] = [];
+    const rejectedKeys = Object.keys(record).filter(
+        (key) => !Object.prototype.hasOwnProperty.call(ACCEPTED_UPDATE_KEYS, key),
+    );
+
+    for (const key of rejectedKeys) {
+        details.push(detail(key, PREFERENCE_FIELD_CODES.READ_ONLY_FIELD));
+    }
+
+    const editedKeys = (Object.keys(ACCEPTED_UPDATE_KEYS) as (keyof PreferencesUpdatePayload)[]).filter(
+        (key) =>
+            !Object.prototype.hasOwnProperty.call(UPDATE_ENVELOPE_KEYS, key) &&
+            Object.prototype.hasOwnProperty.call(record, key),
+    );
+
+    if (rejectedKeys.length === 0 && editedKeys.length === 0) {
+        // A save with nothing in it would still bump the revision and invalidate
+        // every other client's pinned value for no change at all.
+        details.push(detail('body', PREFERENCE_FIELD_CODES.REQUIRED));
+    }
+
+    const malformedRevision = revisionTokenShape(record.expectedRevision);
+
+    if (malformedRevision !== null) {
+        details.push(malformedRevision);
+    }
+
+    const timeZone = normalizeTimeZone(record.timeZone);
+    const zoneDetail =
+        timeZone === null
+            ? detail(
+                  'timeZone',
+                  isAbsent(record.timeZone)
+                      ? PREFERENCE_FIELD_CODES.REQUIRED
+                      : PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE,
+              )
+            : null;
+
+    return { kind: 'inspected', details, record, timeZone, zoneDetail };
+};
+
+/**
+ * A full save, judged as far as the REQUEST alone allows — with no database
+ * access whatsoever. The full-save counterpart of
+ * {@link parseSetupStepRequest}, and it works the same way: the real parse runs
+ * with no row, so the envelope AND every field rule the body carries its own
+ * inputs for are reported together in one 400.
+ *
+ * FOUR RULES READ A STORED VALUE AS THE OTHER HALF OF A PAIR, and each is
+ * skipped here rather than judged against an unread row — otherwise a body that
+ * changes only its goal would be refused for a pace that is already stored:
+ *
+ *  * the goal/pace pair, when the body carries no pace;
+ *  * the goal/current-weight/target-weight tuple, unless the body carries all
+ *    three;
+ *  * the schedule/meal-times pair, unless the body carries both;
+ *  * the budget amount and its "no preference" checkbox, unless both are sent.
+ *
+ * When one of those was applicable and this stage still found something else
+ * wrong, it returns `ok` rather than a refusal that could name fewer offending
+ * controls than the row-backed parse would (AAP §0.7.4) — the caller proceeds
+ * and {@link parsePreferencesUpdate} answers in full. A refusal from here is
+ * therefore always the complete one.
+ */
+export const parsePreferencesUpdateRequest = (body: unknown): PreferenceRequestVerdict => {
+    const verdict = parsePreferencesUpdate(body, { stage: 'request', currentRevision: null });
+
+    if (verdict.kind !== 'error') {
+        // 'ok' needs no answer here, and a stale revision is the row's verdict to
+        // give, never this stage's.
+        return { kind: 'ok' };
+    }
+
+    const record = asRecord(body);
+
+    if (record === null) {
+        return verdict;
+    }
+
+    const has = (key: keyof PreferencesUpdatePayload): boolean =>
+        Object.prototype.hasOwnProperty.call(record, key);
+    const pairDeferred =
+        (has('goal') && !has('paceLbPerWeek')) ||
+        ((has('goal') || has('weightKg') || has('goalWeightKg')) &&
+            !(has('goal') && has('weightKg') && has('goalWeightKg'))) ||
+        ((has('mealTimes') || has('mealSchedule')) && !(has('mealTimes') && has('mealSchedule'))) ||
+        ((has('budget') || has('noBudgetPreference')) &&
+            !(has('budget') && has('noBudgetPreference')));
+
+    return pairDeferred ? { kind: 'ok' } : verdict;
+};
+
+/**
  * Validates the full preferences save.
  *
  * THE KEY SET IS CLOSED, and a key outside it is REFUSED rather than ignored —
@@ -2057,41 +2480,48 @@ export const parsePreferencesUpdate = (
     body: unknown,
     context: PreferencesUpdateContext,
 ): ParsedPreferencesUpdate => {
-    const record = asRecord(body);
+    // The context-free half, shared with the preflight a service runs before any
+    // database read ({@link parsePreferencesUpdateRequest}). A non-object body
+    // ends the parse here; every other envelope problem is merged with the
+    // field-level ones below, so one 400 still names every offending key.
+    const inspection = inspectPreferencesUpdateEnvelope(body);
 
-    if (record === null) {
-        return invalidRequest([detail('body', PREFERENCE_FIELD_CODES.INVALID_TYPE)]);
+    if (inspection.kind === 'unusable') {
+        return invalidRequest(inspection.details);
     }
 
-    const details: InvalidRequestDetail[] = [];
-    const rejectedKeys = Object.keys(record).filter(
-        (key) => !Object.prototype.hasOwnProperty.call(ACCEPTED_UPDATE_KEYS, key),
-    );
+    return parseInspectedPreferencesUpdate(inspection, context);
+};
 
-    for (const key of rejectedKeys) {
-        details.push(detail(key, PREFERENCE_FIELD_CODES.READ_ONLY_FIELD));
-    }
+/**
+ * The authoritative half of a full save: every rule that needs the stored row,
+ * judged against the already-inspected envelope.
+ *
+ * Separate from {@link parsePreferencesUpdate} only so `record` arrives
+ * narrowed rather than being re-derived after the guard.
+ */
+const parseInspectedPreferencesUpdate = (
+    { record, timeZone, zoneDetail, details: envelopeDetails }: InspectedUpdateEnvelope,
+    context: PreferencesUpdateContext,
+): ParsedPreferencesUpdate => {
+    const details: InvalidRequestDetail[] = [...envelopeDetails];
+    // See {@link ParseStage}. Every rule below that reads a stored value as the
+    // OTHER half of a pair is skipped at the request stage, because judging it
+    // against an unread row would refuse coherent requests: a body that changes
+    // only the goal is not a body whose pace is missing.
+    const requestStage = context.stage === 'request';
 
     const has = (key: keyof PreferencesUpdatePayload): boolean =>
         Object.prototype.hasOwnProperty.call(record, key);
 
-    const editedKeys = (Object.keys(ACCEPTED_UPDATE_KEYS) as (keyof PreferencesUpdatePayload)[]).filter(
-        (key) => key !== 'expectedRevision' && has(key),
-    );
+    const revision: ResolvedRevision = requestStage
+        ? { kind: 'ok', expectedRevision: null }
+        : resolveExpectedRevision(record.expectedRevision, context.currentRevision, {
+              optionalBeforeCreation: false,
+          });
 
-    if (rejectedKeys.length === 0 && editedKeys.length === 0) {
-        // A save with nothing in it would still bump the revision and invalidate
-        // every other client's pinned value for no change at all.
-        details.push(detail('body', PREFERENCE_FIELD_CODES.REQUIRED));
-    }
-
-    const revision = resolveExpectedRevision(record.expectedRevision, context.currentRevision, {
-        optionalBeforeCreation: false,
-    });
-
-    if (revision.kind === 'invalid') {
-        details.push(revision.detail);
-    }
+    // A malformed token already travels as an envelope detail, so it is not
+    // pushed a second time here.
 
     const payload: Record<string, unknown> = {};
 
@@ -2144,6 +2574,9 @@ export const parsePreferencesUpdate = (
         !goalRejected &&
         !paceRejected &&
         (has('goal') || has('paceLbPerWeek')) &&
+        // The stored pace stands in for an omitted one, so at the request stage
+        // this rule is judgeable only when the body carries the pace itself.
+        (!requestStage || has('paceLbPerWeek')) &&
         effectiveGoal !== null &&
         !maintains &&
         effectivePace === null
@@ -2351,8 +2784,12 @@ export const parsePreferencesUpdate = (
         if (effectiveSchedule === null) {
             // The times cannot be judged without the schedule that says how many
             // there should be, and guessing the count is how a four-slot week
-            // ends up with three times.
-            details.push(detail('mealSchedule', PREFERENCE_FIELD_CODES.REQUIRED));
+            // ends up with three times. At the request stage a null schedule
+            // means "not read yet" rather than "not answered", so the whole
+            // rule — including the times' own format — waits for the row.
+            if (!requestStage) {
+                details.push(detail('mealSchedule', PREFERENCE_FIELD_CODES.REQUIRED));
+            }
         } else {
             const mealTimes = validateMealTimes(effectiveSchedule, record.mealTimes);
 
@@ -2363,6 +2800,9 @@ export const parsePreferencesUpdate = (
             }
         }
     } else if (
+        // Purely a comparison against the stored schedule: only a CHANGE
+        // invalidates the stored times, so this rule belongs to the row.
+        !requestStage &&
         payload.mealSchedule !== undefined &&
         payload.mealSchedule !== (context.currentMealSchedule ?? null)
     ) {
@@ -2386,7 +2826,13 @@ export const parsePreferencesUpdate = (
         }
     }
 
-    if (has('budget') || has('noBudgetPreference')) {
+    // Both halves of the budget answer stand in for each other, so at the
+    // request stage the pair is judgeable only when the body carries both; a
+    // lone amount or a lone checkbox is decided together with the stored half.
+    if (
+        (has('budget') || has('noBudgetPreference')) &&
+        (!requestStage || (has('budget') && has('noBudgetPreference')))
+    ) {
         const noPreference = has('noBudgetPreference')
             ? record.noBudgetPreference
             : (context.currentNoBudgetPreference ?? false);
@@ -2411,21 +2857,13 @@ export const parsePreferencesUpdate = (
         }
     }
 
-    if (has('timeZone')) {
-        const timeZone = normalizeTimeZone(record.timeZone);
-
-        if (timeZone === null) {
-            details.push(
-                detail(
-                    'timeZone',
-                    isAbsent(record.timeZone)
-                        ? PREFERENCE_FIELD_CODES.REQUIRED
-                        : PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE,
-                ),
-            );
-        } else {
-            payload.timeZone = timeZone;
-        }
+    // The zone is validated and canonicalised by the envelope inspection, which
+    // also REQUIRES it; its refusal is reported here, last, which is where this
+    // endpoint has always reported it.
+    if (zoneDetail !== null) {
+        details.push(zoneDetail);
+    } else if (timeZone !== null) {
+        payload.timeZone = timeZone;
     }
 
     if (details.length > 0) {
@@ -2439,7 +2877,9 @@ export const parsePreferencesUpdate = (
     // materialise setup state that belongs to the first `goal` step. The client
     // recovery is the same one it already has for a lost race — re-read, see
     // `revision: 0` and `setupStatus: 'not_started'`, and go through setup.
-    if (context.currentRevision === null || revision.kind === 'stale') {
+    // Both halves read the row, so neither is answered by the request stage —
+    // whose caller discards the payload anyway and proceeds to the row.
+    if (!requestStage && (context.currentRevision === null || revision.kind === 'stale')) {
         return staleRevision(
             revision.kind === 'stale' ? revision.currentRevision : NO_PREFERENCES_REVISION,
         );
@@ -2532,6 +2972,95 @@ export const resolveTargetRouteForBodyStep = (payload: BodyStepPayload): TargetR
 };
 
 /**
+ * The four measurements the measured body step stores, as they stand AFTER a
+ * write — the only answers that can move the target route.
+ *
+ * The unit preferences are absent because they are display choices: a route is
+ * about whether the energy equation can be applied, and neither `ft_in` nor
+ * `lb` bears on that.
+ */
+export interface BodyAnswerFacts {
+    age: number | null;
+    heightCm: number | null;
+    weightKg: number | null;
+    sexForEstimate: SexForEstimate | null;
+}
+
+/**
+ * Whether the four measurements amount to a complete body answer — the same set
+ * the measured branch of the body step requires, and the set
+ * `targets.logic.ts::resolveEstimateInputs` reads for everything except the
+ * activity level, goal and pace it gets from other steps.
+ */
+export const isBodyAnswerComplete = (facts: BodyAnswerFacts): boolean =>
+    facts.age !== null &&
+    facts.heightCm !== null &&
+    facts.weightKg !== null &&
+    facts.sexForEstimate !== null;
+
+/**
+ * Which target route a FULL SAVE leaves the user on, or `undefined` when it
+ * moves the route nowhere.
+ *
+ * `target_route` is server-owned — it is absent from the editable DTO, so a
+ * client key for it is `read_only_field` — and until this rule existed only a
+ * body-STEP save could resolve it ({@link resolveTargetRouteForBodyStep}).
+ * That left two untruths reachable through the settings screens, which edit the
+ * same answers through `PUT /meal-planning/preferences`:
+ *
+ *  * a user on the estimated route who changed their sex answer to
+ *    "prefer not to say" stayed on the estimated route, so the server would
+ *    still calculate and confirm a target from an assumed sex — the exact
+ *    outcome `resolveTargetRouteForBodyStep` refuses for the same answer;
+ *  * a user on the manual route (Skip, or an earlier "prefer not to say") who
+ *    supplied a measured sex and a complete set of measurements stayed manual,
+ *    so the estimate they had just made calculable remained unavailable.
+ *
+ * `undefined` rather than a value is Prisma's "do not write this column", the
+ * same convention `nextEstimateInputsRevision` uses, so an unrelated save
+ * leaves the route exactly where it stood.
+ *
+ * TWO GUARDS ARE LOAD-BEARING. The route doubles as the server's record THAT
+ * the body step was answered ({@link PROVABLE_STEP_ANSWERS} proves that step by
+ * `route !== null`), so writing one for a user who has not answered it would
+ * fabricate onboarding progress and could promote a row whose measurements were
+ * never given. Hence: a route is derived only where the body answer is now
+ * complete, or where the stored route already records that the step was
+ * answered. And a full save cannot CLEAR a measurement — the parser accepts
+ * only in-range numbers and a known sex for these four keys — so completeness
+ * can only improve, never regress, through this endpoint.
+ */
+export const resolveTargetRouteForUpdate = (
+    storedRoute: TargetRoute | null,
+    facts: BodyAnswerFacts,
+): TargetRoute | undefined => {
+    if (facts.sexForEstimate === null) {
+        return undefined;
+    }
+
+    // Nothing is written while the body step is unanswered and the answer is
+    // still incomplete. The estimate stays correctly unavailable in that state
+    // anyway: `resolveEstimateInputs` reports 'prefer_not_to_say' from the
+    // column itself before it looks at anything else, and an incomplete
+    // measured answer as 'missing_inputs'.
+    if (storedRoute === null && !isBodyAnswerComplete(facts)) {
+        return undefined;
+    }
+
+    const derived: TargetRoute | null =
+        facts.sexForEstimate === 'prefer_not_to_say'
+            ? 'manual'
+            : isBodyAnswerComplete(facts)
+              ? 'estimated'
+              : // A measured sex without the rest of the body answer moves
+                // nothing: the estimate is not yet calculable, and the stored
+                // route already records how the step was answered.
+                null;
+
+    return derived === null || derived === storedRoute ? undefined : derived;
+};
+
+/**
  * The stored answers that PROVE a required step was answered, read straight off
  * the preferences row.
  *
@@ -2604,7 +3133,10 @@ const PROVABLE_STEP_ANSWERS: Readonly<
  * snapshot is the row as it stands BEFORE this write, so checking the incoming
  * step against it would find its own column still null and pin the marker to
  * the screen the user just completed — the activity save would answer activity
- * and then be told to go answer activity.
+ * and then be told to go answer activity. It is `null` for a save that answers
+ * no step at all — a full settings save, which stores answers but earns no
+ * progress ({@link reconcileSetupStateForRoute}) — in which case every required
+ * step is judged from the row.
  *
  * This is what makes a ROUTE CHANGE safe. The two routes require different
  * steps — `activity` belongs to the estimated route and not to the manual one —
@@ -2618,7 +3150,7 @@ const PROVABLE_STEP_ANSWERS: Readonly<
 const outstandingRequiredStep = (
     route: TargetRoute | null,
     answers: SetupAnswerFacts,
-    answeredNow: SetupStep,
+    answeredNow: SetupStep | null,
 ): SetupStep | null => {
     for (const step of requiredSetupSteps(route)) {
         const proves = PROVABLE_STEP_ANSWERS[step];
@@ -2812,6 +3344,69 @@ export const nextSetupState = (
                 : current.setupStatus;
 
     return { setupStatus, setupStep, targetRoute: route };
+};
+
+/** The two setup columns a route change may have to reconcile. */
+export interface SetupStateReconciliation {
+    setupStatus: SetupStatus;
+    setupStep: SetupStep;
+}
+
+/**
+ * How a ROUTE CHANGE outside the wizard reconciles the setup state, or
+ * `undefined` when nothing needs to move.
+ *
+ * A full save never advances setup — it is a settings edit, not a wizard step —
+ * but a route change moves the set of REQUIRED steps under the user, and
+ * `ready_for_review` then claims answers the row does not hold. The estimated
+ * route requires `activity`, which the manual route never asks, so a manual
+ * user who supplies a measured sex from the settings screen becomes an
+ * estimated user with no activity level: readiness would be a statement about
+ * screens answered on a route they are no longer on.
+ *
+ * This is the same "a provably missing answer overrides progress" clause
+ * {@link nextSetupState} applies to step saves, restricted to what a settings
+ * edit may do:
+ *
+ *  * it can only pull the marker BACK to a step the row proves is unanswered,
+ *    and never promote — a full save cannot make anyone ready for review;
+ *  * a `completed` user is never touched. They have a plan, their edits arrive
+ *    from the plan settings screen, and sending them back into onboarding is
+ *    the failure the monotonic status rule exists to prevent;
+ *  * a `not_started` row is never touched either. That row exists for the
+ *    legacy user whose first meal-planning write was a target save (which
+ *    upserts the row without onboarding progress), and there is no progress
+ *    there to reconcile.
+ */
+export const reconcileSetupStateForRoute = (
+    current: SetupStateSnapshot,
+    route: TargetRoute | null,
+): SetupStateReconciliation | undefined => {
+    if (current.setupStatus === 'completed' || current.setupStatus === 'not_started') {
+        return undefined;
+    }
+
+    const order = routeStepOrder(route);
+    // No step was answered by this save, so nothing is credited: a full save
+    // stores answers but earns no progress.
+    const outstanding = outstandingRequiredStep(route, current.answers, null);
+
+    if (outstanding === null) {
+        return undefined;
+    }
+
+    const markerIndex = current.setupStep === null ? -1 : order.indexOf(current.setupStep);
+
+    // A marker the new route does not contain (index -1) is treated as past
+    // everything, exactly as `nextSetupState` treats it, so a stale off-route
+    // marker left behind by the change is reconciled rather than kept as a stop
+    // nobody can answer. A marker already at or before the outstanding step
+    // needs no pull-back: the user is on their way to it.
+    if (markerIndex >= 0 && markerIndex <= order.indexOf(outstanding)) {
+        return undefined;
+    }
+
+    return { setupStatus: 'in_progress', setupStep: outstanding };
 };
 
 /* ---------------------------------------------------------------------------

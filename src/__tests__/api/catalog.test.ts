@@ -1,5 +1,24 @@
-// The enforcing proof that catalog read ordering does not depend on the
-// database it runs in.
+// The catalog area's database-backed suite: the planned home for every proof
+// about the read path behind `GET /catalog/foods`,
+// `GET /catalog/foods/suggestions` and `GET /catalog/status` that needs a real
+// PostgreSQL to make (AAP §0.9.2 names this file for the catalog rows, §0.3.3
+// for the suite inventory). Pure catalog rules — dedupe, `source_key`,
+// publication eligibility, the match set — are unit-tested without a database
+// in `src/services/__tests__/catalog.logic.test.ts`; what lives here is
+// everything whose failure mode is a property of the server rather than a
+// branch in TypeScript.
+//
+// THE SUITE PROVISIONS ITS OWN DATABASE, AND DOES NOT USE THE AMBIENT ONE.
+// Every other suite here runs against the ambient test database; this one
+// creates a disposable database of its own in `beforeAll` and drops it in
+// `afterAll`, for the reason and by the mechanism set out below. The ambient
+// database is therefore never read or written here, which is why this file
+// neither truncates the feature tables nor coordinates with the shared
+// truncation guard — and why the Prisma singleton the services import is mocked
+// to point somewhere else entirely. A case added below that needs the ambient
+// database, an HTTP round-trip through `../setup/testApp` for instance, cannot
+// use that mocked singleton: it has to open its own client against
+// `process.env.DATABASE_URL`.
 //
 // WHAT IS BEING PROVEN, AND WHY A UNIT TEST CANNOT DO IT. `catalog.service.ts`
 // orders search results and dislike suggestions by `display_name` and
@@ -52,11 +71,21 @@
 // ICU `und`, which is the hostile case, and the index therefore carries
 // `text_pattern_ops` explicitly. The final describe pins that class out of
 // `pg_opclass`, pins the plan (with `enable_seqscan = off`, so cost is not a
-// variable), reads the `pg_stat_user_indexes.idx_scan` delta across a real
-// `searchPublishedFoods` call, and confirms equality is still served. The
-// committed schema-evidence gate cannot see an operator class at all —
+// variable), and confirms equality is still served. The committed
+// schema-evidence gate cannot see an operator class at all —
 // `pg_get_indexdef(oid, k, …)` omits it — so these assertions are where that
 // property is held.
+//
+// That the REAL CALLER reaches the index is established in the same describe,
+// and deterministically: the mocked Prisma singleton is constructed with query
+// event logging, so a real `searchPublishedFoods` call hands back the exact SQL
+// and the exact bound parameters it issued, and the page statement is then
+// re-planned and executed with those same values through
+// `EXPLAIN (ANALYZE, FORMAT JSON)` on its own connection. The assertion is a
+// node of that plan tree reading this index, with the `ANALYZE` row and loop
+// counters that only a node which ran has. Nothing is timed, nothing is slept
+// on, and no cumulative or cluster-wide statistic is consulted, so host load
+// cannot fail the test and index activity from elsewhere cannot pass it.
 //
 // Everything here is read-only with respect to the developer's own data: the
 // database is created and dropped by this file and is named after the ambient
@@ -91,6 +120,61 @@ interface PgModule {
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const pg = require('pg') as PgModule;
 
+// --------------------------------------------------------------------------
+// A narrow typed surface over the two other untyped things this file reads: the
+// Prisma query log, and PostgreSQL's JSON plan output. Both are declared with
+// only the fields the assertions use, so a change in either is a compile error
+// here rather than a silently absent property at runtime.
+// --------------------------------------------------------------------------
+
+/** One statement Prisma executed, as its `query` event reports it. */
+interface QueryEvent {
+    /** The SQL with `$n` placeholders, exactly as the engine sent it. */
+    query: string;
+    /** The values bound to those placeholders, as a JSON array in a string. */
+    params: string;
+}
+
+/**
+ * The `query`-event surface of the Prisma singleton.
+ *
+ * `src/prisma/client.ts` constructs its client with no `log` option, so the
+ * exported type has no `query` event in it and `prisma.$on('query', …)` does not
+ * typecheck — while the instance the `jest.mock` factory below installs DOES
+ * emit them, because that factory adds `log: [{emit: 'event', level: 'query'}]`.
+ * This interface is the narrowest bridge across that gap: it names the one
+ * method and the two fields this file uses, so the cast stays checked against a
+ * shape instead of becoming `any`.
+ */
+interface QueryEventSource {
+    $on(event: 'query', listener: (event: QueryEvent) => void): void;
+}
+
+/**
+ * One node of an `EXPLAIN (ANALYZE, FORMAT JSON)` plan tree.
+ *
+ * Every field but the node type is optional because PostgreSQL emits each per
+ * node kind: `Index Name` only on a node that reads an index, and the `Actual …`
+ * counters only under `ANALYZE` — which is what makes their PRESENCE evidence
+ * that the node ran. `Plans` is the child list and is absent on a leaf.
+ */
+interface PlanNode {
+    'Node Type': string;
+    'Index Name'?: string;
+    'Actual Rows'?: number;
+    'Actual Loops'?: number;
+    Plans?: PlanNode[];
+}
+
+/**
+ * The single row `EXPLAIN (… FORMAT JSON)` returns. `pg` parses a `json` column
+ * itself, so `QUERY PLAN` arrives as the one-element array PostgreSQL documents
+ * rather than as text needing a second `JSON.parse`.
+ */
+interface ExplainedStatementRow {
+    'QUERY PLAN': { Plan: PlanNode }[];
+}
+
 /**
  * The naming rule for the disposable database, in one place.
  *
@@ -123,19 +207,30 @@ const icuDatabaseName = (): string => `${ambientDatabaseName()}${ICU_DATABASE_SU
 // rather than from anything in this module's scope. `new PrismaClient()` does
 // not connect, so constructing it here is safe even though the database is
 // created later in `beforeAll`.
+//
+// `log: [{emit: 'event', …}]` is what makes the index evidence at the bottom of
+// this file possible: it hands a subscriber the exact SQL and the exact bound
+// parameters the service issued, so the plan asserted there is the plan of the
+// service's OWN statement rather than of one this test rewrote. `emit: 'event'`
+// and not `'stdout'`, so nothing is printed during an ordinary run.
 jest.mock('../../prisma/client', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { PrismaClient } = require('../../generated/prisma');
     const url = new URL(process.env.DATABASE_URL as string);
     url.pathname = `${url.pathname}_collation_icu`;
 
-    return { prisma: new PrismaClient({ datasourceUrl: url.toString() }) };
+    return {
+        prisma: new PrismaClient({
+            datasourceUrl: url.toString(),
+            log: [{ emit: 'event', level: 'query' }],
+        }),
+    };
 });
 
 import { prisma } from '../../prisma/client';
-import { makeCatalogFood } from '../../__tests__/setup/factories';
-import { CatalogFoodRow, CatalogMappingError, mapCatalogFood } from '../catalog.mapper';
-import { getStatus, getSuggestions, searchPublishedFoods } from '../catalog.service';
+import { makeCatalogFood } from '../setup/factories';
+import { CatalogFoodRow, CatalogMappingError, mapCatalogFood } from '../../services/catalog.mapper';
+import { getStatus, getSuggestions, searchPublishedFoods } from '../../services/catalog.service';
 
 const BACKEND_ROOT = path.resolve(__dirname, '..', '..', '..');
 const MIGRATION_SQL = ['20260706000000_init', '20260908000000_meal_planning'].map((migration) =>
@@ -331,12 +426,36 @@ describe('catalog read ordering across databases', () => {
     // test that proves the five still answer coherently through it, rather than
     // shipping a transaction no automated test ever enters.
     describe('getStatus', () => {
+        /**
+         * The one test in this file that WRITES to the shared seed, and why it
+         * puts it back.
+         *
+         * A status report is a report about global state — a release pointer and
+         * four counts — so proving it needs a quarantined food and a succeeded
+         * `release_load` run to exist. Both are exactly the rows every other
+         * assertion in this file counts: the two collation orders select every
+         * published food, and `searchPublishedFoods('beans').total` is five
+         * because five `beans` rows are published. Leaving the quarantine in
+         * place would make those assertions depend on this test running after
+         * them, which is the coupling this `finally` removes: the fixture state
+         * this test found is the fixture state it leaves, so the suite has no
+         * declaration order it relies on.
+         *
+         * `finally` rather than `afterEach`: the restore is part of this test's
+         * own contract, and a failed expectation must not also leave the
+         * database altered for whatever runs next.
+         */
         it('reports the active release and each publication count from one snapshot', async () => {
+            const quarantinedSourceKey = 'usda:9000001';
+
             await prisma.catalog_foods.update({
-                where: { source_key: 'usda:9000001' },
+                where: { source_key: quarantinedSourceKey },
                 data: { publication_status: 'quarantined' },
             });
-            await prisma.catalog_import_runs.create({
+            // The id is captured from the create rather than matched back by
+            // `manifest_version`, so the delete below can only remove the row
+            // this test inserted.
+            const releaseRun = await prisma.catalog_import_runs.create({
                 data: {
                     kind: 'release_load',
                     manifest_version: 'v-under-test',
@@ -346,14 +465,22 @@ describe('catalog read ordering across databases', () => {
                 },
             });
 
-            const status = await getStatus();
+            try {
+                const status = await getStatus();
 
-            expect(status.catalogRelease).toBe('v-under-test');
-            expect(status.publishedCount).toBe(COLLATION_SENSITIVE_NAMES.length - 1);
-            expect(status.quarantinedCount).toBe(1);
-            expect(status.rejectedCount).toBe(0);
-            expect(status.recipeCount).toBe(0);
-            expect(status.lastLoadedAt).toBe('2026-09-01T10:05:00.000Z');
+                expect(status.catalogRelease).toBe('v-under-test');
+                expect(status.publishedCount).toBe(COLLATION_SENSITIVE_NAMES.length - 1);
+                expect(status.quarantinedCount).toBe(1);
+                expect(status.rejectedCount).toBe(0);
+                expect(status.recipeCount).toBe(0);
+                expect(status.lastLoadedAt).toBe('2026-09-01T10:05:00.000Z');
+            } finally {
+                await prisma.catalog_foods.update({
+                    where: { source_key: quarantinedSourceKey },
+                    data: { publication_status: 'published' },
+                });
+                await prisma.catalog_import_runs.delete({ where: { id: releaseRun.id } });
+            }
         });
     });
 
@@ -437,13 +564,28 @@ describe('catalog read ordering across databases', () => {
 /* ---------------------------------------------------------------------------
  * The alias-prefix index, proven usable by the predicate it exists for.
  *
- * DECLARED LAST, AND THAT IS LOAD-BEARING. Jest runs a describe-scoped
- * `beforeAll` immediately before that describe's first test, in declaration
- * order, and every assertion above depends on exact global state: five published
- * foods, `searchPublishedFoods('beans').total === 5`, `getSuggestions` returning
- * exactly those five names, and `getStatus` counting four published and one
- * quarantined. The food and aliases seeded below would break all three if they
- * existed earlier, so they are created here and nothing above can see them.
+ * DECLARATION ORDER IS NOT LOAD-BEARING. Every assertion above is made against
+ * exactly five published foods: `defaultCollationOrder`/`pinnedCollationOrder`
+ * select EVERY published row, so a sixth published food appears in the expected
+ * order while being absent from a `beans` search result, and `getStatus` counts
+ * four published beside one quarantined. The probe food seeded below is
+ * published, so while it exists it contradicts both. So this describe seeds it
+ * in its own `beforeAll` and REMOVES it in its own `afterAll`, and `getStatus`
+ * restores the one row it quarantines: each describe leaves the database exactly
+ * as it found it, so all four pass in any order and a reordering or a scheduling
+ * change cannot break an unrelated test.
+ *
+ * The corpus still has to be invisible to the assertions above WHILE it exists,
+ * because one shared ICU database serves the whole file and a describe-scoped
+ * hook only bounds time, not visibility. Three properties give that, and all
+ * three are why the alias text below looks the way it does:
+ *
+ *   * the alias stem shares no prefix with `beans`, so no alias can reach a
+ *     `beans` result through the prefix fallback;
+ *   * the probe food is not a common dislike, so it cannot appear in
+ *     `getSuggestions`; and
+ *   * its own `display_name` and `canonical_name` do not match that prefix
+ *     either, so it cannot reach a `beans` result through the name branch.
  * ------------------------------------------------------------------------- */
 describe('the alias-prefix index the search fallback depends on', () => {
     const INDEX_NAME = 'idx_catalog_food_aliases_lower_alias';
@@ -482,50 +624,154 @@ describe('the alias-prefix index the search fallback depends on', () => {
 
     let foodId = '';
 
-    /** The `pg_stat_user_indexes` counter for this index, on this database. */
-    const readIndexScanCount = async (): Promise<number> => {
-        // Statistics accumulate in the backend that did the work and are flushed
-        // at transaction end, at most once a second. `pg_stat_force_next_flush`
-        // lifts that interval for the calling backend, and
-        // `pg_stat_clear_snapshot` drops the per-transaction cached view so the
-        // read that follows sees what was just flushed. Both return `void`,
-        // which `$queryRaw` cannot deserialize, hence `$executeRawUnsafe` —
-        // neither statement interpolates anything.
-        await prisma.$executeRawUnsafe('SELECT pg_stat_force_next_flush()');
-        await prisma.$executeRawUnsafe('SELECT pg_stat_clear_snapshot()');
+    /**
+     * The node types that answer a predicate FROM a btree index.
+     *
+     * A set rather than one name, because which of the three the planner picks
+     * is a costing decision that carries no meaning for this proof: a bitmap
+     * scan is what it chooses when the matching rows are scattered, an index-only
+     * scan when the projection is covered. Pinning a single shape would turn a
+     * legitimate re-costing into a failure — the plan observed here is currently
+     * `Bitmap Index Scan`, and a change to `Index Scan` would be no regression.
+     * The set is still asserted rather than assumed, because these three are the
+     * node types that read a btree BY KEY: a node that merely named this index
+     * while answering some other way would not be the evidence this test claims.
+     */
+    const INDEX_SCAN_NODE_TYPES: readonly string[] = ['Index Scan', 'Index Only Scan', 'Bitmap Index Scan'];
 
-        const rows = await prisma.$queryRaw<{ idx_scan: string }[]>`
-            SELECT COALESCE(idx_scan, 0)::text AS idx_scan
-            FROM pg_stat_user_indexes
-            WHERE schemaname = 'public' AND indexrelname = ${INDEX_NAME}
-        `;
-        if (rows.length !== 1) {
-            throw new Error(`${INDEX_NAME} is absent from pg_stat_user_indexes; the migration did not create it.`);
+    /**
+     * What distinguishes the page statement from the count statement.
+     *
+     * `searchPublishedFoods` issues both over the same `contributions` set, so
+     * both read `catalog_food_aliases` and both bind the prefix pattern; only the
+     * page carries the `LIMIT`/`OFFSET` window `rowWindowFor` produced. The page
+     * is the statement that RETURNED the row the assertion below names, so it is
+     * the statement whose plan is the evidence — and naming it precisely is what
+     * lets the selection insist on exactly ONE match instead of silently
+     * explaining whichever statement came first. Remove this condition and the
+     * selection matches two statements and fails, which is the intended
+     * behaviour of an ambiguous predicate rather than a defect in it.
+     */
+    const PAGE_WINDOW = /LIMIT \$\d+ OFFSET \$\d+/;
+
+    /**
+     * The values one logged statement was executed with.
+     *
+     * Parsed rather than string-matched because the same array is what the
+     * EXPLAIN below has to bind: a plan produced for different values is not
+     * evidence about this call, since a LIKE prefix becomes an index range scan
+     * only when the pattern reaches the planner as a constant. Parameters that
+     * are not a JSON array would be a change in Prisma's logging rather than a
+     * failure of the service, so that is reported as itself.
+     */
+    const boundValues = (statement: QueryEvent): unknown[] => {
+        const parsed: unknown = JSON.parse(statement.params);
+        if (!Array.isArray(parsed)) {
+            throw new Error(
+                `Prisma logged parameters that are not a JSON array (${statement.params}), so the captured ` +
+                    'statement cannot be re-bound for EXPLAIN.',
+            );
         }
-        return Number(rows[0].idx_scan);
+        return parsed;
     };
 
     /**
-     * The counter once the work that produced it is visible.
+     * The one statement of the captured call whose plan is the evidence.
      *
-     * The search runs on a pooled connection, and the flush above only forces
-     * the connection it runs on, so the first read can legitimately precede the
-     * flush of the backend that served the search. Polling makes the assertion
-     * deterministic instead of racing that: it returns as soon as the counter
-     * moves and only spends time when it has not.
+     * Exactly one match is required, and that is the guard: a predicate that
+     * matched two statements would explain an arbitrary one of them, and a
+     * predicate that matched none — because the alias branch was removed, or the
+     * pattern stopped being a parameter — must say so rather than leave the test
+     * asserting about nothing. The failure prints every statement the call
+     * issued, which is what an engineer needs to see to tell those cases apart.
      */
-    const indexScanCountAbove = async (baseline: number): Promise<number> => {
-        const attempts = 40;
-        const pauseMs = 250;
+    const aliasPrefixPageStatement = (statements: readonly QueryEvent[]): QueryEvent => {
+        const matches = statements.filter(
+            (statement) =>
+                statement.query.includes('catalog_food_aliases') &&
+                PAGE_WINDOW.test(statement.query) &&
+                boundValues(statement).includes(PREFIX_PATTERN),
+        );
 
-        for (let attempt = 0; attempt < attempts; attempt += 1) {
-            const observed = await readIndexScanCount();
-            if (observed > baseline) {
-                return observed;
-            }
-            await new Promise((resolve) => setTimeout(resolve, pauseMs));
+        if (matches.length !== 1) {
+            const issued = statements.map((statement) => statement.query.replace(/\s+/g, ' ').trim()).join('\n  ');
+            throw new Error(
+                `Expected exactly one statement of this searchPublishedFoods call to read ` +
+                    `catalog_food_aliases, bind the prefix pattern "${PREFIX_PATTERN}" and carry the page ` +
+                    `window, but ${matches.length} did. The statements issued were:\n  ${issued}`,
+            );
         }
-        return readIndexScanCount();
+
+        return matches[0];
+    };
+
+    /**
+     * The plan of one captured statement, re-planned and EXECUTED with that
+     * statement's own parameter values.
+     *
+     * On a dedicated `pg` connection rather than the Prisma pool, for two
+     * reasons: `EXPLAIN (ANALYZE)` runs the statement, so issuing it through the
+     * client whose log is being read would append to that log; and a plain `pg`
+     * client binds the values back exactly as Prisma bound them, with no
+     * re-serialisation of its own. The connection is closed in `finally`, so a
+     * failed assertion cannot leave it open against a database `afterAll` is
+     * about to drop.
+     *
+     * Re-planning is intended and is what makes this deterministic: the same
+     * SQL, the same values and the same table statistics put the planner in
+     * exactly the position it was in when the service ran — the plan is still
+     * its own cost-based choice — and this time the chosen plan is returned
+     * instead of discarded.
+     */
+    const planOf = async (statement: QueryEvent): Promise<PlanNode> => {
+        const client = new pg.Client({ connectionString: databaseUrlFor(ambientUrl(), icuDatabaseName()) });
+        await client.connect();
+        try {
+            const explained = await client.query<ExplainedStatementRow>(
+                `EXPLAIN (ANALYZE, FORMAT JSON) ${statement.query}`,
+                boundValues(statement),
+            );
+            const [row] = explained.rows;
+            const plan = row?.['QUERY PLAN'][0]?.Plan;
+            if (!plan) {
+                throw new Error(
+                    `EXPLAIN (ANALYZE, FORMAT JSON) returned no plan tree for the captured statement: ` +
+                        `${statement.query}`,
+                );
+            }
+            return plan;
+        } finally {
+            await client.end();
+        }
+    };
+
+    /** Every node of a plan tree that names an index, depth first. */
+    const indexNodesOf = (node: PlanNode): PlanNode[] => [
+        ...(node['Index Name'] === undefined ? [] : [node]),
+        ...(node.Plans ?? []).flatMap(indexNodesOf),
+    ];
+
+    /**
+     * The node that read `indexName`, or a failure naming what the plan read
+     * instead.
+     *
+     * Throwing rather than handing `undefined` back for the test to assert on:
+     * the message that makes a regression diagnosable is the list of indexes the
+     * planner DID choose, and that list only exists here.
+     */
+    const indexNodeFor = (plan: PlanNode, indexName: string): PlanNode => {
+        const indexNodes = indexNodesOf(plan);
+        const match = indexNodes.find((node) => node['Index Name'] === indexName);
+
+        if (!match) {
+            const chosen = indexNodes.map((node) => `${node['Node Type']} using ${node['Index Name']}`).join(', ');
+            throw new Error(
+                `The plan of searchPublishedFoods' own page statement reads no index named ${indexName}. ` +
+                    `Index nodes in that plan: ${chosen === '' ? 'none' : chosen}.`,
+            );
+        }
+
+        return match;
     };
 
     /**
@@ -534,9 +780,10 @@ describe('the alias-prefix index the search fallback depends on', () => {
      * The pattern is a literal rather than a bound parameter on purpose: these
      * two tests are about the OPERATOR CLASS, and a literal removes the second
      * condition an index scan needs (the pattern reaching the planner as a
-     * constant) as a variable. That condition is what the `idx_scan` test
-     * covers, through the real caller. `enable_seqscan = off` is set with `SET
-     * LOCAL` inside the transaction, so it cannot leak to another test.
+     * constant) as a variable. That condition is what the captured-statement
+     * test below covers, through the real caller. `enable_seqscan = off` is set
+     * with `SET LOCAL` inside the transaction, so it cannot leak to another
+     * test.
      */
     const explain = async (predicate: string, disableSeqScan: boolean): Promise<string> =>
         prisma.$transaction(async (tx) => {
@@ -579,6 +826,35 @@ describe('the alias-prefix index the search fallback depends on', () => {
         await prisma.$executeRawUnsafe('ANALYZE catalog_food_aliases');
     });
 
+    /**
+     * The corpus removed again, which is what makes this describe's position in
+     * the file irrelevant.
+     *
+     * An empty `foodId` means `beforeAll` threw before the food was created, so
+     * there is nothing to remove: returning early keeps a setup failure reported
+     * as itself instead of being followed by a second, derived error from a
+     * delete that was never going to match a row.
+     *
+     * The aliases are deleted explicitly before the food even though
+     * `catalog_food_aliases.catalog_food_id` is declared `ON DELETE CASCADE`
+     * (`prisma/migrations/20260908000000_meal_planning/migration.sql`), because a
+     * suite's cleanup should not silently depend on a foreign key's action:
+     * whichever way that constraint is later written, this describe still
+     * removes what it created. `catalog_food_portions` — the one default portion
+     * `makeCatalogFood` nests — is left to the cascade, since deleting a food
+     * without its portion is not a state any test may observe.
+     *
+     * Jest runs a describe-scoped `afterAll` BEFORE the file-scoped one, so the
+     * Prisma connection this needs is still open: the file's `afterAll`
+     * `$disconnect()`s and then drops the whole database.
+     */
+    afterAll(async () => {
+        if (!foodId) return;
+
+        await prisma.catalog_food_aliases.deleteMany({ where: { catalog_food_id: foodId } });
+        await prisma.catalog_foods.delete({ where: { id: foodId } });
+    });
+
     it('seeded the corpus the plan assertions are made against', async () => {
         const [counts] = await prisma.$queryRaw<{ total: bigint; matching: bigint }[]>`
             SELECT COUNT(*) AS total,
@@ -589,7 +865,7 @@ describe('the alias-prefix index the search fallback depends on', () => {
 
         expect(Number(counts.total)).toBe(ALIAS_COUNT);
         // 1% of the corpus: selective enough for an index scan to be the cheaper
-        // plan, which is the premise of the idx_scan test.
+        // plan, which is the premise of the captured-statement plan test below.
         expect(Number(counts.matching)).toBe(ALIAS_COUNT / ALIAS_GROUPS);
     });
 
@@ -633,22 +909,48 @@ describe('the alias-prefix index the search fallback depends on', () => {
     });
 
     it('is used by searchPublishedFoods itself, under the planner´s own costing', async () => {
-        const before = await readIndexScanCount();
+        const captured: QueryEvent[] = [];
+        // Prisma exposes no `$off`, so this listener outlives the test; the flag
+        // is what bounds what it may see. Together with the snapshot taken the
+        // moment the call returns, it keeps the selection below looking at the
+        // statements of THIS call only — a statement from the plan query or from
+        // `afterAll` reaching the array would make "exactly one match" a claim
+        // about the wrong call.
+        let capturing = true;
+        (prisma as unknown as QueryEventSource).$on('query', (event) => {
+            if (capturing) {
+                captured.push({ query: event.query, params: event.params });
+            }
+        });
+
         const result = await searchPublishedFoods(PREFIX_QUERY, 1, 25);
-        const after = await indexScanCountAbove(before);
+        const issued = [...captured];
+        capturing = false;
 
         // The service must have answered from the alias prefix branch: this food
         // matches on no name and no `search_text`, only on its aliases.
         expect(result.total).toBe(1);
         expect(result.items.map((item) => item.name)).toEqual([`Fixture Food ${FOOD_SEQUENCE}`]);
 
-        // And the fallback must have READ the index while doing it. This is the
-        // assertion that fails if the pattern goes back to being projected
-        // through the `search` CTE: a value selected out of a materialised CTE
-        // reaches the planner as a Var rather than a constant, the LIKE bounds
-        // cannot be derived from it, and the same call was measured to leave this
-        // counter at zero across a 10,000-alias corpus.
-        expect(after).toBeGreaterThan(before);
+        // And the fallback must have read the index while doing it — established
+        // from the plan of the service's OWN statement, bound to the service's
+        // own parameter values, rather than from a counter. This is the assertion
+        // that fails if the pattern goes back to being projected through the
+        // `search` CTE: a value selected out of a materialised CTE reaches the
+        // planner as a Var rather than a constant, the LIKE bounds cannot be
+        // derived from it, and the alias branch becomes a sequential scan.
+        const indexNode = indexNodeFor(await planOf(aliasPrefixPageStatement(issued)), INDEX_NAME);
+
+        expect(INDEX_SCAN_NODE_TYPES).toContain(indexNode['Node Type']);
+        // The two ANALYZE-only counters, asserted by PRESENCE and by loop count:
+        // `EXPLAIN` without `ANALYZE` emits neither, and a node that was planned
+        // but never executed reports zero loops. So this is what separates "the
+        // planner chose this index" from "this index was actually read". Rows and
+        // loops, never a duration — a duration would put host load back into the
+        // evidence, which is the property this test exists to have.
+        expect(typeof indexNode['Actual Rows']).toBe('number');
+        expect(typeof indexNode['Actual Loops']).toBe('number');
+        expect(indexNode['Actual Loops']).toBeGreaterThanOrEqual(1);
     });
 
     it('still serves equality on lower(alias), which is why no second index is added', async () => {

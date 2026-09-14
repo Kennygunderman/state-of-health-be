@@ -10,16 +10,24 @@
 // routes ask — may this caller see a RETIRED recipe version? — belongs to
 // `recipe.service.getRecipeVersionForUser`, whose reference checks are scoped
 // by `user_id`.
+//
+// EVERY HANDLER HERE IS `getUserId(req)` → A PURE PARSER → ONE SERVICE CALL
+// (AAP §0.7.2, Rule backend-architecture §4). Each request decision these four
+// routes make is owned by a `*.logic.ts` function this file calls —
+// `parseCatalogSearchQuery` and `parseCatalogSuggestionsQuery` in
+// `catalog.logic.ts`, `parseRecipeVersionPath` in `recipe.logic.ts`, and
+// `parsePagination` for the shared page block — so no allowed-value check or
+// coercion is written inline below, and no service is handed a raw request
+// value or asked to answer with a 400-shaped verdict. That is what keeps the
+// validation rules unit-testable without HTTP and the services HTTP-agnostic
+// (§8): they return a DTO or `null`, and the mapping to 400/404/503 happens
+// only in this file.
 
 import { Request, Response } from 'express';
-import { parseCatalogSearchQuery } from '../services/catalog.logic';
-import {
-    CatalogSuggestionKind,
-    getStatus,
-    getSuggestions,
-    searchPublishedFoods,
-} from '../services/catalog.service';
+import { parseCatalogSearchQuery, parseCatalogSuggestionsQuery } from '../services/catalog.logic';
+import { getStatus, getSuggestions, searchPublishedFoods } from '../services/catalog.service';
 import { MealPlanningDisabledError } from '../services/mealPlanning.errors';
+import { parseRecipeVersionPath } from '../services/recipe.logic';
 import { getRecipeVersionForUser } from '../services/recipe.service';
 import { CatalogSearchResponse } from '../types/catalog';
 import { isMealPlanningEnabled } from '../utils/featureFlags';
@@ -32,13 +40,7 @@ import {
 } from '../utils/pagination';
 
 const FEATURE_DISABLED = 'feature_disabled';
-const INVALID_REQUEST = 'invalid_request';
 const RECIPE_NOT_FOUND = 'Recipe not found';
-
-const SUGGESTION_KIND: CatalogSuggestionKind = 'dislike';
-const SUGGESTION_KIND_FIELD = 'kind';
-const SUGGESTIONS_DEFAULT_LIMIT = 12;
-const SUGGESTIONS_MAX_LIMIT = 30;
 
 const handleCatalogError = (res: Response, error: unknown, fallback: string) => {
     if (error instanceof MealPlanningDisabledError) {
@@ -73,18 +75,11 @@ export const searchCatalogFoodsController = async (req: Request, res: Response) 
 export const getCatalogSuggestionsController = async (req: Request, res: Response) => {
     try {
         getUserId(req);
-        const requestedKind = Array.isArray(req.query.kind) ? req.query.kind[0] : req.query.kind;
-        if (requestedKind !== SUGGESTION_KIND) {
-            return res.status(400).json({
-                error: INVALID_REQUEST,
-                details: [{ field: SUGGESTION_KIND_FIELD, code: 'unsupported' }],
-            });
+        const parsed = parseCatalogSuggestionsQuery(req.query);
+        if (parsed.kind !== 'ok') {
+            return res.status(400).json({ error: parsed.code, details: parsed.details });
         }
-        const { limit } = parsePagination(req.query, {
-            defaultLimit: SUGGESTIONS_DEFAULT_LIMIT,
-            maxLimit: SUGGESTIONS_MAX_LIMIT,
-        });
-        const suggestions = await getSuggestions(SUGGESTION_KIND, limit);
+        const suggestions = await getSuggestions(parsed.suggestionKind, parsed.limit);
         return res.json(suggestions);
     } catch (error) {
         return handleCatalogError(res, error, 'Failed to get catalog suggestions');
@@ -107,14 +102,15 @@ export const getRecipeVersionController = async (req: Request, res: Response) =>
     }
     try {
         const userId = getUserId(req);
-        const result = await getRecipeVersionForUser(userId, req.params.recipeVersionId);
-        if (result.kind !== 'ok') {
-            return res.status(400).json({ error: result.code, details: result.details });
+        const parsed = parseRecipeVersionPath(req.params);
+        if (parsed.kind !== 'ok') {
+            return res.status(400).json({ error: parsed.code, details: parsed.details });
         }
-        if (result.version === null) {
+        const version = await getRecipeVersionForUser(userId, parsed.recipeVersionId);
+        if (version === null) {
             return res.status(404).json({ error: RECIPE_NOT_FOUND });
         }
-        return res.json(result.version);
+        return res.json(version);
     } catch (error) {
         return handleCatalogError(res, error, 'Failed to get recipe');
     }

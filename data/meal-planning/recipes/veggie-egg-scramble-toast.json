@@ -15,7 +15,7 @@
   "prepMinutes": 5,
   "cookMinutes": 10,
   "mealSlots": ["breakfast"],
-  "dietTags": ["pescatarian", "pescatarian_ok", "vegetarian"],
+  "dietTags": ["pescatarian", "vegetarian"],
   "allergenTags": ["eggs", "wheat"],
   "allergenStatus": "known",
   "budgetTier": 1,

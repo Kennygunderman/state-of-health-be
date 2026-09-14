@@ -51,10 +51,14 @@
 //  * NO HTTP. No `res`, no status codes: the two typed errors it raises —
 //    `PlanNotFoundError` and (through the logic layer) `PlanNotActiveError` —
 //    are mapped once, at the controller (§8).
-//  * NO PLAN CONTENT. Planned meals arrive as `PlannedMealForGroceries`, which
-//    is what lets `mealPlan.service.ts` and `swap.service.ts` reuse every
-//    building block below without this file knowing how a week is searched or
-//    how a swap candidate is chosen.
+//  * NO PLAN DECISIONS. This file reads a plan's meals — one owner-scoped
+//    projection, `loadPlannedMealsForGroceries`, because it is the INPUT the
+//    rules below consume and a caller supplying its own could omit an optional
+//    ingredient or a food's state and silently shop for a different week — but
+//    it knows nothing about how a week is searched or how a swap candidate is
+//    chosen. `PlannedMealForGroceries` is the whole of what it understands
+//    about a plan, which is what lets `mealPlan.service.ts` and
+//    `swap.service.ts` reuse every building block below.
 //  * NO REVISION WRITE. Neither `meal_plans.revision` nor
 //    `meal_plan_meals.revision` is touched anywhere in this module.
 
@@ -383,6 +387,72 @@ const toGroceryItemRow = (
 /* ---------------------------------------------------------------------------
  * Drafts — a week of planned meals as shopping lines
  * ------------------------------------------------------------------------- */
+
+/**
+ * A plan's meals as the grocery rules consume them.
+ *
+ * The projection `grocery.logic.ts::PlannedMealForGroceries` declares and
+ * nothing more: the yield the ingredient gram weights are stated per, the slot's
+ * portion multiplier, and each ingredient's `(catalog_food_id, food_state,
+ * gram_weight)`. `food_state` is joined from `catalog_foods` because it is the
+ * FOOD's property and half of the aggregation identity — raw, dry and cooked
+ * amounts of one food must never merge into one shopping line — while
+ * `gram_weight` is the recipe's.
+ *
+ * OPTIONAL INGREDIENTS ARE INCLUDED. They are part of the recipe's nutrition
+ * (`recipe.logic.ts` sums every ingredient) and of its allergen derivation, so
+ * omitting them from the list would hand the user a week whose shopping does not
+ * make the meals the plan promises.
+ *
+ * THE ONE PROJECTION OF A PLAN'S MEALS INTO SHOPPING INPUT, and it lives beside
+ * the rules that consume it: {@link buildPlanGroceryDrafts} and
+ * {@link rebuildPlanGroceries} are this module's, and both of their callers —
+ * the plan service when it publishes or regenerates a week, and
+ * `swap.service.ts` when it reconciles the list after a commit — need the
+ * meals AFTER their own write. Reading them here is what keeps the list one
+ * feature: a caller supplying its own projection could omit optional
+ * ingredients or a food's state and silently shop for a different week.
+ *
+ * Ordered by day then slot so the aggregation walks the week in plan order — the
+ * sum is float addition, which is not associative, and a stable order is what
+ * keeps two reads of one plan producing the same grams.
+ */
+export const loadPlannedMealsForGroceries = async (
+    db: Prisma.TransactionClient,
+    userId: string,
+    planId: string,
+): Promise<PlannedMealForGroceries[]> => {
+    const meals = await db.meal_plan_meals.findMany({
+        where: { meal_plan_id: planId, user_id: userId },
+        select: {
+            portion_multiplier: true,
+            recipe_versions: {
+                select: {
+                    yield_servings: true,
+                    recipe_ingredients: {
+                        select: {
+                            catalog_food_id: true,
+                            gram_weight: true,
+                            catalog_foods: { select: { food_state: true } },
+                        },
+                        orderBy: [{ sort_order: 'asc' }, { catalog_food_id: 'asc' }],
+                    },
+                },
+            },
+        },
+        orderBy: [{ meal_plan_days: { date: 'asc' } }, { sort_order: 'asc' }, { id: 'asc' }],
+    });
+
+    return meals.map((meal) => ({
+        yield_servings: meal.recipe_versions.yield_servings,
+        portion_multiplier: meal.portion_multiplier,
+        ingredients: meal.recipe_versions.recipe_ingredients.map((ingredient) => ({
+            catalog_food_id: ingredient.catalog_food_id,
+            food_state: ingredient.catalog_foods.food_state,
+            gram_weight: ingredient.gram_weight,
+        })),
+    }));
+};
 
 /**
  * The catalog facts a set of planned meals needs, loaded once.

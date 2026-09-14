@@ -1,5 +1,7 @@
-// The read side of recipes: `GET /api/recipes/:recipeVersionId` and the two
-// internal reads the planner and the swap flow are built on.
+// The read side of recipes: `GET /api/recipes/:recipeVersionId` and the three
+// internal reads the planner and the swap flow are built on — the plannable
+// candidate set, the planning projection behind a set of version ids, and the
+// whole rows the swap's alternatives and preview are rendered from.
 //
 // THIS FILE IS THE SINGLE OWNER OF RECIPE READS, which is not a style
 // preference but a stated boundary: `catalog.service.ts`'s own docblock says so
@@ -53,14 +55,12 @@ import { NutritionProvenance } from '../types/nutrition';
 import { RecipeVersionResponse } from '../types/recipe';
 import { isCatalogAllergenStatus, isCatalogNutritionProvenance } from './catalog.logic';
 import { PlanRecipeCandidate } from './mealPlan.logic';
-import { mapRecipeVersion } from './recipe.mapper';
+import { RecipeVersionRow, mapRecipeVersion } from './recipe.mapper';
 import {
     PlanningRecipeVersion,
     RecipeAllergenStatus,
     RecipeIngredientIdentity,
-    RecipeVersionPathRefusal,
     RecipeVersionStatus,
-    parseRecipeVersionPath,
 } from './recipe.logic';
 
 /* ---------------------------------------------------------------------------
@@ -234,31 +234,20 @@ const isVersionReferencedByUser = async (
     return diaryEntry !== null;
 };
 
-/** Either the version this caller may see (or `null`), or the path parser's refusal verbatim. */
-export type RecipeVersionResult =
-    | { kind: 'ok'; version: RecipeVersionResponse | null }
-    | RecipeVersionPathRefusal;
-
 /**
  * `GET /api/recipes/:recipeVersionId` — one recipe version, if this caller may
  * see it.
  *
- * THE PATH IS PARSED BEFORE ANY I/O, as the first statement, so no `await` can
- * precede the judgement (§0.5.2: "server-side validation applied before any
- * Prisma or planning work"). This is the route-facing parse boundary — the
- * arrangement `mealPlan.service.ts`'s entry points and
- * `targets.service.ts::saveTargets` already use — and it separates the two
- * answers this route owes, which a Prisma failure would otherwise collapse into
- * one 500:
- *
- *  * a value that could never denote a version — not a v4 UUID — is the
- *    parser's refusal, RETURNED unchanged for the controller to map to
- *    `400 invalid_request` naming `recipeVersionId` (§8: a field-level failure
- *    is data the client renders, not a throw). Before this, such a segment went
- *    straight into a PostgreSQL `uuid` predicate.
- *  * `version: null` keeps its existing meaning — no such version, a retired
- *    one nobody here references, or one referenced only by someone else — which
- *    is the route's 404, and the three stay indistinguishable on purpose (§1.5).
+ * `recipeVersionId` ARRIVES ALREADY VALIDATED. Its only route-facing caller,
+ * `catalog.controller.ts::getRecipeVersionController`, runs
+ * `recipe.logic.ts::parseRecipeVersionPath` over `req.params` before it calls
+ * this function and answers a refusal itself with `400 invalid_request` naming
+ * `recipeVersionId` (§0.5.2: "server-side validation applied before any Prisma
+ * or planning work"; §0.7.2: `getUserId` → parse → one service call). So a
+ * value that could never denote a version no longer reaches the `uuid`
+ * predicate below — it never reaches this function at all — and this signature
+ * carries no HTTP-shaped verdict: a request judgement belongs to the pure
+ * parser at the boundary, not to a service (Rule backend-architecture §4, §8).
  *
  * The rule, exactly as AAP §0.5.2 states it: a version is visible when its
  * `status` is `current`, OR when the caller owns a `meal_plan_meals` row whose
@@ -296,40 +285,36 @@ export const getRecipeVersionForUser = async (
     userId: string,
     recipeVersionId: string,
     db: Prisma.TransactionClient = prisma,
-): Promise<RecipeVersionResult> => {
-    const parsed = parseRecipeVersionPath({ recipeVersionId });
-
-    if (parsed.kind !== 'ok') {
-        return parsed;
-    }
-
-    const version = await loadVersionWithIngredients(parsed.recipeVersionId, db);
+): Promise<RecipeVersionResponse | null> => {
+    const version = await loadVersionWithIngredients(recipeVersionId, db);
 
     if (version === null) {
-        return { kind: 'ok', version: null };
+        return null;
     }
 
     if (version.status !== CURRENT_VERSION_STATUS) {
-        const referenced = await isVersionReferencedByUser(userId, parsed.recipeVersionId, db);
+        const referenced = await isVersionReferencedByUser(userId, recipeVersionId, db);
 
         if (!referenced) {
-            return { kind: 'ok', version: null };
+            return null;
         }
     }
 
-    return { kind: 'ok', version: mapRecipeVersion(version, version.recipe_ingredients) };
+    return mapRecipeVersion(version, version.recipe_ingredients);
 };
 
 /**
  * The same read WITHOUT the visibility rule, for a caller that has already
  * established the user's right to see this version.
  *
- * NOT A ROUTE-FACING ENTRY POINT, which is why it parses nothing: its `id` is
- * the swap preview's INTERNAL read of a candidate that came from the plannable
- * set — `swap.logic.ts::selectSwapCandidates` run against the user's own plan —
- * so the value was produced by this server from a stored column, never by a
- * client. The path parse belongs at the boundary a client actually reaches,
- * which is {@link getRecipeVersionForUser}.
+ * NOT A ROUTE-FACING ENTRY POINT, and no id reaching it was ever typed by a
+ * client: its `id` is the swap preview's INTERNAL read of a candidate that came
+ * from the plannable set — `swap.logic.ts::selectSwapCandidates` run against the
+ * user's own plan — so the value was produced by this server from a stored
+ * column. A client-supplied path segment is judged at the boundary it actually
+ * reaches, `catalog.controller.ts::getRecipeVersionController` ahead of
+ * {@link getRecipeVersionForUser}, which is why neither read here parses
+ * anything.
  *
  * Exactly one kind of caller qualifies, and the swap preview is it: the
  * candidate it is previewing came from `swap.logic.ts::selectSwapCandidates`
@@ -635,6 +620,58 @@ export const getPlanningRecipeVersionsByIds = async (
     });
 
     return new Map(versions.map((version) => [version.id, toPlanningRecipeVersion(version)]));
+};
+
+/**
+ * The whole `recipe_versions` rows behind a set of version ids, keyed by id.
+ *
+ * THE FOURTH READ PATH THROUGH THIS FILE, added rather than duplicated: the
+ * swap's alternatives list renders each candidate through
+ * `recipe.mapper.ts::mapSwapAlternative`, which takes a full
+ * {@link RecipeVersionRow}, and `swap.service.ts` previously issued that query
+ * itself. Two modules querying `recipe_versions` is how two subtly different
+ * projections come about, and this file's header states the guarantee that
+ * prevents it — the planner, the swap engine and the planned-log service call in
+ * rather than reading the table themselves.
+ *
+ * READ WHOLE rather than projected, deliberately and unlike the two planning
+ * reads above: `RecipeVersionRow` is twenty-four of this table's columns, so an
+ * explicit select would restate the table with one more way to fall behind it —
+ * the same judgement `VERSION_DETAIL_SELECT`'s neighbours document. The row is
+ * the mapper's input contract, so `select: undefined` is what keeps the two in
+ * step.
+ *
+ * BOUNDED BY THE CALLER: the swap asks for at most eight ids, because its list
+ * is truncated before this runs. It is not a search — there is no predicate
+ * beyond the ids — so it stays cheap by construction.
+ *
+ * NOT filtered by `status`, for the reason {@link getPlanningRecipeVersionsByIds}
+ * gives: a version a catalog refresh has since retired still has to render, or a
+ * user's own week would show a blank card. What a retired version MEANS is
+ * eligibility's decision, never this read's.
+ *
+ * NO `userId` PARAMETER, by the §5.1 exception this file's header states:
+ * `recipe_versions` carries no owner column, so there is nothing to scope to.
+ * The ids reach here from a selection made against the caller's own plan, so the
+ * function cannot be turned into a probe by a caller that follows the rule.
+ *
+ * An id with no row is simply absent from the Map, and the caller decides what
+ * that means — `swap.service.ts` treats it as a data fault rather than silently
+ * shortening its list.
+ */
+export const getRecipeVersionRowsByIds = async (
+    recipeVersionIds: readonly string[],
+    db: Prisma.TransactionClient = prisma,
+): Promise<Map<string, RecipeVersionRow>> => {
+    if (recipeVersionIds.length === 0) {
+        return new Map();
+    }
+
+    const versions = await db.recipe_versions.findMany({
+        where: { id: { in: [...new Set(recipeVersionIds)] } },
+    });
+
+    return new Map(versions.map((version) => [version.id, version]));
 };
 
 /**

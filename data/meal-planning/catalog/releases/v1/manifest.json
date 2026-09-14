@@ -8,9 +8,9 @@
     {
       "path": "foods.jsonl",
       "name": "foods.jsonl",
-      "sha256": "81a39f9ebb7f46d6c72d5c1f40ae4606c9fc19837445b66dc8297fd32183f292",
+      "sha256": "f0d733c139f647d94ebf6912ee8862599cf2842c90774b1e38ac2cfdae8180e1",
       "row_count": 11046,
-      "bytes": 13410456
+      "bytes": 13389696
     },
     {
       "path": "aliases.jsonl",
@@ -47,6 +47,7 @@
     "aliases": 15939,
     "portions": 31899,
     "components": 0,
+    "published_ingredient_derived": 0,
     "validation_records": 11046
   },
   "source_datasets": [

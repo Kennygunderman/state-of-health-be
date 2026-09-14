@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "recipeCount": 42,
-  "crossListedRecipeCount": 9,
+  "crossListedRecipeCount": 10,
   "dimensions": {
     "diets": [
       "none",
@@ -63,7 +63,7 @@
         "rule": "prepMinutes + cookMinutes <= timeTier"
       }
     ],
-    "dietTagMatching": "The diet code is matched against the recipe's derived diet tags by exact normalised tag, with no hierarchy re-derivation at count time: containment is already closed into the tags themselves (vegan implies vegetarian implies pescatarian). The catalog's seafood-admissibility tag 'pescatarian_ok' is a distinct tag and is not matched by the 'pescatarian' diet code, so a recipe whose only pescatarian-related tag is 'pescatarian_ok' counts under 'none' alone.",
+    "dietTagMatching": "The diet code is matched against the recipe's derived diet tags by exact normalised tag, with no hierarchy re-derivation at count time: containment is already closed into the tags themselves (vegan implies vegetarian implies pescatarian). Seafood admissibility is carried by that same 'pescatarian' tag and by no other spelling. An earlier revision of the catalog release spelled it 'pescatarian_ok', which the 'pescatarian' diet code does not match, so every fish and seafood recipe - having no vegetarian tag for the implication closure to rescue - counted under 'none' alone and the furtherPescatarian stratum of every main slot read zero. The release, the manifest vocabulary it is imported under and the authored recipe dietTags have since been aligned to 'pescatarian', so a seafood recipe now counts for the pescatarian diet as intended.",
     "recipeTagsAreDerived": "Each recipe's diet and allergen tags were verified equal to the values derived from its ingredient snapshots, so counting from the declared arrays and counting from the derivation give the same answer.",
     "dislikesExcluded": "Dislikes are per-user and remove recipes at request time, so they are not an axis of this table; dislike-driven shortfalls surface in the planner's catalog_coverage check.",
     "timeTiersCumulative": "Tiers are cumulative ceilings, so counts are monotonically non-decreasing across 15, 30, 45 and 60 for every diet, allergen and slot triple."
@@ -89,16 +89,16 @@
         },
         "furtherPescatarian": {
           "floor": 2,
-          "count": 0
+          "count": 2
         },
         "furtherOmnivore": {
           "floor": 3,
-          "count": 5
+          "count": 3
         }
       }
     },
     "lunch": {
-      "dedicatedToSlot": 7,
+      "dedicatedToSlot": 6,
       "totalEligible": 16,
       "composition": {
         "vegan": {
@@ -111,21 +111,21 @@
         },
         "furtherPescatarian": {
           "floor": 2,
-          "count": 0
+          "count": 3
         },
         "furtherOmnivore": {
           "floor": 3,
-          "count": 7
+          "count": 4
         }
       }
     },
     "dinner": {
       "dedicatedToSlot": 8,
-      "totalEligible": 17,
+      "totalEligible": 18,
       "composition": {
         "vegan": {
           "floor": 4,
-          "count": 7
+          "count": 8
         },
         "furtherVegetarian": {
           "floor": 3,
@@ -133,11 +133,11 @@
         },
         "furtherPescatarian": {
           "floor": 2,
-          "count": 0
+          "count": 3
         },
         "furtherOmnivore": {
           "floor": 3,
-          "count": 7
+          "count": 4
         }
       }
     },
@@ -231,14 +231,14 @@
       "allergen": "none",
       "slot": "dinner",
       "timeTier": 15,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
       "allergen": "none",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -250,908 +250,908 @@
     {
       "diet": "none",
       "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 18
+    },
+    {
+      "diet": "none",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 12
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 13
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 13
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 13
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 15
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "none",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 7
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 8
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 13
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 15
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 15
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 14
+    },
+    {
+      "diet": "none",
+      "allergen": "eggs",
       "slot": "dinner",
       "timeTier": 60,
       "count": 17
     },
     {
       "diet": "none",
-      "allergen": "none",
+      "allergen": "eggs",
       "slot": "snack",
       "timeTier": 15,
       "count": 5
     },
     {
       "diet": "none",
-      "allergen": "none",
+      "allergen": "eggs",
       "slot": "snack",
       "timeTier": 30,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "none",
+      "allergen": "eggs",
       "slot": "snack",
       "timeTier": 45,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "none",
+      "allergen": "eggs",
       "slot": "snack",
       "timeTier": 60,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "peanuts",
       "slot": "breakfast",
       "timeTier": 15,
-      "count": 5
+      "count": 6
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "peanuts",
       "slot": "breakfast",
       "timeTier": 30,
+      "count": 9
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 11
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 15,
       "count": 8
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 14
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 16
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 16
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 15
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 18
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 9
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
       "slot": "breakfast",
       "timeTier": 45,
-      "count": 10
+      "count": 11
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "tree_nuts",
       "slot": "breakfast",
       "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 8
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 14
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 16
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 16
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 30,
       "count": 10
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 15
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 18
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "none",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 9
+    },
+    {
+      "diet": "none",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 11
+    },
+    {
+      "diet": "none",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "none",
+      "allergen": "soy",
       "slot": "lunch",
       "timeTier": 15,
       "count": 7
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "soy",
       "slot": "lunch",
       "timeTier": 30,
       "count": 12
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "soy",
       "slot": "lunch",
       "timeTier": 45,
-      "count": 13
+      "count": 14
     },
     {
       "diet": "none",
-      "allergen": "milk",
+      "allergen": "soy",
       "slot": "lunch",
-      "timeTier": 60,
-      "count": 13
-    },
-    {
-      "diet": "none",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "none",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 9
-    },
-    {
-      "diet": "none",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 13
-    },
-    {
-      "diet": "none",
-      "allergen": "milk",
-      "slot": "dinner",
       "timeTier": 60,
       "count": 14
     },
     {
       "diet": "none",
-      "allergen": "milk",
-      "slot": "snack",
+      "allergen": "soy",
+      "slot": "dinner",
       "timeTier": 15,
-      "count": 3
+      "count": 4
     },
     {
       "diet": "none",
-      "allergen": "milk",
-      "slot": "snack",
+      "allergen": "soy",
+      "slot": "dinner",
       "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "none",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "none",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 15,
       "count": 8
     },
     {
       "diet": "none",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 30,
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 45,
       "count": 13
     },
     {
       "diet": "none",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 15
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 15
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 9
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 14
-    },
-    {
-      "diet": "none",
-      "allergen": "eggs",
+      "allergen": "soy",
       "slot": "dinner",
       "timeTier": 60,
       "count": 16
     },
     {
       "diet": "none",
-      "allergen": "eggs",
+      "allergen": "soy",
       "slot": "snack",
       "timeTier": 15,
       "count": 5
     },
     {
       "diet": "none",
-      "allergen": "eggs",
+      "allergen": "soy",
       "slot": "snack",
       "timeTier": 30,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "eggs",
+      "allergen": "soy",
       "slot": "snack",
       "timeTier": 45,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "eggs",
+      "allergen": "soy",
       "slot": "snack",
       "timeTier": 60,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
       "slot": "breakfast",
       "timeTier": 15,
-      "count": 6
+      "count": 5
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
       "slot": "breakfast",
       "timeTier": 30,
-      "count": 9
-    },
-    {
-      "diet": "none",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 11
-    },
-    {
-      "diet": "none",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 11
-    },
-    {
-      "diet": "none",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 15,
       "count": 8
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
       "slot": "lunch",
       "timeTier": 30,
-      "count": 14
+      "count": 11
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
       "slot": "lunch",
       "timeTier": 45,
-      "count": 16
+      "count": 12
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
       "slot": "lunch",
       "timeTier": 60,
-      "count": 16
+      "count": 12
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
       "slot": "dinner",
       "timeTier": 15,
       "count": 4
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 9
+      "count": 8
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "wheat",
       "slot": "dinner",
+      "timeTier": 45,
+      "count": 13
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 15
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 13
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "lunch",
       "timeTier": 45,
       "count": 15
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 15
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 14
+    },
+    {
+      "diet": "none",
+      "allergen": "fish",
       "slot": "dinner",
       "timeTier": 60,
       "count": 17
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "fish",
       "slot": "snack",
       "timeTier": 15,
       "count": 5
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "fish",
       "slot": "snack",
       "timeTier": 30,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "fish",
       "slot": "snack",
       "timeTier": 45,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "peanuts",
+      "allergen": "fish",
       "slot": "snack",
       "timeTier": 60,
       "count": 6
     },
     {
       "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 9
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 11
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 11
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 8
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 14
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 16
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 16
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 9
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 15
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 17
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "breakfast",
       "timeTier": 15,
       "count": 7
     },
     {
       "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "breakfast",
       "timeTier": 30,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "breakfast",
       "timeTier": 45,
-      "count": 11
+      "count": 12
     },
     {
       "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "breakfast",
       "timeTier": 60,
-      "count": 11
+      "count": 12
     },
     {
       "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "lunch",
       "timeTier": 15,
       "count": 7
     },
     {
       "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "lunch",
       "timeTier": 30,
       "count": 12
     },
     {
       "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "lunch",
       "timeTier": 45,
       "count": 14
     },
     {
       "diet": "none",
-      "allergen": "soy",
+      "allergen": "shellfish",
       "slot": "lunch",
       "timeTier": 60,
       "count": 14
     },
     {
       "diet": "none",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 13
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 15
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 8
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 10
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 11
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 13
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 14
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 8
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 10
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 13
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 15
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 15
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
+      "allergen": "shellfish",
       "slot": "dinner",
       "timeTier": 15,
       "count": 4
     },
     {
       "diet": "none",
-      "allergen": "fish",
+      "allergen": "shellfish",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 9
+      "count": 8
     },
     {
       "diet": "none",
-      "allergen": "fish",
+      "allergen": "shellfish",
       "slot": "dinner",
       "timeTier": 45,
-      "count": 14
+      "count": 13
     },
     {
       "diet": "none",
-      "allergen": "fish",
+      "allergen": "shellfish",
       "slot": "dinner",
       "timeTier": 60,
       "count": 16
     },
     {
       "diet": "none",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 10
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 14
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 14
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 13
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 15
-    },
-    {
-      "diet": "none",
       "allergen": "shellfish",
       "slot": "snack",
       "timeTier": 15,
@@ -1239,14 +1239,14 @@
       "allergen": "sesame",
       "slot": "dinner",
       "timeTier": 15,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
       "allergen": "sesame",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -1260,7 +1260,7 @@
       "allergen": "sesame",
       "slot": "dinner",
       "timeTier": 60,
-      "count": 17
+      "count": 18
     },
     {
       "diet": "none",
@@ -1351,14 +1351,14 @@
       "allergen": "none",
       "slot": "dinner",
       "timeTier": 15,
-      "count": 3
+      "count": 4
     },
     {
       "diet": "vegetarian",
       "allergen": "none",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 5
+      "count": 6
     },
     {
       "diet": "vegetarian",
@@ -1372,7 +1372,7 @@
       "allergen": "none",
       "slot": "dinner",
       "timeTier": 60,
-      "count": 10
+      "count": 11
     },
     {
       "diet": "vegetarian",
@@ -1463,14 +1463,14 @@
       "allergen": "milk",
       "slot": "dinner",
       "timeTier": 15,
-      "count": 3
+      "count": 4
     },
     {
       "diet": "vegetarian",
       "allergen": "milk",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 5
+      "count": 6
     },
     {
       "diet": "vegetarian",
@@ -1484,7 +1484,7 @@
       "allergen": "milk",
       "slot": "dinner",
       "timeTier": 60,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegetarian",
@@ -1575,2608 +1575,2608 @@
       "allergen": "eggs",
       "slot": "dinner",
       "timeTier": 15,
-      "count": 3
+      "count": 4
     },
     {
       "diet": "vegetarian",
       "allergen": "eggs",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 8
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 30,
       "count": 6
     },
     {
       "diet": "vegetarian",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 8
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "eggs",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "peanuts",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "tree_nuts",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "soy",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "shellfish",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 3
-    },
-    {
-      "diet": "vegan",
-      "allergen": "sesame",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "none",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 4
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 4
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "milk",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 4
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 4
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 8
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 8
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "eggs",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
       "allergen": "eggs",
       "slot": "dinner",
       "timeTier": 45,
       "count": 8
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "eggs",
       "slot": "dinner",
       "timeTier": 60,
-      "count": 9
+      "count": 10
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "eggs",
       "slot": "snack",
       "timeTier": 15,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "eggs",
       "slot": "snack",
       "timeTier": 30,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "eggs",
       "slot": "snack",
       "timeTier": 45,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "eggs",
       "slot": "snack",
       "timeTier": 60,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "breakfast",
       "timeTier": 15,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "breakfast",
       "timeTier": 30,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "breakfast",
       "timeTier": 45,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "breakfast",
       "timeTier": 60,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "lunch",
       "timeTier": 15,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "lunch",
       "timeTier": 30,
       "count": 7
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "lunch",
       "timeTier": 45,
       "count": 9
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "lunch",
       "timeTier": 60,
       "count": 9
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "dinner",
       "timeTier": 15,
-      "count": 3
+      "count": 4
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 5
+      "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "dinner",
       "timeTier": 45,
       "count": 9
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "dinner",
       "timeTier": 60,
-      "count": 10
+      "count": 11
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "snack",
       "timeTier": 15,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "snack",
       "timeTier": 30,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "snack",
       "timeTier": 45,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "peanuts",
       "slot": "snack",
       "timeTier": 60,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "breakfast",
       "timeTier": 15,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "breakfast",
       "timeTier": 30,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "breakfast",
       "timeTier": 45,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "breakfast",
       "timeTier": 60,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "lunch",
       "timeTier": 15,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "lunch",
       "timeTier": 30,
       "count": 7
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "lunch",
       "timeTier": 45,
       "count": 9
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "lunch",
       "timeTier": 60,
       "count": 9
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "dinner",
       "timeTier": 15,
-      "count": 3
+      "count": 4
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "dinner",
       "timeTier": 30,
-      "count": 5
+      "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "dinner",
       "timeTier": 45,
       "count": 9
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "dinner",
       "timeTier": 60,
-      "count": 10
+      "count": 11
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "snack",
       "timeTier": 15,
       "count": 4
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "snack",
       "timeTier": 30,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "snack",
       "timeTier": 45,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "snack",
       "timeTier": 60,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "breakfast",
       "timeTier": 15,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "breakfast",
       "timeTier": 30,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "breakfast",
       "timeTier": 45,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "breakfast",
       "timeTier": 60,
       "count": 6
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "lunch",
       "timeTier": 15,
       "count": 4
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "lunch",
       "timeTier": 30,
       "count": 5
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "lunch",
       "timeTier": 45,
       "count": 7
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "lunch",
       "timeTier": 60,
       "count": 7
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegetarian",
       "allergen": "soy",
       "slot": "dinner",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "breakfast",
       "timeTier": 15,
       "count": 2
     },
     {
-      "diet": "pescatarian",
-      "allergen": "soy",
-      "slot": "dinner",
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "breakfast",
       "timeTier": 30,
       "count": 3
     },
     {
-      "diet": "pescatarian",
-      "allergen": "soy",
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
       "slot": "dinner",
       "timeTier": 45,
       "count": 7
     },
     {
-      "diet": "pescatarian",
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 2
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 2
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
       "allergen": "soy",
       "slot": "dinner",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "soy",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 2
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "shellfish",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 2
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 3
+    },
+    {
+      "diet": "vegan",
+      "allergen": "sesame",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 3
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 14
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "none",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 3
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 4
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 4
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "milk",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 4
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 13
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "eggs",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 14
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "peanuts",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 14
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "tree_nuts",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "breakfast",
       "timeTier": 60,
       "count": 8
     },
     {
       "diet": "pescatarian",
       "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 4
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "soy",
       "slot": "snack",
       "timeTier": 15,
       "count": 5
@@ -4206,313 +4206,313 @@
       "diet": "pescatarian",
       "allergen": "wheat",
       "slot": "breakfast",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "dinner",
       "timeTier": 15,
       "count": 4
     },
     {
       "diet": "pescatarian",
       "allergen": "wheat",
-      "slot": "breakfast",
+      "slot": "dinner",
       "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 15,
       "count": 5
     },
     {
       "diet": "pescatarian",
       "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "wheat",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
       "slot": "breakfast",
       "timeTier": 45,
-      "count": 5
+      "count": 7
     },
     {
       "diet": "pescatarian",
-      "allergen": "wheat",
+      "allergen": "fish",
       "slot": "breakfast",
       "timeTier": 60,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 30,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 15,
       "count": 5
     },
     {
       "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 3
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 8
     },
     {
       "diet": "pescatarian",
-      "allergen": "wheat",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 11
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 13
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 30,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 45,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "fish",
+      "slot": "snack",
+      "timeTier": 60,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "count": 7
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "count": 9
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "count": 6
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
       "slot": "lunch",
       "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 15,
       "count": 4
     },
     {
       "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
+      "allergen": "shellfish",
       "slot": "dinner",
-      "timeTier": 15,
-      "count": 2
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "snack",
       "timeTier": 30,
       "count": 6
     },
     {
       "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "wheat",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "dinner",
-      "timeTier": 60,
-      "count": 10
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 30,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 45,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "fish",
-      "slot": "snack",
-      "timeTier": 60,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "count": 6
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "count": 7
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
       "allergen": "shellfish",
       "slot": "dinner",
       "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 60,
       "count": 10
     },
     {
       "diet": "pescatarian",
       "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "shellfish",
       "slot": "snack",
       "timeTier": 15,
       "count": 5
@@ -4543,84 +4543,84 @@
       "allergen": "sesame",
       "slot": "breakfast",
       "timeTier": 15,
-      "count": 6
+      "count": 7
     },
     {
       "diet": "pescatarian",
       "allergen": "sesame",
       "slot": "breakfast",
       "timeTier": 30,
-      "count": 7
+      "count": 9
     },
     {
       "diet": "pescatarian",
       "allergen": "sesame",
       "slot": "breakfast",
       "timeTier": 45,
-      "count": 7
+      "count": 9
     },
     {
       "diet": "pescatarian",
       "allergen": "sesame",
       "slot": "breakfast",
       "timeTier": 60,
-      "count": 7
+      "count": 9
     },
     {
       "diet": "pescatarian",
       "allergen": "sesame",
       "slot": "lunch",
       "timeTier": 15,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 30,
       "count": 7
     },
     {
       "diet": "pescatarian",
       "allergen": "sesame",
       "slot": "lunch",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "sesame",
-      "slot": "lunch",
-      "timeTier": 60,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 15,
-      "count": 3
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "sesame",
-      "slot": "dinner",
       "timeTier": 30,
-      "count": 5
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 45,
-      "count": 9
-    },
-    {
-      "diet": "pescatarian",
-      "allergen": "sesame",
-      "slot": "dinner",
-      "timeTier": 60,
       "count": 10
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "sesame",
+      "slot": "lunch",
+      "timeTier": 60,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 15,
+      "count": 5
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 30,
+      "count": 8
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 45,
+      "count": 12
+    },
+    {
+      "diet": "pescatarian",
+      "allergen": "sesame",
+      "slot": "dinner",
+      "timeTier": 60,
+      "count": 14
     },
     {
       "diet": "pescatarian",
@@ -4698,7 +4698,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 17
+      "count": 18
     },
     {
       "diet": "none",
@@ -4762,7 +4762,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 10
+      "count": 11
     },
     {
       "diet": "vegetarian",
@@ -4826,7 +4826,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegan",
@@ -4850,7 +4850,7 @@
       "slot": "breakfast",
       "timeTier": 45,
       "threshold": 4,
-      "count": 7
+      "count": 9
     },
     {
       "diet": "pescatarian",
@@ -4858,7 +4858,7 @@
       "slot": "breakfast",
       "timeTier": 60,
       "threshold": 4,
-      "count": 7
+      "count": 9
     },
     {
       "diet": "pescatarian",
@@ -4866,7 +4866,7 @@
       "slot": "lunch",
       "timeTier": 45,
       "threshold": 4,
-      "count": 9
+      "count": 12
     },
     {
       "diet": "pescatarian",
@@ -4874,7 +4874,7 @@
       "slot": "lunch",
       "timeTier": 60,
       "threshold": 4,
-      "count": 9
+      "count": 12
     },
     {
       "diet": "pescatarian",
@@ -4882,7 +4882,7 @@
       "slot": "dinner",
       "timeTier": 45,
       "threshold": 4,
-      "count": 9
+      "count": 12
     },
     {
       "diet": "pescatarian",
@@ -4890,7 +4890,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 10
+      "count": 14
     },
     {
       "diet": "pescatarian",
@@ -4978,7 +4978,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
@@ -4986,7 +4986,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -5002,7 +5002,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 14
+      "count": 15
     },
     {
       "diet": "none",
@@ -5074,7 +5074,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
@@ -5082,7 +5082,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -5098,7 +5098,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 16
+      "count": 17
     },
     {
       "diet": "none",
@@ -5170,7 +5170,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
@@ -5178,7 +5178,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -5194,7 +5194,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 17
+      "count": 18
     },
     {
       "diet": "none",
@@ -5266,7 +5266,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
@@ -5274,7 +5274,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -5290,7 +5290,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 17
+      "count": 18
     },
     {
       "diet": "none",
@@ -5362,7 +5362,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 3
+      "count": 4
     },
     {
       "diet": "none",
@@ -5370,7 +5370,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "none",
@@ -5386,7 +5386,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 15
+      "count": 16
     },
     {
       "diet": "none",
@@ -5458,7 +5458,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 3
+      "count": 4
     },
     {
       "diet": "none",
@@ -5466,7 +5466,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "none",
@@ -5482,7 +5482,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 14
+      "count": 15
     },
     {
       "diet": "none",
@@ -5554,7 +5554,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
@@ -5562,7 +5562,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -5575,6 +5575,102 @@
     {
       "diet": "none",
       "allergen": "fish",
+      "slot": "dinner",
+      "timeTier": 60,
+      "threshold": 4,
+      "count": 17
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 15,
+      "threshold": 4,
+      "count": 7
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 30,
+      "threshold": 4,
+      "count": 10
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "threshold": 4,
+      "count": 12
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "threshold": 4,
+      "count": 12
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 15,
+      "threshold": 4,
+      "count": 7
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 30,
+      "threshold": 4,
+      "count": 12
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 45,
+      "threshold": 4,
+      "count": 14
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "lunch",
+      "timeTier": 60,
+      "threshold": 4,
+      "count": 14
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 15,
+      "threshold": 4,
+      "count": 4
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 30,
+      "threshold": 4,
+      "count": 8
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
+      "slot": "dinner",
+      "timeTier": 45,
+      "threshold": 4,
+      "count": 13
+    },
+    {
+      "diet": "none",
+      "allergen": "shellfish",
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
@@ -5582,102 +5678,6 @@
     },
     {
       "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 15,
-      "threshold": 4,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 30,
-      "threshold": 4,
-      "count": 10
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "threshold": 4,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "threshold": 4,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 15,
-      "threshold": 4,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 30,
-      "threshold": 4,
-      "count": 12
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 45,
-      "threshold": 4,
-      "count": 14
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "lunch",
-      "timeTier": 60,
-      "threshold": 4,
-      "count": 14
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 15,
-      "threshold": 4,
-      "count": 3
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 30,
-      "threshold": 4,
-      "count": 7
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 45,
-      "threshold": 4,
-      "count": 13
-    },
-    {
-      "diet": "none",
-      "allergen": "shellfish",
-      "slot": "dinner",
-      "timeTier": 60,
-      "threshold": 4,
-      "count": 15
-    },
-    {
-      "diet": "none",
       "allergen": "sesame",
       "slot": "breakfast",
       "timeTier": 15,
@@ -5746,7 +5746,7 @@
       "slot": "dinner",
       "timeTier": 15,
       "threshold": 4,
-      "count": 4
+      "count": 5
     },
     {
       "diet": "none",
@@ -5754,7 +5754,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 4,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -5770,7 +5770,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 4,
-      "count": 17
+      "count": 18
     }
   ],
   "reducedCells": [
@@ -5820,7 +5820,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegetarian",
@@ -5868,58 +5868,58 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "threshold": 2,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "threshold": 2,
-      "count": 6
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 45,
-      "threshold": 2,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "lunch",
-      "timeTier": 60,
-      "threshold": 2,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 45,
-      "threshold": 2,
-      "count": 9
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "peanuts",
-      "slot": "dinner",
-      "timeTier": 60,
-      "threshold": 2,
       "count": 10
     },
     {
       "diet": "vegetarian",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "threshold": 2,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "peanuts",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "threshold": 2,
+      "count": 6
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 45,
+      "threshold": 2,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "peanuts",
+      "slot": "lunch",
+      "timeTier": 60,
+      "threshold": 2,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 45,
+      "threshold": 2,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "peanuts",
+      "slot": "dinner",
+      "timeTier": 60,
+      "threshold": 2,
+      "count": 11
+    },
+    {
+      "diet": "vegetarian",
       "allergen": "tree_nuts",
       "slot": "breakfast",
       "timeTier": 45,
@@ -5964,7 +5964,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 10
+      "count": 11
     },
     {
       "diet": "vegetarian",
@@ -6009,6 +6009,54 @@
     {
       "diet": "vegetarian",
       "allergen": "soy",
+      "slot": "dinner",
+      "timeTier": 60,
+      "threshold": 2,
+      "count": 9
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 45,
+      "threshold": 2,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "breakfast",
+      "timeTier": 60,
+      "threshold": 2,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 45,
+      "threshold": 2,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "lunch",
+      "timeTier": 60,
+      "threshold": 2,
+      "count": 5
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
+      "slot": "dinner",
+      "timeTier": 45,
+      "threshold": 2,
+      "count": 7
+    },
+    {
+      "diet": "vegetarian",
+      "allergen": "wheat",
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
@@ -6016,54 +6064,6 @@
     },
     {
       "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 45,
-      "threshold": 2,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "breakfast",
-      "timeTier": 60,
-      "threshold": 2,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 45,
-      "threshold": 2,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "lunch",
-      "timeTier": 60,
-      "threshold": 2,
-      "count": 5
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 45,
-      "threshold": 2,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
-      "allergen": "wheat",
-      "slot": "dinner",
-      "timeTier": 60,
-      "threshold": 2,
-      "count": 7
-    },
-    {
-      "diet": "vegetarian",
       "allergen": "fish",
       "slot": "breakfast",
       "timeTier": 45,
@@ -6108,7 +6108,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 10
+      "count": 11
     },
     {
       "diet": "vegetarian",
@@ -6156,7 +6156,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 10
+      "count": 11
     },
     {
       "diet": "vegetarian",
@@ -6204,7 +6204,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 10
+      "count": 11
     },
     {
       "diet": "vegan",
@@ -6252,7 +6252,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegan",
@@ -6300,7 +6300,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegan",
@@ -6348,7 +6348,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegan",
@@ -6396,7 +6396,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegan",
@@ -6444,7 +6444,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 5
+      "count": 6
     },
     {
       "diet": "vegan",
@@ -6492,7 +6492,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 5
+      "count": 6
     },
     {
       "diet": "vegan",
@@ -6540,7 +6540,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegan",
@@ -6588,7 +6588,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "vegan",
@@ -6636,7 +6636,7 @@
       "slot": "dinner",
       "timeTier": 60,
       "threshold": 2,
-      "count": 7
+      "count": 8
     },
     {
       "diet": "none",
@@ -6660,7 +6660,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 2,
-      "count": 9
+      "count": 10
     },
     {
       "diet": "none",
@@ -6692,7 +6692,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 2,
-      "count": 5
+      "count": 6
     },
     {
       "diet": "vegetarian",
@@ -6724,7 +6724,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 2,
-      "count": 5
+      "count": 6
     },
     {
       "diet": "vegan",
@@ -6740,7 +6740,7 @@
       "slot": "breakfast",
       "timeTier": 30,
       "threshold": 2,
-      "count": 7
+      "count": 9
     },
     {
       "diet": "pescatarian",
@@ -6748,7 +6748,7 @@
       "slot": "lunch",
       "timeTier": 30,
       "threshold": 2,
-      "count": 7
+      "count": 10
     },
     {
       "diet": "pescatarian",
@@ -6756,7 +6756,7 @@
       "slot": "dinner",
       "timeTier": 30,
       "threshold": 2,
-      "count": 5
+      "count": 8
     },
     {
       "diet": "pescatarian",
