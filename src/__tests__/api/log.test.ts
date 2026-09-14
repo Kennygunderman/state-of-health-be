@@ -20,7 +20,11 @@
 // client obtains `diaryMealId` in the first place (§0.7.3), and reading a
 // planned entry back through them is the only way to prove that what planning
 // wrote is what the shipped diary shows. `src/__tests__/setup/testApp.ts`
-// supplies the supertest handle and the identity headers.
+// supplies the supertest handle and the identity headers. The last block of
+// this file is entirely those routes: the legacy writer's refusal of a string
+// PostgreSQL cannot store, asserted as status codes and response bodies
+// because that is what the refusal IS, together with the shipped responses
+// beside it that must not have moved.
 //
 // WHAT IS ASSERTED IS WHAT THE DATABASE HOLDS. A returned object can be right
 // while the row is wrong, so every write case re-reads `meal_entries`,
@@ -822,5 +826,246 @@ describe('a refused planned log', () => {
         ]);
 
         await expectNothingWritten(week.plan.id);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The shipped diary writer's own refusal: a string PostgreSQL cannot store
+ *
+ * Driven as HTTP for the reason the header gives — both routes are mounted and
+ * shipped, and the status code is the whole point of these cases. A body whose
+ * stored text carries U+0000 used to reach the column, which answers `22021
+ * invalid byte sequence for encoding "UTF8": 0x00`, and the endpoint returned
+ * `500 Failed to log meal entry` for a request only the caller can fix.
+ *
+ * Both halves are asserted here. The refusal: a `400` naming the field, with
+ * nothing written. And the non-regression half, which is the larger risk of
+ * adding a rule to a guard §0.3.1 freezes — the frozen required-fields `400`
+ * keeps its exact body, a valid legacy log still writes, and every other
+ * control character still round-trips through the diary intact.
+ * ------------------------------------------------------------------------- */
+
+describe('a legacy diary write carrying U+0000', () => {
+    /** U+0000 as an escape, so no editor or diff can swallow the literal byte. */
+    const NUL = '\u0000';
+
+    /** The frozen required-fields text, asserted literally as the wire contract. */
+    const LEGACY_REQUIRED_MESSAGE = 'name, calories, protein, carbs, and fat are required';
+
+    /** A well-formed legacy entry body, the shape the shipped app posts. */
+    const legacyEntryBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        name: 'Scrambled eggs',
+        calories: 220,
+        protein: 14,
+        carbs: 2,
+        fat: 16,
+        ...overrides,
+    });
+
+    /** Posts a legacy entry into the caller's own breakfast bucket. */
+    const postEntry = async (body: Record<string, unknown>) => {
+        const bucketId = await diaryBucketId(USER_ID, TODAY);
+
+        return asUser(request.post(`/api/macros/meal/${bucketId}/entries`), { uid: USER_ID }).send(body);
+    };
+
+    /** The entries the shipped diary read reports for the caller's breakfast. */
+    const diaryEntryNames = async (): Promise<string[]> => {
+        const response = await asUser(request.get(`/api/macros/${TODAY}`), { uid: USER_ID }).expect(200);
+        const body = response.body as { meals: { name: string; entries: { name: string }[] }[] };
+
+        return (body.meals.find((meal) => meal.name === 'Breakfast')?.entries ?? []).map((entry) => entry.name);
+    };
+
+    it.each([
+        ['name', { name: `Scrambled${NUL}eggs` }],
+        ['servingText', { servingText: `2${NUL}eggs` }],
+        ['rawInput', { rawInput: `two${NUL}eggs` }],
+    ])('answers a %s carrying U+0000 with 400 and writes nothing', async (field, overrides) => {
+        const response = await postEntry(legacyEntryBody(overrides));
+
+        expect(response.status).toBe(400);
+        expect(response.body).toStrictEqual({
+            error: 'invalid_request',
+            details: [{ field, code: 'invalid_characters' }],
+        });
+        // The 500 this replaces happened at the INSERT, so the proof is the
+        // absence of a row rather than the status alone.
+        expect(await storedEntries()).toHaveLength(0);
+    });
+
+    it('reports every unstorable field of one body at once', async () => {
+        const response = await postEntry(
+            legacyEntryBody({ name: `a${NUL}b`, servingText: `c${NUL}d`, rawInput: `e${NUL}f` }),
+        );
+
+        expect(response.status).toBe(400);
+        expect(response.body).toStrictEqual({
+            error: 'invalid_request',
+            details: [
+                { field: 'name', code: 'invalid_characters' },
+                { field: 'servingText', code: 'invalid_characters' },
+                { field: 'rawInput', code: 'invalid_characters' },
+            ],
+        });
+        expect(await storedEntries()).toHaveLength(0);
+    });
+
+    it('answers an entry edit whose name carries U+0000 with 400, leaving the stored name', async () => {
+        const created = await postEntry(legacyEntryBody());
+
+        expect(created.status).toBe(201);
+
+        const [entry] = await storedEntries();
+
+        const response = await asUser(request.put(`/api/macros/entry/${entry.id}`), { uid: USER_ID }).send({
+            name: `Scrambled${NUL}eggs`,
+        });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toStrictEqual({
+            error: 'invalid_request',
+            details: [{ field: 'name', code: 'invalid_characters' }],
+        });
+
+        // The refusal is judged before the writer runs, so the row is untouched
+        // — not partially updated, and not detached from anything.
+        const stored = await prisma.meal_entries.findUniqueOrThrow({ where: { id: entry.id } });
+
+        expect(stored.name).toBe('Scrambled eggs');
+        expect(stored.calories).toBe(entry.calories);
+    });
+
+    it('keeps the frozen required-fields 400 exactly as shipped clients read it', async () => {
+        // The rule was added AFTER this guard, so a body the endpoint already
+        // refused must still earn the message-only body — no machine code, no
+        // details — even though the new verdict renders differently.
+        const response = await postEntry({ name: 'eggs' });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toStrictEqual({ error: LEGACY_REQUIRED_MESSAGE });
+    });
+
+    it('lets the frozen guard answer first when a body fails both ways', async () => {
+        const response = await postEntry({ name: `a${NUL}b`, calories: 220, protein: 14, carbs: 2 });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toStrictEqual({ error: LEGACY_REQUIRED_MESSAGE });
+        expect(await storedEntries()).toHaveLength(0);
+    });
+
+    it('still logs a valid legacy entry and shows it in the diary', async () => {
+        const response = await postEntry(legacyEntryBody({ servingText: '2 eggs', rawInput: 'two scrambled eggs' }));
+
+        expect(response.status).toBe(201);
+
+        const [entry] = await storedEntries();
+
+        expect(entry.name).toBe('Scrambled eggs');
+        expect(entry.serving_text).toBe('2 eggs');
+        expect(entry.raw_input).toBe('two scrambled eggs');
+        // The legacy path's own classes, unchanged: the server cannot verify
+        // numbers it did not derive, so the entry earns no source label.
+        expect(entry.input_method).toBe('library');
+        expect(entry.nutrition_provenance).toBe('user_entered');
+        expect(await diaryEntryNames()).toEqual(['Scrambled eggs']);
+    });
+
+    it.each([
+        ['BEL and ESC', 'a\u0007b\u001bc'],
+        ['a newline', 'line one\nline two'],
+        ['a zero-width space', 'a\u200bb'],
+    ])('still stores and returns a name containing %s', async (_case, name) => {
+        // The boundary of the rule, observed end to end: these characters reach
+        // `meal_entries.name` and come back through the shipped diary read
+        // unchanged, so the refusal is U+0000 and nothing wider.
+        const response = await postEntry(legacyEntryBody({ name }));
+
+        expect(response.status).toBe(201);
+        expect((await storedEntries())[0].name).toBe(name);
+        expect(await diaryEntryNames()).toEqual([name]);
+    });
+
+    it('still accepts an entry edit that carries no NUL, and still detaches on a macro change', async () => {
+        const created = await postEntry(legacyEntryBody());
+
+        expect(created.status).toBe(201);
+
+        const [entry] = await storedEntries();
+
+        const renamed = await asUser(request.put(`/api/macros/entry/${entry.id}`), { uid: USER_ID }).send({
+            name: 'Poached eggs',
+            calories: 240,
+        });
+
+        expect(renamed.status).toBe(200);
+
+        const stored = await prisma.meal_entries.findUniqueOrThrow({ where: { id: entry.id } });
+
+        expect(stored.name).toBe('Poached eggs');
+        expect(stored.calories).toBe(240);
+        // Unchanged behaviour on the other side of the new check: the edit is
+        // still judged by `planMealEntryEdit`, which detaches on a rewrite.
+        expect(stored.input_method).toBe('library');
+        expect(stored.nutrition_provenance).toBe('user_entered');
+    });
+
+    it('leaves a planned entry reachable by an edit that only changes the servings', async () => {
+        // The planned path shares this route, so the new body check sits in
+        // front of it too: an edit with no NUL must still reach the writer and
+        // keep the link that makes the plan card read LOGGED.
+        const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+
+        await logOrThrow(week.plan.id, week.breakfast.id, logBody({ diaryMealId: bucketId }));
+
+        const [entry] = await storedEntries();
+
+        await asUser(request.put(`/api/macros/entry/${entry.id}`), { uid: USER_ID })
+            .send({ servings: 2 })
+            .expect(200);
+
+        const stored = await prisma.meal_entries.findUniqueOrThrow({ where: { id: entry.id } });
+
+        expect(stored.servings).toBe(2);
+        expect(stored.meal_plan_meal_id).toBe(week.breakfast.id);
+        expect(stored.input_method).toBe('meal_plan');
+    });
+
+    it('refuses a NUL name on a planned entry without touching its link', async () => {
+        const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+
+        await logOrThrow(week.plan.id, week.breakfast.id, logBody({ diaryMealId: bucketId }));
+
+        const [entry] = await storedEntries();
+
+        const response = await asUser(request.put(`/api/macros/entry/${entry.id}`), { uid: USER_ID }).send({
+            name: `a${NUL}b`,
+        });
+
+        expect(response.status).toBe(400);
+
+        const stored = await prisma.meal_entries.findUniqueOrThrow({ where: { id: entry.id } });
+
+        // A refused edit is not a detachment: the entry is still the planned
+        // meal's, so the card must still read LOGGED.
+        expect(stored.name).toBe(entry.name);
+        expect(stored.meal_plan_meal_id).toBe(week.breakfast.id);
+        expect(stored.recipe_version_id).toBe(week.recipe.id);
+        expect(stored.nutrition_provenance).toBe('source_backed');
+    });
+
+    it('still answers a malformed entry id before it reads the body', async () => {
+        // The path parser runs first and keeps its own verdict, so a request
+        // that is wrong in both places is told about the id — the field it must
+        // fix to address a row at all.
+        const response = await asUser(request.put('/api/macros/entry/not-a-uuid'), { uid: USER_ID }).send({
+            name: `a${NUL}b`,
+        });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toStrictEqual({
+            error: 'invalid_request',
+            details: [{ field: 'id', code: 'invalid_id' }],
+        });
     });
 });

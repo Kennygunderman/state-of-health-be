@@ -85,6 +85,9 @@ type LogEntryRoute = 'legacy' | 'catalog' | 'conflict' | 'unrecognized';
  *   presence is what selects the catalog shape at all.
  * - `invalid_servings` — `servings` is absent or outside the servings contract.
  * - `invalid_type` — `servingText` was sent as something other than a string.
+ * - `invalid_characters` — a string the request asks the server to STORE holds
+ *   a character the column cannot represent. Only U+0000 qualifies; see
+ *   {@link containsNulCharacter}.
  * - `conflicting_food_reference` — the body names both a personal food and a
  *   catalog food, so no shape can be chosen for it.
  * - `unrecognized_payload` — the body names neither shape.
@@ -97,6 +100,7 @@ const FIELD_ERROR_CODES = {
     INVALID_ID: 'invalid_id',
     INVALID_SERVINGS: 'invalid_servings',
     INVALID_TYPE: 'invalid_type',
+    INVALID_CHARACTERS: 'invalid_characters',
     CONFLICTING_FOOD_REFERENCE: 'conflicting_food_reference',
     UNRECOGNIZED_PAYLOAD: 'unrecognized_payload',
 } as const;
@@ -192,6 +196,79 @@ const invalidPayload = (message: string, details: LogEntryFieldError[]): LogEntr
 const unrecognizedPayload = (): LogEntryErrorVerdict =>
     invalidPayload(UNRECOGNIZED_MESSAGE, [{ field: 'body', code: FIELD_ERROR_CODES.UNRECOGNIZED_PAYLOAD }]);
 
+/* ---------------------------------------------------------------------------
+ * Storable text
+ *
+ * The rule: a string the request asks the server to STORE may not contain
+ * U+0000. PostgreSQL `text` cannot represent it — the server answers
+ * `22021 invalid byte sequence for encoding "UTF8": 0x00` — so a body carrying
+ * one is a request only the caller can fix, and left unchecked it reaches the
+ * writer and comes back as this endpoint's 500. That is the same reasoning the
+ * path parsers below already apply to an unparsable `@db.Uuid` id, and the same
+ * `400 invalid_request` verdict, so nothing new reaches the wire: the code is a
+ * new member of the vocabulary above, not a new response shape.
+ *
+ * Deciding it here rather than translating the driver's failure at the
+ * controller is not a preference. Prisma raises this as a
+ * `PrismaClientUnknownRequestError` whose only record of the `22021` is free
+ * text inside the connector's message, so a controller branch would have to
+ * pattern-match a vendor string — which `backend-architecture` §9 forbids and
+ * which changes shape on a driver upgrade. A pure predicate over the request is
+ * the one reading that is both testable without a database (§11) and stable.
+ *
+ * U+0000 alone, and deliberately so: every other control character stores and
+ * round-trips intact (BEL and ESC are covered in the tests), so widening this
+ * to a general "unsafe characters" filter would start refusing values the
+ * endpoint accepts today and stores correctly.
+ * ------------------------------------------------------------------------- */
+
+const NUL_CHARACTER = '\u0000';
+
+/**
+ * Whether a value is a string PostgreSQL `text` cannot hold. A non-string is
+ * never this failure: whether it is storable at all is the column's own
+ * question, and the two legacy paths answer it exactly as they always have.
+ */
+export const containsNulCharacter = (value: unknown): boolean =>
+    typeof value === 'string' && value.includes(NUL_CHARACTER);
+
+/**
+ * The client-supplied strings the legacy writer persists, in the order a
+ * failure reports them: `name` → `name`, `servingText` → `serving_text`,
+ * `rawInput` → `raw_input` (`nutrition.service.ts::logMealEntry`).
+ *
+ * `servingText` is on the list even though the writer trims it, because
+ * `String.prototype.trim` removes WhiteSpace and LineTerminator and U+0000 is
+ * neither — `'\u0000'.trim()` is still `'\u0000'`, still truthy, and still
+ * stored.
+ */
+const LEGACY_STORED_TEXT_FIELDS: readonly string[] = ['name', 'servingText', 'rawInput'];
+
+/** The one client-supplied string an entry edit persists (`meal_entries.name`). */
+const EDIT_STORED_TEXT_FIELDS: readonly string[] = ['name'];
+
+const unstorableTextMessage = (field: string): string =>
+    `${field} must not contain a NUL character (U+0000)`;
+
+/**
+ * The verdict for a body whose stored strings cannot be written, or `null` when
+ * every one of them can. Reports every offending field at once and joins their
+ * messages, the same way `parseCatalogBody` reports its field failures, so one
+ * round trip tells the caller everything it has to fix.
+ */
+const unstorableText = (
+    record: Record<string, unknown>,
+    fields: readonly string[],
+): LogEntryErrorVerdict | null => {
+    const errors: LogEntryFieldError[] = fields
+        .filter((field) => containsNulCharacter(record[field]))
+        .map((field) => ({ field, code: FIELD_ERROR_CODES.INVALID_CHARACTERS }));
+
+    if (errors.length === 0) return null;
+
+    return invalidRequest(errors.map((error) => unstorableTextMessage(error.field)).join('; '), errors);
+};
+
 /**
  * The shape decision, taken once. A body that names both a personal food and a
  * catalog food is never resolved by preferring one: doing so would log
@@ -235,6 +312,15 @@ const legacyFieldErrors = (record: Record<string, unknown>): LogEntryFieldError[
 const parseLegacyBody = (body: unknown, record: Record<string, unknown>): ParsedLogEntryBody => {
     const errors = legacyFieldErrors(record);
     if (errors.length > 0) return legacyFieldsRequired(errors);
+
+    // Judged AFTER the guard above, so every body the guard already refuses
+    // keeps the frozen message byte for byte and this verdict can only ever
+    // replace a 500 — never an existing 400. A blank name is "required"; a name
+    // PostgreSQL cannot store is a different failure and names itself, which is
+    // what lets a NUL in `servingText` or `rawInput` report the field the caller
+    // has to fix instead of the five the frozen message lists.
+    const unstorable = unstorableText(record, LEGACY_STORED_TEXT_FIELDS);
+    if (unstorable !== null) return unstorable;
 
     // The legacy body's own `foodId` is deliberately NOT judged here. It reaches
     // `meal_entries.food_id` — a `@db.Uuid` column — and the dedupe lookup that
@@ -760,6 +846,37 @@ export const resolveCatalogEntrySnapshot = (
  * clear them, because the plan and the catalog cannot go on vouching for
  * numbers they did not produce (§0.5.1).
  * ------------------------------------------------------------------------- */
+
+export type ParsedMealEntryEdit =
+    | { kind: 'ok'; payload: UpdateMealEntryPayload }
+    | LogEntryErrorVerdict;
+
+/**
+ * Judges an edit body for the one failure the writer cannot answer: a `name`
+ * carrying U+0000, which reaches `meal_entries.name` and comes back as a 500
+ * for a request only the caller can fix.
+ *
+ * Narrow on purpose. This route has never validated its body, and everything
+ * else it accepts today it must go on accepting: a `name` or macro of another
+ * type is still passed through and still refused at the column, a body that
+ * mentions no editable field is still the no-op 200 it has always been, and a
+ * body that is not an object at all still reaches the writer unchanged — this
+ * parser reports on the fields it can read and invents no other verdict. So the
+ * only response it changes is the one that was a 500, which is exactly what the
+ * shape decision on the log route above does.
+ *
+ * `payload` is the body handed on, not a rebuilt object, for the same reason
+ * `parseLegacyBody` hands its body on unchanged: `planMealEntryEdit` reads each
+ * member itself and normalizes it the way the column stores it.
+ */
+export const parseMealEntryEditBody = (body: unknown): ParsedMealEntryEdit => {
+    const record = asRecord(body);
+    const unstorable = record === null ? null : unstorableText(record, EDIT_STORED_TEXT_FIELDS);
+
+    if (unstorable !== null) return unstorable;
+
+    return { kind: 'ok', payload: body as UpdateMealEntryPayload };
+};
 
 /** The stored row the edit is judged against, in the columns' own spelling. */
 export interface StoredMealEntrySnapshot {

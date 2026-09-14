@@ -38,6 +38,7 @@ import {
     diffGroceryList,
     displayFamilyForPortion,
     indexFoodStatesByName,
+    isGroceryRenderingFault,
     parseGroceryItemPath,
     parseGroceryListPath,
     parseToggleGroceryBody,
@@ -46,6 +47,7 @@ import {
     quantitiesAreEqual,
     requireGroceryWritablePlan,
     storedRowFamily,
+    volumeDensityFor,
 } from '../grocery.logic';
 import { PlanNotActiveError, PlanNotFoundError } from '../mealPlanning.errors';
 // The other three domains of the cross-domain traversal at the end of this
@@ -186,7 +188,15 @@ const defaultPortionOf = (sourceKey: string): GroceryDefaultPortion => {
         throw new Error(`catalog-foods.fixture.json carries no default portion for ${sourceKey}`);
     }
 
-    return { description: row.description, unit: row.unit, gram_weight: row.gram_weight };
+    return {
+        description: row.description,
+        // Carried through rather than defaulted: the portion's `amount` is the
+        // divisor `volumeDensityFor` reads its density with, so a fixture that
+        // dropped it would state a different density from the row on disk.
+        amount: row.amount,
+        unit: row.unit,
+        gram_weight: row.gram_weight,
+    };
 };
 
 /** One committed catalog food as the facts a shopping line reads. */
@@ -248,9 +258,14 @@ const EARLIER = new Date('2026-07-04T09:30:00.000Z');
  * `displayFamilyForPortion` reads the family off. Left synthetic because these
  * are unit-family probes rather than foods: several pass a unit no catalog food
  * carries (`bottle`), which is exactly the fallback being pinned.
+ *
+ * `amount: 1` is the default because it is the catalog's commonest value and
+ * keeps a case's arithmetic readable; the cases that matter for the density a
+ * portion states override it, since `amount` is the divisor.
  */
 const portion = (overrides: Partial<GroceryDefaultPortion> = {}): GroceryDefaultPortion => ({
     description: 'breast',
+    amount: 1,
     unit: 'oz',
     gram_weight: GRAMS_PER_OUNCE,
     ...overrides,
@@ -295,7 +310,7 @@ const eggFacts = (overrides: Partial<GroceryFoodFacts> = {}): GroceryFoodFacts =
 /**
  * Every pluralisation rule a count row's portion description can meet, as
  * `[singular, plural]` pairs: a plain noun, a sibilant ending taking `-es`, a
- * consonant followed by `y` becoming `-ies`, and each of the four irregulars
+ * consonant followed by `y` becoming `-ies`, and each of the irregulars
  * `utils/units.ts` commits to its exceptions map.
  *
  * The rules themselves belong to `utils/units.ts` and are pinned there. What
@@ -311,8 +326,10 @@ const PLURAL_DESCRIPTION_CASES: readonly (readonly [string, string])[] = [
     ['berry', 'berries'],
     ['egg', 'eggs'],
     ['tomato', 'tomatoes'],
+    ['potato', 'potatoes'],
     ['leaf', 'leaves'],
     ['loaf', 'loaves'],
+    ['half', 'halves'],
 ];
 
 /**
@@ -571,7 +588,9 @@ describe('aggregatePlannedGrams', () => {
             expect(rows.find((line) => line.catalog_food_id === ingredient.catalog_food_id)).toMatchObject({
                 food_state: AS_PURCHASED,
                 category: 'dairy_alternatives',
-                name: 'Greek yogurt, plain, as purchased',
+                // `as_purchased` is how the shop sells it, so the name says
+                // nothing about the state: a shopper reads "Greek yogurt, plain".
+                name: 'Greek yogurt, plain',
                 quantity_grams: optionalRecipeGramsOf(ingredient),
                 display_unit: 'oz',
                 display_text: '3 oz',
@@ -704,19 +723,147 @@ describe('classifyQuantityChange', () => {
  * Display and the unit-family lock
  * ------------------------------------------------------------------------- */
 
+/**
+ * The density a volume row is rendered through.
+ *
+ * THE SHIPPED SHAPE these cases exist for: catalog release v1 publishes 11,046
+ * foods, every one `nutrition_basis: per_100g` with `density_g_per_ml` NULL, and
+ * 4,622 of them state their default portion in a volume unit. The committed
+ * fixture carries the same shape in `ai:beverage:cold brew coffee
+ * concentrate:prepared` (1 cup / 240 g / density null), so the derivation is
+ * exercised against a row on disk and not only against a synthetic one.
+ */
+describe('volumeDensityFor', () => {
+    it('prefers the food\u2019s own stored density, which is the curated authority', () => {
+        // `usda:9200113` soy sauce: density 1.2 stored, and a 1 tbsp / 18 g
+        // portion that would imply 1.217. The stored figure wins, so a
+        // `per_100ml` food keeps converting through the number its nutrition
+        // was computed with.
+        expect(volumeDensityFor(groceryFacts('usda:9200113'))).toBe(1.2);
+    });
+
+    it('derives the density from the default portion when the food stores none', () => {
+        // The shipped shape, from the fixture: a cup of this weighs 240 g.
+        expect(volumeDensityFor(groceryFacts('ai:beverage:cold brew coffee concentrate:prepared'))).toBeCloseTo(
+            240 / MILLILITERS_PER_CUP,
+            10,
+        );
+    });
+
+    it('divides the portion\u2019s amount out, so a two-tablespoon portion is not read as one', () => {
+        expect(
+            volumeDensityFor({
+                density_g_per_ml: null,
+                default_portion: portion({ description: '2 tbsp', amount: 2, unit: 'tbsp', gram_weight: 30 }),
+            }),
+        ).toBeCloseTo(30 / (2 * MILLILITERS_PER_TABLESPOON), 10);
+    });
+
+    it.each([
+        ['zero', 0],
+        ['negative', -1],
+        ['NaN', Number.NaN],
+        ['Infinity', Number.POSITIVE_INFINITY],
+    ])('ignores a %s stored density and falls back to the portion', (_case, density) => {
+        expect(
+            volumeDensityFor({
+                density_g_per_ml: density,
+                default_portion: portion({ description: '1 cup', unit: 'cup', gram_weight: 240 }),
+            }),
+        ).toBeCloseTo(240 / MILLILITERS_PER_CUP, 10);
+    });
+
+    it('answers null for a food whose portion is not measured by volume', () => {
+        // Chicken breast: a 100 g default portion. Grams per gram is not a
+        // density, so there is nothing to convert through.
+        expect(volumeDensityFor(facts())).toBeNull();
+    });
+
+    it('answers null for a volume portion with no usable gram weight', () => {
+        // The shape validation quarantines as `missing_gram_weight`, which the
+        // fixture also carries in `ai:prepared_meal:vegetable barley soup cup`:
+        // a cup of something whose weight nobody recorded states no density.
+        expect(
+            volumeDensityFor({
+                density_g_per_ml: null,
+                default_portion: portion({ description: '1 cup', unit: 'cup', gram_weight: 0 }),
+            }),
+        ).toBeNull();
+    });
+
+    it('answers null for a food with no default portion at all', () => {
+        expect(volumeDensityFor({ density_g_per_ml: null, default_portion: null })).toBeNull();
+    });
+});
+
 describe('displayFamilyForPortion', () => {
+    const withPortion = (overrides: Partial<GroceryDefaultPortion>): GroceryConversionFacts => ({
+        density_g_per_ml: null,
+        default_portion: portion(overrides),
+    });
+
     it('reads the family off the default portion unit', () => {
-        expect(displayFamilyForPortion(portion({ unit: 'oz' }))).toBe('mass');
-        expect(displayFamilyForPortion(portion({ unit: 'tbsp' }))).toBe('volume');
-        expect(displayFamilyForPortion(portion({ unit: 'each' }))).toBe('count');
+        expect(displayFamilyForPortion(withPortion({ unit: 'oz' }))).toBe('mass');
+        expect(displayFamilyForPortion(withPortion({ unit: 'tbsp', gram_weight: 14 }))).toBe('volume');
+        expect(displayFamilyForPortion(withPortion({ unit: 'each' }))).toBe('count');
     });
 
     it('falls back to mass for a container unit, which is never generated', () => {
-        expect(displayFamilyForPortion(portion({ description: 'bottle', unit: 'bottle' }))).toBe('mass');
+        expect(displayFamilyForPortion(withPortion({ description: 'bottle', unit: 'bottle' }))).toBe('mass');
     });
 
     it('falls back to mass when the food has no default portion', () => {
-        expect(displayFamilyForPortion(null)).toBe('mass');
+        expect(displayFamilyForPortion({ density_g_per_ml: null, default_portion: null })).toBe('mass');
+    });
+
+    describe('a row is only put in a family it can actually be rendered in', () => {
+        // THE SHIPPED SHAPE, and the reason this function takes the facts rather
+        // than the portion alone. A volume-unit default portion against a null
+        // `density_g_per_ml` is what all 4,622 volume-portion foods of release v1
+        // look like; 41 of the 42 seeded recipes carry at least one. It renders
+        // as a volume because the portion itself states the density.
+        it('chooses volume for a density-less food whose portion states one', () => {
+            expect(displayFamilyForPortion(groceryFacts('ai:beverage:cold brew coffee concentrate:prepared'))).toBe(
+                'volume',
+            );
+        });
+
+        // The degradation, and it is a DEGRADATION rather than a failure: grams
+        // are what was actually measured, so a food that can state no density at
+        // all is weighed. Failing instead would take the whole shopping list —
+        // and with it the plan publication and every swap — down over one row's
+        // unit.
+        it('weighs a volume-portion food that can state no density, instead of throwing', () => {
+            expect(displayFamilyForPortion(withPortion({ description: '1 cup', unit: 'cup', gram_weight: 0 }))).toBe(
+                'mass',
+            );
+        });
+
+        it('weighs a count-portion food whose portion has no gram weight to divide by', () => {
+            // `requireCountPortion` would refuse this portion when the amount is
+            // rendered, so choosing `count` for it would pick a family the row
+            // cannot be shown in.
+            expect(displayFamilyForPortion(withPortion({ unit: 'each', gram_weight: 0 }))).toBe('mass');
+        });
+
+        it('is total: every family it answers can render the grams it was chosen for', () => {
+            const CASES: readonly GroceryConversionFacts[] = [
+                groceryFacts('ai:beverage:cold brew coffee concentrate:prepared'),
+                groceryFacts('usda:9200109'),
+                groceryFacts('usda:9200107'),
+                facts(),
+                withPortion({ description: '1 cup', unit: 'cup', gram_weight: 0 }),
+                withPortion({ unit: 'each', gram_weight: 0 }),
+                withPortion({ description: 'bottle', unit: 'bottle' }),
+                { density_g_per_ml: null, default_portion: null },
+            ];
+
+            for (const candidate of CASES) {
+                const family = displayFamilyForPortion(candidate);
+
+                expect(() => buildGroceryDisplay(500, family, candidate)).not.toThrow();
+            }
+        });
     });
 });
 
@@ -771,7 +918,71 @@ describe('buildGroceryDisplay', () => {
             expect(buildGroceryDisplay(10, 'volume', volumeFacts).text).toBe('10 ml');
         });
 
-        it('refuses to treat millilitres as grams when the food has no density', () => {
+        /**
+         * The shipped shape: `nutrition_basis: per_100g`, `density_g_per_ml`
+         * NULL, and a volume-family default portion — all 4,622 volume-portion
+         * foods of catalog release v1, and the ingredient shape 41 of the 42
+         * seeded recipes carry. The portion is the conversion source §0.1.4
+         * names ("display … through stored portion conversions"), so these rows
+         * render rather than taking the publication down.
+         */
+        describe('a food whose density is stated only by its portion', () => {
+            /** Olive oil as the release ships it: 1 tbsp weighs 13.5 g, density null. */
+            const shippedOilFacts: GroceryConversionFacts = {
+                density_g_per_ml: null,
+                default_portion: portion({ description: '1 tbsp', unit: 'tbsp', gram_weight: 13.5 }),
+            };
+
+            // §0.1.4's own worked example, "Olive oil · 6 tbsp", from the shape
+            // the catalog actually holds: six of a 13.5 g tablespoon is 81 g,
+            // and 81 g back through the density that portion states is exactly
+            // six tablespoons again.
+            it('renders the Agent Action Plan\u2019s "Olive oil \u00b7 6 tbsp" example', () => {
+                expect(buildGroceryDisplay(6 * 13.5, 'volume', shippedOilFacts)).toEqual({
+                    family: 'volume',
+                    quantity: 6,
+                    unit: 'tbsp',
+                    text: '6 tbsp',
+                });
+            });
+
+            it('promotes to cups on the derived density just as it does on a stored one', () => {
+                expect(buildGroceryDisplay(16 * 13.5, 'volume', shippedOilFacts).text).toBe('1 cup');
+            });
+
+            it('renders a committed fixture food of that shape in cups', () => {
+                // `ai:beverage:cold brew coffee concentrate:prepared`: 1 cup
+                // weighs 240 g, so two cups is 480 g.
+                expect(
+                    buildGroceryDisplay(
+                        480,
+                        'volume',
+                        groceryFacts('ai:beverage:cold brew coffee concentrate:prepared'),
+                    ).text,
+                ).toBe('2 cups');
+            });
+
+            it('divides the portion\u2019s amount out, so a two-tablespoon portion renders half as much', () => {
+                // A 2 tbsp / 30 g portion states 15 g per tablespoon, so 60 g is
+                // four tablespoons. Read as a one-tablespoon portion it would
+                // state 30 g and print "2 tbsp" for the same grams.
+                expect(
+                    buildGroceryDisplay(60, 'volume', {
+                        density_g_per_ml: null,
+                        default_portion: portion({ description: '2 tbsp', amount: 2, unit: 'tbsp', gram_weight: 30 }),
+                    }).text,
+                ).toBe('4 tbsp');
+            });
+        });
+
+        // THE LOUD FAILURE IS KEPT, and this is the case that still reaches it:
+        // an `oz` portion states no volume, so this food can state no density at
+        // all — and `displayFamilyForPortion` would therefore never choose
+        // `volume` for it. Getting here means a STORED row's recorded
+        // `display_unit` says volume, which is the unit-family lock broken
+        // upstream (§0.7.3) rather than a rendering choice, so it must not be
+        // papered over with an assumed 1 g/ml.
+        it('refuses to treat millilitres as grams when the food can state no density', () => {
             expect(() =>
                 buildGroceryDisplay(100, 'volume', { density_g_per_ml: null, default_portion: portion() }),
             ).toThrow(UnitConversionError);
@@ -813,6 +1024,56 @@ describe('buildGroceryDisplay', () => {
                     unit: COUNT_DISPLAY_UNIT,
                     text: `4 ${plural}`,
                 });
+            });
+        });
+
+        /*
+         * The descriptions the shipped catalog actually stores, which are not
+         * bare nouns: the item is named first and qualified afterwards
+         * ("egg, large", "can, drained"), and a portion counting several items
+         * states its amount in front of the noun ("5 sprigs" at 1 g, USDA's
+         * dill weed portion). A row that rendered the description verbatim read
+         * "6 1 egg, larges" and counted 9 g of dill as nine sprigs.
+         */
+        describe('a real catalog portion description', () => {
+            const shippedFacts = (description: string, gramWeight: number): GroceryConversionFacts => ({
+                density_g_per_ml: null,
+                default_portion: portion({ description, unit: 'each', gram_weight: gramWeight }),
+            });
+
+            it('states the amount once, and pluralises the item rather than its qualifier', () => {
+                expect(buildGroceryDisplay(300, 'count', shippedFacts('1 egg, large', 50))).toEqual({
+                    family: 'count',
+                    quantity: 6,
+                    unit: COUNT_DISPLAY_UNIT,
+                    text: '6 eggs, large',
+                });
+            });
+
+            it('counts the items a multi-item portion contains', () => {
+                expect(buildGroceryDisplay(9, 'count', shippedFacts('5 sprigs', 1))).toEqual({
+                    family: 'count',
+                    quantity: 45,
+                    unit: COUNT_DISPLAY_UNIT,
+                    text: '45 sprigs',
+                });
+            });
+
+            it('reads a single item of a multi-item portion in the singular', () => {
+                expect(buildGroceryDisplay(0.2, 'count', shippedFacts('5 sprigs', 1)).text).toBe('1 sprig');
+            });
+
+            const SHIPPED_ROWS: Array<[string, number, number, string]> = [
+                ['1 can, drained', 253, 506, '2 cans, drained'],
+                ['1 avocado', 201, 201, '1 avocado'],
+                ['1 tomato, medium', 123, 369, '3 tomatoes, medium'],
+                ['1 clove', 3, 12, '4 cloves'],
+                ['1 potato, medium', 213, 426, '2 potatoes, medium'],
+                ['1 slice', 16, 48, '3 slices'],
+            ];
+
+            it.each(SHIPPED_ROWS)('renders "%s" at %p g each, %p g in all, as "%s"', (description, gramWeight, grams, expected) => {
+                expect(buildGroceryDisplay(grams, 'count', shippedFacts(description, gramWeight)).text).toBe(expected);
             });
         });
 
@@ -867,6 +1128,64 @@ describe('storedRowFamily', () => {
     });
 });
 
+/**
+ * The predicate a plan publication and a swap commit translate their grocery
+ * faults with, so §0.5.2's `502 plan_generation_failed` / `502 swap_failed`
+ * escapes instead of a raw 500.
+ *
+ * It has to recognise BOTH classes and NOTHING else: `grocery.service.ts` raises
+ * plain `Error`s for its own broken write invariants ("deleted N rows instead of
+ * M"), which describe a state no client can act on and are documented as
+ * reaching the controller as a 500. Widening this predicate to `Error` is
+ * exactly how those would start being reported to the client as a swap failure.
+ */
+describe('isGroceryRenderingFault', () => {
+    it('recognises this module\u2019s own data fault', () => {
+        expect(isGroceryRenderingFault(new GroceryDataError('no catalog facts'))).toBe(true);
+    });
+
+    it('recognises the unit conversion fault raised by utils/units.ts', () => {
+        expect(isGroceryRenderingFault(new UnitConversionError('no density'))).toBe(true);
+    });
+
+    it('recognises them as thrown, and not only as constructed', () => {
+        const thrown = ((): unknown => {
+            try {
+                buildGroceryDisplay(100, 'volume', { density_g_per_ml: null, default_portion: portion() });
+            } catch (error) {
+                return error;
+            }
+
+            throw new Error('Expected the volume branch to refuse a food with no density');
+        })();
+
+        expect(isGroceryRenderingFault(thrown)).toBe(true);
+    });
+
+    it('does not recognise the untyped write-invariant faults, which stay 500s', () => {
+        expect(
+            isGroceryRenderingFault(new Error('Removing grocery rows of plan p deleted 2 rows instead of 3.')),
+        ).toBe(false);
+    });
+
+    it.each([
+        ['a typed refusal from another vocabulary', new PlanNotFoundError()],
+        ['a bare error', new Error('boom')],
+        ['a type error', new TypeError('boom')],
+    ])('does not recognise %s', (_case, error) => {
+        expect(isGroceryRenderingFault(error)).toBe(false);
+    });
+
+    it.each([
+        ['a string', 'boom'],
+        ['null', null],
+        ['undefined', undefined],
+        ['a plain object', { name: 'UnitConversionError' }],
+    ])('answers false for %s rather than assuming a shape', (_case, value) => {
+        expect(isGroceryRenderingFault(value)).toBe(false);
+    });
+});
+
 /* ---------------------------------------------------------------------------
  * The food_state name suffix
  * ------------------------------------------------------------------------- */
@@ -907,11 +1226,97 @@ describe('buildGroceryName', () => {
     });
 
     it('reads a multi-word state as words', () => {
-        expect(buildGroceryName('Flour', 'as_purchased', new Map())).toBe('Flour, as purchased');
+        const bothForms = indexFoodStatesByName([
+            { name: 'Flour', food_state: 'as_purchased' },
+            { name: 'Flour', food_state: DRY },
+        ]);
+
+        expect(buildGroceryName('Flour', 'as_purchased', bothForms)).toBe('Flour, as purchased');
     });
 
     it('leaves a raw food unqualified when the list index does not mention it', () => {
         expect(buildGroceryName('Chicken breast', RAW, new Map())).toBe('Chicken breast');
+    });
+
+    /*
+     * The three rules the shopping name balances. A duplicated state ("Brown
+     * rice, cooked, cooked") and a state the shop does not sell the food in any
+     * other way ("Olive oil, as purchased") are both text a shopper has to read
+     * past, and neither tells them anything the name did not already say.
+     */
+    const SHOPPING_FORM_CASES: Array<[string, string]> = [
+        ['Olive oil', 'as_purchased'],
+        ['Canola oil', 'as_purchased'],
+        ['Honey', 'as_purchased'],
+        ['Maple syrup', 'as_purchased'],
+        ['Greek yogurt, plain', 'as_purchased'],
+        ['Almond milk, unsweetened', 'as_purchased'],
+    ];
+
+    it.each(SHOPPING_FORM_CASES)('says nothing about the state of %s, which is sold as purchased', (name, state) => {
+        expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(name);
+    });
+
+    const SELF_STATING_CASES: Array<[string, string]> = [
+        ['Brown rice, cooked', COOKED],
+        ['Pasta, cooked', COOKED],
+        ['Quinoa, cooked', COOKED],
+        ['Black beans, canned', COOKED],
+        ['Kidney beans, canned', COOKED],
+        ['Chickpeas, canned', COOKED],
+        ['Rolled oats, dry', DRY],
+        ['Lentils, dry', DRY],
+        ['Bulgur, dry', DRY],
+        ['Tuna, canned in water', 'prepared'],
+        ['Turkey breast, sliced', 'prepared'],
+    ];
+
+    it.each(SELF_STATING_CASES)('does not repeat the state %s already states', (name, state) => {
+        expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(name);
+    });
+
+    it('reads the qualifiers only, so a name whose noun resembles a state still gets its suffix', () => {
+        // "Rolled oats, dry" in a COOKED state is a different food from the dry
+        // one, and "dry" is not a way of saying "cooked".
+        expect(buildGroceryName('Rolled oats, dry', COOKED, indexFoodStatesByName([{ name: 'Rolled oats, dry', food_state: COOKED }]))).toBe(
+            'Rolled oats, dry, cooked',
+        );
+    });
+
+    it('reads a state stated in the last of several qualifiers', () => {
+        expect(buildGroceryName('Beef, ground, cooked', COOKED, new Map())).toBe('Beef, ground, cooked');
+    });
+
+    const RESIDUAL_SUFFIX_CASES: Array<[string, string, string]> = [
+        ['Salt', DRY, 'Salt, dry'],
+        ['All-purpose flour', DRY, 'All-purpose flour, dry'],
+        ['Salsa', 'prepared', 'Salsa, prepared'],
+        ['Hummus', 'prepared', 'Hummus, prepared'],
+    ];
+
+    it.each(RESIDUAL_SUFFIX_CASES)('still qualifies %s, whose name states no preparation', (name, state, expected) => {
+        expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(expected);
+    });
+
+    it('qualifies every line of a coexisting name, even the ones that would otherwise stay silent', () => {
+        // Coexistence outranks both silencing rules: two rows of one base name
+        // must never render the same string, or the shopper reads one line and
+        // buys half of what the week needs.
+        const coexisting = indexFoodStatesByName([
+            { name: 'Black beans, canned', food_state: COOKED },
+            { name: 'Black beans, canned', food_state: DRY },
+        ]);
+
+        expect(buildGroceryName('Black beans, canned', COOKED, coexisting)).toBe('Black beans, canned, cooked');
+        expect(buildGroceryName('Black beans, canned', DRY, coexisting)).toBe('Black beans, canned, dry');
+
+        const oilForms = indexFoodStatesByName([
+            { name: 'Olive oil', food_state: 'as_purchased' },
+            { name: 'Olive oil', food_state: RAW },
+        ]);
+
+        expect(buildGroceryName('Olive oil', 'as_purchased', oilForms)).toBe('Olive oil, as purchased');
+        expect(buildGroceryName('Olive oil', RAW, oilForms)).toBe('Olive oil, raw');
     });
 });
 
@@ -1038,11 +1443,11 @@ describe('buildGroceryRows', () => {
             [eggFacts(), oilFacts()],
         );
 
-        // The oil's name carries its state because the catalog food really is
-        // `as_purchased` and it is the only non-raw line on this list.
+        // The oil's name says nothing about its state: `as_purchased` is how the
+        // shop sells it, and no second form of it is on this list to tell apart.
         expect(rows.map((line) => [line.name, line.display_text, line.display_unit])).toEqual([
             ['Eggs', '12 eggs', COUNT_DISPLAY_UNIT],
-            ['Olive oil, as purchased', '1 cup', 'cup'],
+            ['Olive oil', '1 cup', 'cup'],
         ]);
     });
 
@@ -1746,6 +2151,168 @@ describe('buildGroceryFlag', () => {
                 });
             });
         });
+
+        /**
+         * A portion that counts several items puts every string on the item
+         * scale, including the baseline. `display_quantity` counts items, so
+         * subtracting portions from it would report a fifth of the real
+         * increase on a five-sprig portion — and the "was" would disagree with
+         * both of the other two strings.
+         */
+        describe('a portion that counts several items', () => {
+            const dillFacts = (): GroceryConversionFacts => ({
+                density_g_per_ml: null,
+                default_portion: portion({ description: '5 sprigs', unit: 'each', gram_weight: 1 }),
+            });
+
+            const dillRow = (grams: number, baselineGrams: number): StoredGroceryRow => {
+                const display = buildGroceryDisplay(grams, 'count', dillFacts());
+
+                return row({
+                    quantity_grams: grams,
+                    display_quantity: display.quantity,
+                    display_unit: display.unit,
+                    display_text: display.text,
+                    previous_quantity_grams: baselineGrams,
+                    flagged_at: NOW,
+                });
+            };
+
+            it('measures the increase in items rather than in portions', () => {
+                // 9 g of dill is 45 sprigs and 5 g is 25, so the shopper needs
+                // twenty sprigs more — not the four portions the grams differ by.
+                expect(buildGroceryFlag(dillRow(9, 5), dillFacts())).toEqual({
+                    previousDisplayText: '25 sprigs',
+                    newDisplayText: '45 sprigs',
+                    deltaDisplayText: '+20 sprigs',
+                    flaggedAt: NOW.toISOString(),
+                });
+            });
+
+            it('reconciles the three strings, whatever the portion counts', () => {
+                const flag = buildGroceryFlag(dillRow(4, 3), dillFacts());
+
+                expect(flag).toMatchObject({
+                    previousDisplayText: '15 sprigs',
+                    newDisplayText: '20 sprigs',
+                    deltaDisplayText: '+5 sprigs',
+                });
+            });
+
+            it('counts from the rendered baseline when the items do not divide evenly', () => {
+                // 8.5 g of dill is 42.5 sprigs and 7.5 g is 37.5. Rounding the
+                // baseline for "was" and again for the pill put "38 sprigs"
+                // beside "+6", which does not reach the 43 the row shows.
+                expect(buildGroceryFlag(dillRow(8.5, 7.5), dillFacts())).toMatchObject({
+                    previousDisplayText: '38 sprigs',
+                    newDisplayText: '43 sprigs',
+                    deltaDisplayText: '+5 sprigs',
+                });
+            });
+        });
+
+        describe('a baseline that renders to a whole item it does not equal', () => {
+            /**
+             * Real weekly amounts rarely divide by a portion weight, so the
+             * baseline usually carries a fraction of an item. Every row here is
+             * a food and a pair of amounts taken from the shipped release, and
+             * every one of them read one item too high before the flag began
+             * subtracting the number it had already rendered.
+             */
+            const FRACTIONAL_CASES: ReadonlyArray<{
+                readonly food: string;
+                readonly description: string;
+                readonly gramWeight: number;
+                readonly grams: number;
+                readonly baselineGrams: number;
+                readonly previous: string;
+                readonly current: string;
+                readonly delta: string;
+            }> = [
+                {
+                    food: 'Avocado',
+                    description: '1 avocado',
+                    gramWeight: 201,
+                    grams: 301.5,
+                    baselineGrams: 100.5,
+                    previous: '1 avocado',
+                    current: '2 avocados',
+                    delta: '+1 avocado',
+                },
+                {
+                    food: 'Banana',
+                    description: '1 banana, medium',
+                    gramWeight: 118,
+                    grams: 413,
+                    baselineGrams: 295,
+                    previous: '3 bananas, medium',
+                    current: '4 bananas, medium',
+                    delta: '+1 banana, medium',
+                },
+                {
+                    food: 'Carrot',
+                    description: '1 carrot, medium',
+                    gramWeight: 61,
+                    grams: 396.5,
+                    baselineGrams: 335.5,
+                    previous: '6 carrots, medium',
+                    current: '7 carrots, medium',
+                    delta: '+1 carrot, medium',
+                },
+                {
+                    food: 'Garlic',
+                    description: '1 clove',
+                    gramWeight: 3,
+                    grams: 40.5,
+                    baselineGrams: 37.5,
+                    previous: '13 cloves',
+                    current: '14 cloves',
+                    delta: '+1 clove',
+                },
+                {
+                    food: 'Potato, russet',
+                    description: '1 potato, medium',
+                    gramWeight: 213,
+                    grams: 319.5,
+                    baselineGrams: 106.5,
+                    previous: '1 potato, medium',
+                    current: '2 potatoes, medium',
+                    delta: '+1 potato, medium',
+                },
+            ];
+
+            it.each(FRACTIONAL_CASES)(
+                '$food reads "was $previous", "$current" and "$delta", which add up',
+                ({ description, gramWeight, grams, baselineGrams, previous, current, delta }) => {
+                    const facts: GroceryConversionFacts = {
+                        density_g_per_ml: null,
+                        default_portion: portion({ description, unit: 'each', gram_weight: gramWeight }),
+                    };
+                    const display = buildGroceryDisplay(grams, 'count', facts);
+
+                    const flag = buildGroceryFlag(
+                        row({
+                            quantity_grams: grams,
+                            display_quantity: display.quantity,
+                            display_unit: display.unit,
+                            display_text: display.text,
+                            previous_quantity_grams: baselineGrams,
+                            flagged_at: NOW,
+                        }),
+                        facts,
+                    );
+
+                    expect(flag).toMatchObject({
+                        previousDisplayText: previous,
+                        newDisplayText: current,
+                        deltaDisplayText: delta,
+                    });
+
+                    const wholeItemsAdded = Number(delta.slice(1, delta.indexOf(' ')));
+                    expect(Number(previous.slice(0, previous.indexOf(' '))) + wholeItemsAdded).toBe(display.quantity);
+                },
+            );
+        });
     });
 
     describe('volumes', () => {
@@ -1782,6 +2349,145 @@ describe('buildGroceryFlag', () => {
             });
 
             expect(buildGroceryFlag(flagged, oilFacts())).toMatchObject({ deltaDisplayText: '+1½ cups' });
+        });
+
+        // THE SHIPPED SHAPE on the flag path, which reads the density a second
+        // time — once for "was Y" and once for the delta pill. A release food
+        // carries no `density_g_per_ml`, so all three strings of the 14b flag
+        // are produced from the density its portion states: a cup of this food
+        // weighs 240 g, so 1 cup was acknowledged, 1¼ cups are needed, and the
+        // pill reconciles the two.
+        it('renders all three strings for a food whose density comes from its portion', () => {
+            const coldBrew = groceryFacts('ai:beverage:cold brew coffee concentrate:prepared');
+            const gramsPerCup = 240;
+            const flagged = oilRow({
+                catalog_food_id: coldBrew.catalog_food_id,
+                name: 'Cold brew coffee concentrate',
+                quantity_grams: 1.25 * gramsPerCup,
+                display_quantity: 1.25,
+                display_text: '1¼ cups',
+                previous_quantity_grams: gramsPerCup,
+            });
+
+            expect(buildGroceryFlag(flagged, coldBrew)).toMatchObject({
+                previousDisplayText: '1 cup',
+                newDisplayText: '1¼ cups',
+                deltaDisplayText: '+¼ cup',
+            });
+        });
+
+        // The lock's counterpart on this path: a stored volume row whose food
+        // can state no density at all is a broken invariant, and the flag fails
+        // loudly rather than describing an amount nothing measured.
+        it('refuses to render a stored volume row whose food can state no density', () => {
+            const flagged = oilRow({
+                quantity_grams: 1.25 * MILLILITERS_PER_CUP,
+                display_quantity: 1.25,
+                display_text: '1¼ cups',
+                previous_quantity_grams: MILLILITERS_PER_CUP,
+            });
+
+            expect(() =>
+                buildGroceryFlag(flagged, { density_g_per_ml: null, default_portion: portion() }),
+            ).toThrow(UnitConversionError);
+        });
+
+        it('stays in tablespoons when the row never leaves them', () => {
+            // A quarter-tablespoon more of oil: the row's unit can hold the
+            // baseline and the gap, so nothing is re-tiered and all three
+            // strings are tablespoons.
+            const flagged = oilRow({
+                display_unit: 'tbsp',
+                quantity_grams: 15.5 * MILLILITERS_PER_TABLESPOON,
+                display_quantity: 15.5,
+                display_text: '15½ tbsp',
+                previous_quantity_grams: 15.25 * MILLILITERS_PER_TABLESPOON,
+            });
+
+            expect(buildGroceryFlag(flagged, oilFacts())).toMatchObject({
+                previousDisplayText: '15¼ tbsp',
+                newDisplayText: '15½ tbsp',
+                deltaDisplayText: '+¼ tbsp',
+            });
+        });
+    });
+
+    /**
+     * The three strings are read together — "Now 2 cups", "was ¾ cup", "+1¼
+     * cups" — so all three are rendered in the ROW's unit even when the
+     * acknowledged amount, taken on its own, would be rendered in a smaller
+     * one. Letting the baseline choose its own unit is what put "was 14 tbsp"
+     * beside "2 cups" with a "+1 cup" pill: each string was true and the three
+     * did not add up.
+     */
+    describe('a baseline whose own unit would differ from the row\u2019s', () => {
+        const cupRow = (baselineTablespoons: number): StoredGroceryRow =>
+            row({
+                catalog_food_id: OLIVE_OIL,
+                name: 'Olive oil',
+                quantity_grams: 2 * MILLILITERS_PER_CUP,
+                display_quantity: 2,
+                display_unit: 'cups',
+                display_text: '2 cups',
+                previous_quantity_grams: baselineTablespoons * MILLILITERS_PER_TABLESPOON,
+                flagged_at: NOW,
+            });
+
+        it('reads a tablespoon-scale baseline in the row\u2019s cups', () => {
+            // 14 tbsp is ⅞ of a cup, which the quarter precision this row
+            // displays reads as 1 — and 1 + 1 = 2, the amount beside it.
+            // formatVolume, asked on its own, would have said "14 tbsp".
+            expect(buildGroceryFlag(cupRow(14), oilFacts())).toEqual({
+                previousDisplayText: '1 cup',
+                newDisplayText: '2 cups',
+                deltaDisplayText: '+1 cup',
+                flaggedAt: NOW.toISOString(),
+            });
+        });
+
+        it('keeps a fractional baseline fractional, in the row\u2019s unit', () => {
+            // 10 tbsp is ⅝ of a cup, which quarter precision reads as ¾, and
+            // ¾ + 1¼ = 2.
+            expect(buildGroceryFlag(cupRow(10), oilFacts())).toMatchObject({
+                previousDisplayText: '¾ cup',
+                deltaDisplayText: '+1¼ cups',
+            });
+        });
+
+        it('reads an ounce-scale baseline in the row\u2019s pounds', () => {
+            // 8.7 oz is 246.6 g, which formatMass renders in ounces; in pounds
+            // it is 0.5, and 0.5 + 0.7 = 1.2 exactly.
+            const flagged = row({
+                quantity_grams: 1.2 * GRAMS_PER_POUND,
+                display_quantity: 1.2,
+                display_unit: 'lb',
+                display_text: '1.2 lb',
+                previous_quantity_grams: 8.7 * GRAMS_PER_OUNCE,
+                flagged_at: NOW,
+            });
+
+            expect(buildGroceryFlag(flagged, facts())).toEqual({
+                previousDisplayText: '0.5 lb',
+                newDisplayText: '1.2 lb',
+                deltaDisplayText: '+0.7 lb',
+                flaggedAt: NOW.toISOString(),
+            });
+        });
+
+        it('keeps a gram row at whole grams, the precision that unit displays', () => {
+            const flagged = row({
+                quantity_grams: 25,
+                display_quantity: 25,
+                display_unit: 'g',
+                display_text: '25 g',
+                previous_quantity_grams: 10,
+                flagged_at: NOW,
+            });
+
+            expect(buildGroceryFlag(flagged, facts())).toMatchObject({
+                previousDisplayText: '10 g',
+                deltaDisplayText: '+15 g',
+            });
         });
     });
 

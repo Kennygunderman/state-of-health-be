@@ -131,6 +131,7 @@
 import { Prisma } from '../generated/prisma';
 import { prisma } from '../prisma/client';
 import {
+    GroceryChangeSummary,
     LoggedPlannedEntry,
     MealPlanDayResponse,
     MealPlanMacroTotals,
@@ -141,7 +142,12 @@ import {
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
 import { mealPlanningFault } from '../utils/featureFlags';
-import { loadPlannedMealsForGroceries, rebuildPlanGroceries } from './grocery.service';
+import { isGroceryRenderingFault } from './grocery.logic';
+import {
+    PlanGroceryRebuildParams,
+    loadPlannedMealsForGroceries,
+    rebuildPlanGroceries,
+} from './grocery.service';
 import {
     PlanLifecycleState,
     requireWritablePlan,
@@ -927,6 +933,41 @@ export const getSwapPreview = async (
  * ------------------------------------------------------------------------- */
 
 /**
+ * Step 7's grocery reconciliation, with the grocery domain's faults translated
+ * into this endpoint's own refusal.
+ *
+ * `grocery.logic.ts` and `utils/units.ts` raise their own classes —
+ * `GroceryDataError` and `UnitConversionError` — which are deliberately absent
+ * from `mealPlanning.errors.ts`'s vocabulary, so left alone they would reach the
+ * controller as an unclassifiable 500 while §0.5.2 promises `502 swap_failed` as
+ * this endpoint's only 5xx. WORSE THAN THE STATUS CODE: the rebuild runs after
+ * the preview has already answered, so the user meets the failure having just
+ * been shown a correct preview, and `swap_failed` is precisely the answer 13e is
+ * drawn for — "your lunch is unchanged and your grocery list was not updated",
+ * which this transaction's rollback makes literally true.
+ *
+ * Only what {@link isGroceryRenderingFault} recognises is translated; anything
+ * else propagates untouched, which is what keeps `grocery.service.ts`'s untyped
+ * write invariants ("deleted N rows instead of M") reaching the controller as
+ * the 500 they are documented to be. The original fault travels on the typed
+ * error's `cause` for the server log.
+ */
+const rebuildGroceriesOrRefuse = async (
+    tx: Prisma.TransactionClient,
+    params: PlanGroceryRebuildParams,
+): Promise<GroceryChangeSummary> => {
+    try {
+        return await rebuildPlanGroceries(tx, params);
+    } catch (error) {
+        if (isGroceryRenderingFault(error)) {
+            throw new SwapFailedError(error);
+        }
+
+        throw error;
+    }
+};
+
+/**
  * `POST …/meals/:mealId/swap` — replace the meal, in one transaction.
  *
  * The sequence inside `work` is §0.5.1's, and every step is ordered for a
@@ -1078,7 +1119,7 @@ export const commitSwap = async (
                     expectedPlanRevision: payload.expectedPlanRevision,
                     now,
                 });
-                const groceryChangeSummary = await rebuildPlanGroceries(lockedTx, {
+                const groceryChangeSummary = await rebuildGroceriesOrRefuse(lockedTx, {
                     userId,
                     planId: parsed.planId,
                     meals: await loadPlannedMealsForGroceries(lockedTx, userId, parsed.planId),

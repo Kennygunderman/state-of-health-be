@@ -117,6 +117,7 @@ import {
     PlanStatus,
     RegeneratePlanPayload,
 } from '../types/mealPlanning';
+import { isGroceryRenderingFault } from './grocery.logic';
 import {
     buildPlanGroceryDrafts,
     loadPlannedMealsForGroceries,
@@ -155,6 +156,7 @@ import {
     toPlanLifecycleState,
 } from './mealPlan.mapper';
 import {
+    PlanGenerationError,
     PlanNotFoundError,
     PreferencesIncompleteError,
     StalePlanError,
@@ -1173,6 +1175,25 @@ const insertGeneratedPlan = async (
  * old plan's stored rows, which is the only place a regeneration's check state
  * can come from — the new plan has no rows of its own yet (§0.5.1, "copies
  * grocery check state for unchanged items").
+ *
+ * THE GROCERY DOMAIN'S FAULTS ARE TRANSLATED HERE, and this is the only place
+ * they are. `grocery.logic.ts` and `utils/units.ts` raise their own classes —
+ * `GroceryDataError` and `UnitConversionError` — which are deliberately absent
+ * from `mealPlanning.errors.ts`'s vocabulary, so left alone they reach the
+ * controller as an unclassifiable 500 while §0.5.2 promises `502
+ * plan_generation_failed` as this endpoint's only 5xx. One wrap covers BOTH
+ * publication paths, because a first generation and a regeneration both write
+ * their list through this function; wrapping the two call sites instead would be
+ * two copies of the rule, one of which would eventually be forgotten.
+ *
+ * Only what {@link isGroceryRenderingFault} recognises is translated. Everything
+ * else propagates untouched — in particular `grocery.service.ts`'s untyped write
+ * invariants ("deleted N rows instead of M"), which describe a state no client
+ * can act on and are documented as reaching the controller as a 500. The
+ * original fault travels on the typed error's `cause` for the server log, and
+ * nothing is persisted either way: the transaction this runs in rolls back
+ * whole, so the "nothing was published" assurance of `PlanGenerationError`
+ * stays true.
  */
 const writeGroceriesForNewPlan = async (
     tx: Prisma.TransactionClient,
@@ -1181,12 +1202,20 @@ const writeGroceriesForNewPlan = async (
     replacedPlanId: string | null,
     now: Date,
 ): Promise<void> => {
-    const meals = await loadPlannedMealsForGroceries(tx, userId, planId);
-    const drafts = await buildPlanGroceryDrafts(tx, meals);
-    const carryOverFrom =
-        replacedPlanId === null ? undefined : await loadStoredGroceryRows(tx, userId, replacedPlanId);
+    try {
+        const meals = await loadPlannedMealsForGroceries(tx, userId, planId);
+        const drafts = await buildPlanGroceryDrafts(tx, meals);
+        const carryOverFrom =
+            replacedPlanId === null ? undefined : await loadStoredGroceryRows(tx, userId, replacedPlanId);
 
-    await writePlanGroceryRows(tx, { userId, planId, drafts, carryOverFrom, now });
+        await writePlanGroceryRows(tx, { userId, planId, drafts, carryOverFrom, now });
+    } catch (error) {
+        if (isGroceryRenderingFault(error)) {
+            throw new PlanGenerationError(error);
+        }
+
+        throw error;
+    }
 };
 
 /**

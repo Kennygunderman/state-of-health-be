@@ -60,6 +60,7 @@ import {
     PlanNotFoundError,
     PreviewStaleError,
     StalePlanError,
+    SwapFailedError,
 } from '../../services/mealPlanning.errors';
 import {
     CommitSwapResult,
@@ -174,12 +175,17 @@ let fixture: SuiteFixture;
  * A food whose default portion is stated in GRAMS, which fixes its grocery line
  * in the `mass` family.
  *
- * `makeCatalogFood`'s own default portion is "1 cup", a VOLUME unit, and its
- * `density_g_per_ml` is null — the combination `utils/units.ts` refuses, because
- * millilitres never equal grams. So a grocery line derived from the factory's
- * default food cannot be rendered at all, and every food this suite shops for
- * states a gram portion instead. `food_state: 'raw'` keeps the rendered name
- * free of the state suffix §0.7.3 appends for every other state.
+ * A DELIBERATE CHOICE OF FAMILY, not a way round a refusal. `makeCatalogFood`'s
+ * own default portion is "1 cup / 200 g" with a null `density_g_per_ml` — the
+ * shape the whole catalog release ships — and it renders perfectly well:
+ * `grocery.logic.ts::volumeDensityFor` reads the density the portion itself
+ * states (200 g per cup ≈ 0.845 g/ml), which is the stored-portion conversion
+ * §0.1.4 prescribes. What a gram portion buys this suite is ARITHMETIC IT CAN
+ * STATE: every diff assertion below is written in the grams the recipes plan,
+ * so a mass line reads "7.1 oz" from 200 g with no unit conversion in between.
+ * The volume family is exercised on its own, in "a volume-portion food's line",
+ * below. `food_state: 'raw'` keeps the rendered name free of the state suffix
+ * §0.7.3 appends for every other state.
  */
 const makeShoppableFood = async (displayName: string): Promise<catalog_foods> =>
     makeCatalogFood({
@@ -188,6 +194,27 @@ const makeShoppableFood = async (displayName: string): Promise<catalog_foods> =>
         category: 'produce_vegetable',
         defaultPortion: { description: '1 portion', amount: 100, unit: 'g', gram_weight: 100 },
     });
+
+/**
+ * A food shaped the way the CATALOG RELEASE ships them: a volume-family default
+ * portion ("1 cup", 200 g) with no `density_g_per_ml` at all.
+ *
+ * `makeCatalogFood`'s own defaults are exactly that shape, which is why they are
+ * taken here rather than restated. The list this food lands on is rebuilt by
+ * `rebuildPlanGroceries` inside the swap's commit, so it is the shape that made
+ * every swap-driven rebuild fail: the row is rendered through the density its
+ * portion states (200 g per cup ≈ 0.845 g/ml, §0.1.4's stored-portion
+ * conversion), and 100 g of it therefore reads "8 tbsp".
+ */
+const makeVolumePortionFood = async (displayName: string): Promise<catalog_foods> =>
+    makeCatalogFood({
+        display_name: displayName,
+        food_state: 'raw',
+        category: 'produce_vegetable',
+    });
+
+/** 100 g of a 200 g-per-cup food, in the volume family: half a cup. */
+const ARRIVING_VOLUME_DISPLAY_TEXT = '8 tbsp';
 
 /**
  * A recipe version of exactly two ingredients, 200 g of each, at the per-100 g
@@ -245,7 +272,11 @@ const seedFixture = async (): Promise<SuiteFixture> => {
     const sharedFood = await makeShoppableFood('Shared Beans');
     const decreasingFood = await makeShoppableFood('Decreasing Lentils');
     const removedFood = await makeShoppableFood('Removed Squash');
-    const newFood = await makeShoppableFood('Arriving Peppers');
+    // The arriving line is the one food of the five whose portion is VOLUMETRIC,
+    // so the swap's own rebuild has to render a volume row to commit at all. It
+    // is the right one to shape that way: every other line carries a diff
+    // assertion stated in grams, while this one only has to appear.
+    const newFood = await makeVolumePortionFood('Arriving Peppers');
 
     const breakfastRecipe = await makeTwoIngredientRecipe(
         'swap-suite-breakfast',
@@ -638,6 +669,25 @@ describe("the grocery consequences of a swap, on a list the shopper has already 
         expect(grams(arrived.previous_quantity_grams)).toBeNull();
     });
 
+    // THE SHIPPED SHAPE, INSIDE THE COMMIT. The arriving food carries a volume
+    // default portion and no stored density — the shape all 4,622 volume-portion
+    // foods of the catalog release have — so the commit can only succeed if the
+    // rebuild renders it through the density that portion states. The failure
+    // this replaces arrived AFTER a correct preview, which is what made it worst:
+    // the user approved a swap and then met a 500.
+    it('renders a volume-portion food\u2019s arriving line instead of failing the commit', async () => {
+        await commitOrThrow(swapBody(fixture.equalPortionCandidate.id, 1));
+
+        const arrived = await requireGroceryRowFor(fixture.newFood);
+
+        expect(arrived.display_text).toBe(ARRIVING_VOLUME_DISPLAY_TEXT);
+        // The stored unit is a token `utils/units.ts` resolves, so the row's
+        // family is readable back off it on every later update (§0.7.3's
+        // unit-family lock).
+        expect(arrived.display_unit).toBe('tbsp');
+        expect(arrived.display_quantity).toBe(8);
+    });
+
     it('leaves the list holding exactly the identities the new week needs', async () => {
         await commitOrThrow(swapBody(fixture.equalPortionCandidate.id, 1));
 
@@ -661,11 +711,19 @@ describe('a swap whose grocery rebuild fails after the meal has been written', (
      * This is the deterministic way to fail the rebuild INSIDE the commit and
      * after the meal write: `applySwap` runs first, then
      * `rebuildPlanGroceries`, whose diff reads every surviving row's family back
-     * off its own `display_unit` and throws `GroceryDataError` for one it cannot
+     * off its own `display_unit` and raises `GroceryDataError` for one it cannot
      * resolve. So the transaction is interrupted exactly between the two halves
      * §0.5.2's 13e copy promises are inseparable — "your lunch is unchanged and
      * your grocery list was not updated" — and what the database holds
      * afterwards is the whole proof.
+     *
+     * WHAT THE CALLER SEES IS `SwapFailedError`, not the grocery class. §0.5.2
+     * gives this endpoint one 5xx, `502 swap_failed`, and 13e's copy is written
+     * for exactly that answer; `GroceryDataError` and `UnitConversionError`
+     * belong to no error vocabulary a controller maps, so escaping raw would
+     * make this a generic 500 the client cannot classify — which is why
+     * `swap.service.ts` translates them at its own boundary and keeps the
+     * original fault on `cause` for the log.
      */
     const breakTheRebuild = async (): Promise<{ rowId: string; restore: () => Promise<void> }> => {
         const row = await requireGroceryRowFor(fixture.unchangedFood);
@@ -683,6 +741,27 @@ describe('a swap whose grocery rebuild fails after the meal has been written', (
         };
     };
 
+    it('answers the typed swap refusal rather than letting the grocery fault escape', async () => {
+        await breakTheRebuild();
+
+        const thrown = await commitSwap(
+            USER_ID,
+            fixture.planId,
+            fixture.lunchMealId,
+            swapBody(fixture.equalPortionCandidate.id, 1),
+            NOW,
+        ).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        // The class the contract names, carrying the fault that caused it: a
+        // controller can answer `502 swap_failed` from the first and log the
+        // second, and neither has to parse a message.
+        expect(thrown).toBeInstanceOf(SwapFailedError);
+        expect((thrown as SwapFailedError).cause).toBeInstanceOf(GroceryDataError);
+    });
+
     it('rolls the meal, the day, the plan revision and the whole list back together', async () => {
         const { rowId } = await breakTheRebuild();
         const mealBefore = await storedLunch();
@@ -690,7 +769,7 @@ describe('a swap whose grocery rebuild fails after the meal has been written', (
         const rowsBefore = await storedGroceryRows();
 
         await expect(commitSwap(USER_ID, fixture.planId, fixture.lunchMealId, swapBody(fixture.equalPortionCandidate.id, 1), NOW)).rejects.toThrow(
-            GroceryDataError,
+            SwapFailedError,
         );
 
         expect(await storedLunch()).toEqual(mealBefore);
@@ -707,7 +786,7 @@ describe('a swap whose grocery rebuild fails after the meal has been written', (
         const { restore } = await breakTheRebuild();
 
         await expect(commitSwap(USER_ID, fixture.planId, fixture.lunchMealId, swapBody(fixture.equalPortionCandidate.id, 1), NOW)).rejects.toThrow(
-            GroceryDataError,
+            SwapFailedError,
         );
         await restore();
 

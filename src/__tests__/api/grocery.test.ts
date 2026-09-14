@@ -160,12 +160,17 @@ interface SuiteFixture {
 let fixture: SuiteFixture;
 
 /**
- * A food whose default portion is stated in GRAMS.
+ * A food whose default portion is stated in GRAMS, matching the `oz` display
+ * unit every line above is inserted with.
  *
- * `makeCatalogFood`'s own default portion is "1 cup" — a VOLUME unit — and its
- * `density_g_per_ml` is null, the combination `utils/units.ts` refuses because
- * millilitres never equal grams. A flagged row renders its "was Y" through these
- * facts, so a food without a mass portion could not be read back at all.
+ * A DELIBERATE CHOICE OF FAMILY, not a way round a refusal. `makeCatalogFood`'s
+ * own default portion is "1 cup / 200 g" with a null `density_g_per_ml` — the
+ * shape the catalog release ships — and it renders perfectly well, through the
+ * density that portion states (§0.1.4's stored-portion conversion). What a gram
+ * portion buys is agreement with the literal `display_*` values this file
+ * states: a flagged row's "was Y" is re-rendered from the food's facts on every
+ * read, so a mass line and a mass portion keep those strings in one family. The
+ * volume family is read back in "a line whose food is measured by volume" below.
  */
 const makeShoppableFood = async (displayName: string): Promise<catalog_foods> =>
     makeCatalogFood({
@@ -173,6 +178,15 @@ const makeShoppableFood = async (displayName: string): Promise<catalog_foods> =>
         food_state: 'raw',
         defaultPortion: { description: '1 portion', amount: 100, unit: 'g', gram_weight: 100 },
     });
+
+/**
+ * A food shaped the way the CATALOG RELEASE ships them: a volume-family default
+ * portion ("1 cup", 200 g) and no `density_g_per_ml` at all — which is exactly
+ * `makeCatalogFood`'s own default, so the defaults are taken rather than
+ * restated.
+ */
+const makeVolumePortionFood = async (displayName: string): Promise<catalog_foods> =>
+    makeCatalogFood({ display_name: displayName, food_state: 'raw' });
 
 const insertLines = async (
     userId: string,
@@ -394,6 +408,86 @@ describe('the grocery list read', () => {
 
         await expect(getGroceryList(OTHER_USER_ID, fixture.planId, NOW)).rejects.toThrow(PlanNotFoundError);
         await expect(getGroceryList(USER_ID, UNKNOWN_ITEM_ID, NOW)).rejects.toThrow(PlanNotFoundError);
+    });
+
+    /**
+     * THE SHIPPED SHAPE, on the read path. Every published food of catalog
+     * release v1 is `per_100g` with `density_g_per_ml` NULL, and 4,622 of them
+     * state their default portion in cups, tablespoons or teaspoons. Reading a
+     * list holding such a line converts grams to millilitres twice — once for
+     * the row's own amount and once for the flag's "was Y" — so the read is
+     * where a food that could not state a density took the whole list down.
+     *
+     * The line is inserted rather than published for this suite's usual reason:
+     * a freshly published list is never already flagged.
+     */
+    describe('a line whose food is measured by volume', () => {
+        /** 200 g of a 200 g-per-cup food: one cup, the acknowledged amount. */
+        const ACKNOWLEDGED_GRAMS = 200;
+
+        /** What the week now needs — half a cup more. */
+        const CURRENT_GRAMS = 300;
+
+        const insertVolumeLine = async (): Promise<string> => {
+            const food = await makeVolumePortionFood('Coconut Milk');
+
+            const row = await prisma.grocery_items.create({
+                data: {
+                    meal_plan_id: fixture.planId,
+                    user_id: USER_ID,
+                    catalog_food_id: food.id,
+                    food_state: food.food_state,
+                    category: 'pantry_other',
+                    name: 'Coconut Milk',
+                    quantity_grams: CURRENT_GRAMS,
+                    // The three `display_*` values a volume row of this food
+                    // carries, stated literally like every other line here:
+                    // 300 g at 200 g per cup is 1½ cups.
+                    display_quantity: 1.5,
+                    display_unit: 'cups',
+                    display_text: '1½ cups',
+                    is_checked: true,
+                    checked_at: CHECKED_AT,
+                    previous_quantity_grams: ACKNOWLEDGED_GRAMS,
+                    flagged_at: FLAGGED_AT,
+                    sort_order: LINES.length,
+                },
+            });
+
+            return row.id;
+        };
+
+        it('reads back with its flag rendered in cups, through the density its portion states', async () => {
+            const rowId = await insertVolumeLine();
+
+            const list = await getGroceryList(USER_ID, fixture.planId, NOW);
+            const line = list.checkedItems.find((item) => item.id === rowId);
+
+            expect(line).toMatchObject({
+                name: 'Coconut Milk',
+                quantityGrams: CURRENT_GRAMS,
+                displayText: '1½ cups',
+                isChecked: true,
+            });
+            // All three strings of the 14b flag, in the row's own family: the
+            // acknowledged cup, the cup and a half the week now needs, and the
+            // difference between the two.
+            expect(line?.flag).toEqual({
+                previousDisplayText: '1 cup',
+                newDisplayText: '1½ cups',
+                deltaDisplayText: '+½ cup',
+                flaggedAt: FLAGGED_AT.toISOString(),
+            });
+        });
+
+        it('is announced beside the mass line it shares the banner with', async () => {
+            await insertVolumeLine();
+
+            expect(await getGroceryList(USER_ID, fixture.planId, NOW)).toMatchObject({
+                totalCount: LINES.length + 1,
+                banner: { code: 'amount_increased', itemNames: ['Beans', 'Coconut Milk'] },
+            });
+        });
     });
 });
 

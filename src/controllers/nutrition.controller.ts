@@ -13,6 +13,7 @@ import {
     LogEntryErrorVerdict,
     parseEntryPath,
     parseLogEntryBody,
+    parseMealEntryEditBody,
     parseMealEntryPath,
 } from '../services/nutrition.logic';
 import { estimateMeal, scanLabel, EstimateFailedError } from '../services/estimate.service';
@@ -119,7 +120,16 @@ export const updateMealEntryController = async (req: Request, res: Response) => 
             return res.status(400).json(logEntryErrorBody(path));
         }
 
-        const entry = await updateMealEntry(userId, path.entryId, req.body);
+        // The body's one unanswerable failure, judged for the same reason as the
+        // path: a `name` carrying U+0000 reaches `meal_entries.name`, which
+        // PostgreSQL refuses, and the caller is the only one who can fix it.
+        // Everything else this route has always accepted it still accepts.
+        const body = parseMealEntryEditBody(req.body);
+        if (body.kind === 'error') {
+            return res.status(400).json(logEntryErrorBody(body));
+        }
+
+        const entry = await updateMealEntry(userId, path.entryId, body.payload);
         if (!entry) {
             return res.status(404).json({ error: 'Entry not found' });
         }

@@ -32,6 +32,14 @@
  *    and per-field details. One code for two of those is how the catalog shape
  *    came to lose its `invalid_request` code and details, so the three verdicts
  *    are asserted as distinct here rather than left to the controller's reading.
+ *  - **A stored string PostgreSQL cannot hold.** A body whose `name`,
+ *    `servingText` or `rawInput` carries U+0000 is refused with
+ *    `invalid_request` and `invalid_characters` on the field that carries it.
+ *    Unchecked it reaches the writer and returns as this endpoint's 500 for a
+ *    request only the caller can fix. The suite pins where the check sits — after
+ *    the legacy guard, so a body the guard already refuses keeps its frozen
+ *    response and this verdict can only ever replace a 500 — and how narrow it
+ *    is: every other control character still reaches the column and stores.
  *  - **Totality.** Every input — `null`, `undefined`, a primitive, an array, an
  *    object whose keys only look like properties — returns a verdict and never
  *    throws.
@@ -67,6 +75,13 @@
  *    and each one fails closed: nothing is written rather than an invented gram
  *    weight, a NULL nutrient read as zero, or a provenance the diary cannot
  *    label.
+ *  - **`containsNulCharacter` / `parseMealEntryEditBody`.** The stored-text rule
+ *    as its own predicate, and the one body check on
+ *    `PUT /api/macros/entry/:id`. That route has never validated its body and
+ *    must go on accepting everything it accepts today, so the edit parser's
+ *    suite is mostly the inputs it must still hand through untouched — the
+ *    non-object body included, which reaches the writer exactly as it always
+ *    has.
  *  - **`planMealEntryEdit`.** Whether an edit detaches the entry from the plan
  *    meal, recipe version or catalog food that vouches for its numbers.
  *    Detachment turns on an effective value change and never on field presence,
@@ -90,11 +105,14 @@ import {
     PLANNED_SNAPSHOT_PROVENANCE,
     ParsedEntryPath,
     ParsedLogEntryBody,
+    ParsedMealEntryEdit,
     ParsedMealEntryPath,
     StoredMealEntrySnapshot,
+    containsNulCharacter,
     isEntryNutritionProvenance,
     parseEntryPath,
     parseLogEntryBody,
+    parseMealEntryEditBody,
     parseMealEntryPath,
     planMealEntryEdit,
     resolveCatalogEntrySnapshot,
@@ -110,6 +128,12 @@ const LEGACY_REQUIRED_MESSAGE = 'name, calories, protein, carbs, and fat are req
 const CONFLICTING_REFERENCE_MESSAGE = 'foodId and catalogFoodId cannot both be provided';
 const UNRECOGNIZED_MESSAGE = 'either catalogFoodId or name, calories, protein, carbs, and fat are required';
 const SERVINGS_MESSAGE = 'servings must be a number between 0.25 and 10 with at most 2 decimal places';
+
+/**
+ * U+0000, written as an escape so it survives every editor and diff that would
+ * otherwise swallow or normalise a literal NUL byte in this file.
+ */
+const NUL = '\u0000';
 
 const validLegacyBody = (): Record<string, unknown> => ({
     name: 'Scrambled eggs',
@@ -150,6 +174,25 @@ const asCatalog = (verdict: ParsedLogEntryBody): CatalogVerdict => {
 /** `field:code` pairs in the order the parser reported them. */
 const fieldCodes = (verdict: ParsedLogEntryBody): string[] =>
     asError(verdict).details.map((detail) => `${detail.field}:${detail.code}`);
+
+type EditOkVerdict = Extract<ParsedMealEntryEdit, { kind: 'ok' }>;
+
+const asEditError = (verdict: ParsedMealEntryEdit): ErrorVerdict => {
+    if (verdict.kind !== 'error') {
+        throw new Error(`expected an error verdict, received "${verdict.kind}"`);
+    }
+    return verdict;
+};
+
+const asEditOk = (verdict: ParsedMealEntryEdit): EditOkVerdict => {
+    if (verdict.kind !== 'ok') {
+        throw new Error(`expected an ok verdict, received "${verdict.kind}"`);
+    }
+    return verdict;
+};
+
+const editFieldCodes = (verdict: ParsedMealEntryEdit): string[] =>
+    asEditError(verdict).details.map((detail) => `${detail.field}:${detail.code}`);
 
 describe('parseLogEntryBody', () => {
     describe('a body that is not an object', () => {
@@ -761,6 +804,282 @@ describe('parseLogEntryBody', () => {
                 expect(detail.field).toMatch(/^[a-zA-Z]+$/);
                 expect(detail.code).toMatch(/^[a-z_]+$/);
             });
+        });
+    });
+
+    describe('a stored string PostgreSQL cannot hold', () => {
+        // U+0000 is the one character a `text` column cannot represent: the
+        // column answers `22021 invalid byte sequence for encoding "UTF8": 0x00`
+        // and the endpoint returned a 500 for a request only the caller can fix.
+        // The verdict is the same `400 invalid_request` the path parsers below
+        // already return for an unparsable id, so what these cases pin is the
+        // field the caller has to fix, the order the check runs in, and how
+        // narrow the rule is.
+        it.each([
+            ['name', { ...validLegacyBody(), name: `Scrambled${NUL}eggs` }],
+            ['servingText', { ...validLegacyBody(), servingText: `2${NUL}eggs` }],
+            ['rawInput', { ...validLegacyBody(), rawInput: `two${NUL}eggs` }],
+        ])('refuses a legacy body whose %s carries U+0000', (field, body) => {
+            const verdict = asError(parseLogEntryBody(body));
+
+            expect(verdict.code).toBe('invalid_request');
+            expect(verdict.details).toStrictEqual([{ field, code: 'invalid_characters' }]);
+            expect(verdict.message).toBe(`${field} must not contain a NUL character (U+0000)`);
+        });
+
+        it.each([
+            ['at the start', `${NUL}eggs`],
+            ['in the middle', `scrambled${NUL}eggs`],
+            ['at the end', `eggs${NUL}`],
+            ['as the whole value', NUL],
+            ['more than once', `a${NUL}b${NUL}c`],
+        ])('refuses a name carrying U+0000 %s', (_case, name) => {
+            expect(fieldCodes(parseLogEntryBody({ ...validLegacyBody(), name }))).toStrictEqual([
+                'name:invalid_characters',
+            ]);
+        });
+
+        it('reports a name that is nothing but U+0000 as unstorable, not as missing', () => {
+            // The two name failures are distinct and must not collapse into each
+            // other. `String.prototype.trim` removes WhiteSpace and
+            // LineTerminator, and U+0000 is neither — so this name is not blank,
+            // the required-field guard passes it, and answering "name is
+            // required" would tell the caller to supply a name it already sent.
+            expect(NUL.trim()).toBe(NUL);
+
+            const verdict = asError(parseLogEntryBody({ ...validLegacyBody(), name: NUL }));
+
+            expect(verdict.code).toBe('invalid_request');
+            expect(verdict.message).not.toBe(LEGACY_REQUIRED_MESSAGE);
+            expect(fieldCodes(verdict)).toStrictEqual(['name:invalid_characters']);
+        });
+
+        it('reports every unstorable field at once, in field order', () => {
+            const verdict = asError(
+                parseLogEntryBody({
+                    ...validLegacyBody(),
+                    name: `a${NUL}b`,
+                    servingText: `c${NUL}d`,
+                    rawInput: `e${NUL}f`,
+                }),
+            );
+
+            expect(fieldCodes(verdict)).toStrictEqual([
+                'name:invalid_characters',
+                'servingText:invalid_characters',
+                'rawInput:invalid_characters',
+            ]);
+            expect(verdict.message).toBe(
+                'name must not contain a NUL character (U+0000); ' +
+                    'servingText must not contain a NUL character (U+0000); ' +
+                    'rawInput must not contain a NUL character (U+0000)',
+            );
+        });
+
+        it('leaves the frozen legacy verdict in front of it, byte for byte', () => {
+            // The ordering that makes this rule safe to add to a frozen guard
+            // (§0.3.1): the required-field check runs first, so every body the
+            // endpoint already refuses keeps the exact response shipped clients
+            // read, and this verdict can only ever replace a 500. Reversing the
+            // two would change a live 400.
+            const verdict = asError(parseLogEntryBody({ name: `a${NUL}b`, calories: 220, protein: 14, carbs: 2 }));
+
+            expect(verdict.code).toBe('legacy_fields_required');
+            expect(verdict.message).toBe(LEGACY_REQUIRED_MESSAGE);
+            expect(fieldCodes(verdict)).toStrictEqual(['fat:required']);
+        });
+
+        it('leaves the shape decision in front of it too', () => {
+            // A body naming both foods is refused before either shape is parsed,
+            // so the conflict — not the unstorable name — is what the caller is
+            // told to fix, and the NUL never becomes the reason a two-food body
+            // was rejected.
+            const verdict = asError(
+                parseLogEntryBody({
+                    ...validLegacyBody(),
+                    name: `a${NUL}b`,
+                    foodId: 'personal-food-1',
+                    catalogFoodId: CATALOG_FOOD_ID,
+                }),
+            );
+
+            expect(verdict.code).toBe('invalid_payload');
+            expect(verdict.message).toBe(CONFLICTING_REFERENCE_MESSAGE);
+        });
+
+        it.each([
+            ['BEL', '\u0007'],
+            ['ESC', '\u001b'],
+            ['DEL', '\u007f'],
+            ['a tab', '\t'],
+            ['a newline', '\n'],
+            ['a zero-width space', '\u200b'],
+            ['an emoji', '🍳'],
+        ])('accepts a name containing %s, which the column stores intact', (_case, marker) => {
+            // The rule is U+0000 and nothing else. Every character here reaches
+            // `meal_entries.name` today and round-trips, so widening this to a
+            // general control-character filter would start refusing entries the
+            // endpoint accepts and stores correctly.
+            const body = { ...validLegacyBody(), name: `a${marker}b` };
+
+            expect(asLegacy(parseLogEntryBody(body)).payload).toBe(body);
+        });
+
+        it.each([
+            ['a numeric servingText', 'servingText', 42],
+            ['an object rawInput', 'rawInput', {}],
+            ['a null servingText', 'servingText', null],
+        ])('never reports %s as unstorable', (_case, field, value) => {
+            // Whether a non-string is storable at all is the column's own
+            // question, and this route has always let it ask: the type stays
+            // unjudged here exactly as it was before the rule was added.
+            expect(parseLogEntryBody({ ...validLegacyBody(), [field]: value }).kind).toBe('legacy');
+        });
+
+        it('does not judge the legacy foodId, whose own column still refuses it', () => {
+            // Deliberately out of the rule's reach and recorded as such:
+            // `foodId` reaches `meal_entries.food_id`, a `@db.Uuid` column, and
+            // the dedupe lookup that precedes the insert filters on it — so a
+            // malformed one surfaces as the 500 it always has. Refusing it here
+            // would be a new verdict on a shape §0.3.1 freezes.
+            expect(parseLogEntryBody({ ...validLegacyBody(), foodId: `a${NUL}b` }).kind).toBe('legacy');
+        });
+
+        it('does not judge a legacy inputMethod, which is never stored as sent', () => {
+            // `resolveLegacyInputMethod` whitelists this field, so an
+            // unrecognised value — a NUL among them — is replaced by the default
+            // and never reaches a column.
+            expect(parseLogEntryBody({ ...validLegacyBody(), inputMethod: `ai${NUL}text` }).kind).toBe('legacy');
+        });
+
+        it('leaves a catalog body to the catalog contract, which already refuses it', () => {
+            // The catalog writer stores no client string: the name is the
+            // published food's own, and `servingText` is honoured only when it
+            // equals one of that food's stored portion descriptions — a NUL
+            // cannot, so the request is already answered with the typed
+            // `invalid_serving` 400 rather than a 500. Adding the stored-text
+            // rule to this shape would replace one 400 with another and change a
+            // documented response.
+            expect(
+                parseLogEntryBody({ catalogFoodId: CATALOG_FOOD_ID, servings: 1, servingText: `1${NUL}cup` }).kind,
+            ).toBe('catalog');
+        });
+    });
+});
+
+describe('containsNulCharacter', () => {
+    // The stored-text rule as its own predicate, tested here rather than only
+    // through the two parsers because it is the whole of the decision: a string
+    // PostgreSQL `text` cannot hold. `backend-architecture` §4 asks for exactly
+    // this — the predicate in the logic module, with a test — and §11 is why it
+    // cannot live beside the Prisma call it protects.
+    it.each([
+        ['a value that is only U+0000', NUL],
+        ['U+0000 at the start', `${NUL}a`],
+        ['U+0000 in the middle', `a${NUL}b`],
+        ['U+0000 at the end', `a${NUL}`],
+        ['several U+0000s', `${NUL}${NUL}`],
+    ])('reports %s', (_case, value) => {
+        expect(containsNulCharacter(value)).toBe(true);
+    });
+
+    it.each([
+        ['an ordinary string', 'Scrambled eggs'],
+        ['an empty string', ''],
+        ['the two-character escape sequence, not the character', '\\u0000'],
+        ['BEL', '\u0007'],
+        ['ESC', '\u001b'],
+        ['DEL', '\u007f'],
+        ['whitespace only', '   \t\n '],
+    ])('does not report %s', (_case, value) => {
+        expect(containsNulCharacter(value)).toBe(false);
+    });
+
+    it.each([
+        ['null', null],
+        ['undefined', undefined],
+        ['a number', 42],
+        ['a boolean', true],
+        ['an empty object', {}],
+        ['an array containing the character', [NUL]],
+        ['an object whose toString contains it', { toString: () => NUL }],
+    ])('does not report %s, because only a string can be stored as text', (_case, value) => {
+        // Never coerces. Stringifying the argument would invent a value the
+        // request never sent and, for the object case, would call caller-supplied
+        // code inside a validator.
+        expect(containsNulCharacter(value)).toBe(false);
+    });
+});
+
+describe('parseMealEntryEditBody', () => {
+    // `PUT /api/macros/entry/:id` has never validated its body, and everything
+    // it accepts today it must go on accepting — so this suite is mostly the
+    // bodies it must hand through untouched. The single refusal exists for the
+    // same reason as the log route's: a `name` carrying U+0000 reaches
+    // `meal_entries.name` and returns as a 500 for a fixable request.
+    it('refuses a name carrying U+0000, naming the field', () => {
+        const verdict = asEditError(parseMealEntryEditBody({ name: `Scrambled${NUL}eggs` }));
+
+        expect(verdict.code).toBe('invalid_request');
+        expect(verdict.details).toStrictEqual([{ field: 'name', code: 'invalid_characters' }]);
+        expect(verdict.message).toBe('name must not contain a NUL character (U+0000)');
+    });
+
+    it('refuses a name that is nothing but U+0000', () => {
+        expect(editFieldCodes(parseMealEntryEditBody({ name: NUL }))).toStrictEqual(['name:invalid_characters']);
+    });
+
+    it('hands a clean body on by identity, not as a rebuilt object', () => {
+        // `planMealEntryEdit` reads each member itself and normalizes it the way
+        // the column stores it, so a parser that rebuilt the payload would
+        // silently drop whichever field it forgot — and a dropped field here is
+        // an edit that detaches an entry from the plan meal vouching for it.
+        const body = { name: 'Scrambled eggs', servings: 2, calories: 240 };
+
+        expect(asEditOk(parseMealEntryEditBody(body)).payload).toBe(body);
+    });
+
+    it.each([
+        ['an empty object', {}],
+        ['a servings-only edit', { servings: 1.5 }],
+        ['a macro-only edit', { calories: 240 }],
+        ['a name containing other control characters', { name: 'a\u0007b\u001bc' }],
+        ['a padded name', { name: '  Scrambled eggs  ' }],
+        ['a name of the wrong type', { name: 42 }],
+        ['a name explicitly nulled', { name: null }],
+        ['a body of unrecognised keys', { nope: `a${NUL}b` }],
+    ])('hands %s through unchanged', (_case, body) => {
+        // Including the two that still fail at the column: a non-string name and
+        // an unrecognised key carrying U+0000. The rule reports on the one field
+        // the route stores and invents no other verdict, so nothing this route
+        // answers today changes.
+        expect(asEditOk(parseMealEntryEditBody(body)).payload).toBe(body);
+    });
+
+    it.each([
+        ['null', null],
+        ['undefined', undefined],
+        ['a number', 7],
+        ['a string', 'name=eggs'],
+        ['an array', [{ name: `a${NUL}b` }]],
+    ])('hands %s on to the writer, exactly as it always has', (_case, body) => {
+        // A non-object body is not this parser's failure to report. The route has
+        // always handed it to the writer — which answers with the 500 the
+        // endpoint documents for a malformed body — and inventing a 400 here
+        // would change a shipped response rather than replace an unanswerable
+        // one.
+        const verdict = parseMealEntryEditBody(body);
+
+        expect(verdict.kind).toBe('ok');
+        expect(asEditOk(verdict).payload).toBe(body);
+    });
+
+    it('returns a verdict for every input and never throws', () => {
+        const inputs: unknown[] = [null, undefined, 0, '', false, [], {}, { name: NUL }, new Date(0), () => NUL];
+
+        inputs.forEach((input) => {
+            expect(() => parseMealEntryEditBody(input)).not.toThrow();
+            expect(['ok', 'error']).toContain(parseMealEntryEditBody(input).kind);
         });
     });
 });

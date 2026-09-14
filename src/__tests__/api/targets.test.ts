@@ -85,13 +85,14 @@ import {
 } from '../setup/factories';
 import { truncateFeatureTables } from '../setup/testDb';
 import { generatePlan, regeneratePlan } from '../../services/mealPlan.service';
-import { TargetsUnconfirmedError } from '../../services/mealPlanning.errors';
+import { PlanGenerationError, TargetsUnconfirmedError } from '../../services/mealPlanning.errors';
 import { withMealPlanningTransaction, withUserLock } from '../../services/mealPlanningAction.service';
 import { updateTargets } from '../../services/nutrition.service';
 import { savePreferences, saveSetupStep } from '../../services/preferences.service';
 import { PlanningPreferences, evaluatePlanningEligibility } from '../../services/recipe.logic';
 import * as groceryService from '../../services/grocery.service';
 import * as recipeService from '../../services/recipe.service';
+import { UnitConversionError, unitFamily } from '../../utils/units';
 import {
     getTargetEstimate,
     getTargets,
@@ -1147,7 +1148,11 @@ const generateRequest = (): Record<string, unknown> => ({
     expectedTargetsRevision: 1,
 });
 
-/** What stands between the seeded catalog and a plannable week, if anything. */
+/**
+ * The real planning read's eligibility verdict over the seeded catalog, judged
+ * against {@link FIXTURE_PLANNING_PREFERENCES}: how many candidates a week can
+ * be built from, and the distinct refusal codes the rest carry.
+ */
 const planningEligibility = async (): Promise<{ eligible: number; refusalCodes: string[] }> => {
     const candidates = await recipeService.getRecipeVersionsForPlanning(prisma);
     const verdicts = candidates.map((candidate) =>
@@ -1160,44 +1165,6 @@ const planningEligibility = async (): Promise<{ eligible: number; refusalCodes: 
             ...new Set(verdicts.flatMap((verdict) => verdict.reasons.map((reason) => reason.code))),
         ].sort(),
     };
-};
-
-/**
- * Supplies the ONE ingredient fact the planner's candidate read does not
- * project, so that the publication path below can actually be reached.
- *
- * WHY THIS SEAM EXISTS, AND WHY IT IS NARROW. `RecipeIngredientIdentity`
- * declares `allergen_status` optional precisely because `recipe_ingredients`
- * does not snapshot it — the contract is that "the planner's service supplies"
- * it from the resolved `catalog_foods` row, exactly as it already supplies
- * `food_group`. `PLANNING_INGREDIENT_SELECT` projects `food_group` and omits
- * `allergen_status`, so `evaluatePlanningEligibility` — which requires an
- * explicit `known` per ingredient — refuses EVERY recipe in EVERY database, and
- * `generatePlan` can never open the transaction this suite needs to observe.
- * That defect is in another work unit's files at this checkpoint and is reported
- * rather than edited here; the test above pins it.
- *
- * So this decorates the REAL read with the value that fix will supply, and
- * nothing else: the recipe rows, their ids and their nutrition all come from the
- * database, so the FKs the publication writes are real, and the lock, the gate,
- * the ledger, the snapshot and the grocery write under test are untouched. When
- * the projection lands, `?? 'known'` becomes a no-op and this seam can be
- * deleted without changing a single assertion.
- */
-const usePlannableCatalog = (): void => {
-    const readCandidates = recipeService.getRecipeVersionsForPlanning;
-
-    jest.spyOn(recipeService, 'getRecipeVersionsForPlanning').mockImplementation(async (db) => {
-        const candidates = await readCandidates(db);
-
-        return candidates.map((candidate) => ({
-            ...candidate,
-            ingredients: candidate.ingredients.map((ingredient) => ({
-                ...ingredient,
-                allergen_status: ingredient.allergen_status ?? 'known',
-            })),
-        }));
-    });
 };
 
 /**
@@ -1245,15 +1212,16 @@ describe('the real generation path against the untouched legacy writer', () => {
             data: { time_zone: 'UTC' },
         });
 
-        // ONE food, with a MASS default portion. The factory's default portion
-        // is `1 cup` against a null `density_g_per_ml`, and the grocery write
-        // that follows publication converts a planned gram weight into the
-        // contributors' own unit family — which for a volume portion requires a
-        // density the food does not have. That is the documented contract, not a
-        // defect, so the fixture states a unit family it can be displayed in.
-        const food = await makeCatalogFood({
-            defaultPortion: { description: '100 g', amount: 100, unit: 'g', gram_weight: 100 },
-        });
+        // ONE food, and the factory's own default portion — `1 cup / 200 g`
+        // against a null `density_g_per_ml`, the shape every volume-portion food
+        // of the catalog release has. The grocery write that follows publication
+        // converts the planned gram weight into the contributors' own unit
+        // family, and for this portion it does so through the density the
+        // portion itself states (§0.1.4's stored-portion conversion), so the
+        // publication reaches its grocery rows with nothing stated here to
+        // accommodate it. Overriding the portion to grams would only hide
+        // whether that still holds.
+        const food = await makeCatalogFood();
 
         for (const { slot, perServing } of SLOT_RECIPE_SHARES) {
             for (let index = 0; index < RECIPES_PER_SLOT; index += 1) {
@@ -1287,33 +1255,38 @@ describe('the real generation path against the untouched legacy writer', () => {
         expect(await getTargets(USER_ID)).toMatchObject({ source: 'legacy' });
     });
 
-    it('pins the one thing that stops this suite reaching a published week', async () => {
-        // NOT a fixture problem, and deliberately asserted rather than worked
-        // around. `recipe.service.ts::PLANNING_INGREDIENT_SELECT` does not
-        // project an ingredient-level `allergen_status`, while
-        // `recipe.logic.ts::evaluatePlanningEligibility` requires every
-        // ingredient to carry exactly `'known'`. No recipe in any database can
-        // therefore be planned, whatever its data — so `generatePlan` answers
-        // `no_matching_meals` for every user until that projection is supplied.
-        //
-        // Both files belong to other work units at this checkpoint, so this is
-        // reported rather than edited here. THIS TEST IS THE HANDSHAKE: when the
-        // projection lands, `eligible` becomes non-zero, this expectation fails,
-        // and the publication race below starts asserting instead of recording
-        // why it cannot. Neither outcome is silent.
-        const { eligible, refusalCodes } = await planningEligibility();
+    it('reads a live allergen review for every candidate ingredient, which is what the published weeks below rest on', async () => {
+        // WHAT THE PUBLICATION TESTS BELOW REST ON. The candidate read and the
+        // search run before the publication transaction opens (§0.5.1), so a
+        // candidate set the eligibility rules refuse ends the request as
+        // `NoMatchingMealsError` with nothing locked and no week to hold open.
+        // `recipe.logic.ts::evaluatePlanningEligibility` admits a recipe only
+        // when EVERY ingredient carries an explicit `'known'` review, and
+        // `recipe_ingredients` does not snapshot that review — so
+        // `recipe.service.ts::PLANNING_INGREDIENT_SELECT` joins it live from
+        // each ingredient's own `catalog_foods` row. Asserted here off the
+        // unspied loader, so a projection that stopped supplying it fails as
+        // itself rather than as a refusal sourced two files away.
+        const expectedCandidates = SLOT_RECIPE_SHARES.length * RECIPES_PER_SLOT;
 
-        if (eligible > 0) {
-            expect(refusalCodes).toEqual([]);
-            return;
-        }
+        const candidates = await recipeService.getRecipeVersionsForPlanning(prisma);
+        const ingredientReviews = candidates.map((candidate) =>
+            candidate.ingredients.map((ingredient) => ingredient.allergen_status),
+        );
 
-        expect(refusalCodes).toEqual(['allergen_status']);
+        // One ingredient per fixture recipe — `perServing` synthesises exactly
+        // one — so an absent review reads as `undefined` here and fails.
+        expect(ingredientReviews).toEqual(
+            Array.from({ length: expectedCandidates }, () => ['known']),
+        );
+
+        expect(await planningEligibility()).toEqual({
+            eligible: expectedCandidates,
+            refusalCodes: [],
+        });
     });
 
     it('waits, and then refuses, when a legacy write holds the user row first', async () => {
-        usePlannableCatalog();
-
         // ORDERING ONE, from inside. A second session holds the user row before
         // the request starts, so generation reaches `requirePinnedInputs` and
         // stops there — which is the assertion that the gate is on the
@@ -1350,6 +1323,94 @@ describe('the real generation path against the untouched legacy writer', () => {
         expect(await getTargets(USER_ID)).toMatchObject({ source: 'legacy' });
     });
 
+    /**
+     * §0.5.2's two outcomes for `POST /meal-planning/plans`, at the grocery
+     * write: a published week whose list is rendered from the catalog's own
+     * volume portions, or the typed `502 plan_generation_failed`.
+     *
+     * Both are asserted here because the publication's grocery step used to have
+     * a third outcome — an untyped fault escaping as a generic 500 — which made
+     * the first unreachable for EVERY user and the second unrecognisable to the
+     * client. The fixture food's portion is `1 cup / 200 g` with no stored
+     * density, so the successful case really does render a volume line.
+     */
+    describe('the grocery step of a publication', () => {
+        /** Where setup stands before a first publication, which is what advances it. */
+        const BEFORE_PUBLICATION_SETUP_STATUS = 'ready_for_review';
+
+        beforeEach(async () => {
+            // `makePreferences` seeds `completed`, which would make the
+            // transition below unobservable: a status that was already the
+            // expected value proves nothing about the publication that was
+            // supposed to write it. So the row is wound back to the state a user
+            // reaches by finishing setup, which `GENERATABLE_SETUP_STATUSES`
+            // admits.
+            await prisma.meal_plan_preferences.update({
+                where: { user_id: USER_ID },
+                data: { setup_status: BEFORE_PUBLICATION_SETUP_STATUS },
+            });
+        });
+
+        it('publishes a week whose volume line renders, and completes setup', async () => {
+            const published = await generatePlan(USER_ID, generateRequest(), new Date());
+
+            expect(published.kind).toBe('ok');
+
+            // One food across every recipe, so one shopping identity — and its
+            // family is the one its portion states rather than the grams that
+            // were measured.
+            const rows = await prisma.grocery_items.findMany({ where: { user_id: USER_ID } });
+
+            expect(rows).toHaveLength(1);
+            expect(unitFamily(rows[0].display_unit)).toBe('volume');
+
+            // §0.5.2's "Sets setupStatus to completed on success", which is only
+            // reachable at all because the grocery write inside the same
+            // transaction now finishes.
+            expect(
+                await prisma.meal_plan_preferences.findUniqueOrThrow({
+                    where: { user_id: USER_ID },
+                    select: { setup_status: true },
+                }),
+            ).toEqual({ setup_status: 'completed' });
+        });
+
+        it('answers the typed generation refusal when a line cannot be rendered', async () => {
+            // The genuinely unrenderable case, forced at the step that renders:
+            // `utils/units.ts` raises this when a volume row's food can state no
+            // density at all, and the class belongs to no vocabulary a
+            // controller maps — so escaping raw it would be a 500 where §0.5.2
+            // promises `502 plan_generation_failed` as this endpoint's only 5xx.
+            const fault = new UnitConversionError(
+                'A positive density_g_per_ml is required to convert grams to millilitres, received null',
+            );
+
+            jest.spyOn(groceryService, 'buildPlanGroceryDrafts').mockRejectedValue(fault);
+
+            const thrown = await generatePlan(USER_ID, generateRequest(), new Date()).then(
+                () => null,
+                (error: unknown) => error,
+            );
+
+            expect(thrown).toBeInstanceOf(PlanGenerationError);
+            // The original fault is kept for the log rather than parsed out of a
+            // message.
+            expect((thrown as PlanGenerationError).cause).toBe(fault);
+
+            // "Nothing was persisted" is what PlanGenerationError promises: the
+            // week, its ledger reservation and its grocery rows all went with
+            // the rollback, and setup did not advance.
+            expect(await countPersisted()).toEqual({ plans: 0, ledger: 0 });
+            expect(await prisma.grocery_items.count({ where: { user_id: USER_ID } })).toBe(0);
+            expect(
+                await prisma.meal_plan_preferences.findUniqueOrThrow({
+                    where: { user_id: USER_ID },
+                    select: { setup_status: true },
+                }),
+            ).toEqual({ setup_status: BEFORE_PUBLICATION_SETUP_STATUS });
+        });
+    });
+
     it('makes the legacy writer wait until the published week has committed', async () => {
         // ORDERING TWO, and the assertion the whole row lock exists for. The
         // request wins the row, so a legacy write fired while it is publishing
@@ -1365,7 +1426,6 @@ describe('the real generation path against the untouched legacy writer', () => {
         // and this expectation would fail. The refusal-shaped tests above cannot
         // see that, because a reader later in the same transaction raises the
         // same error once the legacy value commits.
-        usePlannableCatalog();
         holdPublicationOpen();
 
         const generation = watch(generatePlan(USER_ID, generateRequest(), new Date()));
@@ -1415,8 +1475,6 @@ describe('the real generation path against the untouched legacy writer', () => {
         // attributed to values nobody confirmed. Asserted separately because it
         // is a separate call site: dropping the gate from one callback and not
         // the other is exactly the sort of edit a single test would miss.
-        usePlannableCatalog();
-
         const first = await generatePlan(USER_ID, generateRequest(), new Date());
 
         expect(first.kind).toBe('ok');
@@ -1479,8 +1537,6 @@ describe('the real generation path against the untouched legacy writer', () => {
     });
 
     it('leaves only a safe outcome when the two are raced', async () => {
-        usePlannableCatalog();
-
         // AAP §0.9.2's third clause. Which side wins is timing, so the assertion
         // is the DISJUNCTION the contract allows — and never a published week
         // whose snapshot disagreed with the confirmed targets at its commit.

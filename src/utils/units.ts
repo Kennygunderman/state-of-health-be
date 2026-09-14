@@ -7,6 +7,16 @@
 // one-family invariant, a missing density) are pinned by unit tests instead of
 // being discovered in someone's shopping list.
 //
+// Two of those rules are about the words rather than the numbers, and both
+// exist because a portion description is data the catalog wrote, not a label
+// this module chose:
+//
+//  * A COUNT PORTION MAY STATE ITS OWN AMOUNT. "5 sprigs" is one portion of
+//    five sprigs, so the amount is read off the description and multiplied out
+//    rather than printed in front of it.
+//  * THE ITEM IS THE HEAD NOUN. "egg, large" pluralises to "eggs, large": the
+//    qualifier after the comma is not the thing being counted.
+//
 // Not this module's job: aggregating planned portions, the equality epsilon,
 // aisle categories, the "Now X, was Y" sub-line, delta pills and the
 // food-state name suffix all belong to grocery.logic.ts, which composes the
@@ -213,6 +223,69 @@ export const gramsToMilliliters = (grams: number, densityGPerMl: number | null |
     );
 };
 
+const isPositiveFinite = (value: number): boolean => Number.isFinite(value) && value > 0;
+
+/** The `catalog_food_portions` columns a stored portion states its volume with. */
+export interface PortionVolumeMeasurement {
+    /** `amount` — how many `unit` this portion is. Often not 1 ("0.5 cup"). */
+    amount: number;
+    unit: string;
+    /** `gram_weight` — what `amount` of `unit` actually weighs. */
+    gram_weight: number;
+}
+
+/**
+ * The grams-per-millilitre a stored VOLUME portion states about its own food,
+ * or null when the portion cannot state one.
+ *
+ * `amount` units of volume weighing `gram_weight` grams IS a density:
+ * `gram_weight / (amount * millilitres per one unit)`. A "1 cup / 150 g" portion
+ * therefore states 0.634 g/ml and a "0.5 cup / 107 g" portion 0.905 g/ml — which
+ * is why `amount` is divided out rather than assumed to be 1. The conversion
+ * factor comes from the same {@link UNIT_DEFINITIONS} table every other
+ * conversion in this module reads, so a unit cannot state one volume here and a
+ * different one three functions up.
+ *
+ * NULL RATHER THAN A THROW, deliberately, and it is the only density entry point
+ * that answers that way. This is a QUESTION about a portion ("can this row be
+ * shown as a volume?") rather than a conversion being performed, and the two
+ * callers want opposite things from an unanswerable one: the grocery display
+ * rules choose a different unit family and show the grams they actually measured,
+ * while nutrition arithmetic must still fail loudly. So the question is answered
+ * here and {@link millilitersToGrams} / {@link gramsToMilliliters} keep refusing
+ * a missing density exactly as before — `catalog.logic.ts`'s `per_100ml` basis
+ * and `recipes-seed.ts` depend on that refusal, and a packing density inferred
+ * from a cup measure must never reach a nutrient calculation.
+ *
+ * Null is returned for every input that cannot yield a truthful figure: a
+ * non-volume unit (grams per gram is not a density), an unrecognised token, a
+ * non-positive or non-finite `amount` or `gram_weight` — validation's
+ * `unsupported_portion` and `missing_gram_weight` checks quarantine those, so
+ * reaching one here means the food was never publishable — and a result that
+ * overflows to a non-finite number.
+ *
+ * @example
+ * // A shipped per_100g food whose default portion is volumetric.
+ * portionVolumeDensity({ amount: 1, unit: 'cup', gram_weight: 150 });   // 0.634…
+ * portionVolumeDensity({ amount: 0.5, unit: 'cup', gram_weight: 107 }); // 0.904…
+ * portionVolumeDensity({ amount: 1, unit: 'oz', gram_weight: 28.35 });  // null
+ */
+export const portionVolumeDensity = (portion: PortionVolumeMeasurement): number | null => {
+    const definition = definitionFor(portion.unit);
+
+    if (!definition || definition.family !== 'volume') {
+        return null;
+    }
+
+    if (!isPositiveFinite(portion.amount) || !isPositiveFinite(portion.gram_weight)) {
+        return null;
+    }
+
+    const density = portion.gram_weight / (portion.amount * definition.perBase);
+
+    return isPositiveFinite(density) ? density : null;
+};
+
 const roundToInteger = (value: number): number => Math.round(value);
 
 const roundToTenth = (value: number): number => Math.round(value * TENTHS_PER_UNIT) / TENTHS_PER_UNIT;
@@ -325,20 +398,91 @@ export const formatMass = (grams: number): DisplayQuantity => formatTiered(grams
 export const formatVolume = (milliliters: number): DisplayQuantity =>
     formatTiered(milliliters, VOLUME_TIERS, 'millilitres');
 
-// Irregular plurals the general rule gets wrong ("tomatos", "leafs").
+const TIERS_BY_FAMILY: Record<'mass' | 'volume', DisplayTier[]> = { mass: MASS_TIERS, volume: VOLUME_TIERS };
+
+// A unit outside its family's display tiers (kg, tsp, fl oz) still has to
+// render somewhere, so it borrows its family's precision: tenths for a mass,
+// quarters for a volume.
+const PRECISION_BY_FAMILY: Record<'mass' | 'volume', Pick<DisplayTier, 'round' | 'render'>> = {
+    mass: { round: roundToTenth, render: renderDecimal },
+    volume: { round: roundToQuarter, render: formatQuarters },
+};
+
+/**
+ * Renders a base-unit amount — grams, millilitres — in a NAMED unit.
+ *
+ * `formatMass` and `formatVolume` choose the unit themselves, which is right
+ * for an amount being shown on its own and wrong for one that has to be read
+ * beside an amount already rendered in a fixed unit: re-tiering it is how
+ * "14 tbsp" comes to sit beside "2 cups". This renders at the named unit's own
+ * display precision instead, and does NOT clamp a small amount up to one,
+ * because "1 lb" for five grams would be a lie — an amount too small for the
+ * unit returns a value of zero, and the caller decides what that means. Throws
+ * for a count unit, whose amounts are items rather than base units, and for an
+ * unrecognised one.
+ */
+export const formatInUnit = (baseAmount: number, unit: string): DisplayQuantity => {
+    assertFiniteQuantity(baseAmount, 'quantity');
+
+    const definition = definitionFor(unit);
+    if (!definition) {
+        throw new UnitConversionError(`Unrecognised unit "${unit}"`);
+    }
+    if (definition.family === 'count') {
+        throw new UnitConversionError(`"${unit}" counts items, so it cannot render a base-unit amount`);
+    }
+
+    const key = normaliseUnit(unit);
+    const tier =
+        TIERS_BY_FAMILY[definition.family].find((candidate) => candidate.unit === key || candidate.pluralUnit === key) ??
+        { unit: key, perBase: definition.perBase, ...PRECISION_BY_FAMILY[definition.family] };
+
+    const value = tier.round(baseAmount / tier.perBase);
+    const word = unitWord(tier, value);
+
+    return { value, unit: word, text: `${tier.render(value)} ${word}` };
+};
+
+// Irregular plurals the general rule gets wrong ("tomatos", "leafs"). The list
+// is closed against the catalog rather than against English: of the 262 head
+// nouns the shipped count portions use, these are the ones the rules below
+// inflect incorrectly. Every other -o noun in that set takes a plain s
+// (avocados, burritos, tacos, matzos), which is why there is no -o rule.
 const PLURAL_EXCEPTIONS: Record<string, string> = {
     egg: 'eggs',
     tomato: 'tomatoes',
+    potato: 'potatoes',
     leaf: 'leaves',
     loaf: 'loaves',
+    half: 'halves',
 };
 
 const ES_SUFFIX_PATTERN = /(?:s|x|z|ch|sh)$/;
 const CONSONANT_Y_PATTERN = /[^aeiou]y$/;
-// The last run of letters in a description: "chicken breast" pluralises its
-// last word, and any trailing punctuation or spacing is left untouched. No 'g'
-// flag, so exec() carries no lastIndex state between calls.
+// An -s that ends a SINGULAR word: "glass", "hummus", "iris". A description
+// already written in the plural ("5 sprigs", "slices") must not be inflected a
+// second time into "sprigses", and a trailing "s" alone cannot tell the two
+// apart — these three endings are what separates them.
+const SINGULAR_S_ENDING_PATTERN = /(?:ss|us|is)$/;
+// The counted noun's own last word. USDA portion descriptions name the item
+// first and qualify it afterwards — "egg, large", "can, drained",
+// "container (6 oz)" — so inflecting the description's last word pluralises the
+// qualifier ("larges", "draineds") instead of the thing being counted. The head
+// segment ends at the first comma or opening parenthesis; the last run of
+// letters inside it is the noun. Neither pattern carries a 'g' flag, so exec()
+// keeps no lastIndex state between calls.
+const HEAD_SEGMENT_PATTERN = /^[^,(]*/;
 const LAST_WORD_PATTERN = /[a-z]+(?=[^a-z]*$)/i;
+
+// A head segment with no letters of its own ("(6 oz) tub") falls back to the
+// whole description, which is where the noun then has to be. The head is a
+// prefix of the description either way, so `match.index` addresses both.
+const headNounMatch = (description: string): RegExpExecArray | null => {
+    const head = HEAD_SEGMENT_PATTERN.exec(description);
+    const withinHead = head ? LAST_WORD_PATTERN.exec(head[0]) : null;
+
+    return withinHead ?? LAST_WORD_PATTERN.exec(description);
+};
 
 const pluralizeWord = (word: string): string => {
     const lower = word.toLowerCase();
@@ -356,6 +500,49 @@ const pluralizeWord = (word: string): string => {
     return `${lower}s`;
 };
 
+const alreadyPlural = (word: string): boolean => {
+    const lower = word.toLowerCase();
+
+    return lower.endsWith('s') && !SINGULAR_S_ENDING_PATTERN.test(lower);
+};
+
+const invert = (table: Record<string, string>): Record<string, string> => {
+    const inverted: Record<string, string> = {};
+
+    for (const key of Object.keys(table)) {
+        inverted[table[key]] = key;
+    }
+
+    return inverted;
+};
+
+// The same four irregulars read the other way, built from the table above so
+// the pair cannot drift apart.
+const SINGULAR_EXCEPTIONS: Record<string, string> = invert(PLURAL_EXCEPTIONS);
+
+const ES_PLURAL_PATTERN = /(?:s|x|z|ch|sh)es$/;
+const IES_PLURAL_PATTERN = /[^aeiou]ies$/;
+
+// The inverse of pluralizeWord, for a description the catalog already wrote in
+// the plural ("5 sprigs", "slices"): one of them has to read "1 sprig".
+const singularizeWord = (word: string): string => {
+    const lower = word.toLowerCase();
+
+    const exception = Object.prototype.hasOwnProperty.call(SINGULAR_EXCEPTIONS, lower)
+        ? SINGULAR_EXCEPTIONS[lower]
+        : null;
+    if (exception) {
+        return exception;
+    }
+    if (ES_PLURAL_PATTERN.test(lower)) {
+        return lower.slice(0, -2);
+    }
+    if (IES_PLURAL_PATTERN.test(lower)) {
+        return `${lower.slice(0, -3)}y`;
+    }
+    return lower.slice(0, -1);
+};
+
 // The exceptions map is keyed in lower case, so the description's own casing is
 // restored afterwards: "Egg" stays capitalised, "EGG" stays shouted.
 const matchCase = (original: string, replacement: string): string => {
@@ -368,32 +555,101 @@ const matchCase = (original: string, replacement: string): string => {
     return replacement;
 };
 
-export const pluralizeCount = (count: number, description: string): string => {
-    if (count === 1 || count === -1) {
-        return description;
+export interface CountPortionLabel {
+    /**
+     * Countable items in ONE stored portion, taken from the description's
+     * leading amount; 1 when it states none.
+     */
+    itemsPerPortion: number;
+    /** The item noun alone: "1 egg, large" -> "egg, large", "5 sprigs" -> "sprigs". */
+    noun: string;
+}
+
+// A USDA count portion states its own amount inside the description whenever it
+// counts more than one item: "5 sprigs" is one portion of five sprigs and
+// "1 egg, large" one portion of one egg. Rendering the portion count in front
+// of that text reads "9 5 sprigs", and treating the portion as the item
+// undercounts a multi-item portion ninefold, so the amount is read off the
+// description and multiplied out. Every leading number in the shipped catalog
+// equals its portion's stored `amount`, which is what makes the description a
+// sufficient source and keeps this a pure string rule.
+const LEADING_AMOUNT_PATTERN = /^(\d+(?:\.\d+)?)\s+(\S.*)$/;
+
+export const parseCountPortion = (description: string): CountPortionLabel => {
+    const label = description.trim();
+    const match = LEADING_AMOUNT_PATTERN.exec(label);
+
+    if (!match) {
+        return { itemsPerPortion: 1, noun: label };
     }
 
-    const match = LAST_WORD_PATTERN.exec(description);
+    const itemsPerPortion = Number(match[1]);
+
+    // A leading zero counts nothing and would erase the row. Anything that is
+    // not a positive finite amount therefore leaves the description whole and
+    // counts portions, which is the behaviour of a description that states no
+    // amount at all.
+    if (!Number.isFinite(itemsPerPortion) || itemsPerPortion <= 0) {
+        return { itemsPerPortion: 1, noun: label };
+    }
+
+    return { itemsPerPortion, noun: match[2] };
+};
+
+/** Items in `portions` of a count portion described by `description`. */
+export const countPortionItems = (portions: number, description: string): number => {
+    assertFiniteQuantity(portions, 'count');
+
+    const { itemsPerPortion } = parseCountPortion(description);
+
+    return requireFiniteResult(
+        portions * itemsPerPortion,
+        `${String(portions)} portions of "${description.trim()}" to items`,
+    );
+};
+
+/**
+ * The item noun of a count portion, in the number `count` calls for.
+ *
+ * The portion's own leading amount is dropped first — "6" portions of
+ * "1 egg, large" is "6 eggs, large", never "6 1 egg, larges" — and a
+ * description the catalog already wrote in the plural is inflected in whichever
+ * direction it needs, or left alone when it is already right.
+ */
+export const pluralizeCount = (count: number, description: string): string => {
+    const { noun } = parseCountPortion(description);
+    const match = headNounMatch(noun);
+
     if (!match) {
-        return description;
+        return noun;
     }
 
     const word = match[0];
-    const plural = matchCase(word, pluralizeWord(word));
-    return description.slice(0, match.index) + plural + description.slice(match.index + word.length);
+    const wantsSingular = count === 1 || count === -1;
+    const isPlural = alreadyPlural(word);
+
+    // Nothing to do when the description is already in the number asked for.
+    if (wantsSingular !== isPlural) {
+        return noun;
+    }
+
+    const inflected = matchCase(word, wantsSingular ? singularizeWord(word) : pluralizeWord(word));
+
+    return noun.slice(0, match.index) + inflected + noun.slice(match.index + word.length);
 };
 
 export const formatCount = (count: number, description: string): DisplayQuantity => {
     assertFiniteQuantity(count, 'count');
 
-    const value = clampPositiveToOne(roundToInteger(count), count);
-    const label = description.trim();
+    const { noun } = parseCountPortion(description);
+    const items = countPortionItems(count, description);
+    const value = clampPositiveToOne(roundToInteger(items), items);
 
     // A count with no portion description renders as the bare number: "3".
-    if (!label) {
+    if (!noun) {
         return { value, unit: '', text: String(value) };
     }
 
-    const unit = pluralizeCount(value, label);
+    const unit = pluralizeCount(value, noun);
     return { value, unit, text: `${value} ${unit}` };
 };

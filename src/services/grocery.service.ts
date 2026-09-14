@@ -231,6 +231,13 @@ const toPlanDayKey = (date: Date, column: string, planId: string): string => {
  * row and reject for a count row — validation quarantines exactly that case, so
  * inventing a gram weight here would be inventing the number every quantity is
  * then computed from.
+ *
+ * `amount` IS PART OF THAT PROJECTION, not incidental to it. A volume row is
+ * rendered through the density its portion states, and `grocery.logic.ts`'s
+ * `volumeDensityFor` computes that as `gram_weight / (amount * ml per unit)` —
+ * so a projection that read "107 g" and "cup" without the "0.5" would state
+ * half the real density for every food whose portion is not one of its unit,
+ * and the catalog ships thousands that are not.
  */
 export const loadGroceryFoodFacts = async (
     catalogFoodIds: readonly string[],
@@ -252,7 +259,7 @@ export const loadGroceryFoodFacts = async (
             density_g_per_ml: true,
             catalog_food_portions: {
                 where: { is_default: true },
-                select: { description: true, unit: true, gram_weight: true },
+                select: { description: true, amount: true, unit: true, gram_weight: true },
             },
         },
     });

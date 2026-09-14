@@ -21,16 +21,24 @@
 // instruction completeness — is exercised against the real corpus rather than
 // restated here.
 //
-// `scripts/catalog-load.ts` is still preflight-only at this checkpoint: it
-// parses its arguments, reports the accepted database origin, checks its inputs
-// and refuses with `stage_pipeline_pending`, its write half being a §0.7.1
-// Group 3 deliverable. So the CATALOG slice is still loaded through Prisma
-// directly, reconciling on the stable identities `catalog-load.ts` documents
-// (`catalog_foods.source_key`, and each food's aliases, portions and validation
-// record replaced wholesale inside that food's own transaction). When that
-// stage's write half lands, the loader is swapped in behind
-// `applyCatalogSlice` and every assertion below still states what it states
-// today.
+// The CATALOG slice, by contrast, is applied through Prisma directly rather
+// than through `scripts/catalog-load.ts` — not because that stage is unbuilt,
+// since it carries its whole write half (verification, retirement, per-food
+// reconciliation, applied-byte and count verification, activation), but because
+// it applies the WHOLE release: all 11,046 published foods with their 15,939
+// aliases, 31,899 portions and 11,046 validation records, and it refuses to
+// activate unless the row counts after the load equal the manifest's. That is
+// exactly what "WHY IT LOADS ONLY A SLICE" below rules out here — this gate
+// needs the 69-food ingredient slice the recipes depend on and nothing more,
+// and applying the release whole would make it a benchmark. The loader's own run
+// is covered where it belongs, by `src/__tests__/scripts/catalog-load.test.ts`:
+// a v1 load, a no-op rerun, a failure after partial progress repaired by
+// rerunning, a v1 → v2 upgrade, and a tampered release refused with nothing
+// written. What is applied below reconciles on the stable identities
+// `catalog-load.ts` documents (`catalog_foods.source_key`, and each food's
+// aliases, portions and validation record replaced wholesale inside that food's
+// own transaction), which is why re-applying the slice leaves the same rows —
+// the eighth claim in the list below.
 //
 // WHAT IT PROVES, in the order the describes run:
 //   1. the manifest gate — every release file's streamed SHA-256, byte length

@@ -127,9 +127,12 @@ export interface LogCatalogMealEntryPayload {
 // source label rather than erasing them.
 //
 // The members are typed as the values the endpoint means, not as what an
-// unvalidated body may contain: this route has never validated its body, so a
-// caller that sends a name or macro of another type reaches the column and is
-// refused there, exactly as it has always been.
+// unvalidated body may contain: this route validates its body for one failure
+// only — a `name` carrying U+0000, which no `text` column can hold and which
+// `nutrition.logic.ts::parseMealEntryEditBody` refuses with `400
+// invalid_request` rather than letting it become a 500. Everything else is
+// unjudged as it always has been, so a caller that sends a name or macro of
+// another type still reaches the column and is still refused there.
 export interface UpdateMealEntryPayload {
     servings?: number;
     name?: string;

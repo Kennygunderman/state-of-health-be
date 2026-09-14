@@ -49,9 +49,13 @@
 //
 //  * `utils/units.ts` owns unit families, gram conversions, numeric formatting
 //    and pluralisation. It is never re-implemented here — including the rule
-//    that millilitres without a stored density cannot become grams, which is
-//    why that failure surfaces as its own `UnitConversionError` from that
-//    module rather than being pre-empted by a copy of the check.
+//    that millilitres without a density cannot become grams, which is why that
+//    failure surfaces as its own `UnitConversionError` from that module rather
+//    than being pre-empted by a copy of the check, and including the arithmetic
+//    that reads a density off a stored volume portion (`portionVolumeDensity`).
+//    What THIS file decides is which of a food's two possible densities a row
+//    is rendered through (`volumeDensityFor`) and, when it can state neither,
+//    that the row is weighed rather than measured (`displayFamilyForPortion`).
 //  * `catalog.logic.ts` owns the catalog category -> aisle mapping and the
 //    aisle sort order. A second copy is how a newly added catalog category
 //    lands in the right aisle in one place and the wrong one in the other.
@@ -84,13 +88,16 @@ import {
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
 import {
+    UnitConversionError,
     UnitFamily,
     formatCount,
+    formatInUnit,
     formatMass,
     formatQuarters,
     formatVolume,
     gramsToMilliliters,
     pluralizeCount,
+    portionVolumeDensity,
     toBaseQuantity,
     unitFamily,
 } from '../utils/units';
@@ -172,6 +179,33 @@ export class GroceryDataError extends Error {
         this.name = 'GroceryDataError';
     }
 }
+
+/**
+ * True when a failure came from BUILDING A SHOPPING LINE — this module's
+ * {@link GroceryDataError} or `utils/units.ts`'s `UnitConversionError`.
+ *
+ * Its purpose is the boundary above: a plan publication and a swap commit each
+ * do their grocery work inside a transaction whose failure the client must be
+ * told about in the vocabulary of `mealPlanning.errors.ts` — §0.5.2's `502
+ * plan_generation_failed` and `502 swap_failed` — and neither of these two
+ * classes is in that vocabulary, so without this predicate they escape as a
+ * generic 500 the client cannot classify. The callers translate exactly what
+ * this recognises and RE-THROW everything else untouched, which is what keeps
+ * `grocery.service.ts`'s deliberate untyped invariant failures ("deleted N rows
+ * instead of M") reaching the controller as the 500 they are documented to be.
+ *
+ * IT LIVES HERE, NOT IN THE ERROR MODULE, on that module's own stated ground:
+ * its header records that vendor and utility failures — `UnitConversionError`
+ * among them — belong to the modules that raise them and are deliberately not
+ * re-exported there, because a barrel would rebuild the coupling the boundary
+ * exists to prevent (§9). This file already owns one of the two classes and
+ * already imports the other, so recognising the pair costs no new edge.
+ *
+ * Pure and total: a thrown string, a rejected null, anything at all — it
+ * answers false rather than assuming a shape.
+ */
+export const isGroceryRenderingFault = (error: unknown): boolean =>
+    error instanceof GroceryDataError || error instanceof UnitConversionError;
 
 /**
  * The wire vocabulary for a grocery `details[].code`. Machine-readable only —
@@ -334,9 +368,19 @@ export const classifyQuantityChange = (previous: number, next: number): GroceryQ
  * Display — the unit family is locked at generation
  * ------------------------------------------------------------------------- */
 
-/** The food's default portion, as `catalog_food_portions` stores it. */
+/**
+ * The food's default portion, as `catalog_food_portions` stores it.
+ *
+ * `amount` travels with the unit because the two only mean something together:
+ * "0.5 cup / 107 g" states a different density from "1 cup / 107 g", and
+ * {@link volumeDensityFor} divides it out. A projection that dropped it would
+ * read every portion as one of its unit and misstate every volume row whose
+ * portion is not.
+ */
 export interface GroceryDefaultPortion {
     description: string;
+    /** How many `unit` the portion is. Often not 1 across the catalog. */
+    amount: number;
     unit: string;
     gram_weight: number;
 }
@@ -373,23 +417,97 @@ export interface GroceryDisplay {
 }
 
 /**
+ * The grams-per-millilitre a volume row is rendered through, or null when this
+ * food cannot state one.
+ *
+ * TWO SOURCES, IN THIS ORDER, and the order is the rule:
+ *
+ *  1. The food's own stored `density_g_per_ml`. A `per_100ml` food carries a
+ *     curated figure, and that figure is the authority on what its millilitres
+ *     weigh — a number a human or a source stated about the substance, which
+ *     `catalog.logic.ts` also computes its nutrition through.
+ *  2. Failing that, the density the DEFAULT PORTION itself states:
+ *     `gram_weight` grams per `amount` of a volume unit is a density, computed
+ *     by `utils/units.ts`'s `portionVolumeDensity`. §0.1.4 names the stored
+ *     portion as the sanctioned conversion source — "display in the
+ *     contributors' shared unit family through stored portion conversions (e.g.
+ *     'Olive oil · 6 tbsp')" — and it is what the shipped release actually
+ *     holds: every published food is `per_100g` with a null density, and 4,622
+ *     of them measure their default portion in cups, tablespoons or teaspoons.
+ *
+ * So a row shows the volume the catalog measured it in, and the derived figure
+ * is only ever reached for a food whose curated one is absent. Null means this
+ * food cannot be shown as a volume at all — the caller chooses a family it can
+ * be shown in ({@link displayFamilyForPortion}) rather than rendering
+ * millilitres nothing measured.
+ *
+ * THE DERIVED FIGURE NEVER LEAVES THE DISPLAY PATH. It is a packing density
+ * ("what a cup of this weighs"), not a substance density, so it is fit for
+ * deciding that 202 g of cooked rice reads "1 cup" and unfit for converting a
+ * nutrient basis — which is why `utils/units.ts` still refuses a missing density
+ * in `millilitersToGrams`/`gramsToMilliliters` and nothing here weakens that.
+ */
+export const volumeDensityFor = (facts: GroceryConversionFacts): number | null => {
+    if (facts.density_g_per_ml !== null && Number.isFinite(facts.density_g_per_ml) && facts.density_g_per_ml > 0) {
+        return facts.density_g_per_ml;
+    }
+
+    return facts.default_portion ? portionVolumeDensity(facts.default_portion) : null;
+};
+
+/**
  * The unit family a new row is created in, chosen from the food's default
  * portion and from nothing else.
  *
- * TOTAL by design, and biased to `mass`: an unrecognised portion unit — the
- * mockup's "1 bottle" is exactly this case — falls back to the grams that were
- * actually measured rather than being counted as containers, which the prompt
- * forbids generating. Only the unit TOKEN is consulted, because the same
- * decision has to be reproducible from a stored `display_unit` on every later
- * update; whether the food can actually be converted is checked when the
- * amount is rendered.
+ * TOTAL by design, and biased to `mass`: this function DEGRADES and never
+ * throws, because grams are always renderable — they are what was actually
+ * measured — so every food has a truthful shopping line available to it. Three
+ * answers, each with a condition that has to hold for the row to be renderable
+ * at all:
+ *
+ *  * `volume` — the portion's unit token is a volume one AND
+ *    {@link volumeDensityFor} resolves. A food whose density is neither stored
+ *    nor derivable from its portion becomes a MASS row: "152 g" is the truth,
+ *    and demanding millilitres of it would fail the whole shopping list over a
+ *    unit choice nobody asked for. (This is the defect the shipped release
+ *    exposed: 41 of 42 seeded recipes carry such an ingredient.)
+ *  * `count` — the token is a count one AND the portion has a positive gram
+ *    weight, the same requirement `requireCountPortion` enforces when the amount
+ *    is rendered. Without it there is no "50 g each" to divide by, so the row
+ *    cannot be counted and is weighed instead.
+ *  * `mass` — everything else, including an unrecognised portion unit (the
+ *    mockup's "1 bottle" is exactly this case, and container units are never
+ *    generated) and a food with no default portion at all.
+ *
+ * The decision still rests on the portion, because it has to be reproducible:
+ * the family is chosen ONCE at plan generation and read back from the row's own
+ * stored `display_unit` on every later update (§0.7.3, and the unit-family lock
+ * in this file's header). A stored row is therefore never re-judged here — see
+ * {@link storedRowFamily}, which keeps failing loudly for a stored volume row
+ * whose food can no longer state a density, since that is a real invariant break
+ * rather than a rendering choice.
+ *
+ * Takes the whole {@link GroceryConversionFacts} rather than the portion alone
+ * because the density is half of the volume question and lives beside it.
  */
-export const displayFamilyForPortion = (portion: GroceryDefaultPortion | null): UnitFamily => {
+export const displayFamilyForPortion = (facts: GroceryConversionFacts): UnitFamily => {
+    const portion = facts.default_portion;
+
     if (!portion) {
         return 'mass';
     }
 
-    return unitFamily(portion.unit) ?? 'mass';
+    const family = unitFamily(portion.unit);
+
+    if (family === 'volume') {
+        return volumeDensityFor(facts) === null ? 'mass' : 'volume';
+    }
+
+    if (family === 'count') {
+        return Number.isFinite(portion.gram_weight) && portion.gram_weight > 0 ? 'count' : 'mass';
+    }
+
+    return 'mass';
 };
 
 const requireCountPortion = (portion: GroceryDefaultPortion | null): GroceryDefaultPortion => {
@@ -408,13 +526,20 @@ const requireCountPortion = (portion: GroceryDefaultPortion | null): GroceryDefa
  *
  * Each family reaches its numbers a different way, and only the mass family
  * needs nothing but the grams:
- *  - `volume` converts through the stored density. A missing density THROWS
- *    (`UnitConversionError`, from `utils/units.ts`, which owns that rule):
- *    millilitres never equal grams, and a plan that reached this point with a
- *    density-less volume food is a seed fault to surface, not to paper over.
+ *  - `volume` converts through the density {@link volumeDensityFor} resolves —
+ *    the food's stored one, or the one its default portion states. A food that
+ *    can state NEITHER still THROWS (`UnitConversionError`, from
+ *    `utils/units.ts`, which owns that rule): millilitres never equal grams, and
+ *    {@link displayFamilyForPortion} never chooses this family for such a food,
+ *    so reaching it here means a STORED row's recorded `display_unit` says
+ *    volume while its food can no longer be converted — the unit-family lock
+ *    broken upstream, which is a fault to surface rather than paper over.
  *  - `count` divides by the default portion's gram weight — 600 g of egg at
  *    50 g each is "12 eggs" — and stores {@link COUNT_DISPLAY_UNIT} rather than
- *    the pluralised word, so the row's family stays readable.
+ *    the pluralised word, so the row's family stays readable. The stored
+ *    quantity counts ITEMS, not portions: a portion that counts several items
+ *    ("5 sprigs", 1 g) is multiplied out by `utils/units.ts`, so 9 g of dill is
+ *    45 sprigs. Every count comparison below therefore works in items too.
  *  - `mass` tiers grams -> oz -> lb in `utils/units.ts`.
  */
 export const buildGroceryDisplay = (
@@ -429,7 +554,7 @@ export const buildGroceryDisplay = (
     }
 
     if (family === 'volume') {
-        const rendered = formatVolume(gramsToMilliliters(quantityGrams, facts.density_g_per_ml));
+        const rendered = formatVolume(gramsToMilliliters(quantityGrams, volumeDensityFor(facts)));
 
         return { family, quantity: rendered.value, unit: rendered.unit, text: rendered.text };
     }
@@ -479,25 +604,94 @@ export const indexFoodStatesByName = (
 };
 
 /**
+ * The states that need no qualifier of their own: a shopper buys the food as
+ * the shop sells it. `raw` is the catalog's default and `as_purchased` says the
+ * same thing about a food that is never sold in another state — oil, honey,
+ * vinegar, milk — so "Olive oil, as purchased" adds a code where §0.1.4's own
+ * grocery example reads "Olive oil".
+ */
+const SHOPPING_FORM_STATES: ReadonlySet<string> = new Set([RAW_FOOD_STATE, 'as_purchased']);
+
+/**
+ * The words that already state a given preparation, per state.
+ *
+ * Catalog display names carry their own preparation qualifier — "Brown rice,
+ * cooked", "Black beans, canned", "Turkey breast, sliced" — so appending the
+ * state produces "Brown rice, cooked, cooked" and "Black beans, canned,
+ * cooked". Matching is per state and against the name's LAST qualifier only,
+ * never a keyword scan of the whole name: "Rolled oats, dry" on a `cooked` row
+ * is a different food from the dry one and must still read "..., cooked".
+ */
+const STATE_SYNONYMS: Record<string, readonly string[]> = {
+    dry: ['dry', 'dried', 'uncooked'],
+    cooked: ['cooked', 'canned', 'boiled', 'roasted', 'braised', 'steamed', 'grilled', 'baked'],
+    prepared: [
+        'prepared',
+        'canned',
+        'jarred',
+        'bottled',
+        'sliced',
+        'shredded',
+        'smoked',
+        'roasted',
+        'pickled',
+        'cured',
+    ],
+};
+
+// Only the qualifiers are read — everything after the FIRST comma — so the
+// food's own noun can never be mistaken for a preparation. "Tuna, canned in
+// water" states its preparation inside a phrase and "Beef, ground, cooked" in
+// the last of two qualifiers, so every qualifier word is tested rather than one
+// of them compared whole.
+const statesItsOwnPreparation = (baseName: string, foodState: string): boolean => {
+    const synonyms = Object.prototype.hasOwnProperty.call(STATE_SYNONYMS, foodState)
+        ? STATE_SYNONYMS[foodState]
+        : null;
+
+    if (!synonyms) {
+        return false;
+    }
+
+    const [, ...qualifiers] = baseName.split(',');
+    const words = qualifiers.join(' ').toLowerCase().match(/[a-z]+/g) ?? [];
+
+    return words.some((word) => synonyms.includes(word));
+};
+
+/**
  * The shopping name: the base name, plus the state when the state is worth
  * saying.
  *
- * The suffix appears when the state is not `raw` — "Chicken breast" needs no
- * qualifier, "Rice, dry" does — OR when the same base name is on the list in
- * more than one state, which is what keeps "Rice, dry" and "Rice, cooked" two
- * distinguishable lines. `as_purchased` reads as "as purchased": the stored
- * value is a code, and this is the one place a grocery code becomes words,
- * because the name is text this module owns.
+ * Three rules, in this order, because they can disagree:
+ *
+ *  1. COEXISTENCE ALWAYS WINS. While one base name is on the list in more than
+ *     one state, every one of its rows is qualified — that is what keeps
+ *     "Rice, dry" and "Rice, cooked" two distinguishable lines, and suppressing
+ *     either would collapse two rows to one name.
+ *  2. A SHOPPING-FORM STATE IS SILENT. {@link SHOPPING_FORM_STATES} needs no
+ *     qualifier: "Chicken breast", "Olive oil".
+ *  3. A NAME THAT ALREADY SAYS IT IS LEFT ALONE. "Brown rice, cooked" on a
+ *     `cooked` row is complete; §0.7.3's suffix exists to tell states apart,
+ *     not to repeat one the catalog already wrote.
+ *
+ * Otherwise the state is appended, and `as_purchased` reads as "as purchased":
+ * the stored value is a code, and this is the one place a grocery code becomes
+ * words, because the name is text this module owns.
  */
 export const buildGroceryName = (baseName: string, foodState: string, statesByName: FoodStatesByName): string => {
     const coexistingStates = statesByName.get(baseName);
-    const needsSuffix = foodState !== RAW_FOOD_STATE || (coexistingStates !== undefined && coexistingStates.size > 1);
+    const suffixed = `${baseName}, ${foodState.replace(/_/g, ' ')}`;
 
-    if (!needsSuffix) {
+    if (coexistingStates !== undefined && coexistingStates.size > 1) {
+        return suffixed;
+    }
+
+    if (SHOPPING_FORM_STATES.has(foodState) || statesItsOwnPreparation(baseName, foodState)) {
         return baseName;
     }
 
-    return `${baseName}, ${foodState.replace(/_/g, ' ')}`;
+    return suffixed;
 };
 
 /* ---------------------------------------------------------------------------
@@ -593,7 +787,7 @@ export const buildGroceryRows = (
         .map(({ total, fact }) => {
             const display = buildGroceryDisplay(
                 total.quantity_grams,
-                displayFamilyForPortion(fact.default_portion),
+                displayFamilyForPortion(fact),
                 fact,
             );
 
@@ -713,79 +907,106 @@ const VANISHED_DELTA = 0;
  */
 const MIN_COUNT_DELTA_ITEMS = 1;
 
+/** The two strings a flagged row's "Now X, was Y" sub-line and delta pill render. */
+interface FlagStrings {
+    previousDisplayText: string;
+    deltaDisplayText: string;
+}
+
 /**
- * The delta pill's text, in the row's OWN unit rather than a freshly tiered one.
+ * A count row's pair, both derived from the SAME rendered baseline.
  *
- * This is the difference between "+0.6 lb" and "+9.6 oz": 0.6 lb is 272 g, and
- * re-tiering 272 g on its own picks ounces, so the three strings the user reads
- * would no longer add up ("was 2.5 lb", "Now 3.1 lb", "+9.6 oz"). The unit's
- * conversion factor comes from `utils/units.ts` — `toBaseQuantity(1, unit)` is
- * how many base units one of it is — and only the per-family precision choice
- * is made here, because that module exposes no "render this value in this unit"
- * entry point. The sign is always "+": a flag is only ever raised by an
- * increase over the acknowledged amount.
+ * The baseline is rendered once, and the delta subtracts the whole number that
+ * rendering produced — not the fractional item count behind it. Rounding the
+ * baseline twice, once for "was" and once for the pill, is what let the two
+ * disagree by a whole item: 37.5 sprigs renders as "38 sprigs" while 43 − 37.5
+ * rounds to 6, and the shopper reads "was 38, Now 43, +6". Subtracting the
+ * displayed numbers is the only arithmetic that reconciles, and it needs no
+ * rounding of its own because both sides are already whole items.
  *
- * Two invariants hold whatever the numbers do, because the pill is read beside
- * the row's own "was Y" and "Now X" and has to agree with both:
+ * Counting items rather than portions matters here too: `display_quantity`
+ * counts items and a portion may count several ("5 sprigs"), so comparing items
+ * against portions would report a fifth of the real increase — which is why the
+ * baseline goes through the same renderer as the row.
+ *
+ * The floor is one whole item: a flag that stands is worth at least one thing to
+ * buy, and the count family has no smaller unit to fall back to the way a mass
+ * row falls back to grams. It binds only when the increase is under one item,
+ * which `diffGroceryList` does not flag in the first place — a row whose
+ * rendered text did not change is never flagged.
+ */
+const countFlagStrings = ({ baselineGrams, displayQuantity, family, facts }: DeltaTextInputs): FlagStrings => {
+    const portion = requireCountPortion(facts.default_portion);
+    const baseline = buildGroceryDisplay(baselineGrams, family, facts);
+    const items = Math.max(displayQuantity - baseline.quantity, MIN_COUNT_DELTA_ITEMS);
+
+    return {
+        previousDisplayText: baseline.text,
+        deltaDisplayText: `+${items} ${pluralizeCount(items, portion.description)}`,
+    };
+};
+
+/**
+ * A mass or volume row's pair, both rendered in the ROW'S unit.
+ *
+ * All three strings the shopper reads together — "was Y", "Now X" and the pill
+ * — are one unit's worth of arithmetic, so they are computed here together
+ * rather than each finding its own unit. Re-tiering the baseline on its own is
+ * what put "was 14 tbsp" beside "2 cups" with "+1 cup": each string was
+ * truthful and the three did not reconcile. The baseline is therefore rendered
+ * in the row's own `display_unit` at that unit's precision, and the delta is
+ * the difference of the two ROUNDED amounts, so the pill is exactly what the
+ * shopper gets by subtracting the numbers in front of them. The sign is always
+ * "+": a flag is only ever raised by an increase over the acknowledged amount.
+ *
+ * Two invariants hold whatever the numbers do:
  *
  *  * A FLAGGED INCREASE NEVER RENDERS ZERO. An increase that crosses a
  *    promotion boundary is, by definition, smaller than one step of the unit it
- *    promoted INTO: 447.9 g reads "15.8 oz" and 452.5 g reads "1 lb", so the
- *    gap between the two strings is a fraction of a pound and the row's own
- *    unit can only call it "+0 lb" — three strings that contradict each other.
- *    The SAME difference is then re-rendered from the family's BASE units
- *    (grams, millilitres) by `utils/units.ts`'s own tiered formatter, which
- *    picks a unit small enough to show it and clamps a positive amount away
- *    from zero. It is the same difference the line above computes — the row's
- *    RENDERED amount ("1 lb", 453.6 g) less the acknowledged amount (447.9 g),
- *    so the pill keeps reconciling the two strings it is read beside — which
- *    here reads "+6 g". The count family has no smaller unit to fall back to,
- *    so it is floored at one whole item instead.
- *  * THE DELTA STAYS INSIDE THE ROW'S UNIT FAMILY. The fallback re-renders the
- *    same difference through that family's formatter and no other, so a mass
- *    row's delta is always a mass and a volume row's always a volume — the
- *    unit-family lock the header states, applied to the pill.
+ *    promoted INTO: 447.9 g and 453.6 g are "15.8 oz" and "1 lb", and in pounds
+ *    both round to 1, so the row's own unit can only call the gap "+0 lb". That
+ *    degenerate case — a baseline the row's unit cannot tell apart from the
+ *    current amount, or one that rounds away entirely — is the ONE place the
+ *    pair falls back to `utils/units.ts`'s tiered formatter, which picks a unit
+ *    small enough to show the difference and clamps a positive amount away from
+ *    zero ("was 15.8 oz", "+6 g"). Both strings fall back together, so they
+ *    still describe the same two amounts.
+ *  * THE DELTA STAYS INSIDE THE ROW'S UNIT FAMILY. The row's unit, and the
+ *    fallback's formatter, both belong to the family the row was created with,
+ *    so a mass row's delta is always a mass and a volume row's always a volume
+ *    — the unit-family lock the header states, applied to the pill.
  */
-const deltaTextFor = ({
+const measuredFlagStrings = ({
     baselineGrams,
     displayQuantity,
     displayUnit,
     family,
     facts,
-}: DeltaTextInputs): string => {
-    if (family === 'count') {
-        const portion = requireCountPortion(facts.default_portion);
-        const items = Math.max(
-            Math.round(displayQuantity - baselineGrams / portion.gram_weight),
-            MIN_COUNT_DELTA_ITEMS,
-        );
+}: DeltaTextInputs): FlagStrings => {
+    const baseAmount = family === 'volume' ? gramsToMilliliters(baselineGrams, volumeDensityFor(facts)) : baselineGrams;
+    const baseline = formatInUnit(baseAmount, displayUnit);
+    const difference = displayQuantity - baseline.value;
+    const delta = family === 'volume' ? roundToQuarter(difference) : roundToTenth(difference);
 
-        return `+${items} ${pluralizeCount(items, portion.description)}`;
+    if (baseline.value > 0 && delta !== VANISHED_DELTA) {
+        return {
+            previousDisplayText: baseline.text,
+            deltaDisplayText: `+${family === 'volume' ? formatQuarters(delta) : String(delta)} ${deltaUnitWord(displayUnit, delta)}`,
+        };
     }
 
     const perUnit = toBaseQuantity(1, displayUnit).amount;
+    const exactDifference = Math.abs(displayQuantity - baseAmount / perUnit) * perUnit;
+    const smallerUnit = family === 'volume' ? formatVolume(exactDifference) : formatMass(exactDifference);
 
-    if (family === 'volume') {
-        const baselineInUnit = gramsToMilliliters(baselineGrams, facts.density_g_per_ml) / perUnit;
-        const delta = displayQuantity - baselineInUnit;
-        const quarters = roundToQuarter(delta);
-
-        if (quarters === VANISHED_DELTA) {
-            return `+${formatVolume(Math.abs(delta) * perUnit).text}`;
-        }
-
-        return `+${formatQuarters(quarters)} ${deltaUnitWord(displayUnit, quarters)}`;
-    }
-
-    const delta = displayQuantity - baselineGrams / perUnit;
-    const tenths = roundToTenth(delta);
-
-    if (tenths === VANISHED_DELTA) {
-        return `+${formatMass(Math.abs(delta) * perUnit).text}`;
-    }
-
-    return `+${String(tenths)} ${deltaUnitWord(displayUnit, tenths)}`;
+    return {
+        previousDisplayText: buildGroceryDisplay(baselineGrams, family, facts).text,
+        deltaDisplayText: `+${smallerUnit.text}`,
+    };
 };
+
+const buildFlagStrings = (inputs: DeltaTextInputs): FlagStrings =>
+    inputs.family === 'count' ? countFlagStrings(inputs) : measuredFlagStrings(inputs);
 
 /**
  * The wire flag for a row, or null when the row is not flagged.
@@ -795,6 +1016,9 @@ const deltaTextFor = ({
  * is the amount the user ACKNOWLEDGED and not the amount before the last change.
  * A row flagged without a recorded baseline describes nothing truthfully, so it
  * reports no flag rather than inventing a "was".
+ *
+ * "was Y" and the delta are built together, in ONE unit, so the three strings
+ * the shopper reads side by side reconcile — see {@link measuredFlagStrings}.
  */
 export const buildGroceryFlag = (
     row: Pick<
@@ -809,17 +1033,18 @@ export const buildGroceryFlag = (
 
     const family = storedRowFamily(row);
     const baselineGrams = row.previous_quantity_grams;
+    const { previousDisplayText, deltaDisplayText } = buildFlagStrings({
+        baselineGrams,
+        displayQuantity: row.display_quantity,
+        displayUnit: row.display_unit,
+        family,
+        facts,
+    });
 
     return {
-        previousDisplayText: buildGroceryDisplay(baselineGrams, family, facts).text,
+        previousDisplayText,
         newDisplayText: row.display_text,
-        deltaDisplayText: deltaTextFor({
-            baselineGrams,
-            displayQuantity: row.display_quantity,
-            displayUnit: row.display_unit,
-            family,
-            facts,
-        }),
+        deltaDisplayText,
         flaggedAt: row.flagged_at.toISOString(),
     };
 };

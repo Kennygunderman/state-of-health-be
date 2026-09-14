@@ -250,8 +250,16 @@ export class NoMatchingMealsError extends Error implements NoMatchingMealsErrorD
 // The search could not complete — distinct from NoMatchingMealsError, which is
 // a completed search reporting infeasibility. Nothing was persisted, so any
 // plan the user already had is still theirs.
+//
+// `cause` is DIAGNOSTIC ONLY and never serialised: §0.5.2's body for this
+// failure is the machine code `plan_generation_failed` and nothing else, so the
+// underlying fault is carried for the server log rather than for the client.
+// Optional because most throw sites are the search's own timeout and have no
+// inner error to attach, and because it keeps the existing no-argument
+// construction compiling. It is a constructor member rather than the ES2022
+// `Error` option: tsconfig targets es2016, where those typings do not exist.
 export class PlanGenerationError extends Error {
-    constructor() {
+    constructor(public readonly cause?: unknown) {
         super('Plan generation failed');
         this.name = 'PlanGenerationError';
     }
@@ -283,8 +291,14 @@ export class RecipeIneligibleError extends Error {
 // The commit failed and nothing was written: the original meal stands and the
 // grocery list was not touched. That is the assurance the client shows, so this
 // class is thrown only when it is actually true.
+//
+// `cause` carries the underlying fault for the server log, on the same terms as
+// PlanGenerationError above: diagnostic only, never part of the `swap_failed`
+// body, optional so the injected-fault throw site still constructs it with no
+// arguments, and a constructor member because es2016 has no `Error` cause
+// option.
 export class SwapFailedError extends Error {
-    constructor() {
+    constructor(public readonly cause?: unknown) {
         super('Meal swap failed');
         this.name = 'SwapFailedError';
     }

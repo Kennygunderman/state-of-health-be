@@ -5,8 +5,10 @@
  * unrecognised token to none, the definitional conversion factors, the
  * 16 oz / 16 tbsp promotion thresholds together with the re-round that makes
  * "16.0 oz" unprintable, the refusal to cross mass and volume without a stored
- * density, the clamp that stops a positive quantity reading as zero, and the
- * irregular plurals.
+ * density, the clamp that stops a positive quantity reading as zero, the
+ * irregular plurals, and the two rules that read a catalog portion description
+ * rather than printing it: the amount a multi-item portion states in front of
+ * its noun, and the head noun a qualifier must not be mistaken for.
  *
  * The token tables below are exhaustive rather than sampled, because a token
  * quietly changing family is the corruption the one-family invariant exists to
@@ -38,10 +40,14 @@ import {
     toBaseQuantity,
     millilitersToGrams,
     gramsToMilliliters,
+    portionVolumeDensity,
     formatMass,
     formatVolume,
     formatQuarters,
+    formatInUnit,
     pluralizeCount,
+    parseCountPortion,
+    countPortionItems,
     formatCount,
 } from '../units';
 
@@ -389,6 +395,153 @@ describe('gramsToMilliliters', () => {
     });
 });
 
+/**
+ * `portionVolumeDensity` — the density a stored volume portion states about its
+ * own food.
+ *
+ * THE SHAPE IT EXISTS FOR is the one the shipped catalog release actually
+ * carries: 11,046 published foods, every one `nutrition_basis: per_100g` with
+ * `density_g_per_ml` NULL, and 4,622 of them holding a VOLUME-family default
+ * portion. Each such portion states `amount` units of volume weighing
+ * `gram_weight` grams, which is a density — so the figure the display path needs
+ * is already in the data and is read from it here instead of being demanded of a
+ * column that is null.
+ *
+ * `amount` IS DIVIDED OUT rather than assumed to be 1, because the release
+ * disagrees with that assumption: alongside 4,164 portions at amount 1 it ships
+ * 156 at 0.5, 36 at 2, 24 at 0.25, 22 at 8 and more. Assuming 1 would double a
+ * half-cup food's density and halve a two-cup food's.
+ *
+ * Every unanswerable input is null rather than a throw, and the last case here
+ * pins the counterpart: the two conversion entry points still refuse a missing
+ * density loudly, because `catalog.logic.ts`'s `per_100ml` nutrition basis and
+ * `recipes-seed.ts` are built on that refusal.
+ */
+describe('portionVolumeDensity', () => {
+    describe('a volume portion states its own density', () => {
+        // `usda:167561`: default portion "1 cup", 150 g, density NULL — a real
+        // shipped row, and the arithmetic is stated through the module's own cup
+        // factor so the test cannot disagree with it about how many millilitres
+        // a cup is.
+        it('divides the gram weight by the millilitres the portion measures', () => {
+            expect(portionVolumeDensity({ amount: 1, unit: 'cup', gram_weight: 150 })).toBeCloseTo(
+                150 / MILLILITERS_PER_CUP,
+                10,
+            );
+        });
+
+        // `usda:167573`: default portion "0.5 cup", 107 g. Read as one cup it
+        // would state 0.452 g/ml — half the truth — so the divisor is the whole
+        // measured volume and not the unit's own factor.
+        it('divides by the AMOUNT as well as the unit, for a portion that is not one of it', () => {
+            expect(portionVolumeDensity({ amount: 0.5, unit: 'cup', gram_weight: 107 })).toBeCloseTo(
+                107 / (0.5 * MILLILITERS_PER_CUP),
+                10,
+            );
+        });
+
+        it('scales linearly with the amount, so 8 of a unit is an eighth of the density', () => {
+            const one = portionVolumeDensity({ amount: 1, unit: 'cup', gram_weight: 240 });
+            const eight = portionVolumeDensity({ amount: 8, unit: 'cup', gram_weight: 240 });
+
+            expect(one).not.toBeNull();
+            expect(eight).toBeCloseTo((one as number) / 8, 10);
+        });
+
+        // Water-like by construction: a millilitre portion weighing its own
+        // number of grams is 1 g/ml whichever volume token states it, which is
+        // what makes every recognised volume unit comparable here.
+        it.each(VOLUME_UNITS)('answers for %s, using that unit\u2019s own factor', (unit) => {
+            const milliliters = toBaseQuantity(1, unit).amount;
+
+            expect(portionVolumeDensity({ amount: 1, unit, gram_weight: milliliters })).toBeCloseTo(1, 10);
+        });
+
+        it('normalises the unit token the way every other conversion does', () => {
+            expect(portionVolumeDensity({ amount: 1, unit: ' CUPS ', gram_weight: 150 })).toBeCloseTo(
+                150 / MILLILITERS_PER_CUP,
+                10,
+            );
+        });
+
+        // A tablespoon of olive oil: the AAP's own example food, at the density
+        // the release's portion implies rather than a curated one.
+        it('answers for the tablespoon portion the grocery list renders oil in', () => {
+            expect(portionVolumeDensity({ amount: 1, unit: 'tbsp', gram_weight: 13.5 })).toBeCloseTo(
+                13.5 / MILLILITERS_PER_TABLESPOON,
+                10,
+            );
+        });
+    });
+
+    describe('a portion that states no volume states no density', () => {
+        it.each(MASS_UNITS)('answers null for the mass unit %s, because grams per gram is not a density', (unit) => {
+            expect(portionVolumeDensity({ amount: 1, unit, gram_weight: 100 })).toBeNull();
+        });
+
+        it.each(COUNT_UNITS)('answers null for the count unit %s', (unit) => {
+            expect(portionVolumeDensity({ amount: 1, unit, gram_weight: 50 })).toBeNull();
+        });
+
+        it.each(['bottle', 'sachet', 'can', '', '   ', 'floz', 'constructor', '__proto__'])(
+            'answers null for the unrecognised token %p rather than guessing a volume',
+            (unit) => {
+                expect(portionVolumeDensity({ amount: 1, unit, gram_weight: 100 })).toBeNull();
+            },
+        );
+    });
+
+    describe('an unusable measurement states no density', () => {
+        const UNUSABLE_NUMBERS: Array<[string, number]> = [
+            ['zero', 0],
+            ['negative', -1],
+            ['NaN', Number.NaN],
+            ['Infinity', Number.POSITIVE_INFINITY],
+            ['-Infinity', Number.NEGATIVE_INFINITY],
+        ];
+
+        // Validation's `unsupported_portion` check rejects a non-positive amount
+        // and `missing_gram_weight` an absent weight, so neither shape can reach
+        // this function from a published food — which is exactly why it answers
+        // instead of throwing: the display path has a truthful mass row to fall
+        // back to either way.
+        it.each(UNUSABLE_NUMBERS)('answers null for a %s amount', (_case, amount) => {
+            expect(portionVolumeDensity({ amount, unit: 'cup', gram_weight: 150 })).toBeNull();
+        });
+
+        it.each(UNUSABLE_NUMBERS)('answers null for a %s gram weight', (_case, gram_weight) => {
+            expect(portionVolumeDensity({ amount: 1, unit: 'cup', gram_weight })).toBeNull();
+        });
+
+        // Both inputs are finite and positive; the quotient is not. A silent
+        // Infinity would travel on as the divisor of every rendered amount.
+        it('answers null when the quotient is not finite', () => {
+            expect(portionVolumeDensity({ amount: 5e-324, unit: 'ml', gram_weight: 1e308 })).toBeNull();
+        });
+
+        // The mirror case: a colossal volume under a tiny weight divides to 0,
+        // and a zero density is no more usable than a null one.
+        it('answers null when the quotient rounds away to zero', () => {
+            expect(portionVolumeDensity({ amount: 1e308, unit: 'l', gram_weight: 5e-324 })).toBeNull();
+        });
+    });
+
+    // The whole point of answering null: the CONVERSIONS still refuse. A future
+    // change that made `requireDensity` tolerate a missing density would let a
+    // `per_100ml` food's nutrition be computed at 1 g/ml, which is the fault
+    // this module's loud failure exists to prevent.
+    it('does not soften the conversions, which still refuse a density they were not given', () => {
+        expect(portionVolumeDensity({ amount: 1, unit: 'cup', gram_weight: 150 })).not.toBeNull();
+
+        expect(() => gramsToMilliliters(100, null)).toThrow(
+            'A positive density_g_per_ml is required to convert grams to millilitres',
+        );
+        expect(() => millilitersToGrams(100, null)).toThrow(
+            'A positive density_g_per_ml is required to convert millilitres to grams',
+        );
+    });
+});
+
 describe('formatMass — the largest unit that keeps the value at or above one', () => {
     const MASS_TEXT_CASES: Array<[number, string]> = [
         [15, '15 g'],
@@ -711,6 +864,225 @@ describe('formatCount', () => {
     it.each(NON_FINITE_QUANTITIES)('throws for a %s count', (_case, count) => {
         expect(() => formatCount(count, 'egg')).toThrow(UnitConversionError);
         expect(() => formatCount(count, 'egg')).toThrow('count must be a finite number');
+    });
+});
+
+/*
+ * The shipped catalog's count portions, as `catalog_food_portions.description`
+ * stores them: the item is named first and qualified afterwards ("egg, large",
+ * "can, drained"), and a portion counting several items states the amount in
+ * front of the noun ("5 sprigs", USDA's dill weed portion at 1 g). Both halves
+ * have to be read rather than rendered verbatim — a grocery row that printed
+ * the portion count in front of the description read "9 5 sprigs", and
+ * inflecting the description's last word read "6 1 egg, larges".
+ */
+describe('parseCountPortion', () => {
+    it('reads the amount a description states, and the noun it counts', () => {
+        expect(parseCountPortion('5 sprigs')).toEqual({ itemsPerPortion: 5, noun: 'sprigs' });
+    });
+
+    it('counts one item when the description states no amount', () => {
+        expect(parseCountPortion('container (6 oz)')).toEqual({ itemsPerPortion: 1, noun: 'container (6 oz)' });
+    });
+
+    it('keeps the qualifier with the noun', () => {
+        expect(parseCountPortion('1 egg, large')).toEqual({ itemsPerPortion: 1, noun: 'egg, large' });
+    });
+
+    it('trims the description', () => {
+        expect(parseCountPortion('  1 avocado  ')).toEqual({ itemsPerPortion: 1, noun: 'avocado' });
+    });
+
+    it('reads a fractional amount', () => {
+        expect(parseCountPortion('0.5 fillet')).toEqual({ itemsPerPortion: 0.5, noun: 'fillet' });
+    });
+
+    const NOT_AN_AMOUNT: Array<[string, string]> = [
+        ['a leading zero, which would erase the row', '0 slices'],
+        ['a number with no noun after it', '12'],
+        ['a number joined to its noun', '12oz'],
+        ['an empty description', ''],
+    ];
+
+    it.each(NOT_AN_AMOUNT)('counts portions for %s', (_case, description) => {
+        expect(parseCountPortion(description)).toEqual({ itemsPerPortion: 1, noun: description.trim() });
+    });
+});
+
+describe('countPortionItems', () => {
+    it('multiplies portions by the items one portion counts', () => {
+        expect(countPortionItems(9, '5 sprigs')).toBe(45);
+    });
+
+    it('counts portions directly when one portion is one item', () => {
+        expect(countPortionItems(6, '1 egg, large')).toBe(6);
+    });
+
+    it.each(NON_FINITE_QUANTITIES)('throws for a %s number of portions', (_case, portions) => {
+        expect(() => countPortionItems(portions, '5 sprigs')).toThrow(UnitConversionError);
+        expect(() => countPortionItems(portions, '5 sprigs')).toThrow('count must be a finite number');
+    });
+
+    it('throws rather than returning an infinite item count', () => {
+        expect(() => countPortionItems(Number.MAX_VALUE, '5 sprigs')).toThrow(UnitConversionError);
+    });
+});
+
+describe('pluralizeCount — real catalog portion descriptions', () => {
+    const SHIPPED_CASES: Array<[string, string]> = [
+        ['1 egg, large', 'eggs, large'],
+        ['1 can, drained', 'cans, drained'],
+        ['1 tomato, medium', 'tomatoes, medium'],
+        ['1 carrot, medium', 'carrots, medium'],
+        ['1 stalk, medium', 'stalks, medium'],
+        ['1 olive, large', 'olives, large'],
+        ['1 potato, medium', 'potatoes, medium'],
+        ['1 avocado', 'avocados'],
+        ['1 clove', 'cloves'],
+        ['1 slice', 'slices'],
+        ['1 lemon', 'lemons'],
+        ['1 pepper', 'peppers'],
+    ];
+
+    it.each(SHIPPED_CASES)('renders "%s" as "%s"', (description, expected) => {
+        expect(pluralizeCount(4, description)).toBe(expected);
+    });
+
+    it.each(SHIPPED_CASES)('drops the stated amount from "%s" for a single item too', (description) => {
+        expect(pluralizeCount(1, description)).toBe(description.replace(/^1 /, ''));
+    });
+
+    it('inflects the noun rather than the qualifier after a parenthesis', () => {
+        expect(pluralizeCount(4, 'container (6 oz)')).toBe('containers (6 oz)');
+    });
+
+    const ALREADY_PLURAL: string[] = ['5 sprigs', 'sprigs', 'slices', 'cloves', 'eggs'];
+
+    it.each(ALREADY_PLURAL)('leaves "%s" alone, because it is already plural', (description) => {
+        expect(pluralizeCount(4, description)).toBe(description.replace(/^5 /, ''));
+    });
+
+    /*
+     * The irregulars are chosen against the catalog, not against English: of
+     * the 262 head nouns the shipped count portions use, only these inflect
+     * wrongly under the general rules. The -o nouns beside them — avocado,
+     * burrito, taco, matzo — all take a plain s, so no -o rule exists.
+     */
+    const CATALOG_IRREGULARS: Array<[string, string]> = [
+        ['1 potato, medium', 'potatoes, medium'],
+        ['baby potato', 'baby potatoes'],
+        ['half', 'halves'],
+        ['1 tomato, medium', 'tomatoes, medium'],
+    ];
+
+    it.each(CATALOG_IRREGULARS)('pluralises "%s" as "%s"', (description, expected) => {
+        expect(pluralizeCount(2, description)).toBe(expected);
+    });
+
+    const CATALOG_REGULAR_O_NOUNS: Array<[string, string]> = [
+        ['1 avocado', 'avocados'],
+        ['burrito', 'burritos'],
+        ['taco', 'tacos'],
+        ['matzo', 'matzos'],
+    ];
+
+    it.each(CATALOG_REGULAR_O_NOUNS)('pluralises "%s" as "%s", with a plain s', (description, expected) => {
+        expect(pluralizeCount(2, description)).toBe(expected);
+    });
+
+    const SINGULAR_TO_PLURAL_AND_BACK: Array<[string, string]> = [
+        ['sprigs', 'sprig'],
+        ['slices', 'slice'],
+        ['eggs', 'egg'],
+        ['berries', 'berry'],
+        ['glasses', 'glass'],
+        ['bunches', 'bunch'],
+        ['leaves', 'leaf'],
+        ['potatoes', 'potato'],
+        ['halves', 'half'],
+    ];
+
+    it.each(SINGULAR_TO_PLURAL_AND_BACK)('reads one of "%s" as "%s"', (description, expected) => {
+        expect(pluralizeCount(1, description)).toBe(expected);
+    });
+
+    // An -ss, -us or -is ending belongs to a singular word, so it is inflected
+    // rather than mistaken for a plural and left as it is.
+    const SINGULAR_S_ENDINGS: Array<[string, string]> = [
+        ['glass', 'glasses'],
+        ['hummus', 'hummuses'],
+    ];
+
+    it.each(SINGULAR_S_ENDINGS)('treats "%s" as singular and pluralises it to "%s"', (description, expected) => {
+        expect(pluralizeCount(2, description)).toBe(expected);
+    });
+});
+
+describe('formatCount — a portion that counts several items', () => {
+    it('renders the items, not the portions', () => {
+        // USDA states dill weed as 5 sprigs per gram, so nine grams is 45
+        // sprigs — a ninefold undercount if the portion were the item.
+        expect(formatCount(9, '5 sprigs')).toEqual({ value: 45, unit: 'sprigs', text: '45 sprigs' });
+    });
+
+    it('renders a single item of a plural description in the singular', () => {
+        expect(formatCount(0.2, '5 sprigs')).toEqual({ value: 1, unit: 'sprig', text: '1 sprig' });
+    });
+
+    it('counts portions when one portion is one item', () => {
+        expect(formatCount(6, '1 egg, large')).toEqual({ value: 6, unit: 'eggs, large', text: '6 eggs, large' });
+    });
+
+    it('never repeats the portion amount in the text', () => {
+        expect(formatCount(6, '1 egg, large').text).not.toContain('1 egg');
+        expect(formatCount(9, '5 sprigs').text).not.toContain('5 sprigs,');
+    });
+
+    it('keeps the singular for exactly one of a one-item portion', () => {
+        expect(formatCount(1, '1 avocado')).toEqual({ value: 1, unit: 'avocado', text: '1 avocado' });
+    });
+});
+
+describe('formatInUnit', () => {
+    it('renders a mass in the unit it is asked for', () => {
+        expect(formatInUnit(1133.98, 'lb')).toEqual({ value: 2.5, unit: 'lb', text: '2.5 lb' });
+        expect(formatInUnit(400, 'oz')).toEqual({ value: 14.1, unit: 'oz', text: '14.1 oz' });
+    });
+
+    it('keeps an amount below one in the unit asked for instead of promoting it', () => {
+        // 207 ml is fourteen tablespoons, which is what formatVolume picks; the
+        // same amount read in the cups a grocery row already displays is ¾.
+        expect(formatVolume(207).text).toBe('14 tbsp');
+        expect(formatInUnit(207, 'cups')).toEqual({ value: 0.75, unit: 'cup', text: '¾ cup' });
+    });
+
+    it('renders zero for an amount too small for the unit, rather than clamping it up', () => {
+        expect(formatInUnit(5, 'lb')).toEqual({ value: 0, unit: 'lb', text: '0 lb' });
+    });
+
+    it('pluralises the one unit that carries a plural', () => {
+        expect(formatInUnit(MILLILITERS_PER_CUP * 2, 'cup').text).toBe('2 cups');
+        expect(formatInUnit(MILLILITERS_PER_CUP, 'cups').text).toBe('1 cup');
+    });
+
+    it('borrows the family precision for a unit outside the display tiers', () => {
+        expect(formatInUnit(1500, 'kg')).toEqual({ value: 1.5, unit: 'kg', text: '1.5 kg' });
+        expect(formatInUnit(MILLILITERS_PER_TEASPOON * 2, 'tsp')).toEqual({ value: 2, unit: 'tsp', text: '2 tsp' });
+    });
+
+    it('refuses a count unit, whose amounts are items rather than base units', () => {
+        expect(() => formatInUnit(12, 'each')).toThrow(UnitConversionError);
+        expect(() => formatInUnit(12, 'each')).toThrow('counts items');
+    });
+
+    it('refuses an unrecognised unit', () => {
+        expect(() => formatInUnit(12, 'bottle')).toThrow(UnitConversionError);
+        expect(() => formatInUnit(12, 'bottle')).toThrow('Unrecognised unit');
+    });
+
+    it.each(NON_FINITE_QUANTITIES)('throws for a %s amount', (_case, amount) => {
+        expect(() => formatInUnit(amount, 'g')).toThrow(UnitConversionError);
+        expect(() => formatInUnit(amount, 'g')).toThrow('quantity must be a finite number');
     });
 });
 
