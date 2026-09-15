@@ -44,6 +44,8 @@ import { loadCoveragePlan, loadUsdaManifest } from '../../../scripts/lib/manifes
 import type { UsdaManifest, UsdaManifestFood } from '../../../scripts/lib/manifest';
 import type { UsdaFoodDetail, UsdaFoodPortion, UsdaFoodSummary } from '../../services/usda.service';
 import {
+    CatalogImportError,
+    IMPORT_REPORT_NOTE_KEY,
     buildImportPlan,
     describeFailure,
     importRunScope,
@@ -51,6 +53,7 @@ import {
     parsePortionLabel,
     prepareCatalogFood,
     runImport,
+    writeImportReport,
 } from '../../../scripts/catalog-import-usda';
 import type {
     ImportAssignment,
@@ -96,6 +99,7 @@ import {
     type UsdaRateLedger,
     type UsdaRateLimiter,
     type UsdaRateReservation,
+    type UsdaRequestStats,
 } from '../../../scripts/lib/rateLimiter';
 // The version decision and the persistence it feeds (DB-F08), plus the batch
 // accounting (DB-F11). `nextCatalogFoodVersions` is pure, so most of that
@@ -162,6 +166,10 @@ const options = (overrides: Partial<ImportOptions> = {}): ImportOptions => ({
     limit: null,
     resume: false,
     dryRun: false,
+    // No stated expectation, which is the default an operator gets: the run
+    // imports whichever manifest version the checkout ships. The cases that
+    // exercise `--manifest` set it explicitly.
+    manifestVersion: null,
     ...overrides,
 });
 
@@ -654,7 +662,672 @@ describe('describeFailure', () => {
     it('reports a non-Error value without throwing', () => {
         expect(describeFailure('something went wrong').code).toBe('unexpected_error');
     });
+
+    it('reports the stage’s own error under the code it carries', () => {
+        const described = describeFailure(
+            new CatalogImportError('manifest_version_mismatch', '--manifest v2 was given', {
+                manifestVersion: 'v2',
+            }),
+        );
+
+        expect(described.code).toBe('manifest_version_mismatch');
+        expect(described.error.name).toBe('CatalogImportError');
+    });
 });
+
+/**
+ * THE VENDOR BOUNDARY (Rule backend-architecture §9).
+ *
+ * A USDA failure used to leave this stage as `UsdaError` itself, so everything
+ * upstream was left matching a shape `src/services/usda.service.ts` owns, and
+ * the operator was never told WHICH of ~600 batches stopped. Wrapping is the
+ * rule; carrying the batch is what makes the wrap worth having, because
+ * "re-run with --resume" and "read the code" are different answers and the
+ * batch identity is how an operator tells them apart.
+ */
+describe('a vendor failure leaves this stage as its own error (§9)', () => {
+    const vendorOutage = (): Error => {
+        const error = new Error('USDA returned 503');
+        error.name = 'UsdaError';
+
+        return error;
+    };
+
+    const sweptRow = (index: number): UsdaFoodSummary => ({
+        fdcId: 970000 + index,
+        description: `Carrots, raw, boundary ${index}`,
+        dataType: 'SR Legacy',
+    });
+
+    const depsThrowingFrom = (
+        stage: 'list' | 'batch',
+        reports: unknown[] = [],
+    ): RunImportDeps =>
+        ({
+            db: new Proxy(
+                {},
+                {
+                    get: (_target, property) => {
+                        throw new Error(`the catalog was written after a vendor outage: db.${String(property)}`);
+                    },
+                },
+            ),
+            runDb: new Proxy(
+                {},
+                {
+                    get: (_target, property) => {
+                        throw new Error(`run state was touched before the plan: runDb.${String(property)}`);
+                    },
+                },
+            ),
+            usda: {
+                listFoods: async (): Promise<UsdaFoodSummary[]> => {
+                    if (stage === 'list') {
+                        throw vendorOutage();
+                    }
+
+                    return [sweptRow(0)];
+                },
+                getFoodsBatch: async (): Promise<UsdaFoodDetail[]> => {
+                    throw vendorOutage();
+                },
+                describeBatchRetrieval: async (): Promise<UsdaBatchRetrieval> => retrieval([sweptRow(0).fdcId]),
+            },
+            manifest,
+            coveragePlan,
+            // Dry run so the failure is reached without a database: the plan
+            // pass is where `listFoods` is called, and it runs before any
+            // claim. The batch case is proven against the real client in the
+            // DB-F11 cases, which now assert the failed closure too.
+            options: options({ dryRun: true }),
+            logger: silentLogger,
+            now: () => new Date('2026-09-13T11:00:00.000Z'),
+            installRateLimiter: () => (): void => undefined,
+            writeReport: (report: unknown) => {
+                reports.push(report);
+            },
+        }) as unknown as RunImportDeps;
+
+    it('wraps an enumeration failure and names the sweep it stopped on', async () => {
+        const failure = await runImport(depsThrowingFrom('list')).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        expect(failure).toBeInstanceOf(CatalogImportError);
+        const wrapped = failure as CatalogImportError;
+        expect(wrapped.name).toBe('CatalogImportError');
+        expect(wrapped.code).toBe('usda_request_failed');
+        expect(wrapped.context.sweepKey).toBe(manifest.datasetSweeps[0].sweepKey);
+        // The original is kept, so nothing is lost to the wrap.
+        expect((wrapped.underlying as Error).name).toBe('UsdaError');
+        expect(describeFailure(wrapped).code).toBe('usda_request_failed');
+    });
+
+    it('does not wrap a failure that is not the vendor’s', async () => {
+        const deps = depsThrowingFrom('list');
+        const notVendor = new TypeError('cannot read properties of undefined');
+        const withDefect = {
+            ...deps,
+            usda: {
+                ...deps.usda,
+                listFoods: async (): Promise<UsdaFoodSummary[]> => {
+                    throw notVendor;
+                },
+            },
+        } as unknown as RunImportDeps;
+
+        // A defect in this file reported as "USDA did not answer" would send an
+        // operator to the vendor's status page for a bug in the importer.
+        await expect(runImport(withDefect)).rejects.toBe(notVendor);
+    });
+});
+
+/**
+ * `--manifest` states which curation the operator believes they are importing.
+ *
+ * It asserts rather than selects, because `loadUsdaManifest` resolves exactly
+ * one document and version-checks it; what the flag adds is the refusal, and a
+ * refusal is only worth having if it costs nothing — so it is checked before
+ * the limiter, the plan and the first request.
+ */
+describe('--manifest refuses a curation the operator did not mean (§0.7.1)', () => {
+    const countingDeps = (
+        manifestVersion: string | null,
+    ): { deps: RunImportDeps; listCalls: () => number; reports: unknown[] } => {
+        let listCalls = 0;
+        const reports: unknown[] = [];
+
+        const deps = {
+            db: new Proxy(
+                {},
+                {
+                    get: (_target, property) => {
+                        throw new Error(`a refused run reached the catalog: db.${String(property)}`);
+                    },
+                },
+            ),
+            runDb: new Proxy(
+                {},
+                {
+                    get: (_target, property) => {
+                        throw new Error(`a refused run reached run state: runDb.${String(property)}`);
+                    },
+                },
+            ),
+            usda: {
+                listFoods: async (): Promise<UsdaFoodSummary[]> => {
+                    listCalls += 1;
+
+                    return [];
+                },
+                getFoodsBatch: async (): Promise<UsdaFoodDetail[]> => [],
+                describeBatchRetrieval: async (): Promise<UsdaBatchRetrieval> => retrieval([]),
+            },
+            manifest,
+            coveragePlan,
+            options: options({ dryRun: true, manifestVersion }),
+            logger: silentLogger,
+            now: () => new Date('2026-09-13T11:00:00.000Z'),
+            installRateLimiter: () => (): void => undefined,
+            writeReport: (report: unknown) => {
+                reports.push(report);
+            },
+        } as unknown as RunImportDeps;
+
+        return { deps, listCalls: () => listCalls, reports };
+    };
+
+    it('refuses a mismatch before spending a single request', async () => {
+        const { deps, listCalls, reports } = countingDeps('v2');
+
+        const failure = await runImport(deps).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        expect(failure).toBeInstanceOf(CatalogImportError);
+        expect((failure as CatalogImportError).code).toBe('manifest_version_mismatch');
+        expect((failure as CatalogImportError).context.manifestVersion).toBe('v2');
+        // The whole point of checking first: nothing was enumerated, nothing
+        // was reported and no run state exists to clean up.
+        expect(listCalls()).toBe(0);
+        expect(reports).toEqual([]);
+    });
+
+    it('proceeds when the stated version is the one the checkout ships', async () => {
+        const { deps, reports } = countingDeps(manifest.usdaManifestVersion);
+
+        const outcome = await runImport(deps);
+
+        expect(outcome.runId).toBeNull();
+        expect(reports).toHaveLength(1);
+        expect((reports[0] as { options: { manifestVersion: string | null } }).options.manifestVersion).toBe(
+            manifest.usdaManifestVersion,
+        );
+    });
+
+    it('proceeds when no expectation was stated, which is the default', async () => {
+        const { deps } = countingDeps(null);
+
+        await expect(runImport(deps)).resolves.toMatchObject({ runId: null });
+    });
+});
+
+/**
+ * WHAT THE REPORT HAS TO SAY (AAP §0.7.1 Group 3, §0.7.3).
+ *
+ * The import half of data/meal-planning/reports/latest/import-report.json.
+ * Every block here was absent before, and the committed artefact had to
+ * describe the absence from the outside — `usdaRequests.unmeasuredReason` and
+ * `measurementGaps` named this stage as the reason its counters were null. The
+ * cases below are what stop that from being true again.
+ */
+describe('the import report states what the run measured (§0.7.3)', () => {
+    interface CategoryRow {
+        readonly category: string;
+        readonly publishedTarget: number;
+        readonly candidateVolume: number;
+        readonly candidates: number;
+        readonly published: number;
+        readonly shortfall: number;
+        readonly candidateVolumeShortfall: number;
+    }
+
+    const dryRunReport = (stats?: () => UsdaRequestStats): Record<string, unknown> => {
+        const reports: unknown[] = [];
+        const deps = {
+            db: {},
+            runDb: {},
+            usda: {
+                listFoods: async (): Promise<UsdaFoodSummary[]> => [],
+                getFoodsBatch: async (): Promise<UsdaFoodDetail[]> => [],
+                describeBatchRetrieval: async (): Promise<UsdaBatchRetrieval> => retrieval([]),
+            },
+            manifest,
+            coveragePlan,
+            options: options({ dryRun: true }),
+            logger: silentLogger,
+            now: () => new Date('2026-09-13T11:00:00.000Z'),
+            installRateLimiter: () => (): void => undefined,
+            rateLimiterStats: stats,
+            writeReport: (report: unknown) => {
+                reports.push(report);
+            },
+        } as unknown as RunImportDeps;
+
+        return runImport(deps).then(() => reports[0] as Record<string, unknown>) as unknown as Record<string, unknown>;
+    };
+
+    const measuredStats = (): UsdaRequestStats => ({
+        configuredPerHour: 900,
+        vendorCapPerHour: 1000,
+        burstCapacity: 20,
+        attempts: 617,
+        pauses: 2,
+        totalPausedMs: 41_000,
+        longestPauseMs: 28_500,
+        firstAttemptAt: '2026-09-13T10:00:00.000Z',
+        lastAttemptAt: '2026-09-13T11:00:00.000Z',
+        ledgerKind: 'file',
+        ledgerScope: 'api.nal.usda.gov',
+        attemptsInWindow: 640,
+    });
+
+    it('writes the limiter’s own counters verbatim under usdaRequests', async () => {
+        const report = await dryRunReport(measuredStats);
+        const block = report.usdaRequests as Record<string, unknown>;
+
+        // Verbatim: the field names are rateLimiter.ts's contract, and
+        // catalog-report.ts reconciles against them.
+        expect(block).toMatchObject(measuredStats());
+        expect(block.unmeasured).toBe(false);
+        expect(block.limiterCountsPhysicalAttempts).toBe(true);
+        // A pause is the ceiling working, so the report has to say so rather
+        // than leave a non-zero count looking like an error.
+        expect(String(block.pausesNote)).toContain('never fail');
+        // The retry accounting is explained and its owner named, not restated
+        // as numbers this file would have to keep in step.
+        expect(block.rulesOwnedBy).toBe('src/services/usda.service.ts');
+        expect(String(block.accountingBasis)).toContain('Attempt-based');
+        // 900 configured against a 1000 cap leaves the live API its share.
+        expect(block.headroomPerHour).toBe(100);
+    });
+
+    it('says a counter was not measured rather than reporting it as zero', async () => {
+        const block = (await dryRunReport(undefined)).usdaRequests as Record<string, unknown>;
+
+        expect(block.unmeasured).toBe(true);
+        expect(String(block.unmeasuredReason)).toContain('zero would claim');
+        // The absence is the assertion: a zero here would state that a run
+        // which really did enumerate the sweeps issued no vendor request.
+        expect(block).not.toHaveProperty('attempts');
+        expect(block).not.toHaveProperty('pauses');
+        // The accounting basis is stated either way — it describes the stage,
+        // not the invocation.
+        expect(block.detailBatchSize).toBe(manifest.importLimits.detailBatchSize);
+    });
+
+    it('declares that attempts are not split by status class, instead of implying a zero', async () => {
+        const block = (await dryRunReport(measuredStats)).usdaRequests as Record<string, unknown>;
+
+        expect(String(block.statusClassCountsUnavailable)).toContain('does not see the response');
+        expect(block).not.toHaveProperty('statusClassCounts');
+    });
+
+    it('separates the two import-stage dedupe mechanisms from the validator’s', async () => {
+        const report = await dryRunReport(measuredStats);
+        const duplicates = report.duplicatesRemoved as Record<string, unknown>;
+
+        // Reported by a dry run because both mechanisms are applied while the
+        // plan is built, before any fetch.
+        expect(duplicates.skippedCuratedIdentityAtImport).toEqual(expect.any(Number));
+        expect(duplicates.skippedDuplicateInPlanAtImport).toEqual(expect.any(Number));
+        // The cross-table decision is catalog:validate's, and the report says
+        // so rather than leaving a reader to assume this stage made it.
+        expect(String(duplicates.basis)).toContain('dedupeIdentity runs in catalog:validate');
+    });
+
+    it('omits the measured blocks a dry run never looked at', async () => {
+        const report = await dryRunReport(measuredStats);
+
+        // An empty categories or quarantined block would read as "none found"
+        // where the truth is "never validated": the dry run writes no row and
+        // runs no check, so the honest report leaves them out.
+        expect(report).not.toHaveProperty('categories');
+        expect(report).not.toHaveProperty('quarantined');
+        expect(report).not.toHaveProperty('failuresByCheck');
+    });
+
+    it('states plainly that a dry run does spend enumeration requests', async () => {
+        const report = await dryRunReport(measuredStats);
+
+        // The previous note claimed "Nothing was fetched", which the sweep
+        // enumeration contradicts: buildImportPlan walks /foods/list.
+        expect(String(report.note)).toContain('no detail record was fetched');
+        expect(String(report.note)).not.toContain('Nothing was fetched');
+    });
+});
+
+/**
+ * The MEASURED half of the report, which only a real run can produce.
+ *
+ * These go through the real run ledger for the same reason the batch-accounting
+ * cases do: the blocks are written at the end of a run that claimed a row, and
+ * what is under test is the artefact that run leaves behind. The catalog writes
+ * are faked — an empty vendor response leaves the persistence path with nothing
+ * to write — which keeps the cases about the report alone.
+ */
+describe('the measured half of the import report (§0.7.3)', () => {
+    const FIXED_NOW = new Date('2026-09-14T09:00:00.000Z');
+
+    interface CategoryRow {
+        readonly category: string;
+        readonly publishedTarget: number;
+        readonly candidateVolume: number;
+        readonly candidates: number;
+        readonly published: number;
+        readonly shortfall: number;
+        readonly candidateVolumeShortfall: number;
+    }
+
+    /** One batch of work, so the run reaches its report without a long plan. */
+    const LIMIT = 20;
+
+    const runScope = importRunScope(manifest.usdaManifestVersion, options({ limit: LIMIT }));
+
+    const clearClaimedRun = async (): Promise<void> => {
+        await prisma.catalog_import_runs.deleteMany({
+            where: { kind: 'usda_import', manifest_version: runScope },
+        });
+    };
+
+    beforeEach(clearClaimedRun);
+    afterEach(clearClaimedRun);
+
+    const transactionOnlyDb = (): ImportDb => {
+        const db = new Proxy(
+            {},
+            {
+                get: (_target, property) => {
+                    if (property === '$transaction') {
+                        return async (work: (tx: ImportDb) => Promise<unknown>) => work(db);
+                    }
+                    throw new Error(`a report case reached catalog state: db.${String(property)}`);
+                },
+            },
+        ) as unknown as ImportDb;
+
+        return db;
+    };
+
+    const runAndReadReport = async (): Promise<Record<string, unknown>> => {
+        const reports: unknown[] = [];
+        const deps = {
+            db: transactionOnlyDb(),
+            runDb: prisma,
+            usda: {
+                listFoods: async (): Promise<UsdaFoodSummary[]> => [],
+                getFoodsBatch: async (): Promise<UsdaFoodDetail[]> => [],
+                describeBatchRetrieval: async (fdcIds: readonly number[]): Promise<UsdaBatchRetrieval> =>
+                    retrieval(fdcIds),
+            },
+            manifest,
+            coveragePlan,
+            options: options({ limit: LIMIT }),
+            logger: silentLogger,
+            now: () => FIXED_NOW,
+            installRateLimiter: () => (): void => undefined,
+            writeReport: (report: unknown) => {
+                reports.push(report);
+            },
+        } as unknown as RunImportDeps;
+
+        await runImport(deps);
+        expect(reports).toHaveLength(1);
+
+        return reports[0] as Record<string, unknown>;
+    };
+
+    it('carries one categories row per coverage-plan category, with the exact shortfall', async () => {
+        const report = await runAndReadReport();
+        const rows = report.categories as CategoryRow[];
+
+        expect(rows).toHaveLength(coveragePlan.categories.length);
+        expect(rows.map((row) => row.category)).toEqual(coveragePlan.categories.map((row) => row.category));
+
+        for (const planned of coveragePlan.categories) {
+            const row = rows.find((candidate) => candidate.category === planned.category) as CategoryRow;
+            expect(row.publishedTarget).toBe(planned.publishedTarget);
+            expect(row.candidateVolume).toBe(planned.candidateVolume);
+            // This stage publishes nothing, so the shortfall is the whole
+            // target — reported exactly, never softened (§0.7.3).
+            expect(row.published).toBe(0);
+            expect(row.shortfall).toBe(planned.publishedTarget);
+        }
+
+        const coverage = report.coverage as {
+            publishedTargetTotal: number;
+            shortfallTotal: number;
+            meetsTarget: boolean;
+        };
+        expect(coverage.shortfallTotal).toBe(coverage.publishedTargetTotal);
+        expect(coverage.meetsTarget).toBe(false);
+        // The basis is what stops the number being misread as a defect.
+        expect(String(report.shortfallBasis)).toContain('writes none by design');
+        expect(String(report.shortfallBasis)).toContain('candidateVolumeShortfall is the figure that judges THIS stage');
+    });
+
+    it('lists every category short of its candidate volume as a coverage gap', async () => {
+        const report = await runAndReadReport();
+        const gaps = report.coverageGaps as { category: string; candidateVolumeShortfall: number }[];
+
+        // The vendor answered every batch with nothing, so no candidate was
+        // written and every planned category is short by its whole volume.
+        expect(gaps).toHaveLength(coveragePlan.categories.length);
+        for (const gap of gaps) {
+            const planned = coveragePlan.categories.find((row) => row.category === gap.category);
+            expect(gap.candidateVolumeShortfall).toBe(planned?.candidateVolume);
+        }
+    });
+
+    it('keys the failing-check totals by the tier catalog.logic.ts assigns', async () => {
+        const report = await runAndReadReport();
+        const failures = report.failuresByCheck as {
+            checkNameVocabulary: string;
+            importStage: Record<string, Record<string, number>>;
+        };
+
+        expect(failures.checkNameVocabulary).toContain('CATALOG_CHECK_NAMES');
+        // All three tiers are always present, so a consumer never has to guess
+        // whether an absent tier means "none" or "not reported".
+        expect(Object.keys(failures.importStage).sort()).toEqual(['quarantine', 'reject', 'review']);
+    });
+
+    it('reports the quarantined list with its own bound, so a failing run still writes a readable report', async () => {
+        const report = await runAndReadReport();
+        const quarantined = report.quarantined as {
+            total: number;
+            listed: number;
+            truncated: boolean;
+            listLimit: number;
+        };
+
+        expect(quarantined.total).toBe(0);
+        expect(quarantined.listed).toBe(0);
+        expect(quarantined.truncated).toBe(false);
+        // The bound is stated, so a truncated list can be recognised as one.
+        expect(quarantined.listLimit).toBeGreaterThan(0);
+    });
+
+    it('measures provenance from the rows written rather than restating the policy', async () => {
+        const report = await runAndReadReport();
+        const identity = report.countsByIdentitySource as Record<string, unknown>;
+        const provenance = report.countsByNutritionProvenance as Record<string, unknown>;
+
+        // Nothing was written, so every measured total is 0 — and the zero is
+        // measured, which is exactly what the wording has to say.
+        expect(identity.usda).toBe(0);
+        expect(identity.ai_generated).toBe(0);
+        expect(String(identity.measuredFrom)).toContain('written on each catalog_foods row');
+        expect(String(identity.aiGeneratedZeroReason)).toContain('never here');
+        expect(provenance.source_backed).toBe(0);
+        expect(provenance.ingredient_derived).toBe(0);
+        expect(provenance.ai_estimated).toBe(0);
+    });
+});
+
+/**
+ * Writing the report file MERGES; it does not clobber (§0.7.3).
+ *
+ * `import-report.json` is a shared artefact: `catalog-report.ts` aggregates the
+ * release identity, the cross-stage reconciliation and the measurement gaps
+ * into the same document, and the committed v1 artefact carries all of it. A
+ * plain `writeFileSync` at the end of an import would delete that half of the
+ * file every time an operator re-imported, which is why the write layers this
+ * stage's keys over whatever is already there.
+ *
+ * These cases run against a real temporary file rather than a fake `fs`,
+ * because what is under test is the read-modify-write of an on-disk document —
+ * the thing a stub would assume rather than prove.
+ */
+describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
+    let workspace: string;
+    let target: string;
+
+    // The two shapes of key a sibling stage owns: one this stage never emits
+    // (must survive) and one it does (must be replaced by the fresher value).
+    const SIBLING_ONLY_KEY = 'catalogRelease';
+    const SHARED_KEY = 'counts';
+
+    const existingDocument = (): Record<string, unknown> => ({
+        [SIBLING_ONLY_KEY]: 'v1',
+        aggregatedAt: '2026-09-10T00:00:00.000Z',
+        producedBy: 'catalog-report.ts',
+        [SHARED_KEY]: { inserted: 999 },
+    });
+
+    const warnings: { event: string; fields?: Record<string, unknown> }[] = [];
+    const warnCapturingLogger: ScriptLogger = {
+        debug: () => undefined,
+        info: () => undefined,
+        warn: (event: string, fields?: Record<string, unknown>) => {
+            warnings.push({ event, fields });
+        },
+        error: () => undefined,
+        child: () => warnCapturingLogger,
+    };
+
+    const readTarget = (): Record<string, unknown> =>
+        JSON.parse(fs.readFileSync(target, 'utf-8')) as Record<string, unknown>;
+
+    beforeEach(() => {
+        workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-import-report-'));
+        target = path.join(workspace, 'nested', 'import-report.json');
+        warnings.length = 0;
+    });
+
+    afterEach(() => {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    });
+
+    it('preserves every key the import stage does not measure', () => {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, JSON.stringify(existingDocument(), null, 2), 'utf-8');
+
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 }, usdaRequests: { attempts: 1 } }, warnCapturingLogger);
+        const merged = readTarget();
+
+        // The sibling's half is still the sibling's, byte-for-byte.
+        expect(merged[SIBLING_ONLY_KEY]).toBe('v1');
+        expect(merged.aggregatedAt).toBe('2026-09-10T00:00:00.000Z');
+        expect(merged.producedBy).toBe('catalog-report.ts');
+        // This stage's half is this run's, not the stale aggregate's.
+        expect(merged[SHARED_KEY]).toEqual({ inserted: 20 });
+        expect(merged.usdaRequests).toEqual({ attempts: 1 });
+        // Nothing was dropped: every pre-existing key is still present.
+        for (const key of Object.keys(existingDocument())) {
+            expect(merged).toHaveProperty(key);
+        }
+        expect(warnings).toEqual([]);
+    });
+
+    it('records which half of the artefact the run produced', () => {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, JSON.stringify(existingDocument(), null, 2), 'utf-8');
+
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, warnCapturingLogger);
+        const note = readTarget()[IMPORT_REPORT_NOTE_KEY] as Record<string, unknown>;
+
+        expect(note.mergedIntoExisting).toBe(true);
+        // preservedKeys names what this write left alone — sorted, and holding
+        // only the keys the report did not carry, so a reader can tell the two
+        // halves apart without diffing the file against a previous copy.
+        expect(note.preservedKeys).toEqual([SIBLING_ONLY_KEY, 'aggregatedAt', 'producedBy'].sort());
+        expect(note.preservedKeys).not.toContain(SHARED_KEY);
+        expect(String(note.basis)).toContain('catalog-report.ts');
+    });
+
+    it('creates the document, and its directory, when no sibling has written one', () => {
+        expect(fs.existsSync(target)).toBe(false);
+
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 0 } }, warnCapturingLogger);
+        const written = readTarget();
+        const note = written[IMPORT_REPORT_NOTE_KEY] as Record<string, unknown>;
+
+        expect(written[SHARED_KEY]).toEqual({ inserted: 0 });
+        // Nothing was merged, and the note says so rather than claiming a
+        // merge that never happened over an empty base.
+        expect(note.mergedIntoExisting).toBe(false);
+        expect(note.preservedKeys).toEqual([]);
+        expect(warnings).toEqual([]);
+    });
+
+    it('replaces an unparseable document and says so, instead of failing the import', () => {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, '{"counts": {"inserted": 2', 'utf-8');
+
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, warnCapturingLogger);
+        const written = readTarget();
+
+        // The work is already committed to the database by the time the report
+        // is written, so a half-written file must not throw it away — and the
+        // replacement is never silent.
+        expect(written[SHARED_KEY]).toEqual({ inserted: 20 });
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]?.event).toBe('report_replaced');
+        expect(String(warnings[0]?.fields?.reason)).toContain('could not be parsed');
+        // The file name is enough context; the path is not logged.
+        expect(warnings[0]?.fields?.file).toBe('import-report.json');
+    });
+
+    it('replaces a document that is valid JSON but not an object', () => {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, JSON.stringify([{ counts: { inserted: 2 } }]), 'utf-8');
+
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 20 } }, warnCapturingLogger);
+        const written = readTarget();
+        const note = written[IMPORT_REPORT_NOTE_KEY] as Record<string, unknown>;
+
+        // An array spread into an object shape would produce "0", "1", … keys
+        // beside the report, which is why it counts as unusable rather than as
+        // a base to merge into.
+        expect(Array.isArray(written)).toBe(false);
+        expect(written).not.toHaveProperty('0');
+        expect(note.mergedIntoExisting).toBe(false);
+        expect(warnings[0]?.event).toBe('report_replaced');
+        expect(String(warnings[0]?.fields?.reason)).toContain('not a JSON object');
+    });
+
+    it('writes a trailing newline so the artefact stays a well-formed text file', () => {
+        writeImportReport(target, { [SHARED_KEY]: { inserted: 0 } }, warnCapturingLogger);
+
+        // The committed artefact ends in a newline; a write that dropped it
+        // would show as a whole-file diff on every import.
+        expect(fs.readFileSync(target, 'utf-8').endsWith('}\n')).toBe(true);
+    });
+});
+
 
 /* -------------------------------------------------------------------------- *
  * The first of the two libraries every import run depends on.
@@ -3495,7 +4168,15 @@ describe('the durable batch total a checkpoint records (DB-F11)', () => {
         const openRunRow = await prisma.catalog_import_runs.findFirst({
             where: { kind: 'usda_import', manifest_version: scopeFor(140) },
         });
-        expect(openRunRow?.status).toBe('running');
+        // 'failed', not 'running': an interrupted attempt SETTLES its run row
+        // with the reason, because a row left 'running' forever cannot be told
+        // from one still in flight — which is precisely the read
+        // catalog:validate's prerequisite check makes. The cursor and the
+        // durable batch total are untouched by that closure, and
+        // openOrResumeRun reopens a failed row through retryFailedRun, so the
+        // resume below continues THIS row rather than opening a second one
+        // beside it (checkpoint.ts's WHY A RETRY CONTINUES THE SAME ROW).
+        expect(openRunRow?.status).toBe('failed');
         expect(openRunRow?.cursor).toMatchObject({ nextBatchIndex: 5 });
         expect(await durableBatchesProcessed(openRunRow?.id as string)).toBe(5);
 
@@ -5063,10 +5744,20 @@ describe('the stage lock (DB-F09)', () => {
             // `count(*)::int` rather than the bigint PostgreSQL returns by
             // default: the build targets below ES2020, where a BigInt literal
             // is not available to compare against.
+            //
+            // SCOPED TO THIS DATABASE, which is not optional. pg_locks is a
+            // CLUSTER-wide view, and advisory locks in it carry the database
+            // they were taken in; the catalog classid is the same constant in
+            // every database. Without this predicate the count includes locks
+            // held by another database on the same server — a second checkout
+            // running this very suite — so "did MY holder release?" would be
+            // answered by somebody else's lock and fail at random.
             const rows = await prisma.$queryRaw<{ count: number }[]>`
                 SELECT count(*)::int AS count
                 FROM pg_locks
-                WHERE locktype = 'advisory' AND classid = ${0x434154}::int4
+                WHERE locktype = 'advisory'
+                  AND classid = ${0x434154}::int4
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
             `;
             return Number(rows[0]?.count ?? 0);
         };
@@ -5847,10 +6538,15 @@ describe('every catalog CLI refuses to run while another stage holds the graph (
     });
 
     it('leaves the graph lock with its one holder, so a refused CLI released what it opened', async () => {
+        // Scoped to this database for the same reason as advisoryLockCount
+        // above: pg_locks is cluster-wide, so an unscoped count answers this
+        // question with another checkout's lock.
         const rows = await prisma.$queryRaw<{ count: number }[]>`
             SELECT count(*)::int AS count
             FROM pg_locks
-            WHERE locktype = 'advisory' AND classid = ${0x434154}::int4
+            WHERE locktype = 'advisory'
+              AND classid = ${0x434154}::int4
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
         `;
 
         expect(Number(rows[0]?.count ?? 0)).toBe(1);

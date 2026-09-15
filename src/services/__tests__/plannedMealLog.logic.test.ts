@@ -12,6 +12,9 @@
 //    consumed total scales the ROUNDED snapshot. A round-then-round or a
 //    round-only-at-the-end regression breaks the cross-step assertions below,
 //    which is exactly the disagreement the client's "This adds" card would show.
+//    The last step is additionally asserted against `asEaten` below — the
+//    shipped diary's own arithmetic — so the two sides are pinned to each other
+//    and not merely to this suite's expectations.
 //  - THE TWO 404 PREDICATES, tested separately and then through
 //    `requireLoggableTarget`, because dropping either is a real hole: one lets a
 //    client write into another user's diary, the other files a Tuesday meal
@@ -252,6 +255,40 @@ const rejectionDetails = (body: unknown) => {
 
 const codeFor = (body: unknown, field: string): string | undefined =>
     rejectionDetails(body).find((detail) => detail.field === field)?.code;
+
+// The shipped diary's own arithmetic, transcribed from
+// `nutrition.service.ts::asEaten` (`Math.round(perServing * servings)`) — the
+// function its day totals sum and its history aggregates mirror in SQL as
+// `SUM(ROUND(x * servings))::int`. It is private to that module, so the
+// reference has to be restated here to be asserted against; the integers this
+// suite expects are derived from it and from nothing else, which is why a
+// change to either side must be made on both.
+const asEaten = (perServing: number, servings: number): number => Math.round(perServing * servings);
+
+const MILLISECONDS_PER_DAY = 86_400_000;
+
+/**
+ * The day key `offset` days from `dayKey`, stepped through UTC midnights.
+ *
+ * UTC has no transitions, so a day is 86,400,000 ms there and the arithmetic
+ * cannot drift by an hour — which is what lets the DST cases below assert seven
+ * real calendar days without depending on the zone this process runs in. The
+ * `Date.UTC(year, month - 1, day)` spelling is avoided deliberately: it maps a
+ * two-digit year to the twentieth century, the exact trap `isCalendarDayKey`'s
+ * own cases pin.
+ */
+const shiftDay = (dayKey: string, offset: number): string =>
+    new Date(new Date(`${dayKey}T00:00:00.000Z`).getTime() + offset * MILLISECONDS_PER_DAY)
+        .toISOString()
+        .slice(0, 10);
+
+const dayBefore = (dayKey: string): string => shiftDay(dayKey, -1);
+
+const dayAfter = (dayKey: string): string => shiftDay(dayKey, 1);
+
+/** `count` consecutive day keys starting at `dayKey`. */
+const daysFrom = (dayKey: string, count: number): string[] =>
+    Array.from({ length: count }, (_unused, index) => shiftDay(dayKey, index));
 
 /* ---------------------------------------------------------------------------
  * The two stored facts
@@ -555,6 +592,57 @@ describe('derivePlannedSnapshot', () => {
         });
     });
 
+    // The same committed recipe at the three portions the planner places most,
+    // as the integers the `meal_entries` row actually stores. Written as
+    // literals rather than as `Math.round(perServing * multiplier)` so the four
+    // numbers are readable next to the fixture's own per-serving set
+    // (428.2475 / 38.3846875 / 39.715125 / 12.2653) and a rounding step moved
+    // to either side of the multiplication changes a number here rather than
+    // cancelling out on both sides of an expression.
+    it.each([
+        [0.5, { calories: 214, protein_g: 19, carbs_g: 20, fat_g: 6 }],
+        [1, { calories: 428, protein_g: 38, carbs_g: 40, fat_g: 12 }],
+        [1.5, { calories: 642, protein_g: 58, carbs_g: 60, fat_g: 18 }],
+    ])('stores the planned portion at a multiplier of %s as four integers', (multiplier, expected) => {
+        const snapshot = derivePlannedSnapshot(
+            plannedMeal({ portion_multiplier: multiplier }),
+            recipeVersion(),
+        );
+
+        expect({
+            calories: snapshot.calories,
+            protein_g: snapshot.protein_g,
+            carbs_g: snapshot.carbs_g,
+            fat_g: snapshot.fat_g,
+        }).toEqual(expected);
+    });
+
+    it('rounds a half up, as the diary does', () => {
+        // A planned portion landing exactly on .5 is the one input where a
+        // rounding mode is a visible decision: `Math.round` takes it up, and
+        // the diary's insert applies the identical `Math.round` to the same
+        // value, so a half-even or truncating variant here would store a
+        // different integer than the row the service writes.
+        const halves = recipeVersion({
+            per_serving_calories: 100.5,
+            per_serving_protein_g: 20.5,
+            per_serving_carbs_g: 41.25,
+            per_serving_fat_g: 8.5,
+        });
+
+        const snapshot = derivePlannedSnapshot(plannedMeal(), halves);
+
+        expect(snapshot.calories).toBe(101);
+        expect(snapshot.protein_g).toBe(21);
+        expect(snapshot.fat_g).toBe(9);
+        // The same number reached by multiplying instead of by a fixture value,
+        // so the direction is pinned for a scaled portion too: 41.25 × 1.5 is
+        // 61.875, and 20.5 × 1.5 is 30.75.
+        const scaled = derivePlannedSnapshot(plannedMeal({ portion_multiplier: 1.5 }), halves);
+        expect(scaled.carbs_g).toBe(62);
+        expect(scaled.protein_g).toBe(31);
+    });
+
     it('describes ONE stored serving as the planned portion', () => {
         const snapshot = derivePlannedSnapshot(plannedMeal({ portion_multiplier: 0.75 }), recipeVersion());
 
@@ -646,6 +734,44 @@ describe('deriveConsumedTotals', () => {
             carbs: Math.round(58 * 0.33),
             fat: Math.round(21 * 0.33),
         });
+    });
+
+    // The whole chain, end to end, against the diary's own function: the
+    // planned portion is rounded ONCE into the snapshot, and what the day shows
+    // is `asEaten` of that snapshot — the identical arithmetic the client's
+    // "This adds" card performs on the identical stored row. Asserted at a
+    // whole serving and at the two fraction-chip values, since a fractional
+    // serving is where a second rounding step would show up as a calorie or two
+    // of disagreement on screen.
+    it.each([1, 0.5, 0.33])('agrees with the diary at %s servings', (eatenServings) => {
+        const snapshot = derivePlannedSnapshot(plannedMeal({ portion_multiplier: 1.5 }), recipeVersion());
+
+        expect(deriveConsumedTotals(snapshot, eatenServings)).toEqual({
+            calories: asEaten(snapshot.calories, eatenServings),
+            protein: asEaten(snapshot.protein_g, eatenServings),
+            carbs: asEaten(snapshot.carbs_g, eatenServings),
+            fat: asEaten(snapshot.fat_g, eatenServings),
+        });
+    });
+
+    it('stores the values the diary scales, and not the portion they came from', () => {
+        // The two candidate inputs stated side by side at the fixture's own
+        // numbers: 642.37125 planned at 1.5x, stored as 642. A consumed total
+        // is asEaten(642, ...) — never asEaten(642.37125, ...) — because 642 is
+        // the only figure the row holds and therefore the only one the client
+        // can have.
+        const meal = plannedMeal({ portion_multiplier: 1.5 });
+        const planned = derivePlannedPortion(meal, recipeVersion());
+        const snapshot = derivePlannedSnapshot(meal, recipeVersion());
+
+        expect(planned.calories).toBeCloseTo(642.37125, 9);
+        expect(snapshot.calories).toBe(642);
+        expect(deriveConsumedTotals(snapshot, 0.33).calories).toBe(asEaten(642, 0.33));
+        expect(deriveConsumedTotals(snapshot, 0.33).calories).toBe(212);
+        expect(asEaten(planned.calories, 0.33)).toBe(212);
+        // A whole serving is the case that makes the guarantee literal: '1
+        // serving' in the diary is the planned portion, to the integer.
+        expect(deriveConsumedTotals(snapshot, 1).calories).toBe(snapshot.calories);
     });
 
     it('refuses a servings value that is not a positive finite number', () => {
@@ -748,7 +874,17 @@ describe('parseLogPlannedMealRequest', () => {
         // every one of these reaches `invalid_servings` rather than
         // `invalid_type`, which is the code the client renders under the
         // stepper.
-        for (const servings of [0, 0.2, 0.24, 10.01, 10.5, 1.005, Number.NaN, Number.POSITIVE_INFINITY]) {
+        for (const servings of [
+            0,
+            -1,
+            0.2,
+            0.24,
+            10.01,
+            10.5,
+            1.005,
+            Number.NaN,
+            Number.POSITIVE_INFINITY,
+        ]) {
             expect(codeFor(validBody({ servings }), 'servings')).toBe(
                 LOG_PLANNED_MEAL_FIELD_CODES.INVALID_SERVINGS,
             );
@@ -767,17 +903,61 @@ describe('parseLogPlannedMealRequest', () => {
         );
     });
 
-    it('rejects an id that is not a v4 UUID', () => {
-        expect(codeFor(validBody({ diaryMealId: 42 }), 'diaryMealId')).toBe(
-            LOG_PLANNED_MEAL_FIELD_CODES.INVALID_TYPE,
-        );
-        expect(codeFor(validBody({ diaryMealId: 'not-a-uuid' }), 'diaryMealId')).toBe(
+    it.each([
+        ['an unpadded month and day', '2026-7-05'],
+        ['a day-first written form', '07/05/2026'],
+        ['a slashed ISO-ish form', '2026/07/05'],
+        ['an empty string', ''],
+        ['a whitespace-padded day key', ' 2026-07-05 '],
+    ])('rejects %s as an invalid date rather than reading a day out of it', (_label, date) => {
+        // Every one of these is a present string, so none can answer `required`
+        // and none may be coerced: the day key is what the entry is filed
+        // under, and a parser that repaired '07/05/2026' would be choosing
+        // between 5 July and 7 May on the client's behalf.
+        expect(codeFor(validBody({ date }), 'date')).toBe(LOG_PLANNED_MEAL_FIELD_CODES.INVALID_DATE);
+    });
+
+    // Both id fields carry the same rule, so both are judged the same way:
+    // `diaryMealId` decides whose diary the entry lands in and
+    // `idempotencyKey` decides whether a retry writes a second one, and a
+    // version check enforced on only one of them would be the kind of asymmetry
+    // no single-field test can see.
+    it.each(['diaryMealId', 'idempotencyKey'])('requires %s to be a v4 UUID', (field) => {
+        // A v1 UUID is the case a shape-only check admits: right length, right
+        // hyphens, wrong version nibble.
+        expect(codeFor(validBody({ [field]: 'c20ad4d7-6fe9-1779-a1a0-1a7b2c3d4e5f' }), field)).toBe(
             LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID,
         );
-        // A v1 UUID: right shape, wrong version nibble.
-        expect(
-            codeFor(validBody({ idempotencyKey: 'c20ad4d7-6fe9-1779-a1a0-1a7b2c3d4e5f' }), 'idempotencyKey'),
-        ).toBe(LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID);
+        expect(codeFor(validBody({ [field]: 'not-a-uuid' }), field)).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID,
+        );
+        expect(codeFor(validBody({ [field]: '' }), field)).toBe(LOG_PLANNED_MEAL_FIELD_CODES.INVALID_ID);
+        expect(codeFor(validBody({ [field]: 42 }), field)).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.INVALID_TYPE,
+        );
+
+        const { [field]: _absent, ...withoutTheField } = validBody();
+        expect(codeFor(withoutTheField, field)).toBe(LOG_PLANNED_MEAL_FIELD_CODES.REQUIRED);
+        expect(codeFor(validBody({ [field]: null }), field)).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.REQUIRED,
+        );
+    });
+
+    it('requires expectedPlanRevision rather than defaulting it', () => {
+        // The stale-plan guard, so its absence has to REFUSE: a parser that
+        // defaulted it to 1 — or dropped it and let the service compare
+        // nothing — would let a screen drawn against an old plan overwrite
+        // whatever the plan has become since.
+        const { expectedPlanRevision: _omitted, ...withoutRevision } = validBody();
+        const parsed = parseLogPlannedMealRequest(withoutRevision);
+
+        expect(parsed.kind).toBe('error');
+        expect(codeFor(withoutRevision, 'expectedPlanRevision')).toBe(
+            LOG_PLANNED_MEAL_FIELD_CODES.REQUIRED,
+        );
+        // Named explicitly: no payload is produced at all, so there is nothing
+        // carrying a substituted revision for the write to pin.
+        expect('payload' in parsed).toBe(false);
     });
 
     it('accepts an upper-case UUID', () => {
@@ -1081,10 +1261,25 @@ describe('isDiaryMealAcceptable', () => {
         ).toBe(true);
     });
 
-    it("refuses another user's bucket", () => {
+    // The two conditions are varied ONE AT A TIME here and in the case below,
+    // which is the point of splitting them: a scenario that moved the owner and
+    // the date together would still pass with either check deleted, and the
+    // remaining hole — a client writing into another user's diary, or a Tuesday
+    // meal filed under Monday — would be invisible.
+    it("refuses another user's bucket, with the date left matching", () => {
         expect(isDiaryMealAcceptable(diaryMeal({ user_id: OTHER_USER_ID }), USER_ID, '2026-07-05')).toBe(
             false,
         );
+    });
+
+    it('refuses a bucket that is neither the caller\'s nor the logged day\'s', () => {
+        expect(
+            isDiaryMealAcceptable(
+                diaryMeal({ user_id: OTHER_USER_ID, date: '2026-07-06' }),
+                USER_ID,
+                '2026-07-05',
+            ),
+        ).toBe(false);
     });
 
     it('refuses a missing bucket, so "no such bucket" and "not yours" are one answer', () => {
@@ -1146,6 +1341,25 @@ describe('isDiaryMealAcceptable', () => {
             ),
         ).toThrow(PlannedMealLogDataError);
     });
+
+    it('reads no clock and writes to nothing, so the verdict is the arguments alone', () => {
+        // Whether a bucket may receive the entry is decided by the rows handed
+        // in. Nothing here consults "now", so the same three arguments answer
+        // the same way at any instant — an evening request cannot be refused
+        // for a bucket a morning request would have accepted — and the rows
+        // come back unmodified, so a caller may judge two candidates from one
+        // object.
+        const bucket = diaryMeal({ date: new Date('2026-07-05T00:00:00.000Z') });
+        const before = JSON.parse(JSON.stringify(bucket));
+
+        const first = isDiaryMealAcceptable(bucket, USER_ID, '2026-07-05');
+        const second = isDiaryMealAcceptable(bucket, USER_ID, '2026-07-05');
+
+        expect(first).toBe(true);
+        expect(second).toBe(first);
+        expect(isDiaryMealAcceptable(bucket, USER_ID, '2026-07-06')).toBe(false);
+        expect(JSON.parse(JSON.stringify(bucket))).toEqual(before);
+    });
 });
 
 describe('isDateInPlanWeek', () => {
@@ -1166,6 +1380,29 @@ describe('isDateInPlanWeek', () => {
         expect(isDateInPlanWeek('2026-07-31', week)).toBe(true);
         expect(isDateInPlanWeek('2026-08-01', week)).toBe(true);
         expect(isDateInPlanWeek('2026-08-05', week)).toBe(false);
+    });
+
+    // A DST week is where an instant-based comparison goes wrong: the seven
+    // days either side of a transition are 167 or 169 hours, so a rule that
+    // built a moment from each endpoint and compared elapsed time would lose or
+    // gain a day at one end. Day keys have no hour to shift, so both weeks
+    // below are simply seven calendar days — and the plan's own days are the
+    // authority, not any zone this process happens to run in.
+    it.each([
+        ['spring forward', '2026-03-05', '2026-03-11', '2026-03-08'],
+        ['autumn back', '2026-10-29', '2026-11-04', '2026-11-01'],
+    ])('counts seven local days across the %s transition', (_label, start, end, transitionDay) => {
+        const week = planWeek({ start_date: start, end_date: end });
+
+        expect(isDateInPlanWeek(transitionDay, week)).toBe(true);
+        expect(isDateInPlanWeek(start, week)).toBe(true);
+        expect(isDateInPlanWeek(end, week)).toBe(true);
+        expect(isDateInPlanWeek(dayBefore(start), week)).toBe(false);
+        expect(isDateInPlanWeek(dayAfter(end), week)).toBe(false);
+        // Every one of the seven is inside, and the eighth is not: the week is
+        // a count of days, whatever the hours between them came to.
+        expect(daysFrom(start, 7).filter((day) => isDateInPlanWeek(day, week))).toHaveLength(7);
+        expect(daysFrom(start, 8).filter((day) => isDateInPlanWeek(day, week))).toHaveLength(7);
     });
 
     it('reads @db.Date endpoints held as Dates', () => {
@@ -1305,6 +1542,29 @@ describe('deriveLoggedStatus', () => {
         expect(state.previousRecipeVersionIds).toEqual([OTHER_RECIPE_VERSION_ID]);
     });
 
+    it('still names A after A -> B -> C when A was eaten twice', () => {
+        // The same chain with the second helping the stepper allows: two
+        // intentional entries, both of recipe A, and a slot that now holds C
+        // after a swap to B and a swap to C. Two things are asserted at once
+        // and both are the rule this module exists for — the caption names A,
+        // the recipe the user actually ate, and B appears NOWHERE, because B is
+        // only ever the audit column's answer and was never on a plate.
+        const A = OTHER_RECIPE_VERSION_ID;
+        const B = RECIPE_VERSION_ID;
+        const C = THIRD_RECIPE_VERSION_ID;
+
+        const state = deriveLoggedStatus(
+            [entry({ id: 'entry-a1', recipe_version_id: A }), entry({ id: 'entry-a2', recipe_version_id: A })],
+            C,
+        );
+
+        expect(state.status).toBe('logged_then_swapped');
+        expect(state.isLogged).toBe(false);
+        expect(state.previousRecipeVersionIds).toEqual([A]);
+        expect(state.previousRecipeVersionIds).not.toContain(B);
+        expect(state.previousRecipeVersionIds).not.toContain(C);
+    });
+
     it('is logged when the old and the new recipe are both logged', () => {
         const state = deriveLoggedStatus(
             [
@@ -1332,6 +1592,49 @@ describe('deriveLoggedStatus', () => {
         );
 
         expect(state.previousRecipeVersionIds).toEqual([THIRD_RECIPE_VERSION_ID, OTHER_RECIPE_VERSION_ID]);
+    });
+
+    // First-seen order is meaningful because of WHICH order the entries arrive
+    // in: `loggedEntries` is ordered by `loggedAt` ascending and then by
+    // `entryId`, so the latest entry is last (`../../types/mealPlanning`, and
+    // `mealPlan.mapper.ts` performs that sort — this module never reorders
+    // anything, which is what the two cases below pin). The tie matters: two
+    // entries sharing a `loggedAt` are separated by `entryId` alone, and if
+    // this module resorted or reversed what it was handed, "View in diary"
+    // would open the wrong one of them.
+    it('preserves the order it is handed, including the entryId tie-break', () => {
+        const inContractOrder = [
+            entry({ id: 'entry-1', recipe_version_id: THIRD_RECIPE_VERSION_ID }),
+            entry({ id: 'entry-2', recipe_version_id: OTHER_RECIPE_VERSION_ID }),
+        ];
+
+        expect(deriveLoggedStatus(inContractOrder, RECIPE_VERSION_ID).previousRecipeVersionIds).toEqual([
+            THIRD_RECIPE_VERSION_ID,
+            OTHER_RECIPE_VERSION_ID,
+        ]);
+        // The same two entries in the other order — which is what a different
+        // `entryId` tie-break would produce — come back in that other order,
+        // rather than being normalised to the first list.
+        expect(
+            deriveLoggedStatus([...inContractOrder].reverse(), RECIPE_VERSION_ID).previousRecipeVersionIds,
+        ).toEqual([OTHER_RECIPE_VERSION_ID, THIRD_RECIPE_VERSION_ID]);
+    });
+
+    it('answers the same way however often it is asked', () => {
+        const entries = [
+            entry({ id: 'entry-1', recipe_version_id: OTHER_RECIPE_VERSION_ID }),
+            entry({ id: 'entry-2', recipe_version_id: RECIPE_VERSION_ID }),
+        ];
+
+        expect(deriveLoggedStatus(entries, RECIPE_VERSION_ID)).toEqual(
+            deriveLoggedStatus(entries, RECIPE_VERSION_ID),
+        );
+        // Derived live on every read, with no stored `is_logged` column to fall
+        // out of step: the same entries judged against a different current
+        // version answer differently, and that is the whole mechanism by which
+        // a swap changes the card without anything being written.
+        expect(deriveLoggedStatus(entries, RECIPE_VERSION_ID).status).toBe('logged');
+        expect(deriveLoggedStatus(entries, THIRD_RECIPE_VERSION_ID).status).toBe('logged_then_swapped');
     });
 
     it('treats a detached entry as neither this meal logged nor an earlier one', () => {

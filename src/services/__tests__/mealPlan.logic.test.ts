@@ -37,6 +37,7 @@ import {
     EXTENDED_PORTION_POLICY,
     GeneratedPlan,
     MACRO_TOLERANCE_ABSOLUTE_G,
+    MACRO_TOLERANCE_RATIO,
     MAIN_SLOT_PORTION_MULTIPLIERS,
     MAX_EVALUATIONS_PER_DAY,
     MAX_EVALUATIONS_PER_PLAN,
@@ -138,6 +139,10 @@ import {
     PlanOverlapError,
     UpcomingExistsError,
 } from '../mealPlanning.errors';
+// The seed's one consumer, imported to prove the derived number is a number the
+// generator can actually draw from. The PRNG itself is tested in
+// `src/utils/__tests__/seededRandom.test.ts`, not here.
+import { mulberry32 } from '../../utils/seededRandom';
 import type { MealPlanMacroTotals, MealTimeEntry } from '../../types/mealPlanning';
 import type { MealSlot } from '../../types/recipe';
 
@@ -524,6 +529,25 @@ describe('derivePlanSeed', () => {
         expect(Number.isInteger(seed)).toBe(true);
         expect(seed).toBeGreaterThanOrEqual(0);
         expect(seed).toBeLessThanOrEqual(0xffffffff);
+    });
+
+    it('is a seed the generator can draw from, not a digest it would have to parse', () => {
+        const draw = mulberry32(derivePlanSeed(makeSeedInputs()))();
+
+        expect(Number.isFinite(draw)).toBe(true);
+        expect(draw).toBeGreaterThanOrEqual(0);
+        expect(draw).toBeLessThan(1);
+    });
+
+    it('replays one stream for one set of inputs and another for a changed one', () => {
+        const streamFor = (overrides: Partial<PlanSeedInputs> = {}): number[] => {
+            const draw = mulberry32(derivePlanSeed(makeSeedInputs(overrides)));
+
+            return [draw(), draw(), draw()];
+        };
+
+        expect(streamFor()).toEqual(streamFor());
+        expect(streamFor({ generationAttempt: 2 })).not.toEqual(streamFor());
     });
 
     it.each([
@@ -984,6 +1008,36 @@ describe('scoreCandidate', () => {
 
         expect(scoreCandidate(onPoint, zeroTotals, 0.25, TARGETS, 1, noFoods)).toBeLessThan(
             scoreCandidate(short, zeroTotals, 0.25, TARGETS, 1, noFoods),
+        );
+    });
+
+    it('stops rewarding a shared ingredient at the fourth, so a long list cannot buy the slot', () => {
+        const scoreWith = (ingredientIds: string[]): number => {
+            const subject = candidate({ slug: 'shared', calories: 500, ingredientIds });
+
+            return scoreCandidate(subject, zeroTotals, 0.25, TARGETS, 1, new Set(ingredientIds));
+        };
+
+        const atCap = scoreWith(['a', 'b', 'c', 'd']);
+
+        expect(scoreWith(['a', 'b', 'c', 'd', 'e'])).toBeCloseTo(atCap, 12);
+        expect(atCap).toBeLessThan(scoreWith(['a', 'b', 'c']));
+    });
+
+    it('still scores a candidate nowhere near its guidance point, rather than refusing it', () => {
+        const farOff = candidate({ slug: 'far-off', calories: 1800 });
+        const score = scoreCandidate(farOff, zeroTotals, 0.25, TARGETS, 1, new Set<string>());
+
+        expect(Number.isFinite(score)).toBe(true);
+        expect(score).toBeGreaterThan(
+            scoreCandidate(
+                candidate({ slug: 'on-point', calories: 500 }),
+                zeroTotals,
+                0.25,
+                TARGETS,
+                1,
+                new Set<string>(),
+            ),
         );
     });
 });
@@ -1797,6 +1851,42 @@ describe('generateWeeklyPlan', () => {
 
         for (const day of result.days) {
             expect(day.plannedTotals).toEqual(computeDayTotals(day.meals));
+        }
+    });
+
+    // The one catalog whose slots CANNOT approach their guidance points: the
+    // smallest breakfast the portion set can cut from an 1,800 kcal recipe is
+    // 900, against a 500 kcal guidance point. Every other feasible fixture in
+    // this file sits exactly on its points, so a guidance share promoted from a
+    // move-order hint to a per-slot acceptance test would pass all of them —
+    // and fail only here.
+    it('plans a week whose slots cannot sit near their guidance points', () => {
+        const breakfastCalories = 1800;
+        const guidancePoint = scheduleCumulativeShares('three')[0] * TARGETS.calories;
+        const smallestBreakfast = breakfastCalories * Math.min(...MAIN_SLOT_PORTION_MULTIPLIERS);
+
+        expect(smallestBreakfast).toBeGreaterThan(guidancePoint * 1.5);
+
+        const skewed = [
+            ...['b1', 'b2', 'b3', 'b4'].map((slug) =>
+                makeRecipe({ slug, slots: ['breakfast'], calories: breakfastCalories }),
+            ),
+            ...['l1', 'l2', 'l3', 'l4'].map((slug) =>
+                makeRecipe({ slug, slots: ['lunch'], calories: 300 }),
+            ),
+            ...['d1', 'd2', 'd3', 'd4'].map((slug) =>
+                makeRecipe({ slug, slots: ['dinner'], calories: 700 }),
+            ),
+        ];
+
+        const result = plan(skewed);
+
+        expect(result.days).toHaveLength(PLAN_DAY_COUNT);
+
+        for (const day of result.days) {
+            expect(isDayWithinTolerance(day.plannedTotals, TARGETS)).toBe(true);
+            expect(day.meals[0].slot).toBe('breakfast');
+            expect(day.meals[0].planned.calories).toBeGreaterThanOrEqual(smallestBreakfast);
         }
     });
 
@@ -3391,6 +3481,26 @@ describe('parseGeneratePlanRequest', () => {
         });
     });
 
+    it('ignores a key it does not know, and never carries one into the payload', () => {
+        // The payload is what `mealPlanningAction.logic.ts` fingerprints, so a
+        // leaked key would make two requests of the same intent, carrying
+        // different junk, look like two different intents to the replay gate.
+        const verdict = parseGeneratePlanRequest(
+            body({ expectedPlanRevision: 9, timeZone: 'Pacific/Auckland' }),
+            window,
+        );
+
+        expect(verdict).toEqual({
+            kind: 'ok',
+            payload: {
+                startDate: '2026-07-12',
+                idempotencyKey: '8f1f4d7e-0d2c-4a0b-9f3e-2b6a1c5d4e7f',
+                expectedPreferencesRevision: 3,
+                expectedTargetsRevision: 2,
+            },
+        });
+    });
+
     it.each([undefined, null, 'not-an-object', 42, []])('requires a body object, not %p', (value) => {
         const verdict = parseGeneratePlanRequest(value, window);
 
@@ -3671,6 +3781,24 @@ describe('parseRegeneratePlanRequest', () => {
 
     it('accepts a complete request', () => {
         expect(parseRegeneratePlanRequest({ planId: PLAN_ID }, body())).toEqual({
+            kind: 'ok',
+            planId: PLAN_ID,
+            payload: {
+                idempotencyKey: '8f1f4d7e-0d2c-4a0b-9f3e-2b6a1c5d4e7f',
+                expectedPlanRevision: 1,
+                expectedPreferencesRevision: 3,
+                expectedTargetsRevision: 2,
+            },
+        });
+    });
+
+    it('ignores an unknown key here too, and drops the start date a regeneration may not move', () => {
+        const verdict = parseRegeneratePlanRequest(
+            { planId: PLAN_ID },
+            body({ startDate: '2026-08-02', reason: 'diet changed' }),
+        );
+
+        expect(verdict).toEqual({
             kind: 'ok',
             planId: PLAN_ID,
             payload: {
@@ -4019,6 +4147,25 @@ describe('policy constants', () => {
     it('bounds the search at 2,000 evaluations a day and 14,000 a plan', () => {
         expect(MAX_EVALUATIONS_PER_DAY).toBe(2000);
         expect(MAX_EVALUATIONS_PER_PLAN).toBe(14000);
+    });
+
+    // The tolerance cases above build their bands FROM these constants, which
+    // is what keeps one band in one place — and is also why widening a band
+    // would leave every one of them green. The literals live here instead, so a
+    // change to the accepted day is a change to this test.
+    it('accepts a day within 10 % on calories and the asymmetric protein band', () => {
+        expect(CALORIE_TOLERANCE_RATIO).toBe(0.1);
+        expect(PROTEIN_TOLERANCE_UNDER_G).toBe(15);
+        expect(PROTEIN_TOLERANCE_OVER_G).toBe(25);
+    });
+
+    it('judges carbs and fat on 15 g or 15 %, whichever is the wider', () => {
+        expect(MACRO_TOLERANCE_ABSOLUTE_G).toBe(15);
+        expect(MACRO_TOLERANCE_RATIO).toBe(0.15);
+    });
+
+    it('stops counting a shared ingredient at the fourth', () => {
+        expect(REUSE_BONUS_CAP).toBe(4);
     });
 
     it('sets the plan budget at exactly seven day budgets, which is why the guards need separating', () => {

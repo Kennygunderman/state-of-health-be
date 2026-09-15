@@ -19,7 +19,7 @@ import { join } from 'path';
 // The closed sets come from the contract module that declares them, never from
 // literals repeated here: a suite that restated the nine icon keys, five badges
 // and four slots would keep passing after one of them was dropped or renamed.
-import { MEAL_SLOTS, RECIPE_BADGES, RECIPE_ICON_KEYS } from '../../types/recipe';
+import { MEAL_SLOTS, RECIPE_BADGES, RECIPE_ICON_KEYS, RecipePerServingNutrition } from '../../types/recipe';
 import { UnitConversionError } from '../../utils/units';
 import { CatalogMappingError } from '../catalog.mapper';
 import {
@@ -194,11 +194,38 @@ interface CatalogFixtureDocument {
     foods: FixtureCatalogFood[];
 }
 
+/**
+ * The fixture's declared-vs-derived negative case, held OUTSIDE
+ * `recipe_versions` and outside `insert_order` because its columns
+ * deliberately disagree with its ingredients: a loader walking the insert order
+ * would otherwise persist an invalid row and change the plannable-version count
+ * every planner test reads.
+ *
+ * `declaration` is typed as the contract shape rather than re-described, so a
+ * fixture that stopped supplying a field `validateRecipeDeclaration` requires
+ * fails to compile instead of failing obscurely at run time.
+ */
+interface FixtureDeclarationNegativeCase {
+    recipe_slug: string;
+    expected_valid: false;
+    expected_mismatch_fields: { field: string; code: string }[];
+    derived_for_reference: { diet_tags: string[]; allergen_tags: string[]; badges: string[] };
+    declaration: RecipeDeclaration;
+    ingredients: FixtureRecipeIngredient[];
+}
+
 interface RecipeFixtureDocument {
-    counts: { recipes: number; recipe_versions: number; recipe_ingredients: number; plannable_versions: number };
+    counts: {
+        recipes: number;
+        recipe_versions: number;
+        recipe_ingredients: number;
+        plannable_versions: number;
+        declaration_negative_cases: number;
+    };
     recipes: { id: string; slug: string; current_version_id: string }[];
     recipe_versions: FixtureRecipeVersion[];
     recipe_ingredients: FixtureRecipeIngredient[];
+    declaration_negative_cases: FixtureDeclarationNegativeCase[];
 }
 
 const readCatalogFixture = (): CatalogFixtureDocument => JSON.parse(CATALOG_FOODS_JSON) as CatalogFixtureDocument;
@@ -263,6 +290,20 @@ const publicationIngredients = (slug: string, version: number): RecipePublicatio
     }
 
     return rows.map(toPublicationIngredient);
+};
+
+/** The one committed declared-vs-derived negative case, or a failure saying it is gone. */
+const declarationNegativeCase = (): FixtureDeclarationNegativeCase => {
+    const fixture = readRecipeFixture();
+    const [negativeCase] = fixture.declaration_negative_cases;
+
+    if (!negativeCase) {
+        throw new Error('recipes.fixture.json carries no declaration_negative_cases entry');
+    }
+
+    expect(fixture.declaration_negative_cases).toHaveLength(fixture.counts.declaration_negative_cases);
+
+    return negativeCase;
 };
 
 /** One named ingredient of one fixture version, by the food's stable source key. */
@@ -508,6 +549,7 @@ describe('closed-set guards', () => {
             'high protein',
             'high-protein',
             'highprotein',
+            'highProtein',
             'glutenfree',
             'gluten-free',
             'dairyfree',
@@ -577,6 +619,12 @@ describe('isIngredientSnapshotStale', () => {
     it('is stale when only the METADATA counter moved (an ingredient can gain a milk tag)', () => {
         expect(
             isIngredientSnapshotStale(snapshot, { catalog_nutrition_version: 3, catalog_metadata_version: 6 }),
+        ).toBe(true);
+    });
+
+    it('is stale when both counters moved', () => {
+        expect(
+            isIngredientSnapshotStale(snapshot, { catalog_nutrition_version: 4, catalog_metadata_version: 6 }),
         ).toBe(true);
     });
 
@@ -671,6 +719,26 @@ describe('deriveRecipeNutrition', () => {
         expect(Number.isInteger(derived.perServing.calories)).toBe(false);
     });
 
+    it('scales inversely with the yield: the same dish divided eight ways is an eighth of a serving', () => {
+        const ingredients = [
+            makeIngredient({ gram_weight: 240 }),
+            makeIngredient({ catalog_food_id: FOOD_B, sort_order: 1, gram_weight: 160 }),
+        ];
+
+        const whole = deriveRecipeNutrition(ingredients, 1);
+        const eight = deriveRecipeNutrition(ingredients, 8);
+
+        // The whole-recipe totals are a property of the ingredients alone, so
+        // only the divisor moves — which is what makes yield an editorial
+        // decision about portioning rather than a change to the dish.
+        expect(eight.total).toEqual(whole.total);
+        expect(eight.perServing.calories).toBeCloseTo(whole.perServing.calories / 8, 9);
+        expect(eight.perServing.protein).toBeCloseTo(whole.perServing.protein / 8, 9);
+        expect(eight.perServing.carbs).toBeCloseTo(whole.perServing.carbs / 8, 9);
+        expect(eight.perServing.fat).toBeCloseTo(whole.perServing.fat / 8, 9);
+        expect(eight.perServingFiber).toBeCloseTo((whole.perServingFiber as number) / 8, 9);
+    });
+
     it('includes an optional ingredient — optional is still in the dish', () => {
         const derived = deriveRecipeNutrition(
             [
@@ -689,6 +757,14 @@ describe('deriveRecipeNutrition', () => {
 
         expect(deriveRecipeNutrition([first, second], 3).total).toEqual(
             deriveRecipeNutrition([second, first], 3).total,
+        );
+    });
+
+    it('reads an absent nutrition_basis as per_100g, the basis a published food states', () => {
+        const { nutrition_basis: _absentBasis, ...withoutBasis } = makeIngredient({ gram_weight: 250 });
+
+        expect(deriveRecipeNutrition([withoutBasis], 1).total).toEqual(
+            deriveRecipeNutrition([makeIngredient({ gram_weight: 250, nutrition_basis: 'per_100g' })], 1).total,
         );
     });
 
@@ -1199,6 +1275,10 @@ describe('deriveBadges', () => {
             expect(deriveBadges([makeIngredient()], context(400, 29.9))).not.toContain('high_protein');
         });
 
+        it('is earned just above 30 %', () => {
+            expect(deriveBadges([makeIngredient()], context(400, 30.1))).toContain('high_protein');
+        });
+
         it('is not earned when there is no energy to take a share of', () => {
             expect(deriveBadges([makeIngredient()], context(0, 10))).not.toContain('high_protein');
         });
@@ -1501,6 +1581,33 @@ describe('scaleIngredients', () => {
 
         expect(JSON.stringify(ingredients)).toBe(before);
         expect(scaled[0]).not.toBe(ingredients[0]);
+    });
+
+    it('scales an optional ingredient exactly like a required one, and says which it is', () => {
+        const [required, optional] = scaleIngredients(
+            [
+                makeIngredient({ quantity: 2, gram_weight: 200 }),
+                makeIngredient({
+                    catalog_food_id: FOOD_B,
+                    snapshot_name: 'Greek yogurt, plain',
+                    sort_order: 1,
+                    is_optional: true,
+                    quantity: 2,
+                    gram_weight: 200,
+                }),
+            ],
+            1,
+            2,
+        );
+
+        // Optional describes whether the cook may leave it out, never how much
+        // of it a portion is: a row scaled differently would put a different
+        // amount on the recipe card than the grocery list shopped for.
+        expect(optional.quantity).toBe(required.quantity);
+        expect(optional.gramWeight).toBe(required.gramWeight);
+        expect(optional.displayText).toBe(required.displayText);
+        expect(optional.isOptional).toBe(true);
+        expect(required.isOptional).toBe(false);
     });
 
     it('returns ingredients in sort order', () => {
@@ -1899,6 +2006,19 @@ describe('evaluatePlanningEligibility', () => {
                 reasonFor(makeRecipe({ total_minutes: 31 }), makePreferences({ cooking_time_limit_min: 30 }), 'cooking_time')
                     ?.detail,
             ).toEqual(['31']);
+        });
+
+        // The four limits the setup screen offers, each asserted at the limit
+        // and one minute past it. A single boundary would leave `<=` and `<`
+        // indistinguishable at the other three, and a user who answered "15
+        // min" is the one an off-by-one hands a 16-minute recipe to.
+        it.each([15, 30, 45, 60])('admits exactly %i minutes and refuses one more', (limit) => {
+            expect(codesOf(makeRecipe({ total_minutes: limit }), makePreferences({ cooking_time_limit_min: limit }))).toEqual(
+                [],
+            );
+            expect(
+                codesOf(makeRecipe({ total_minutes: limit + 1 }), makePreferences({ cooking_time_limit_min: limit })),
+            ).toEqual(['cooking_time']);
         });
 
         it('applies no limit when the user has not answered', () => {
@@ -2328,6 +2448,81 @@ describe('validateRecipeDeclaration', () => {
 
         expect(verdict.valid).toBe(false);
         expect(verdict.derived.totalMinutes).toBe(25);
+    });
+
+    /**
+     * The fixture's committed negative case, read off disk rather than
+     * transcribed, so a correction to it changes what this suite asserts.
+     *
+     * Its declaration fails in the DANGEROUS direction: it claims
+     * `allergen_tags: []` and the `dairy_free` and `vegan` badges while a cup of
+     * whole milk is in the dish. A seed that trusted the file would offer a
+     * milk-bearing dinner to a milk-allergic user, which is the whole reason
+     * `recipes-seed.ts` derives these columns and only ever compares the file
+     * against the derivation.
+     */
+    describe('the committed negative case', () => {
+        const negativeCase = () => {
+            const fixtureCase = declarationNegativeCase();
+
+            return {
+                fixtureCase,
+                verdict: validateRecipeDeclaration(
+                    fixtureCase.declaration,
+                    fixtureCase.ingredients.map(toPublicationIngredient),
+                ),
+            };
+        };
+
+        it('refuses the declaration on exactly the fields and codes the fixture records', () => {
+            const { fixtureCase, verdict } = negativeCase();
+
+            expect(verdict.valid).toBe(fixtureCase.expected_valid);
+            expect(verdict.mismatches.map((mismatch) => ({ field: mismatch.field, code: mismatch.code }))).toEqual(
+                fixtureCase.expected_mismatch_fields,
+            );
+        });
+
+        it('returns the DERIVED tags and badges, never the declared ones', () => {
+            const { fixtureCase, verdict } = negativeCase();
+
+            // The derivation is the source of truth: the verdict hands the seed
+            // what the ingredients actually support, and the declaration is
+            // only ever the thing compared against it.
+            expect(verdict.derived.allergenTags).toEqual(fixtureCase.derived_for_reference.allergen_tags);
+            expect(verdict.derived.dietTags).toEqual(fixtureCase.derived_for_reference.diet_tags);
+            expect(verdict.derived.badges).toEqual(fixtureCase.derived_for_reference.badges);
+        });
+
+        it('names the milk the file omitted and the badges it cannot support', () => {
+            const { verdict } = negativeCase();
+            const understatedAllergen = verdict.mismatches.find((mismatch) => mismatch.field === 'allergen_tags');
+            const overstatedBadges = verdict.mismatches.filter(
+                (mismatch) => mismatch.field === 'badges' && mismatch.code === 'unsupported',
+            );
+
+            expect(understatedAllergen).toMatchObject({ code: 'undeclared', derived: 'milk' });
+            expect(understatedAllergen?.ingredients).toEqual(['Whole milk']);
+            expect(overstatedBadges.map((mismatch) => mismatch.declared)).toEqual(['dairy_free', 'vegan']);
+            for (const mismatch of overstatedBadges) {
+                expect(mismatch.ingredients).toEqual(['Whole milk']);
+            }
+        });
+
+        it('stays outside recipe_versions, so no loader can persist it', () => {
+            const { fixtureCase } = negativeCase();
+
+            // The invalid row lives beside the graph rather than in it: a
+            // loader walking `insert_order` would otherwise persist a recipe
+            // whose columns understate an allergen, and would change the
+            // plannable-version count every planner test reads.
+            expect(readRecipeFixture().recipe_versions.map((version) => version.recipe_slug)).not.toContain(
+                fixtureCase.recipe_slug,
+            );
+            expect(readRecipeFixture().recipe_ingredients).not.toContainEqual(
+                expect.objectContaining({ recipe_version_id: fixtureCase.ingredients[0].recipe_version_id }),
+            );
+        });
     });
 });
 
@@ -2819,6 +3014,101 @@ describe('the committed recipe graph', () => {
             expect(planned.calories).toBeCloseTo(version.per_serving_calories * PORTION_MULTIPLIER, 9);
             expect(roundNutritionForDisplay(planned).calories).toBe(
                 Math.round(version.per_serving_calories * PORTION_MULTIPLIER),
+            );
+        });
+    });
+
+    /**
+     * The rounding contract, composed across the two modules that own it.
+     *
+     * This module's half is the one asserted here: it hands over UNROUNDED
+     * floats, and the only roundings in the chain happen downstream, once each.
+     * The chain is
+     *
+     *   1. `deriveRecipeNutrition` / `scalePlannedNutrition` — full precision;
+     *   2. `nutrition.service.ts::insertPlannedMealEntry` — `Math.round` per
+     *      value, ONCE, into the diary snapshot;
+     *   3. `nutrition.service.ts::asEaten` — `Math.round(snapshot × servings)`,
+     *      the consumed total the mobile "This adds" card must agree with.
+     *
+     * Steps 2 and 3 are restated below rather than imported, because
+     * `nutrition.service.ts` imports the Prisma client and this suite is
+     * database-free by rule. `plannedMealLog.logic.test.ts` owns the logging
+     * side of the contract; what is at stake HERE is that an extra round
+     * inside step 1 would shift both of the others, which is invisible in
+     * either module read alone.
+     */
+    describe('the rounding contract', () => {
+        /** `nutrition.service.ts::insertPlannedMealEntry` — one round per value, on insert. */
+        const asSnapshot = (nutrition: RecipePerServingNutrition): RecipePerServingNutrition => ({
+            calories: Math.round(nutrition.calories),
+            protein: Math.round(nutrition.protein),
+            carbs: Math.round(nutrition.carbs),
+            fat: Math.round(nutrition.fat),
+        });
+
+        /** `nutrition.service.ts::asEaten` — `Math.round(perServing * servings)`. */
+        const asEaten = (perServing: number, servings: number): number => Math.round(perServing * servings);
+
+        const plannedPortion = (slug: string, versionNumber: number, portionMultiplier: number) => {
+            const version = recipeVersionRow(slug, versionNumber);
+            const derived = deriveRecipeNutrition(publicationIngredients(slug, versionNumber), version.yield_servings);
+
+            return { version, derived, planned: scalePlannedNutrition(derived.perServing, portionMultiplier) };
+        };
+
+        it('hands the planned portion over unrounded, fractions intact', () => {
+            const { version, derived, planned } = plannedPortion('soy-glazed-chicken-and-rice-bowl', 1, 1.25);
+
+            expect(Number.isInteger(derived.perServing.calories)).toBe(false);
+            expect(Number.isInteger(planned.calories)).toBe(false);
+            expect(planned.calories).toBeCloseTo(version.per_serving_calories * 1.25, 9);
+            expect(planned.calories).not.toBe(Math.round(planned.calories));
+        });
+
+        it('rounds once into the snapshot and once again for the servings eaten', () => {
+            const { planned } = plannedPortion('soy-glazed-chicken-and-rice-bowl', 1, 1.25);
+            const snapshot = asSnapshot(planned);
+
+            // Two roundings, and only two: the snapshot is what "1 serving"
+            // means in the diary from then on, so the consumed total is taken
+            // from the STORED integer and never recomputed from the float.
+            expect(snapshot.calories).toBe(Math.round(planned.calories));
+            expect(asEaten(snapshot.calories, 1)).toBe(snapshot.calories);
+            expect(asEaten(snapshot.calories, 2)).toBe(snapshot.calories * 2);
+            expect(asEaten(snapshot.calories, 0.5)).toBe(Math.round(snapshot.calories / 2));
+        });
+
+        it('rounds a half up, so the diary and the client agree on the .5 case', () => {
+            // An odd snapshot halved lands exactly on .5 — the one input where
+            // half-up and half-even disagree, and where a client using the
+            // other rule would show a calorie less than the server stored.
+            const snapshot = { calories: 421, protein: 41, carbs: 51, fat: 11 };
+
+            expect(snapshot.calories % 2).toBe(1);
+            expect(asEaten(snapshot.calories, 0.5)).toBe(211);
+            expect(asEaten(snapshot.protein, 0.5)).toBe(21);
+            expect(asSnapshot({ calories: 12.5, protein: 1.5, carbs: 2.5, fat: 0.5 })).toEqual({
+                calories: 13,
+                protein: 2,
+                carbs: 3,
+                fat: 1,
+            });
+        });
+
+        it('would disagree with the diary if this module rounded before scaling', () => {
+            const MULTIPLIER = 1.5;
+            const { derived, planned } = plannedPortion('herb-chicken-rice-and-kale-bowl', 1, MULTIPLIER);
+
+            // The failure mode the contract exists to prevent, shown by doing
+            // it: rounding the per-serving value BEFORE the portion multiplier
+            // is applied moves the stored snapshot, and with it every consumed
+            // total the diary computes from that snapshot.
+            const roundedTooEarly = scalePlannedNutrition(roundNutritionForDisplay(derived.perServing), MULTIPLIER);
+
+            expect(asSnapshot(roundedTooEarly).calories).not.toBe(asSnapshot(planned).calories);
+            expect(asEaten(asSnapshot(roundedTooEarly).calories, 1)).not.toBe(
+                asEaten(asSnapshot(planned).calories, 1),
             );
         });
     });

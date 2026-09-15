@@ -1188,7 +1188,15 @@ describe('a grocery toggle and a swap that rebuilds the list', () => {
         await toggleGroceryItem(USER_ID, week.plan.id, week.lunchGroceryItem.id, { isChecked: true }, NOW);
         await commitSwap(USER_ID, week.plan.id, week.breakfastMeal.id, swapBody(week.alternative.id, 1), NOW);
 
-        const list = await getGroceryList(USER_ID, week.plan.id, NOW);
+        // Read with no reference instant, which is what a client does — the
+        // parameter defaults to `new Date()`. It matters here because this is
+        // the one assertion in the file that depends on the swap's ledger row
+        // being VISIBLE to the read: `loadLastSwapContext` bounds that lookup
+        // with `created_at <= now`, and `meal_plan_actions.created_at` is
+        // stamped by the database clock rather than by the `now` the write was
+        // driven with. Passing the suite's fixed NOW (12:00Z) therefore hid the
+        // row from the banner on any run that happened after midday UTC.
+        const list = await getGroceryList(USER_ID, week.plan.id);
 
         expect(list.totalCount).toBe(4);
         expect(list.checkedCount).toBe(1);

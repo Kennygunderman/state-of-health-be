@@ -49,7 +49,14 @@ import path from 'path';
 import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
 import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
 import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
-import { ManifestError, loadCoveragePlan, loadUsdaManifest, reportPath } from './lib/manifest';
+import {
+    EXPECTED_USDA_MANIFEST_VERSION,
+    ManifestError,
+    USDA_MANIFEST_FILE,
+    loadCoveragePlan,
+    loadUsdaManifest,
+    reportPath,
+} from './lib/manifest';
 import type {
     CatalogFoodState,
     CostClass,
@@ -67,6 +74,7 @@ import type {
 } from './lib/manifest';
 import { ModelBudgetError } from './lib/budget';
 import { RateLimitConfigError, createUsdaRateLimiter, getUsdaImportRateLimitPerHour } from './lib/rateLimiter';
+import type { UsdaRateLimiter, UsdaRequestStats } from './lib/rateLimiter';
 import {
     CheckpointError,
     appendRunLog,
@@ -82,8 +90,16 @@ import type { CatalogRunDb } from './lib/checkpoint';
 // no connection — which is why it is a top-level import where the USDA client
 // and the Prisma client, both of which construct state at module load, are
 // reached lazily from main().
-import { buildSourceKey, normalizeCanonicalName, validateCatalogCandidate } from '../src/services/catalog.logic';
+import {
+    CATALOG_CHECK_NAMES,
+    buildSourceKey,
+    catalogCheckTier,
+    computeCoverageShortfall,
+    normalizeCanonicalName,
+    validateCatalogCandidate,
+} from '../src/services/catalog.logic';
 import type {
+    CatalogCheckName,
     CatalogFoodCandidate,
     CatalogFoodPortionCandidate,
     CatalogValidationPolicy,
@@ -118,6 +134,92 @@ const CATALOG_LOGIC_MODULE = 'src/services/catalog.logic.ts';
 const logger = createLogger(STAGE);
 
 // ---------------------------------------------------------------------------
+// This stage's own error.
+// ---------------------------------------------------------------------------
+
+/** What the stage refused on, stable because an operator greps for it. */
+export type CatalogImportErrorCode =
+    /** A USDA request did not answer usably — the vendor boundary's failure, wrapped. */
+    | 'usda_request_failed'
+    /** `--manifest` named a version the loaded manifest does not declare. */
+    | 'manifest_version_mismatch';
+
+/**
+ * The stage's own failure, and the only shape callers of this file are asked
+ * to recognise.
+ *
+ * WHY IT EXISTS RATHER THAN LETTING `UsdaError` OUT. Rule
+ * backend-architecture §9 requires a vendor's failure to be wrapped in an
+ * error of ours, so nothing upstream is left pattern-matching a shape
+ * `src/services/usda.service.ts` owns and may change. It also carries what the
+ * vendor error cannot: WHICH work item stopped — the batch index, the FDC ids
+ * in it and the sweep it came from — which is the difference between an
+ * operator re-running with `--resume` and an operator reading code.
+ *
+ * `underlying` holds the original, so nothing is lost by wrapping. It is named
+ * that rather than `cause` because this package compiles to ES2016, whose
+ * `Error` has neither the `{cause}` constructor option nor the property — a
+ * field the runtime would ignore is worse than one it carries. It is never
+ * logged raw either way: a raw error on this pipeline can carry a request URL
+ * bearing the USDA key, which is why every log goes through `safeError`.
+ */
+export class CatalogImportError extends Error {
+    constructor(
+        public readonly code: CatalogImportErrorCode,
+        message: string,
+        public readonly context: {
+            readonly batchIndex?: number;
+            readonly fdcIds?: readonly number[];
+            readonly fdcId?: number;
+            readonly sweepKey?: string;
+            readonly manifestVersion?: string;
+        } = {},
+        public readonly underlying?: unknown,
+    ) {
+        super(message);
+        this.name = 'CatalogImportError';
+    }
+}
+
+/**
+ * The one error class this stage observes that it cannot name by `instanceof`.
+ *
+ * `UsdaError` is the vendor boundary's own error, and every batch and
+ * enumeration failure arrives as one: a definitive `401`/`403`/`404`, which the
+ * boundary reports after a single attempt instead of four, and a request that
+ * passed its deadline. Narrowing on the class would mean importing
+ * `src/services/usda.service.ts` at module load, which constructs a Prisma
+ * client — the very thing `main()` defers with a dynamic import so that this
+ * file's pure exports stay importable without a database. The name is set in
+ * the class's constructor and pinned by `usda.service.test.ts`, so it is the
+ * stable handle available here.
+ */
+const isUsdaError = (error: unknown): boolean => error instanceof Error && error.name === 'UsdaError';
+
+/**
+ * Wraps whatever the vendor boundary threw as this stage's own failure, so
+ * nothing upstream is left reading a shape `usda.service.ts` owns (§9).
+ *
+ * Anything that is NOT a vendor failure is returned untouched: a defect in this
+ * file must never be reported as USDA's answer.
+ */
+const asImportFailure = (error: unknown, context: CatalogImportError['context']): unknown => {
+    if (!isUsdaError(error)) {
+        return error;
+    }
+    const where =
+        context.batchIndex === undefined
+            ? `sweep ${context.sweepKey ?? 'unknown'}`
+            : `batch ${context.batchIndex}`;
+    return new CatalogImportError(
+        'usda_request_failed',
+        `USDA did not answer usably for ${where}: ${safeError(error).message}`,
+        context,
+        error,
+    );
+};
+
+// ---------------------------------------------------------------------------
 // Argument parsing — pure, so every branch below is decided without touching
 // `process`, the filesystem or the clock (Rule backend-architecture §1.2).
 // ---------------------------------------------------------------------------
@@ -131,6 +233,21 @@ export interface ImportOptions {
     readonly limit: number | null;
     readonly resume: boolean;
     readonly dryRun: boolean;
+    /**
+     * `--manifest`; `null` means the operator stated no expectation, which is
+     * not the same as stating the version the checkout happens to ship.
+     *
+     * It ASSERTS rather than selects, and deliberately so: `loadUsdaManifest`
+     * resolves one path (`data/meal-planning/usda-manifest.v1.json`) and
+     * version-checks it against `EXPECTED_USDA_MANIFEST_VERSION`, so there is
+     * no second curation for a flag to choose between and inventing a path
+     * template here would let an unreviewed document into the catalog. What an
+     * operator needs from the flag is the other half — writing down which
+     * curation they believe they are importing, and being refused before the
+     * first request when the checkout disagrees. Same shape as dbGuard's
+     * `--confirm-target`: state the target, or accept the one you are given.
+     */
+    readonly manifestVersion: string | null;
 }
 
 export interface ArgumentError {
@@ -181,7 +298,17 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     // Help is answered whatever else is on the line: an operator asking how to
     // use the command must not have to write a valid command line first.
     if (argv.some((token) => HELP_FLAGS.includes(token))) {
-        return { ok: true, options: { help: true, categories: [], limit: null, resume: false, dryRun: false } };
+        return {
+            ok: true,
+            options: {
+                help: true,
+                categories: [],
+                limit: null,
+                resume: false,
+                dryRun: false,
+                manifestVersion: null,
+            },
+        };
     }
 
     const errors: ArgumentError[] = [];
@@ -190,6 +317,8 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     let limitSeen = false;
     let resume = false;
     let dryRun = false;
+    let manifestVersion: string | null = null;
+    let manifestSeen = false;
 
     let index = 0;
     // Reads a flag's value from either form. A following token that is itself a
@@ -241,6 +370,21 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
             continue;
         }
 
+        if (flag === '--manifest') {
+            const value = takeValue(inlineValue);
+            if (value === null) {
+                errors.push({ flag, message: `${flag} requires a manifest version, such as ${EXPECTED_USDA_MANIFEST_VERSION}` });
+                continue;
+            }
+            if (manifestSeen) {
+                errors.push({ flag, message: `${flag} was given more than once; it takes a single value` });
+                continue;
+            }
+            manifestSeen = true;
+            manifestVersion = value;
+            continue;
+        }
+
         if (flag === '--resume') {
             resume = true;
             continue;
@@ -263,7 +407,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         return { ok: false, errors };
     }
 
-    return { ok: true, options: { help: false, categories, limit, resume, dryRun } };
+    return { ok: true, options: { help: false, categories, limit, resume, dryRun, manifestVersion } };
 };
 
 // ---------------------------------------------------------------------------
@@ -305,6 +449,10 @@ export const describeUsage = (): string =>
         '                      Default: off (a new run).',
         '  --dry-run           Report what the import would write without writing it.',
         '                      Default: off.',
+        `  --manifest <ver>    Refuse unless the manifest declares this version (${EXPECTED_USDA_MANIFEST_VERSION}).`,
+        '                      Checked before the first request, so a checkout carrying a',
+        '                      different curation costs nothing to discover.',
+        '                      Default: import whichever version the checkout ships.',
         '  --help, -h          Print this usage block and exit 0.',
         '',
         'Inputs read:',
@@ -1672,6 +1820,25 @@ export const dedupeSortedAliases = (aliases: readonly string[], canonicalName: s
 
 // ---------------------------------------------------------------------------
 // Persistence.
+//
+// WHY NOT ONE `where` HERE CARRIES AN OWNER, AND WHY THAT IS NOT A §5.1
+// VIOLATION. Rule backend-architecture §5.1 requires every Prisma predicate to
+// include `user_id: userId`, because a write found by id alone is a cross-user
+// write waiting to happen. The four tables below have no `user_id` column AT
+// ALL, by design: `catalog_foods` and its aliases, portions and validation
+// records are shared reference data — one row per food for the whole
+// installation, exactly like the recipe catalog — so there is no owner to scope
+// to and an owner predicate here would not compile, let alone protect anything.
+// AAP §0.5.1 names them as the only authenticated reads without a tenant
+// predicate.
+//
+// The guarantee that replaces it is the DATABASE ORIGIN, checked before any of
+// this runs: `lib/dbGuard.ts` classifies DATABASE_URL at module load (the
+// second import in this file) and refuses an origin it cannot recognise rather
+// than guessing, so this stage cannot be pointed at production data by
+// accident. Identity is enforced instead by the keys: every write below is an
+// upsert on `source_key`, which is derived from USDA's own id, so a rerun
+// converges on the same rows rather than accumulating new ones.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2220,7 +2387,15 @@ export const buildImportPlan = async (
             if (atLimit()) {
                 break;
             }
-            const rows = await listFoodsForDataType(sweep.dataType, sweep.pageSize, page);
+            // Wrapped at the boundary (§9): a sweep that dies on page 43 of a
+            // dataset is reported as this stage's failure naming that sweep,
+            // not as a vendor error the caller has to interpret.
+            let rows: UsdaFoodSummary[];
+            try {
+                rows = await listFoodsForDataType(sweep.dataType, sweep.pageSize, page);
+            } catch (error) {
+                throw asImportFailure(error, { sweepKey: sweep.sweepKey });
+            }
             if (rows.length === 0) {
                 break;
             }
@@ -2338,6 +2513,16 @@ export interface RunImportDeps {
     readonly now: () => Date;
     /** Installs the pacing over `fetch` and returns the restore. Seamed so a test runs unpaced. */
     readonly installRateLimiter: () => () => void;
+    /**
+     * What the pacing actually did, read AFTER the run so the report states
+     * measured attempts and pauses rather than a plan.
+     *
+     * Optional because an unpaced caller has nothing to report: a suite that
+     * installs no limiter would otherwise have to invent a stats object, and a
+     * fabricated zero is exactly what `usdaRequests.unmeasured` exists to
+     * avoid. `main()` always supplies it, so every real run measures.
+     */
+    readonly rateLimiterStats?: () => UsdaRequestStats;
     readonly writeReport: (report: unknown) => void;
 }
 
@@ -2348,6 +2533,31 @@ export interface ImportOutcome {
     readonly counts: Readonly<Record<string, number>>;
     readonly plannedBatches: number;
     readonly processedBatches: number;
+}
+
+/**
+ * One record this stage refused to publish, as the report lists it.
+ *
+ * The failing check names are carried, not a prose reason: every name is a
+ * member of `CATALOG_CHECK_NAMES`, so the list stays greppable and the
+ * coverage plan's own vocabulary is the only one the artefact uses.
+ */
+export interface QuarantinedRecord {
+    readonly sourceKey: string;
+    readonly fdcId: number;
+    readonly category: string;
+    readonly foodState: string;
+    readonly publicationStatus: string;
+    readonly failedChecks: readonly string[];
+}
+
+/** The per-category outcome split the report's `categories` rows are built from. */
+interface CategoryOutcomeCounts {
+    /** Every record written for the category, whatever its publication status. */
+    written: number;
+    candidates: number;
+    quarantined: number;
+    rejected: number;
 }
 
 const CURSOR_SAVE_EVERY_BATCHES = 5;
@@ -2427,13 +2637,26 @@ const reportDryRun = async (
             limit: deps.options.limit,
             resume: deps.options.resume,
             dryRun: true,
+            manifestVersion: deps.options.manifestVersion,
         },
         plannedBatches: plan.batches.length,
         processedBatches: 0,
         counts,
         byCategory: {},
         failedChecks: {},
-        note: 'dry run: the plan only. Nothing was fetched, nothing was written, and no run or checkpoint state was touched, so the canonical import still has its work to do.',
+        // A plan-time fact, so a dry run can state it: both mechanisms are
+        // applied while the work list is built, before any fetch. The measured
+        // blocks (categories, failuresByCheck, quarantined) are deliberately
+        // NOT here — nothing was validated or written, and an empty block
+        // would read as "none found" rather than "never looked".
+        duplicatesRemoved: buildDuplicatesRemovedBlock(plan),
+        // Reported for a dry run too, because a dry run really does spend
+        // vendor requests: buildImportPlan walks the dataset sweeps through
+        // /foods/list to decide the batches. Omitting the block would make the
+        // one command an operator runs to find out what an import costs the
+        // only one that does not say what it cost.
+        usdaRequests: buildUsdaRequestsBlock(deps.manifest, deps.rateLimiterStats),
+        note: 'dry run: the plan only. Any dataset-sweep enumeration pages the plan needed were fetched and are counted in usdaRequests (attempts states how many), but no detail record was fetched, nothing was written, and no run or checkpoint state was touched, so the canonical import still has its work to do.',
     });
 
     return {
@@ -2445,8 +2668,345 @@ const reportDryRun = async (
     };
 };
 
+/**
+ * How many refused records the report lists by source key before it stops.
+ *
+ * Generous enough to carry every refusal a healthy run produces (the observed
+ * figure is under 100), and bounded so a systematically failing run — a bound
+ * mis-set in the coverage plan, say — writes a report an operator can still
+ * open. `quarantinedListTruncated` states when it bound.
+ */
+const QUARANTINE_LIST_LIMIT = 500;
+
+/** Accumulates one written record into its category's outcome split. */
+const countCategoryOutcome = (
+    byCategory: Map<string, CategoryOutcomeCounts>,
+    category: string,
+    publicationStatus: string,
+): void => {
+    const row = byCategory.get(category) ?? { written: 0, candidates: 0, quarantined: 0, rejected: 0 };
+    row.written += 1;
+    if (publicationStatus === 'candidate') {
+        row.candidates += 1;
+    } else if (publicationStatus === 'quarantined') {
+        row.quarantined += 1;
+    } else if (publicationStatus === 'rejected') {
+        row.rejected += 1;
+    }
+    byCategory.set(category, row);
+};
+
+/**
+ * Groups the failing-check totals by the tier that decides what the check
+ * costs a record, which is the shape `failuresByCheck` carries.
+ *
+ * The tier is asked of `catalog.logic.ts` rather than restated: a check moved
+ * from `review` to `quarantine` there must move here with it, and a second
+ * table in this file is how the two would come to disagree (§7).
+ */
+const groupChecksByTier = (byCheck: Readonly<Record<string, number>>): Record<string, Record<string, number>> => {
+    const grouped: Record<string, Record<string, number>> = { reject: {}, quarantine: {}, review: {} };
+    for (const [name, count] of Object.entries(byCheck)) {
+        // A name the vocabulary does not carry is reported under `unknown`
+        // rather than dropped: a count this file cannot classify is still a
+        // count, and losing it would understate the refusals.
+        const tier = isCatalogCheckName(name) ? catalogCheckTier(name) : 'unknown';
+        const bucket = grouped[tier] ?? {};
+        bucket[name] = count;
+        grouped[tier] = bucket;
+    }
+    return grouped;
+};
+
+/** Whether a string is one of the check names `catalog.logic.ts` declares. */
+const isCatalogCheckName = (name: string): name is CatalogCheckName =>
+    (Object.values(CATALOG_CHECK_NAMES) as readonly string[]).includes(name);
+
+/**
+ * The report's coverage half: one row per coverage-plan category, the
+ * categories the plan does not declare, and the exact shortfall.
+ *
+ * TWO MEASURES, KEPT APART, BECAUSE THEY ANSWER DIFFERENT QUESTIONS.
+ * `candidates` against `candidateVolume` is what THIS stage can be held to: it
+ * produced candidates, and a category short of its volume is a gap the import
+ * is the one to close. `published` against `publishedTarget` is the
+ * requirement, and it is 0 here for every category BY DESIGN — this stage
+ * never publishes (see importPublicationStatus) — so the shortfall it reports
+ * is the whole target until `catalog:validate` runs. That is stated rather
+ * than softened: AAP §0.7.3 requires the shortfall exactly, never rounded,
+ * estimated or fabricated, and `shortfallBasis` is how the number is read
+ * correctly instead of made comfortable.
+ *
+ * The shortfall arithmetic itself is `catalog.logic.ts`'s, not this file's: it
+ * is the rule that decides whether a requirement is met, and a second
+ * `max(0, target − published)` written here is how the two would diverge (§7).
+ */
+const buildImportReportCoverage = (
+    coveragePlan: CoveragePlan,
+    policy: CatalogValidationPolicy,
+    byCategoryOutcome: ReadonlyMap<string, CategoryOutcomeCounts>,
+): Record<string, unknown> => {
+    // Published rows per category: zero for each category this run wrote to,
+    // because this stage publishes nothing. The categories are listed rather
+    // than an empty object passed, so `unknownCategories` still does its job —
+    // a category this run wrote rows for that the coverage plan does not
+    // declare is surfaced by the comparison rather than silently absorbed.
+    const publishedByCategory: Record<string, number> = {};
+    for (const category of byCategoryOutcome.keys()) {
+        publishedByCategory[category] = 0;
+    }
+    const shortfall = computeCoverageShortfall(policy, publishedByCategory);
+    const shortfallByCategory = new Map(shortfall.categories.map((row) => [row.category, row]));
+
+    const categories = coveragePlan.categories.map((planned) => {
+        const outcome = byCategoryOutcome.get(planned.category) ?? {
+            written: 0,
+            candidates: 0,
+            quarantined: 0,
+            rejected: 0,
+        };
+        const row = shortfallByCategory.get(planned.category);
+        return {
+            category: planned.category,
+            publishedTarget: planned.publishedTarget,
+            candidateVolume: planned.candidateVolume,
+            candidates: outcome.candidates,
+            recordsWritten: outcome.written,
+            quarantined: outcome.quarantined,
+            rejected: outcome.rejected,
+            published: row?.published ?? 0,
+            shortfall: row?.shortfall ?? planned.publishedTarget,
+            candidateVolumeShortfall: Math.max(0, planned.candidateVolume - outcome.candidates),
+        };
+    });
+
+    return {
+        categories,
+        categoriesLegend: {
+            publishedTarget: "The category's publishedTarget in coverage-plan.v1.json.",
+            candidateVolume: "The category's candidateVolume in coverage-plan.v1.json, ceil(1.25 x publishedTarget).",
+            candidates: 'Records this run wrote for the category with publication_status candidate.',
+            recordsWritten: 'Every record this run wrote for the category, whatever its publication status.',
+            quarantined: 'Records this run wrote for the category with publication_status quarantined.',
+            rejected: 'Records this run wrote for the category with publication_status rejected.',
+            published: 'Rows this run published: 0 for every category, because this stage never publishes.',
+            shortfall: 'max(0, publishedTarget - published) from catalog.logic.ts computeCoverageShortfall. See shortfallBasis.',
+            candidateVolumeShortfall:
+                'max(0, candidateVolume - candidates) - the gap this stage is the one to close, and the number to read after an import.',
+        },
+        shortfallBasis:
+            'Measured against published rows, of which this stage writes none by design, so every shortfall equals its publishedTarget until catalog:validate has run. Reported exactly rather than suppressed: it is an unmet requirement, not a metric, and softening it here is how a catalog ships short. candidateVolumeShortfall is the figure that judges THIS stage.',
+        coverage: {
+            publishedTotal: shortfall.publishedTotal,
+            publishedTargetTotal: shortfall.publishedTargetTotal,
+            shortfallTotal: shortfall.shortfallTotal,
+            meetsTarget: shortfall.meetsTarget,
+            candidatesTotal: categories.reduce((total, row) => total + row.candidates, 0),
+            candidateVolumeTotal: categories.reduce((total, row) => total + row.candidateVolume, 0),
+            unknownCategories: shortfall.unknownCategories,
+        },
+        // Only the categories this stage left short of their candidate volume:
+        // the published-side gap is every category here and says nothing about
+        // the import, so listing it as a gap would bury the real ones.
+        coverageGaps: categories
+            .filter((row) => row.candidateVolumeShortfall > 0)
+            .map((row) => ({
+                category: row.category,
+                candidateVolume: row.candidateVolume,
+                candidates: row.candidates,
+                candidateVolumeShortfall: row.candidateVolumeShortfall,
+                publishedTarget: row.publishedTarget,
+            })),
+    };
+};
+
+/**
+ * The report keys this stage owns, and therefore the only ones it replaces.
+ *
+ * Every other key in the artefact belongs to a sibling — `catalog-report.ts`'s
+ * aggregate sections, the release identity, the reconciliation between stages —
+ * and survives an import untouched.
+ */
+export const IMPORT_REPORT_NOTE_KEY = 'importStageWrite';
+
+/**
+ * Writes the import half of the report file, MERGING rather than clobbering.
+ *
+ * WHY MERGE. `import-report.json` is not this stage's private artefact: a
+ * sibling pass aggregates into the same document (release identity,
+ * cross-stage reconciliation, the measurement gaps a reviewer reads), and a
+ * plain writeFileSync would delete all of it every time an import ran. So the
+ * existing document is read first and this report is layered over it: the keys
+ * this stage measured win, and the keys it knows nothing about are preserved
+ * exactly. An import therefore updates the import half and leaves the rest of
+ * the file as the stage that produced it wrote it.
+ *
+ * A DOCUMENT THAT CANNOT BE PARSED IS REPLACED, NOT PRESERVED, and the run
+ * says so: merging into a half-written or hand-edited file would carry
+ * unreadable content forward under this run's name, and failing the import
+ * over a stale report file would throw away work that is already committed to
+ * the database. Neither is silent.
+ */
+export const writeImportReport = (target: string, report: unknown, log: ScriptLogger): void => {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+
+    let existing: Record<string, unknown> = {};
+    if (fs.existsSync(target)) {
+        try {
+            const parsed: unknown = JSON.parse(fs.readFileSync(target, 'utf-8'));
+            // Objects only. A JSON array or scalar is a valid document and a
+            // useless base to merge into, so it is treated as unusable rather
+            // than spread into an object shape it does not have.
+            if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                existing = parsed as Record<string, unknown>;
+            } else {
+                log.warn('report_replaced', {
+                    stage: STAGE,
+                    file: path.basename(target),
+                    reason: 'the existing report is not a JSON object, so there is nothing to merge into',
+                });
+            }
+        } catch (error) {
+            log.warn('report_replaced', {
+                stage: STAGE,
+                file: path.basename(target),
+                reason: 'the existing report could not be parsed as JSON',
+                error: safeError(error),
+            });
+        }
+    }
+
+    const merged = {
+        ...existing,
+        ...(report as Record<string, unknown>),
+        [IMPORT_REPORT_NOTE_KEY]: {
+            mergedIntoExisting: Object.keys(existing).length > 0,
+            preservedKeys: Object.keys(existing)
+                .filter((key) => !Object.prototype.hasOwnProperty.call(report as Record<string, unknown>, key))
+                .sort(),
+            basis:
+                'The import stage replaces the keys it measures and preserves every other key in the document, because catalog-report.ts aggregates into the same file. preservedKeys names what this write left alone, so a reader can tell which half of the artefact this run produced.',
+        },
+    };
+
+    fs.writeFileSync(target, `${JSON.stringify(merged, null, 2)}\n`, 'utf-8');
+};
+
+/**
+ * The two import-stage dedupe mechanisms, and whose job the third one is.
+ *
+ * Both of these are applied while the plan is built, before any fetch, which
+ * is why a dry run can report them. The CROSS-TABLE duplicate decision is
+ * deliberately not one of them.
+ */
+const buildDuplicatesRemovedBlock = (plan: ImportPlan): Record<string, unknown> => ({
+    skippedCuratedIdentityAtImport: plan.skipped.skippedCuratedIdentity ?? 0,
+    skippedDuplicateInPlanAtImport: plan.skipped.skippedDuplicateInPlan ?? 0,
+    basis:
+        'Two import-stage mechanisms, both applied while the plan is built and before any fetch: a swept record whose normalised identity collides with a reviewed curated entry is never assigned, and an FDC id already in the plan is never assigned twice. The cross-table duplicate decision is deliberately NOT made here - it needs a view of the whole non-rejected table that a batch-at-a-time import cannot have - so dedupeIdentity runs in catalog:validate and its duplicate_identity counts appear in the validation report.',
+});
+
+/**
+ * The `usdaRequests` block, written from the limiter's own counters.
+ *
+ * `UsdaRequestStats` is spread VERBATIM: its field names are a contract
+ * (scripts/lib/rateLimiter.ts says so, and catalog-report.ts reconciles
+ * against them), so this function adds the accounting facts around it and
+ * renames nothing inside it.
+ *
+ * WITH NO STATS SEAM THE BLOCK SAYS SO. An unpaced caller has no attempts to
+ * report, and writing zeros would state that a run made no vendor request —
+ * which for a real import is false. `unmeasured` plus a reason is the honest
+ * shape, and it is the one the previous revision's report had to describe from
+ * the outside because this block did not exist at all.
+ */
+const buildUsdaRequestsBlock = (
+    manifest: UsdaManifest,
+    readStats: (() => UsdaRequestStats) | undefined,
+): Record<string, unknown> => {
+    const accounting = {
+        accountingBasis:
+            'Attempt-based, not logical-call-based. src/services/usda.service.ts retries a bounded number of physical fetches per logical call and deliberately retries 400 alongside 408, 429 and 5xx, because USDA intermittently answers 400 to a request that succeeds when retried verbatim. One logical call can therefore cost several tokens, and the limiter counts physical attempts. Counting logical calls would understate consumption against the vendor cap.',
+        // The attempt ceiling and the retryable-status set are usda.service.ts's
+        // rules (MAX_ATTEMPTS, isRetryableUsdaStatus), and the module that owns
+        // them is named above rather than having its numbers copied into this
+        // artefact: a restated constant is one that goes stale silently, and it
+        // would make a report disagree with the code that produced it (§7).
+        rulesOwnedBy: 'src/services/usda.service.ts',
+        rateLimitEnvVar: 'USDA_IMPORT_RATE_LIMIT_PER_HOUR',
+        detailBatchSize: manifest.importLimits.detailBatchSize,
+        maxListPageSize: manifest.importLimits.maxListPageSize,
+        headroomPerHour: manifest.importLimits.vendorRequestsPerHour - manifest.importLimits.configuredRequestsPerHour,
+        headroomReason:
+            "Left on the same key for the running API's estimate, label-scan and branded-search traffic, which share the credential with this import.",
+        limiterCountsPhysicalAttempts: true,
+        pausesNote:
+            'An exhausted bucket or a spent hour makes the import WAIT, never fail, so a non-zero pause count is the ceiling working rather than an error. The limiter fails the run only when its durable ledger cannot be trusted.',
+        // Declared, not omitted: a reader looking for "how many 429s" must find
+        // out that nobody counted them, rather than infer a zero.
+        statusClassCountsUnavailable:
+            'The limiter gates every physical attempt but does not see the response, so attempts are not broken down by status class. A 429/5xx split would have to be counted inside src/services/usda.service.ts, where the response is read. Not estimated here.',
+    };
+
+    if (readStats === undefined) {
+        return {
+            ...accounting,
+            unmeasured: true,
+            unmeasuredReason:
+                'This invocation installed no rate limiter, so there are no attempt or pause counters to report. The fields are absent rather than zero: zero would claim the run issued no vendor request.',
+        };
+    }
+
+    return { ...readStats(), ...accounting, unmeasured: false };
+};
+
+/**
+ * Settles a run row an attempt is abandoning, and never replaces the failure
+ * an operator has to act on.
+ *
+ * The cursor is left exactly as the last checkpoint wrote it: the row records
+ * that the attempt stopped, while the saved batch index is what `--resume`
+ * continues from. A failure to record the failure is reported BESIDE the
+ * original, never instead of it — the caller rethrows what it caught.
+ */
+const closeFailedRun = async (
+    deps: RunImportDeps,
+    runId: string,
+    counts: Readonly<Record<string, number>>,
+    error: unknown,
+): Promise<void> => {
+    const failure = describeFailure(error);
+    deps.logger.error('run_failed', {
+        stage: STAGE,
+        runId,
+        code: failure.code,
+        error: failure.error,
+        counts: JSON.stringify(counts),
+        note: 'the checkpoint cursor is untouched, so `npm run catalog:import -- --resume` continues from the last saved batch',
+    });
+
+    try {
+        await finishRun(deps.runDb, runId, 'failed', { counts: { ...counts }, error, logger: deps.logger });
+    } catch (closeError) {
+        deps.logger.error('run_close_failed', { stage: STAGE, runId, error: safeError(closeError) });
+    }
+};
+
 export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => {
     const { manifest, coveragePlan, logger, options } = deps;
+
+    // BEFORE THE LIMITER, THE PLAN AND THE FIRST REQUEST. An operator who
+    // stated which curation they meant to import and got a different one must
+    // spend no vendor request and touch no run state finding out.
+    if (options.manifestVersion !== null && options.manifestVersion !== manifest.usdaManifestVersion) {
+        throw new CatalogImportError(
+            'manifest_version_mismatch',
+            `--manifest ${options.manifestVersion} was given, but data/meal-planning/${USDA_MANIFEST_FILE} declares ` +
+                `usdaManifestVersion ${manifest.usdaManifestVersion}. Re-run without --manifest to import the curation this ` +
+                'checkout ships, or check out the revision that carries the one you meant.',
+            { manifestVersion: options.manifestVersion },
+        );
+    }
 
     const policy: CatalogValidationPolicy = {
         categories: coveragePlan.categories,
@@ -2504,6 +3064,38 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             };
         }
 
+        // Declared before the attempt below, so the failure path can report the
+        // partial work: only `batchesProcessed` is recorded durably as the run
+        // goes, and a run closed 'failed' with nothing else would say a run
+        // that imported 9,000 records imported none.
+        const counts: Record<string, number> = {
+            planned: plan.assignments.size,
+            inserted: 0,
+            updated: 0,
+            candidates: 0,
+            quarantined: 0,
+            rejected: 0,
+            missingFromVendor: 0,
+            ...plan.skipped,
+        };
+        const byCategory: Record<string, number> = {};
+        const byCheck: Record<string, number> = {};
+        const byIdentityStatus: Record<string, number> = {};
+        const byNutritionMethod: Record<string, number> = {};
+        const byCategoryOutcome = new Map<string, CategoryOutcomeCounts>();
+        const quarantined: QuarantinedRecord[] = [];
+        let processedBatches = 0;
+
+        // FROM HERE THE RUN ROW EXISTS, SO EVERY EXIT HAS TO SETTLE IT.
+        // An uncaught throw used to leave the row 'running' forever: the
+        // checkpoint survived, so a resume still worked, but nothing on the row
+        // said the attempt had stopped, and `catalog:validate`'s prerequisite
+        // read cannot tell a crashed import from one still in flight. Closing
+        // it 'failed' with the reason records that, and deliberately does NOT
+        // touch the cursor — the saved index is what makes `--resume` pick up
+        // where this attempt stopped (AAP §0.7.1 Group 3; the same shape as
+        // catalog-load.ts's closeFailedRun).
+        try {
         const savedCursor = claim.run.cursor;
         let startIndex = 0;
         if (claim.resumed && savedCursor !== null && typeof savedCursor === 'object') {
@@ -2528,19 +3120,6 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             }
         }
 
-        const counts: Record<string, number> = {
-            planned: plan.assignments.size,
-            inserted: 0,
-            updated: 0,
-            candidates: 0,
-            quarantined: 0,
-            rejected: 0,
-            missingFromVendor: 0,
-            ...plan.skipped,
-        };
-        const byCategory: Record<string, number> = {};
-        const byCheck: Record<string, number> = {};
-        let processedBatches = 0;
         // The batch index the durable `batchesProcessed` total was last brought
         // up to. It starts at the RESUME index, not at 0: recordCounts merges
         // additively into the run row, the earlier invocation already recorded
@@ -2551,8 +3130,23 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
         for (let index = startIndex; index < plan.batches.length; index += 1) {
             const batch = plan.batches[index];
             const fetchedAt = deps.now();
-            const details = options.dryRun ? [] : await deps.usda.getFoodsBatch(batch.fdcIds);
-            const retrieval = options.dryRun ? null : await deps.usda.describeBatchRetrieval(batch.fdcIds);
+            // Both vendor reads are wrapped at the boundary (§9), and with the
+            // batch's own ids: "USDA did not answer usably for batch 137" plus
+            // the twenty ids is what an operator needs, and re-running with
+            // `--resume` picks up from the checkpoint below rather than from
+            // the start.
+            let details: UsdaFoodDetail[];
+            let retrieval: UsdaBatchRetrieval | null;
+            try {
+                details = options.dryRun ? [] : await deps.usda.getFoodsBatch(batch.fdcIds);
+                retrieval = options.dryRun ? null : await deps.usda.describeBatchRetrieval(batch.fdcIds);
+            } catch (error) {
+                throw asImportFailure(error, {
+                    batchIndex: batch.index,
+                    fdcIds: batch.fdcIds,
+                    sweepKey: batch.source,
+                });
+            }
             const returned = new Set<number>();
 
             if (!options.dryRun && retrieval !== null) {
@@ -2579,10 +3173,39 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                             counts[outcome] += 1;
                             counts[publicationStatusCountKey(publicationStatus)] += 1;
                             byCategory[prepared.row.category] = (byCategory[prepared.row.category] ?? 0) + 1;
+
+                            // Measured from the row that was just written, not
+                            // asserted from what this stage "always" writes: a
+                            // report that states its own policy back to itself
+                            // cannot show the policy being broken.
+                            byIdentityStatus[prepared.row.identity_status] =
+                                (byIdentityStatus[prepared.row.identity_status] ?? 0) + 1;
+                            byNutritionMethod[prepared.nutritionMethod] =
+                                (byNutritionMethod[prepared.nutritionMethod] ?? 0) + 1;
+                            countCategoryOutcome(byCategoryOutcome, prepared.row.category, publicationStatus);
+
+                            const failedChecks: string[] = [];
                             for (const check of verdict.checks) {
                                 if (!check.pass) {
                                     byCheck[check.name] = (byCheck[check.name] ?? 0) + 1;
+                                    failedChecks.push(check.name);
                                 }
+                            }
+
+                            // Listed individually, capped, because the list is
+                            // a worklist an operator acts on rather than a
+                            // metric: a 12,000-record refusal must not produce
+                            // a report too large to open, and the per-check and
+                            // per-category totals above stay complete either way.
+                            if (publicationStatus !== 'candidate' && quarantined.length < QUARANTINE_LIST_LIMIT) {
+                                quarantined.push({
+                                    sourceKey: prepared.sourceKey,
+                                    fdcId: prepared.fdcId,
+                                    category: prepared.row.category,
+                                    foodState: prepared.row.food_state,
+                                    publicationStatus,
+                                    failedChecks,
+                                });
                             }
                         }
                     },
@@ -2634,12 +3257,43 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                 limit: options.limit,
                 resume: options.resume,
                 dryRun: options.dryRun,
+                manifestVersion: options.manifestVersion,
             },
             plannedBatches: plan.batches.length,
             processedBatches,
             counts,
             byCategory,
             failedChecks: byCheck,
+            ...buildImportReportCoverage(coveragePlan, policy, byCategoryOutcome),
+            countsByIdentitySource: {
+                usda: Object.values(byIdentityStatus).reduce((total, count) => total + count, 0),
+                ai_generated: 0,
+                byIdentityStatus,
+                measuredFrom: 'the identity_source and identity_status written on each catalog_foods row by this run',
+                aiGeneratedZeroReason:
+                    'This stage imports FoodData Central records only. An AI-estimated food can be created by catalog:generate and never here, which is what makes every row this stage writes source_backed.',
+            },
+            countsByNutritionProvenance: {
+                source_backed: Object.values(byNutritionMethod).reduce((total, count) => total + count, 0),
+                ingredient_derived: 0,
+                ai_estimated: 0,
+                byNutritionMethod,
+                measuredFrom: 'the nutrition_provenance written on each catalog_foods row and the nutrition_method on its validation record',
+            },
+            duplicatesRemoved: buildDuplicatesRemovedBlock(plan),
+            failuresByCheck: {
+                checkNameVocabulary:
+                    'src/services/catalog.logic.ts CATALOG_CHECK_NAMES, with the tier per name from catalogCheckTier',
+                importStage: groupChecksByTier(byCheck),
+            },
+            quarantined: {
+                total: counts.quarantined + counts.rejected,
+                listed: quarantined.length,
+                truncated: quarantined.length >= QUARANTINE_LIST_LIMIT,
+                listLimit: QUARANTINE_LIST_LIMIT,
+                records: quarantined,
+            },
+            usdaRequests: buildUsdaRequestsBlock(manifest, deps.rateLimiterStats),
             note: 'publication_status is candidate or quarantined here by design: catalog:validate is the stage that publishes.',
         };
         deps.writeReport(report);
@@ -2653,6 +3307,13 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             plannedBatches: plan.batches.length,
             processedBatches,
         };
+        } catch (error) {
+            await closeFailedRun(deps, claim.run.id, counts, error);
+            // Rethrown, always: main() maps it to a code and a non-zero exit,
+            // and swallowing it here would report a failed import as a
+            // successful one (Rule backend-architecture §8).
+            throw error;
+        }
     } finally {
         // Unconditional: install() replaced globalThis.fetch, and leaving a
         // paced fetch behind would silently throttle everything that runs after
@@ -2703,36 +3364,34 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
     return fields;
 };
 
-/**
- * The one error class this stage observes that it cannot name by `instanceof`.
- *
- * `UsdaError` is the vendor boundary's own error, and every batch and
- * enumeration failure arrives as one: a definitive `401`/`403`/`404`, which the
- * boundary now reports after a single attempt instead of four, and a request
- * that passed its deadline. Narrowing on the class would mean importing
- * `src/services/usda.service.ts` at module load, which constructs a Prisma
- * client — the very thing `main()` defers with a dynamic import so that this
- * file's pure exports stay importable without a database. The name is set in
- * the class's constructor and pinned by `usda.service.test.ts`, so it is the
- * stable handle available here.
- */
-const isUsdaError = (error: unknown): boolean => error instanceof Error && error.name === 'UsdaError';
-
 // Every error class this file can observe gets its own reported code, so an
-// operator never has to read a stack trace to know which layer refused. The
-// three library classes carry a `code` of their own; RateLimitConfigError
-// carries its numbers instead, so it is reported under a fixed code, as is a
-// vendor failure — `usda_request_failed` says the run stopped on USDA's answer
-// (or its silence) rather than on a defect here, which is the difference
-// between re-running with `--resume` and reading code. Anything
-// unrecognised is reported through safeError under `unexpected_error` — it is
-// never swallowed and never printed raw, because a raw error on this pipeline
-// can carry a connection URL or a vendor key.
+// operator never has to read a stack trace to know which layer refused.
+// CatalogImportError and the three library classes carry a `code` of their own;
+// RateLimitConfigError carries its numbers instead, so it is reported under a
+// fixed code. `usda_request_failed` says the run stopped on USDA's answer (or
+// its silence) rather than on a defect here, which is the difference between
+// re-running with `--resume` and reading code.
+//
+// The bare `isUsdaError` branch is a BACKSTOP, not the main path: every call
+// this stage makes is wrapped by `asImportFailure`, so a vendor error reaching
+// here unwrapped means a call site was added without it. Classifying it
+// correctly anyway is strictly better than reporting it as a defect, and it is
+// also the contract `usda.service.test.ts` asserts from the other side.
+//
+// Anything unrecognised is reported through safeError under `unexpected_error`
+// — it is never swallowed and never printed raw, because a raw error on this
+// pipeline can carry a connection URL or a vendor key.
 //
 // Exported for the same reason every other decision in this file is: the code
 // an operator reads is a behaviour, and `src/__tests__/scripts/` asserts it
 // without running a stage.
 export const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
+    // First, because it is this stage's OWN error and the one every vendor
+    // failure now arrives as. It already names the batch that stopped, so its
+    // code is reported straight rather than re-derived from what it wrapped.
+    if (error instanceof CatalogImportError) {
+        return { code: error.code, error: safeError(error) };
+    }
     if (error instanceof DatabaseOriginError) {
         return { code: error.code, error: safeError(error) };
     }
@@ -2787,6 +3446,7 @@ const main = async (): Promise<number> => {
         limit: parsed.options.limit,
         resume: parsed.options.resume,
         dryRun: parsed.options.dryRun,
+        expectedManifestVersion: parsed.options.manifestVersion,
     });
 
     const gaps = preflight(defaultPreflightDeps());
@@ -2816,6 +3476,10 @@ const main = async (): Promise<number> => {
     const manifest = loadUsdaManifest();
     const coveragePlan = loadCoveragePlan();
     const requestsPerHour = getUsdaImportRateLimitPerHour(process.env);
+
+    // Assigned by installRateLimiter below and read by rateLimiterStats, so
+    // the report states what the pacing measured rather than what it intended.
+    let limiter: UsdaRateLimiter | null = null;
 
     const importDeps: RunImportDeps = {
         db: prisma as unknown as ImportDb,
@@ -2855,16 +3519,34 @@ const main = async (): Promise<number> => {
         options: parsed.options,
         logger,
         now: () => new Date(),
-        installRateLimiter: () =>
-            createUsdaRateLimiter({
+        // The limiter is held so the report can read its counters afterwards.
+        // Building it inside installRateLimiter and discarding it was why the
+        // report had no usdaRequests block to write: stats() was unreachable,
+        // and the counters the limiter had been keeping all along went
+        // unrecorded (scripts/lib/rateLimiter.ts UsdaRequestStats).
+        installRateLimiter: () => {
+            limiter = createUsdaRateLimiter({
                 requestsPerHour,
                 vendorCapPerHour: manifest.importLimits.vendorRequestsPerHour,
                 logger,
-            }).install(),
+            });
+            return limiter.install();
+        },
+        rateLimiterStats: () => {
+            if (limiter === null) {
+                // Unreachable through runImport, which installs before it
+                // plans and reads the stats after the last batch. Throwing
+                // rather than returning zeros keeps that ordering a defect if
+                // it is ever broken, instead of a quietly empty report.
+                throw new CatalogImportError(
+                    'usda_request_failed',
+                    'the rate limiter was asked for its counters before it was installed',
+                );
+            }
+            return limiter.stats();
+        },
         writeReport: (report) => {
-            const target = reportPath('import-report.json');
-            fs.mkdirSync(path.dirname(target), { recursive: true });
-            fs.writeFileSync(target, `${JSON.stringify(report, null, 2)}\n`, 'utf-8');
+            writeImportReport(reportPath('import-report.json'), report, logger);
         },
     };
 

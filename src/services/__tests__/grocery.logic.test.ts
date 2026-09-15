@@ -55,6 +55,7 @@ import { PlanNotActiveError, PlanNotFoundError } from '../mealPlanning.errors';
 import { PlanRecipeCandidate, buildPlanCandidates } from '../mealPlan.logic';
 import { derivePlannedSnapshot } from '../plannedMealLog.logic';
 import { RecipeIngredientSnapshot, scaleIngredients } from '../recipe.logic';
+import { ToggleGroceryItemPayload } from '../../types/mealPlanning';
 import {
     GRAMS_PER_OUNCE,
     GRAMS_PER_POUND,
@@ -1093,6 +1094,14 @@ describe('buildGroceryDisplay', () => {
         });
     });
 
+    it('states a bulk week in the largest unit its family has, not in hundreds of the smallest', () => {
+        const eggsPerItem = countFacts.default_portion.gram_weight;
+
+        expect(buildGroceryDisplay(25 * GRAMS_PER_POUND, 'mass', massFacts).text).toBe('25 lb');
+        expect(buildGroceryDisplay(20 * MILLILITERS_PER_CUP, 'volume', volumeFacts).text).toBe('20 cups');
+        expect(buildGroceryDisplay(120 * eggsPerItem, 'count', countFacts).text).toBe('120 eggs');
+    });
+
     describe('the stored display_unit always resolves to its own family', () => {
         it('holds for every family, which is what makes the lock readable', () => {
             const massUnit = buildGroceryDisplay(2.5 * GRAMS_PER_POUND, 'mass', massFacts);
@@ -2027,6 +2036,19 @@ describe('diffGroceryList', () => {
             summary: { added: 0, removed: 0, increased: 0 },
         });
     });
+
+    it('plans the writes without touching what it was given, and plans the same ones twice over', () => {
+        const stored = [Object.freeze(acknowledgedRow({ flagged_at: EARLIER }))];
+        const aggregated = [Object.freeze(massDraft(3.1 * GRAMS_PER_POUND))];
+        const catalogFacts = [Object.freeze(facts())];
+        const beforeDiffing = structuredClone({ stored, aggregated, catalogFacts });
+
+        const first = diffGroceryList(stored, aggregated, catalogFacts, NOW);
+        const second = diffGroceryList(stored, aggregated, catalogFacts, NOW);
+
+        expect(first).toEqual(second);
+        expect({ stored, aggregated, catalogFacts }).toEqual(beforeDiffing);
+    });
 });
 
 /* ---------------------------------------------------------------------------
@@ -2807,6 +2829,28 @@ describe('parseToggleGroceryBody', () => {
         expect(parseToggleGroceryBody(null).kind).toBe('error');
         expect(parseToggleGroceryBody('isChecked').kind).toBe('error');
         expect(parseToggleGroceryBody([{ isChecked: true }]).kind).toBe('error');
+    });
+
+    /**
+     * A check mark is state-setting and last-write-wins: §0.5.1 gives the
+     * grocery writes no idempotency key and no expected revision, and the body
+     * is where either would first appear. The mapped type below stops
+     * compiling the moment the payload grows a second field, and the parse
+     * proves a client that sends one anyway does not get it threaded through —
+     * so making check marks revisioned has to be a deliberate change to this
+     * test rather than a quiet one somewhere else.
+     */
+    it('names the desired state alone, carrying no idempotency key and no expected revision', () => {
+        const everyPayloadField: { [K in keyof ToggleGroceryItemPayload]-?: true } = { isChecked: true };
+
+        expect(Object.keys(everyPayloadField)).toEqual(['isChecked']);
+        expect(
+            parseToggleGroceryBody({
+                isChecked: true,
+                idempotencyKey: '0f4d8a2e-6b1c-4f3a-9e7d-2c5b8a1f6d40',
+                expectedPlanRevision: 4,
+            }),
+        ).toEqual({ kind: 'ok', payload: { isChecked: true } });
     });
 });
 

@@ -40,6 +40,16 @@
 //    `plannedMealLog.logic.ts::deriveLoggedStatus` rather than re-implemented in
 //    `swap.logic.ts`: the audit column names B while the diary entries still
 //    name A, and it is the entries the caption must come from.
+//  - THE SWAP READS THE SAME FOOD GRAPH THE GENERATOR PLANS FROM. The last
+//    describe drives the committed `recipes.fixture.json` versions — the rows
+//    the recipe, planner, grocery and planned-log suites read — so the two
+//    domains are proved to accept the same meals over real ingredient
+//    snapshots, allergen tags and cooking times rather than over synthesised
+//    ones. The synthetic recipes above pin the arithmetic; this pins the
+//    agreement.
+//  - THE SELECTION LEAVES ITS CALLER'S ARRAYS ALONE. The rows a list is built
+//    from are very often the query result a later step reuses, and the sort
+//    that ranks them is one `context.recipes.sort()` away from reordering it.
 //  - THE REQUEST PARSERS ANSWER IN DATA, AND ANSWER ONCE. The three parsers
 //    report every offending field of a request in ONE verdict, never throw, and
 //    refuse a `portionMultiplier` that is not one of the offered portions — the
@@ -54,6 +64,9 @@
 // instead, it states an explicit per-serving profile. Thresholds are never
 // hand-copied: the multiplier sets and the list length come from the modules'
 // own exported constants.
+
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
 import {
     MAX_SWAP_ALTERNATIVES,
@@ -343,6 +356,18 @@ const ALT_LARGER = makeRecipe({ slug: 'alt-larger', perServingCalories: 500 });
 const ALT_TINY = makeRecipe({ slug: 'alt-tiny', perServingCalories: 200 });
 
 /**
+ * 630 per serving: one portion lands the day at 1,930 kcal, 70 BELOW the day as
+ * it stands — frame 13b's `−70 cal` delta pill, and the one sign the fixtures
+ * above cannot produce (`alt-half` moves the day by nothing and `alt-larger`
+ * moves it up).
+ *
+ * One portion is also the chosen one: three quarters leaves the day at 1,772.5
+ * and outside the calorie band, and one and a quarter is 87.5 kcal out against
+ * this portion's 70.
+ */
+const ALT_LIGHTER = makeRecipe({ slug: 'alt-lighter', perServingCalories: 630 });
+
+/**
  * Lands the day's CALORIES exactly on target at one serving while leaving its
  * protein far below the band — the whole-day tolerance case.
  */
@@ -562,6 +587,66 @@ describe('selectSwapPortion', () => {
         // A like-for-like swap moves nothing; the heavier portion moves the day up.
         expect(half.calorieDelta).toBe(0);
         expect(larger.calorieDelta).toBe(50);
+    });
+
+    it('computes the whole resulting day, not only its calories, at full precision', () => {
+        const context = makeContext();
+        const half = requirePortion(context, ALT_HALF);
+        const larger = requirePortion(context, ALT_LARGER);
+
+        // All four values, against the day recomputed independently with the
+        // candidate substituted in place: the preview card, the swap's stored
+        // day totals and every macro band are read off this object, so a term
+        // dropped from it would leave the calorie figure — the only one a
+        // narrower assertion checks — perfectly right.
+        expect(half.dayTotalsIfSwapped).toEqual(dayIfLunchWere(scaled(ALT_HALF.per_serving, 0.5)));
+        expect(larger.dayTotalsIfSwapped).toEqual(dayIfLunchWere(scaled(ALT_LARGER.per_serving, 1.5)));
+        // And unrounded: 37.5 g of protein at one and a half portions leaves the
+        // day on a quarter gram, which the diary rounds once, later.
+        expect(larger.dayTotalsIfSwapped.protein).toBe(153.75);
+    });
+
+    it('signs the calorie delta against the day as it stands: down, up and exactly level', () => {
+        const context = makeContext();
+        const currentCalories = currentDayTotalsFor(context).calories;
+
+        // The sign is the delta pill's whole meaning, and inverting it is a
+        // one-character change: 13b draws `−70 cal` for a day that gets lighter.
+        expect(requirePortion(context, ALT_LIGHTER).calorieDelta).toBe(-70);
+        expect(requirePortion(context, ALT_LARGER).calorieDelta).toBe(50);
+        expect(requirePortion(context, ALT_HALF).calorieDelta).toBe(0);
+
+        for (const recipe of [ALT_LIGHTER, ALT_LARGER, ALT_HALF]) {
+            const candidate = requirePortion(context, recipe);
+
+            expect(candidate.calorieDelta).toBe(candidate.dayTotalsIfSwapped.calories - currentCalories);
+        }
+    });
+
+    it('carries every number an alternatives row needs, and none of its prose', () => {
+        const candidate = requirePortion(makeContext(), ALT_LIGHTER);
+
+        expect(Object.keys(candidate).sort()).toEqual([
+            'calorieDelta',
+            'dayTotalsIfSwapped',
+            'nutrition',
+            'portionMultiplier',
+            'recipe',
+            'targetProximity',
+        ]);
+        // §0.5.2's alternatives row reads `recipeVersionId`, `calories`,
+        // `protein`, `totalMinutes` and `portionMultiplier` off exactly this
+        // object, so each has to be here and has to be the candidate's own
+        // portion rather than the recipe's serving.
+        expect(candidate.recipe.recipe_version_id).toBe(ALT_LIGHTER.recipe_version_id);
+        expect(candidate.recipe.total_minutes).toBe(ALT_LIGHTER.total_minutes);
+        expect(candidate.portionMultiplier).toBe(1);
+        expect(candidate.nutrition.calories).toBe(ALT_LIGHTER.per_serving.calories);
+        expect(candidate.nutrition.protein).toBe(ALT_LIGHTER.per_serving.protein);
+        // The row's `name` and `iconKey` are the mapper's to supply (Rule
+        // backend-architecture §6), so this module invents no display string:
+        // nothing it computes is text at all.
+        expect(Object.values(candidate).some((value) => typeof value === 'string')).toBe(false);
     });
 
     it('ranks on the resulting whole day, never on a slot share', () => {
@@ -823,6 +908,14 @@ describe('selectSwapCandidates ranking', () => {
         }
     });
 
+    it('offers eight rows at most, which is the product decision, not an arithmetic one', () => {
+        // Every other assertion in this file reaches the length through the
+        // exported constant, deliberately — this is the one place the NUMBER is
+        // pinned, because §0.7.3 fixes it at eight and a change to it changes
+        // the offer the preview and the commit are held to.
+        expect(MAX_SWAP_ALTERNATIVES).toBe(8);
+    });
+
     it('truncates to the policy maximum AFTER ranking, so the rows are the best ones', () => {
         const candidates = selectSwapCandidates(makeContext({ recipes: rankedAlternatives() }));
 
@@ -858,6 +951,37 @@ describe('selectSwapCandidates ranking', () => {
         expect(inputErrorField(() => selectSwapCandidates(makeContext({ recipes, limit: 0 })))).toBe('limit');
         expect(inputErrorField(() => selectSwapCandidates(makeContext({ recipes, limit: 2.5 })))).toBe(
             'limit',
+        );
+    });
+
+    it('leaves the caller\'s own rows untouched, because a later step reuses them', () => {
+        const recipes = rankedAlternatives();
+        const context = makeContext({ recipes, dayMeals: dayMeals(), weekMeals: weekMeals() });
+        const before = JSON.stringify({
+            recipes: context.recipes,
+            dayMeals: context.dayMeals,
+            weekMeals: context.weekMeals,
+            targets: context.targets,
+        });
+
+        const listed = selectSwapCandidates(context);
+
+        // The ranking sorts, and `candidates.sort(...)` on the caller's own
+        // array instead of a copy is the plausible slip: `swap.service.ts`
+        // hands in the query result it goes on to read the committed rows from,
+        // and a reordered — or worse, truncated — input is a defect that would
+        // only show up in the grocery diff two steps later.
+        expect(
+            JSON.stringify({
+                recipes: context.recipes,
+                dayMeals: context.dayMeals,
+                weekMeals: context.weekMeals,
+                targets: context.targets,
+            }),
+        ).toBe(before);
+        expect(listed).not.toBe(context.recipes);
+        expect(recipes.map((recipe) => recipe.slug)).toEqual(
+            rankedAlternatives().map((recipe) => recipe.slug),
         );
     });
 });
@@ -1100,6 +1224,18 @@ describe('an empty alternatives list', () => {
 
     it('is the answer when nothing is plannable at all', () => {
         expect(selectSwapCandidates(makeContext({ recipes: [] }))).toEqual([]);
+    });
+
+    it('is RETURNED and not thrown, so 13d is distinguishable from a failure', () => {
+        // The client renders "no alternatives fit" from an empty list and an
+        // error banner from a throw, and they say different things to the user:
+        // one is the truthful consequence of their own restrictions, the other
+        // says the app is broken. A refusal dressed up as an exception — or an
+        // exception swallowed into `[]` — swaps the two.
+        const noneEligible = makeContext({ recipes: [WRAP_V1, ALT_TINY] });
+
+        expect(() => selectSwapCandidates(noneEligible)).not.toThrow();
+        expect(selectSwapCandidates(noneEligible)).toEqual([]);
     });
 });
 
@@ -1348,7 +1484,11 @@ describe('swapMealWhere', () => {
  * ------------------------------------------------------------------------- */
 
 describe('a logged meal swapped twice', () => {
-    /** The two intentional entries: one meal eaten, then a second serving of it. */
+    /**
+     * The two intentional entries — one meal eaten, then a second serving of it
+     * — which with the two swaps below IS the scenario the card treatment is
+     * derived from (§0.7.3): two logs of A, a swap to B, a swap to C.
+     */
     const twoEntriesForA = (): LinkedDiaryEntryRow[] => [
         { id: 'entry-first-serving', recipe_version_id: WRAP_VERSION_1 },
         { id: 'entry-second-serving', recipe_version_id: WRAP_VERSION_1 },
@@ -1433,6 +1573,263 @@ describe('a logged meal swapped twice', () => {
 
         expect(state.status).toBe('logged');
         expect(state.isLogged).toBe(true);
+    });
+
+    it('never marks the replacement eaten: no entry references the recipe now planned', () => {
+        const { toB, toC } = swapTwice();
+        const entries = twoEntriesForA();
+
+        // The user ate A. Swapping the slot cannot make C — or the B it passed
+        // through — food anybody consumed, and the write carries no entry link
+        // to invent one with.
+        expect(entries.map((entry) => entry.recipe_version_id)).not.toContain(toC.recipe_version_id);
+        expect(entries.map((entry) => entry.recipe_version_id)).not.toContain(toB.recipe_version_id);
+        expect(deriveLoggedStatus(entries, toC.recipe_version_id).isLogged).toBe(false);
+        expect(Object.keys(toC)).not.toContain('meal_entry_id');
+    });
+
+    it('leaves the logged entries exactly as the diary stored them (deriveLoggedStatus itself is covered by plannedMealLog.logic.test.ts; this asserts the swap-side composition)', () => {
+        const { toC } = swapTwice();
+        const entries = twoEntriesForA();
+        const stored = JSON.stringify(entries);
+
+        deriveLoggedStatus(entries, toC.recipe_version_id);
+
+        // The diary snapshot outlives every swap: §0.7.3 keeps what the user
+        // ate, and the caption is derived from these rows rather than written
+        // back onto them.
+        expect(JSON.stringify(entries)).toBe(stored);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The committed recipe fixture — one food graph, two domains
+ *
+ * Everything above judges synthetic recipes whose macros sit on the target's
+ * own ratio, which is what makes each rule's arithmetic readable. This block
+ * judges the COMMITTED rows instead: `data/meal-planning/recipes.fixture.json`
+ * is the referentially closed pair (§0.3.3) the recipe, planner, grocery and
+ * planned-log suites all read, so driving a swap through it proves the two
+ * domains accept the same meals over real ingredient snapshots, real allergen
+ * metadata and real cooking times — the property §0.7.3 asks for when it says
+ * the swap must not offer a dish the generator refused.
+ *
+ * Read off disk and re-parsed per accessor, the convention `mealPlan.logic.test.ts`
+ * uses, so a case that mutates a row cannot leak into the next. Nothing is
+ * transcribed: every number below is the fixture's, and the premises each test
+ * opens with are what makes it fail loudly — rather than vacuously — if the
+ * committed graph changes shape.
+ * ------------------------------------------------------------------------- */
+
+const FIXTURE_DIRECTORY = join(__dirname, '..', '..', '..', 'data', 'meal-planning', 'fixtures');
+
+const RECIPES_FIXTURE_JSON = readFileSync(join(FIXTURE_DIRECTORY, 'recipes.fixture.json'), 'utf8');
+
+/** The `recipe_versions` columns a swap candidate is built from. */
+interface FixtureRecipeVersion {
+    id: string;
+    recipe_id: string;
+    recipe_slug: string;
+    version: number;
+    total_minutes: number;
+    meal_slots: MealSlot[];
+    status: 'current' | 'retired';
+    nutrition_provenance: PlanRecipeCandidate['nutrition_provenance'];
+    allergen_status: 'known' | 'unknown';
+    budget_tier: number;
+    per_serving_calories: number;
+    per_serving_protein_g: number;
+    per_serving_carbs_g: number;
+    per_serving_fat_g: number;
+}
+
+/**
+ * A `recipe_ingredients` row. `resolved_catalog_facts` is the fixture's
+ * documented non-column field — the `catalog_foods` facts the table does not
+ * snapshot, which is where the dislike rule's `food_group` comes from.
+ */
+interface FixtureRecipeIngredient {
+    recipe_version_id: string;
+    snapshot_name: string;
+    snapshot_provenance: Ingredient['snapshot_provenance'];
+    snapshot_allergen_tags: string[];
+    snapshot_diet_tags: string[];
+    catalog_food_id: string;
+    is_optional: boolean;
+    resolved_catalog_facts: { allergen_status: 'known' | 'unknown'; food_group: string };
+}
+
+interface RecipeFixtureDocument {
+    recipe_versions: FixtureRecipeVersion[];
+    recipe_ingredients: FixtureRecipeIngredient[];
+}
+
+const readRecipeFixture = (): RecipeFixtureDocument => JSON.parse(RECIPES_FIXTURE_JSON) as RecipeFixtureDocument;
+
+/** The `(slug, version)` row, or a failure naming the pair it could not find. */
+const fixtureVersion = (slug: string, version: number): FixtureRecipeVersion => {
+    const row = readRecipeFixture().recipe_versions.find(
+        (candidate) => candidate.recipe_slug === slug && candidate.version === version,
+    );
+
+    if (row === undefined) {
+        throw new Error(`recipes.fixture.json carries no ${slug} v${version}`);
+    }
+
+    return row;
+};
+
+const fixtureIngredients = (versionId: string): FixtureRecipeIngredient[] =>
+    readRecipeFixture().recipe_ingredients.filter((row) => row.recipe_version_id === versionId);
+
+/** One committed version as a swap candidate. Every field is the fixture's. */
+const fixtureCandidate = (slug: string, version: number): PlanRecipeCandidate => {
+    const row = fixtureVersion(slug, version);
+
+    return {
+        recipe_version_id: row.id,
+        recipe_id: row.recipe_id,
+        slug: row.recipe_slug,
+        version: row.version,
+        status: row.status,
+        nutrition_provenance: row.nutrition_provenance,
+        allergen_status: row.allergen_status,
+        total_minutes: row.total_minutes,
+        meal_slots: row.meal_slots,
+        budget_tier: row.budget_tier,
+        per_serving: {
+            calories: row.per_serving_calories,
+            protein: row.per_serving_protein_g,
+            carbs: row.per_serving_carbs_g,
+            fat: row.per_serving_fat_g,
+        },
+        ingredients: fixtureIngredients(row.id).map(
+            (ingredient): Ingredient => ({
+                catalog_food_id: ingredient.catalog_food_id,
+                snapshot_name: ingredient.snapshot_name,
+                snapshot_provenance: ingredient.snapshot_provenance,
+                snapshot_allergen_tags: ingredient.snapshot_allergen_tags,
+                snapshot_diet_tags: ingredient.snapshot_diet_tags,
+                is_optional: ingredient.is_optional,
+                food_group: ingredient.resolved_catalog_facts.food_group,
+                allergen_status: ingredient.resolved_catalog_facts.allergen_status,
+            }),
+        ),
+    };
+};
+
+/** Every committed version, the retired one included — the plannable set as loaded. */
+const fixtureCatalog = (): PlanRecipeCandidate[] =>
+    readRecipeFixture().recipe_versions.map((row) => fixtureCandidate(row.recipe_slug, row.version));
+
+describe('a swap over the committed recipe fixture', () => {
+    const FIXTURE_BREAKFAST_ID = 'fixture-meal-breakfast';
+    const FIXTURE_LUNCH_ID = 'fixture-meal-lunch';
+    const FIXTURE_DINNER_ID = 'fixture-meal-dinner';
+
+    const BREAKFAST = fixtureCandidate('yogurt-egg-white-crispbread-plate', 1);
+    /** The lunch under replacement: the dish's CURRENT version. */
+    const PLANNED_LUNCH = fixtureCandidate('lemon-herb-chicken-and-rice', 2);
+    const DINNER = fixtureCandidate('salmon-and-kale-plate', 1);
+    const STEW = fixtureCandidate('lentil-and-kale-stew', 1);
+
+    /** Targets this committed day sits inside, so the portion rule can bind. */
+    const FIXTURE_TARGETS: MealPlanMacroTotals = { calories: 1230, protein: 90, carbs: 120, fat: 45 };
+
+    const plannedMeal = (
+        id: string,
+        slot: MealSlot,
+        recipe: PlanRecipeCandidate,
+    ): SwapDayMeal => ({
+        id,
+        slot,
+        recipeId: recipe.recipe_id,
+        recipeVersionId: recipe.recipe_version_id,
+        portionMultiplier: 1,
+        planned: recipe.per_serving,
+        revision: 1,
+    });
+
+    const fixtureDayMeals = (): SwapDayMeal[] => [
+        plannedMeal(FIXTURE_BREAKFAST_ID, 'breakfast', BREAKFAST),
+        plannedMeal(FIXTURE_LUNCH_ID, 'lunch', PLANNED_LUNCH),
+        plannedMeal(FIXTURE_DINNER_ID, 'dinner', DINNER),
+    ];
+
+    const fixtureContext = (overrides: Partial<SwapSelectionContext> = {}): SwapSelectionContext => ({
+        mealId: FIXTURE_LUNCH_ID,
+        date: SWAP_DATE,
+        slot: 'lunch',
+        dayMeals: fixtureDayMeals(),
+        weekMeals: fixtureDayMeals().map((meal) => ({
+            id: meal.id,
+            date: SWAP_DATE,
+            recipeId: meal.recipeId,
+        })),
+        targets: FIXTURE_TARGETS,
+        preferences: makePreferences(),
+        recipes: fixtureCatalog(),
+        ...overrides,
+    });
+
+    it('offers the one committed version a lunch swap may take, out of the whole graph', () => {
+        // The premises: the fixture really does carry the four lunch-declaring
+        // versions this refuses, each for a different reason, so the single-row
+        // answer below is a decision and not an accident of a thin fixture.
+        expect(fixtureVersion('lemon-herb-chicken-and-rice', 1).status).toBe('retired');
+        expect(fixtureVersion('roasted-carrot-and-lentil-salad', 1).nutrition_provenance).toBe(
+            'ai_estimated',
+        );
+        expect(fixtureVersion('lemon-dressed-spinach-salad', 1).nutrition_provenance).toBe(
+            'ingredient_derived',
+        );
+        expect(fixtureVersion('cracker-and-yogurt-snack-plate', 1).allergen_status).toBe('unknown');
+        expect(fixtureCatalog().length).toBeGreaterThan(MAX_SWAP_ALTERNATIVES);
+
+        const candidates = selectSwapCandidates(fixtureContext());
+
+        expect(slugsOf(candidates)).toEqual(['lentil-and-kale-stew']);
+        expect(candidates[0].portionMultiplier).toBe(1);
+    });
+
+    it('prices that swap with the fixture\'s own per-serving numbers', () => {
+        const candidate = selectSwapCandidate(fixtureContext(), STEW.recipe_version_id);
+        const currentDay = currentDayTotalsFor(fixtureContext());
+
+        expect(candidate.nutrition).toEqual(STEW.per_serving);
+        expect(candidate.dayTotalsIfSwapped).toEqual(
+            computeDayTotals([
+                { planned: BREAKFAST.per_serving },
+                { planned: STEW.per_serving },
+                { planned: DINNER.per_serving },
+            ]),
+        );
+        expect(candidate.calorieDelta).toBeCloseTo(
+            STEW.per_serving.calories - PLANNED_LUNCH.per_serving.calories,
+            9,
+        );
+        expect(isDayWithinTolerance(candidate.dayTotalsIfSwapped, FIXTURE_TARGETS)).toBe(true);
+        expect(currentDay.calories).toBeCloseTo(
+            BREAKFAST.per_serving.calories +
+                PLANNED_LUNCH.per_serving.calories +
+                DINNER.per_serving.calories,
+            9,
+        );
+    });
+
+    it('answers 13d when the user dislikes the food group its only alternative carries', () => {
+        const mushroom = fixtureIngredients(STEW.recipe_version_id).find(
+            (ingredient) => ingredient.resolved_catalog_facts.food_group === 'mushroom',
+        );
+
+        expect(mushroom?.snapshot_name).toBe('Cremini mushrooms');
+
+        const disliked = fixtureContext({
+            preferences: makePreferences({ disliked_food_groups: ['mushroom'] }),
+        });
+
+        expect(selectSwapCandidates(disliked)).toEqual([]);
+        expect(() => selectSwapCandidate(disliked, STEW.recipe_version_id)).toThrow(RecipeIneligibleError);
     });
 });
 
