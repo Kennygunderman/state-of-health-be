@@ -70,6 +70,7 @@ import {
     CatalogNutritionBasisRule,
     CatalogNutritionSource,
     CatalogPolicyError,
+    CatalogSourceKeyInput,
     CatalogValidationContext,
     CatalogValidationPolicy,
     assertUsableValidationPolicy,
@@ -494,6 +495,67 @@ describe('buildSourceKey', () => {
         ).toBe('ai:produce_vegetable:kale:raw');
     });
 
+    // One food reaching two keys is the difference between the import UPDATING
+    // its row and adding a second row for the same food, so the two spellings a
+    // generation run and a re-run produce have to land on one key.
+    it('mints one key for two spellings of the same food', () => {
+        const key = buildSourceKey({
+            identitySource: 'ai_generated',
+            category: 'produce_vegetable',
+            canonicalName: 'Brussels Sprouts, Roasted',
+            foodState: 'cooked',
+        });
+
+        expect(key).toBe('ai:produce_vegetable:brussels sprouts roasted:cooked');
+        expect(
+            buildSourceKey({
+                identitySource: 'ai_generated',
+                category: 'PRODUCE_VEGETABLE',
+                canonicalName: '  brussels   sprouts  (roasted)  ',
+                foodState: 'cooked',
+            }),
+        ).toBe(key);
+    });
+
+    // The pipeline's idempotency anchor: the USDA import upserts on this column,
+    // catalog-load.ts reconciles a release on it, the recipe seeds reference
+    // their ingredients by it and search-benchmark.v1.json names its
+    // expectations by it. A key carrying anything per-call — a counter, a clock
+    // reading, an iteration order — would file one food under several rows.
+    it('mints a byte-identical key for the same input on every call', () => {
+        const inputs: readonly CatalogSourceKeyInput[] = [
+            { identitySource: 'usda', fdcId: 171077 },
+            { identitySource: 'usda', fdcId: '171077' },
+            {
+                identitySource: 'ai_generated',
+                category: 'prepared_meal',
+                canonicalName: 'Vegetable Barley Soup',
+                foodState: 'prepared',
+            },
+        ];
+
+        for (const input of inputs) {
+            expect(new Set([buildSourceKey(input), buildSourceKey(input), buildSourceKey(input)]).size).toBe(1);
+        }
+    });
+
+    // Raw, cooked, dry, prepared and as-purchased forms of one food have
+    // different energy per 100 g and are judged against different bands, so each
+    // is its own row and needs its own key.
+    it('keeps the five states of one food on five separate keys', () => {
+        const keys = CATALOG_FOOD_STATES.map((foodState) =>
+            buildSourceKey({
+                identitySource: 'ai_generated',
+                category: 'grain',
+                canonicalName: 'brown rice',
+                foodState,
+            }),
+        );
+
+        expect(new Set(keys).size).toBe(CATALOG_FOOD_STATES.length);
+        expect(keys).toEqual(expect.arrayContaining(['ai:grain:brown rice:dry', 'ai:grain:brown rice:cooked']));
+    });
+
     // Louder than a verdict on purpose: source_key is the UNIQUE upsert column,
     // so a key derived from an empty name would collapse every such candidate
     // onto one row — and a key derived from a coerced id would file a food
@@ -734,6 +796,56 @@ describe('dedupeIdentity', () => {
         expect(plan.merges[0].aliases).toEqual(['Andean Grain']);
     });
 
+    // Three spellings of one food reaching the pipeline — a USDA record and two
+    // generation batches — publish ONE row, and the two losers become aliases of
+    // it so a search for either spelling still finds it. Each loser is weighed
+    // against the aliases already collected, not just against the survivor's own
+    // names, so the survivor never gains the same alias twice.
+    it('collapses a three-way duplicate onto one survivor carrying two aliases', () => {
+        const sourced = candidate({
+            source_key: 'usda:7',
+            identity_source: 'usda',
+            canonical_name: 'chickpeas',
+        });
+        const withAlias = candidate({
+            source_key: 'ai:x',
+            canonical_name: 'Chickpeas',
+            aliases: ['garbanzo beans'],
+        });
+        const withDisplayName = candidate({
+            source_key: 'ai:y',
+            canonical_name: 'CHICKPEAS',
+            display_name: 'Chickpeas, cooked',
+        });
+
+        const expected = {
+            survivors: ['usda:7'],
+            duplicateSourceKeys: ['ai:x', 'ai:y'],
+            merges: [
+                { duplicateSourceKey: 'ai:x', aliases: ['garbanzo beans'] },
+                { duplicateSourceKey: 'ai:y', aliases: ['Chickpeas, cooked'] },
+            ],
+        };
+
+        for (const input of [
+            [sourced, withAlias, withDisplayName],
+            [withDisplayName, withAlias, sourced],
+        ]) {
+            const plan = dedupeIdentity(input);
+
+            expect({
+                survivors: plan.survivors.map((entry) => entry.source_key),
+                duplicateSourceKeys: plan.duplicateSourceKeys,
+                merges: plan.merges.map((entry) => ({
+                    duplicateSourceKey: entry.duplicateSourceKey,
+                    aliases: entry.aliases,
+                })),
+            }).toEqual(expected);
+            expect(plan.merges.every((entry) => entry.survivorSourceKey === 'usda:7')).toBe(true);
+            expect(plan.merges.flatMap((entry) => entry.aliases)).toHaveLength(2);
+        }
+    });
+
     it('returns survivors, merges and duplicate keys in a stable sorted order', () => {
         const plan = dedupeIdentity([
             candidate({ source_key: 'ai:c' }),
@@ -800,6 +912,18 @@ describe('parseCatalogSearchQuery', () => {
                 details: [{ field: 'q', code: 'invalid_length' }],
             });
         }
+    });
+
+    // The accepted side of trim-before-length, and the reason the order matters
+    // in both directions: the padding is not part of the query, so a
+    // maximum-length query survives whitespace around it while ' y ' above does
+    // not survive being one character.
+    it('accepts a maximum-length query whose padding takes the raw string past the bound', () => {
+        const trimmed = 'x'.repeat(MAX_SEARCH_QUERY_LENGTH);
+        const padded = `  ${trimmed}  `;
+
+        expect(padded.length).toBeGreaterThan(MAX_SEARCH_QUERY_LENGTH);
+        expect(parseCatalogSearchQuery(padded)).toEqual({ kind: 'ok', q: trimmed });
     });
 
     // The regression guard. A U+0000 cannot be represented in a PostgreSQL
@@ -3891,6 +4015,7 @@ const ROW = {
     AI_PUBLISHED: 'ai:produce_vegetable:roasted carrot coins:cooked',
     DERIVED_CURRENT: 'ai:condiment_sauce:lemon olive oil dressing:prepared',
     DERIVED_STALE: 'ai:prepared_meal:herbed yogurt dip:prepared',
+    VOLUME_BASIS: 'usda:9200110',
     MISSING_DENSITY: 'ai:beverage:cold brew coffee concentrate:prepared',
     MISSING_CORE_NUTRIENT: 'ai:spice_herb:smoked paprika blend:dry',
     UNSOURCED: 'ai:other:mixed micronutrient powder:dry',
@@ -4802,6 +4927,41 @@ describe('the boundary rows of the committed fixture', () => {
         expect(verdict.publicationStatus).toBe('quarantined');
         expect(verdict.decidingCheckNames).toEqual([CATALOG_CHECK_NAMES.MISSING_DENSITY]);
         expect(verdict.normalizedNutrition).toBeNull();
+    });
+
+    // The other side of the same rule, on the row the fixture stores for it: 100
+    // ml of whole milk weighs 103.2 g, so the per-100 g values are the stored
+    // ones scaled by 100/103.2. The conversion is asserted on a committed row
+    // rather than a hand-built one because this is the arithmetic every
+    // volume-basis food in the catalog reaches its grocery quantity through.
+    it('converts the volume-basis row through its stored density', () => {
+        const food = fixtureFood(ROW.VOLUME_BASIS);
+        const density = food.density_g_per_ml as number;
+        const basisGrams = food.basis_amount * density;
+        const factor = PER_100G_BASIS_AMOUNT / basisGrams;
+        const result = normalizeToPer100g(fixtureCandidate(ROW.VOLUME_BASIS));
+
+        expect({ basis: food.nutrition_basis, basisAmount: food.basis_amount, density }).toEqual({
+            basis: 'per_100ml',
+            basisAmount: 100,
+            density: 1.032,
+        });
+        expect(basisGrams).toBeCloseTo(103.2, 10);
+        expect(result.kind).toBe('ok');
+        if (result.kind !== 'ok') {
+            return;
+        }
+        expect(result.normalized.nutrition_basis).toBe('per_100g');
+        expect(result.normalized.basis_amount).toBe(PER_100G_BASIS_AMOUNT);
+        expect(result.normalized.basisGrams).toBeCloseTo(basisGrams, 10);
+        expect(result.normalized.factor).toBeCloseTo(factor, 10);
+        // 64 kcal per 100 ml is 62.0155… per 100 g: less energy per gram than
+        // per millilitre, because milk is denser than water.
+        expect(result.normalized.nutrition.calories as number).toBeCloseTo(62.0155, 4);
+        for (const field of CORE_NUTRIENT_FIELDS) {
+            expect(result.normalized.nutrition[field] as number).toBeCloseTo((food[field] as number) * factor, 10);
+        }
+        expect(validateFixtureRow(ROW.VOLUME_BASIS).publicationStatus).toBe('published');
     });
 
     // Null means unknown either way; which nutrient it is decides the outcome.

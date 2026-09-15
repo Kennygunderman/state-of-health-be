@@ -50,6 +50,10 @@ import { prisma } from '../../prisma/client';
 import { loadPlannedMealsForGroceries, rebuildPlanGroceries } from '../../services/grocery.service';
 import { generatePlan } from '../../services/mealPlan.service';
 import { commitSwap } from '../../services/swap.service';
+// The regeneration case pins its request to the CURRENT targets revision rather
+// than a literal, for the reason the targets suite states: publication moves the
+// preference row, so both pins are read rather than assumed.
+import { getTargets } from '../../services/targets.service';
 import {
     FIXTURE_TARGETS,
     FIXTURE_USER_TARGET_COLUMNS,
@@ -243,6 +247,10 @@ interface FaultedModules {
     readonly resolvedFault: string;
     readonly commitSwap: SwapServiceModule['commitSwap'];
     readonly generatePlan: MealPlanServiceModule['generatePlan'];
+    // §0.9.4 arms `generation` for BOTH publication entry points, so the
+    // regeneration case needs the faulted graph's copy too — the one whose
+    // assurance is that the week it was asked to replace is still there.
+    readonly regeneratePlan: MealPlanServiceModule['regeneratePlan'];
 }
 
 interface FaultWindowOptions {
@@ -299,6 +307,7 @@ const withFault = async <TResult>(
                 resolvedFault: featureFlags.mealPlanningFault(),
                 commitSwap: swapService.commitSwap,
                 generatePlan: mealPlanService.generatePlan,
+                regeneratePlan: mealPlanService.regeneratePlan,
             };
         });
 
@@ -515,24 +524,129 @@ describe('the injected swap fault', () => {
  * ------------------------------------------------------------------------- */
 
 describe('the injected generation fault', () => {
-    it('is decoded by the flag module, which is the whole of what is wired today', async () => {
-        // The switch is parsed and reachable — `featureFlags.ts` resolves it and
-        // `resolveFault` admits it — and this is the only part of §0.9.4's
-        // `generation` fault that exists in this checkout.
+    it('fails the generation before its transaction opens, leaving no plan and no ledger row', async () => {
+        // §0.9.2's invariant, asserted against the switch itself now that
+        // `mealPlan.service.ts::raiseInjectedGenerationFault` sits between
+        // `searchCandidateWeek` and `prisma.$transaction`.
         //
-        // `mealPlan.service.ts` does NOT consult `mealPlanningFault()`:
-        // `generatePlan` runs `searchCandidateWeek` and opens its transaction
-        // with no fault check between them, so arming `generation` changes
-        // nothing about a generation. That gap is reported to the checkpoint
-        // owner rather than asserted here, because asserting the current
-        // behaviour would pin the very thing that has to change; the case below
-        // proves the INVARIANT §0.9.2 attaches to the fault ("leaves no action
-        // row and no plan … and the retry without the fault commits once")
-        // through a pre-transaction failure that IS implemented, and the fault's
-        // own case belongs beside it the moment the check is added.
-        await withFault('generation', async ({ resolvedFault }) => {
+        // The two emptiness assertions are the whole point: the fault is raised
+        // in FRONT of the transaction, so there is no advisory lock, no
+        // `meal_plan_actions` reservation and no plan row — nothing was written
+        // and then rolled back, because nothing was ever reached. A check armed
+        // one statement later, inside the transaction, would leave these same
+        // two assertions passing for an entirely different reason, which is why
+        // the position is stated in the service and pinned here.
+        const refused = await withFault('generation', async ({ resolvedFault, generatePlan: faulted }) => {
             expect(resolvedFault).toBe('generation');
+
+            return faulted(GENERATION_USER_ID, generateBody(), NOW).then(
+                () => null,
+                (error: unknown) => error,
+            );
         });
+
+        expect(refused).toBeInstanceOf(Error);
+        expect((refused as Error).name).toBe('PlanGenerationError');
+        expect(await generatedPlans()).toHaveLength(0);
+        expect(await ledgerRowsFor(GENERATION_USER_ID, GENERATION_KEY)).toHaveLength(0);
+
+        // The identical request — same key, same body — once the switch is off.
+        // A key the faulted attempt never reserved is a key the ledger has never
+        // seen, so this is a first publication rather than a replay.
+        const published = await generatePlan(GENERATION_USER_ID, generateBody(), NOW);
+
+        expect(published.kind).toBe('ok');
+
+        if (published.kind !== 'ok') {
+            throw new Error(`the generation was refused as invalid: ${JSON.stringify(published)}`);
+        }
+
+        expect(published.result.status).toBe(201);
+
+        const plans = await generatedPlans();
+
+        expect(plans).toHaveLength(1);
+        expect(plans[0].status).toBe('active');
+        expect(plans[0].revision).toBe(1);
+        expect(await ledgerRowsFor(GENERATION_USER_ID, GENERATION_KEY)).toHaveLength(1);
+    });
+
+    it('fails a regeneration the same way, leaving the week it was asked to replace active', async () => {
+        // The assurance the 16b dialog makes, and the reason §0.9.4 arms this
+        // fault for `/regenerate` as well: a regeneration that fails must leave
+        // the user with the week they already had. The fault is raised before
+        // the transaction that would have superseded it, so the old plan keeps
+        // its `active` status AND its revision — an untouched row, not a
+        // restored one.
+        const original = await generatePlan(GENERATION_USER_ID, generateBody(), NOW);
+
+        if (original.kind !== 'ok') {
+            throw new Error(`the first publication was refused: ${JSON.stringify(original)}`);
+        }
+
+        const [before] = await generatedPlans();
+        const preferences = await prisma.meal_plan_preferences.findUniqueOrThrow({
+            where: { user_id: GENERATION_USER_ID },
+            select: { revision: true },
+        });
+        const { revision: targetsRevision } = await getTargets(GENERATION_USER_ID);
+        const regenerationKey = '66666666-6666-4666-8666-666666666666';
+
+        const refused = await withFault('generation', async ({ regeneratePlan: faulted }) =>
+            faulted(
+                GENERATION_USER_ID,
+                before.id,
+                {
+                    idempotencyKey: regenerationKey,
+                    expectedPlanRevision: before.revision,
+                    expectedPreferencesRevision: preferences.revision,
+                    expectedTargetsRevision: targetsRevision,
+                },
+                NOW,
+            ).then(
+                () => null,
+                (error: unknown) => error,
+            ),
+        );
+
+        expect(refused).toBeInstanceOf(Error);
+        expect((refused as Error).name).toBe('PlanGenerationError');
+
+        // Still exactly one plan, still the original, still writable.
+        const after = await generatedPlans();
+
+        expect(after).toHaveLength(1);
+        expect(after[0].id).toBe(before.id);
+        expect(after[0].status).toBe('active');
+        expect(after[0].revision).toBe(before.revision);
+        expect(after[0].replaced_plan_id).toBeNull();
+        expect(await ledgerRowsFor(GENERATION_USER_ID, regenerationKey)).toHaveLength(0);
+    });
+
+    it('is inert under NODE_ENV=production, where the generation goes through', async () => {
+        // The resolver checks production BEFORE it validates the value, so a
+        // stray switch on a production host can neither fault a generation nor
+        // fail startup. Same guarantee the swap case above pins, asserted for
+        // the entry point this file's other cases fault.
+        const published = await withFault(
+            'generation',
+            async ({ resolvedFault, generatePlan: faulted }) => {
+                expect(resolvedFault).toBe('off');
+
+                return faulted(GENERATION_USER_ID, generateBody(), NOW);
+            },
+            { nodeEnv: 'production' },
+        );
+
+        expect(published.kind).toBe('ok');
+
+        if (published.kind !== 'ok') {
+            throw new Error(`the generation was refused as invalid: ${JSON.stringify(published)}`);
+        }
+
+        expect(published.result.status).toBe(201);
+        expect(await generatedPlans()).toHaveLength(1);
+        expect(await ledgerRowsFor(GENERATION_USER_ID, GENERATION_KEY)).toHaveLength(1);
     });
 
     it('leaves no plan and no ledger row when a generation fails before its transaction, and then publishes exactly one', async () => {

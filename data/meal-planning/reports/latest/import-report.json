@@ -60,5 +60,700 @@
     "missing_core_nutrient": 74,
     "nutrient_negative": 10
   },
-  "note": "publication_status is candidate or quarantined here by design: catalog:validate is the stage that publishes."
+  "note": "publication_status is candidate or quarantined here by design: catalog:validate is the stage that publishes.",
+  "reportVersion": "v1",
+  "catalogRelease": "v1",
+  "aggregatedAt": "2026-09-15T04:16:12.000Z",
+  "producedBy": {
+    "stageFieldsCommand": "npm run catalog:import",
+    "stageFieldsScript": "scripts/catalog-import-usda.ts",
+    "stageFields": [
+      "stage",
+      "generatedAt",
+      "runId",
+      "usdaManifestVersion",
+      "coveragePlanVersion",
+      "planFingerprint",
+      "options",
+      "plannedBatches",
+      "processedBatches",
+      "counts",
+      "byCategory",
+      "failedChecks",
+      "note"
+    ],
+    "aggregateFieldsDerivedFrom": [
+      "data/meal-planning/coverage-plan.v1.json",
+      "data/meal-planning/usda-manifest.v1.json",
+      "data/meal-planning/catalog/releases/v1/manifest.json",
+      "data/meal-planning/catalog/releases/v1/foods.jsonl",
+      "data/meal-planning/catalog/releases/v1/validation-records.jsonl",
+      "data/meal-planning/reports/latest/validation-report.json"
+    ],
+    "regenerability": "A rerun of npm run catalog:import rewrites the stage fields above from its own counters. The aggregate fields are re-derivable by anyone from the committed artefacts in aggregateFieldsDerivedFrom, whose checksums the release manifest records; no value here is an operator judgement. npm run catalog:report writes its own artefact, validation-report.json, and does not own this file.",
+    "aggregatedRunKinds": [
+      {
+        "kind": "catalog-import-usda",
+        "ran": true,
+        "runId": "914bb617-3af0-4bd1-a56e-7343120a27c4",
+        "generatedAt": "2026-09-13T11:36:49.175Z"
+      },
+      {
+        "kind": "catalog-validate",
+        "ran": true,
+        "runId": "6b5602c3-7ed2-4f42-abfc-347b30f1c5dd",
+        "generatedAt": "2026-09-13T11:36:52.694Z"
+      },
+      {
+        "kind": "catalog-release",
+        "ran": true,
+        "runId": null,
+        "generatedAt": "2026-09-13T11:37:28.970Z"
+      },
+      {
+        "kind": "catalog-generate-ai",
+        "ran": false,
+        "runId": null,
+        "generatedAt": null,
+        "reason": "No generation run exists for this catalog. Four independent measurements agree: the release manifest states null for every model_versions field, 0 of the published foods carry a generation_batch_key, identity_source is usda on every published food, and llm_review is null on every validation record. Every aiCandidates figure below is therefore a planned volume that was never generated, which is where the per-category shortfall comes from."
+      }
+    ]
+  },
+  "requirement": {
+    "requiredPublishedItems": 10000,
+    "publishedItems": 11046,
+    "requirementMet": true,
+    "surplusAgainstRequirement": 1046,
+    "publishedTargetTotal": 11010,
+    "surplusAgainstPublishedTargetTotal": 36,
+    "perCategoryShortfallTotal": 2344,
+    "categoriesBelowTarget": 12,
+    "categoriesAtOrAboveTarget": 9,
+    "verdict": "The 10,000-item requirement is met: 11,046 published items exceed it by 1,046, and exceed the 11,010 per-category target sum by 36. That aggregate pass does not clear the per-category plan — 12 of 21 categories are below their publishedTarget by 2,344 items in total, listed exactly in coverageGaps. Both statements are true at once because the categories that over-deliver (protein_meat by 1,518, produce_vegetable by 224, bread_bakery by 305) cannot substitute for the ones that under-deliver, and recipe eligibility draws on specific categories. The shortfall is reported as an unmet per-category requirement, not smoothed against the surplus."
+  },
+  "categoriesLegend": {
+    "publishedTarget": "The category's publishedTarget in coverage-plan.v1.json. The 21 targets sum to 11,010.",
+    "candidateVolume": "The category's candidateVolume in coverage-plan.v1.json, ceil(1.25 x publishedTarget). The 21 volumes sum to 13,765.",
+    "candidates": "Candidates attempted for the category, measured by the import stage and equal to its byCategory entry. It is also the usdaCandidatesImported term of the coverage plan's aiCandidateFormula, because no generation run exists for this catalog, so every candidate in every category came from the USDA import.",
+    "aiCandidates": "max(0, candidateVolume - candidates), the coverage plan's aiCandidateFormula. A planned volume that was never generated, not a count of anything that happened.",
+    "batches": "ceil(aiCandidates / batchSize) at batchSize 25, the tail batch holding the remainder. Planned, addressed by batchKey; see modelSpend.",
+    "batchesExecuted": "Measured. Zero in every category: no generation batch ran.",
+    "published": "Measured from catalog/releases/v1/foods.jsonl, and equal to the release manifest and validation report figures for all 21 categories.",
+    "quarantined": "Null in every row, and unmeasured rather than zero: neither stage report breaks quarantine down by category. The measured totals are in the quarantined block (181 overall, 74 at import and 107 at validate); see measurementGaps.",
+    "shortfall": "max(0, publishedTarget - published), exact and never rounded. The 21 values sum to 2,344."
+  },
+  "categories": [
+    {
+      "category": "produce_vegetable",
+      "publishedTarget": 1200,
+      "candidateVolume": 1500,
+      "candidates": 1474,
+      "aiCandidates": 26,
+      "batches": 2,
+      "batchesExecuted": 0,
+      "published": 1424,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "produce_fruit",
+      "publishedTarget": 700,
+      "candidateVolume": 875,
+      "candidates": 758,
+      "aiCandidates": 117,
+      "batches": 5,
+      "batchesExecuted": 0,
+      "published": 730,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "protein_meat",
+      "publishedTarget": 700,
+      "candidateVolume": 875,
+      "candidates": 2240,
+      "aiCandidates": 0,
+      "batches": 0,
+      "batchesExecuted": 0,
+      "published": 2218,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "protein_poultry",
+      "publishedTarget": 400,
+      "candidateVolume": 500,
+      "candidates": 507,
+      "aiCandidates": 0,
+      "batches": 0,
+      "batchesExecuted": 0,
+      "published": 499,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "protein_seafood",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "candidates": 564,
+      "aiCandidates": 186,
+      "batches": 8,
+      "batchesExecuted": 0,
+      "published": 558,
+      "quarantined": null,
+      "shortfall": 42
+    },
+    {
+      "category": "protein_egg",
+      "publishedTarget": 60,
+      "candidateVolume": 75,
+      "candidates": 63,
+      "aiCandidates": 12,
+      "batches": 1,
+      "batchesExecuted": 0,
+      "published": 58,
+      "quarantined": null,
+      "shortfall": 2
+    },
+    {
+      "category": "protein_plant",
+      "publishedTarget": 350,
+      "candidateVolume": 438,
+      "candidates": 38,
+      "aiCandidates": 400,
+      "batches": 16,
+      "batchesExecuted": 0,
+      "published": 38,
+      "quarantined": null,
+      "shortfall": 312
+    },
+    {
+      "category": "dairy",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "candidates": 387,
+      "aiCandidates": 363,
+      "batches": 15,
+      "batchesExecuted": 0,
+      "published": 371,
+      "quarantined": null,
+      "shortfall": 229
+    },
+    {
+      "category": "dairy_alternative",
+      "publishedTarget": 250,
+      "candidateVolume": 313,
+      "candidates": 52,
+      "aiCandidates": 261,
+      "batches": 11,
+      "batchesExecuted": 0,
+      "published": 52,
+      "quarantined": null,
+      "shortfall": 198
+    },
+    {
+      "category": "grain",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "candidates": 542,
+      "aiCandidates": 208,
+      "batches": 9,
+      "batchesExecuted": 0,
+      "published": 537,
+      "quarantined": null,
+      "shortfall": 63
+    },
+    {
+      "category": "bread_bakery",
+      "publishedTarget": 500,
+      "candidateVolume": 625,
+      "candidates": 816,
+      "aiCandidates": 0,
+      "batches": 0,
+      "batchesExecuted": 0,
+      "published": 805,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "legume",
+      "publishedTarget": 250,
+      "candidateVolume": 313,
+      "candidates": 320,
+      "aiCandidates": 0,
+      "batches": 0,
+      "batchesExecuted": 0,
+      "published": 297,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "nut_seed",
+      "publishedTarget": 350,
+      "candidateVolume": 438,
+      "candidates": 297,
+      "aiCandidates": 141,
+      "batches": 6,
+      "batchesExecuted": 0,
+      "published": 293,
+      "quarantined": null,
+      "shortfall": 57
+    },
+    {
+      "category": "oil_fat",
+      "publishedTarget": 150,
+      "candidateVolume": 188,
+      "candidates": 166,
+      "aiCandidates": 22,
+      "batches": 1,
+      "batchesExecuted": 0,
+      "published": 152,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "condiment_sauce",
+      "publishedTarget": 700,
+      "candidateVolume": 875,
+      "candidates": 201,
+      "aiCandidates": 674,
+      "batches": 27,
+      "batchesExecuted": 0,
+      "published": 198,
+      "quarantined": null,
+      "shortfall": 502
+    },
+    {
+      "category": "spice_herb",
+      "publishedTarget": 300,
+      "candidateVolume": 375,
+      "candidates": 54,
+      "aiCandidates": 321,
+      "batches": 13,
+      "batchesExecuted": 0,
+      "published": 49,
+      "quarantined": null,
+      "shortfall": 251
+    },
+    {
+      "category": "beverage",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "candidates": 542,
+      "aiCandidates": 208,
+      "batches": 9,
+      "batchesExecuted": 0,
+      "published": 432,
+      "quarantined": null,
+      "shortfall": 168
+    },
+    {
+      "category": "snack",
+      "publishedTarget": 600,
+      "candidateVolume": 750,
+      "candidates": 233,
+      "aiCandidates": 517,
+      "batches": 21,
+      "batchesExecuted": 0,
+      "published": 233,
+      "quarantined": null,
+      "shortfall": 367
+    },
+    {
+      "category": "sweet",
+      "publishedTarget": 500,
+      "candidateVolume": 625,
+      "candidates": 565,
+      "aiCandidates": 60,
+      "batches": 3,
+      "batchesExecuted": 0,
+      "published": 556,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "prepared_meal",
+      "publishedTarget": 1400,
+      "candidateVolume": 1750,
+      "candidates": 1504,
+      "aiCandidates": 246,
+      "batches": 10,
+      "batchesExecuted": 0,
+      "published": 1499,
+      "quarantined": null,
+      "shortfall": 0
+    },
+    {
+      "category": "other",
+      "publishedTarget": 200,
+      "candidateVolume": 250,
+      "candidates": 929,
+      "aiCandidates": 0,
+      "batches": 0,
+      "batchesExecuted": 0,
+      "published": 47,
+      "quarantined": null,
+      "shortfall": 153
+    }
+  ],
+  "coverageGaps": [
+    {
+      "category": "protein_seafood",
+      "publishedTarget": 600,
+      "published": 558,
+      "shortfall": 42,
+      "aiCandidates": 186,
+      "batchesPlanned": 8,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "protein_egg",
+      "publishedTarget": 60,
+      "published": 58,
+      "shortfall": 2,
+      "aiCandidates": 12,
+      "batchesPlanned": 1,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "protein_plant",
+      "publishedTarget": 350,
+      "published": 38,
+      "shortfall": 312,
+      "aiCandidates": 400,
+      "batchesPlanned": 16,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "dairy",
+      "publishedTarget": 600,
+      "published": 371,
+      "shortfall": 229,
+      "aiCandidates": 363,
+      "batchesPlanned": 15,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "dairy_alternative",
+      "publishedTarget": 250,
+      "published": 52,
+      "shortfall": 198,
+      "aiCandidates": 261,
+      "batchesPlanned": 11,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "grain",
+      "publishedTarget": 600,
+      "published": 537,
+      "shortfall": 63,
+      "aiCandidates": 208,
+      "batchesPlanned": 9,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "nut_seed",
+      "publishedTarget": 350,
+      "published": 293,
+      "shortfall": 57,
+      "aiCandidates": 141,
+      "batchesPlanned": 6,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "condiment_sauce",
+      "publishedTarget": 700,
+      "published": 198,
+      "shortfall": 502,
+      "aiCandidates": 674,
+      "batchesPlanned": 27,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "spice_herb",
+      "publishedTarget": 300,
+      "published": 49,
+      "shortfall": 251,
+      "aiCandidates": 321,
+      "batchesPlanned": 13,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "beverage",
+      "publishedTarget": 600,
+      "published": 432,
+      "shortfall": 168,
+      "aiCandidates": 208,
+      "batchesPlanned": 9,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "snack",
+      "publishedTarget": 600,
+      "published": 233,
+      "shortfall": 367,
+      "aiCandidates": 517,
+      "batchesPlanned": 21,
+      "batchesExecuted": 0
+    },
+    {
+      "category": "other",
+      "publishedTarget": 200,
+      "published": 47,
+      "shortfall": 153,
+      "aiCandidates": 0,
+      "batchesPlanned": 0,
+      "batchesExecuted": 0
+    }
+  ],
+  "countsByIdentitySource": {
+    "usda": 11046,
+    "ai_generated": 0,
+    "measuredFrom": "catalog/releases/v1/foods.jsonl identity_source"
+  },
+  "countsByNutritionProvenance": {
+    "source_backed": 11046,
+    "ingredient_derived": 0,
+    "ai_estimated": 0,
+    "measuredFrom": "catalog/releases/v1/foods.jsonl nutrition_provenance",
+    "note": "Every published item states nutrition per 100 g from a USDA record, so the whole catalog is source_backed and recipe eligibility, which admits source_backed ingredients only, is not constrained by provenance in this release. published_ingredient_derived is 0 in the release manifest and components.jsonl holds 0 rows, which agrees."
+  },
+  "usdaDataTypes": {
+    "Foundation": 231,
+    "SR Legacy": 6246,
+    "Survey (FNDDS)": 4569,
+    "Branded": 0,
+    "measuredFrom": "catalog/releases/v1/foods.jsonl usda_data_type",
+    "brandedZeroReason": "Branded is absent by policy, not by accident. usda-manifest.v1.json brandedDataTypePolicy states that no dataset sweep enumerates Branded and no manifest entry selects it, so a manufacturer identity enters the catalog only through a reviewed curated entry. The running API keeps its own live branded search, which this catalog does not replace."
+  },
+  "duplicatesRemoved": {
+    "duplicateIdentitiesDetectedAtValidate": 117,
+    "aliasesMerged": 2,
+    "aliasRecordsRestated": 2,
+    "quarantinedDuplicateIdentity": 107,
+    "skippedCuratedIdentityAtImport": 8,
+    "skippedDuplicateInPlanAtImport": 0,
+    "unattributedDifference": 10,
+    "note": "duplicateIdentitiesDetectedAtValidate counts the source keys that lost the identity dedupe (scripts/catalog-validate.ts, dedupe.duplicateSourceKeys.length); quarantinedDuplicateIdentity counts the candidates whose disposition became quarantined for it. Neither stage report decomposes the difference between the two, so it is stated as unattributedDifference rather than explained. skippedCuratedIdentityAtImport is a different mechanism at a different stage — a swept record colliding with a reviewed curated identity is never inserted, so it never reaches the validator dedupe set — and is reported here only so the two are not mistaken for each other."
+  },
+  "failuresByCheck": {
+    "checkNameVocabulary": "src/services/catalog.logic.ts CATALOG_CHECK_NAMES, with tiers in CHECK_TIERS; coverage-plan.v1.json quarantineChecks owns the quarantine subset",
+    "importStage": {
+      "reject": {
+        "kcal_ceiling": 9,
+        "energy_macro_mismatch": 176,
+        "nutrient_negative": 10
+      },
+      "quarantine": {
+        "missing_core_nutrient": 74
+      },
+      "review": {
+        "out_of_category_range": 1276,
+        "allergens_unknown": 12128
+      }
+    },
+    "validateStage": {
+      "reject": {},
+      "quarantine": {
+        "duplicate_identity": 107
+      },
+      "review": {
+        "out_of_category_range": 1223,
+        "allergens_unknown": 11859
+      }
+    },
+    "note": "Counts are kept per stage because the two stages check overlapping row sets — validate reconsiders the 11,983 candidates the import produced — so adding the two review-tier figures would double count. A review-tier flag on a USDA-sourced record is recorded and published, which is why allergens_unknown is the largest count here and no items are lost to it."
+  },
+  "quarantined": {
+    "total": 181,
+    "atImport": 74,
+    "atValidate": 107,
+    "byCheck": {
+      "missing_core_nutrient": 74,
+      "duplicate_identity": 107
+    },
+    "countsTowardPublishedTarget": false,
+    "identities": null,
+    "identitiesUnavailableReason": "The release carries published rows only — foods.jsonl and validation-records.jsonl hold 11,046 rows each, all publication_status published and outcome accepted — so the quarantined identities exist in catalog_foods and catalog_validation_records but in no committed artefact. The per-check counts above are measured; the identity list is available from the database the run wrote, by publication_status.",
+    "note": "A quarantined record is never published with an invented value. missing_core_nutrient means calories, protein, carbohydrate or fat is unknown, and a per-serving-only record whose serving carries no sourced gram weight is held as missing_gram_weight rather than published on a fabricated weight — which is why quarantined rows do not count toward the target and the shortfall stays truthful."
+  },
+  "usdaRequests": {
+    "fieldContract": "scripts/lib/rateLimiter.ts UsdaRequestStats is the field contract for this block, and it records that catalog-import-usda.ts is to write it here verbatim. The import stage in this checkout does not yet emit it, so the counters below are recorded as unmeasured with their reason instead of being estimated.",
+    "accountingBasis": "Attempt-based, not logical-call-based. src/services/usda.service.ts retries up to MAX_ATTEMPTS = 4 physical fetches per logical call and deliberately retries 400 alongside 408, 429 and 5xx, because USDA intermittently answers 400 to a request that succeeds when retried verbatim (about 1 in 5 observed). One logical call can therefore cost up to four tokens, and the limiter counts physical attempts. Counting logical calls would understate consumption against the vendor cap.",
+    "configuredPerHour": 900,
+    "vendorCapPerHour": 1000,
+    "burstCapacity": 20,
+    "burstCapacityBasis": "min(configuredPerHour, DEFAULT_BURST_CAPACITY) from scripts/lib/rateLimiter.ts, which is one USDA detail batch back-to-back. There is no environment override for it, so this is the value the run used.",
+    "headroomPerHour": 100,
+    "headroomReason": "Leaves 100 requests an hour on the same key for the running API's estimate, label-scan and branded-search traffic.",
+    "rateLimitEnvVar": "USDA_IMPORT_RATE_LIMIT_PER_HOUR",
+    "maxPhysicalAttemptsPerRequest": 4,
+    "retriedStatuses": [
+      400,
+      429,
+      500,
+      502,
+      503,
+      504
+    ],
+    "retriedStatusesNote": "The manifest value above is what the import ran under. src/services/usda.service.ts now also retries 408 (RETRYABLE_STATUSES is {400, 408, 429} plus any status at or above 500), so the service predicate is one status wider than the manifest enumerates. Recorded rather than reconciled: it changes how many tokens a logical call can cost.",
+    "detailBatchSize": 20,
+    "maxListPageSize": 200,
+    "limiterCountsPhysicalAttempts": true,
+    "minimumPhysicalAttempts": 615,
+    "minimumPhysicalAttemptsBasis": "A lower bound, not a count: each of the processedBatches detail batches issues at least one physical request, so the run made at least that many. The true figure is higher by every retry and every /foods/list page the dataset sweeps walked.",
+    "attempts": null,
+    "pauses": null,
+    "totalPausedMs": null,
+    "longestPauseMs": null,
+    "firstAttemptAt": null,
+    "lastAttemptAt": null,
+    "attemptsInWindow": null,
+    "ledgerKind": null,
+    "ledgerScope": null,
+    "statusClassCounts": null,
+    "unmeasuredReason": "attempts, pauses, totalPausedMs, longestPauseMs, firstAttemptAt, lastAttemptAt, attemptsInWindow, ledgerKind, ledgerScope and statusClassCounts were not recorded by the run that produced this report: the limiter maintains them, but the import stage report has no usdaRequests block to write them into. They are null because they were not measured — not zero, not suppressed. A rerun of an import stage that writes the block populates them, and the pause counters matter because the import pauses rather than fails when the bucket empties."
+  },
+  "modelSpend": {
+    "meteringOrder": "Reserve before spending. src/services/entitlement.service.ts records the rule for the request-time AI endpoints — consumption is counted before the call, because a failed call still spends — and scripts/lib/budget.ts applies the same order at operator scope for the catalog scripts, reserving one call in catalog_generation_batches before each paid call. A positive reservedMinusUsed is therefore the audit trail of calls that were paid for and failed, and is shown rather than reconciled away.",
+    "scope": "catalog_generation_batches, operator scope. The offline catalog scripts run with no user, so they are not metered by the per-user ai_usage table, and meal planning makes no request-time model call at all.",
+    "budgetEnvVar": "CATALOG_MODEL_CALL_BUDGET",
+    "budgetLimit": 1500,
+    "batchSizeEnvVar": "CATALOG_BATCH_SIZE",
+    "batchSize": 25,
+    "modelCallsPerBatch": 2,
+    "generationModel": "google/gemini-2.5-flash",
+    "generationModelEnvVar": "CATALOG_GENERATION_MODEL",
+    "generationModelFallbackEnvVar": "OPENROUTER_MODEL",
+    "reviewModel": "openai/gpt-4o-mini",
+    "reviewModelEnvVar": "CATALOG_REVIEW_MODEL",
+    "reviewModelFallbackEnvVar": "ESTIMATE_JUDGE_MODEL",
+    "generationPromptVersion": "catalog-generation-2026-09-08",
+    "reviewPromptVersion": "catalog-review-2026-09-08",
+    "modelCallsReserved": 0,
+    "modelCallsUsed": 0,
+    "reservedMinusUsed": 0,
+    "tokensUsed": 0,
+    "budgetRemaining": 1500,
+    "budgetExhausted": false,
+    "stoppedAtBatchKey": null,
+    "perBatchKey": [],
+    "batchKeyFormat": "<coveragePlanVersion>:<category>:<batchIndex>",
+    "batchIndexPadWidth": 4,
+    "batchesPlanned": 157,
+    "batchesExecuted": 0,
+    "modelCallsPlannedIfGenerated": 314,
+    "note": "A measured zero, not an unmeasured one, and the reason the aggregate is honest: no paid call was made anywhere in this catalog. No generation batch ran, so perBatchKey is empty and batchesExecuted is 0; the validation stage made no advisory review call either, because every row is a USDA record whose disposition the deterministic checks settle and an advisory review never promotes a value. tokensUsed is 0 by construction — no call, no tokens. batchesPlanned and modelCallsPlannedIfGenerated are the plan arithmetic for the ungenerated half (ceil(aiCandidates / batchSize) per category, two calls each) and would have fitted inside the budget; they are planned volumes, never spend."
+  },
+  "dataProvenance": {
+    "usdaPublicDomain": true,
+    "legalBasisForCommitting": "USDA FoodData Central is public domain with no retention restrictions, which is what makes committing these identity and nutrient aggregates, and snapshotting per-100 g values into a release, legal. The determination is recorded in the repository in two places, cited below, and was checked before the storage model was designed.",
+    "citations": [
+      {
+        "path": "src/services/usda.service.ts",
+        "lines": "5-6",
+        "anchor": "USDA FoodData Central (public domain — no retention restrictions, so the snapshot-at-log-time model is fully legal for this data source)."
+      },
+      {
+        "path": "prisma/schema.prisma",
+        "lines": "299-301",
+        "anchor": "Raw USDA responses keyed by normalized request (path + params). USDA data is public domain with no retention restrictions"
+      }
+    ],
+    "citationNote": "Line numbers are as of backend commit 59b5732; the anchor text is quoted so the citation survives the lines moving.",
+    "sourceDatasets": [
+      {
+        "name": "Foundation",
+        "version": "Foundation 2026-04",
+        "retrievedAt": "2026-09-13T11:35:18.625Z",
+        "publicDomain": true
+      },
+      {
+        "name": "SR Legacy",
+        "version": "SR Legacy 2019-04",
+        "retrievedAt": "2026-09-13T11:36:16.185Z",
+        "publicDomain": true
+      },
+      {
+        "name": "Survey (FNDDS)",
+        "version": "Survey (FNDDS) 2024-10",
+        "retrievedAt": "2026-09-13T11:36:49.111Z",
+        "publicDomain": true
+      }
+    ],
+    "otherProvidersPresent": false,
+    "aiGeneratedContentPresent": false,
+    "aiGenerationPolicy": "Generation proposes generic preparations only and never a branded product, and a candidate whose name matches a brand pattern is rejected at parse time. No generation ran for this catalog, so no generated content is present to label.",
+    "userOwnedDataPresent": false,
+    "userOwnedDataNote": "This report aggregates shared catalog reference data only. It carries no user identifier, no contact detail and no diary, plan or grocery content, which is part of what makes it safe to commit."
+  },
+  "siblingReconciliation": {
+    "validationReport": {
+      "path": "data/meal-planning/reports/latest/validation-report.json",
+      "runId": "6b5602c3-7ed2-4f42-abfc-347b30f1c5dd",
+      "publishedAgrees": true,
+      "shortfallTotalAgrees": true,
+      "perCategoryAgrees": true,
+      "quarantinedThere": 107,
+      "quarantinedHere": 181,
+      "quarantinedReconciliation": "The two figures are different measurements and both are stated: the validation report counts the 107 candidates its own pass quarantined, while quarantined.total here is 181, the whole catalog figure, adding the 74 the import stage had already quarantined for missing_core_nutrient. 107 + 74 = 181, and neither number is adjusted to match the other. Each check name appears in exactly one stage, so nothing is double counted.",
+      "modelCallsAgrees": true
+    },
+    "releaseManifest": {
+      "path": "data/meal-planning/catalog/releases/v1/manifest.json",
+      "releaseId": "v1",
+      "publishedFoodsThere": 11046,
+      "publishedFoodsHere": 11046,
+      "publishedAgrees": true,
+      "publishedTargetTotalAgrees": true,
+      "shortfallTotalAgrees": true,
+      "perCategoryAgrees": true,
+      "rowCounts": [
+        {
+          "name": "foods.jsonl",
+          "rowCount": 11046
+        },
+        {
+          "name": "aliases.jsonl",
+          "rowCount": 15939
+        },
+        {
+          "name": "portions.jsonl",
+          "rowCount": 31899
+        },
+        {
+          "name": "components.jsonl",
+          "rowCount": 0
+        },
+        {
+          "name": "validation-records.jsonl",
+          "rowCount": 11046
+        }
+      ],
+      "note": "Every per-category published and shortfall figure in this report was compared against both the release manifest coverage block and the validation report while this document was generated, and all 21 categories agree in all three places. No disagreement was found, so none is reported."
+    },
+    "benchmarkReport": {
+      "path": "data/meal-planning/reports/latest/benchmark-report.json",
+      "present": false,
+      "note": "Search relevance, pagination and latency are that artefact of npm run search:benchmark, not this one. Its absence is not a finding about this import."
+    },
+    "recipeCountsExcluded": "Deliberately absent. This report is scoped to catalog data; the recipe count and the diet, allergen, slot and time coverage matrix are evidenced by data/meal-planning/recipes/coverage-report.json and GET /api/catalog/status. Restating them here would create a second source of truth."
+  },
+  "measurementGaps": [
+    {
+      "field": "categories[].quarantined",
+      "value": null,
+      "reason": "Neither stage report breaks quarantine down by category: the import report states 74 in total and the validation report 107, each with the failing check but not the category. The release carries published rows only, so the split is not recoverable from any committed artefact. The measured totals are in quarantined.total, atImport and atValidate."
+    },
+    {
+      "field": "usdaRequests physical attempt and pause counters",
+      "value": null,
+      "reason": "Not recorded by the run: the limiter maintains them but the import stage report has no usdaRequests block to write them into. usdaRequests.minimumPhysicalAttempts states the derived lower bound instead, and usdaRequests.unmeasuredReason names every null field."
+    },
+    {
+      "field": "modelSpend.tokensUsed",
+      "value": 0,
+      "reason": "Derived, not metered: no model call was made in any stage, so no tokens were spent. Listed here so the 0 is not read as a missing measurement."
+    }
+  ]
 }

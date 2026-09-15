@@ -19,7 +19,8 @@
             "food_source_key": "On recipe_ingredients: the catalog food stable source_key. catalog_food_id is the real column.",
             "resolved_catalog_facts": "On recipe_ingredients: the catalog_foods facts recipe_ingredients does NOT snapshot, which the seed holds from the row it resolved and which RecipePublicationIngredient in src/services/recipe.logic.ts requires - allergen_status and cost_class are required there, and food_group, nutrition_basis and density_g_per_ml are the optional extras the planner and the volume-basis conversion need. publication_status is carried too so a consumer can see that the retired food is retired without loading the catalog fixture. Grouped under one key rather than spread flat so the boundary between real columns and resolved facts stays unambiguous.",
             "derived_reference": "On recipe_versions: three derived values with no column - per_serving_fiber_g (null when ANY ingredient fibre is unknown; recipe_versions stores only the four macros), cost_score (the mass-weighted 1-3 score budget_tier is cut from) and calorie_divergence (the ratio sourced_calories_note is written from). Recorded so the fibre-unknown, tier-boundary and 5% divergence rules can be asserted as numbers rather than parsed out of prose."
-        }
+        },
+        "non_loadable_arrays": "insert_order names the three arrays a loader inserts, and declaration_negative_cases is deliberately NOT one of them. It holds a version whose declared columns contradict its ingredients, so it is kept out of recipe_versions to keep this file loadable and its eligible-recipe counts stable."
     },
     "insert_order": [
         "recipes",
@@ -30,17 +31,19 @@
         "everything_is_derived": "A recipe file declares nothing the derivation owns. total_minutes = prep_minutes + cook_minutes; allergen_tags is the UNION of the ingredient snapshots and diet_tags their INTERSECTION closed under vegan -> vegetarian -> pescatarian; allergen_status is known only when every ingredient is reviewed; nutrition_provenance is the WEAKEST ingredient provenance; badges are earned from the ingredient set and the derived nutrition; budget_tier is cut from the mass-weighted cost score. Every value in this file was produced that way and then re-checked by validateRecipeDeclaration, so no row can talk its way into a badge or an understated allergen list.",
         "optional_is_still_in_the_dish": "An optional ingredient counts for the allergen union, for the diet intersection and for the nutrition totals. roasted-carrot-and-lentil-salad exists to pin that: its optional Greek yogurt is what puts milk into the allergen list and what takes vegan out of the diet list.",
         "two_versions_one_current": "lemon-herb-chicken-and-rice holds both versions. Exactly one is current, which the partial unique index unique_current_recipe_version enforces and recipes.current_version_id points at; the retired one stays readable so a historical plan or diary link still resolves.",
-        "staleness_is_a_pointer_comparison": "recipe_ingredients.catalog_nutrition_version is a POINTER, and snapshot_per_100g is the frozen copy the per-serving numbers were derived from. herbed-yogurt-and-kale-dip-plate points at version 1 of a food now at version 2, so a refresh detects the difference and publishes a NEW version rather than rewriting this one - which is precisely why a catalog refresh can never change an existing recipe_versions row.",
+        "staleness_is_a_pointer_comparison": "recipe_ingredients.catalog_nutrition_version and catalog_metadata_version are POINTERS, and snapshot_per_100g/snapshot_name are the frozen copies the per-serving numbers and the displayed name were taken from. usda:9200115 has moved on in BOTH counters, so the four rows that reference it cover all three states isIngredientSnapshotStale distinguishes plus the ordinary one: herbed-yogurt-and-kale-dip-plate is stale in both (superseded numbers AND superseded name - the proof that a historical read never joins to the live row), yogurt-egg-white-crispbread-plate is nutrition-stale with current metadata, cracker-and-yogurt-snack-plate is metadata-stale with current nutrition, and roasted-carrot-and-lentil-salad is current in both. The comparison is inequality rather than greater-than, so no chronological reading of the two counters is implied; a refresh publishes a NEW recipe version rather than rewriting any of these.",
         "planning_admits_three_facts": "A version is plannable only when it is current, source_backed and allergen-known. Three of the ten versions here fail exactly one of those on purpose: roasted-carrot-and-lentil-salad is ai_estimated, lemon-dressed-spinach-salad is ingredient_derived, and cracker-and-yogurt-snack-plate has an unreviewed ingredient. The retired version fails the first.",
-        "fibre_propagates_unknown": "soy-glazed-chicken-and-rice-bowl has a null per-serving fibre because soy sauce states none. A sum missing a term is not a smaller sum, and 0 would claim a fibre content no source stated."
+        "fibre_propagates_unknown": "soy-glazed-chicken-and-rice-bowl has a null per-serving fibre because soy sauce states none. A sum missing a term is not a smaller sum, and 0 would claim a fibre content no source stated.",
+        "badge_boundaries_are_pinned_on_both_sides": "Every numeric badge cut has a row on each side of it, because an inclusive comparison written exclusively is the bug a fixture of comfortable middle values cannot catch. high_protein (>= 30 % of energy from protein): herb-chicken-rice-and-kale-bowl sits at exactly 30 % and earns it, yogurt-egg-white-crispbread-plate at 29.85 % does not. quick (total_minutes <= 15): herbed-yogurt-and-kale-dip-plate sits at exactly 15 and earns it, yogurt-egg-white-crispbread-plate at 16 does not. The cooking-time filter (total_minutes <= cooking_time_limit_min) has rows on each of the four offered limits - 15, 30, 45 and 60 - plus roasted-carrot-and-lentil-salad at 70, above them all. The 5 % sourced-calorie cut is pinned by lemon-dressed-spinach-salad at 8.02 % with a note against every other version under 5 % with none."
     },
     "counts": {
-        "recipes": 9,
-        "recipe_versions": 10,
-        "recipe_ingredients": 42,
-        "current_versions": 9,
+        "recipes": 11,
+        "recipe_versions": 12,
+        "recipe_ingredients": 51,
+        "current_versions": 11,
         "retired_versions": 1,
-        "plannable_versions": 6
+        "plannable_versions": 8,
+        "declaration_negative_cases": 1
     },
     "recipes": [
         {
@@ -105,6 +108,20 @@
             "current_version_id": "d2000000-0000-4000-8000-00000000000a",
             "created_at": "2026-09-10T12:00:00.000Z",
             "note": "the budget-tier-3 recipe and the only pescatarian-without-vegetarian diet set, from the salmon."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-00000000000a",
+            "slug": "herb-chicken-rice-and-kale-bowl",
+            "current_version_id": "d2000000-0000-4000-8000-00000000000b",
+            "created_at": "2026-09-12T12:00:00.000Z",
+            "note": "the high-protein boundary recipe: its protein supplies exactly 30 % of its energy, the inclusive edge of HIGH_PROTEIN_MIN_ENERGY_SHARE."
+        },
+        {
+            "id": "d1000000-0000-4000-8000-00000000000b",
+            "slug": "yogurt-egg-white-crispbread-plate",
+            "current_version_id": "d2000000-0000-4000-8000-00000000000c",
+            "created_at": "2026-09-11T12:00:00.000Z",
+            "note": "the negative half of two badge boundaries at once: protein is 29.85 % of energy (just under the high_protein cut) and total_minutes is 16 (just over the quick cut), so it earns NO badge at all."
         }
     ],
     "recipe_versions": [
@@ -373,9 +390,9 @@
             ],
             "yield_servings": 2,
             "serving_description": "1 small plate",
-            "prep_minutes": 10,
+            "prep_minutes": 15,
             "cook_minutes": 0,
-            "total_minutes": 10,
+            "total_minutes": 15,
             "meal_slots": [
                 "snack"
             ],
@@ -408,7 +425,7 @@
                 "cost_score": 2,
                 "calorie_divergence": 0.0334407218317328
             },
-            "note": "Still published and still plannable: staleness is a pointer comparison a refresh makes, never a validation failure, so this version keeps serving until the refresh republishes it."
+            "note": "Still published and still plannable: staleness is a pointer comparison a refresh makes, never a validation failure, so this version keeps serving until the refresh republishes it. Its total_minutes is exactly 15, the quick badge ceiling: QUICK_MAX_TOTAL_MINUTES is compared with <=, so this row earns the badge and pins the inclusive edge."
         },
         {
             "id": "d2000000-0000-4000-8000-000000000007",
@@ -425,9 +442,9 @@
             ],
             "yield_servings": 3,
             "serving_description": "1 bowl",
-            "prep_minutes": 15,
-            "cook_minutes": 25,
-            "total_minutes": 40,
+            "prep_minutes": 20,
+            "cook_minutes": 50,
+            "total_minutes": 70,
             "meal_slots": [
                 "lunch"
             ],
@@ -458,7 +475,7 @@
                 "cost_score": 1.338008415147265,
                 "calorie_divergence": 0.03753461934386615
             },
-            "note": "The only version whose nutrition_provenance is ai_estimated."
+            "note": "The only version whose nutrition_provenance is ai_estimated. Its total_minutes is 70, above every cooking_time_limit_min the product offers (15/30/45/60), so it is the row that pins the time filter's upper side. The long time sits on an ai_estimated version that planning already refuses, so no plannable recipe was spent on the case."
         },
         {
             "id": "d2000000-0000-4000-8000-000000000008",
@@ -608,6 +625,103 @@
                 "calorie_divergence": 0.003942964267454328
             },
             "note": "The cost-class-3 salmon dominates the mass, so the score clears 2.5 and the tier is 3."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-00000000000b",
+            "recipe_id": "d1000000-0000-4000-8000-00000000000a",
+            "recipe_slug": "herb-chicken-rice-and-kale-bowl",
+            "version": 1,
+            "name": "Herb chicken, rice and kale bowl",
+            "description": "Lemon-herb chicken over brown rice with pan-wilted kale.",
+            "icon_key": "bowl",
+            "instructions": [
+                "Simmer the brown rice until tender.",
+                "Sear the chicken breast in the olive oil, then rest and slice it.",
+                "Wilt the curly kale in the same pan and finish it with the lemon juice.",
+                "Divide the rice, kale and chicken between four bowls."
+            ],
+            "yield_servings": 4,
+            "serving_description": "1 bowl",
+            "prep_minutes": 15,
+            "cook_minutes": 45,
+            "total_minutes": 60,
+            "meal_slots": [
+                "dinner"
+            ],
+            "diet_tags": [
+                "gluten_free"
+            ],
+            "allergen_tags": [],
+            "allergen_status": "known",
+            "budget_tier": 2,
+            "badges": [
+                "high_protein",
+                "gluten_free",
+                "dairy_free"
+            ],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 557.55,
+            "per_serving_protein_g": 41.816250000000004,
+            "per_serving_carbs_g": 64.03250000000001,
+            "per_serving_fat_g": 14.5905,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-12T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 4.807499999999999,
+                "cost_score": 1.7355371900826446,
+                "calorie_divergence": 0.005094610348847266
+            },
+            "note": "THE >= BOUNDARY FOR high_protein. Protein supplies EXACTLY 30 % of the energy: 40 x (sum of protein centigram-grams) equals 3 x (the same sum for calories) as integers, so the share is exactly 3/10 rather than 0.2999 or 0.3001, and no float tolerance is doing the work. HIGH_PROTEIN_MIN_ENERGY_SHARE is compared with >=, so the badge IS earned here; herb-chicken-rice-and-kale-bowl and yogurt-egg-white-crispbread-plate (29.85 %) are the pair that pins >= against >. total_minutes is also exactly 60, the largest cooking_time_limit_min the product offers, so the time filter is pinned on its inclusive edge too."
+        },
+        {
+            "id": "d2000000-0000-4000-8000-00000000000c",
+            "recipe_id": "d1000000-0000-4000-8000-00000000000b",
+            "recipe_slug": "yogurt-egg-white-crispbread-plate",
+            "version": 1,
+            "name": "Yogurt, egg white and crispbread plate",
+            "description": "Soft-scrambled egg whites with wilted spinach, yogurt and rye crispbread.",
+            "icon_key": "fork_knife",
+            "instructions": [
+                "Scramble the egg white over a low heat until just set.",
+                "Wilt the spinach alongside it.",
+                "Spoon the Greek yogurt onto the plate and add the rye crispbread."
+            ],
+            "yield_servings": 2,
+            "serving_description": "1 plate",
+            "prep_minutes": 10,
+            "cook_minutes": 6,
+            "total_minutes": 16,
+            "meal_slots": [
+                "breakfast"
+            ],
+            "diet_tags": [
+                "pescatarian",
+                "vegetarian"
+            ],
+            "allergen_tags": [
+                "eggs",
+                "milk"
+            ],
+            "allergen_status": "known",
+            "budget_tier": 2,
+            "badges": [],
+            "nutrition_provenance": "source_backed",
+            "per_serving_calories": 352.95000000000005,
+            "per_serving_protein_g": 26.34,
+            "per_serving_carbs_g": 49.414,
+            "per_serving_fat_g": 5.9559999999999995,
+            "sourced_calories_note": null,
+            "status": "current",
+            "published_at": "2026-09-11T12:00:00.000Z",
+            "retired_at": null,
+            "derived_reference": {
+                "per_serving_fiber_g": 11.25,
+                "cost_score": 1.8,
+                "calorie_divergence": 0.010398073381498679
+            },
+            "note": "THE NEGATIVE SIDE OF TWO BOUNDARIES, one row. Protein supplies 29.85 % of the energy, just under HIGH_PROTEIN_MIN_ENERGY_SHARE, so high_protein is NOT earned - the counterpart to herb-chicken-rice-and-kale-bowl at exactly 30 %. total_minutes is 16, one minute over QUICK_MAX_TOTAL_MINUTES, so quick is NOT earned either - the counterpart to herbed-yogurt-and-kale-dip-plate at exactly 15. gluten_free is withheld because rye crispbread carries no reviewed gluten_free tag, and dairy_free because the yogurt carries milk, so badges is the EMPTY array: the one version here that earns nothing, which is what makes an accidentally-generous derivation visible."
         }
     ],
     "recipe_ingredients": [
@@ -1498,7 +1612,7 @@
                 "fat_g": 0.7,
                 "fiber_g": 0
             },
-            "snapshot_name": "Greek yogurt, plain",
+            "snapshot_name": "Yogurt, Greek, plain, nonfat",
             "snapshot_provenance": "source_backed",
             "snapshot_allergen_tags": [
                 "milk"
@@ -1522,7 +1636,7 @@
                 "density_g_per_ml": null,
                 "publication_status": "published"
             },
-            "note": "STALE by construction: catalog_nutrition_version is 1 and usda:9200115 is now at 2, so snapshot_per_100g holds that food's superseded_nutrition values. The snapshot is what the per-serving numbers were derived from and stays frozen - a catalog refresh publishes a NEW version rather than rewriting this one."
+            "note": "STALE IN BOTH COUNTERS by construction, and the fixture's proof that a historical read never joins to the live catalog row. catalog_nutrition_version is 1 while usda:9200115 is at 2, so snapshot_per_100g holds that food's superseded_nutrition values; catalog_metadata_version is 1 while the food is at 2, so snapshot_name is its superseded_metadata display_name (\"Yogurt, Greek, plain, nonfat\") rather than the current \"Greek yogurt, plain\". Both the name and all four numbers therefore differ from the live row, and the per-serving values were derived from THIS snapshot. A refresh publishes a NEW version rather than rewriting this one."
         },
         {
             "id": "d3000000-0000-4000-8000-000000000019",
@@ -1835,7 +1949,7 @@
             "food_source_key": "usda:9200115",
             "catalog_food_id": "c1000000-0000-4000-8000-00000000000f",
             "catalog_nutrition_version": 2,
-            "catalog_metadata_version": 1,
+            "catalog_metadata_version": 2,
             "snapshot_per_100g": {
                 "calories": 59,
                 "protein_g": 10.19,
@@ -1867,7 +1981,7 @@
                 "density_g_per_ml": null,
                 "publication_status": "published"
             },
-            "note": "OPTIONAL and counted anyway: it contributes its milk allergen to the union and removes vegan from the intersection, and its grams are included in the nutrition totals. Optional is still in the dish, and understating an allergen is the one direction of error that reaches a plate."
+            "note": "OPTIONAL and counted anyway: it contributes its milk allergen to the union and removes vegan from the intersection, and its grams are included in the nutrition totals. Optional is still in the dish, and understating an allergen is the one direction of error that reaches a plate. Both of its catalog pointers are CURRENT (nutrition 2, metadata 2), so its snapshot_name and numbers match the live row: the ordinary case the three stale rows are contrasted against."
         },
         {
             "id": "d3000000-0000-4000-8000-000000000022",
@@ -2034,7 +2148,7 @@
                 "fat_g": 0.39,
                 "fiber_g": 0
             },
-            "snapshot_name": "Greek yogurt, plain",
+            "snapshot_name": "Yogurt, Greek, plain, nonfat",
             "snapshot_provenance": "source_backed",
             "snapshot_allergen_tags": [
                 "milk"
@@ -2057,7 +2171,8 @@
                 "nutrition_basis": "per_100g",
                 "density_g_per_ml": null,
                 "publication_status": "published"
-            }
+            },
+            "note": "METADATA STALE, NUTRITION CURRENT: catalog_nutrition_version is 2 and matches usda:9200115, so snapshot_per_100g holds that food's CURRENT nutrients, while catalog_metadata_version is 1 against the food's 2, so snapshot_name is still the superseded display_name. This is the half of the staleness rule a nutrition-only comparison misses - the direction in which an ingredient can silently gain an allergen tag while the published recipe goes on claiming a badge - so a fixture that varied only the nutrition counter would leave it untested."
         },
         {
             "id": "d3000000-0000-4000-8000-000000000027",
@@ -2210,6 +2325,541 @@
                 "density_g_per_ml": 1.03,
                 "publication_status": "published"
             }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000002b",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000b",
+            "food_source_key": "usda:9200101",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000001",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 120,
+                "protein_g": 22.5,
+                "carbs_g": 0,
+                "fat_g": 2.62,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Chicken breast",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "gluten_free"
+            ],
+            "quantity": 610,
+            "unit": "g",
+            "gram_weight": 610,
+            "display_text": "610 g chicken breast",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "chicken",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000002c",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000b",
+            "food_source_key": "usda:9200103",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000003",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 360,
+                "protein_g": 7.5,
+                "carbs_g": 76.2,
+                "fat_g": 2.9,
+                "fiber_g": 3.4
+            },
+            "snapshot_name": "Brown rice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 320,
+            "unit": "g",
+            "gram_weight": 320,
+            "display_text": "320 g brown rice, dry",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "rice",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000002d",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000b",
+            "food_source_key": "usda:9200112",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000c",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 35,
+                "protein_g": 2.92,
+                "carbs_g": 4.42,
+                "fat_g": 1.49,
+                "fiber_g": 4.1
+            },
+            "snapshot_name": "Kale",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 200,
+            "unit": "g",
+            "gram_weight": 200,
+            "display_text": "200 g curly kale",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000002e",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000b",
+            "food_source_key": "usda:9200109",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000009",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 884,
+                "protein_g": 0,
+                "carbs_g": 0,
+                "fat_g": 100,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Olive oil",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 30,
+            "unit": "g",
+            "gram_weight": 30,
+            "display_text": "30 g olive oil",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "olive_oil",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 0.918,
+                "publication_status": "published"
+            },
+            "note": "The pan oil is a listed ingredient because the instructions name it and it carries 265 kcal of the recipe. An unlisted cooking fat is the omission recipes-seed.ts fails a file for, so the fixture does not model it."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-00000000002f",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000b",
+            "food_source_key": "usda:9200114",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000e",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 22,
+                "protein_g": 0.35,
+                "carbs_g": 6.9,
+                "fat_g": 0.24,
+                "fiber_g": 0.3
+            },
+            "snapshot_name": "Lemon juice",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 50,
+            "unit": "g",
+            "gram_weight": 50,
+            "display_text": "50 g lemon juice",
+            "sort_order": 4,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "citrus",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": 1.03,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000030",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000c",
+            "food_source_key": "usda:9200115",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000f",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 2,
+            "snapshot_per_100g": {
+                "calories": 61,
+                "protein_g": 10,
+                "carbs_g": 3.9,
+                "fat_g": 0.7,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Greek yogurt, plain",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "milk"
+            ],
+            "snapshot_diet_tags": [
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 220,
+            "unit": "g",
+            "gram_weight": 220,
+            "display_text": "220 g Greek yogurt",
+            "sort_order": 0,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "yogurt",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            },
+            "note": "NUTRITION STALE, METADATA CURRENT - the reverse of the pair on cracker-and-yogurt-snack-plate. catalog_nutrition_version is 1 against usda:9200115's 2, so snapshot_per_100g holds the superseded_nutrition values and the per-serving numbers were derived from them; catalog_metadata_version is 2 and matches, so snapshot_name is the CURRENT display_name. The two counters are independent pointers, not a timeline: isIngredientSnapshotStale compares them with inequality precisely because a catalog rollback or a reloaded release can move either one on its own."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000031",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000c",
+            "food_source_key": "usda:9200107",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000007",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 52,
+                "protein_g": 10.9,
+                "carbs_g": 0.73,
+                "fat_g": 0.17,
+                "fiber_g": 0
+            },
+            "snapshot_name": "Egg white",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [
+                "eggs"
+            ],
+            "snapshot_diet_tags": [
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 110,
+            "unit": "g",
+            "gram_weight": 110,
+            "display_text": "110 g egg white",
+            "sort_order": 1,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "egg_product",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000032",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000c",
+            "food_source_key": "usda:9200118",
+            "catalog_food_id": "c1000000-0000-4000-8000-000000000012",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 400,
+                "protein_g": 12,
+                "carbs_g": 70,
+                "fat_g": 8,
+                "fiber_g": 16
+            },
+            "snapshot_name": "Rye crispbread",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian"
+            ],
+            "quantity": 120,
+            "unit": "g",
+            "gram_weight": 120,
+            "display_text": "120 g rye crispbread",
+            "sort_order": 2,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 1,
+                "food_group": "cracker",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            },
+            "note": "Carries no reviewed gluten_free tag, which is what withholds the gluten_free badge from this version even though every other ingredient carries it. The badge is withheld rather than resolved in the recipe's favour."
+        },
+        {
+            "id": "d3000000-0000-4000-8000-000000000033",
+            "recipe_version_id": "d2000000-0000-4000-8000-00000000000c",
+            "food_source_key": "usda:9200111",
+            "catalog_food_id": "c1000000-0000-4000-8000-00000000000b",
+            "catalog_nutrition_version": 1,
+            "catalog_metadata_version": 1,
+            "snapshot_per_100g": {
+                "calories": 23,
+                "protein_g": 2.86,
+                "carbs_g": 3.63,
+                "fat_g": 0.39,
+                "fiber_g": 2.2
+            },
+            "snapshot_name": "Spinach",
+            "snapshot_provenance": "source_backed",
+            "snapshot_allergen_tags": [],
+            "snapshot_diet_tags": [
+                "vegan",
+                "vegetarian",
+                "pescatarian",
+                "gluten_free"
+            ],
+            "quantity": 150,
+            "unit": "g",
+            "gram_weight": 150,
+            "display_text": "150 g spinach",
+            "sort_order": 3,
+            "is_optional": false,
+            "resolved_catalog_facts": {
+                "allergen_status": "known",
+                "cost_class": 2,
+                "food_group": "leafy_green",
+                "nutrition_basis": "per_100g",
+                "density_g_per_ml": null,
+                "publication_status": "published"
+            }
+        }
+    ],
+    "declaration_negative_cases": [
+        {
+            "why": "The negative case for validateRecipeDeclaration, and the one row in this file whose declared columns deliberately DISAGREE with its ingredients. It is held OUTSIDE recipe_versions and outside insert_order on purpose: this fixture promises a referentially closed, loadable dataset, and an invalid row inside recipe_versions would be inserted by any loader that walks insert_order and would quietly change the eligible-recipe count every planner test reads. Feed declaration + ingredients to validateRecipeDeclaration and assert valid === false and that the reported fields equal expected_mismatch_fields.",
+            "recipe_slug": "creamy-spinach-rice-bake-INVALID",
+            "recipe_version_id": "d2000000-0000-4000-8000-0000000000ff",
+            "expected_valid": false,
+            "expected_mismatch_fields": [
+                {
+                    "field": "badges",
+                    "code": "undeclared"
+                },
+                {
+                    "field": "badges",
+                    "code": "unsupported"
+                },
+                {
+                    "field": "badges",
+                    "code": "unsupported"
+                },
+                {
+                    "field": "allergen_tags",
+                    "code": "undeclared"
+                },
+                {
+                    "field": "diet_tags",
+                    "code": "undeclared"
+                },
+                {
+                    "field": "diet_tags",
+                    "code": "undeclared"
+                },
+                {
+                    "field": "diet_tags",
+                    "code": "undeclared"
+                },
+                {
+                    "field": "diet_tags",
+                    "code": "unsupported"
+                }
+            ],
+            "derived_for_reference": {
+                "diet_tags": [
+                    "gluten_free",
+                    "pescatarian",
+                    "vegetarian"
+                ],
+                "allergen_tags": [
+                    "milk"
+                ],
+                "badges": [
+                    "gluten_free"
+                ]
+            },
+            "note": "The declaration understates an allergen and overstates two badges - the dangerous direction. It claims allergen_tags [] and badge dairy_free while whole milk is in the dish, and claims diet_tag/badge vegan while whole milk is not vegan. A seed that trusted the file here would offer a milk-bearing dinner to a milk-allergic user, which is why recipes-seed.ts derives these columns and only ever compares the file against the derivation.",
+            "declaration": {
+                "icon_key": "pot",
+                "meal_slots": [
+                    "dinner"
+                ],
+                "badges": [
+                    "dairy_free",
+                    "vegan"
+                ],
+                "diet_tags": [
+                    "vegan"
+                ],
+                "allergen_tags": [],
+                "prep_minutes": 10,
+                "cook_minutes": 20,
+                "yield_servings": 2,
+                "total_minutes": 30
+            },
+            "ingredients": [
+                {
+                    "id": "d3000000-0000-4000-8000-0000000000f1",
+                    "recipe_version_id": "d2000000-0000-4000-8000-0000000000ff",
+                    "food_source_key": "usda:9200110",
+                    "catalog_food_id": "c1000000-0000-4000-8000-00000000000a",
+                    "catalog_nutrition_version": 1,
+                    "catalog_metadata_version": 1,
+                    "snapshot_per_100g": {
+                        "calories": 64,
+                        "protein_g": 3.28,
+                        "carbs_g": 4.78,
+                        "fat_g": 3.46,
+                        "fiber_g": 0
+                    },
+                    "snapshot_name": "Whole milk",
+                    "snapshot_provenance": "source_backed",
+                    "snapshot_allergen_tags": [
+                        "milk"
+                    ],
+                    "snapshot_diet_tags": [
+                        "vegetarian",
+                        "pescatarian",
+                        "gluten_free"
+                    ],
+                    "quantity": 1,
+                    "unit": "cup",
+                    "gram_weight": 244,
+                    "display_text": "1 cup whole milk",
+                    "sort_order": 0,
+                    "is_optional": false,
+                    "resolved_catalog_facts": {
+                        "allergen_status": "known",
+                        "cost_class": 1,
+                        "food_group": "milk",
+                        "nutrition_basis": "per_100ml",
+                        "density_g_per_ml": 1.032,
+                        "publication_status": "published"
+                    },
+                    "note": "The milk-bearing ingredient the declaration omits. Its snapshot_allergen_tags carry milk and its snapshot_diet_tags lack vegan, so the derivation contradicts all three declared columns."
+                },
+                {
+                    "id": "d3000000-0000-4000-8000-0000000000f2",
+                    "recipe_version_id": "d2000000-0000-4000-8000-0000000000ff",
+                    "food_source_key": "usda:9200104",
+                    "catalog_food_id": "c1000000-0000-4000-8000-000000000004",
+                    "catalog_nutrition_version": 1,
+                    "catalog_metadata_version": 1,
+                    "snapshot_per_100g": {
+                        "calories": 123,
+                        "protein_g": 2.7,
+                        "carbs_g": 25.6,
+                        "fat_g": 0.97,
+                        "fiber_g": 1.6
+                    },
+                    "snapshot_name": "Brown rice",
+                    "snapshot_provenance": "source_backed",
+                    "snapshot_allergen_tags": [],
+                    "snapshot_diet_tags": [
+                        "vegan",
+                        "vegetarian",
+                        "pescatarian",
+                        "gluten_free"
+                    ],
+                    "quantity": 300,
+                    "unit": "g",
+                    "gram_weight": 300,
+                    "display_text": "300 g brown rice, cooked",
+                    "sort_order": 1,
+                    "is_optional": false,
+                    "resolved_catalog_facts": {
+                        "allergen_status": "known",
+                        "cost_class": 1,
+                        "food_group": "rice",
+                        "nutrition_basis": "per_100g",
+                        "density_g_per_ml": null,
+                        "publication_status": "published"
+                    }
+                },
+                {
+                    "id": "d3000000-0000-4000-8000-0000000000f3",
+                    "recipe_version_id": "d2000000-0000-4000-8000-0000000000ff",
+                    "food_source_key": "usda:9200111",
+                    "catalog_food_id": "c1000000-0000-4000-8000-00000000000b",
+                    "catalog_nutrition_version": 1,
+                    "catalog_metadata_version": 1,
+                    "snapshot_per_100g": {
+                        "calories": 23,
+                        "protein_g": 2.86,
+                        "carbs_g": 3.63,
+                        "fat_g": 0.39,
+                        "fiber_g": 2.2
+                    },
+                    "snapshot_name": "Spinach",
+                    "snapshot_provenance": "source_backed",
+                    "snapshot_allergen_tags": [],
+                    "snapshot_diet_tags": [
+                        "vegan",
+                        "vegetarian",
+                        "pescatarian",
+                        "gluten_free"
+                    ],
+                    "quantity": 150,
+                    "unit": "g",
+                    "gram_weight": 150,
+                    "display_text": "150 g spinach",
+                    "sort_order": 2,
+                    "is_optional": false,
+                    "resolved_catalog_facts": {
+                        "allergen_status": "known",
+                        "cost_class": 2,
+                        "food_group": "leafy_green",
+                        "nutrition_basis": "per_100g",
+                        "density_g_per_ml": null,
+                        "publication_status": "published"
+                    }
+                }
+            ]
         }
     ]
 }

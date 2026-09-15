@@ -45,6 +45,12 @@
 //    (`replayCommittedKeyedAction`): asking "has this key already committed?"
 //    is the same question the gate answers, so one module answers it, and the
 //    two generation entry points below ask rather than re-implement.
+//  * `utils/featureFlags.ts` owns both server switches, resolved once at import.
+//    The only one this file asks about is `MEAL_PLANNING_FAULT` (§0.9.4), and it
+//    asks through `mealPlanningFault()` rather than reading the environment
+//    (§5), which is also what makes the injected fault inert in production
+//    without this service testing `NODE_ENV` itself. The capability gate
+//    `MEAL_PLANNING_ENABLED` is the controller's to apply, not a service's.
 //
 //  * `mealPlan.mapper.ts` owns the plan, day and meal DTOs. Rule
 //    backend-architecture §6 promotes a row -> DTO mapper out of its service
@@ -117,6 +123,7 @@ import {
     PlanStatus,
     RegeneratePlanPayload,
 } from '../types/mealPlanning';
+import { mealPlanningFault } from '../utils/featureFlags';
 import { isGroceryRenderingFault } from './grocery.logic';
 import {
     buildPlanGroceryDrafts,
@@ -1219,6 +1226,47 @@ const writeGroceriesForNewPlan = async (
 };
 
 /**
+ * Raises the injected generation fault, if one is armed.
+ *
+ * CALLED FROM EXACTLY ONE POSITION IN EACH ENTRY POINT: after the in-memory
+ * search has returned and before `prisma.$transaction` opens (§0.9.4). That
+ * position is the whole point of the switch rather than a detail of it. Thrown
+ * here, nothing has run: no advisory lock, no `meal_plan_actions` reservation,
+ * no plan row, no grocery list. So the property §0.9.2 asserts of the fault —
+ * "leaves no action row and no plan … and the retry without the fault commits
+ * once" — holds because the fault never reaches the ledger at all, not because
+ * a rollback tidied up after it. Armed one statement later, inside the
+ * transaction, the same throw would exercise a rollback instead and prove
+ * nothing about the pre-transaction path a real generation failure takes.
+ *
+ * AFTER THE SEARCH, THOUGH, NOT BEFORE IT. Raising it earlier would pre-empt
+ * `NoMatchingMealsError` and `StaleRevisionError`, so a developer arming
+ * `generation` to reach 10b would instead be hiding whichever refusal the
+ * request genuinely deserved — and 10b's copy ("your answers are saved, try
+ * again") would be attached to a request that could never have published.
+ *
+ * ONE FUNCTION FOR BOTH PUBLICATION PATHS, for the reason
+ * {@link writeGroceriesForNewPlan} gives for the grocery translation it
+ * centralises: §0.9.4 arms this fault for `POST /plans` AND
+ * `POST /plans/:planId/regenerate`, and two copies of the check are one copy
+ * that eventually stops matching the other. On a regeneration the throw also
+ * carries the assurance the 16b dialog makes — the old week is still the
+ * user's, because it is superseded inside the transaction this runs in front of.
+ *
+ * The value comes from the `featureFlags.ts` accessor and never from
+ * `process.env` (§5): that module resolves it once at import and forces it to
+ * `'off'` under `NODE_ENV=production`, so this branch is unreachable in
+ * production by construction rather than by this service remembering to check
+ * the environment. `PlanGenerationError` is raised with no `cause`, because the
+ * switch IS the reason — there is no underlying fault to carry to the log.
+ */
+const raiseInjectedGenerationFault = (): void => {
+    if (mealPlanningFault() === 'generation') {
+        throw new PlanGenerationError();
+    }
+};
+
+/**
  * Records that the user has published a week.
  *
  * §0.5.2's "Sets setupStatus to completed on success" for `POST /plans`, and
@@ -1434,6 +1482,8 @@ export const generatePlan = async (
     const generatable = requireGeneratableSetup(row);
     const candidate = await searchCandidateWeek(userId, generatable, payload, FIRST_GENERATION_ATTEMPT);
 
+    raiseInjectedGenerationFault();
+
     const result = await prisma.$transaction((tx) =>
         runKeyedAction(
             tx,
@@ -1550,6 +1600,8 @@ export const regeneratePlan = async (
         { ...payload, startDate: existing.startDate },
         existing.generationAttempt + 1,
     );
+
+    raiseInjectedGenerationFault();
 
     const result = await prisma.$transaction((tx) =>
         runKeyedAction(

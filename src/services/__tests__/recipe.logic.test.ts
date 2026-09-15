@@ -116,6 +116,8 @@ interface FixtureCatalogFood {
     metadata_version: number;
     publication_status: string;
     nutrition_basis: string;
+    /** Read only to prove a frozen snapshot disagrees with the live row. */
+    calories: number;
     density_g_per_ml: number | null;
     allergen_status: 'known' | 'unknown';
     cost_class: number;
@@ -2498,6 +2500,8 @@ describe('the committed recipe graph', () => {
             ['lemon-dressed-spinach-salad', 1, ['nutrition_provenance']],
             ['cracker-and-yogurt-snack-plate', 1, ['allergen_status']],
             ['salmon-and-kale-plate', 1, []],
+            ['herb-chicken-rice-and-kale-bowl', 1, []],
+            ['yogurt-egg-white-crispbread-plate', 1, []],
         ];
 
         it.each(EXPECTED_REFUSALS)('%s v%i refuses on exactly %j for an unrestricted user', (slug, versionNumber, codes) => {
@@ -2511,13 +2515,31 @@ describe('the committed recipe graph', () => {
             expect(verdict.eligible).toBe(codes.length === 0);
         });
 
-        it('leaves six of the ten versions plannable, which is what the fixture records', () => {
+        it('leaves eight of the twelve versions plannable, which is what the fixture records', () => {
             const plannable = COMMITTED_VERSIONS.filter(([slug, versionNumber]) =>
                 isEligibleForPlanning(planningVersionOf(recipeVersionRow(slug, versionNumber)), makePreferences()),
             );
 
             expect(plannable).toHaveLength(readRecipeFixture().counts.plannable_versions);
-            expect(plannable).toHaveLength(6);
+            expect(plannable).toHaveLength(8);
+        });
+
+        it('offers at least four plannable recipes in one slot, which the repeat rule needs', () => {
+            const perSlot = new Map<string, number>();
+            for (const [slug, versionNumber] of COMMITTED_VERSIONS) {
+                const version = recipeVersionRow(slug, versionNumber);
+                if (!isEligibleForPlanning(planningVersionOf(version), makePreferences())) {
+                    continue;
+                }
+                for (const slot of version.meal_slots) {
+                    perSlot.set(slot, (perSlot.get(slot) ?? 0) + 1);
+                }
+            }
+
+            // A recipe may be used at most twice a week and never on
+            // consecutive days, so four per slot is the minimum that lets a
+            // seven-day week close at all.
+            expect(Math.max(...perSlot.values())).toBeGreaterThanOrEqual(4);
         });
     });
 
@@ -2581,19 +2603,24 @@ describe('the committed recipe graph', () => {
                 ]),
             );
 
-        it('reports the yogurt as nutrition-stale against the live catalog row', () => {
+        it('reports the yogurt as stale in BOTH counters against the live catalog row', () => {
             const stale = findStaleIngredients(publicationIngredients(SLUG, 1), liveVersions());
             const yogurt = catalogFood('usda:9200115');
 
+            // This row is frozen before both of the catalog's bumps, so its
+            // numbers AND its name differ from the live row. The name is the
+            // half a nutrition-only comparison would miss.
             expect(stale).toHaveLength(1);
             expect(stale[0]).toMatchObject({
                 catalogFoodId: yogurt.id,
-                name: 'Greek yogurt, plain',
-                changed: ['nutrition'],
+                name: 'Yogurt, Greek, plain, nonfat',
+                changed: ['nutrition', 'metadata'],
                 snapshotNutritionVersion: 1,
+                snapshotMetadataVersion: 1,
                 currentNutritionVersion: 2,
-                currentMetadataVersion: 1,
+                currentMetadataVersion: 2,
             });
+            expect(stale[0]?.name).not.toBe(yogurt.display_name);
             expect(isIngredientSnapshotStale(
                 { catalog_nutrition_version: 1, catalog_metadata_version: 1 },
                 { catalog_nutrition_version: yogurt.nutrition_version, catalog_metadata_version: yogurt.metadata_version },
@@ -2609,8 +2636,9 @@ describe('the committed recipe graph', () => {
             // The fixture's whole point: the snapshot disagrees with the live
             // row, so a derivation that joined to the catalog instead of
             // reading the snapshot would produce a different number.
-            expect(yogurtRow.snapshot_per_100g.calories).not.toBe(live.nutrition_version);
+            expect(yogurtRow.snapshot_per_100g.calories).not.toBe(live.calories);
             expect(yogurtRow.snapshot_per_100g.calories).toBe(61);
+            expect(live.calories).toBe(59);
 
             const fromSnapshot = deriveRecipeNutrition(ingredients, version.yield_servings);
             const asIfJoinedToLive = deriveRecipeNutrition(
@@ -2632,12 +2660,27 @@ describe('the committed recipe graph', () => {
                     findStaleIngredients(publicationIngredients(slug, versionNumber), liveVersions()).length === 0,
             );
 
-            // The two versions that point at the version-2 yogurt with a
-            // version-2 snapshot are current; only the frozen version-1
-            // snapshot is stale.
+            // Only the version whose snapshot matches the live row in BOTH
+            // counters is current. The fixture deliberately covers all three
+            // stale states, so two other yogurt references are stale too —
+            // each in a different counter.
             expect(matching).not.toContainEqual([SLUG, 1]);
             expect(matching).toContainEqual(['roasted-carrot-and-lentil-salad', 1]);
-            expect(matching).toContainEqual(['cracker-and-yogurt-snack-plate', 1]);
+            expect(matching).not.toContainEqual(['cracker-and-yogurt-snack-plate', 1]);
+            expect(matching).not.toContainEqual(['yogurt-egg-white-crispbread-plate', 1]);
+        });
+
+        it('covers all three staleness states across the graph, one per counter', () => {
+            const changedFor = (slug: string): readonly string[] =>
+                findStaleIngredients(publicationIngredients(slug, 1), liveVersions())[0]?.changed ?? [];
+
+            // Both counters, nutrition only, and metadata only. A fixture that
+            // varied one counter would leave half of
+            // isIngredientSnapshotStale untested.
+            expect(changedFor(SLUG)).toEqual(['nutrition', 'metadata']);
+            expect(changedFor('yogurt-egg-white-crispbread-plate')).toEqual(['nutrition']);
+            expect(changedFor('cracker-and-yogurt-snack-plate')).toEqual(['metadata']);
+            expect(changedFor('roasted-carrot-and-lentil-salad')).toEqual([]);
         });
     });
 

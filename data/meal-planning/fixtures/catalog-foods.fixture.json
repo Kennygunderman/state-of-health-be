@@ -676,7 +676,7 @@
             "nutrition_provenance": "source_backed",
             "publication_status": "published",
             "nutrition_version": 2,
-            "metadata_version": 1,
+            "metadata_version": 2,
             "nutrition_basis": "per_100g",
             "basis_amount": 100,
             "calories": 59,
@@ -705,7 +705,7 @@
             "search_text": "greek yogurt plain yoghurt strained",
             "imported_at": "2026-09-12T00:00:00.000Z",
             "created_at": "2026-09-12T00:00:00.000Z",
-            "updated_at": "2026-09-13T00:00:00.000Z",
+            "updated_at": "2026-09-14T00:00:00.000Z",
             "superseded_nutrition": [
                 {
                     "nutrition_version": 1,
@@ -717,7 +717,14 @@
                     "note": "The values this row carried at nutrition_version 1. Kept as data, not prose, so both the stale derivation on ai:prepared_meal:herbed yogurt dip:prepared and the stale recipe_ingredients snapshot on 'herbed-yogurt-and-kale-dip-plate' stay recomputable by a reader."
                 }
             ],
-            "note": "the food whose nutrition_version moved to 2 — the single cause of every staleness case in both fixtures"
+            "note": "the food both counters have moved on: nutrition_version 1 -> 2 (a source correction, superseded_nutrition) and metadata_version 1 -> 2 (a display_name correction, superseded_metadata). It is the single cause of every staleness case in both fixtures, and the only row that can exercise the metadata half of isIngredientSnapshotStale.",
+            "superseded_metadata": [
+                {
+                    "metadata_version": 1,
+                    "display_name": "Yogurt, Greek, plain, nonfat",
+                    "note": "The display_name this row carried at metadata_version 1 - the raw source description, before curation shortened it to \"Greek yogurt, plain\". No allergen tag, diet tag or food group changed, so the rename is the whole of the metadata_version 2 bump. Kept as data so a reader can tell a frozen recipe_ingredients.snapshot_name apart from this row's current one without guessing."
+                }
+            ]
         },
         {
             "id": "c1000000-0000-4000-8000-000000000010",
@@ -4889,7 +4896,7 @@
                     "outcome": "accepted",
                     "publication_status": "published",
                     "nutrition_version": 1,
-                    "note": "Accepted at nutrition_version 1; a source correction bumped the row to nutrition_version 2 and this record was re-reviewed."
+                    "note": "Accepted at nutrition_version 1; a source correction bumped the row to nutrition_version 2 and this record was re-reviewed. A later display_name correction bumped metadata_version to 2, which validation does not re-review: metadata_version carries identity and safety labels, not nutrients."
                 }
             ],
             "note": "outcome accepted; deciding checks [none]; review flags [none]"

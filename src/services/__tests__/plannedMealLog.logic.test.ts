@@ -1391,7 +1391,7 @@ const COMMITTED_VERSIONS: [string, number][] = readRecipeFixture().recipe_versio
 describe('the committed recipe graph', () => {
     it('covers every version the fixture records', () => {
         expect(COMMITTED_VERSIONS).toHaveLength(readRecipeFixture().counts.recipe_versions);
-        expect(COMMITTED_VERSIONS).toHaveLength(10);
+        expect(COMMITTED_VERSIONS).toHaveLength(12);
     });
 
     describe.each(COMMITTED_VERSIONS)('%s v%i', (slug, versionNumber) => {

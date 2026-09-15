@@ -1,0 +1,6605 @@
+{
+  "stage": "search-benchmark",
+  "reportVersion": "v1",
+  "generatedAt": "2026-09-15T04:29:24.051Z",
+  "benchmarkVersion": "v1",
+  "catalogRelease": "v1",
+  "producedBy": "npm run search:benchmark",
+  "verdict": {
+    "overall": "fail",
+    "failedThresholds": [
+      "topThreeHitRate",
+      "topTenHitRate"
+    ],
+    "passedThresholds": [
+      "maxZeroResultRate",
+      "p95LatencyMs"
+    ],
+    "statement": "Search quality does NOT meet the contract's acceptance bar: topThreeHitRate and topTenHitRate were missed. Under the contract's thresholdPolicy the benchmark fails closed, so this report must not be cited as evidence that catalog search meets its requirement. Retrieval, ordering determinism, the zero-result bound and the latency bound did meet their bars; the two hit-rate bounds did not. See diagnostics for what the misses are and are not.",
+    "remediationOwner": "Not settled here. The measured facts are that no expectation is unretrievable and that the misses concentrate in broad single-word queries over a corpus roughly eighty times larger than the one the query set was authored against (see contractStatementsNowStale). Whether the remedy is recalibrating data/meal-planning/search-benchmark.v1.json expectations, changing the ranking in src/services/catalog.service.ts, or both, belongs to the owners of those two files and is deliberately not decided by this report."
+  },
+  "provenance": {
+    "acceptanceRunner": "scripts/search-benchmark.ts",
+    "acceptanceRunnerCommand": "npm run search:benchmark",
+    "runnerMeasurementBodyExists": false,
+    "howTheseFiguresWereObtained": "By driving the contract's measuredUnit (catalog.service.searchPublishedFoods) directly, in process, under the contract's protocol verbatim — one untimed warm-up pass, then three timed passes, sequential, one connection — over all 426 committed queries against the loaded release, in this checkout's sandbox.",
+    "honestyStatement": "scripts/search-benchmark.ts carries no measurement body in this checkout: it validates its inputs and exits stage_pipeline_pending without importing the service, timing a query or writing a report, and it says so in its own header. The command named in producedBy is therefore the DESIGNATED acceptance path and the one that must own this artefact, not the process that emitted these bytes. The figures here are a real measurement of the same unit under the same protocol, so the runner is expected to reproduce the ranks and page sequences exactly once its body lands; only latencies may differ. Nothing in this report is estimated, and no figure was carried over from any earlier document.",
+    "supersedes": "data/meal-planning/search-benchmark.v1.json implementationStatus.acceptanceReportExists is false and records that no p50, p95, hit rate or zero-result rate for catalog search exists anywhere in the repository. That was true when it was written and is superseded by this file; the contract's own numeric thresholds and protocol values were final already and were consumed, not altered."
+  },
+  "acceptanceEvidence": {
+    "thisReportIsAcceptanceEvidence": true,
+    "measuredAgainst": "the loaded catalog release v1, 11046 published foods",
+    "nonAcceptanceSuite": {
+      "path": "src/__tests__/api/benchmark.test.ts",
+      "fixture": "data/meal-planning/fixtures/benchmark-synthetic-10k.json",
+      "existsInThisCheckout": false,
+      "isAcceptanceEvidence": false,
+      "statement": "src/__tests__/api/benchmark.test.ts, against data/meal-planning/fixtures/benchmark-synthetic-10k.json, exercises the benchmark MECHANICS against a synthetic corpus only. It is NOT acceptance evidence and can pass while real search quality is unmeasured or failing: no token in that fixture is a real food name and its keys are prefixed synthetic-bench10k:. Only a run against the loaded release — this report — speaks to search quality. Neither the suite nor its expansion contributed any figure here."
+    }
+  },
+  "dataLegality": {
+    "status": "legal_to_commit",
+    "basis": "Every food reflected here is USDA FoodData Central data or self-generated generic catalog data. USDA FoodData Central is public domain with no retention restrictions, which is the in-repo determination this artefact relies on.",
+    "citations": [
+      "src/services/usda.service.ts:4-5 — \"USDA FoodData Central (public domain — no retention restrictions, so the snapshot-at-log-time model is fully legal for this data source).\"",
+      "prisma/schema.prisma:299-301 — the usda_api_cache model comment recording the same determination for the cached vendor payloads: \"USDA data is public domain with no retention restrictions\"."
+    ],
+    "containsUserOwnedData": false,
+    "userOwnedDataStatement": "This report aggregates catalog and search data exclusively. It carries no user identifier, no contact address, no diary content and no owner-scoped row of any kind. Every identity in it is a catalog source_key."
+  },
+  "conditions": {
+    "catalogReleaseChecksum": {
+      "manifestSha256": "7b4f9d68c4e89ea7fb8a860feee3b544b6a36ef3af751205c06cfdd75167c890",
+      "files": [
+        {
+          "name": "foods.jsonl",
+          "sha256": "f0d733c139f647d94ebf6912ee8862599cf2842c90774b1e38ac2cfdae8180e1"
+        },
+        {
+          "name": "aliases.jsonl",
+          "sha256": "b14909373894e5066ff6555f3fef5859fb2bb0d0a4293d6f2eafd11528e8fc5e"
+        },
+        {
+          "name": "portions.jsonl",
+          "sha256": "798b4588e8bfb2dddba8f0663b3cd74785ca02b806699c331d4edb674436de63"
+        },
+        {
+          "name": "components.jsonl",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "name": "validation-records.jsonl",
+          "sha256": "2251674dba5dacd7c5b02518110cf6e73545127af4f49ea12bba0016f72e0db4"
+        }
+      ],
+      "verifiedAgainstCommittedFiles": true,
+      "note": "The release manifest carries no single release-level digest, only a per-file sha256, so none is invented here. All five committed files were re-hashed and matched the manifest, and catalog-load verified the same checksums and every row count before activating the release. manifestSha256 is the sha256 of manifest.json itself, which is this report's one portable digest of the whole file set because that file contains every per-file digest."
+    },
+    "postgresVersion": "PostgreSQL 16.15 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "hostCpu": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz, 112 logical CPUs",
+    "hostMemory": "3145377181696 bytes (2929.4 GiB)",
+    "sharedBuffers": "128MB",
+    "warmCacheCondition": {
+      "warmupPasses": 1,
+      "timedPasses": 3,
+      "sequential": true,
+      "connections": 1,
+      "timing": "in_process",
+      "measuredUnit": "catalog.service.searchPublishedFoods",
+      "statement": "One untimed warm-up pass over the full query set settled the shared buffers and the GIN index into cache; the three timed passes that follow measure the steady state. Every call was timed IN PROCESS around catalog.service.searchPublishedFoods with process.hrtime.bigint(), so these latencies exclude network, Express and JSON-serialisation time and are NOT over-HTTP figures. Execution was sequential on a single connection (connection_limit=1), so a percentile describes the query rather than queueing behind other queries."
+    },
+    "orderingCollation": {
+      "collation": "C",
+      "appliesTo": [
+        "display_name",
+        "source_key"
+      ],
+      "readBackFrom": "src/services/catalog.service.ts",
+      "orderBy": "ORDER BY r.rank DESC, f.display_name COLLATE \"C\" ASC, f.source_key COLLATE \"C\" ASC",
+      "note": "Read back from the service's own ORDER BY rather than assumed, as the contract's collationEvidenceRule requires. C is byte order over the stored UTF-8, so it is identical on every server and is what makes the order a property of the release rather than of the database."
+    },
+    "databaseDefaultCollation": "en_US.utf8"
+  },
+  "corpus": {
+    "publishedFoods": 11046,
+    "manifestPublishedFoods": 11046,
+    "countsAgree": true,
+    "loadedBy": "npm run catalog:load -- --release v1",
+    "loadCounts": {
+      "foodsInserted": 11046,
+      "aliasesWritten": 15939,
+      "portionsWritten": 31899,
+      "validationRecordsWritten": 11046,
+      "componentsWritten": 0
+    },
+    "expectationResolution": {
+      "mode": "sourceKey",
+      "expectations": 467,
+      "resolved": 467,
+      "unresolved": 0,
+      "statement": "Every expectation resolved from its stable catalog_foods.source_key to a local id after the release was loaded. An unresolvable key would have failed the whole run by contract, never been skipped or scored as a miss."
+    }
+  },
+  "thresholds": {
+    "source": "data/meal-planning/search-benchmark.v1.json thresholds",
+    "policy": "fail_closed",
+    "measuredAtLimit": 25,
+    "checks": {
+      "topThreeHitRate": {
+        "contractKey": "topThreeHitRate",
+        "bound": 0.9,
+        "comparison": "measured >= bound",
+        "measured": 0.622,
+        "measuredAsCount": "265 of 426 queries",
+        "verdict": "fail"
+      },
+      "topTenHitRate": {
+        "contractKey": "topTenHitRate",
+        "bound": 0.97,
+        "comparison": "measured >= bound",
+        "measured": 0.803,
+        "measuredAsCount": "342 of 426 queries",
+        "verdict": "fail"
+      },
+      "maxZeroResultRate": {
+        "contractKey": "maxZeroResultRate",
+        "bound": 0.03,
+        "comparison": "measured <= bound",
+        "measured": 0,
+        "measuredAsCount": "0 of 426 queries returned no rows",
+        "verdict": "pass"
+      },
+      "p95LatencyMs": {
+        "contractKey": "p95LatencyMs",
+        "bound": 150,
+        "comparison": "measured <= bound",
+        "measured": 83.687,
+        "measuredAsCount": "1278 timed samples at limit 25",
+        "verdict": "pass"
+      }
+    }
+  },
+  "rollups": {
+    "queriesScored": 426,
+    "topThreeHitRate": 0.622,
+    "topTenHitRate": 0.803,
+    "zeroResultCount": 0,
+    "zeroResultRate": 0,
+    "beyondMeasuredPageCount": 50,
+    "rankStability": {
+      "queriesStableAcrossAllTimedPasses": 426,
+      "unstable": 0,
+      "statement": "Every query returned the same rank and the same match-set total on all three timed passes, so the ranks below are a property of the release and not of one pass."
+    },
+    "perKind": [
+      {
+        "kind": "exact",
+        "queries": 153,
+        "topThreeHitRate": 0.425,
+        "topTenHitRate": 0.66,
+        "beyondMeasuredPage": 32
+      },
+      {
+        "kind": "multi_word",
+        "queries": 65,
+        "topThreeHitRate": 0.754,
+        "topTenHitRate": 0.846,
+        "beyondMeasuredPage": 6
+      },
+      {
+        "kind": "misspelling",
+        "queries": 41,
+        "topThreeHitRate": 0.976,
+        "topTenHitRate": 1,
+        "beyondMeasuredPage": 0
+      },
+      {
+        "kind": "alias",
+        "queries": 95,
+        "topThreeHitRate": 0.695,
+        "topTenHitRate": 0.874,
+        "beyondMeasuredPage": 7
+      },
+      {
+        "kind": "plural",
+        "queries": 32,
+        "topThreeHitRate": 0.688,
+        "topTenHitRate": 0.875,
+        "beyondMeasuredPage": 2
+      },
+      {
+        "kind": "partial",
+        "queries": 40,
+        "topThreeHitRate": 0.575,
+        "topTenHitRate": 0.85,
+        "beyondMeasuredPage": 3
+      }
+    ]
+  },
+  "latency": {
+    "measuredAtLimit": 25,
+    "timing": "in_process",
+    "measuredUnit": "catalog.service.searchPublishedFoods",
+    "samples": 1278,
+    "p50LatencyMs": 77.019,
+    "p95LatencyMs": 83.687,
+    "p99LatencyMs": 89.09,
+    "minLatencyMs": 65.76,
+    "maxLatencyMs": 110.712,
+    "percentileMethod": "nearest-rank over all timed samples",
+    "contentionCaveat": "Measured on a shared host that runs up to 64 concurrent validation workloads against one PostgreSQL instance, so these figures carry contention noise and are an upper bound rather than an idle-machine number. The p95 bound is met with headroom regardless. Latency is the one class of figure the contract allows to differ between runs; ranks and page sequences are not."
+  },
+  "paginationCheck": {
+    "queryIds": [
+      "q008",
+      "q020",
+      "q050",
+      "q099",
+      "q123",
+      "q131",
+      "q188",
+      "q245",
+      "q254",
+      "q260",
+      "q369",
+      "q377",
+      "q378",
+      "q379",
+      "q380",
+      "q381",
+      "q382",
+      "q383",
+      "q384",
+      "q386"
+    ],
+    "limit": 25,
+    "pages": 3,
+    "singlePageLimit": 75,
+    "referenceMode": "in_process",
+    "referenceModeStatement": "The limit=75 reference page was read IN PROCESS through catalog.service.searchPublishedFoods, not over HTTP: GET /catalog/foods validates limit as 1 to 50 and would answer 400 invalid_request for 75. singlePageLimit was not lowered to make it routable, and the service deliberately does not apply the route cap, so the reference is untruncated.",
+    "ordering": [
+      "ts_rank DESC",
+      "display_name COLLATE \"C\" ASC",
+      "source_key COLLATE \"C\" ASC"
+    ],
+    "outcome": "pass",
+    "queriesChecked": 20,
+    "queriesPassed": 20,
+    "duplicateIds": 0,
+    "missingIds": 0,
+    "threePageTraversals": 17,
+    "matchSetWidthRange": [
+      16,
+      674
+    ],
+    "statement": "For all twenty queries, pages 1, 2 and 3 at limit 25 (offsets 0, 25 and 50) concatenated equal the first min(75, total) foods of the single limit=75 reference fetch, in the same order, with no id repeated and none missing. Seventeen of the twenty match sets are wide enough to fill all three pages, so multi-page traversal is genuinely exercised and not a vacuous pass.",
+    "perQuery": [
+      {
+        "id": "q008",
+        "q": "water",
+        "matchSetTotal": 220,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q020",
+        "q": "whole wheat bread",
+        "matchSetTotal": 25,
+        "pagedIds": 25,
+        "referenceIds": 25,
+        "expectedIds": 25,
+        "pagesTraversed": 1,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q050",
+        "q": "butter",
+        "matchSetTotal": 231,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q099",
+        "q": "oats",
+        "matchSetTotal": 63,
+        "pagedIds": 63,
+        "referenceIds": 63,
+        "expectedIds": 63,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q123",
+        "q": "almonds",
+        "matchSetTotal": 52,
+        "pagedIds": 52,
+        "referenceIds": 52,
+        "expectedIds": 52,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q131",
+        "q": "peanuts",
+        "matchSetTotal": 124,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q188",
+        "q": "grapes",
+        "matchSetTotal": 39,
+        "pagedIds": 39,
+        "referenceIds": 39,
+        "expectedIds": 39,
+        "pagesTraversed": 2,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q245",
+        "q": "potato",
+        "matchSetTotal": 495,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q254",
+        "q": "tomato",
+        "matchSetTotal": 334,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q260",
+        "q": "egg",
+        "matchSetTotal": 311,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q369",
+        "q": "chickpeas",
+        "matchSetTotal": 16,
+        "pagedIds": 16,
+        "referenceIds": 16,
+        "expectedIds": 16,
+        "pagesTraversed": 1,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q377",
+        "q": "rice",
+        "matchSetTotal": 355,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q378",
+        "q": "pasta",
+        "matchSetTotal": 280,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q379",
+        "q": "cheese",
+        "matchSetTotal": 631,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q380",
+        "q": "beans",
+        "matchSetTotal": 364,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q381",
+        "q": "milk",
+        "matchSetTotal": 350,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q382",
+        "q": "chicken",
+        "matchSetTotal": 674,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q383",
+        "q": "oil",
+        "matchSetTotal": 252,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q384",
+        "q": "whole wheat",
+        "matchSetTotal": 63,
+        "pagedIds": 63,
+        "referenceIds": 63,
+        "expectedIds": 63,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      },
+      {
+        "id": "q386",
+        "q": "nuts",
+        "matchSetTotal": 199,
+        "pagedIds": 75,
+        "referenceIds": 75,
+        "expectedIds": 75,
+        "pagesTraversed": 3,
+        "sequenceMatches": true,
+        "duplicates": 0,
+        "missing": 0
+      }
+    ]
+  },
+  "crossDatabaseReproduction": {
+    "outcome": "reproduced",
+    "databasesCompared": 2,
+    "statement": "The release was loaded a second time into an independently created database and the whole query set re-run there. All 426 measured page sequences and all 20 pagination sequences were identical between the two databases, compared by source_key because the primary keys are gen_random_uuid() and differ per database. This is the evidence that ranks and page sequences belong to the release rather than to one machine.",
+    "defaultCollations": {
+      "firstDatabase": "en_US.utf8",
+      "secondDatabase": "C",
+      "note": "The two databases were deliberately created with DIFFERENT default collations, which is the case the contract's collationEvidenceRule calls readable: two runs that agree only because both databases were created the same way evidence nothing. The pinned COLLATE \"C\" on both text keys is what holds the order identical across them."
+    },
+    "publishedFoods": {
+      "firstDatabase": 11046,
+      "secondDatabase": 11046
+    },
+    "pageSequenceMismatches": 0,
+    "paginationSequenceMismatches": 0,
+    "latencyComparison": null,
+    "latencyComparisonReason": "Not compared. Both runs shared one host and one PostgreSQL instance under concurrent load, so a latency difference between them would measure contention rather than the release; the contract frees latency to differ between runs for this reason."
+  },
+  "diagnostics": {
+    "beyondMeasuredPage": {
+      "queries": 50,
+      "retrievableAtDeeperRank": 50,
+      "notRetrievableAtAll": 0,
+      "deepRankRange": [
+        26,
+        463
+      ],
+      "deepRankMedian": 54,
+      "statement": "Every one of the fifty misses is retrievable: the expected food is in the match set at a deeper rank (26 to 463, median 54), and none is unreachable. So no miss is a retrieval failure — the expected canonical food is outranked, not absent. This is measured by walking each full result set, not inferred.",
+      "concentration": "The misses concentrate in broad single-word queries whose match sets are now 26 to 674 foods wide, while the median match set across the whole query set is only 7. Curated misspellings, the most selective kind, score a 0.976 top-three rate; plain single-word exact queries score 0.425. Nine of the fifty expected foods rank within the last three positions of their own match set."
+    },
+    "interpretationLimits": "This report states what was measured and does not diagnose a cause. Two candidate explanations are consistent with the evidence — expectations calibrated against a far smaller corpus, and a ranking that favours elaborated names over the plain generic food — and distinguishing them requires judgement about intent that belongs to the owners of the query set and the search service."
+  },
+  "notMeasured": {
+    "statement": "Everything the contract asks a run to report was measured. The items below are adjacent things this report deliberately does not claim, recorded so no reader infers them.",
+    "items": [
+      {
+        "item": "idleHostLatency",
+        "value": null,
+        "reason": "No idle-host latency figure exists. The only host available runs up to 64 concurrent validation workloads, so an idle number could not be measured and is not estimated."
+      },
+      {
+        "item": "overHttpLatency",
+        "value": null,
+        "reason": "Not measured by design. The contract times the service function, not an HTTP round trip, so no over-HTTP latency is reported and none may be inferred from these figures."
+      },
+      {
+        "item": "multiPageTraversalBeyondThreePages",
+        "value": null,
+        "reason": "Out of contract. The check specifies three pages at limit 25 against a limit=75 reference; deeper traversal was not part of it and was not measured."
+      }
+    ]
+  },
+  "contractStatementsNowStale": [
+    {
+      "field": "authoringBasis",
+      "says": "Release v1 publishes 139 foods.",
+      "measured": "The committed release publishes 11046 foods, confirmed independently by the manifest counts and by reports/latest/validation-report.json.",
+      "consequence": "The expectations still resolve — all 467 of them — but their expected RANKS were never validated against a corpus roughly eighty times larger. This is the single most important context for the two failed hit-rate thresholds and is why this report records the failure with diagnostics rather than as a bare red mark."
+    },
+    {
+      "field": "paginationCheck.breadthLimitation",
+      "says": "The widest query in this set matches 8 published foods, so no query fills even the first page and the check proves ordering stability rather than multi-page traversal.",
+      "measured": "The widest of the twenty pagination queries now matches 674 foods and seventeen of the twenty fill all three pages, so the check does now exercise real multi-page traversal.",
+      "consequence": "The limitation the contract records no longer applies. The ids were chosen by measured breadth so that the same twenty would exercise all three pages once the catalog reached its target, and they now do."
+    },
+    {
+      "field": "implementationStatus.acceptanceReportExists",
+      "says": "false — no acceptance report exists, and no p50, p95, hit rate or zero-result rate for catalog search exists anywhere in the repository.",
+      "measured": "This file now exists and carries all four.",
+      "consequence": "Stale as a statement of fact about the checkout. It remains correct about scripts/search-benchmark.ts, whose measurement body is still absent; see provenance."
+    }
+  ],
+  "resultsSchema": {
+    "rank": "One-based position of the best-placed expected food within the measured page (limit 25). Null means no expected food appeared in that page; outcome then reads beyond_measured_page and rankInFullResultSet carries its real, measured position.",
+    "rankInFullResultSet": "The expected food's measured position in the complete ordered result set. Equal to rank for every query that placed within the measured page, because that page starts at offset 0.",
+    "expectedSourceKeys": "Acceptable answers, identified only by stable catalog_foods.source_key — never by a database-generated id, which would differ per database and destroy the cross-database comparison above. Plural because the contract's expectedSemantics allows several acceptable answers for a genuinely ambiguous term, with the best-placed member counting for the rank metrics.",
+    "matchedSourceKey": "The expected food that actually placed, or null when none placed within the measured page."
+  },
+  "results": [
+    {
+      "id": "q001",
+      "q": "coffee",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171890"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 131,
+      "matchSetTotal": 163,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q002",
+      "q": "black coffee",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:171890"
+      ],
+      "matchedSourceKey": "usda:171890",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q003",
+      "q": "orange juice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169098"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 31,
+      "matchSetTotal": 40,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q004",
+      "q": "orange juce",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169098"
+      ],
+      "matchedSourceKey": "usda:169098",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q005",
+      "q": "oj",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169098"
+      ],
+      "matchedSourceKey": "usda:169098",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q006",
+      "q": "tea",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173227"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 84,
+      "matchSetTotal": 85,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q007",
+      "q": "black tea",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173227"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 31,
+      "matchSetTotal": 31,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q008",
+      "q": "water",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173647"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 214,
+      "matchSetTotal": 220,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q009",
+      "q": "tap water",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173647"
+      ],
+      "matchedSourceKey": "usda:173647",
+      "rank": 11,
+      "rankInFullResultSet": 11,
+      "matchSetTotal": 11,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q010",
+      "q": "drinking water",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173647"
+      ],
+      "matchedSourceKey": "usda:173647",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 12,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q011",
+      "q": "croissant",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174987"
+      ],
+      "matchedSourceKey": "usda:174987",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 10,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q012",
+      "q": "crossaint",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:174987"
+      ],
+      "matchedSourceKey": "usda:174987",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q013",
+      "q": "croissants",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:174987"
+      ],
+      "matchedSourceKey": "usda:174987",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 10,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q014",
+      "q": "pita bread",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174916"
+      ],
+      "matchedSourceKey": "usda:174916",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q015",
+      "q": "pitta bread",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:174916"
+      ],
+      "matchedSourceKey": "usda:174916",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q016",
+      "q": "flatbread",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174916"
+      ],
+      "matchedSourceKey": "usda:174916",
+      "rank": 25,
+      "rankInFullResultSet": 25,
+      "matchSetTotal": 29,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q017",
+      "q": "tortilla",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2707825"
+      ],
+      "matchedSourceKey": "usda:2707825",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 51,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q018",
+      "q": "tortillas",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:2707825"
+      ],
+      "matchedSourceKey": "usda:2707825",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 51,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q019",
+      "q": "whole wheat tortilla",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:2707825"
+      ],
+      "matchedSourceKey": "usda:2707825",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q020",
+      "q": "whole wheat bread",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172688"
+      ],
+      "matchedSourceKey": "usda:172688",
+      "rank": 20,
+      "rankInFullResultSet": 20,
+      "matchSetTotal": 25,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q021",
+      "q": "wholewheat bread",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:172688"
+      ],
+      "matchedSourceKey": "usda:172688",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q022",
+      "q": "wholemeal bread",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172688"
+      ],
+      "matchedSourceKey": "usda:172688",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q023",
+      "q": "crackers",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172749"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 73,
+      "matchSetTotal": 109,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q024",
+      "q": "wheat crackers",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172749"
+      ],
+      "matchedSourceKey": "usda:172749",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 18,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q025",
+      "q": "balsamic vinegar",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172241"
+      ],
+      "matchedSourceKey": "usda:172241",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q026",
+      "q": "vinegar",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172241"
+      ],
+      "matchedSourceKey": "usda:172241",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q027",
+      "q": "balsamic",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172241"
+      ],
+      "matchedSourceKey": "usda:172241",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q028",
+      "q": "hummus",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174289"
+      ],
+      "matchedSourceKey": "usda:174289",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 5,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q029",
+      "q": "humus",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:174289"
+      ],
+      "matchedSourceKey": "usda:174289",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q030",
+      "q": "houmous",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174289"
+      ],
+      "matchedSourceKey": "usda:174289",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q031",
+      "q": "mayonnaise",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171009"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 31,
+      "matchSetTotal": 57,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q032",
+      "q": "mayonaise",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:171009"
+      ],
+      "matchedSourceKey": "usda:171009",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q033",
+      "q": "mayo",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171009"
+      ],
+      "matchedSourceKey": "usda:171009",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 20,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q034",
+      "q": "ranch dressing",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173592"
+      ],
+      "matchedSourceKey": "usda:173592",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q035",
+      "q": "ranch",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173592"
+      ],
+      "matchedSourceKey": "usda:173592",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q036",
+      "q": "salsa",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174524"
+      ],
+      "matchedSourceKey": "usda:174524",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q037",
+      "q": "salza",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:174524"
+      ],
+      "matchedSourceKey": "usda:174524",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q038",
+      "q": "pico de gallo",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174524"
+      ],
+      "matchedSourceKey": "usda:174524",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q039",
+      "q": "soy sauce",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174277"
+      ],
+      "matchedSourceKey": "usda:174277",
+      "rank": 11,
+      "rankInFullResultSet": 11,
+      "matchSetTotal": 57,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q040",
+      "q": "shoyu",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174277"
+      ],
+      "matchedSourceKey": "usda:174277",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q041",
+      "q": "soya sauce",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174277"
+      ],
+      "matchedSourceKey": "usda:174277",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q042",
+      "q": "sriracha",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171186"
+      ],
+      "matchedSourceKey": "usda:171186",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q043",
+      "q": "hot sauce",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171186"
+      ],
+      "matchedSourceKey": "usda:171186",
+      "rank": 10,
+      "rankInFullResultSet": 10,
+      "matchSetTotal": 11,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q044",
+      "q": "chili sauce",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171186"
+      ],
+      "matchedSourceKey": "usda:171186",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 5,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q045",
+      "q": "mustard",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172234"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 26,
+      "matchSetTotal": 26,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q046",
+      "q": "yellow mustard",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172234"
+      ],
+      "matchedSourceKey": "usda:172234",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q047",
+      "q": "american mustard",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172234"
+      ],
+      "matchedSourceKey": "usda:172234",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q048",
+      "q": "blue cheese",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172175"
+      ],
+      "matchedSourceKey": "usda:172175",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 10,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q049",
+      "q": "bleu cheese",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:172175"
+      ],
+      "matchedSourceKey": "usda:172175",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q050",
+      "q": "butter",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173410"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 39,
+      "matchSetTotal": 231,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q051",
+      "q": "salted butter",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173410"
+      ],
+      "matchedSourceKey": "usda:173410",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 19,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q052",
+      "q": "cheddar cheese",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:328637"
+      ],
+      "matchedSourceKey": "usda:328637",
+      "rank": 13,
+      "rankInFullResultSet": 13,
+      "matchSetTotal": 22,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q053",
+      "q": "cheeder cheese",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:328637"
+      ],
+      "matchedSourceKey": "usda:328637",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q054",
+      "q": "cheddar",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:328637"
+      ],
+      "matchedSourceKey": "usda:328637",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 23,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q055",
+      "q": "feta cheese",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173420"
+      ],
+      "matchedSourceKey": "usda:173420",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q056",
+      "q": "fetta",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:173420"
+      ],
+      "matchedSourceKey": "usda:173420",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q057",
+      "q": "feta",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173420"
+      ],
+      "matchedSourceKey": "usda:173420",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q058",
+      "q": "greek yogurt",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2705424"
+      ],
+      "matchedSourceKey": "usda:2705424",
+      "rank": 23,
+      "rankInFullResultSet": 23,
+      "matchSetTotal": 23,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q059",
+      "q": "greek yoghurt",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2705424"
+      ],
+      "matchedSourceKey": "usda:2705424",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q060",
+      "q": "yoghurt",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2705424"
+      ],
+      "matchedSourceKey": "usda:2705424",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q061",
+      "q": "heavy cream",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170859"
+      ],
+      "matchedSourceKey": "usda:170859",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 4,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q062",
+      "q": "heavy whipping cream",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:170859"
+      ],
+      "matchedSourceKey": "usda:170859",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q063",
+      "q": "double cream",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170859"
+      ],
+      "matchedSourceKey": "usda:170859",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q064",
+      "q": "reduced fat milk",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171267"
+      ],
+      "matchedSourceKey": "usda:171267",
+      "rank": 17,
+      "rankInFullResultSet": 17,
+      "matchSetTotal": 24,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q065",
+      "q": "semi skimmed milk",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171267"
+      ],
+      "matchedSourceKey": "usda:171267",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q066",
+      "q": "almond milk",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174832"
+      ],
+      "matchedSourceKey": "usda:174832",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 12,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q067",
+      "q": "almondmilk",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:174832"
+      ],
+      "matchedSourceKey": "usda:174832",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q068",
+      "q": "unsweetened almond milk",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:174832"
+      ],
+      "matchedSourceKey": "usda:174832",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 5,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q069",
+      "q": "coconut milk",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170173"
+      ],
+      "matchedSourceKey": "usda:170173",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 19,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q070",
+      "q": "tinned coconut milk",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170173"
+      ],
+      "matchedSourceKey": "usda:170173",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q071",
+      "q": "oat milk",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2705412"
+      ],
+      "matchedSourceKey": "usda:2705412",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 10,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q072",
+      "q": "oatmilk",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:2705412"
+      ],
+      "matchedSourceKey": "usda:2705412",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q073",
+      "q": "oat drink",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2705412"
+      ],
+      "matchedSourceKey": "usda:2705412",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q074",
+      "q": "soy milk",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:175215"
+      ],
+      "matchedSourceKey": "usda:175215",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 19,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q075",
+      "q": "soymilk",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:175215"
+      ],
+      "matchedSourceKey": "usda:175215",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 12,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q076",
+      "q": "soya milk",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:175215"
+      ],
+      "matchedSourceKey": "usda:175215",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q077",
+      "q": "all purpose flour",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168894"
+      ],
+      "matchedSourceKey": "usda:168894",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 8,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q078",
+      "q": "wheat flour",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:168894"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 26,
+      "matchSetTotal": 30,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q079",
+      "q": "plain flour",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:168894"
+      ],
+      "matchedSourceKey": "usda:168894",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q080",
+      "q": "cooked brown rice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169704"
+      ],
+      "matchedSourceKey": "usda:169704",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 13,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q081",
+      "q": "steamed brown rice",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169704"
+      ],
+      "matchedSourceKey": "usda:169704",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q082",
+      "q": "uncooked brown rice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169703"
+      ],
+      "matchedSourceKey": "usda:169703",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q083",
+      "q": "wholegrain rice",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169703"
+      ],
+      "matchedSourceKey": "usda:169703",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q084",
+      "q": "bulgur",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170688"
+      ],
+      "matchedSourceKey": "usda:170688",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 6,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q085",
+      "q": "bulghur",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:170688"
+      ],
+      "matchedSourceKey": "usda:170688",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q086",
+      "q": "bulgar",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:170688"
+      ],
+      "matchedSourceKey": "usda:170688",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q087",
+      "q": "cooked pasta",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169737"
+      ],
+      "matchedSourceKey": "usda:169737",
+      "rank": 22,
+      "rankInFullResultSet": 22,
+      "matchSetTotal": 27,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q088",
+      "q": "boiled pasta",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169737"
+      ],
+      "matchedSourceKey": "usda:169737",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q089",
+      "q": "cooked spaghetti",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169737"
+      ],
+      "matchedSourceKey": "usda:169737",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 6,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q090",
+      "q": "dry pasta",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169736"
+      ],
+      "matchedSourceKey": "usda:169736",
+      "rank": 10,
+      "rankInFullResultSet": 10,
+      "matchSetTotal": 14,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q091",
+      "q": "uncooked pasta",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169736"
+      ],
+      "matchedSourceKey": "usda:169736",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q092",
+      "q": "penne",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169736"
+      ],
+      "matchedSourceKey": "usda:169736",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q093",
+      "q": "pearl barley",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170284"
+      ],
+      "matchedSourceKey": "usda:170284",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q094",
+      "q": "barley",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170284"
+      ],
+      "matchedSourceKey": "usda:170284",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 13,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q095",
+      "q": "cooked quinoa",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168917"
+      ],
+      "matchedSourceKey": "usda:168917",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q096",
+      "q": "uncooked quinoa",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168874"
+      ],
+      "matchedSourceKey": "usda:168874",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q097",
+      "q": "keenwa",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:168874"
+      ],
+      "matchedSourceKey": "usda:168874",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q098",
+      "q": "rolled oats",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173904"
+      ],
+      "matchedSourceKey": "usda:173904",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q099",
+      "q": "oats",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173904"
+      ],
+      "matchedSourceKey": "usda:173904",
+      "rank": 13,
+      "rankInFullResultSet": 13,
+      "matchSetTotal": 63,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q100",
+      "q": "oatmeal",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173904"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 54,
+      "matchSetTotal": 54,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q101",
+      "q": "cooked white rice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169757"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 30,
+      "matchSetTotal": 30,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q102",
+      "q": "boiled rice",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169757"
+      ],
+      "matchedSourceKey": "usda:169757",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q103",
+      "q": "long grain rice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169756"
+      ],
+      "matchedSourceKey": "usda:169756",
+      "rank": 13,
+      "rankInFullResultSet": 13,
+      "matchSetTotal": 13,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q104",
+      "q": "raw rice",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169756"
+      ],
+      "matchedSourceKey": "usda:169756",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 14,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q105",
+      "q": "canned black beans",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:175238"
+      ],
+      "matchedSourceKey": "usda:175238",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 8,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q106",
+      "q": "tinned black beans",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:175238"
+      ],
+      "matchedSourceKey": "usda:175238",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q107",
+      "q": "dry black beans",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173734"
+      ],
+      "matchedSourceKey": "usda:173734",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q108",
+      "q": "turtle beans",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173734"
+      ],
+      "matchedSourceKey": "usda:173734",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 5,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q109",
+      "q": "canned chickpeas",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173800"
+      ],
+      "matchedSourceKey": "usda:173800",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 8,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q110",
+      "q": "tinned chickpeas",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173800"
+      ],
+      "matchedSourceKey": "usda:173800",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q111",
+      "q": "dry chickpeas",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173756"
+      ],
+      "matchedSourceKey": "usda:173756",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 4,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q112",
+      "q": "chick peas",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173756"
+      ],
+      "matchedSourceKey": "usda:173756",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q113",
+      "q": "edamame",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169282"
+      ],
+      "matchedSourceKey": "usda:169282",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 4,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q114",
+      "q": "edaname",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169282"
+      ],
+      "matchedSourceKey": "usda:169282",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q115",
+      "q": "green soybeans",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169282"
+      ],
+      "matchedSourceKey": "usda:169282",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q116",
+      "q": "kidney beans",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174285"
+      ],
+      "matchedSourceKey": "usda:174285",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 34,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q117",
+      "q": "red kidney beans",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:174285"
+      ],
+      "matchedSourceKey": "usda:174285",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 15,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q118",
+      "q": "rajma",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174285"
+      ],
+      "matchedSourceKey": "usda:174285",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q119",
+      "q": "cooked lentils",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172421"
+      ],
+      "matchedSourceKey": "usda:172421",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q120",
+      "q": "boiled lentils",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172421"
+      ],
+      "matchedSourceKey": "usda:172421",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q121",
+      "q": "dry lentils",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172420"
+      ],
+      "matchedSourceKey": "usda:172420",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q122",
+      "q": "red lentils",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172420"
+      ],
+      "matchedSourceKey": "usda:172420",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q123",
+      "q": "almonds",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170567"
+      ],
+      "matchedSourceKey": "usda:170567",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 52,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q124",
+      "q": "almond",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170567"
+      ],
+      "matchedSourceKey": "usda:170567",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 52,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q125",
+      "q": "cashews",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170162"
+      ],
+      "matchedSourceKey": "usda:170162",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 15,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q126",
+      "q": "cashew",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170162"
+      ],
+      "matchedSourceKey": "usda:170162",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 15,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q127",
+      "q": "kaju",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170162"
+      ],
+      "matchedSourceKey": "usda:170162",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q128",
+      "q": "peanut butter",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172470"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 49,
+      "matchSetTotal": 72,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q129",
+      "q": "peanutbutter",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:172470"
+      ],
+      "matchedSourceKey": "usda:172470",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q130",
+      "q": "creamy peanut butter",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172470"
+      ],
+      "matchedSourceKey": "usda:172470",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q131",
+      "q": "peanuts",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173806"
+      ],
+      "matchedSourceKey": "usda:173806",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 124,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q132",
+      "q": "roasted peanuts",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173806"
+      ],
+      "matchedSourceKey": "usda:173806",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 24,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q133",
+      "q": "groundnuts",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173806"
+      ],
+      "matchedSourceKey": "usda:173806",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q134",
+      "q": "pistachios",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170184"
+      ],
+      "matchedSourceKey": "usda:170184",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 8,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q135",
+      "q": "pistachio",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170184"
+      ],
+      "matchedSourceKey": "usda:170184",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 8,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q136",
+      "q": "shredded coconut",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170170"
+      ],
+      "matchedSourceKey": "usda:170170",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q137",
+      "q": "coconut flakes",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:170170"
+      ],
+      "matchedSourceKey": "usda:170170",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q138",
+      "q": "desiccated coconut",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170170"
+      ],
+      "matchedSourceKey": "usda:170170",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 6,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q139",
+      "q": "sunflower seeds",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170562"
+      ],
+      "matchedSourceKey": "usda:170562",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 16,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q140",
+      "q": "sunflower kernels",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170562"
+      ],
+      "matchedSourceKey": "usda:170562",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 9,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q141",
+      "q": "tahini",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170189"
+      ],
+      "matchedSourceKey": "usda:170189",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 4,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q142",
+      "q": "tahina",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:170189"
+      ],
+      "matchedSourceKey": "usda:170189",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q143",
+      "q": "sesame paste",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170189"
+      ],
+      "matchedSourceKey": "usda:170189",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q144",
+      "q": "walnuts",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170187"
+      ],
+      "matchedSourceKey": "usda:170187",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q145",
+      "q": "walnut",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170187"
+      ],
+      "matchedSourceKey": "usda:170187",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q146",
+      "q": "english walnuts",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:170187"
+      ],
+      "matchedSourceKey": "usda:170187",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q147",
+      "q": "canola oil",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172336"
+      ],
+      "matchedSourceKey": "usda:172336",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 10,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q148",
+      "q": "vegetable oil",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172336"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 78,
+      "matchSetTotal": 151,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q149",
+      "q": "coconut oil",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171412"
+      ],
+      "matchedSourceKey": "usda:171412",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q150",
+      "q": "virgin coconut oil",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:171412"
+      ],
+      "matchedSourceKey": "usda:171412",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q151",
+      "q": "olive oil",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171413"
+      ],
+      "matchedSourceKey": "usda:171413",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 5,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q152",
+      "q": "extra virgin olive oil",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:171413"
+      ],
+      "matchedSourceKey": "usda:171413",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q153",
+      "q": "evoo",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171413"
+      ],
+      "matchedSourceKey": "usda:171413",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q154",
+      "q": "cornstarch",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169698"
+      ],
+      "matchedSourceKey": "usda:169698",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q155",
+      "q": "corn starch",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169698"
+      ],
+      "matchedSourceKey": "usda:169698",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q156",
+      "q": "cornflour",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169698"
+      ],
+      "matchedSourceKey": "usda:169698",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q157",
+      "q": "meal replacement shake",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2710725"
+      ],
+      "matchedSourceKey": "usda:2710725",
+      "rank": 10,
+      "rankInFullResultSet": 10,
+      "matchSetTotal": 10,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q158",
+      "q": "nutrition shake",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2710725"
+      ],
+      "matchedSourceKey": "usda:2710725",
+      "rank": 11,
+      "rankInFullResultSet": 11,
+      "matchSetTotal": 11,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q159",
+      "q": "whey protein",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2710742"
+      ],
+      "matchedSourceKey": "usda:2710742",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q160",
+      "q": "protein powder",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2710742"
+      ],
+      "matchedSourceKey": "usda:2710742",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q161",
+      "q": "burrito",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2708549"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 28,
+      "matchSetTotal": 43,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q162",
+      "q": "bean burrito",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:2708549"
+      ],
+      "matchedSourceKey": "usda:2708549",
+      "rank": 14,
+      "rankInFullResultSet": 14,
+      "matchSetTotal": 23,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q163",
+      "q": "pizza",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2708618"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 61,
+      "matchSetTotal": 120,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q164",
+      "q": "cheese pizza",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:2708618"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 42,
+      "matchSetTotal": 51,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q165",
+      "q": "margherita pizza",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2708618"
+      ],
+      "matchedSourceKey": "usda:2708618",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q166",
+      "q": "chicken noodle soup",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172909"
+      ],
+      "matchedSourceKey": "usda:172909",
+      "rank": 10,
+      "rankInFullResultSet": 10,
+      "matchSetTotal": 10,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q167",
+      "q": "noodle soup",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172909"
+      ],
+      "matchedSourceKey": "usda:172909",
+      "rank": 20,
+      "rankInFullResultSet": 20,
+      "matchSetTotal": 20,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q168",
+      "q": "chicken soup",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172909"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 44,
+      "matchSetTotal": 47,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q169",
+      "q": "ham and cheese sandwich",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2706967"
+      ],
+      "matchedSourceKey": "usda:2706967",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 6,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q170",
+      "q": "ham sandwich",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:2706967"
+      ],
+      "matchedSourceKey": "usda:2706967",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 21,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q171",
+      "q": "green salad",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2709823"
+      ],
+      "matchedSourceKey": "usda:2709823",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 8,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q172",
+      "q": "side salad",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2709823"
+      ],
+      "matchedSourceKey": "usda:2709823",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q173",
+      "q": "mixed salad",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2709823"
+      ],
+      "matchedSourceKey": "usda:2709823",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q174",
+      "q": "macaroni and cheese",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2708811"
+      ],
+      "matchedSourceKey": "usda:2708811",
+      "rank": 16,
+      "rankInFullResultSet": 16,
+      "matchSetTotal": 27,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q175",
+      "q": "mac and cheese",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2708811"
+      ],
+      "matchedSourceKey": "usda:2708811",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q176",
+      "q": "spaghetti marinara",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2708831"
+      ],
+      "matchedSourceKey": "usda:2708831",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q177",
+      "q": "spagetti with tomato sauce",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:2708831"
+      ],
+      "matchedSourceKey": "usda:2708831",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q178",
+      "q": "pasta with tomato sauce",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:2708831"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 42,
+      "matchSetTotal": 71,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q179",
+      "q": "apple",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168202"
+      ],
+      "matchedSourceKey": "usda:168202",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 126,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q180",
+      "q": "apples",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:168202"
+      ],
+      "matchedSourceKey": "usda:168202",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 126,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q181",
+      "q": "gala apple",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:168202"
+      ],
+      "matchedSourceKey": "usda:168202",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q182",
+      "q": "avocado",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171705"
+      ],
+      "matchedSourceKey": "usda:171705",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 10,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q183",
+      "q": "avacado",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:171705"
+      ],
+      "matchedSourceKey": "usda:171705",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q184",
+      "q": "avocadoes",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:171705"
+      ],
+      "matchedSourceKey": "usda:171705",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 10,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q185",
+      "q": "banana",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173944"
+      ],
+      "matchedSourceKey": "usda:173944",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 77,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q186",
+      "q": "bannana",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:173944"
+      ],
+      "matchedSourceKey": "usda:173944",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q187",
+      "q": "bananas",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:173944"
+      ],
+      "matchedSourceKey": "usda:173944",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 77,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q188",
+      "q": "grapes",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174683"
+      ],
+      "matchedSourceKey": "usda:174683",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 39,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q189",
+      "q": "grape",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:174683"
+      ],
+      "matchedSourceKey": "usda:174683",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 63,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q190",
+      "q": "seedless grapes",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:174683"
+      ],
+      "matchedSourceKey": "usda:174683",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 5,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q191",
+      "q": "lemon",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:167746"
+      ],
+      "matchedSourceKey": "usda:167746",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 60,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q192",
+      "q": "lemons",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:167746"
+      ],
+      "matchedSourceKey": "usda:167746",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 50,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q193",
+      "q": "fresh lemon",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:167746"
+      ],
+      "matchedSourceKey": "usda:167746",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q194",
+      "q": "lime",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168155"
+      ],
+      "matchedSourceKey": "usda:168155",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 12,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q195",
+      "q": "limes",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:168155"
+      ],
+      "matchedSourceKey": "usda:168155",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 11,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q196",
+      "q": "key lime",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:168155"
+      ],
+      "matchedSourceKey": "usda:168155",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q197",
+      "q": "mango",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169910"
+      ],
+      "matchedSourceKey": "usda:169910",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 12,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q198",
+      "q": "mangos",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169910"
+      ],
+      "matchedSourceKey": "usda:169910",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 12,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q199",
+      "q": "mangoes",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:169910"
+      ],
+      "matchedSourceKey": "usda:169910",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 11,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q200",
+      "q": "peach",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169928"
+      ],
+      "matchedSourceKey": "usda:169928",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 52,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q201",
+      "q": "peaches",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:169928"
+      ],
+      "matchedSourceKey": "usda:169928",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 52,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q202",
+      "q": "raisins",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168165"
+      ],
+      "matchedSourceKey": "usda:168165",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 49,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q203",
+      "q": "raisin",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:168165"
+      ],
+      "matchedSourceKey": "usda:168165",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 49,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q204",
+      "q": "dried grapes",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:168165"
+      ],
+      "matchedSourceKey": "usda:168165",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q205",
+      "q": "strawberries",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:167762"
+      ],
+      "matchedSourceKey": "usda:167762",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 37,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q206",
+      "q": "strawberrys",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:167762"
+      ],
+      "matchedSourceKey": "usda:167762",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 37,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q207",
+      "q": "strawberry",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:167762"
+      ],
+      "matchedSourceKey": "usda:167762",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 37,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q208",
+      "q": "bell pepper",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170108"
+      ],
+      "matchedSourceKey": "usda:170108",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 24,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q209",
+      "q": "bell peppers",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170108"
+      ],
+      "matchedSourceKey": "usda:170108",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 24,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q210",
+      "q": "capsicum",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170108"
+      ],
+      "matchedSourceKey": "usda:170108",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q211",
+      "q": "broccoli",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170379"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 78,
+      "matchSetTotal": 194,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q212",
+      "q": "brocoli",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:170379"
+      ],
+      "matchedSourceKey": "usda:170379",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q213",
+      "q": "brocolli",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:170379"
+      ],
+      "matchedSourceKey": "usda:170379",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q214",
+      "q": "cabbage",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169975"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 37,
+      "matchSetTotal": 43,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q215",
+      "q": "shredded cabbage",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169975"
+      ],
+      "matchedSourceKey": "usda:169975",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q216",
+      "q": "green cabbage",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169975"
+      ],
+      "matchedSourceKey": "usda:169975",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q217",
+      "q": "carrot",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170393"
+      ],
+      "matchedSourceKey": "usda:170393",
+      "rank": 13,
+      "rankInFullResultSet": 13,
+      "matchSetTotal": 265,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q218",
+      "q": "carrots",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170393"
+      ],
+      "matchedSourceKey": "usda:170393",
+      "rank": 13,
+      "rankInFullResultSet": 13,
+      "matchSetTotal": 265,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q219",
+      "q": "baby carrots",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:170393"
+      ],
+      "matchedSourceKey": "usda:170393",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q220",
+      "q": "cauliflower",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169986"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 26,
+      "matchSetTotal": 27,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q221",
+      "q": "cauliflour",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169986"
+      ],
+      "matchedSourceKey": "usda:169986",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q222",
+      "q": "califlower",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169986"
+      ],
+      "matchedSourceKey": "usda:169986",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q223",
+      "q": "celery",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169988"
+      ],
+      "matchedSourceKey": "usda:169988",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 14,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q224",
+      "q": "celery stalks",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169988"
+      ],
+      "matchedSourceKey": "usda:169988",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q225",
+      "q": "green chili",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170497"
+      ],
+      "matchedSourceKey": "usda:170497",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 5,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q226",
+      "q": "chilli pepper",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170497"
+      ],
+      "matchedSourceKey": "usda:170497",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q227",
+      "q": "hot pepper",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170497"
+      ],
+      "matchedSourceKey": "usda:170497",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 12,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q228",
+      "q": "cucumber",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168409"
+      ],
+      "matchedSourceKey": "usda:168409",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 17,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q229",
+      "q": "cucumbers",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:168409"
+      ],
+      "matchedSourceKey": "usda:168409",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 17,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q230",
+      "q": "cukes",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:168409"
+      ],
+      "matchedSourceKey": "usda:168409",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q231",
+      "q": "eggplant",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169228"
+      ],
+      "matchedSourceKey": "usda:169228",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 13,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q232",
+      "q": "aubergine",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169228"
+      ],
+      "matchedSourceKey": "usda:169228",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q233",
+      "q": "brinjal",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169228"
+      ],
+      "matchedSourceKey": "usda:169228",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q234",
+      "q": "garlic",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169230"
+      ],
+      "matchedSourceKey": "usda:169230",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 15,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q235",
+      "q": "garlic cloves",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169230"
+      ],
+      "matchedSourceKey": "usda:169230",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q236",
+      "q": "mushrooms",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169251"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 41,
+      "matchSetTotal": 100,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q237",
+      "q": "mushroom",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:169251"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 41,
+      "matchSetTotal": 100,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q238",
+      "q": "button mushrooms",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169251"
+      ],
+      "matchedSourceKey": "usda:169251",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q239",
+      "q": "olives",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169094"
+      ],
+      "matchedSourceKey": "usda:169094",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 12,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q240",
+      "q": "olive",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:169094"
+      ],
+      "matchedSourceKey": "usda:169094",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 12,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q241",
+      "q": "black olives",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169094"
+      ],
+      "matchedSourceKey": "usda:169094",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q242",
+      "q": "onion",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170000"
+      ],
+      "matchedSourceKey": "usda:170000",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 87,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q243",
+      "q": "onions",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170000"
+      ],
+      "matchedSourceKey": "usda:170000",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 87,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q244",
+      "q": "yellow onion",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:170000"
+      ],
+      "matchedSourceKey": "usda:170000",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q245",
+      "q": "potato",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170027"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 119,
+      "matchSetTotal": 495,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q246",
+      "q": "potatoes",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170027"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 119,
+      "matchSetTotal": 495,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q247",
+      "q": "russet potato",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:170027"
+      ],
+      "matchedSourceKey": "usda:170027",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q248",
+      "q": "spinach",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168462"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 48,
+      "matchSetTotal": 60,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q249",
+      "q": "spinich",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:168462"
+      ],
+      "matchedSourceKey": "usda:168462",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q250",
+      "q": "baby spinach",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:168462"
+      ],
+      "matchedSourceKey": "usda:168462",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q251",
+      "q": "sweet potato",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168482"
+      ],
+      "matchedSourceKey": "usda:168482",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 57,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q252",
+      "q": "sweetpotato",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:168482"
+      ],
+      "matchedSourceKey": "usda:168482",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q253",
+      "q": "sweet potatoes",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:168482"
+      ],
+      "matchedSourceKey": "usda:168482",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 57,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q254",
+      "q": "tomato",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170457"
+      ],
+      "matchedSourceKey": "usda:170457",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 334,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q255",
+      "q": "tomatos",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:170457"
+      ],
+      "matchedSourceKey": "usda:170457",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 334,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q256",
+      "q": "tomatoes",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:170457"
+      ],
+      "matchedSourceKey": "usda:170457",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 333,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q257",
+      "q": "zucchini",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169291"
+      ],
+      "matchedSourceKey": "usda:169291",
+      "rank": 13,
+      "rankInFullResultSet": 13,
+      "matchSetTotal": 13,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q258",
+      "q": "zuchini",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169291"
+      ],
+      "matchedSourceKey": "usda:169291",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q259",
+      "q": "courgette",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169291"
+      ],
+      "matchedSourceKey": "usda:169291",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q260",
+      "q": "egg",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171287"
+      ],
+      "matchedSourceKey": "usda:171287",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 311,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q261",
+      "q": "eggs",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:171287"
+      ],
+      "matchedSourceKey": "usda:171287",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 299,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q262",
+      "q": "large egg",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:171287"
+      ],
+      "matchedSourceKey": "usda:171287",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q263",
+      "q": "egg white",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172183"
+      ],
+      "matchedSourceKey": "usda:172183",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 33,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q264",
+      "q": "egg whites",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:172183"
+      ],
+      "matchedSourceKey": "usda:172183",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 33,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q265",
+      "q": "albumen",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172183"
+      ],
+      "matchedSourceKey": "usda:172183",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q266",
+      "q": "egg yolk",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172184"
+      ],
+      "matchedSourceKey": "usda:172184",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 13,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q267",
+      "q": "egg yolks",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:172184"
+      ],
+      "matchedSourceKey": "usda:172184",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 13,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q268",
+      "q": "yolk",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172184"
+      ],
+      "matchedSourceKey": "usda:172184",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 13,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q269",
+      "q": "egg substitute",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173462"
+      ],
+      "matchedSourceKey": "usda:173462",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 11,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q270",
+      "q": "liquid eggs",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173462"
+      ],
+      "matchedSourceKey": "usda:173462",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q271",
+      "q": "egg replacer",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173462"
+      ],
+      "matchedSourceKey": "usda:173462",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q272",
+      "q": "bacon",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168277"
+      ],
+      "matchedSourceKey": "usda:168277",
+      "rank": 23,
+      "rankInFullResultSet": 23,
+      "matchSetTotal": 60,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q273",
+      "q": "bacon strips",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:168277"
+      ],
+      "matchedSourceKey": "usda:168277",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q274",
+      "q": "streaky bacon",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:168277"
+      ],
+      "matchedSourceKey": "usda:168277",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q275",
+      "q": "beef liver",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169451"
+      ],
+      "matchedSourceKey": "usda:169451",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q276",
+      "q": "calf liver",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169451"
+      ],
+      "matchedSourceKey": "usda:169451",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q277",
+      "q": "liver",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169451"
+      ],
+      "matchedSourceKey": "usda:169451",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 46,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q278",
+      "q": "ground beef",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173110"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 51,
+      "matchSetTotal": 59,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q279",
+      "q": "minced beef",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173110"
+      ],
+      "matchedSourceKey": "usda:173110",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q280",
+      "q": "hamburger meat",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173110"
+      ],
+      "matchedSourceKey": "usda:173110",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q281",
+      "q": "ground bison",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174421"
+      ],
+      "matchedSourceKey": "usda:174421",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 4,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q282",
+      "q": "buffalo meat",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174421"
+      ],
+      "matchedSourceKey": "usda:174421",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 5,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q283",
+      "q": "bison",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174421"
+      ],
+      "matchedSourceKey": "usda:174421",
+      "rank": 16,
+      "rankInFullResultSet": 16,
+      "matchSetTotal": 16,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q284",
+      "q": "ground lamb",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174370"
+      ],
+      "matchedSourceKey": "usda:174370",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 6,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q285",
+      "q": "minced lamb",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174370"
+      ],
+      "matchedSourceKey": "usda:174370",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q286",
+      "q": "pork tenderloin",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168249"
+      ],
+      "matchedSourceKey": "usda:168249",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 12,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q287",
+      "q": "pork loin",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:168249"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 125,
+      "matchSetTotal": 125,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q288",
+      "q": "tempeh",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174272"
+      ],
+      "matchedSourceKey": "usda:174272",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q289",
+      "q": "tempe",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:174272"
+      ],
+      "matchedSourceKey": "usda:174272",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q290",
+      "q": "tofu",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172448"
+      ],
+      "matchedSourceKey": "usda:172448",
+      "rank": 14,
+      "rankInFullResultSet": 14,
+      "matchSetTotal": 22,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q291",
+      "q": "firm tofu",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172448"
+      ],
+      "matchedSourceKey": "usda:172448",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q292",
+      "q": "bean curd",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172448"
+      ],
+      "matchedSourceKey": "usda:172448",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q293",
+      "q": "wheat gluten",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2709163"
+      ],
+      "matchedSourceKey": "usda:2709163",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q294",
+      "q": "wheat meat",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:2709163"
+      ],
+      "matchedSourceKey": "usda:2709163",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 13,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q295",
+      "q": "seitan",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2709163"
+      ],
+      "matchedSourceKey": "usda:2709163",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q296",
+      "q": "chiken breast",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:171077"
+      ],
+      "matchedSourceKey": "usda:171077",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q297",
+      "q": "chicken breasts",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:171077"
+      ],
+      "matchedSourceKey": "usda:171077",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 52,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q298",
+      "q": "boneless skinless chicken breast",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:171077"
+      ],
+      "matchedSourceKey": "usda:171077",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 7,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q299",
+      "q": "grilled chicken breast",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171477"
+      ],
+      "matchedSourceKey": "usda:171477",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q300",
+      "q": "cooked chicken breast",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:171477"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 31,
+      "matchSetTotal": 40,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q301",
+      "q": "roasted chicken breast",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171477"
+      ],
+      "matchedSourceKey": "usda:171477",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 8,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q302",
+      "q": "duck",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172410"
+      ],
+      "matchedSourceKey": "usda:172410",
+      "rank": 18,
+      "rankInFullResultSet": 18,
+      "matchSetTotal": 21,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q303",
+      "q": "duck breast",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172410"
+      ],
+      "matchedSourceKey": "usda:172410",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 4,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q304",
+      "q": "duckling",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172410"
+      ],
+      "matchedSourceKey": "usda:172410",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 5,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q305",
+      "q": "turkey bacon",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:2706135"
+      ],
+      "matchedSourceKey": "usda:2706135",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q306",
+      "q": "turkey rashers",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:2706135"
+      ],
+      "matchedSourceKey": "usda:2706135",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q307",
+      "q": "raw turkey breast",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171098"
+      ],
+      "matchedSourceKey": "usda:171098",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q308",
+      "q": "turkey fillet",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171098"
+      ],
+      "matchedSourceKey": "usda:171098",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q309",
+      "q": "sliced turkey",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172941"
+      ],
+      "matchedSourceKey": "usda:172941",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q310",
+      "q": "turkey slices",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172941"
+      ],
+      "matchedSourceKey": "usda:172941",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q311",
+      "q": "deli turkey",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172941"
+      ],
+      "matchedSourceKey": "usda:172941",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q312",
+      "q": "anchovies",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174183"
+      ],
+      "matchedSourceKey": "usda:174183",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q313",
+      "q": "anchovie",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:174183"
+      ],
+      "matchedSourceKey": "usda:174183",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q314",
+      "q": "anchovy",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:174183"
+      ],
+      "matchedSourceKey": "usda:174183",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q315",
+      "q": "cod",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171955"
+      ],
+      "matchedSourceKey": "usda:171955",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 17,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q316",
+      "q": "cod filet",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:171955"
+      ],
+      "matchedSourceKey": "usda:171955",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q317",
+      "q": "codfish",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171955"
+      ],
+      "matchedSourceKey": "usda:171955",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q318",
+      "q": "mussels",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174216"
+      ],
+      "matchedSourceKey": "usda:174216",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q319",
+      "q": "mussel",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:174216"
+      ],
+      "matchedSourceKey": "usda:174216",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q320",
+      "q": "salmon",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:175167"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 59,
+      "matchSetTotal": 65,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q321",
+      "q": "salmon filet",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:175167"
+      ],
+      "matchedSourceKey": "usda:175167",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q322",
+      "q": "atlantic salmon",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:175167"
+      ],
+      "matchedSourceKey": "usda:175167",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 5,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q323",
+      "q": "shrimp",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:174210"
+      ],
+      "matchedSourceKey": "usda:174210",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 65,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q324",
+      "q": "shrimps",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:174210"
+      ],
+      "matchedSourceKey": "usda:174210",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 65,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q325",
+      "q": "prawns",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:174210"
+      ],
+      "matchedSourceKey": "usda:174210",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q326",
+      "q": "tilapia",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:175176"
+      ],
+      "matchedSourceKey": "usda:175176",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q327",
+      "q": "tilapa",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:175176"
+      ],
+      "matchedSourceKey": "usda:175176",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q328",
+      "q": "tuna",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171986"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 53,
+      "matchSetTotal": 53,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q329",
+      "q": "canned tuna",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:171986"
+      ],
+      "matchedSourceKey": "usda:171986",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 10,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q330",
+      "q": "popcorn",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:167959"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 35,
+      "matchSetTotal": 46,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q331",
+      "q": "air popped popcorn",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:167959"
+      ],
+      "matchedSourceKey": "usda:167959",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q332",
+      "q": "potato chips",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169677"
+      ],
+      "matchedSourceKey": "usda:169677",
+      "rank": 17,
+      "rankInFullResultSet": 17,
+      "matchSetTotal": 51,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q333",
+      "q": "crisps",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169677"
+      ],
+      "matchedSourceKey": "usda:169677",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q334",
+      "q": "pretzels",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:167555"
+      ],
+      "matchedSourceKey": "usda:167555",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 54,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q335",
+      "q": "pretzel",
+      "kind": "plural",
+      "expectedSourceKeys": [
+        "usda:167555"
+      ],
+      "matchedSourceKey": "usda:167555",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 54,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q336",
+      "q": "hard pretzels",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:167555"
+      ],
+      "matchedSourceKey": "usda:167555",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 26,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q337",
+      "q": "basil",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172232"
+      ],
+      "matchedSourceKey": "usda:172232",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q338",
+      "q": "fresh basil",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172232"
+      ],
+      "matchedSourceKey": "usda:172232",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q339",
+      "q": "black pepper",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170931"
+      ],
+      "matchedSourceKey": "usda:170931",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q340",
+      "q": "peppercorn",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170931"
+      ],
+      "matchedSourceKey": "usda:170931",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q341",
+      "q": "chili powder",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171319"
+      ],
+      "matchedSourceKey": "usda:171319",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q342",
+      "q": "chilli powder",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171319"
+      ],
+      "matchedSourceKey": "usda:171319",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q343",
+      "q": "cilantro",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169997"
+      ],
+      "matchedSourceKey": "usda:169997",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q344",
+      "q": "corriander",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169997"
+      ],
+      "matchedSourceKey": "usda:169997",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q345",
+      "q": "coriander",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169997"
+      ],
+      "matchedSourceKey": "usda:169997",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q346",
+      "q": "dill",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172233"
+      ],
+      "matchedSourceKey": "usda:172233",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 6,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q347",
+      "q": "dill weed",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:172233"
+      ],
+      "matchedSourceKey": "usda:172233",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q348",
+      "q": "ground cumin",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:170923"
+      ],
+      "matchedSourceKey": "usda:170923",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q349",
+      "q": "cumin",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170923"
+      ],
+      "matchedSourceKey": "usda:170923",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q350",
+      "q": "jeera",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170923"
+      ],
+      "matchedSourceKey": "usda:170923",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q351",
+      "q": "mint",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173475"
+      ],
+      "matchedSourceKey": "usda:173475",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q352",
+      "q": "mint leaves",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173475"
+      ],
+      "matchedSourceKey": "usda:173475",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q353",
+      "q": "spearmint",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173475"
+      ],
+      "matchedSourceKey": "usda:173475",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q354",
+      "q": "salt",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173468"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 463,
+      "matchSetTotal": 602,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q355",
+      "q": "sea salt",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:173468"
+      ],
+      "matchedSourceKey": "usda:173468",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q356",
+      "q": "granulated sugar",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169655"
+      ],
+      "matchedSourceKey": "usda:169655",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q357",
+      "q": "sugar",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169655"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 89,
+      "matchSetTotal": 162,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q358",
+      "q": "gumdrops",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:167989"
+      ],
+      "matchedSourceKey": "usda:167989",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q359",
+      "q": "gum drops",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:167989"
+      ],
+      "matchedSourceKey": "usda:167989",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q360",
+      "q": "gummy candy",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:167989"
+      ],
+      "matchedSourceKey": "usda:167989",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q361",
+      "q": "honey",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169640"
+      ],
+      "matchedSourceKey": "usda:169640",
+      "rank": 12,
+      "rankInFullResultSet": 12,
+      "matchSetTotal": 30,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q362",
+      "q": "raw honey",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:169640"
+      ],
+      "matchedSourceKey": "usda:169640",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q363",
+      "q": "maple syrup",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169661"
+      ],
+      "matchedSourceKey": "usda:169661",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q364",
+      "q": "maple sirup",
+      "kind": "misspelling",
+      "expectedSourceKeys": [
+        "usda:169661"
+      ],
+      "matchedSourceKey": "usda:169661",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q365",
+      "q": "chicken breast",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171077",
+        "usda:171477"
+      ],
+      "matchedSourceKey": "usda:171077",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 52,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q366",
+      "q": "turkey breast",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171098",
+        "usda:172941"
+      ],
+      "matchedSourceKey": "usda:171098",
+      "rank": 17,
+      "rankInFullResultSet": 17,
+      "matchSetTotal": 18,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q367",
+      "q": "quinoa",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:168874",
+        "usda:168917"
+      ],
+      "matchedSourceKey": "usda:168917",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 6,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q368",
+      "q": "lentils",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172420",
+        "usda:172421"
+      ],
+      "matchedSourceKey": "usda:172421",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 22,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q369",
+      "q": "chickpeas",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173756",
+        "usda:173800"
+      ],
+      "matchedSourceKey": "usda:173800",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 16,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q370",
+      "q": "garbanzo beans",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:173756",
+        "usda:173800"
+      ],
+      "matchedSourceKey": "usda:173800",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q371",
+      "q": "black beans",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173734",
+        "usda:175238"
+      ],
+      "matchedSourceKey": "usda:173734",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 23,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q372",
+      "q": "brown rice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169703",
+        "usda:169704"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 70,
+      "matchSetTotal": 88,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q373",
+      "q": "white rice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169756",
+        "usda:169757"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 95,
+      "matchSetTotal": 104,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q374",
+      "q": "steamed rice",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169704",
+        "usda:169757"
+      ],
+      "matchedSourceKey": "usda:169757",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q375",
+      "q": "macaroni",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169736",
+        "usda:2708811"
+      ],
+      "matchedSourceKey": "usda:2708811",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 52,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q376",
+      "q": "spaghetti",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:169737",
+        "usda:2708831"
+      ],
+      "matchedSourceKey": "usda:2708831",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 30,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q377",
+      "q": "rice",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169703",
+        "usda:169704",
+        "usda:169756",
+        "usda:169757"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 226,
+      "matchSetTotal": 355,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q378",
+      "q": "pasta",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:169736",
+        "usda:169737"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 209,
+      "matchSetTotal": 280,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q379",
+      "q": "cheese",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:172175",
+        "usda:328637",
+        "usda:173420",
+        "usda:2706967",
+        "usda:2708618",
+        "usda:2708811"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 187,
+      "matchSetTotal": 631,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q380",
+      "q": "beans",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:173734",
+        "usda:175238",
+        "usda:173756",
+        "usda:173800",
+        "usda:174285",
+        "usda:169282"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 129,
+      "matchSetTotal": 364,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q381",
+      "q": "milk",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171267",
+        "usda:174832",
+        "usda:170173",
+        "usda:2705412",
+        "usda:175215"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 102,
+      "matchSetTotal": 350,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q382",
+      "q": "chicken",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171077",
+        "usda:171477",
+        "usda:172909"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 265,
+      "matchSetTotal": 674,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q383",
+      "q": "oil",
+      "kind": "exact",
+      "expectedSourceKeys": [
+        "usda:171413",
+        "usda:172336",
+        "usda:171412"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 87,
+      "matchSetTotal": 252,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q384",
+      "q": "whole wheat",
+      "kind": "multi_word",
+      "expectedSourceKeys": [
+        "usda:172688",
+        "usda:174916",
+        "usda:2707825",
+        "usda:172749"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 40,
+      "matchSetTotal": 63,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q385",
+      "q": "fish",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:171955",
+        "usda:171986"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 349,
+      "matchSetTotal": 392,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q386",
+      "q": "nuts",
+      "kind": "alias",
+      "expectedSourceKeys": [
+        "usda:170162",
+        "usda:170184"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 73,
+      "matchSetTotal": 199,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q387",
+      "q": "brocc",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:170379"
+      ],
+      "matchedSourceKey": "usda:170379",
+      "rank": 11,
+      "rankInFullResultSet": 11,
+      "matchSetTotal": 83,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q388",
+      "q": "cauli",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:169986"
+      ],
+      "matchedSourceKey": "usda:169986",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 21,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q389",
+      "q": "zucch",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:169291"
+      ],
+      "matchedSourceKey": "usda:169291",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 6,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q390",
+      "q": "avoca",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:171705"
+      ],
+      "matchedSourceKey": "usda:171705",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 9,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q391",
+      "q": "straw",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:167762"
+      ],
+      "matchedSourceKey": "usda:167762",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 23,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q392",
+      "q": "cucum",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:168409"
+      ],
+      "matchedSourceKey": "usda:168409",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 17,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q393",
+      "q": "mushro",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:169251"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 44,
+      "matchSetTotal": 49,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q394",
+      "q": "salmo",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:175167"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 53,
+      "matchSetTotal": 61,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q395",
+      "q": "shrim",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:174210"
+      ],
+      "matchedSourceKey": "usda:174210",
+      "rank": 11,
+      "rankInFullResultSet": 11,
+      "matchSetTotal": 51,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q396",
+      "q": "tilap",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:175176"
+      ],
+      "matchedSourceKey": "usda:175176",
+      "rank": 9,
+      "rankInFullResultSet": 9,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q397",
+      "q": "hummu",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:174289"
+      ],
+      "matchedSourceKey": "usda:174289",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 5,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q398",
+      "q": "tahin",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:170189"
+      ],
+      "matchedSourceKey": "usda:170189",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 4,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q399",
+      "q": "pistach",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:170184"
+      ],
+      "matchedSourceKey": "usda:170184",
+      "rank": 5,
+      "rankInFullResultSet": 5,
+      "matchSetTotal": 5,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q400",
+      "q": "cashe",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:170162"
+      ],
+      "matchedSourceKey": "usda:170162",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 8,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q401",
+      "q": "chedd",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:328637"
+      ],
+      "matchedSourceKey": "usda:328637",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 8,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q402",
+      "q": "crois",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:174987"
+      ],
+      "matchedSourceKey": "usda:174987",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 6,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q403",
+      "q": "tortil",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:2707825"
+      ],
+      "matchedSourceKey": "usda:2707825",
+      "rank": 15,
+      "rankInFullResultSet": 15,
+      "matchSetTotal": 21,
+      "outcome": "top11_25",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q404",
+      "q": "edama",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:169282"
+      ],
+      "matchedSourceKey": "usda:169282",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q405",
+      "q": "cilan",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:169997"
+      ],
+      "matchedSourceKey": "usda:169997",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 2,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q406",
+      "q": "walnu",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:170187"
+      ],
+      "matchedSourceKey": "usda:170187",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 9,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q407",
+      "q": "spina",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:168462"
+      ],
+      "matchedSourceKey": "usda:168462",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 41,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q408",
+      "q": "bulgu",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:170688"
+      ],
+      "matchedSourceKey": "usda:170688",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 6,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q409",
+      "q": "srirac",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:171186"
+      ],
+      "matchedSourceKey": "usda:171186",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q410",
+      "q": "mayon",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:171009"
+      ],
+      "matchedSourceKey": "usda:171009",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 20,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q411",
+      "q": "balsa",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:172241"
+      ],
+      "matchedSourceKey": "usda:172241",
+      "rank": 7,
+      "rankInFullResultSet": 7,
+      "matchSetTotal": 7,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q412",
+      "q": "popco",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:167959"
+      ],
+      "matchedSourceKey": "usda:167959",
+      "rank": 6,
+      "rankInFullResultSet": 6,
+      "matchSetTotal": 45,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q413",
+      "q": "pretz",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:167555"
+      ],
+      "matchedSourceKey": "usda:167555",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 53,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q414",
+      "q": "gumdr",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:167989"
+      ],
+      "matchedSourceKey": "usda:167989",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q415",
+      "q": "raisi",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:168165"
+      ],
+      "matchedSourceKey": "usda:168165",
+      "rank": 8,
+      "rankInFullResultSet": 8,
+      "matchSetTotal": 11,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q416",
+      "q": "sultan",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:168165"
+      ],
+      "matchedSourceKey": "usda:168165",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q417",
+      "q": "oatme",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:173904"
+      ],
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 45,
+      "matchSetTotal": 45,
+      "outcome": "beyond_measured_page",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q418",
+      "q": "anchov",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:174183"
+      ],
+      "matchedSourceKey": "usda:174183",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 4,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q419",
+      "q": "musse",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:174216"
+      ],
+      "matchedSourceKey": "usda:174216",
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 3,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q420",
+      "q": "burri",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:2708549"
+      ],
+      "matchedSourceKey": "usda:2708549",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 38,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q421",
+      "q": "capsic",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:170108"
+      ],
+      "matchedSourceKey": "usda:170108",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q422",
+      "q": "auberg",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:169228"
+      ],
+      "matchedSourceKey": "usda:169228",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q423",
+      "q": "courge",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:169291"
+      ],
+      "matchedSourceKey": "usda:169291",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q424",
+      "q": "kumar",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:168482"
+      ],
+      "matchedSourceKey": "usda:168482",
+      "rank": 1,
+      "rankInFullResultSet": 1,
+      "matchSetTotal": 1,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q425",
+      "q": "quino",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:168874",
+        "usda:168917"
+      ],
+      "matchedSourceKey": "usda:168917",
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 6,
+      "outcome": "top3",
+      "rankStableAcrossPasses": true
+    },
+    {
+      "id": "q426",
+      "q": "lenti",
+      "kind": "partial",
+      "expectedSourceKeys": [
+        "usda:172420",
+        "usda:172421"
+      ],
+      "matchedSourceKey": "usda:172421",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 17,
+      "outcome": "top4_10",
+      "rankStableAcrossPasses": true
+    }
+  ]
+}

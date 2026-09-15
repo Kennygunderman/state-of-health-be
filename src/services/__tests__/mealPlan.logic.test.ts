@@ -4123,12 +4123,12 @@ describe('the committed catalog and recipe graph', () => {
             }
         });
 
-        it('admits only the six versions the fixture records as plannable', () => {
+        it('admits only the eight versions the fixture records as plannable', () => {
             const candidates = buildPlanCandidates(fixtureCatalog(), makePreferences(), seed);
             const admitted = new Set(candidates.map((candidate) => candidate.recipe.recipe_version_id));
 
             expect(admitted.size).toBe(readRecipeFixture().counts.plannable_versions);
-            expect(admitted.size).toBe(6);
+            expect(admitted.size).toBe(8);
             expect(candidates).toHaveLength(admitted.size * MAIN_SLOT_PORTION_MULTIPLIERS.length);
         });
 
@@ -4154,12 +4154,13 @@ describe('the committed catalog and recipe graph', () => {
 
     describe('what the committed graph can and cannot fill', () => {
         it.each<[MealSlot, number, string[]]>([
-            ['breakfast', 1, ['spinach-egg-white-scramble:1']],
+            ['breakfast', 2, ['spinach-egg-white-scramble:1', 'yogurt-egg-white-crispbread-plate:1']],
             ['lunch', 2, ['lemon-herb-chicken-and-rice:2', 'lentil-and-kale-stew:1']],
             [
                 'dinner',
-                4,
+                5,
                 [
+                    'herb-chicken-rice-and-kale-bowl:1',
                     'lemon-herb-chicken-and-rice:2',
                     'lentil-and-kale-stew:1',
                     'salmon-and-kale-plate:1',
@@ -4204,7 +4205,7 @@ describe('the committed catalog and recipe graph', () => {
             ).toEqual([
                 {
                     constraintKey: 'catalog_coverage',
-                    value: 1,
+                    value: 2,
                     unit: 'recipes',
                     slots: ['breakfast', 'lunch'],
                     editStep: 'schedule',
@@ -4215,8 +4216,8 @@ describe('the committed catalog and recipe graph', () => {
 
     describe('a week whose breakfasts are committed recipes', () => {
         /**
-         * The four plannable committed versions that are not already breakfast,
-         * widened to that slot and nothing else. `meal_slots` is the one
+         * Four of the plannable committed versions that are not already
+         * breakfast, widened to that slot and nothing else. `meal_slots` is the one
          * focused delta: four recipes at the weekly cap of two uses cover seven
          * days, which is what lets every breakfast the planner places be a
          * committed row. Lunch and dinner stay synthetic, because the graph
@@ -4356,12 +4357,16 @@ describe('the committed catalog and recipe graph', () => {
             const candidates = buildPlanCandidates(fixtureCatalog(), preferences, seed);
             const admitted = new Set(candidates.map((candidate) => candidate.recipe.slug));
 
-            // spinach-egg-white-scramble carries whole milk and
-            // herbed-yogurt-and-kale-dip-plate carries Greek yogurt; the other
-            // four plannable versions carry neither.
+            // spinach-egg-white-scramble carries whole milk,
+            // herbed-yogurt-and-kale-dip-plate and
+            // yogurt-egg-white-crispbread-plate carry Greek yogurt; the other
+            // five plannable versions carry neither. Listed exhaustively, so a
+            // recipe that started or stopped bearing milk fails here.
             expect(admitted.has('spinach-egg-white-scramble')).toBe(false);
             expect(admitted.has('herbed-yogurt-and-kale-dip-plate')).toBe(false);
+            expect(admitted.has('yogurt-egg-white-crispbread-plate')).toBe(false);
             expect([...admitted].sort()).toEqual([
+                'herb-chicken-rice-and-kale-bowl',
                 'lemon-herb-chicken-and-rice',
                 'lentil-and-kale-stew',
                 'salmon-and-kale-plate',
