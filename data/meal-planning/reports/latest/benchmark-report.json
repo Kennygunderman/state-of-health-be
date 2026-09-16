@@ -1,7 +1,7 @@
 {
   "stage": "search-benchmark",
   "reportVersion": "v1",
-  "generatedAt": "2026-09-16T11:15:39.466Z",
+  "generatedAt": "2026-09-16T14:34:57.973Z",
   "benchmarkVersion": "v1",
   "catalogRelease": "v1",
   "producedBy": "npm run search:benchmark",
@@ -27,7 +27,7 @@
     "measuredAgainst": "the loaded catalog release v1, 11046 published foods",
     "nonAcceptanceSuite": {
       "path": "src/__tests__/api/benchmark.test.ts",
-      "presentInThisCheckout": false,
+      "presentInThisCheckout": true,
       "fixture": "data/meal-planning/fixtures/benchmark-synthetic-10k.json",
       "isAcceptanceEvidence": false,
       "statement": "src/__tests__/api/benchmark.test.ts exercises the same search mechanics over a synthetic corpus and is explicitly NOT acceptance evidence: a synthetic corpus can demonstrate that paging, ranking and the zero-result path behave, but it cannot establish that real common-food searches find real foods. Only this report, produced by npm run search:benchmark against a loaded release, carries that claim."
@@ -146,7 +146,7 @@
         "contractKey": "p95LatencyMs",
         "bound": 150,
         "comparison": "measured <= bound",
-        "measured": 84.944,
+        "measured": 86.969,
         "measuredAsCount": "1278 timed samples at limit 25",
         "verdict": "pass"
       }
@@ -215,11 +215,11 @@
     "timing": "in_process",
     "measuredUnit": "catalog.service.searchPublishedFoods",
     "samples": 1278,
-    "p50LatencyMs": 78.177,
-    "p95LatencyMs": 84.944,
-    "p99LatencyMs": 90.603,
-    "minLatencyMs": 66.152,
-    "maxLatencyMs": 112.718,
+    "p50LatencyMs": 80.286,
+    "p95LatencyMs": 86.969,
+    "p99LatencyMs": 97.019,
+    "minLatencyMs": 72.407,
+    "maxLatencyMs": 116.848,
     "percentileMethod": "nearest-rank over all timed samples",
     "contentionCaveat": "Latency was measured on whatever host ran this command. A figure taken on a host running other workloads against the same PostgreSQL instance is an upper bound on the query, not a clean measurement of it; the relevance figures and page sequences are unaffected by load."
   },
