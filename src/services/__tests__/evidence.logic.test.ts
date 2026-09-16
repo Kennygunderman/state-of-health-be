@@ -594,6 +594,24 @@ describe('the committed evidence allowlist and the reviewed attestation', () => 
         }
     });
 
+    it.each(asCase(committedRows))('states a complete, three-valued row for %s', (cidr, row) => {
+        // Asserted against the document on disk rather than the rows the
+        // validator already normalized, because the mistyped refresh is the case
+        // this catches: `"false"`, `0`, `null` and an absent name all parse as
+        // JSON, and a fourth reachability value would be read by nothing.
+        const raw = mutableRows().filter((entry) => entry.cidr === cidr)[0];
+
+        expect(Object.keys(raw).sort()).toStrictEqual(['cidr', 'globallyReachable', 'name', 'registry']);
+
+        for (const member of [raw.cidr, raw.name, raw.registry]) {
+            expect(typeof member).toBe('string');
+            expect((member as string).trim()).not.toBe('');
+        }
+
+        expect([true, false, 'n/a']).toContain(raw.globallyReachable);
+        expect(raw.globallyReachable).toBe(row.globallyReachable);
+    });
+
     it('splits the reviewed snapshot into the three registry reachability values', () => {
         // Read off the document rather than asserted as a remembered total: the
         // three counts must add up to the reviewed row count, and 'n/a' must
@@ -635,6 +653,54 @@ describe('the committed evidence allowlist and the reviewed attestation', () => 
                 expect(EVIDENCE_TYPES).toContain(evidenceType);
             }
         }
+    });
+
+    it('consults no manufacturer or brand domain', () => {
+        // AI generation proposes generic preparations only, never branded
+        // products, so a model-proposed manufacturer domain could never
+        // independently corroborate a model-proposed product. Every entry is
+        // therefore a government, academic or named reference-work host. Each
+        // suffix begins with a dot, so the label boundary is explicit and
+        // `evilgov.com` cannot satisfy `.gov`.
+        const GOVERNMENT_OR_ACADEMIC_SUFFIXES = [
+            '.gov',
+            '.edu',
+            '.gov.uk',
+            '.gov.au',
+            '.canada.ca',
+            '.europa.eu',
+            '.fao.org',
+        ];
+        const REVIEWED_REFERENCE_WORKS = ['www.oxfordreference.com', 'www.britannica.com', 'www.larousse.fr'];
+
+        for (const hostClass of committedHostClasses) {
+            for (const entry of hostClass.hosts) {
+                const host = entry.slice(0, 2) === '*.' ? entry.slice(2) : entry;
+                const isReferenceWork = REVIEWED_REFERENCE_WORKS.indexOf(host) !== -1;
+                const isGovernmentOrAcademic = GOVERNMENT_OR_ACADEMIC_SUFFIXES.some((suffix) =>
+                    host.endsWith(suffix),
+                );
+
+                expect(isGovernmentOrAcademic || isReferenceWork).toBe(true);
+                if (isReferenceWork) {
+                    expect(hostClass.class).toBe('named_culinary_reference');
+                }
+            }
+        }
+    });
+
+    it('trusts no commercial reference work with nutrition or allergen claims', () => {
+        // The one class carrying commercial (`.com`/`.fr`) hosts may say what a
+        // dish is and how it is prepared, and must never stand in as an
+        // authority on its nutrients or on which of the nine allergens it
+        // contains — that is the whole reason authorization is per evidence type.
+        const culinary = committedHostClasses.filter(
+            (hostClass) => hostClass.class === 'named_culinary_reference',
+        )[0];
+
+        expect(culinary.evidenceTypes).not.toContain('nutrition_reference');
+        expect(culinary.evidenceTypes).not.toContain('allergen_composition');
+        expect(culinary.evidenceTypes).toContain('canonical_identity');
     });
 });
 
@@ -1118,6 +1184,9 @@ describe('parseIpAddress', () => {
         ['a dotted quad before a gap', '1.2.3.4::'],
         ['a bare colon', ':'],
         ['a trailing single colon', '2001:db8:'],
+        ['URL brackets around a loopback', '[::1]'],
+        ['URL brackets around a public address', '[2606:2800:220:1::]'],
+        ['a half-open bracket', '[::1'],
     ])('refuses the IPv6 form with %s', (_case, text) => {
         expect(parseIpAddress(text)).toBeNull();
     });
@@ -2543,6 +2612,16 @@ describe('matchEvidenceHostClass and isHostAllowed', () => {
         );
         expect(matchEvidenceHostClass('a.example.gov', null as unknown as EvidenceHostClass[], 'canonical_identity'))
             .toBeNull();
+    });
+
+    it('admits nothing at all when the allowlist is empty', () => {
+        // The fail-closed shape of a truncated or over-filtered document: an
+        // empty list allowlists no host, so it authorizes no claim. "No entry
+        // objected" must never read as "permitted".
+        for (const evidenceType of EVIDENCE_TYPES) {
+            expect(matchEvidenceHostClass('nal.usda.gov', [], evidenceType)).toBeNull();
+            expect(isHostAllowed('nal.usda.gov', [], evidenceType)).toBe(false);
+        }
     });
 });
 

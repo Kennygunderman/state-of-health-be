@@ -1,9 +1,15 @@
 # Meal planning — operator commands
 
-The entry point for running the meal-planning backend: the command order from a
-fresh checkout to a verified environment, the nine CLI entry points the feature
-has, the database guards those commands answer to, and the environment variables
-an operator sets.
+The entry point for running the meal-planning backend: the prerequisites, the
+command order from a fresh checkout to a verified environment, the separate order
+in which the feature is switched on, the nine CLI entry points the feature has,
+the database guards those commands answer to, and the environment variables an
+operator sets.
+
+It documents only what the code cannot carry — the orders that are contracts and
+the reasons behind them. It is not an architecture overview: the layering, the
+error mapping and the ownership rules live in the backend architecture guide, and
+the subject documents below own their own subjects.
 
 Every command below is run from the `backend/` package root. Each CLI entry point
 prints its own authoritative usage — options, the inputs it reads and the
@@ -13,15 +19,71 @@ remedy rather than starting partial work.
 
 Companion documents, none of which is restated here:
 
-- [`release-and-recovery.md`](./release-and-recovery.md) — the release, switch-on
-  and rollback procedure, and the record of which of the things these commands
-  name are present in the tree at a given commit.
+- [`api.md`](./api.md) — the endpoint surface: request and response shapes, the
+  machine-readable error codes, and which routes the feature gate spares.
+- [`planning-policy.md`](./planning-policy.md) — the reviewed numbers and rules
+  behind nutrition targets, plan generation, swaps and grocery aggregation.
 - [`catalog-policy.md`](./catalog-policy.md) — the reviewed catalogue policy: the
   identity-evidence (SSRF) policy and its address-table attestation, the
   provenance model, and where the coverage plan, the validation checks and the
   search-benchmark thresholds are authoritatively recorded.
+- [`release-and-recovery.md`](./release-and-recovery.md) — the release, switch-on
+  and rollback procedure, and the record of which of the things these commands
+  name are present in the tree at a given commit.
+- [`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md) —
+  each requirement mapped to where it is implemented and what evidence covers it.
 - [`expected-schema-diff.sql`](./expected-schema-diff.sql) — the committed
   schema-drift evidence for the meal-planning migration.
+
+## Prerequisites
+
+- **Node 22.** The package declares no `engines` field and the repository has no
+  `.nvmrc`, so the line is fixed by the two places that pin it: `FROM
+  node:22-alpine` in the `Dockerfile` and `node-version: 22` in
+  `.github/workflows/ci.yml`. A current 22.x with its bundled npm is what these
+  commands were run against. If you select it with nvm, note that activation is
+  **per shell** — every one of the command blocks below needs `nvm use 22` first,
+  or it silently runs on whatever `node` the shell already had.
+- **PostgreSQL 16, on a host that is not production.** The repository documents no
+  server version; 16 is the major chosen here and the one CI runs
+  (`postgres:16-alpine`). The exact patch level is recorded in each
+  validation and benchmark report, so a measurement stays reproducible against
+  the server that produced it.
+- **Firebase development credentials.** `FIREBASE_SERVICE_ACCOUNT` holds the
+  **base64** of the development project's service-account JSON
+  (`base64 -i serviceAccountKey.json`); locally it may be omitted, in which case
+  the code falls back to an untracked `./serviceAccountKey.json` in the package
+  root. Either form is a secret: inject it, never commit it. Only authenticated
+  requests need it — `/health` and the guards below do not.
+- **`USDA_API_KEY` and `OPENROUTER_API_KEY`** keep the runtime roles they already
+  had — `/api/macros/estimate` and `/api/macros/label-scan` call OpenRouter,
+  `/api/macros/search-branded-foods` calls USDA — and are **additionally**
+  required by the offline catalog scripts. The new guarantee is narrower than
+  "no vendor calls": once the catalog and recipes are loaded, plan generation,
+  swaps, grocery aggregation, recipe viewing and internal catalog search make no
+  live USDA or model call.
+
+## The three local databases
+
+Three separate databases, because two of the commands here destroy the database
+they point at and one refuses to run unless it may:
+
+| Database | Set as | Used by | Note |
+| --- | --- | --- | --- |
+| `soh_dev` | `DATABASE_URL` | `npm run dev`, and the catalog, recipe and dev-seed scripts | Of the three, the only one `db:seed:dev` accepts, and the only one where `catalog:load` and `recipes:seed` need no confirmation flag |
+| `soh_test` | `DATABASE_URL` on the test command | `npm test` | **The name must end in `_test`** (a clone index after it is fine, as in `soh_test_7`). The guard also accepts a database named exactly `ci` on a local host, which is CI's shape. It additionally requires `NODE_ENV=test` and `ALLOW_DB_TRUNCATE=true` — see [Running the test suite](#running-the-test-suite) |
+| `soh_shadow` | `SHADOW_DATABASE_URL` | `npx prisma migrate dev --create-only`, `npx prisma migrate diff` | **Both reset it.** Nothing of value may live here, and no other command reads it |
+
+```bash
+createdb soh_dev soh_test soh_shadow
+```
+
+**Never point any of these three at production.** That is not only a convention:
+the origin guard classifies `DATABASE_URL` before any script can open a client
+and refuses an origin it does not recognise, and the test guard refuses to
+truncate anything whose name does not say test. A production URL satisfies
+neither, so the failure is a refusal rather than a loss — but the refusal is the
+backstop, not the plan.
 
 ## Command order — setup to verification
 
@@ -38,13 +100,32 @@ npm test                     # see "Running the test suite" for its required env
 npm run dev
 ```
 
+The sequence is the contract, and each step below says what would break if it
+moved:
+
 - `DATABASE_URL` must be set for every step from `prisma generate` onward. The
   CLI entry points import `scripts/lib/bootstrap.ts` first, which calls
   `dotenv.config()`, so `backend/.env` supplies it; a value already in the
   environment is never overwritten.
-- `npx prisma generate` writes the Prisma client to `src/generated/prisma`, and
-  `npx prisma migrate deploy` applies `prisma/migrations/` —
-  `20260706000000_init` and `20260908000000_meal_planning`.
+- `npx prisma generate` is **required, not optional**, and it is the step most
+  often skipped. It writes the client to `src/generated/prisma`, which this
+  repository git-ignores and regenerates in CI and in the Docker build stage —
+  so on a fresh checkout nothing that imports Prisma compiles or runs until it
+  has been run, and `typecheck`, `build`, `test` and every script fail on a
+  missing module rather than on anything they are actually about. (The
+  architecture guide's §12 describes that client as committed build output while
+  the repository ignores it; the repository's practice is the one followed here,
+  so no generated file appears in a pull request.)
+- `npx prisma migrate deploy` applies `prisma/migrations/` —
+  `20260706000000_init` and `20260908000000_meal_planning`. The meal-planning
+  migration is **additive**: it creates new tables and adds nullable columns, and
+  changes no existing column or constraint. The identical command also runs at
+  container boot from the `Dockerfile` `CMD`, which is why `prisma/migrations/`
+  is the executed, authoritative ledger and
+  `prisma/manual-migrations/meal-planning/` is a reference copy for operators
+  rather than something to run — [`release-and-recovery.md`](./release-and-recovery.md)
+  carries that reasoning and the `migrate resolve` step anyone running the copy
+  by hand owes afterwards.
 - `npm run catalog:load -- --release v1` loads the reviewed, checksummed release
   committed at `data/meal-planning/catalog/releases/v1/`: it verifies the
   SHA-256, row count and size that `manifest.json` records for each of its five
@@ -60,8 +141,70 @@ npm run dev
   `DATABASE_URL` and writes its report to
   `data/meal-planning/reports/latest/benchmark-report.json`. The report belongs
   to the run that produced it; its numbers are recorded nowhere else.
+- `npm run typecheck` is the fast gate — run it before `build`, because it
+  reports the same errors in less time. It covers the production sources only;
+  the tests and the scripts are separate projects with their own compiler
+  settings, so `npm run typecheck:test` and `npm run typecheck:scripts` are the
+  other two thirds of the same check and CI runs all three.
+- `npm test` **is a real test suite now.** It was `echo "no tests yet"` before
+  this feature; it is `jest --ci --runInBand --coverage`, and the coverage gate
+  is derived from the files on disk — one 80 %-branch threshold per
+  `src/services/*.logic.ts` and per covered `src/utils/` module, so a new pure
+  logic module joins the gate the moment it is added and cannot hide behind a
+  global average. It needs its own database and two acknowledgements; see
+  [Running the test suite](#running-the-test-suite) for the exact invocation.
 - `npm run dev` serves the API with `ts-node-dev`; `npm run build` then
-  `npm start` is the compiled form.
+  `npm start` is the compiled form. Verify either the same way:
+
+  ```bash
+  curl http://localhost:3000/health
+  ```
+
+  `/health` is unauthenticated by design — Coolify's health check, uptime
+  monitoring and post-deploy verification all use it. It answers
+  `{"status":"ok","version":"<commit>"}` only after a real `SELECT 1` against
+  `DATABASE_URL`, so `status: ok` is a statement about the database and not just
+  the process. `version` carries `GIT_SHA`, which is injected at image build
+  time, so outside Docker it reads `"unknown"` and that is correct rather than a
+  fault.
+
+## Switch-on order — why the flag comes last
+
+A second sequence, with a different reason for its order: the feature must not be
+reachable before the data it needs is present and verified. Planning off is
+therefore the starting state, not a fallback.
+
+1. **Migrate with `MEAL_PLANNING_ENABLED` unset.** The flag being off — not the
+   tables being empty — is what makes every gated `/meal-planning/*` handler and
+   `/recipes/*` answer `503 feature_disabled`, which is why this step is safe to
+   deploy before any data exists. `/meal-planning/targets*` and `/catalog/*` are
+   deliberately **not** gated, so Account, Diary and Progress keep reading and
+   writing nutrition targets throughout — [`api.md`](./api.md) has the per-route
+   detail.
+2. `npm run catalog:load -- --release v1`
+3. `npm run recipes:seed`
+4. **Verify before enabling**, with the flag still off:
+
+   ```bash
+   curl -H "Authorization: Bearer $ID_TOKEN" \
+     http://localhost:3000/api/catalog/status
+   ```
+
+   It reports the loaded release id and the published, quarantined, rejected and
+   recipe counts. Confirm they are the release you intended and that
+   `search:benchmark`'s report met its thresholds. The route carries no user
+   data, but it still sits behind the API's auth boundary — without a Firebase
+   ID token it answers `401`, not the status — so it needs a token the way every
+   other `/api` route does. `/health` is the only unauthenticated endpoint.
+5. **Only then** set `MEAL_PLANNING_ENABLED=true` and restart. The flag is read
+   once at import, so a running process never picks up a change to it.
+
+A development **device** needs one more thing that no backend command can
+supply: the development Firebase project's Remote Config `meal_planning_enabled`
+must be `true` and must have been fetched at least once. The client ships with
+that default set to `false` and fetches at launch, so until then the Meal Plan
+segment is hidden — by design, not as a failure. Cold-start the app after
+changing it.
 
 ## Building a new catalog release (development machine only)
 
@@ -119,15 +262,72 @@ outright. Every recognised origin is on host `localhost`, `127.0.0.1` or
 `postgres`: a `_dev`, `_test` or `_shadow` name does not make a remote database
 one.
 
+`development` is the widest class and the one to understand before pointing a
+script anywhere: it is satisfied by **host alone** on `localhost` or
+`127.0.0.1`, or by a `_dev` name on any of the three hosts. So an arbitrarily
+named local database is development, while the same name on `postgres` — a
+container-network service that in CI or a compose stack need not be anyone's
+development box — is `unknown` and refused. `test` and `shadow` have no
+host-only arm: they are reached by name only, so nothing becomes a test database
+by being local.
+
 | Policy | Scripts | Rule |
 | --- | --- | --- |
 | `development_or_confirmed` | `catalog:load`, `recipes:seed` | Against anything other than a development origin the run is refused at module load with code `confirmation_required` unless `--confirm-target <dbname>` names that URL's database exactly. Never needed against a development origin |
 | `development_only` | `db:seed:dev` | Only a development origin is accepted; a test, shadow or unrecognised database is refused and no flag opens the door, because this is the one script that writes user-scoped rows |
 | `any_recognised` | `catalog:import`, `catalog:generate`, `catalog:validate`, `catalog:report`, `catalog:release`, `search:benchmark` | Any origin the guard can classify is accepted; an unrecognised one is still refused |
 
+Against a development origin the flag is never needed and is accepted and
+ignored. Everywhere else, the database's own name is what unlocks the run:
+
+```bash
+npm run catalog:load -- --release v1 --confirm-target soh_test
+```
+
+A name that does not match the one in `DATABASE_URL` is refused
+(`confirmation_mismatch`) just as firmly as a missing flag
+(`confirmation_required`), so the flag cannot be satisfied by habit — it has to
+be the name of the database actually being written.
+
 `SHADOW_DATABASE_URL` is needed only by `npx prisma migrate dev --create-only`
 and `npx prisma migrate diff`, both of which reset the database they point at.
 Give development, test and shadow three separate local databases.
+
+The guard's siblings under `scripts/lib/` are libraries the entry points import,
+not commands:
+
+| Module | What it owns |
+| --- | --- |
+| `bootstrap.ts` | The DNS ordering and `dotenv.config()` — see below |
+| `dbGuard.ts` | The origin classification and the policies above |
+| `manifest.ts` | Loading the versioned data files under `data/meal-planning/`, resolved from the repository root rather than the working directory |
+| `rateLimiter.ts` | Pacing USDA requests under `USDA_IMPORT_RATE_LIMIT_PER_HOUR`; it pauses when the bucket empties instead of failing |
+| `checkpoint.ts` | Run state in `catalog_import_runs`, so an interrupted stage resumes instead of restarting |
+| `budget.ts` | The model-call ledger — reserve before spending, never released on failure ([`catalog-policy.md`](./catalog-policy.md)) |
+| `logger.ts` | Structured output that never prints a secret — not `DATABASE_URL`'s password, not USDA's `api_key` query parameter, not OpenRouter's bearer token |
+
+## `bootstrap.ts` and the DNS ordering
+
+Every CLI entry point imports `scripts/lib/bootstrap.ts` as its **literal first
+statement**, before any other import. It exports nothing — importing it is the
+whole API — and it does two things in this order:
+
+1. `dns.setDefaultResultOrder('ipv4first')`, **before any network module loads.**
+2. `dotenv.config()`, which never overwrites a variable already in the
+   environment, so a CI-injected or command-line value wins over `.env`.
+
+The first line is the one that matters and the reason is not visible from the
+code: the VPS this service runs on has broken IPv6 egress. Node otherwise
+prefers AAAA records, and outbound HTTPS — the Firebase certificate download,
+OpenRouter, USDA — hangs until timeout on a fresh process rather than failing
+fast. `src/server.ts` does the same thing for the server process, and the
+architecture guide's §10 says not to move or remove that ordering; this module
+is its one sanctioned mirror, for processes that never load `server.ts`.
+
+So the import order in a script is not style. A script that imports a service,
+Prisma or anything else network-touching **above** `bootstrap` reintroduces the
+hang, and it reintroduces it as an intermittent timeout on a fresh process
+rather than as an error anyone can read.
 
 ## Running the test suite
 
@@ -167,20 +367,85 @@ own and is what `pretest` runs before every `npm test`.
 
 ## Environment variables
 
-`.env.example` is the full list; these are the meal-planning ones.
+Every key in `.env.example`, with the module that reads it. **The values below
+are development placeholders.** Production values live in Coolify, not in any
+checked-in file, and nothing real — no host, key, token or service account —
+belongs in this repository.
 
-| Variable | Value | Notes |
+| Variable | Development value | Read by, and what it means |
 | --- | --- | --- |
-| `MEAL_PLANNING_ENABLED` | `false` | The server kill switch, read once at import by `src/utils/featureFlags.ts` and matched against the exact string `true`, so absent, blank and misspelled all mean off. A release boots with planning off — gated handlers answer 503 — and turns it on only after the catalog, the recipes and the search benchmark have been loaded and verified |
-| `MEAL_PLANNING_FAULT` | `off` | Development and test fault injection (`off \| generation \| swap \| log`), read once at startup by `src/utils/featureFlags.ts`. It is forced to `off` whenever `NODE_ENV` is `production`, and it is never set in production; outside production an unrecognised value fails startup |
-| `USDA_API_KEY` | — | Keeps its runtime role for `/api/macros/search-branded-foods`, and is additionally required by `catalog:import` |
-| `OPENROUTER_API_KEY` | — | Keeps its runtime role for `/api/macros/estimate` and `/api/macros/label-scan`, and is additionally required by `catalog:generate` and by `catalog:validate`'s advisory review |
-| `CATALOG_MODEL_CALL_BUDGET` | `1500` | Required positive integer: the hard cap on OpenRouter calls for one `catalog:generate` or `catalog:validate` run, shared by the generation and the review call. The scripts fail closed at startup when it is missing, non-numeric, zero or negative |
-| `CATALOG_BATCH_SIZE` | `25` | Candidates per generation batch, read by `scripts/lib/budget.ts`; `catalog:generate --batch-size <n>` overrides it for one run |
-| `USDA_IMPORT_RATE_LIMIT_PER_HOUR` | `900` | Read by `scripts/lib/rateLimiter.ts`; an integer between 1 and the vendor's 1000-per-hour cap. 900 leaves headroom on the same key for the running API's estimate and branded-search traffic, and the import pauses when the bucket empties rather than failing |
-| `EVIDENCE_FETCH_TIMEOUT_MS` | `10000` | Total timeout for one identity-evidence fetch |
-| `ALLOW_DB_TRUNCATE` | `true`, on the test command only | Deliberately commented out in `.env.example`: the guard reads the process environment directly, so a value written to `.env` is never seen by `npm test` |
+| `DATABASE_URL` | `postgresql://user:password@localhost:5432/soh_dev` | `src/prisma/client.ts` for the server; classified by `scripts/lib/dbGuard.ts` before any script can open a client, and by the test guard before the suite may truncate. The password sits in the URL's userinfo, which is why `logger.ts` never prints the URL itself |
+| `USDA_API_KEY` | *(a development FoodData Central key)* | `src/services/usda.service.ts` behind an accessor that throws when it is absent. Keeps its runtime role for `/api/macros/search-branded-foods`, and is additionally required by `catalog:import` |
+| `OPENROUTER_API_KEY` | *(a development OpenRouter key)* | `src/services/openrouter.service.ts`, same accessor pattern. Keeps its runtime role for `/api/macros/estimate` and `/api/macros/label-scan`, and is additionally required by `catalog:generate` and by `catalog:validate`'s advisory review |
+| `FIREBASE_SERVICE_ACCOUNT` | *(base64 of the development service-account JSON)* | `src/utils/firebase.ts` at import. Optional locally — it falls back to an untracked `./serviceAccountKey.json` — and required in any deployed environment |
+| `NODE_ENV` | `development` | The image sets `production`; CI sets `test`. Three behaviours key off it: the fault switch below is forced off in production, the test guard demands exactly `test`, and the post-commit abort header is read only under `test` |
+| `PORT` | `3000` | `src/server.ts`, which already falls back to 3000, so it is optional either way |
+| `MEAL_PLANNING_ENABLED` | `false` | `src/utils/featureFlags.ts`, read once at import and matched against the exact string `true` — so absent, blank and misspelled all mean **off**. Gates `/meal-planning/*` and `/recipes/*`, and deliberately spares `/meal-planning/targets*` and `/catalog/*` ([`api.md`](./api.md)). A release boots with planning off and turns it on only after the catalog, the recipes and the benchmark are loaded and verified |
+| `MEAL_PLANNING_FAULT` | `off` | `src/utils/featureFlags.ts`, read once at startup. See the note below the table |
+| `CATALOG_GENERATION_MODEL` | *(blank)* | `catalog:generate`. Blank inherits `OPENROUTER_MODEL` |
+| `CATALOG_REVIEW_MODEL` | *(blank)* | `catalog:validate`'s advisory review. Blank inherits `ESTIMATE_JUDGE_MODEL` |
+| `USDA_IMPORT_RATE_LIMIT_PER_HOUR` | `900` | `scripts/lib/rateLimiter.ts`; an integer between 1 and the vendor's 1000-per-hour cap. 900 leaves headroom on the same key for the running API's estimate and branded-search traffic, and the import pauses when the bucket empties rather than failing |
+| `CATALOG_BATCH_SIZE` | `25` | Candidates per generation batch; `catalog:generate --batch-size <n>` overrides it for one run |
+| `CATALOG_MODEL_CALL_BUDGET` | `1500` | `scripts/lib/budget.ts`. A **required positive integer** — the hard cap on OpenRouter calls for one `catalog:generate` or `catalog:validate` run, shared by the generation and the review call. The scripts fail closed at startup when it is missing, non-numeric, zero or negative. The reserve-before-spend ledger it drives is described in [`catalog-policy.md`](./catalog-policy.md) |
+| `EVIDENCE_FETCH_TIMEOUT_MS` | `10000` | `src/services/evidence.service.ts`; the total timeout for one identity-evidence fetch |
 
-Once the catalog and recipes are loaded, plan generation, swaps, grocery
-aggregation, recipe viewing and internal catalog search make no live USDA or
-model calls.
+Two variables an operator will look for and not find as keys:
+
+- `SHADOW_DATABASE_URL` — used only by the two Prisma commands that reset the
+  database they point at, so `.env.example` names it in a comment rather than
+  offering a value to copy.
+- `ALLOW_DB_TRUNCATE` — deliberately commented out. Not because an active value
+  would be dangerous (the name rule below means it can never authorise a
+  development, shadow or production database on its own), but because it would
+  not work: the guard runs as Jest's first setup statement and reads the process
+  environment directly, and nothing in the test harness loads `.env`. It belongs
+  on the test command itself.
+
+### `MEAL_PLANNING_FAULT`
+
+Fault injection, `off | generation | swap | log`, default `off`, for development
+and test only. It exists so the failure states the design draws are reachable
+from a device without breaking anything: each value makes one write path fail in
+a specific, documented way.
+
+| Value | Effect |
+| --- | --- |
+| `generation` | `POST /plans` and `/regenerate` throw **before** their transaction, so nothing is written and the same idempotency key retried without the fault succeeds |
+| `swap` | The swap commit throws before its transaction, with the same property |
+| `log` | The post-commit transport-loss seam: the `/log` transaction **commits**, then the handler drops the response socket instead of writing a body — the client sees a network error over a durable write, which is the one case a retry must resolve by replay rather than by writing again |
+
+It is **forced to `off` whenever `NODE_ENV` is `production`**, and that check
+runs before the value is validated, so a stray or misspelled value in production
+is ignored rather than failing startup. Outside production an unrecognised value
+fails startup loudly instead of being coerced to a working default that hides the
+typo. **Never set it in production.**
+
+## Known environment limitations
+
+What was not verified, recorded here rather than left to be assumed:
+
+- **The physical-iPhone checklist is unrun.** A native iOS build, a simulator
+  and visual comparison were unavailable in the Linux environment this work was
+  done in. Nothing in this document, and no passing JavaScript check, is
+  evidence that the native app behaves as described.
+- **Android is unverified beyond TypeScript.** There is no Android SDK in that
+  environment and the development `google-services.json` the app configuration
+  references was not supplied, so compilation past the type check was never
+  attempted.
+- **The supplied production `DATABASE_URL` was unreachable** from that
+  environment (Prisma `P1001` — the host is internal to the deployment
+  platform), so everything here was exercised against a local PostgreSQL 16
+  instead. That is also why the exact patch level travels with each report
+  rather than being assumed.
+- **What was exercised, and what was not.** `prisma generate`, `prisma migrate
+  deploy`, the three typechecks, `check:test-db` and its refusals, the
+  `--confirm-target` and `development_only` refusals, and `npm run dev` with its
+  `/health` response were all run as written. A full `catalog:load`,
+  `recipes:seed` and `search:benchmark` were **not** run end to end here — only
+  their guard paths — so treat their step descriptions as the contract they
+  implement rather than as a recorded measurement. `search:benchmark`'s numbers
+  only ever mean something for the environment and release that produced them.
+- **The mobile repository's `npm ci` fails** with a pre-existing `ERESOLVE`
+  (`jest-expo`'s peer range against the installed React Native), and needs
+  `npm ci --legacy-peer-deps`. That is documented, not fixed: changing either
+  version would be a framework upgrade, which this work does not do.
