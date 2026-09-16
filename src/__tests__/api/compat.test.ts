@@ -1667,3 +1667,964 @@ describe('the meal-planning action ledger', () => {
         expect(await ledgerRows()).toHaveLength(1);
     });
 });
+
+// ==========================================================================
+// The additive-contract gate (§0.9.1 "Contract compatibility").
+//
+// The three suites above prove the schema the migration produces, the new
+// behaviour of the entries endpoint, and the replay ledger. What none of them
+// answers is the question this gate exists for: does a client written against
+// the PREVIOUS release still get exactly what it got before? The prompt's
+// preservation directive — "Keep existing API consumers compatible" — is a
+// claim about responses that were never supposed to move, so the only proof is
+// to state each one and compare.
+//
+// Everything below is therefore a pin on shipped behaviour, read off
+// `nutrition.controller.ts`, `nutrition.service.ts`, `food.controller.ts` and
+// `app.ts` and then observed over HTTP:
+//
+//   * the diary entry DTO — the eleven keys the mobile codec decodes, the two
+//     additive members that are always PRESENT and sometimes null, and no
+//     thirteenth key;
+//   * the frozen responses — the five-field 400, the two 404 strings, the
+//     `{success: true}` body, the day-read date guard, and the history page
+//     block with its `parseInt(...) || default` behaviour;
+//   * the untouched legacy target writer, which still writes `users.target_*`
+//     and still creates no meal-planning state;
+//   * the ownership boundary of the two entry routes, where the owner-bearing
+//     write predicate changed and the HTTP answer did not;
+//   * the neighbours this feature never touched, including both body-size
+//     parser tiers.
+//
+// Why these belong here rather than in a `*.logic.test.ts`: every one of them
+// is controller wiring, a mapper, a Prisma predicate or a mount order
+// (`backend-architecture` §11). The per-field parser rules they sit on top of
+// are `nutrition.logic.test.ts`'s and are deliberately not restated — what is
+// asserted here is the RESPONSE, byte for byte, which only the mounted app can
+// produce. Identity always arrives through the auth mock's header (§4), so a
+// cross-user case still means what it says.
+// ==========================================================================
+
+import { MacroTotals } from '../../types/nutrition';
+
+/**
+ * The eleven keys `mapEntry` emitted before this feature, in its own order.
+ * Every one of them is part of the mobile client's `MealEntryResponse` codec,
+ * so a rename or an omission here is a client-visible break.
+ */
+const LEGACY_MEAL_ENTRY_DTO_KEYS = [
+    'id',
+    'foodId',
+    'name',
+    'servingText',
+    'servings',
+    'calories',
+    'protein',
+    'carbs',
+    'fat',
+    'inputMethod',
+    'loggedAt',
+] as const;
+
+/**
+ * The two this release adds. They are ADDITIVE in the strict sense the client's
+ * codec needs: always present, `null` where they do not apply. The mobile
+ * decoder declares them as `io.union([io.string, io.null])` inside an
+ * `io.partial`, and a plain optional would reject an explicit `null` — so an
+ * absent key and a null key are two different failures, and only one of them is
+ * the contract.
+ */
+const ADDITIVE_MEAL_ENTRY_DTO_KEYS = ['mealPlanMealId', 'nutritionProvenance'] as const;
+
+/** Both sets, sorted — the complete key set a diary entry may carry. */
+const MEAL_ENTRY_DTO_KEYS = [...LEGACY_MEAL_ENTRY_DTO_KEYS, ...ADDITIVE_MEAL_ENTRY_DTO_KEYS]
+    .slice()
+    .sort();
+
+/** The ten keys `food.service.ts::mapFood` emits, sorted. Untouched by this feature. */
+const FOOD_DTO_KEYS = [
+    'brand',
+    'calories',
+    'carbs',
+    'fat',
+    'id',
+    'name',
+    'protein',
+    'servingAmount',
+    'servingUnit',
+    'source',
+].sort();
+
+/** The four starter foods `getFoodsForUser` seeds into an empty library. */
+const STARTER_FOOD_NAMES = ['Apple', 'Chicken Breast', 'Egg', 'Peanut Butter'];
+
+const sortedKeys = (value: object): string[] => Object.keys(value).sort();
+
+/**
+ * Resolves one of the four diary buckets for a day the way the app does — by
+ * reading the day, which is what materializes them (§0.7.4). Nothing here
+ * inserts a `meals` row directly, so the id every case below posts to is one a
+ * client could actually hold.
+ */
+const diaryMealId = async (identity: { uid: string }, dayKey: string, mealName: string): Promise<string> => {
+    const day = await asUser(request.get(`/api/macros/${dayKey}`), identity).expect(200);
+    const meal = (day.body.meals as { id: string; name: string }[]).find(
+        (candidate) => candidate.name === mealName,
+    );
+
+    if (meal === undefined) {
+        throw new Error(`the day read for ${dayKey} returned no ${mealName} bucket`);
+    }
+
+    return meal.id;
+};
+
+/** Where an entry sits. The update contract carries no move fields, and this is how that is checked. */
+const storedPlacement = async (entryId: string): Promise<{ meal_id: string; date: Date }> => {
+    const row = await prisma.meal_entries.findUnique({
+        where: { id: entryId },
+        select: { meal_id: true, date: true },
+    });
+
+    if (row === null) {
+        throw new Error(`entry ${entryId} was not written`);
+    }
+
+    return row;
+};
+
+/** The four `users` columns the legacy target writer owns, read straight from the row. */
+const storedTargetColumns = async (userId: string) => {
+    const row = await prisma.users.findUnique({
+        where: { id: userId },
+        select: {
+            target_calories: true,
+            target_protein_g: true,
+            target_carbs_g: true,
+            target_fat_g: true,
+        },
+    });
+
+    if (row === null) {
+        throw new Error(`user ${userId} was not created`);
+    }
+
+    return row;
+};
+
+describe('the diary entry DTO', () => {
+    const owner = { uid: '' };
+    let lunchId = '';
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+
+        const user = await makeUser();
+        owner.uid = user.id;
+        lunchId = await diaryMealId(owner, DAY_KEY, 'Lunch');
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    const logEntry = (body: Record<string, unknown>) =>
+        asUser(request.post(`/api/macros/meal/${lunchId}/entries`).send(body), owner);
+
+    it('carries the eleven keys a shipped client decodes, and exactly two more', async () => {
+        const created = await logEntry({
+            ...legacyBody(),
+            servingText: '1 cup',
+            servings: 0.33,
+            inputMethod: 'ai_photo',
+        }).expect(201);
+
+        // The whole key set at once, so a leaked `catalogFoodId`,
+        // `recipeVersionId`, `userId` or snake_case column fails here rather
+        // than in a client the next release ships against.
+        expect(sortedKeys(created.body)).toEqual(MEAL_ENTRY_DTO_KEYS);
+
+        for (const key of LEGACY_MEAL_ENTRY_DTO_KEYS) {
+            expect(created.body).toHaveProperty(key);
+        }
+
+        expect(created.body.id).toEqual(expect.any(String));
+        expect(created.body.name).toBe('Scrambled eggs');
+        expect(created.body.servingText).toBe('1 cup');
+        expect(created.body.servings).toBe(0.33);
+        expect(created.body.inputMethod).toBe('ai_photo');
+    });
+
+    it('reports the two additive members as present, not as absent', async () => {
+        const created = await logEntry(legacyBody()).expect(201);
+
+        // `in`, not a falsy check: `undefined` and `null` are both falsy and
+        // only one of them is the contract. This is the assertion the mobile
+        // codec's `io.union([io.string, io.null])` actually depends on.
+        for (const key of ADDITIVE_MEAL_ENTRY_DTO_KEYS) {
+            expect(key in created.body).toBe(true);
+        }
+
+        expect(created.body.mealPlanMealId).toBeNull();
+        // Not null here: a client-supplied snapshot is classified, and null is
+        // reserved for rows written before the column existed (§0.7.3).
+        expect(created.body.nutritionProvenance).toBe('user_entered');
+    });
+
+    it('keeps the macros per serving, while the meal total is what was eaten', async () => {
+        const created = await logEntry({ ...legacyBody(), servings: 3 }).expect(201);
+
+        // The DTO's four numbers are the SNAPSHOT — `calories * servings` is
+        // the client's job, and the day read's totals are the server's. Mixing
+        // the two would triple every number the app displays on a 3-serving row.
+        expect(created.body.calories).toBe(220);
+        expect(created.body.protein).toBe(14);
+        expect(created.body.carbs).toBe(2);
+        expect(created.body.fat).toBe(16);
+
+        const day = await asUser(request.get(`/api/macros/${DAY_KEY}`), owner).expect(200);
+        const lunch = (day.body.meals as { id: string; totals: MacroTotals }[]).find(
+            (meal) => meal.id === lunchId,
+        );
+
+        expect(lunch?.totals).toStrictEqual({ calories: 660, protein: 42, carbs: 6, fat: 48 });
+        expect(day.body.totals).toStrictEqual({ calories: 660, protein: 42, carbs: 6, fat: 48 });
+    });
+
+    it('rounds a fractional macro to the integer the column holds', async () => {
+        const created = await logEntry({ ...legacyBody(), calories: 10.6 }).expect(201);
+
+        expect(created.body.calories).toBe(11);
+    });
+
+    it('reports foodId and servingText as null rather than omitting them', async () => {
+        const created = await logEntry(legacyBody()).expect(201);
+
+        expect('foodId' in created.body).toBe(true);
+        expect('servingText' in created.body).toBe(true);
+        expect(created.body.foodId).toBeNull();
+        expect(created.body.servingText).toBeNull();
+    });
+
+    it('reports loggedAt as an ISO-8601 instant that round-trips', async () => {
+        const created = await logEntry(legacyBody()).expect(201);
+        const loggedAt = created.body.loggedAt as string;
+
+        expect(loggedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+        expect(new Date(loggedAt).toISOString()).toBe(loggedAt);
+    });
+
+    it('is the same shape on the create, the day read and the update', async () => {
+        const created = await logEntry(legacyBody()).expect(201);
+        const updated = await asUser(
+            request.put(`/api/macros/entry/${created.body.id}`).send({ servings: 2 }),
+            owner,
+        ).expect(200);
+        const day = await asUser(request.get(`/api/macros/${DAY_KEY}`), owner).expect(200);
+        const read = (day.body.meals as { entries: Record<string, unknown>[] }[])
+            .flatMap((meal) => meal.entries)
+            .find((entry) => entry.id === created.body.id);
+
+        // One mapper, three responses (§6): a client decodes the same shape
+        // wherever an entry reaches it.
+        expect(sortedKeys(updated.body)).toEqual(MEAL_ENTRY_DTO_KEYS);
+        expect(read).toBeDefined();
+        expect(sortedKeys(read as object)).toEqual(MEAL_ENTRY_DTO_KEYS);
+    });
+
+    it.each(['library', 'search', 'ai_text', 'ai_photo'])(
+        'stores the input method a body may ask for and classifies the snapshot: %s',
+        async (inputMethod) => {
+            const created = await logEntry({ ...legacyBody(), inputMethod }).expect(201);
+
+            expect(created.body.inputMethod).toBe(inputMethod);
+            // The numbers arrived from the client whatever method produced
+            // them, so none of the four earns a source label (§0.7.3).
+            expect(created.body.nutritionProvenance).toBe('user_entered');
+            expect((await storedEntry(created.body.id)).nutrition_provenance).toBe('user_entered');
+        },
+    );
+
+    it('refuses to let a body claim the planned origin', async () => {
+        const created = await logEntry({ ...legacyBody(), inputMethod: 'meal_plan' }).expect(201);
+
+        // 'meal_plan' is in the COLUMN's vocabulary and not in the accept-list
+        // a body may choose from: the diary captions a row "From meal plan"
+        // from this field alone, and a legacy body carries no plan, no recipe
+        // version and unverifiable macros. It is not rejected — that would fail
+        // a request the endpoint accepts today — it is simply not honoured.
+        expect(created.body.inputMethod).toBe('library');
+        expect(created.body.mealPlanMealId).toBeNull();
+        expect((await storedEntry(created.body.id)).input_method).toBe('library');
+    });
+
+    it.each<[string, unknown]>([
+        ['an unknown string', 'bogus'],
+        ['a number', 42],
+        ['null', null],
+    ])('falls back to library for a method it cannot use: %s', async (_case, inputMethod) => {
+        const created = await logEntry({ ...legacyBody(), inputMethod }).expect(201);
+
+        expect(created.body.inputMethod).toBe('library');
+    });
+
+    it('falls back to library when the body names no method at all', async () => {
+        const created = await logEntry(legacyBody()).expect(201);
+
+        expect(created.body.inputMethod).toBe('library');
+    });
+});
+
+
+describe('the frozen diary responses', () => {
+    const owner = { uid: '' };
+    let breakfastId = '';
+    let lunchId = '';
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+
+        const user = await makeUser();
+        owner.uid = user.id;
+        breakfastId = await diaryMealId(owner, DAY_KEY, 'Breakfast');
+        lunchId = await diaryMealId(owner, DAY_KEY, 'Lunch');
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    describe('the five-field guard on the entries route', () => {
+        // One complete body, minus one field per case. Every one of the five is
+        // "required" by the shipped message, so each removal must earn the same
+        // string — and it is asserted on a WELL-FORMED path, because the
+        // ordering case (a malformed path must not pre-empt this) is already
+        // covered above and this is the plain contract.
+        it.each(['name', 'calories', 'protein', 'carbs', 'fat'])(
+            'answers the frozen 400 when %s is missing',
+            async (field) => {
+                const body: Record<string, unknown> = { ...legacyBody() };
+                delete body[field];
+
+                const response = await asUser(
+                    request.post(`/api/macros/meal/${breakfastId}/entries`).send(body),
+                    owner,
+                ).expect(400);
+
+                // toStrictEqual, so a `details` key added beside the message
+                // fails: shipped clients read `{error}` and nothing else.
+                expect(response.body).toStrictEqual({ error: LEGACY_REQUIRED_MESSAGE });
+                expect(await prisma.meal_entries.count({ where: { meal_id: breakfastId } })).toBe(0);
+            },
+        );
+
+        it('answers it for a name that is only whitespace', async () => {
+            const response = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send({ ...legacyBody(), name: '   ' }),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({ error: LEGACY_REQUIRED_MESSAGE });
+        });
+
+        it('still accepts a macro sent as a numeric string, as it always has', async () => {
+            // The `Number()` coercion in the shipped guard is load-bearing
+            // compatibility, not laxness: a client sending "220" has always
+            // been accepted and the writer rounds it identically.
+            const created = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send({
+                    name: 'Coerced',
+                    calories: '220',
+                    protein: '14',
+                    carbs: '2',
+                    fat: '16',
+                }),
+                owner,
+            ).expect(201);
+
+            expect(created.body.calories).toBe(220);
+            expect(created.body.fat).toBe(16);
+        });
+
+        it('answers 201 with the entry for a body that satisfies it', async () => {
+            const created = await asUser(
+                request.post(`/api/macros/meal/${breakfastId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(201);
+
+            expect(sortedKeys(created.body)).toEqual(MEAL_ENTRY_DTO_KEYS);
+        });
+    });
+
+    describe('the two 404 strings on the entry routes', () => {
+        it('answers the update of an absent entry with Entry not found', async () => {
+            const response = await asUser(
+                request.put(`/api/macros/entry/${ABSENT_UUID}`).send({ servings: 2 }),
+                owner,
+            ).expect(404);
+
+            expect(response.body).toStrictEqual({ error: 'Entry not found' });
+        });
+
+        it('answers the delete of an absent entry with Entry not found', async () => {
+            const response = await asUser(request.delete(`/api/macros/entry/${ABSENT_UUID}`), owner).expect(404);
+
+            expect(response.body).toStrictEqual({ error: 'Entry not found' });
+        });
+
+        it('answers a successful delete with {success: true} and soft-deletes the row', async () => {
+            const created = await asUser(
+                request.post(`/api/macros/meal/${lunchId}/entries`).send(legacyBody()),
+                owner,
+            ).expect(201);
+
+            const response = await asUser(request.delete(`/api/macros/entry/${created.body.id}`), owner).expect(200);
+
+            expect(response.body).toStrictEqual({ success: true });
+            // Soft, not hard: the row stays for history and for the plan links
+            // that reference it, and the diary read filters on deleted_at.
+            expect((await storedEntry(created.body.id)).deleted_at).not.toBeNull();
+        });
+    });
+
+    describe('the day read´s date guard', () => {
+        it.each([
+            ['a single-digit month', '2026-1-05'],
+            ['a two-digit year', '26-01-05'],
+            ['slashes', '2026/01/05'],
+            ['free text', 'not-a-date'],
+        ])('refuses %s with the frozen message', async (_case, dayKey) => {
+            const response = await asUser(
+                request.get(`/api/macros/${encodeURIComponent(dayKey)}`),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({ error: 'date must be yyyy-MM-dd' });
+        });
+
+        it('accepts a well-formed day key and echoes it', async () => {
+            const response = await asUser(request.get('/api/macros/2026-01-05'), owner).expect(200);
+
+            expect(response.body.date).toBe('2026-01-05');
+            expect((response.body.meals as { name: string }[]).map((meal) => meal.name)).toEqual([
+                'Breakfast',
+                'Lunch',
+                'Dinner',
+                'Snack',
+            ]);
+        });
+
+        it('is syntactic only: a calendar-impossible key passes the guard and fails behind it', async () => {
+            // `^\d{4}-\d{2}-\d{2}$` matches 2026-13-45, `new Date` makes it an
+            // Invalid Date, and Prisma refuses it — so the shipped answer is a
+            // 500 with the handler's own message. Pinned as it is, deliberately
+            // NOT repaired here: tightening the guard would change a response
+            // this gate exists to hold still, and it is recorded as an
+            // observation instead.
+            const response = await asUser(request.get('/api/macros/2026-13-45'), owner).expect(500);
+
+            expect(response.body).toStrictEqual({ error: 'Failed to get daily macros' });
+        });
+
+        it('lets JavaScript roll an out-of-range day rather than refusing it', async () => {
+            // 2026-02-30 is syntactically valid, so it is accepted and the key
+            // is echoed back verbatim while the rows are addressed by the date
+            // `new Date` produced. Same reasoning as above: observed, not fixed.
+            const response = await asUser(request.get('/api/macros/2026-02-30'), owner).expect(200);
+
+            expect(response.body.date).toBe('2026-02-30');
+        });
+    });
+});
+
+describe('the diary history read', () => {
+    const owner = { uid: '' };
+
+    // Three days with known totals, built through the endpoint rather than
+    // inserted, so what the history read summarizes is what a client logged:
+    //   2026-03-11  two buckets, 100x2 + 50  -> 250 kcal, mealCount 2
+    //   2026-03-10  one zero-calorie entry   -> excluded by the HAVING clause
+    //   2026-03-09  one bucket, 300          -> 300 kcal, mealCount 1
+    const NEWEST_DAY = '2026-03-11';
+    const ZERO_CALORIE_DAY = '2026-03-10';
+    const OLDEST_DAY = '2026-03-09';
+
+    beforeAll(async () => {
+        await truncateFeatureTables();
+
+        const user = await makeUser();
+        owner.uid = user.id;
+
+        const log = async (dayKey: string, mealName: string, body: Record<string, unknown>) => {
+            const mealId = await diaryMealId(owner, dayKey, mealName);
+
+            await asUser(request.post(`/api/macros/meal/${mealId}/entries`).send(body), owner).expect(201);
+        };
+
+        await log(NEWEST_DAY, 'Breakfast', {
+            name: 'Oats',
+            calories: 100,
+            protein: 10,
+            carbs: 5,
+            fat: 2,
+            servings: 2,
+        });
+        await log(NEWEST_DAY, 'Lunch', { name: 'Soup', calories: 50, protein: 5, carbs: 3, fat: 1 });
+        await log(ZERO_CALORIE_DAY, 'Breakfast', {
+            name: 'Black coffee',
+            calories: 0,
+            protein: 0,
+            carbs: 0,
+            fat: 0,
+        });
+        await log(OLDEST_DAY, 'Breakfast', { name: 'Bagel', calories: 300, protein: 1, carbs: 1, fat: 1 });
+    }, 60_000);
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('answers the shipped page block with its defaults', async () => {
+        const response = await asUser(request.get('/api/macros/history'), owner).expect(200);
+
+        expect(sortedKeys(response.body)).toEqual(['days', 'pagination']);
+        expect(response.body.pagination).toStrictEqual({ page: 1, limit: 30, total: 2, totalPages: 1 });
+    });
+
+    it('summarizes each day as eaten, newest first', async () => {
+        const response = await asUser(request.get('/api/macros/history'), owner).expect(200);
+        const days = response.body.days as {
+            date: string;
+            mealCount: number;
+            calories: number;
+            protein: number;
+            carbs: number;
+            fat: number;
+            meals: { name: string; sortOrder: number; calories: number }[];
+        }[];
+
+        // ORDER BY date DESC, and the totals are `SUM(ROUND(value * servings))`
+        // — the 2-serving oats count twice, which is what makes these the
+        // as-eaten figures rather than the snapshots.
+        expect(days.map((day) => day.date)).toEqual([NEWEST_DAY, OLDEST_DAY]);
+        expect(days[0]).toMatchObject({
+            date: NEWEST_DAY,
+            mealCount: 2,
+            calories: 250,
+            protein: 25,
+            carbs: 13,
+            fat: 5,
+        });
+        expect(days[1]).toMatchObject({ date: OLDEST_DAY, mealCount: 1, calories: 300 });
+        // mealCount is COUNT(DISTINCT meal_id), so it counts buckets and not
+        // entries, and the per-meal breakdown is ordered by the bucket's own
+        // sort order.
+        expect(days[0].meals.map((meal) => [meal.name, meal.sortOrder, meal.calories])).toEqual([
+            ['Breakfast', 0, 200],
+            ['Lunch', 1, 50],
+        ]);
+    });
+
+    it('skips a day whose entries add up to zero calories', async () => {
+        const response = await asUser(request.get('/api/macros/history'), owner).expect(200);
+        const days = response.body.days as { date: string }[];
+
+        // `HAVING SUM(ROUND(calories * servings)) > 0` — the old app's
+        // behaviour, and the reason the day is absent from both the page and
+        // the total rather than present with a zero.
+        expect(days.map((day) => day.date)).not.toContain(ZERO_CALORIE_DAY);
+        expect(response.body.pagination.total).toBe(2);
+    });
+
+    it.each([
+        ['page=0, because 0 is falsy', 'page=0', 1, 30],
+        ['a non-numeric page', 'page=abc', 1, 30],
+        ['limit=0, for the same reason', 'limit=0', 1, 30],
+        ['a non-numeric limit', 'limit=abc', 1, 30],
+    ])('falls back through parseInt(...) || default for %s', async (_case, query, page, limit) => {
+        const response = await asUser(request.get(`/api/macros/history?${query}`), owner).expect(200);
+
+        expect(response.body.pagination).toMatchObject({ page, limit });
+    });
+
+    it('pages with the limit it was given, and reports totalPages from it', async () => {
+        const first = await asUser(request.get('/api/macros/history?page=1&limit=1'), owner).expect(200);
+        const second = await asUser(request.get('/api/macros/history?page=2&limit=1'), owner).expect(200);
+
+        expect(first.body.pagination).toStrictEqual({ page: 1, limit: 1, total: 2, totalPages: 2 });
+        expect((first.body.days as { date: string }[]).map((day) => day.date)).toEqual([NEWEST_DAY]);
+        expect((second.body.days as { date: string }[]).map((day) => day.date)).toEqual([OLDEST_DAY]);
+    });
+
+    it('answers a user with nothing logged with an empty page rather than a 404', async () => {
+        const stranger = await makeUser();
+
+        const response = await asUser(request.get('/api/macros/history'), { uid: stranger.id }).expect(200);
+
+        expect(response.body.days).toEqual([]);
+        // Math.ceil(0 / 30) is 0, which is what this endpoint has always
+        // reported for an empty history.
+        expect(response.body.pagination).toStrictEqual({ page: 1, limit: 30, total: 0, totalPages: 0 });
+    });
+});
+
+
+describe('the untouched legacy target writer', () => {
+    const owner = { uid: '' };
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+
+        // Targets null, which is "never opted in" — the state this route has
+        // always been the only writer for.
+        const user = await makeUser();
+        owner.uid = user.id;
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    const putLegacyTargets = (body: Record<string, unknown>) =>
+        asUser(request.put('/api/user/targets').send(body), owner);
+
+    it('answers User not found for an identity with no row', async () => {
+        const response = await asUser(request.put('/api/user/targets').send({ calories: 2000 }), {
+            uid: 'no-such-user',
+        }).expect(404);
+
+        expect(response.body).toStrictEqual({ error: 'User not found' });
+    });
+
+    it('writes the four columns and returns exactly them', async () => {
+        const response = await putLegacyTargets({
+            calories: 2000,
+            protein: 150,
+            carbs: 200,
+            fat: 70,
+        }).expect(200);
+
+        expect(response.body).toStrictEqual({ calories: 2000, protein: 150, carbs: 200, fat: 70 });
+        expect(await storedTargetColumns(owner.uid)).toStrictEqual({
+            target_calories: 2000,
+            target_protein_g: 150,
+            target_carbs_g: 200,
+            target_fat_g: 70,
+        });
+    });
+
+    it('creates no meal-planning state and advances no targets revision', async () => {
+        await putLegacyTargets({ calories: 2000, protein: 150, carbs: 200, fat: 70 }).expect(200);
+
+        // §0.1.3: this route "stays untouched for API compatibility". It is not
+        // the canonical writer, so it owns no preferences row and no revision —
+        // and the canonical read stays truthful about that by reporting the
+        // values as `legacy` rather than by being written to.
+        expect(await prisma.meal_plan_preferences.count()).toBe(0);
+
+        const canonical = await asUser(request.get('/api/meal-planning/targets'), owner).expect(200);
+
+        expect(canonical.body).toStrictEqual({
+            targets: { calories: 2000, protein: 150, carbs: 200, fat: 70 },
+            complete: true,
+            source: 'legacy',
+            stale: false,
+            revision: 0,
+        });
+    });
+
+    it('rounds a fractional value the way it always has', async () => {
+        const response = await putLegacyTargets({ calories: 1999.6 }).expect(200);
+
+        expect(response.body.calories).toBe(2000);
+    });
+
+    it('writes an explicit null, because clearing a target is a real request', async () => {
+        await putLegacyTargets({ calories: 2000, protein: 150, carbs: 200, fat: 70 }).expect(200);
+
+        const response = await putLegacyTargets({ protein: null }).expect(200);
+
+        expect(response.body).toStrictEqual({ calories: 2000, protein: null, carbs: 200, fat: 70 });
+        expect((await storedTargetColumns(owner.uid)).target_protein_g).toBeNull();
+    });
+
+    it.each<[string, Record<string, unknown>]>([
+        ['zero', { calories: 0 }],
+        ['a negative number', { calories: -500 }],
+        ['a value that does not coerce to a number', { calories: 'abc' }],
+        ['a field the body does not name at all', {}],
+    ])('leaves the stored value alone for %s', async (_case, body) => {
+        await putLegacyTargets({ calories: 2000, protein: 150, carbs: 200, fat: 70 }).expect(200);
+
+        // The shipped coercion keeps a value only when it is finite AND > 0;
+        // everything else collapses to `undefined`, which the service reads as
+        // "not being written". That makes 0 and a negative number SILENTLY
+        // IGNORED rather than stored or refused — the compat trap this case
+        // exists for, since a client that means "clear it" has to send null.
+        const response = await putLegacyTargets(body).expect(200);
+
+        expect(response.body.calories).toBe(2000);
+        expect((await storedTargetColumns(owner.uid)).target_calories).toBe(2000);
+    });
+
+    it('cannot carry NaN over the wire, and ignores the string that produces it', async () => {
+        await putLegacyTargets({ calories: 2000, protein: 150, carbs: 200, fat: 70 }).expect(200);
+
+        // JSON has no NaN literal: `JSON.stringify({x: NaN})` is `{"x":null}`,
+        // so a client "sending NaN" actually sends null and CLEARS the column.
+        // The NaN branch of the coercion is only reachable through a
+        // non-numeric string, and that branch ignores the field instead.
+        const asNull = await putLegacyTargets({ protein: Number.NaN }).expect(200);
+        const asString = await putLegacyTargets({ carbs: 'not a number' }).expect(200);
+
+        expect(asNull.body.protein).toBeNull();
+        expect(asString.body.carbs).toBe(200);
+    });
+
+    it('turns confirmed targets into legacy ones the moment it moves a value', async () => {
+        // The canonical writer first, so there is something to diverge from.
+        const confirmed = await asUser(
+            request
+                .put('/api/meal-planning/targets')
+                .send({ source: 'manual', calories: 2000, protein: 150, carbs: 200, fat: 70 }),
+            owner,
+        ).expect(200);
+        const confirmedRevision = confirmed.body.targets.revision as number;
+
+        expect(confirmed.body.targets).toMatchObject({ source: 'manual', complete: true });
+        expect(confirmedRevision).toBeGreaterThan(0);
+
+        // Then the untouched legacy route, moving one of the four.
+        await putLegacyTargets({ calories: 2100 }).expect(200);
+
+        const canonical = await asUser(request.get('/api/meal-planning/targets'), owner).expect(200);
+
+        // §0.5.2: the stored values no longer equal `confirmed_targets`, so the
+        // attribution becomes `legacy` — which is how an old client keeps
+        // working while the planner still refuses to build a week from numbers
+        // nobody confirmed. The revision does NOT move: this writer never
+        // touches it.
+        expect(canonical.body).toStrictEqual({
+            targets: { calories: 2100, protein: 150, carbs: 200, fat: 70 },
+            complete: true,
+            source: 'legacy',
+            stale: false,
+            revision: confirmedRevision,
+        });
+    });
+});
+
+describe('the diary entry ownership boundary', () => {
+    const owner = { uid: '' };
+    const stranger = { uid: '' };
+    let strangerEntryId = '';
+    let ownerBreakfastId = '';
+    let ownerLunchId = '';
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+
+        const first = await makeUser();
+        const second = await makeUser();
+        owner.uid = first.id;
+        stranger.uid = second.id;
+
+        ownerBreakfastId = await diaryMealId(owner, DAY_KEY, 'Breakfast');
+        ownerLunchId = await diaryMealId(owner, DAY_KEY, 'Lunch');
+
+        const strangerBreakfastId = await diaryMealId(stranger, DAY_KEY, 'Breakfast');
+        const created = await asUser(
+            request.post(`/api/macros/meal/${strangerBreakfastId}/entries`).send(legacyBody()),
+            stranger,
+        ).expect(201);
+
+        strangerEntryId = created.body.id as string;
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('answers a foreign update with Entry not found and changes nothing', async () => {
+        const before = await storedEntry(strangerEntryId);
+
+        const response = await asUser(
+            request.put(`/api/macros/entry/${strangerEntryId}`).send({ servings: 9, name: 'Hijacked', calories: 1 }),
+            owner,
+        ).expect(404);
+
+        expect(response.body).toStrictEqual({ error: 'Entry not found' });
+        // The HTTP answer was already 404 before the write predicate gained its
+        // owner key — the read did the authorizing — so the ONLY way to see
+        // that the predicate landed is to read the row back. Rule §5.1: a write
+        // that finds by id alone is a cross-user write waiting to happen.
+        expect(await storedEntry(strangerEntryId)).toStrictEqual(before);
+    });
+
+    it('answers a foreign delete with Entry not found and leaves the row live', async () => {
+        const response = await asUser(request.delete(`/api/macros/entry/${strangerEntryId}`), owner).expect(404);
+
+        expect(response.body).toStrictEqual({ error: 'Entry not found' });
+        expect((await storedEntry(strangerEntryId)).deleted_at).toBeNull();
+
+        // Still the stranger's to delete, which is what "unchanged" has to mean.
+        await asUser(request.delete(`/api/macros/entry/${strangerEntryId}`), stranger).expect(200);
+    });
+
+    it('answers a foreign id and an absent id identically, so existence never leaks', async () => {
+        const foreignUpdate = await asUser(
+            request.put(`/api/macros/entry/${strangerEntryId}`).send({ servings: 2 }),
+            owner,
+        );
+        const absentUpdate = await asUser(request.put(`/api/macros/entry/${ABSENT_UUID}`).send({ servings: 2 }), owner);
+        const foreignDelete = await asUser(request.delete(`/api/macros/entry/${strangerEntryId}`), owner);
+        const absentDelete = await asUser(request.delete(`/api/macros/entry/${ABSENT_UUID}`), owner);
+
+        // §1.5 / §8: 404 for both, never 403, and the two indistinguishable.
+        expect(foreignUpdate.status).toBe(absentUpdate.status);
+        expect(foreignUpdate.body).toStrictEqual(absentUpdate.body);
+        expect(foreignDelete.status).toBe(absentDelete.status);
+        expect(foreignDelete.body).toStrictEqual(absentDelete.body);
+        expect(foreignUpdate.status).toBe(404);
+        expect(foreignDelete.status).toBe(404);
+    });
+
+    it('leaves the stranger´s day read untouched by the attempts', async () => {
+        await asUser(request.put(`/api/macros/entry/${strangerEntryId}`).send({ name: 'Hijacked' }), owner).expect(404);
+
+        const day = await asUser(request.get(`/api/macros/${DAY_KEY}`), stranger).expect(200);
+        const entries = (day.body.meals as { entries: { id: string; name: string }[] }[]).flatMap(
+            (meal) => meal.entries,
+        );
+
+        expect(entries).toHaveLength(1);
+        expect(entries[0]).toMatchObject({ id: strangerEntryId, name: 'Scrambled eggs' });
+    });
+
+    it('ignores a meal and a date the update body names', async () => {
+        const created = await asUser(
+            request.post(`/api/macros/meal/${ownerBreakfastId}/entries`).send(legacyBody()),
+            owner,
+        ).expect(201);
+        const before = await storedPlacement(created.body.id);
+
+        const response = await asUser(
+            request.put(`/api/macros/entry/${created.body.id}`).send({
+                mealId: ownerLunchId,
+                date: '2026-04-01',
+                servings: 2,
+            }),
+            owner,
+        ).expect(200);
+
+        // §0.5.1: "The existing update contract has no move fields, and none are
+        // added: an entry stays in its meal and on its date." The body is
+        // accepted — unknown keys have never been refused here — and the two
+        // columns a move would need are simply not among the ones the service
+        // writes.
+        expect(response.body.servings).toBe(2);
+        expect(sortedKeys(response.body)).toEqual(MEAL_ENTRY_DTO_KEYS);
+
+        const after = await storedPlacement(created.body.id);
+
+        expect(after.meal_id).toBe(before.meal_id);
+        expect(after.meal_id).toBe(ownerBreakfastId);
+        expect(after.date.toISOString()).toBe(before.date.toISOString());
+    });
+});
+
+describe('the neighbours this feature did not touch', () => {
+    const owner = { uid: '' };
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+
+        const user = await makeUser();
+        owner.uid = user.id;
+    });
+
+    afterAll(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('answers /health without an identity header', async () => {
+        // Unauthenticated by design (§3.1): Coolify health checks, uptime
+        // monitoring and post-deploy verification all hit it, and mounting the
+        // new routers must not have moved it behind the auth boundary.
+        const response = await request.get('/health').expect(200);
+
+        expect(sortedKeys(response.body)).toEqual(['status', 'version']);
+        expect(response.body.status).toBe('ok');
+        expect(response.body.version).toEqual(expect.any(String));
+    });
+
+    it('still refuses an authenticated route without one', async () => {
+        const response = await request.get('/api/foods').expect(401);
+
+        expect(response.body).toStrictEqual({ error: 'No token provided' });
+    });
+
+    it('answers the foods library with its shipped page block and starter foods', async () => {
+        const response = await asUser(request.get('/api/foods'), owner).expect(200);
+        const foods = response.body.foods as { name: string }[];
+
+        expect(sortedKeys(response.body)).toEqual(['foods', 'pagination']);
+        // Defaults 1 and 25, and the four starter foods a fresh library is
+        // seeded with on first read — both unchanged by the catalog work, which
+        // adds a separate `/api/catalog/foods` route rather than touching this one.
+        expect(response.body.pagination).toStrictEqual({ page: 1, limit: 25, total: 4, totalPages: 1 });
+        expect(foods.map((food) => food.name).sort()).toEqual(STARTER_FOOD_NAMES);
+        expect(sortedKeys(foods[0])).toEqual(FOOD_DTO_KEYS);
+    });
+
+    it('answers the AI usage meter unchanged', async () => {
+        // No email header, so the unlimited whitelist cannot match whatever the
+        // environment has configured and the answer is deterministic.
+        const response = await asUser(request.get('/api/macros/ai-usage'), owner).expect(200);
+
+        expect(sortedKeys(response.body)).toEqual(['limit', 'resetsAt', 'unlimited', 'used']);
+        expect(response.body.used).toBe(0);
+        expect(response.body.unlimited).toBe(false);
+        expect(Number.isInteger(response.body.limit) && response.body.limit > 0).toBe(true);
+        // The first millisecond of the next UTC day.
+        expect(response.body.resetsAt).toMatch(/T00:00:00\.000Z$/);
+    });
+
+    describe('the two body-size parser tiers', () => {
+        // Comfortably over the global 100 KB default and far under the AI
+        // routes' 10 MB one, so one payload tells the two tiers apart.
+        const OVERSIZED_BODY = 'x'.repeat(150 * 1024);
+
+        it('lets the AI tier parse a body the global limit would refuse', async () => {
+            // §3.1: "the first JSON parser to run wins", so the 10 MB parser has
+            // to stay mounted BEFORE the global one. The proof is that the
+            // request reaches the controller at all — it answers the controller's
+            // own validation message instead of a 413, and no vendor call or
+            // quota consumption is involved in getting there.
+            const response = await asUser(
+                request.post('/api/macros/label-scan').send({ padding: OVERSIZED_BODY }),
+                owner,
+            ).expect(400);
+
+            expect(response.body).toStrictEqual({ error: 'imageBase64 is required' });
+        });
+
+        it('still refuses an oversized diary body at the global tier', async () => {
+            const breakfastId = await diaryMealId(owner, DAY_KEY, 'Breakfast');
+
+            // The entries route is on the global parser, which rejects the body
+            // before the handler sees it. Express's default error handler owns
+            // this response, so only the status is a contract — and nothing
+            // reaches the database.
+            await asUser(
+                request
+                    .post(`/api/macros/meal/${breakfastId}/entries`)
+                    .send({ ...legacyBody(), rawInput: OVERSIZED_BODY }),
+                owner,
+            ).expect(413);
+
+            expect(await prisma.meal_entries.count({ where: { user_id: owner.uid } })).toBe(0);
+        });
+    });
+});
+

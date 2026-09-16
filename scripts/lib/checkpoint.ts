@@ -1845,11 +1845,11 @@ export const getActiveReleaseLoad = async (
 // deliberately absent, so the narrow interfaces below declare exactly the three
 // calls this file makes, which is the established in-repo precedent
 // (src/__tests__/setup/testDb.ts, src/__tests__/api/compat.test.ts and
-// src/__tests__/api/catalog.test.ts all declare their own PgClient the same
-// way). The require lives INSIDE the opener rather than at module load, for the
-// same reason the Prisma import above is type-only: importing checkpoint.ts must
-// stay side-effect-free, so a suite that only reads the pure decisions never
-// loads a database driver.
+// src/__tests__/api/catalogCollation.test.ts all declare their own PgClient the
+// same way). The require lives INSIDE the opener rather than at module load,
+// for the same reason the Prisma import above is type-only: importing
+// checkpoint.ts must stay side-effect-free, so a suite that only reads the pure
+// decisions never loads a database driver.
 //
 // WHAT HOLDS AND WHAT DOES NOT. A PostgreSQL session advisory lock needs no
 // renewal — there is no lease to reassert, which is what makes it usable without

@@ -68,14 +68,82 @@
 // than a convenience: a lock test needs a session that is not the one holding
 // the lock, and a statement count needs a client whose query events are
 // observable.
+//
+// ---------------------------------------------------------------------------
+// THE SECOND HALF: THE HTTP BOUNDARY (from "the three target routes over HTTP"
+// onwards)
+// ---------------------------------------------------------------------------
+//
+// The four properties above are session-level: each one is the difference
+// between one statement and two, or between a row lock held to COMMIT and none,
+// so each is driven through the service entry point where the lock and the
+// statement actually live. None of them can be observed from outside a request
+// at all.
+//
+// Everything a REQUEST can be wrong about is a different set of properties, and
+// they are proven in the second half of this file by driving the shipped app
+// through `request` from `../setup/testApp` — the real `src/app.ts`, with its
+// real mount order and its real auth boundary, never a hand-assembled router.
+// What only the boundary can establish:
+//
+// 5. THE THREE TARGET ROUTES ARE THE ROUTER'S ONLY UNGATED MEMBERS.
+//    `mealPlanning.controller.ts` calls `assertMealPlanningEnabled()` in
+//    fifteen handlers and deliberately not in these three (AAP §0.5.2, §0.7.5),
+//    and `mealPlanning.routes.ts` registers all eighteen on one router. A unit
+//    test of `isMealPlanningEnabled` proves what the flag reads, never which
+//    handlers consult it; only a request against a module graph built with the
+//    flag off can show that Account's read and write still answer while
+//    `GET /meal-planning/preferences` on the SAME router answers 503. The
+//    contrast is the assertion: either half alone would pass for a gate applied
+//    to everything or to nothing.
+//
+// 6. THE CANONICAL WRITE AGREES WITH THE DIARY'S OWN READ. `saveTargets` writes
+//    `users.target_*` through the untouched `nutrition.service.ts::updateTargets`,
+//    and `GET /api/macros/:date` reads those same four columns through the
+//    untouched `getTargetsForUser`. Asserting the two responses against each
+//    other after ONE save is what shows the canonical writer wrote the SHARED
+//    columns rather than a parallel store of its own — the prompt's "the
+//    planner and diary must display the same confirmed values", and AAP §0.9.3's
+//    named evidence. Neither service can make that claim about the other.
+//
+// 7. THE REQUEST CARRIES NO IDENTITY AND NO INPUTS. `getUserId(req)` reads the
+//    verified token, the estimate is recomputed from stored preferences, and
+//    both arms of the save envelope are closed sets. So a `userId` in the body,
+//    a calorie figure on the estimated arm and an input in the query string are
+//    all things the boundary must refuse or ignore, and there is no layer below
+//    it where "the body could not express an identity" is even a statement.
+//
+// 8. THE STATUS, CODE AND PAYLOAD OF EVERY REFUSAL. `mealPlanning.errors.ts` is
+//    deliberately status-free (Rule `backend-architecture` §8) and the parsers
+//    return verdicts rather than throwing, so the mapping from a refusal to
+//    `409 stale_targets {currentRevision}`, `422 targets_missing {missing}` or
+//    `400 invalid_request {details}` exists only in the controller. A service
+//    test that asserts an error CLASS pins the opposite of what the client
+//    depends on.
+//
+// The second half is asserted in both directions for the same reason the first
+// is: the ungated routes answer normally AND the gated sibling refuses; a
+// pinned revision is refused when it is wrong AND accepted when it is right; a
+// bound rejects 0 and 1001 AND accepts 1 and 1000; an infeasible save WARNS and
+// still stores, while a coherent one warns about nothing.
+//
+// The two halves share this file because they are one subject, and a helper
+// that crossed between suites would have to live somewhere this directory does
+// not allow (Rule §7.1). They share the outer `beforeEach` too: it truncates
+// and seeds ONE confirmed-estimate user, and every HTTP case below creates the
+// identities it needs for itself, so the seeded user is never the subject of a
+// request and no case inherits another's state.
 
 import { randomUUID } from 'node:crypto';
+
+import supertest from 'supertest';
 
 import { PrismaClient } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
 import {
     FIXTURE_TARGETS,
     FIXTURE_USER_TARGET_COLUMNS,
+    FixtureMacros,
     addDaysToDayKey,
     makeCatalogFood,
     makePreferences,
@@ -83,6 +151,7 @@ import {
     makeUser,
     utcTodayDayKey,
 } from '../setup/factories';
+import { asUser, request } from '../setup/testApp';
 import { truncateFeatureTables } from '../setup/testDb';
 import { generatePlan, regeneratePlan } from '../../services/mealPlan.service';
 import { PlanGenerationError, TargetsUnconfirmedError } from '../../services/mealPlanning.errors';
@@ -93,6 +162,13 @@ import { PlanningPreferences, evaluatePlanningEligibility } from '../../services
 import * as groceryService from '../../services/grocery.service';
 import * as recipeService from '../../services/recipe.service';
 import { UnitConversionError, unitFamily } from '../../utils/units';
+import type { DailyMacrosResponse } from '../../types/nutrition';
+import type {
+    InvalidRequestDetail,
+    SaveTargetsResponse,
+    TargetEstimateResponse,
+    TargetsResponse,
+} from '../../types/mealPlanning';
 import {
     getTargetEstimate,
     getTargets,
@@ -1558,5 +1634,2219 @@ describe('the real generation path against the untouched legacy writer', () => {
 
         expect(plans).toHaveLength(1);
         expect(plans[0].targets_snapshot).toEqual({ ...FIXTURE_TARGETS });
+    });
+});
+
+/* ===========================================================================
+ * THE THREE TARGET ROUTES OVER HTTP
+ *
+ * Everything below drives the shipped `src/app.ts` through `request`, so every
+ * assertion is about the boundary: the mount, the auth middleware, the
+ * controller's status mapping and the wire shape the mobile codecs decode. The
+ * identity arrives only in the header, which is what makes "user A cannot reach
+ * user B's row" mean anything (see `setup/jestSetup.ts`).
+ * ========================================================================= */
+
+const ESTIMATE_PATH = '/api/meal-planning/targets/estimate';
+const TARGETS_PATH = '/api/meal-planning/targets';
+const PREFERENCES_PATH = '/api/meal-planning/preferences';
+const PLANS_PATH = '/api/meal-planning/plans';
+const LEGACY_TARGETS_PATH = '/api/user/targets';
+
+/**
+ * The two identities the HTTP cases use.
+ *
+ * Fixed strings rather than generated ones: the outer `beforeEach` truncates
+ * before every case, so reuse is always a fresh row, and a named id makes the
+ * ownership assertions readable. Neither is the seeded `USER_ID`, so no HTTP
+ * case is affected by the confirmed-estimate state the outer hook leaves.
+ */
+const HTTP_USER = 'targets-http-user';
+const OTHER_HTTP_USER = 'targets-http-other-user';
+
+/** A day key the diary read can be asked for without depending on when the suite runs. */
+const DIARY_DAY_KEY = '2026-07-05';
+
+const getEstimate = (uid: string) => asUser(request.get(ESTIMATE_PATH), { uid });
+
+const getTargetsOverHttp = (uid: string) => asUser(request.get(TARGETS_PATH), { uid });
+
+/**
+ * `PUT /api/meal-planning/targets`.
+ *
+ * `body` is `unknown` because half the cases below send something the envelope
+ * must refuse — an array, a mixed body, a key the arm does not accept — and
+ * typing it as the DTO would make those cases uncompilable rather than
+ * assertable.
+ */
+const saveTargetsOverHttp = (uid: string, body: unknown) =>
+    asUser(request.put(TARGETS_PATH), { uid }).send(body as object);
+
+/** The confirmed-estimate state, for the user an HTTP case addresses. */
+const seedHttpConfirmedEstimate = async (
+    uid: string = HTTP_USER,
+    preferences: Parameters<typeof makePreferences>[1] = {},
+): Promise<void> => {
+    await makeUser({ id: uid, ...FIXTURE_USER_TARGET_COLUMNS });
+    await makePreferences(uid, preferences);
+};
+
+/** The four stored columns, read directly — the canonical values every surface must agree with. */
+const storedUserTargets = async (uid: string) =>
+    prisma.users.findUniqueOrThrow({
+        where: { id: uid },
+        select: {
+            target_calories: true,
+            target_protein_g: true,
+            target_carbs_g: true,
+            target_fat_g: true,
+        },
+    });
+
+/** The attribution record the canonical read compares those columns against. */
+const storedTargetRecord = async (uid: string) =>
+    prisma.meal_plan_preferences.findUniqueOrThrow({
+        where: { user_id: uid },
+        select: {
+            setup_status: true,
+            setup_step: true,
+            target_source: true,
+            confirmed_targets: true,
+            targets_revision: true,
+            targets_input_revision: true,
+            revision: true,
+        },
+    });
+
+/** The `{field, code}` pairs of a `400 invalid_request` body. */
+const refusalDetails = (body: unknown): InvalidRequestDetail[] =>
+    (body as { details?: InvalidRequestDetail[] }).details ?? [];
+
+/* ---------------------------------------------------------------------------
+ * GET /api/meal-planning/targets/estimate
+ *
+ * The calculated figure the review screen shows, recomputed on every read. The
+ * equation, the factors, the clamps and every envelope corner are
+ * `targets.logic.test.ts`'s; what the boundary owns is that this path reaches
+ * that computation at all, that the number it returns was derived from the
+ * STORED answers rather than from the request, and that the two unavailable
+ * reasons arrive as the machine-readable codes the client routes on.
+ * ------------------------------------------------------------------------- */
+
+describe('GET /api/meal-planning/targets/estimate', () => {
+    it('refuses a request that carries no identity', async () => {
+        // The auth boundary, not this handler: `app.ts` mounts
+        // `authenticateFirebaseToken` before the meal-planning router, so a
+        // request with no token never reaches `getUserId`.
+        const response = await request.get(ESTIMATE_PATH).expect(401);
+
+        expect(response.body).toEqual({ error: 'No token provided' });
+    });
+
+    it('is answered by its own handler rather than captured by the /targets sibling', async () => {
+        // `/meal-planning/targets/estimate` and `/meal-planning/targets` are
+        // siblings on one router (Rule §3.1). The proof that the literal one is
+        // reached is that the body is the ESTIMATE shape — a derivation with
+        // `bmr` and `inputs` — and carries none of the canonical read's own
+        // members, which is what a capture by the other handler would return.
+        await seedHttpConfirmedEstimate();
+
+        const response = await getEstimate(HTTP_USER).expect(200);
+        const body = response.body as TargetEstimateResponse & Partial<TargetsResponse>;
+
+        expect(body.source).toBe('estimated');
+        expect(typeof body.bmr).toBe('number');
+        expect(body.inputs).toBeDefined();
+        expect(body).not.toHaveProperty('complete');
+        expect(body).not.toHaveProperty('stale');
+    });
+
+    it('answers the whole estimate shape, derivation included', async () => {
+        await seedHttpConfirmedEstimate();
+
+        const response = await getEstimate(HTTP_USER).expect(200);
+
+        // Asserted whole rather than field by field: the review screen renders
+        // every member, so an extra or missing one is a contract change.
+        expect(Object.keys(response.body as object).sort()).toEqual([
+            'adjustment',
+            'bmr',
+            'calories',
+            'carbs',
+            'clampReason',
+            'clamped',
+            'estimateRevision',
+            'fat',
+            'inputs',
+            'protein',
+            'source',
+            'tdee',
+        ]);
+        expect((response.body as TargetEstimateResponse).inputs).toEqual({
+            // The stored answers `makePreferences` holds, echoed so the screen
+            // can show what produced the numbers.
+            age: 34,
+            heightCm: 178,
+            weightKg: 79,
+            sexForEstimate: 'male',
+            activityLevel: 'lightly_active',
+            goal: 'maintain',
+            paceLbPerWeek: null,
+        });
+    });
+
+    it('reaches the real computation: the audited fixture arrives value for value', async () => {
+        // AAP §0.9.3's named inputs, and the ONE arithmetic case at this layer.
+        // Its job is to prove the request path ends in `computeTargetEstimate`
+        // rather than in something that merely answers plausibly; the equation
+        // itself is pinned at every envelope corner, with every clamp branch, in
+        // `targets.logic.test.ts`.
+        await seedHttpConfirmedEstimate(HTTP_USER, {
+            sex_for_estimate: 'female',
+            age: 34,
+            height_cm: 177.8,
+            weight_kg: 82.6,
+            activity_level: 'lightly_active',
+            goal: 'lose',
+            pace_lb_per_week: 1,
+        });
+
+        const response = await getEstimate(HTTP_USER).expect(200);
+
+        expect(response.body).toMatchObject({
+            bmr: 1606,
+            tdee: 2209,
+            adjustment: -500,
+            calories: 1709,
+            protein: 128,
+            carbs: 171,
+            fat: 57,
+            clamped: false,
+            clampReason: null,
+        });
+    });
+
+    it('carries a clamp to the wire as the bound that decided the number', async () => {
+        // The lowest corner of the supported envelope: the calculated figure is
+        // below the female floor, so the floor is what the user is shown and
+        // `clampReason` says which bound it was. The other two branches belong
+        // to the pure suite; what this asserts is that neither flag is dropped
+        // between the computation and the response.
+        await seedHttpConfirmedEstimate(HTTP_USER, {
+            sex_for_estimate: 'female',
+            age: 100,
+            height_cm: 120,
+            weight_kg: 30,
+            activity_level: 'not_very_active',
+            goal: 'maintain',
+            pace_lb_per_week: null,
+        });
+
+        expect((await getEstimate(HTTP_USER).expect(200)).body).toMatchObject({
+            bmr: 389,
+            calories: 1200,
+            clamped: true,
+            clampReason: 'floor',
+        });
+    });
+
+    describe('estimateRevision', () => {
+        it('echoes the preferences revision the inputs came from', async () => {
+            // This number is the whole reason the save can refuse an estimate
+            // computed from answers that have since moved: it is the preferences
+            // `revision`, not a counter of its own.
+            await seedHttpConfirmedEstimate();
+
+            expect((await getEstimate(HTTP_USER).expect(200)).body).toMatchObject({
+                estimateRevision: 1,
+            });
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ revision: 1 });
+        });
+
+        it('moves when a real preference save advances that revision', async () => {
+            await seedHttpConfirmedEstimate();
+
+            await asUser(request.put(`${PREFERENCES_PATH}/steps/diet`), { uid: HTTP_USER })
+                .send({
+                    diet: 'vegan',
+                    allergens: ['milk'],
+                    timeZone: TIME_ZONE,
+                    expectedRevision: 1,
+                })
+                .expect(200);
+
+            // A diet is not a term in the energy equation, so the four numbers
+            // are unchanged — and the revision they are attributed to is not.
+            // That is what makes the pin an ancestry claim rather than a
+            // checksum of the arithmetic.
+            const refreshed = (await getEstimate(HTTP_USER).expect(200))
+                .body as TargetEstimateResponse;
+
+            expect(refreshed.estimateRevision).toBe(2);
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ revision: 2 });
+        });
+    });
+
+    describe('the inputs come from storage and nowhere else', () => {
+        it('ignores query parameters that name an input', async () => {
+            await seedHttpConfirmedEstimate();
+
+            const stored = (await getEstimate(HTTP_USER).expect(200)).body;
+            const withQuery = await asUser(request.get(ESTIMATE_PATH), { uid: HTTP_USER })
+                .query({
+                    age: 99,
+                    weightKg: 200,
+                    activityLevel: 'very_active',
+                    goal: 'gain',
+                    sexForEstimate: 'female',
+                })
+                .expect(200);
+
+            // Compared whole: any input the handler had taken from the query
+            // would change `inputs` and the four figures derived from them.
+            expect(withQuery.body).toEqual(stored);
+        });
+
+        it('ignores a request body that names an input', async () => {
+            await seedHttpConfirmedEstimate();
+
+            const stored = (await getEstimate(HTTP_USER).expect(200)).body;
+            const withBody = await asUser(request.get(ESTIMATE_PATH), { uid: HTTP_USER })
+                .send({ age: 99, weightKg: 200, activityLevel: 'very_active' })
+                .expect(200);
+
+            expect(withBody.body).toEqual(stored);
+        });
+
+        it('persists nothing by being read', async () => {
+            await seedHttpConfirmedEstimate();
+
+            const before = await storedTargetRecord(HTTP_USER);
+
+            await getEstimate(HTTP_USER).expect(200);
+            await getEstimate(HTTP_USER).expect(200);
+
+            // The estimate is a derivation, not a record. A second source for
+            // it could disagree with the inputs it claims to come from, so
+            // reading it must leave `estimated_targets`, the revisions and the
+            // confirmed figure exactly where they stood.
+            expect(await storedTargetRecord(HTTP_USER)).toEqual(before);
+        });
+    });
+
+    describe('409 estimate_unavailable', () => {
+        it('reports the user\'s own answer as prefer_not_to_say', async () => {
+            // An answer, not a gap: the client routes it to manual entry and
+            // says so, which it can only do from the `reason` payload.
+            await seedHttpConfirmedEstimate(HTTP_USER, { sex_for_estimate: 'prefer_not_to_say' });
+
+            const response = await getEstimate(HTTP_USER).expect(409);
+
+            expect(response.body).toEqual({
+                error: 'estimate_unavailable',
+                reason: 'prefer_not_to_say',
+            });
+        });
+
+        it('reports an unanswered input as missing_inputs', async () => {
+            await seedHttpConfirmedEstimate(HTTP_USER, { activity_level: null });
+
+            expect((await getEstimate(HTTP_USER).expect(409)).body).toEqual({
+                error: 'estimate_unavailable',
+                reason: 'missing_inputs',
+            });
+        });
+
+        it('reports a user with no preferences row as missing_inputs', async () => {
+            // The same reason a row with gaps gets, because both lead the client
+            // to the same manual-entry screen.
+            await makeUser({ id: HTTP_USER });
+
+            expect((await getEstimate(HTTP_USER).expect(409)).body).toEqual({
+                error: 'estimate_unavailable',
+                reason: 'missing_inputs',
+            });
+        });
+
+        it('never leaks an error object, a stack or Prisma text', async () => {
+            await seedHttpConfirmedEstimate(HTTP_USER, { sex_for_estimate: 'prefer_not_to_say' });
+
+            const response = await getEstimate(HTTP_USER).expect(409);
+
+            // Rule §4: the refusal body is a code and the data the client acts
+            // on. `{error: err}` is the pattern that rule names as the one to
+            // fix, so the assertion is on the body's WHOLE key set.
+            expect(Object.keys(response.body as object).sort()).toEqual(['error', 'reason']);
+            expect(JSON.stringify(response.body)).not.toMatch(
+                /stack|prisma|Invocation|node_modules/i,
+            );
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * GET /api/meal-planning/targets — the canonical read
+ *
+ * Five surfaces act on this one verdict: Review, plan settings, Account,
+ * Progress and the planner. `deriveTargetsResponse` decides what `complete`,
+ * `source` and `stale` mean and is unit-tested on its two row shapes; every arm
+ * below is instead a distinct PERSISTED state, reached through the writers that
+ * really produce it — the canonical save, a real preference save, and the
+ * untouched legacy route — and read back over the wire the client decodes.
+ * ------------------------------------------------------------------------- */
+
+describe('GET /api/meal-planning/targets', () => {
+    it('refuses a request that carries no identity', async () => {
+        expect((await request.get(TARGETS_PATH).expect(401)).body).toEqual({
+            error: 'No token provided',
+        });
+    });
+
+    it('answers 200 with a null target set for a user who never set one, and never 404', async () => {
+        // THE ASSERTION THAT PROTECTS THE CLIENT'S UNAVAILABILITY DETECTION.
+        // AAP §0.2.5 makes a 404 WITHOUT a decodable code from this
+        // resource-less GET the client's signal that the meal-planning routes
+        // are not mounted at all — a rolled-back backend. So "this user has no
+        // targets" must never be spelled as a 404: it is a 200 whose `targets`
+        // is null, and the client then falls back to its local value instead of
+        // hiding the feature.
+        await makeUser({ id: HTTP_USER });
+
+        const response = await getTargetsOverHttp(HTTP_USER).expect(200);
+
+        expect(response.body).toEqual({
+            targets: null,
+            complete: false,
+            source: null,
+            stale: false,
+            revision: 0,
+        });
+    });
+
+    it('keeps per-field nullability for a calories-only legacy account', async () => {
+        // `users.target_*` are four independently nullable columns, and the
+        // diary's own `resolveMacroTargets` resolves them FIELD BY FIELD. So a
+        // partially set account must arrive as an OBJECT WITH NULLS INSIDE and
+        // not as `targets: null` — the difference decides whether the diary
+        // shows the user's real calorie target or falls back for all four.
+        await makeUser({ id: HTTP_USER, target_calories: 1900 });
+
+        const response = await getTargetsOverHttp(HTTP_USER).expect(200);
+
+        expect(response.body).toEqual({
+            targets: { calories: 1900, protein: null, carbs: null, fat: null },
+            complete: false,
+            // No preferences row, so the values cannot be attributed to a route
+            // this feature ran.
+            source: 'legacy',
+            stale: false,
+            revision: 0,
+        });
+    });
+
+    it('reports revision 0 without a preferences row and the targets counter with one', async () => {
+        await makeUser({ id: HTTP_USER, target_calories: 1900 });
+
+        expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+            revision: 0,
+        });
+
+        await prisma.users.delete({ where: { id: HTTP_USER } });
+        await seedHttpConfirmedEstimate(HTTP_USER, { targets_revision: 4 });
+
+        expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+            revision: 4,
+        });
+    });
+
+    describe('the route the values are attributed to', () => {
+        it('reports a confirmed estimate as estimated, with the snapshot matching the columns', async () => {
+            // Written by the canonical route rather than seeded, so the
+            // attribution is a property of that write.
+            await makeUser({ id: HTTP_USER });
+            await makePreferences(HTTP_USER, {
+                target_source: null,
+                confirmed_targets: undefined,
+                targets_revision: 0,
+                targets_input_revision: null,
+            });
+
+            const estimate = (await getEstimate(HTTP_USER).expect(200))
+                .body as TargetEstimateResponse;
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: estimate.estimateRevision,
+            }).expect(200);
+
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                targets: {
+                    calories: estimate.calories,
+                    protein: estimate.protein,
+                    carbs: estimate.carbs,
+                    fat: estimate.fat,
+                },
+                complete: true,
+                source: 'estimated',
+                stale: false,
+                revision: 1,
+            });
+
+            // The attribution is exactly this agreement: the snapshot the save
+            // recorded equals the four columns it wrote. Asserted directly,
+            // because it is the comparison `source` is derived from.
+            const record = await storedTargetRecord(HTTP_USER);
+
+            expect(record.confirmed_targets).toEqual({
+                calories: estimate.calories,
+                protein: estimate.protein,
+                carbs: estimate.carbs,
+                fat: estimate.fat,
+            });
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: estimate.calories,
+                target_protein_g: estimate.protein,
+                target_carbs_g: estimate.carbs,
+                target_fat_g: estimate.fat,
+            });
+        });
+
+        it('reports hand-entered values as manual', async () => {
+            await makeUser({ id: HTTP_USER });
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                calories: 1940,
+                protein: 146,
+                carbs: 194,
+                fat: 65,
+            }).expect(200);
+
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                targets: { calories: 1940, protein: 146, carbs: 194, fat: 65 },
+                complete: true,
+                source: 'manual',
+                // Manual targets never go stale: the user typed them, so a
+                // change of inputs says nothing about them.
+                stale: false,
+                revision: 1,
+            });
+        });
+
+        describe('legacy', () => {
+            it('is the verdict when values are set and no preferences row exists', async () => {
+                // The first of the two causes: nobody confirmed these HERE, so
+                // the planner must refuse to present a week built on them as
+                // reviewed.
+                await makeUser({ id: HTTP_USER, ...FIXTURE_USER_TARGET_COLUMNS });
+
+                expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                    targets: { ...FIXTURE_TARGETS },
+                    complete: true,
+                    source: 'legacy',
+                    stale: false,
+                    revision: 0,
+                });
+            });
+
+            it('is the verdict once the untouched legacy route moves a value after a confirmation', async () => {
+                // The second cause, and the reason the attribution exists at
+                // all: `PUT /api/user/targets` stays untouched for API
+                // compatibility, never bumps the targets revision and leaves no
+                // other trace, so comparing the columns with the snapshot is the
+                // ONLY way this read stays truthful for an older client.
+                await seedHttpConfirmedEstimate();
+
+                expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+                    source: 'estimated',
+                });
+
+                await asUser(request.put(LEGACY_TARGETS_PATH), { uid: HTTP_USER })
+                    .send({ calories: FIXTURE_TARGETS.calories + 100 })
+                    .expect(200);
+
+                const response = await getTargetsOverHttp(HTTP_USER).expect(200);
+
+                expect(response.body).toEqual({
+                    targets: {
+                        calories: FIXTURE_TARGETS.calories + 100,
+                        protein: FIXTURE_TARGETS.protein,
+                        carbs: FIXTURE_TARGETS.carbs,
+                        fat: FIXTURE_TARGETS.fat,
+                    },
+                    complete: true,
+                    source: 'legacy',
+                    // Staleness is only ever claimed about a confirmed
+                    // ESTIMATE; a legacy verdict already sends both surfaces to
+                    // "review your targets".
+                    stale: false,
+                    // Untouched by the legacy writer, which is what makes the
+                    // mismatch — rather than the counter — the signal.
+                    revision: 1,
+                });
+                expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                    targets_revision: 1,
+                    confirmed_targets: { ...FIXTURE_TARGETS },
+                });
+            });
+        });
+    });
+
+    describe('stale', () => {
+        it('becomes true when a preference save advances the revision, and the confirmed values stand', async () => {
+            await seedHttpConfirmedEstimate();
+
+            await asUser(request.put(`${PREFERENCES_PATH}/steps/activity`), { uid: HTTP_USER })
+                .send({ activityLevel: 'very_active', timeZone: TIME_ZONE, expectedRevision: 1 })
+                .expect(200);
+
+            const response = await getTargetsOverHttp(HTTP_USER).expect(200);
+
+            // BOTH halves matter. `stale` is how Review and plan settings come
+            // to OFFER a recalculation — and the four values are untouched,
+            // because a confirmed estimate is fixed once confirmed and nothing
+            // recalculates on its own.
+            expect(response.body).toEqual({
+                targets: { ...FIXTURE_TARGETS },
+                complete: true,
+                source: 'estimated',
+                stale: true,
+                revision: 1,
+            });
+
+            // The fresh estimate really has moved, so the case is not passing
+            // because the recalculation would be a no-op.
+            expect((await getEstimate(HTTP_USER).expect(200)).body).toMatchObject({
+                estimateRevision: 2,
+            });
+            expect(
+                ((await getEstimate(HTTP_USER).expect(200)).body as TargetEstimateResponse).calories,
+            ).not.toBe(FIXTURE_TARGETS.calories);
+        });
+
+        it('is false again once the user reconfirms at the current revision', async () => {
+            await seedHttpConfirmedEstimate();
+
+            await asUser(request.put(`${PREFERENCES_PATH}/steps/activity`), { uid: HTTP_USER })
+                .send({ activityLevel: 'very_active', timeZone: TIME_ZONE, expectedRevision: 1 })
+                .expect(200);
+
+            const fresh = (await getEstimate(HTTP_USER).expect(200)).body as TargetEstimateResponse;
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: fresh.estimateRevision,
+                expectedTargetsRevision: 1,
+            }).expect(200);
+
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                targets: {
+                    calories: fresh.calories,
+                    protein: fresh.protein,
+                    carbs: fresh.carbs,
+                    fat: fresh.fat,
+                },
+                complete: true,
+                source: 'estimated',
+                stale: false,
+                revision: 2,
+            });
+        });
+
+        it('stays false for hand-entered values however many preference saves follow', async () => {
+            await makeUser({ id: HTTP_USER });
+            await makePreferences(HTTP_USER, {
+                target_source: null,
+                confirmed_targets: undefined,
+                targets_revision: 0,
+                targets_input_revision: null,
+            });
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                calories: 1940,
+                protein: 146,
+                carbs: 194,
+                fat: 65,
+            }).expect(200);
+
+            await asUser(request.put(`${PREFERENCES_PATH}/steps/activity`), { uid: HTTP_USER })
+                .send({ activityLevel: 'very_active', timeZone: TIME_ZONE, expectedRevision: 1 })
+                .expect(200);
+
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+                source: 'manual',
+                stale: false,
+            });
+        });
+    });
+
+    it('agrees with the stored columns and the diary response after one save', async () => {
+        // THE PROMPT'S SYNCHRONISATION DIRECTIVE, and AAP §0.9.3's named
+        // evidence: "the planner and diary must display the same confirmed
+        // values".
+        //
+        // The third read is the load-bearing one. `GET /api/macros/:date`
+        // resolves its `targets` block through the UNTOUCHED
+        // `nutrition.service.ts::getTargetsForUser`, which reads the four
+        // `users.target_*` columns and knows nothing about this feature. So its
+        // agreement with the canonical read is what shows the canonical WRITER
+        // wrote those shared columns — through the equally untouched
+        // `updateTargets` — rather than a parallel store of its own that only
+        // its own reader can see.
+        await makeUser({ id: HTTP_USER });
+
+        const values = { calories: 1940, protein: 146, carbs: 194, fat: 65 };
+
+        await saveTargetsOverHttp(HTTP_USER, { source: 'manual', ...values }).expect(200);
+
+        const canonical = (await getTargetsOverHttp(HTTP_USER).expect(200)).body as TargetsResponse;
+        const diary = await asUser(request.get(`/api/macros/${DIARY_DAY_KEY}`), { uid: HTTP_USER })
+            .expect(200);
+
+        expect(canonical.targets).toEqual(values);
+        expect((diary.body as DailyMacrosResponse).targets).toEqual(values);
+        expect(await storedUserTargets(HTTP_USER)).toEqual({
+            target_calories: values.calories,
+            target_protein_g: values.protein,
+            target_carbs_g: values.carbs,
+            target_fat_g: values.fat,
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * PUT /api/meal-planning/targets — the canonical writer
+ *
+ * The single path that writes `users.target_*` for an opted-in user, and the
+ * only one that records what was confirmed. Two things are asserted here that
+ * exist nowhere else: that ONE transaction carries both halves of the write, and
+ * that the pinned revision is enforced rather than merely checked. The envelope
+ * parser and the bound arithmetic are `targets.logic.test.ts`'s; what the
+ * boundary owns is which status, code and payload each refusal becomes, and what
+ * the database holds afterwards.
+ * ------------------------------------------------------------------------- */
+
+/** Four coherent values: the macros' energy is within a rounding of the calories. */
+const COHERENT_TARGETS = { calories: 2000, protein: 150, carbs: 200, fat: 67 } as const;
+
+/** A row that has never confirmed anything, so the first save is the first save. */
+const seedUnconfirmedPreferences = async (
+    uid: string = HTTP_USER,
+    overrides: Parameters<typeof makePreferences>[1] = {},
+): Promise<void> => {
+    await makeUser({ id: uid });
+    await makePreferences(uid, {
+        target_source: null,
+        confirmed_targets: undefined,
+        targets_revision: 0,
+        targets_input_revision: null,
+        ...overrides,
+    });
+};
+
+describe('PUT /api/meal-planning/targets', () => {
+    it('refuses a request that carries no identity', async () => {
+        const response = await request
+            .put(TARGETS_PATH)
+            .send({ source: 'manual', ...COHERENT_TARGETS })
+            .expect(401);
+
+        expect(response.body).toEqual({ error: 'No token provided' });
+    });
+
+    describe('the envelope', () => {
+        it('refuses a body that is not an object', async () => {
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, []).expect(400);
+
+            expect(response.body).toMatchObject({ error: 'invalid_request' });
+            expect(refusalDetails(response.body)).toEqual([
+                { field: 'body', code: 'invalid_type' },
+            ]);
+        });
+
+        it('refuses a body that declares no source', async () => {
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {}).expect(400);
+
+            expect(refusalDetails(response.body)).toEqual([
+                { field: 'source', code: 'required' },
+            ]);
+        });
+
+        it('refuses a source outside the two the envelope accepts', async () => {
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'calculated',
+                ...COHERENT_TARGETS,
+            }).expect(400);
+
+            expect(refusalDetails(response.body)).toEqual([
+                { field: 'source', code: 'unknown_value' },
+            ]);
+        });
+
+        it('refuses an estimated body that also carries manual values', async () => {
+            // The two arms are CLOSED key sets, so a mixed body is refused
+            // rather than half-read. That is what makes "the client never sends
+            // the numbers" enforceable on the estimated arm.
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: 1,
+                ...COHERENT_TARGETS,
+            }).expect(400);
+
+            expect(refusalDetails(response.body).map((detail) => detail.field).sort()).toEqual([
+                'calories',
+                'carbs',
+                'fat',
+                'protein',
+            ]);
+            expect(
+                refusalDetails(response.body).every((detail) => detail.code === 'unknown_field'),
+            ).toBe(true);
+        });
+
+        it('refuses a manual body that also pins an estimate revision', async () => {
+            // The other direction: nothing was recomputed, so there are no
+            // inputs to pin, and a body that pins some is describing the other
+            // shape.
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                estimateRevision: 1,
+            }).expect(400);
+
+            expect(refusalDetails(response.body)).toEqual([
+                { field: 'estimateRevision', code: 'unknown_field' },
+            ]);
+        });
+
+        it('refuses an estimated body that pins no estimate revision', async () => {
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, { source: 'estimated' }).expect(
+                400,
+            );
+
+            expect(refusalDetails(response.body)).toEqual([
+                { field: 'estimateRevision', code: 'required' },
+            ]);
+        });
+
+        it('reports every offending field in one answer, so the screen can show them at once', async () => {
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                calories: 2000,
+                protein: 0,
+                carbs: 0,
+                fat: 65,
+                userId: OTHER_HTTP_USER,
+            }).expect(400);
+
+            expect(refusalDetails(response.body)).toEqual([
+                { field: 'protein', code: 'below_minimum' },
+                { field: 'carbs', code: 'below_minimum' },
+                { field: 'userId', code: 'unknown_field' },
+            ]);
+        });
+
+        it('writes nothing when the envelope is refused', async () => {
+            await seedUnconfirmedPreferences();
+
+            const before = await storedTargetRecord(HTTP_USER);
+
+            await saveTargetsOverHttp(HTTP_USER, { source: 'manual', calories: 2000 }).expect(400);
+
+            expect(await storedTargetRecord(HTTP_USER)).toEqual(before);
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: null,
+                target_protein_g: null,
+                target_carbs_g: null,
+                target_fat_g: null,
+            });
+        });
+    });
+
+    describe('the estimated arm', () => {
+        it('stores the server recomputation, which a client cannot offer for itself', async () => {
+            // Two halves, and both are needed. The case above shows a body
+            // carrying numbers is REFUSED — the client cannot even offer them —
+            // and this one shows what is stored when it does not: the figure
+            // this server recomputes from the stored answers, value for value
+            // with what the estimate route returns.
+            await seedUnconfirmedPreferences();
+
+            const estimate = (await getEstimate(HTTP_USER).expect(200))
+                .body as TargetEstimateResponse;
+            const saved = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: estimate.estimateRevision,
+            }).expect(200);
+
+            expect((saved.body as SaveTargetsResponse).targets.targets).toEqual({
+                calories: estimate.calories,
+                protein: estimate.protein,
+                carbs: estimate.carbs,
+                fat: estimate.fat,
+            });
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: estimate.calories,
+                target_protein_g: estimate.protein,
+                target_carbs_g: estimate.carbs,
+                target_fat_g: estimate.fat,
+            });
+        });
+
+        it('records the pinned input revision as the confirmed figure\'s ancestry', async () => {
+            await seedUnconfirmedPreferences();
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: 1,
+            }).expect(200);
+
+            // This is the number `stale` is later compared against, so the save
+            // recording it is what makes staleness answerable at all.
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                target_source: 'estimated',
+                targets_input_revision: 1,
+                revision: 1,
+            });
+        });
+
+        it('refuses an estimate pinned to answers the row has moved past', async () => {
+            await seedUnconfirmedPreferences();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: 99,
+            }).expect(409);
+
+            expect(response.body).toEqual({ error: 'estimate_stale' });
+            expect(await storedUserTargets(HTTP_USER)).toMatchObject({ target_calories: null });
+        });
+
+        it('refuses to confirm a calculated figure for a user with no answers on file', async () => {
+            // No preferences row at all: there is nothing to recompute from, so
+            // the save cannot be turned into a confirmation of anything.
+            await makeUser({ id: HTTP_USER });
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: 0,
+            }).expect(409);
+
+            expect(response.body).toEqual({
+                error: 'estimate_unavailable',
+                reason: 'missing_inputs',
+            });
+            expect(await prisma.meal_plan_preferences.count({ where: { user_id: HTTP_USER } })).toBe(
+                0,
+            );
+        });
+    });
+
+    describe('the two revisions are distinct tokens', () => {
+        /**
+         * A row whose two counters differ, which is the only state that can
+         * tell them apart: `estimateRevision` pins the ANSWERS (`revision` 1)
+         * and `expectedTargetsRevision` pins the TARGET RECORD
+         * (`targets_revision` 3). Conflating them is the obvious implementation
+         * slip, and swapping the two values is what surfaces it.
+         */
+        const seedDivergedRevisions = () =>
+            seedHttpConfirmedEstimate(HTTP_USER, {
+                targets_revision: 3,
+                revision: 1,
+                targets_input_revision: 1,
+            });
+
+        it('accepts the save when each token pins its own counter', async () => {
+            await seedDivergedRevisions();
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: 1,
+                expectedTargetsRevision: 3,
+            }).expect(200);
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                targets_revision: 4,
+                targets_input_revision: 1,
+                revision: 1,
+            });
+        });
+
+        it('refuses the estimate when the answers token carries the target record\'s value', async () => {
+            await seedDivergedRevisions();
+
+            expect(
+                (
+                    await saveTargetsOverHttp(HTTP_USER, {
+                        source: 'estimated',
+                        estimateRevision: 3,
+                        expectedTargetsRevision: 3,
+                    }).expect(409)
+                ).body,
+            ).toEqual({ error: 'estimate_stale' });
+        });
+
+        it('refuses the record when the target token carries the answers\' value', async () => {
+            await seedDivergedRevisions();
+
+            expect(
+                (
+                    await saveTargetsOverHttp(HTTP_USER, {
+                        source: 'estimated',
+                        estimateRevision: 1,
+                        expectedTargetsRevision: 1,
+                    }).expect(409)
+                ).body,
+            ).toEqual({ error: 'stale_targets', currentRevision: 3 });
+        });
+    });
+
+    describe('expectedTargetsRevision', () => {
+        it('may be omitted on the very first save, when there is no revision to pin', async () => {
+            await seedUnconfirmedPreferences();
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+            }).expect(200);
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ targets_revision: 1 });
+        });
+
+        it('is required once a revision exists, and its absence is a stale pin', async () => {
+            // Not a 400: the omission means the client is acting on a target
+            // record it has not seen, which is the same situation as pinning the
+            // wrong one. The authoritative revision comes back either way, so
+            // one recovery path serves both.
+            await seedHttpConfirmedEstimate();
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+            }).expect(409);
+
+            expect(response.body).toEqual({ error: 'stale_targets', currentRevision: 1 });
+        });
+
+        it('refuses a mismatch and names the authoritative revision', async () => {
+            await seedHttpConfirmedEstimate(HTTP_USER, { targets_revision: 7 });
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                expectedTargetsRevision: 6,
+            }).expect(409);
+
+            // `currentRevision` is what lets the client re-read, compare with
+            // its draft and resolve silently when the two already agree.
+            expect(response.body).toEqual({ error: 'stale_targets', currentRevision: 7 });
+        });
+
+        it('refuses a pinned revision against a stored zero', async () => {
+            // The client pinned a revision that never existed, which is as much
+            // a lost update as pinning the wrong one.
+            await seedUnconfirmedPreferences();
+
+            expect(
+                (
+                    await saveTargetsOverHttp(HTTP_USER, {
+                        source: 'manual',
+                        ...COHERENT_TARGETS,
+                        expectedTargetsRevision: 1,
+                    }).expect(409)
+                ).body,
+            ).toEqual({ error: 'stale_targets', currentRevision: 0 });
+        });
+
+        it('increments the stored revision by exactly one per accepted save', async () => {
+            await seedUnconfirmedPreferences();
+
+            for (const expectedTargetsRevision of [null, 1, 2]) {
+                const body =
+                    expectedTargetsRevision === null
+                        ? { source: 'manual', ...COHERENT_TARGETS }
+                        : { source: 'manual', ...COHERENT_TARGETS, expectedTargetsRevision };
+                const saved = await saveTargetsOverHttp(HTTP_USER, body).expect(200);
+
+                expect((saved.body as SaveTargetsResponse).targets.revision).toBe(
+                    (expectedTargetsRevision ?? 0) + 1,
+                );
+            }
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ targets_revision: 3 });
+        });
+    });
+
+    describe('one transaction, both halves', () => {
+        it('writes the columns, the snapshot, the source, the revision and the ancestry together', async () => {
+            await seedUnconfirmedPreferences();
+
+            const estimate = (await getEstimate(HTTP_USER).expect(200))
+                .body as TargetEstimateResponse;
+            const values = {
+                calories: estimate.calories,
+                protein: estimate.protein,
+                carbs: estimate.carbs,
+                fat: estimate.fat,
+            };
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'estimated',
+                estimateRevision: estimate.estimateRevision,
+            }).expect(200);
+
+            // All five facts, because the write is only canonical if every one
+            // of them landed: the columns every surface reads, the snapshot the
+            // attribution compares against, the route, the bumped token, and
+            // the ancestry staleness is judged by.
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: values.calories,
+                target_protein_g: values.protein,
+                target_carbs_g: values.carbs,
+                target_fat_g: values.fat,
+            });
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                target_source: 'estimated',
+                confirmed_targets: values,
+                targets_revision: 1,
+                targets_input_revision: estimate.estimateRevision,
+            });
+        });
+
+        it('moves neither half when the pinned revision is refused', async () => {
+            // THE ATOMICITY ASSERTION. A `users` write without the preferences
+            // write would leave a confirmed target recorded against preferences
+            // that never got it — the canonical read would then report `legacy`
+            // for a figure this feature had just written. The refusal is raised
+            // inside the transaction, so both halves must be exactly where they
+            // stood.
+            await seedHttpConfirmedEstimate();
+
+            const columnsBefore = await storedUserTargets(HTTP_USER);
+            const recordBefore = await storedTargetRecord(HTTP_USER);
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                calories: 1234,
+                protein: 123,
+                carbs: 123,
+                fat: 12,
+                expectedTargetsRevision: 99,
+            }).expect(409);
+
+            expect(await storedUserTargets(HTTP_USER)).toEqual(columnsBefore);
+            expect(await storedTargetRecord(HTTP_USER)).toEqual(recordBefore);
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+                targets: { ...FIXTURE_TARGETS },
+                source: 'estimated',
+            });
+        });
+    });
+
+    describe('a legacy user saving targets before any onboarding', () => {
+        /** The Account-screen case: targets edited by a user who has never run the wizard. */
+        const saveFromAccount = async (): Promise<void> => {
+            await makeUser({ id: HTTP_USER });
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+            }).expect(200);
+        };
+
+        it('creates the row it needs, at revision 1 and not_started', async () => {
+            await saveFromAccount();
+
+            expect(await storedTargetRecord(HTTP_USER)).toEqual({
+                setup_status: 'not_started',
+                setup_step: null,
+                target_source: 'manual',
+                confirmed_targets: { ...COHERENT_TARGETS },
+                targets_revision: 1,
+                // Manual values have no calculated ancestry.
+                targets_input_revision: null,
+                // AAP §0.5.2: the revision the client then pins on its first
+                // preference save.
+                revision: 1,
+            });
+        });
+
+        it('sets nothing else, because a target is not an answer to the wizard', async () => {
+            await saveFromAccount();
+
+            const row = await prisma.meal_plan_preferences.findUniqueOrThrow({
+                where: { user_id: HTTP_USER },
+            });
+
+            // A naive upsert that filled in defaults here would put a legacy
+            // user halfway through an onboarding they never started.
+            expect({
+                goal: row.goal,
+                age: row.age,
+                height_cm: row.height_cm,
+                weight_kg: row.weight_kg,
+                sex_for_estimate: row.sex_for_estimate,
+                activity_level: row.activity_level,
+                diet: row.diet,
+                meal_schedule: row.meal_schedule,
+                meal_times: row.meal_times,
+                cooking_time_limit_min: row.cooking_time_limit_min,
+                target_route: row.target_route,
+                time_zone: row.time_zone,
+                review_start_date: row.review_start_date,
+                allergens: row.allergens,
+                disliked_food_ids: row.disliked_food_ids,
+                disliked_food_groups: row.disliked_food_groups,
+            }).toEqual({
+                goal: null,
+                age: null,
+                height_cm: null,
+                weight_kg: null,
+                sex_for_estimate: null,
+                activity_level: null,
+                diet: null,
+                meal_schedule: null,
+                meal_times: null,
+                cooking_time_limit_min: null,
+                target_route: null,
+                time_zone: null,
+                review_start_date: null,
+                allergens: [],
+                disliked_food_ids: [],
+                disliked_food_groups: [],
+            });
+        });
+
+        it('is not onboarding progress: the preferences read still says not_started', async () => {
+            await saveFromAccount();
+
+            const response = await asUser(request.get(PREFERENCES_PATH), { uid: HTTP_USER }).expect(
+                200,
+            );
+
+            expect(response.body).toMatchObject({ setupStatus: 'not_started', setupStep: null });
+        });
+    });
+
+    describe('feasibility is advisory and never blocking', () => {
+        /** Saves `values` as the first manual confirmation and returns the advisory verdict. */
+        const saveAndAssess = async (values: {
+            calories: number;
+            protein: number;
+            carbs: number;
+            fat: number;
+        }): Promise<{ body: SaveTargetsResponse; status: number }> => {
+            await makeUser({ id: HTTP_USER });
+
+            const response = await saveTargetsOverHttp(HTTP_USER, { source: 'manual', ...values });
+
+            return { body: response.body as SaveTargetsResponse, status: response.status };
+        };
+
+        it('reports ok with no warnings for coherent values', async () => {
+            const { body, status } = await saveAndAssess(COHERENT_TARGETS);
+
+            expect(status).toBe(200);
+            expect(body.feasibility).toEqual({ ok: true, warnings: [] });
+        });
+
+        it('warns that the macros do not account for the calories, and stores them anyway', async () => {
+            // AAP §0.5.2: "Infeasible-but-valid targets return 200 with
+            // warnings; there is no 422 on this route." The edit screen promises
+            // in so many words that the macros need not add up, so refusing
+            // them would break a stated promise and rebalancing them would break
+            // it worse.
+            const { body, status } = await saveAndAssess({
+                calories: 2000,
+                protein: 1,
+                carbs: 1,
+                fat: 1,
+            });
+
+            expect(status).toBe(200);
+            expect(body.feasibility).toEqual({ ok: false, warnings: ['macro_energy_mismatch'] });
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: 2000,
+                target_protein_g: 1,
+                target_carbs_g: 1,
+                target_fat_g: 1,
+            });
+        });
+
+        it('warns that the calorie figure is below what the catalog can build a week within', async () => {
+            const { body, status } = await saveAndAssess({
+                calories: 900,
+                protein: 68,
+                carbs: 90,
+                fat: 30,
+            });
+
+            expect(status).toBe(200);
+            expect(body.feasibility).toEqual({ ok: false, warnings: ['below_catalog_min'] });
+            expect(body.targets.targets).toMatchObject({ calories: 900 });
+        });
+
+        it('warns that it is above that range', async () => {
+            const { body, status } = await saveAndAssess({
+                calories: 5000,
+                protein: 375,
+                carbs: 500,
+                fat: 167,
+            });
+
+            expect(status).toBe(200);
+            expect(body.feasibility).toEqual({ ok: false, warnings: ['above_catalog_max'] });
+            expect(body.targets.targets).toMatchObject({ calories: 5000 });
+        });
+    });
+
+    describe('the hand-entered bounds', () => {
+        const acceptedFields: readonly ('protein' | 'carbs' | 'fat')[] = [
+            'protein',
+            'carbs',
+            'fat',
+        ];
+
+        it.each(acceptedFields)('accepts a %s target of 1 gram', async (field) => {
+            // ONE gram is the minimum, not zero — see the rejection below.
+            await makeUser({ id: HTTP_USER });
+
+            const saved = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                [field]: 1,
+            }).expect(200);
+
+            expect((saved.body as SaveTargetsResponse).targets.targets).toMatchObject({
+                [field]: 1,
+            });
+        });
+
+        it.each(acceptedFields)('accepts a %s target of 1,000 grams', async (field) => {
+            await makeUser({ id: HTTP_USER });
+
+            const saved = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                [field]: 1000,
+            }).expect(200);
+
+            expect((saved.body as SaveTargetsResponse).targets.targets).toMatchObject({
+                [field]: 1000,
+            });
+        });
+
+        it.each(acceptedFields)('refuses a %s target of 0, naming the field', async (field) => {
+            // THE ERROR FRAME 09b RENDERS: "Enter a carb target above 0 g". A
+            // zero must fail validation rather than save as a real target of
+            // nothing, and the refusal has to name the field so the screen can
+            // put the message under the right input.
+            await makeUser({ id: HTTP_USER });
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                [field]: 0,
+            }).expect(400);
+
+            expect(response.body).toMatchObject({ error: 'invalid_request' });
+            expect(refusalDetails(response.body)).toEqual([{ field, code: 'below_minimum' }]);
+            expect(await storedUserTargets(HTTP_USER)).toMatchObject({ target_calories: null });
+        });
+
+        it.each([
+            ['a macro above the maximum', { protein: 1001 }, { field: 'protein', code: 'above_maximum' }],
+            ['a negative macro', { fat: -1 }, { field: 'fat', code: 'below_minimum' }],
+            ['a fractional macro', { carbs: 194.5 }, { field: 'carbs', code: 'not_an_integer' }],
+            ['a numeric string', { protein: '146' }, { field: 'protein', code: 'invalid_type' }],
+            ['a null macro', { fat: null }, { field: 'fat', code: 'required' }],
+            ['calories below the minimum', { calories: 799 }, { field: 'calories', code: 'below_minimum' }],
+            ['calories above the maximum', { calories: 6001 }, { field: 'calories', code: 'above_maximum' }],
+            ['fractional calories', { calories: 1940.5 }, { field: 'calories', code: 'not_an_integer' }],
+        ] as const)('refuses %s', async (_label, override, expected) => {
+            await makeUser({ id: HTTP_USER });
+
+            const response = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                ...override,
+            }).expect(400);
+
+            expect(refusalDetails(response.body)).toEqual([expected]);
+        });
+
+        it.each([800, 6000])('accepts a calorie target of %s', async (calories) => {
+            await makeUser({ id: HTTP_USER });
+
+            const saved = await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                calories,
+            }).expect(200);
+
+            expect((saved.body as SaveTargetsResponse).targets.targets).toMatchObject({ calories });
+        });
+    });
+
+    it('stores hand-entered values exactly, with no rebalancing to match the calories', async () => {
+        // The four numbers the user typed, and not the 4/4/9 split of the
+        // calorie figure — which for 1,940 kcal would be 146 / 194 / 65 and is
+        // deliberately NOT what these values are.
+        await makeUser({ id: HTTP_USER });
+
+        const typed = { calories: 1940, protein: 200, carbs: 100, fat: 40 };
+        const saved = await saveTargetsOverHttp(HTTP_USER, {
+            source: 'manual',
+            ...typed,
+        }).expect(200);
+
+        expect((saved.body as SaveTargetsResponse).targets.targets).toEqual(typed);
+        expect(await storedUserTargets(HTTP_USER)).toEqual({
+            target_calories: 1940,
+            target_protein_g: 200,
+            target_carbs_g: 100,
+            target_fat_g: 40,
+        });
+        expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ confirmed_targets: typed });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The flag that gates the rest of the router and not these three
+ *
+ * THIS SUITE'S UNIQUE CHARTER. `mealPlanning.controller.ts` calls
+ * `assertMealPlanningEnabled()` in fifteen handlers and deliberately not in the
+ * three target ones, because Account, Progress and the diary's target editor
+ * read and write targets through them (AAP §0.3.1, §0.5.2, §0.7.5). All
+ * eighteen are registered on ONE router, so the gate is per-handler and there is
+ * no mount-level evidence for it.
+ *
+ * `src/utils/__tests__/featureFlags.test.ts` owns what the flag READS. What it
+ * cannot show — and what nothing else in the repository shows — is WHICH
+ * handlers consult it. Only a request does, and only against a module graph
+ * built while the variable is off.
+ * ------------------------------------------------------------------------- */
+
+type AppModule = typeof import('../../app');
+type PrismaClientModule = typeof import('../../prisma/client');
+type FeatureFlagsModule = typeof import('../../utils/featureFlags');
+
+/** The one gated route the contrast is drawn against, plus a second so "the rest" is not one example. */
+const GATED_PATHS = [PREFERENCES_PATH, PLANS_PATH] as const;
+
+/**
+ * Runs `work` against an app graph imported with `MEAL_PLANNING_ENABLED` unset.
+ *
+ * WHY THE GRAPH IS REBUILT RATHER THAN THE FLAG MOCKED. `utils/featureFlags.ts`
+ * resolves the variable ONCE at import and exposes it only through an accessor
+ * — which is the contract Rule `backend-architecture` §9 requires of it, and
+ * the contract this window has to respect rather than bypass. Assigning to
+ * `process.env` mid-suite is therefore inert, and stubbing the accessor would
+ * assert against a mock of the very thing under test. Re-evaluating the graph
+ * is what `src/__tests__/api/fault.test.ts` and
+ * `src/utils/__tests__/featureFlags.test.ts` already do for the same reason.
+ *
+ * `jest.isolateModules` keeps that second graph in a registry of its own, so the
+ * functions captured out of it — here, the express app — stay bound to it after
+ * the callback returns while this file's own top-level `prisma` import still
+ * observes the same database for the assertions. The module mocks registered in
+ * `setup/jestSetup.ts` survive `resetModules`, so the isolated app keeps the
+ * stubbed Firebase Admin and the header-based identity.
+ *
+ * The isolated graph constructs its own `PrismaClient`; it is disconnected in
+ * the `finally`, where the variable is also restored — DELETED rather than
+ * assigned when it was previously unset, since assigning `undefined` would
+ * store the string "undefined" and the flag's own `=== 'true'` test would then
+ * be reading a value nobody set.
+ */
+const withPlanningDisabled = async <TResult>(
+    work: (context: { agent: supertest.Agent; enabled: boolean }) => Promise<TResult>,
+): Promise<TResult> => {
+    const previous = process.env.MEAL_PLANNING_ENABLED;
+
+    delete process.env.MEAL_PLANNING_ENABLED;
+    jest.resetModules();
+
+    // Held on an object rather than in locals: the assignments happen inside
+    // `isolateModules`' synchronous callback, and a property stays typed as
+    // possibly absent afterwards where a captured local would need a cast.
+    const isolated: { client?: PrismaClientModule; context?: { agent: supertest.Agent; enabled: boolean } } =
+        {};
+
+    try {
+        jest.isolateModules(() => {
+            const flags = require('../../utils/featureFlags') as FeatureFlagsModule;
+            const appModule = require('../../app') as AppModule;
+
+            isolated.client = require('../../prisma/client') as PrismaClientModule;
+            isolated.context = {
+                agent: supertest(appModule.default),
+                enabled: flags.isMealPlanningEnabled(),
+            };
+        });
+
+        const context = isolated.context;
+
+        if (context === undefined) {
+            throw new Error('The disabled module graph was not built, so no case can run against it.');
+        }
+
+        return await work(context);
+    } finally {
+        if (isolated.client !== undefined) {
+            await isolated.client.prisma.$disconnect();
+        }
+
+        if (previous === undefined) {
+            delete process.env.MEAL_PLANNING_ENABLED;
+        } else {
+            process.env.MEAL_PLANNING_ENABLED = previous;
+        }
+
+        jest.resetModules();
+    }
+};
+
+describe('with MEAL_PLANNING_ENABLED off', () => {
+    it('really did build the graph with the flag off', async () => {
+        // The premise of every case below. Without it they would all pass
+        // unchanged against a graph whose flag was still on, and the exemption
+        // would be untested.
+        await withPlanningDisabled(async ({ enabled }) => {
+            expect(enabled).toBe(false);
+        });
+    });
+
+    it('still answers the canonical target read', async () => {
+        await seedHttpConfirmedEstimate();
+
+        await withPlanningDisabled(async ({ agent }) => {
+            const response = await asUser(agent.get(TARGETS_PATH), { uid: HTTP_USER }).expect(200);
+
+            // The real verdict, not merely a 200: Account and Progress render
+            // these values while planning is off.
+            expect(response.body).toEqual({
+                targets: { ...FIXTURE_TARGETS },
+                complete: true,
+                source: 'estimated',
+                stale: false,
+                revision: 1,
+            });
+        });
+    });
+
+    it('still answers the calculated estimate', async () => {
+        await seedHttpConfirmedEstimate();
+
+        await withPlanningDisabled(async ({ agent }) => {
+            const response = await asUser(agent.get(ESTIMATE_PATH), { uid: HTTP_USER }).expect(200);
+
+            expect(response.body).toMatchObject({ source: 'estimated', estimateRevision: 1 });
+        });
+    });
+
+    it('still accepts the canonical write, and it persists', async () => {
+        await makeUser({ id: HTTP_USER });
+
+        await withPlanningDisabled(async ({ agent }) => {
+            await asUser(agent.put(TARGETS_PATH), { uid: HTTP_USER })
+                .send({ source: 'manual', ...COHERENT_TARGETS })
+                .expect(200);
+        });
+
+        // Read back through this file's own client, after the window closed: the
+        // write was real, not something the isolated graph held privately. This
+        // is the diary's target editor working with planning off.
+        expect(await storedUserTargets(HTTP_USER)).toEqual({
+            target_calories: COHERENT_TARGETS.calories,
+            target_protein_g: COHERENT_TARGETS.protein,
+            target_carbs_g: COHERENT_TARGETS.carbs,
+            target_fat_g: COHERENT_TARGETS.fat,
+        });
+        expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+            target_source: 'manual',
+            targets_revision: 1,
+        });
+    });
+
+    it('answers 200 with a null target set rather than 404, even with the feature off', async () => {
+        // The client reads a bare 404 from this route as "the routes are not
+        // mounted" — a rolled-back backend — and degrades the whole segment. A
+        // flag that is merely OFF must not produce that signal, or turning
+        // planning off would look like a rollback to every device.
+        await makeUser({ id: HTTP_USER });
+
+        await withPlanningDisabled(async ({ agent }) => {
+            const response = await asUser(agent.get(TARGETS_PATH), { uid: HTTP_USER }).expect(200);
+
+            expect(response.body).toMatchObject({ targets: null, source: null, revision: 0 });
+        });
+    });
+
+    it.each(GATED_PATHS)('refuses %s with 503 feature_disabled', async (path) => {
+        // THE CONTRAST THAT MAKES THE EXEMPTION AN ASSERTION. These routes are
+        // registered on the SAME router as the three above and handled in the
+        // same controller file, so this is the only evidence that the gate is
+        // per-handler rather than applied to the whole router — or to nothing.
+        await seedHttpConfirmedEstimate();
+
+        await withPlanningDisabled(async ({ agent }) => {
+            const response =
+                path === PLANS_PATH
+                    ? await asUser(agent.post(path), { uid: HTTP_USER })
+                          .send({
+                              startDate: addDaysToDayKey(utcTodayDayKey(), 1),
+                              idempotencyKey: randomUUID(),
+                              expectedPreferencesRevision: 1,
+                              expectedTargetsRevision: 1,
+                          })
+                          .expect(503)
+                    : await asUser(agent.get(path), { uid: HTTP_USER }).expect(503);
+
+            expect(response.body).toEqual({ error: 'feature_disabled' });
+        });
+    });
+
+    it('leaves the ambient graph enabled, so a neighbouring suite is unaffected', async () => {
+        // `--runInBand` shares this process with every other suite, so a window
+        // that leaked its environment would disable meal planning for whichever
+        // file ran next. Asserted through the ambient app — the one imported at
+        // the top of this file — after a window has opened and closed.
+        await seedHttpConfirmedEstimate();
+
+        await withPlanningDisabled(async ({ agent }) => {
+            await asUser(agent.get(PREFERENCES_PATH), { uid: HTTP_USER }).expect(503);
+        });
+
+        expect(process.env.MEAL_PLANNING_ENABLED).toBe('true');
+        await asUser(request.get(PREFERENCES_PATH), { uid: HTTP_USER }).expect(200);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Two clients, and a response nobody received
+ *
+ * The pinned revision travels in the UPDATE's own predicate, which the first
+ * half of this file proves against a held row lock. What the boundary adds is
+ * the CLIENT-VISIBLE outcome of the same rule: exactly one of two competing
+ * saves is accepted, and the loser is told which revision is authoritative so
+ * the mobile `resolveStaleRevision` helper can re-read, compare with its draft
+ * and resolve silently when the two already agree.
+ * ------------------------------------------------------------------------- */
+
+describe('two clients saving the same targets revision', () => {
+    /** Two drafts that differ, so which one won is visible in the stored values. */
+    const FIRST_DRAFT = { calories: 1800, protein: 135, carbs: 180, fat: 60 } as const;
+    const SECOND_DRAFT = { calories: 2200, protein: 165, carbs: 220, fat: 73 } as const;
+
+    const saveDraft = (draft: { calories: number; protein: number; carbs: number; fat: number }) =>
+        saveTargetsOverHttp(HTTP_USER, {
+            source: 'manual',
+            ...draft,
+            expectedTargetsRevision: 1,
+        });
+
+    it('accepts one and refuses the other when they arrive in sequence', async () => {
+        await seedHttpConfirmedEstimate();
+
+        await saveDraft(FIRST_DRAFT).expect(200);
+
+        const second = await saveDraft(SECOND_DRAFT).expect(409);
+
+        // Exactly one update survives, and the loser learns where the record
+        // now stands rather than being told only that it failed.
+        expect(second.body).toEqual({ error: 'stale_targets', currentRevision: 2 });
+        expect(
+            ((await getTargetsOverHttp(HTTP_USER).expect(200)).body as TargetsResponse).targets,
+        ).toEqual(FIRST_DRAFT);
+    });
+
+    it('accepts exactly one when the two are raced', async () => {
+        await seedHttpConfirmedEstimate();
+
+        const [first, second] = await Promise.all([
+            saveDraft(FIRST_DRAFT),
+            saveDraft(SECOND_DRAFT),
+        ]);
+
+        const statuses = [first.status, second.status].sort();
+
+        // Which one wins is timing, so the assertion is the contract: one
+        // acceptance and one refusal, never two of either. Two acceptances
+        // would be the lost update the pin exists to prevent; two refusals
+        // would mean a client had to retry a save nobody made.
+        expect(statuses).toEqual([200, 409]);
+
+        const winner = first.status === 200 ? FIRST_DRAFT : SECOND_DRAFT;
+        const loser = first.status === 200 ? second : first;
+
+        expect(loser.body).toEqual({ error: 'stale_targets', currentRevision: 2 });
+        expect(
+            ((await getTargetsOverHttp(HTTP_USER).expect(200)).body as TargetsResponse).targets,
+        ).toEqual(winner);
+        expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ targets_revision: 2 });
+    });
+
+    it('answers an identical re-send with the authoritative revision, and the values already agree', async () => {
+        // THE RESPONSE-LOSS CASE. A save whose response never arrived is
+        // indistinguishable, from the client, from one that never committed —
+        // so the client re-sends the SAME draft with the SAME pin. The server
+        // refuses it, because the record has moved; what makes that harmless is
+        // the second half of this assertion: the stored values are already the
+        // ones the draft carried. `resolveStaleRevision` re-reads, finds the
+        // two equal and resolves without a dialog, so a lost response never
+        // produces a duplicate write or a question the user has to answer.
+        await seedHttpConfirmedEstimate();
+
+        await saveDraft(FIRST_DRAFT).expect(200);
+
+        const resent = await saveDraft(FIRST_DRAFT).expect(409);
+
+        expect(resent.body).toEqual({ error: 'stale_targets', currentRevision: 2 });
+        expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+            targets: { ...FIRST_DRAFT },
+            complete: true,
+            source: 'manual',
+            stale: false,
+            revision: 2,
+        });
+
+        // And exactly one write happened: the counter moved once.
+        expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ targets_revision: 2 });
+    });
+
+    it('carries no idempotency key, because a target save is revisioned rather than keyed', async () => {
+        // The four keyed writes reserve a `meal_plan_actions` row and replay
+        // their stored response. A target save does neither: it is protected by
+        // the pinned revision instead, so a key would be a second mechanism
+        // with nothing to do — and the envelope refuses one outright.
+        await seedHttpConfirmedEstimate();
+
+        const response = await saveTargetsOverHttp(HTTP_USER, {
+            source: 'manual',
+            ...FIRST_DRAFT,
+            expectedTargetsRevision: 1,
+            idempotencyKey: randomUUID(),
+        }).expect(400);
+
+        expect(refusalDetails(response.body)).toEqual([
+            { field: 'idempotencyKey', code: 'unknown_field' },
+        ]);
+
+        await saveDraft(FIRST_DRAFT).expect(200);
+
+        expect(await prisma.meal_plan_actions.count({ where: { user_id: HTTP_USER } })).toBe(0);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The planner's precondition
+ *
+ * `POST /meal-planning/plans` has its own suite; what belongs here is the
+ * LINKAGE — that the two verdicts this file's read produces are the two a week
+ * is refused for, with the payload the client acts on. The ordering races
+ * between a generation and a target write belong to `concurrency.test.ts` and
+ * to this file's own publication-gate section, which drives them through the
+ * gate itself.
+ * ------------------------------------------------------------------------- */
+
+/** The three slot shares §0.7.3 guides a three-meal day by. */
+const SLOT_SHARES = [
+    { slot: 'breakfast', share: 0.25 },
+    { slot: 'lunch', share: 0.35 },
+    { slot: 'dinner', share: 0.4 },
+] as const;
+
+/**
+ * A catalog and twelve recipes sized to `targets`, so a day built from one
+ * recipe per slot lands on that target and the day tolerance is satisfied
+ * without relying on portion multipliers.
+ *
+ * Derived from the target rather than fixed, because the two cases below
+ * publish against DIFFERENT confirmed figures and the whole point of them is
+ * which figure the week was built on.
+ */
+const seedPlannableWeek = async (targets: FixtureMacros): Promise<void> => {
+    const food = await makeCatalogFood();
+
+    for (const { slot, share } of SLOT_SHARES) {
+        const perServing: FixtureMacros = {
+            calories: Math.round(targets.calories * share),
+            protein: Math.round(targets.protein * share),
+            carbs: Math.round(targets.carbs * share),
+            fat: Math.round(targets.fat * share),
+        };
+
+        for (let index = 0; index < RECIPES_PER_SLOT; index += 1) {
+            await makeRecipeVersion({
+                slug: `targets-http-${slot}-${index}`,
+                catalogFoodId: food.id,
+                meal_slots: [slot],
+                perServing,
+            });
+        }
+    }
+};
+
+/** A generation request for tomorrow, inside the start-date window on any day the suite runs. */
+const generatePlanOverHttp = (
+    uid: string,
+    revisions: { preferences: number; targets: number },
+) =>
+    asUser(request.post(PLANS_PATH), { uid }).send({
+        startDate: addDaysToDayKey(utcTodayDayKey(), 1),
+        idempotencyKey: randomUUID(),
+        expectedPreferencesRevision: revisions.preferences,
+        expectedTargetsRevision: revisions.targets,
+    });
+
+/** The snapshot every published week records the targets it was built against in. */
+const publishedTargetsSnapshots = async (uid: string): Promise<unknown[]> =>
+    (
+        await prisma.meal_plans.findMany({
+            where: { user_id: uid },
+            orderBy: { start_date: 'asc' },
+            select: { targets_snapshot: true },
+        })
+    ).map((plan) => plan.targets_snapshot);
+
+describe('the week a target set does or does not admit', () => {
+    it('refuses an incomplete target set and names the fields that are unset', async () => {
+        // The planner needs all four; a calories-only account cannot be planned
+        // for, and the `missing` array is what sends the user to the fields
+        // rather than to a dead end.
+        await makeUser({ id: HTTP_USER, target_calories: 1900 });
+        await makePreferences(HTTP_USER, { time_zone: 'UTC' });
+
+        const response = await generatePlanOverHttp(HTTP_USER, {
+            preferences: 1,
+            targets: 1,
+        }).expect(422);
+
+        expect(response.body).toEqual({
+            error: 'targets_missing',
+            missing: ['protein', 'carbs', 'fat'],
+        });
+        expect(await publishedTargetsSnapshots(HTTP_USER)).toEqual([]);
+    });
+
+    it('names all four when nothing was ever set', async () => {
+        await makeUser({ id: HTTP_USER });
+        await makePreferences(HTTP_USER, { time_zone: 'UTC' });
+
+        expect(
+            (await generatePlanOverHttp(HTTP_USER, { preferences: 1, targets: 1 }).expect(422)).body,
+        ).toEqual({
+            error: 'targets_missing',
+            missing: ['calories', 'protein', 'carbs', 'fat'],
+        });
+    });
+
+    it('refuses a complete set that nobody confirmed here', async () => {
+        // `legacy` means the values were last written from outside this feature,
+        // so presenting the resulting week as reviewed would be untrue. The
+        // user reconfirms, and the same request then succeeds.
+        await seedHttpConfirmedEstimate(HTTP_USER, { time_zone: 'UTC' });
+        await asUser(request.put(LEGACY_TARGETS_PATH), { uid: HTTP_USER })
+            .send({ calories: FIXTURE_TARGETS.calories + 100 })
+            .expect(200);
+
+        const response = await generatePlanOverHttp(HTTP_USER, {
+            preferences: 1,
+            targets: 1,
+        }).expect(409);
+
+        expect(response.body).toEqual({ error: 'targets_unconfirmed' });
+        expect(await publishedTargetsSnapshots(HTTP_USER)).toEqual([]);
+    });
+});
+
+describe('a stale confirmed estimate, through to a published week', () => {
+    it('builds the week on the confirmed figure, not on the recalculation on offer', async () => {
+        // AAP §0.7.3's first half. A confirmed estimate is FIXED once
+        // confirmed: the review screen offers a recalculation and generation
+        // keeps using what the user actually confirmed until they take it.
+        await seedHttpConfirmedEstimate(HTTP_USER, { time_zone: 'UTC' });
+        await seedPlannableWeek(FIXTURE_TARGETS);
+
+        await asUser(request.put(`${PREFERENCES_PATH}/steps/activity`), { uid: HTTP_USER })
+            .send({ activityLevel: 'very_active', timeZone: 'UTC', expectedRevision: 1 })
+            .expect(200);
+
+        const onOffer = (await getEstimate(HTTP_USER).expect(200)).body as TargetEstimateResponse;
+
+        // The recalculation really differs, so the case cannot pass by the two
+        // figures happening to agree.
+        expect(onOffer.calories).not.toBe(FIXTURE_TARGETS.calories);
+        expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+            targets: { ...FIXTURE_TARGETS },
+            stale: true,
+        });
+
+        // The targets revision did NOT move — only the answers did — so the
+        // week is pinned to the confirmed record.
+        const published = await generatePlanOverHttp(HTTP_USER, {
+            preferences: 2,
+            targets: 1,
+        }).expect(201);
+
+        expect(await publishedTargetsSnapshots(HTTP_USER)).toEqual([{ ...FIXTURE_TARGETS }]);
+        expect(published.body).toMatchObject({
+            generationTargets: { ...FIXTURE_TARGETS },
+            targets: { ...FIXTURE_TARGETS },
+            targetsStale: false,
+        });
+    });
+
+    it('builds it on the new figure once the user takes the recalculation', async () => {
+        // The second half, and what makes the first an assertion rather than an
+        // accident: the same sequence with one extra step — the user confirming
+        // the fresh estimate — publishes a week against the NEW numbers.
+        await seedHttpConfirmedEstimate(HTTP_USER, { time_zone: 'UTC' });
+
+        await asUser(request.put(`${PREFERENCES_PATH}/steps/activity`), { uid: HTTP_USER })
+            .send({ activityLevel: 'very_active', timeZone: 'UTC', expectedRevision: 1 })
+            .expect(200);
+
+        const fresh = (await getEstimate(HTTP_USER).expect(200)).body as TargetEstimateResponse;
+        const reconfirmed: FixtureMacros = {
+            calories: fresh.calories,
+            protein: fresh.protein,
+            carbs: fresh.carbs,
+            fat: fresh.fat,
+        };
+
+        await saveTargetsOverHttp(HTTP_USER, {
+            source: 'estimated',
+            estimateRevision: fresh.estimateRevision,
+            expectedTargetsRevision: 1,
+        }).expect(200);
+
+        expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+            targets: reconfirmed,
+            stale: false,
+        });
+
+        await seedPlannableWeek(reconfirmed);
+
+        const published = await generatePlanOverHttp(HTTP_USER, {
+            preferences: 2,
+            targets: 2,
+        }).expect(201);
+
+        expect(await publishedTargetsSnapshots(HTTP_USER)).toEqual([reconfirmed]);
+        expect(published.body).toMatchObject({
+            generationTargets: reconfirmed,
+            targets: reconfirmed,
+            targetsStale: false,
+        });
+        expect(reconfirmed.calories).not.toBe(FIXTURE_TARGETS.calories);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Tenancy and the shape of a refusal
+ *
+ * Rule `backend-architecture` §1.5, §4, §5.1 and §8. The identity is the
+ * verified token's and nothing else; a write reaches exactly one owner's rows;
+ * and every refusal is a status, a machine-readable code and the data the client
+ * acts on — never a class name, a stack or a vendor's error text.
+ * ------------------------------------------------------------------------- */
+
+describe('the caller these routes act for', () => {
+    /** Two confirmed users, so a write that crossed between them would be visible. */
+    const seedBothUsers = async (): Promise<void> => {
+        await seedHttpConfirmedEstimate(HTTP_USER);
+        await seedHttpConfirmedEstimate(OTHER_HTTP_USER);
+    };
+
+    it('writes only the rows of the user the header names', async () => {
+        await seedBothUsers();
+
+        const draft = { calories: 1800, protein: 135, carbs: 180, fat: 60 };
+
+        await saveTargetsOverHttp(HTTP_USER, {
+            source: 'manual',
+            ...draft,
+            expectedTargetsRevision: 1,
+        }).expect(200);
+
+        // The other user's four columns and their whole target record are
+        // exactly as seeded — §5.1's "every `where` includes the owner key,
+        // including on updates".
+        expect(await storedUserTargets(OTHER_HTTP_USER)).toEqual({
+            target_calories: FIXTURE_TARGETS.calories,
+            target_protein_g: FIXTURE_TARGETS.protein,
+            target_carbs_g: FIXTURE_TARGETS.carbs,
+            target_fat_g: FIXTURE_TARGETS.fat,
+        });
+        expect(await storedTargetRecord(OTHER_HTTP_USER)).toMatchObject({
+            target_source: 'estimated',
+            confirmed_targets: { ...FIXTURE_TARGETS },
+            targets_revision: 1,
+        });
+        expect(await storedUserTargets(HTTP_USER)).toEqual({
+            target_calories: draft.calories,
+            target_protein_g: draft.protein,
+            target_carbs_g: draft.carbs,
+            target_fat_g: draft.fat,
+        });
+    });
+
+    it('reads only the rows of the user the header names', async () => {
+        await seedHttpConfirmedEstimate(HTTP_USER);
+        await makeUser({ id: OTHER_HTTP_USER });
+
+        // Same request, two identities, two different answers — and the second
+        // is the honest "nothing set" rather than a neighbour's figures.
+        expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
+            targets: { ...FIXTURE_TARGETS },
+        });
+        expect((await getTargetsOverHttp(OTHER_HTTP_USER).expect(200)).body).toMatchObject({
+            targets: null,
+        });
+    });
+
+    it('sends the same body to two owners when two headers send it', async () => {
+        await makeUser({ id: HTTP_USER });
+        await makeUser({ id: OTHER_HTTP_USER });
+
+        const body = { source: 'manual', ...COHERENT_TARGETS };
+
+        await saveTargetsOverHttp(HTTP_USER, body).expect(200);
+        await saveTargetsOverHttp(OTHER_HTTP_USER, body).expect(200);
+
+        // Two rows, each at its own first revision: the subject of the write is
+        // the header's, so an identical body is not an identical write.
+        expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ targets_revision: 1 });
+        expect(await storedTargetRecord(OTHER_HTTP_USER)).toMatchObject({ targets_revision: 1 });
+    });
+
+    it('refuses a body that names a user, because identity is not request data', async () => {
+        // §4: the caller is read from the verified token through `getUserId`,
+        // never from the body. On this route the envelope is a closed key set,
+        // so the body cannot even EXPRESS an identity — a stronger outcome than
+        // ignoring one, and the one that cannot silently become a
+        // cross-user write later.
+        await seedHttpConfirmedEstimate(HTTP_USER);
+        await seedHttpConfirmedEstimate(OTHER_HTTP_USER);
+
+        const response = await saveTargetsOverHttp(HTTP_USER, {
+            source: 'manual',
+            ...COHERENT_TARGETS,
+            expectedTargetsRevision: 1,
+            userId: OTHER_HTTP_USER,
+        }).expect(400);
+
+        expect(refusalDetails(response.body)).toEqual([
+            { field: 'userId', code: 'unknown_field' },
+        ]);
+        expect(await storedUserTargets(OTHER_HTTP_USER)).toMatchObject({
+            target_calories: FIXTURE_TARGETS.calories,
+        });
+    });
+});
+
+/**
+ * One refusal per branch these three routes can take, each with the world that
+ * produces it. Driven as a table because the assertions below are the same for
+ * every one of them: a refusal's SHAPE is a property of the route family, not
+ * of the branch.
+ */
+interface RefusalCase {
+    readonly label: string;
+    readonly status: number;
+    readonly keys: readonly string[];
+    readonly run: () => Promise<supertest.Response>;
+}
+
+const REFUSAL_CASES: readonly RefusalCase[] = [
+    {
+        label: 'no identity on the read',
+        status: 401,
+        keys: ['error'],
+        run: () => request.get(TARGETS_PATH),
+    },
+    {
+        label: 'no identity on the estimate',
+        status: 401,
+        keys: ['error'],
+        run: () => request.get(ESTIMATE_PATH),
+    },
+    {
+        label: 'no identity on the save',
+        status: 401,
+        keys: ['error'],
+        run: () => request.put(TARGETS_PATH).send({ source: 'manual', ...COHERENT_TARGETS }),
+    },
+    {
+        label: 'an estimate the answers do not support',
+        status: 409,
+        keys: ['error', 'reason'],
+        run: async () => {
+            await seedHttpConfirmedEstimate(HTTP_USER, { sex_for_estimate: 'prefer_not_to_say' });
+
+            return getEstimate(HTTP_USER);
+        },
+    },
+    {
+        label: 'an estimate pinned to answers that moved',
+        status: 409,
+        keys: ['error'],
+        run: async () => {
+            await seedUnconfirmedPreferences();
+
+            return saveTargetsOverHttp(HTTP_USER, { source: 'estimated', estimateRevision: 99 });
+        },
+    },
+    {
+        label: 'a target record someone else advanced',
+        status: 409,
+        keys: ['error', 'currentRevision'],
+        run: async () => {
+            await seedHttpConfirmedEstimate();
+
+            return saveTargetsOverHttp(HTTP_USER, { source: 'manual', ...COHERENT_TARGETS });
+        },
+    },
+    {
+        label: 'a malformed envelope',
+        status: 400,
+        keys: ['error', 'details'],
+        run: async () => {
+            await seedUnconfirmedPreferences();
+
+            return saveTargetsOverHttp(HTTP_USER, { source: 'manual', calories: 0 });
+        },
+    },
+    {
+        label: 'a week asked for on an incomplete target set',
+        status: 422,
+        keys: ['error', 'missing'],
+        run: async () => {
+            await makeUser({ id: HTTP_USER, target_calories: 1900 });
+            await makePreferences(HTTP_USER, { time_zone: 'UTC' });
+
+            return generatePlanOverHttp(HTTP_USER, { preferences: 1, targets: 1 });
+        },
+    },
+    {
+        label: 'a week asked for on targets nobody confirmed here',
+        status: 409,
+        keys: ['error'],
+        run: async () => {
+            await seedHttpConfirmedEstimate(HTTP_USER, { time_zone: 'UTC' });
+            await asUser(request.put(LEGACY_TARGETS_PATH), { uid: HTTP_USER })
+                .send({ calories: FIXTURE_TARGETS.calories + 100 })
+                .expect(200);
+
+            return generatePlanOverHttp(HTTP_USER, { preferences: 1, targets: 1 });
+        },
+    },
+];
+
+describe('the shape of every refusal', () => {
+    it.each(REFUSAL_CASES.map((refusal) => [refusal.label, refusal] as const))(
+        'answers %s with a status, a code and nothing else',
+        async (_label, refusal) => {
+            const response = await refusal.run();
+
+            expect(response.status).toBe(refusal.status);
+
+            // THE WHOLE KEY SET, so an added member — a stack, a `name`, a
+            // vendor payload — fails rather than passing unnoticed.
+            expect(Object.keys(response.body as object).sort()).toEqual([...refusal.keys].sort());
+
+            const serialised = JSON.stringify(response.body);
+
+            // §4's named anti-pattern is `{error: err}`: an Error serialises to
+            // `{}` or carries its own members, so `error` must be a STRING code.
+            expect(typeof (response.body as { error: unknown }).error).toBe('string');
+            expect(serialised).not.toMatch(/stack|node_modules|prisma|Invocation|PrismaClient/i);
+            // §8: the client acts on the code, so the class name must never
+            // reach it. `mealPlanning.errors.ts` is deliberately status-free for
+            // the same reason.
+            expect(serialised).not.toMatch(/Error"|StaleTargets|EstimateStale|TargetsMissing/);
+        },
+    );
+
+    it('never answers 403, for any of them', async () => {
+        // §1.5: cross-user and missing resources are 404 and an unauthenticated
+        // request is 401 — a 403 would confirm that something exists and that
+        // the caller is simply not allowed it.
+        for (const refusal of REFUSAL_CASES) {
+            await truncateFeatureTables();
+
+            const response = await refusal.run();
+
+            expect(response.status).not.toBe(403);
+        }
+    });
+});
+
+describe('the closed sets these routes emit', () => {
+    it('only ever emits a source and a clamp reason the client maps', async () => {
+        // `target_source`, `clampReason` and the feasibility codes are plain
+        // TEXT columns and plain string literals — the schema carries no enum
+        // and no CHECK — so nothing but the code keeps an unmapped value off
+        // the wire. Proven through the API across the four states this route
+        // family can be in, never by writing a bad value into the column.
+        await seedHttpConfirmedEstimate();
+
+        const confirmed = (await getTargetsOverHttp(HTTP_USER).expect(200)).body as TargetsResponse;
+        const estimate = (await getEstimate(HTTP_USER).expect(200)).body as TargetEstimateResponse;
+
+        await asUser(request.put(LEGACY_TARGETS_PATH), { uid: HTTP_USER })
+            .send({ calories: FIXTURE_TARGETS.calories + 100 })
+            .expect(200);
+
+        const legacy = (await getTargetsOverHttp(HTTP_USER).expect(200)).body as TargetsResponse;
+
+        await prisma.users.update({
+            where: { id: HTTP_USER },
+            data: {
+                target_calories: null,
+                target_protein_g: null,
+                target_carbs_g: null,
+                target_fat_g: null,
+            },
+        });
+
+        const unset = (await getTargetsOverHttp(HTTP_USER).expect(200)).body as TargetsResponse;
+
+        expect([confirmed.source, legacy.source, unset.source]).toEqual([
+            'estimated',
+            'legacy',
+            null,
+        ]);
+        expect([null, 'floor', 'below_bmr', 'ceiling']).toContain(estimate.clampReason);
+    });
+
+    it('refuses a source outside that set rather than storing it', async () => {
+        await seedUnconfirmedPreferences();
+
+        await saveTargetsOverHttp(HTTP_USER, {
+            source: 'imported',
+            ...COHERENT_TARGETS,
+        }).expect(400);
+
+        // Refused by the parser, so the column never receives the value — the
+        // only place that refusal can live, since the column would accept it.
+        expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ target_source: null });
     });
 });

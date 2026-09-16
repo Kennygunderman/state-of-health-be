@@ -306,7 +306,9 @@ export interface CatalogSearchResult {
  *    used no index at all, while binding it into each branch — which is what the
  *    two branches below do — produced the index scan.
  *
- * Both conditions are asserted, not asserted-to: `src/__tests__/api/catalog.test.ts`
+ * Both conditions are asserted, not asserted-to:
+ * `src/__tests__/api/catalogCollation.test.ts` — the suite that provisions a
+ * database whose default collation makes the class load-bearing —
  * pins the operator class out of `pg_opclass`, pins the plan under
  * `enable_seqscan = off`, and reads the `pg_stat_user_indexes.idx_scan` delta
  * across a real `searchPublishedFoods` call. The cost direction they protect,
