@@ -38,13 +38,49 @@
 // stage with no write at all. Deliberate re-judgement comes from a new coverage
 // plan version, which is what the bounds themselves live in.
 //
-// ON THE ADVISORY REVIEW. The advisory review shares the single
-// CATALOG_MODEL_CALL_BUDGET cap with generation, which is why this stage
-// resolves that cap. It spends nothing on a catalog of sourced records: every
-// disposition is settled deterministically and the review never promotes a
-// value, so no call is made and `llm_review` is recorded as `null` — the
-// honest value for a review that did not happen, reported as such in the
-// validation report rather than left to be inferred.
+// ON THE ADVISORY REVIEW. `--review` enables a second-model pass, and it is OFF
+// BY DEFAULT because it spends the single CATALOG_MODEL_CALL_BUDGET cap this
+// stage shares with generation (which is why the startup estimate there is two
+// calls per batch). What the review may do is bounded by construction rather
+// than by promise: AN AI PLAUSIBILITY REVIEW IS NEVER PRESENTED AS VERIFIED
+// NUTRITION. It supplies no value — nothing it returns reaches a nutrient, a
+// name, a portion or a provenance column — and it cannot overturn a failure,
+// because a reject-tier or quarantine-tier check returns from
+// `resolveCatalogDisposition` before the review branch is reached
+// (src/services/catalog.logic.ts). The single thing it can do is confirm a
+// REVIEW-TIER flag on a GENERATED candidate that nothing else holds, and even
+// then only a flag this stage put to it. Its answer is recorded in
+// `catalog_validation_records.llm_review` as advisory flags, where `null` is
+// the honest value for a judgement that consulted no review.
+//
+// A USDA-sourced record never needs it: the vendor is authoritative, so such a
+// row publishes WITH its flag recorded, and no call is made for it.
+//
+// A confirmation is scoped to the judgement that obtained it. A later pass that
+// consults no review holds the row again, which is the correct reading of the
+// deterministic checks on their own; durable publication of an atypical
+// generated value is the CURATOR's path (`curatorAllowlistedCheckNames`), not
+// a stored model answer that would harden into verified nutrition over time.
+//
+// WHY NO PRISMA PREDICATE IN THIS STAGE CARRIES AN OWNER (Rule
+// backend-architecture §5.1). Every table this file writes — `catalog_foods`,
+// its aliases and its validation records — has no `user_id` column at all, by
+// design: they are shared reference data, one row per food for the whole
+// installation, and AAP §0.5.1 names them as the only authenticated reads
+// without a tenant predicate. There is no owner to scope to, so an owner
+// predicate here would not compile, let alone protect anything.
+//
+// That matters more here than in the stages before it, because THIS is the only
+// stage that publishes: import and generation leave every row a `candidate`, so
+// a wrong DATABASE_URL would mean publishing into the wrong database. The
+// guarantee that replaces the owner predicate is therefore the DATABASE ORIGIN,
+// checked before any of this runs — `lib/dbGuard.ts` classifies DATABASE_URL at
+// module load (the second import below) and refuses an origin it cannot
+// recognise rather than guessing. Inside a recognised origin the writes are
+// pinned by keys rather than by an owner: a food by its own id under a
+// `FOR UPDATE` re-read, its record by the UNIQUE `catalog_food_id` it upserts
+// on, and the whole pass by the per-stage advisory lock, so a rerun converges
+// on the same rows instead of accumulating new ones.
 //
 // The two guard imports are ordered and load-bearing: Rule
 // backend-architecture §10's IPv4-first DNS ordering, then dbGuard's
@@ -62,8 +98,12 @@ import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib
 import type { LogFields, LogLevel } from './lib/logger';
 import { ManifestError, loadCoveragePlan, loadEvidenceAllowlist, reportPath } from './lib/manifest';
 import type { CatalogFoodState, CoveragePlan } from './lib/manifest';
-import { ModelBudgetError, getCatalogModelCallBudget } from './lib/budget';
-import { RateLimitConfigError } from './lib/rateLimiter';
+import {
+    ModelBudgetError,
+    getCatalogModelCallBudget,
+    recordModelCallUsage,
+    reserveModelCall,
+} from './lib/budget';
 import {
     CheckpointError,
     GRAPH_MUTATING_RUN_KINDS,
@@ -80,26 +120,120 @@ import {
     validationRunKeyInputPart,
     withCatalogStageLock,
 } from './lib/checkpoint';
-import type { CatalogInputRunRow, CatalogRunDb } from './lib/checkpoint';
+import type { CatalogInputRunRow, CatalogRunClaim, CatalogRunDb } from './lib/checkpoint';
 import type { ScriptLogger } from './lib/logger';
 
 // The checks themselves. Pure, so this import opens nothing; the Prisma client
 // is reached from main() because constructing it is a module-load side effect.
 import { dedupeIdentity, normalizeCanonicalName, validateCatalogCandidate } from '../src/services/catalog.logic';
 import type {
+    CatalogAdvisoryReview,
     CatalogFoodCandidate,
     CatalogValidationPolicy,
     CatalogValidationVerdict,
 } from '../src/services/catalog.logic';
-import type { CatalogIdentityStatus } from '../src/types/catalog';
+
+// The advisory review's one route to a paid vendor (§9). Nothing else in this
+// file may reach OpenRouter, and every failure leaving that boundary is an
+// OpenRouterError, translated below into this stage's own error so no caller
+// pattern-matches a vendor error shape.
+import { OpenRouterError, callOpenRouter, getOpenRouterConfig } from '../src/services/openrouter.service';
 
 const STAGE = 'catalog-validate';
 
 const OPENROUTER_API_KEY_ENV = 'OPENROUTER_API_KEY';
 
+const CATALOG_REVIEW_MODEL_ENV = 'CATALOG_REVIEW_MODEL';
+
+const REVIEW_MODEL_FALLBACK_ENV = 'ESTIMATE_JUDGE_MODEL';
+
 const CATALOG_LOGIC_MODULE = 'src/services/catalog.logic.ts';
 
 const logger = createLogger(STAGE);
+
+// ---------------------------------------------------------------------------
+// The advisory review's failures and its configuration (Rule
+// backend-architecture §8 and §9).
+// ---------------------------------------------------------------------------
+
+export type CatalogReviewErrorCode =
+    | 'review_model_unconfigured'
+    | 'review_call_failed'
+    | 'review_response_unusable'
+    | 'review_ledger_mismatch';
+
+/**
+ * One class, a stable code per cause, and the offending `source_key` wherever
+ * the failure belongs to a food — an operator reading a pass over thousands of
+ * rows needs to know which one it was.
+ */
+export class CatalogReviewError extends Error {
+    constructor(
+        public readonly code: CatalogReviewErrorCode,
+        message: string,
+        public readonly context: {
+            readonly sourceKey?: string;
+            /** The vendor failure kind, when one is known, never the vendor's error object. */
+            readonly kind?: string;
+            readonly status?: number;
+            readonly detail?: string;
+        } = {},
+    ) {
+        super(message);
+        this.name = 'CatalogReviewError';
+    }
+}
+
+/** Wraps a vendor or library failure in this stage's own error (§9). */
+const asReviewFailure = (
+    error: unknown,
+    code: CatalogReviewErrorCode,
+    context: { sourceKey?: string; detail?: string } = {},
+): CatalogReviewError => {
+    if (error instanceof CatalogReviewError) {
+        return error;
+    }
+
+    if (error instanceof OpenRouterError) {
+        return new CatalogReviewError(code, `OpenRouter call failed (${error.kind}): ${error.message}`, {
+            ...context,
+            kind: error.kind,
+            status: error.status,
+        });
+    }
+
+    const described = safeError(error);
+    return new CatalogReviewError(code, `${described.name}: ${described.message}`, context);
+};
+
+// Read once, here, at the top of the module — never from inside the judgement
+// loop (§9). Mirrors catalog-generate-ai.ts's GENERATION_MODEL_OVERRIDE.
+const REVIEW_MODEL_OVERRIDE = process.env[CATALOG_REVIEW_MODEL_ENV];
+
+/**
+ * The review model: `CATALOG_REVIEW_MODEL` when set, otherwise the vendor
+ * boundary's configured judge model (`ESTIMATE_JUDGE_MODEL`, then that
+ * module's own default) — the precedence AAP §0.4.3 and .env.example state.
+ *
+ * Loud when the integration is unusable: `getOpenRouterConfig()` throws
+ * `OpenRouterError('not_configured')` with no API key, and a review pass cannot
+ * run without one, so it is translated into this file's own error rather than
+ * sending an unauthenticated request.
+ */
+export const getReviewModel = (): string => {
+    const override = REVIEW_MODEL_OVERRIDE === undefined ? '' : REVIEW_MODEL_OVERRIDE.trim();
+    if (override.length > 0) {
+        return override;
+    }
+
+    try {
+        return getOpenRouterConfig().judgeModel;
+    } catch (error) {
+        throw asReviewFailure(error, 'review_model_unconfigured', {
+            detail: `${CATALOG_REVIEW_MODEL_ENV} is unset, so the model comes from ${REVIEW_MODEL_FALLBACK_ENV} through the OpenRouter boundary, which is not configured`,
+        });
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Argument parsing — pure (Rule backend-architecture §1.2).
@@ -111,6 +245,19 @@ export interface ValidateOptions {
     readonly categories: readonly string[];
     /** `--revalidate-quarantined`: re-run the checks over quarantined rows too. */
     readonly revalidateQuarantined: boolean;
+    /**
+     * `--review`: consult the advisory second model on a generated candidate
+     * held by review-tier flags alone. OFF BY DEFAULT — it is the only part of
+     * this stage that spends money, and the deterministic checks settle every
+     * other disposition without it (see ON THE ADVISORY REVIEW).
+     */
+    readonly review: boolean;
+    /**
+     * `--dry-run`: judge everything and write NOTHING — no status, no
+     * validation record, no run row, no cursor, no counts, no report file and
+     * no model call. What the pass would do, reported to the log.
+     */
+    readonly dryRun: boolean;
 }
 
 export interface ArgumentError {
@@ -149,12 +296,23 @@ const splitToken = (token: string): Token => {
 
 export const parseArgs = (argv: readonly string[]): ParseResult => {
     if (argv.some((token) => HELP_FLAGS.includes(token))) {
-        return { ok: true, options: { help: true, categories: [], revalidateQuarantined: false } };
+        return {
+            ok: true,
+            options: {
+                help: true,
+                categories: [],
+                revalidateQuarantined: false,
+                review: false,
+                dryRun: false,
+            },
+        };
     }
 
     const errors: ArgumentError[] = [];
     const categories: string[] = [];
     let revalidateQuarantined = false;
+    let review = false;
+    let dryRun = false;
 
     let index = 0;
     const takeValue = (inlineValue: string | null): string | null => {
@@ -188,6 +346,16 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
             continue;
         }
 
+        if (flag === '--review') {
+            review = true;
+            continue;
+        }
+
+        if (flag === '--dry-run') {
+            dryRun = true;
+            continue;
+        }
+
         if (flag === CONFIRM_TARGET_FLAG) {
             takeValue(inlineValue);
             continue;
@@ -200,8 +368,22 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         return { ok: false, errors };
     }
 
-    return { ok: true, options: { help: false, categories, revalidateQuarantined } };
+    return { ok: true, options: { help: false, categories, revalidateQuarantined, review, dryRun } };
 };
+
+/**
+ * Whether this invocation may make an advisory review call.
+ *
+ * `--dry-run` overrides `--review`, and not as a convenience: reserving a call
+ * writes to the budget ledger and the call itself spends money, so a pass that
+ * promises to write nothing cannot make one. `--review --dry-run` therefore
+ * shows what the DETERMINISTIC checks would decide, and main() says so rather
+ * than leaving the operator to infer it from a spend of zero.
+ *
+ * One definition, consulted by preflight and by the judgement loop, so the
+ * prerequisite and the behaviour cannot drift apart.
+ */
+export const advisoryReviewEnabled = (options: ValidateOptions): boolean => options.review && !options.dryRun;
 
 // ---------------------------------------------------------------------------
 // Usage.
@@ -219,9 +401,9 @@ export const describeUsage = (): string =>
         'over every row it owns, writes one validation record per judged food, and',
         'reports the counts and the exact per-category shortfall.',
         '',
-        'No model call is made: every disposition here is settled deterministically',
-        'and the advisory review never promotes a value, so llm_review is recorded',
-        'as null — the honest value for a review that did not happen.',
+        'No model call is made unless --review is passed: every disposition is',
+        'settled deterministically, and the advisory review never promotes a value,',
+        'so llm_review is recorded as null for a judgement that consulted none.',
         '',
         'Options:',
         '  --category <name>           Restrict validation to one coverage-plan',
@@ -230,6 +412,16 @@ export const describeUsage = (): string =>
         '  --revalidate-quarantined    Re-run the checks over rows already quarantined,',
         '                              so a bounds or evidence fix can release them.',
         '                              Default: off (candidates only).',
+        '  --review                    Consult the advisory second model where a',
+        '                              GENERATED candidate is held by review-tier flags',
+        '                              alone. It can confirm such a flag and nothing',
+        '                              else: it never supplies a value and never',
+        '                              overturns a reject or a quarantine. Spends the',
+        '                              CATALOG_MODEL_CALL_BUDGET cap shared with',
+        '                              catalog:generate. Default: off.',
+        '  --dry-run                   Judge everything and write nothing — no status,',
+        '                              no validation record, no run row, no cursor, no',
+        '                              report file and no model call. Default: off.',
         '  --help, -h                  Print this usage block and exit 0.',
         '',
         'Inputs read:',
@@ -243,7 +435,9 @@ export const describeUsage = (): string =>
         '  DATABASE_URL                 required; classified by scripts/lib/dbGuard.ts',
         '  CATALOG_MODEL_CALL_BUDGET    required positive integer; the advisory review',
         '                               call shares this cap with catalog:generate',
-        '  OPENROUTER_API_KEY           required only for the advisory review call',
+        '  OPENROUTER_API_KEY           required only with --review',
+        `  ${CATALOG_REVIEW_MODEL_ENV}         the review model; inherits`,
+        `                               ${REVIEW_MODEL_FALLBACK_ENV} when blank`,
     ].join('\n');
 
 const writeUsage = (level: LogLevel): void => {
@@ -261,17 +455,23 @@ export interface ValidatePreflightDeps {
     readonly resolveModelCallBudget: (env: NodeJS.ProcessEnv) => number;
     /** Repository-relative existence check, seamed so preflight stays testable. */
     readonly fileExists: (repoRelativePath: string) => boolean;
+    /**
+     * This invocation's options, because one prerequisite is conditional: the
+     * vendor key is a requirement of `--review` and of nothing else.
+     */
+    readonly options: ValidateOptions;
 }
 
 const repoFileExists = (repoRelativePath: string): boolean =>
     fs.existsSync(path.resolve(__dirname, '..', repoRelativePath));
 
-const defaultPreflightDeps = (): ValidatePreflightDeps => ({
+const defaultPreflightDeps = (options: ValidateOptions): ValidatePreflightDeps => ({
     env: process.env,
     loadCoveragePlan,
     loadEvidenceAllowlist,
     resolveModelCallBudget: getCatalogModelCallBudget,
     fileExists: repoFileExists,
+    options,
 });
 
 // A document that fails for one of manifest.ts's own documented reasons is a
@@ -333,17 +533,21 @@ export const preflight = (deps: ValidatePreflightDeps): readonly PrerequisiteGap
         }
     }
 
-    // Reported as its own gap rather than folded into the budget one: the
-    // advisory review is the only part of this stage that spends, so an
-    // operator who has no key still needs to know the deterministic checks are
-    // all they will get.
-    const openRouterKey = deps.env[OPENROUTER_API_KEY_ENV];
-    if (openRouterKey === undefined || openRouterKey.trim().length === 0) {
-        gaps.push({
-            code: 'openrouter_api_key_missing',
-            requirement: `${OPENROUTER_API_KEY_ENV} must be set for the advisory review pass over the cases the deterministic checks cannot settle`,
-            remedy: `Set ${OPENROUTER_API_KEY_ENV} in backend/.env (see .env.example) or in the environment.`,
-        });
+    // CONDITIONAL ON `--review`, AND THAT IS THE WHOLE POINT OF THE FLAG. The
+    // deterministic checks settle every disposition without a vendor, so a
+    // default pass must run on a machine that has no key at all; demanding one
+    // unconditionally made the stage unusable exactly where it needs nothing.
+    // With `--review` the key IS a prerequisite, and a run that would otherwise
+    // reach `getReviewModel()` and fail per food is stopped here instead.
+    if (advisoryReviewEnabled(deps.options)) {
+        const openRouterKey = deps.env[OPENROUTER_API_KEY_ENV];
+        if (openRouterKey === undefined || openRouterKey.trim().length === 0) {
+            gaps.push({
+                code: 'openrouter_api_key_missing',
+                requirement: `${OPENROUTER_API_KEY_ENV} must be set for --review, the advisory pass over the cases the deterministic checks cannot settle`,
+                remedy: `Set ${OPENROUTER_API_KEY_ENV} in backend/.env (see .env.example) or in the environment, or drop --review to judge on the deterministic checks alone.`,
+            });
+        }
     }
 
     if (!deps.fileExists(CATALOG_LOGIC_MODULE)) {
@@ -463,6 +667,19 @@ export interface RunValidationDeps {
     readonly logger: ScriptLogger;
     readonly now: () => Date;
     readonly writeReport: (report: unknown) => void;
+    /**
+     * The advisory review's vendor seam and its ledger, both optional because a
+     * default pass makes no call and must not need either — a caller that omits
+     * them while passing `--review` is told so rather than silently judging
+     * without one. Seamed at all so a script test can drive the pass with a
+     * fake model and a fake ledger.
+     */
+    readonly review?: ValidationReviewClient;
+    readonly budget?: ValidationBudget;
+    /** The review model, resolved once before the pass — never read per food (§9). */
+    readonly reviewModel?: string;
+    /** `CATALOG_MODEL_CALL_BUDGET`, shared with catalog:generate. */
+    readonly modelCallBudget?: number;
 }
 
 export interface ValidationOutcome {
@@ -507,7 +724,11 @@ export const candidateFromRow = (row: ValidationFoodRow): CatalogFoodCandidate =
     category: row.category,
     food_state: row.food_state as CatalogFoodState,
     identity_source: row.identity_source as 'usda' | 'ai_generated',
-    identity_status: row.identity_status as CatalogIdentityStatus,
+    // Indexed off the candidate type rather than naming the status union
+    // separately: the assertion then cannot drift from the field it is asserted
+    // for, and this file's only type dependency stays catalog.logic — the module
+    // that owns the checks these values are handed to.
+    identity_status: row.identity_status as CatalogFoodCandidate['identity_status'],
     nutrition_provenance: row.nutrition_provenance as 'source_backed' | 'ingredient_derived' | 'ai_estimated',
     allergen_status: row.allergen_status as 'known' | 'unknown',
     allergen_tags: row.allergen_tags,
@@ -552,6 +773,332 @@ export const curatorReviewRequired = (row: ValidationFoodRow): boolean => {
     }
     return (identity as { curator_review_required?: unknown }).curator_review_required === true;
 };
+
+// ---------------------------------------------------------------------------
+// The advisory review pass. Everything here is pure (§1.2) — which flags may
+// be put to a model, what it is asked, and how its answer is narrowed. The
+// call itself is orchestrated inside runValidation, where the budget ledger
+// and the run id live.
+// ---------------------------------------------------------------------------
+
+/**
+ * The review-tier flags that are actually HOLDING this candidate.
+ *
+ * `reviewFlags` lists every failed review-tier check whether or not it held the
+ * row (a USDA record publishes with its flags recorded), so the held set is the
+ * intersection with the checks that decided the disposition. Those are the only
+ * names a model is ever asked about, and — because
+ * `resolveCatalogDisposition` lifts a flag only from that same list — the only
+ * names an answer could affect.
+ */
+export const heldReviewFlags = (verdict: CatalogValidationVerdict): string[] =>
+    verdict.decidingCheckNames.filter((name) => verdict.reviewFlags.includes(name));
+
+/**
+ * Whether the advisory review could change this row's disposition at all.
+ *
+ * Five conditions, and each one is a reason NOT to spend money rather than a
+ * preference:
+ *
+ *  * `ai_generated` only — THE USDA/AI SPLIT. A USDA-sourced record publishes
+ *    with its review flag recorded, because the vendor asserted the value and
+ *    the flag is informational; a generated one is held until something
+ *    outside the model's own output speaks for it. Reviewing a USDA row could
+ *    therefore change nothing, and asking a model to vouch for a record that
+ *    already publishes would be spending for the appearance of scrutiny.
+ *  * held at all — a row the checks passed needs nothing.
+ *  * held by review-tier flags ALONE — if any deciding check is reject- or
+ *    quarantine-tier the disposition stands whatever a model says, so the call
+ *    would be pure cost.
+ *  * a verified identity and no pending curator classification — both are
+ *    floors this stage applies after the checks and no confirmation lifts
+ *    them, so the row cannot publish on this pass either way.
+ */
+export const advisoryReviewApplies = (row: ValidationFoodRow, verdict: CatalogValidationVerdict): boolean => {
+    if (row.identity_source !== 'ai_generated') {
+        return false;
+    }
+    if (verdict.publicationStatus !== 'quarantined') {
+        return false;
+    }
+    if (!publishableIdentity(row.identity_status) || curatorReviewRequired(row)) {
+        return false;
+    }
+
+    const held = heldReviewFlags(verdict);
+    return held.length > 0 && held.length === verdict.decidingCheckNames.length;
+};
+
+/** The review batch key's fixed part, so the ledger reads unambiguously. */
+const REVIEW_BATCH_KEY_PREFIX = 'review';
+
+/**
+ * The ledger key one review call is reserved under.
+ *
+ * `catalog_generation_batches.batch_key` is UNIQUE ACROSS THE TABLE and
+ * generation owns `<planVersion>:<category>:<index>`, so this stage supplies a
+ * format that cannot collide with it — which is exactly the arrangement
+ * lib/budget.ts::batchKeyFor documents ("catalog-validate.ts's advisory review
+ * owns its own format").
+ *
+ * THE RUN ID IS IN THE KEY, and that is what makes a second pass possible. The
+ * ledger refuses a key whose row belongs to another run (`batch_run_mismatch`),
+ * so a key built from the food alone would reserve once and then fail for every
+ * later validation run of the same food — a review after a catalog refresh
+ * could never happen. Keyed by run and food it is unique across the table,
+ * stable within the run that owns it, and one row per reviewed food.
+ */
+export const reviewBatchKey = (runId: string, sourceKey: string): string =>
+    `${REVIEW_BATCH_KEY_PREFIX}:${runId}:${sourceKey}`;
+
+/**
+ * What the model is told it is doing, and the limits it is told it has.
+ *
+ * The prompt asks for a PLAUSIBILITY judgement on values this stage already
+ * holds, and asks for no values at all — there is no field in the schema below
+ * for a nutrient, a name or a portion, so a model that tried to supply one has
+ * nowhere to put it. That is the constraint enforced structurally rather than
+ * requested politely.
+ */
+const REVIEW_SYSTEM_PROMPT = [
+    'You are reviewing one food record from a nutrition catalog for PLAUSIBILITY only.',
+    'The record has already passed every deterministic safety and arithmetic check.',
+    'What remains is that one or more stated values are atypical for the food category.',
+    'For each flagged check, answer whether the observed value is plausible for this specific food and preparation state.',
+    'Answer plausible=true ONLY when the value is genuinely typical or has a well-known reason to sit outside the band,',
+    'and say why in one short sentence naming that reason.',
+    'You are NOT asked for nutrition values and must not supply any: your answer cannot change a stored number.',
+    'Judge only the checks listed. Ignore anything else about the record.',
+].join(' ');
+
+/** The check names a model may answer about, in one schema-enforced shape. */
+const buildReviewSchema = (checkNames: readonly string[]): object => ({
+    name: 'catalog_review_assessment',
+    strict: true,
+    schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['assessments'],
+        properties: {
+            assessments: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['check', 'plausible', 'reason'],
+                    properties: {
+                        // Enumerated, so a name this stage did not ask about is
+                        // a schema violation at the vendor rather than
+                        // something to filter afterwards. The intersection
+                        // below still runs: a strict schema is the vendor's
+                        // promise, not this stage's guarantee.
+                        check: { type: 'string', enum: [...checkNames] },
+                        plausible: { type: 'boolean' },
+                        reason: { type: 'string' },
+                    },
+                },
+            },
+        },
+    },
+});
+
+/** The record the model judges: the food, its per-100 g values, and the flags. */
+const buildReviewUserContent = (
+    row: ValidationFoodRow,
+    verdict: CatalogValidationVerdict,
+    checkNames: readonly string[],
+): string =>
+    JSON.stringify({
+        food: {
+            canonicalName: row.canonical_name,
+            displayName: row.display_name,
+            category: row.category,
+            foodState: row.food_state,
+            foodStateMeaning: 'the preparation state the stated values describe',
+        },
+        statedPer100g: verdict.normalizedNutrition,
+        flaggedChecks: verdict.checks
+            .filter((check) => checkNames.includes(check.name))
+            .map((check) => ({ check: check.name, observed: check.observed, expectedBand: check.bound })),
+    });
+
+/** One assessment as this stage reads it back. */
+export interface ReviewAssessment {
+    readonly check: string;
+    readonly plausible: boolean;
+    readonly reason: string;
+}
+
+/** How much of a model's free-text reason is kept, so a record cannot be inflated by it. */
+const REVIEW_REASON_LIMIT = 300;
+
+/**
+ * Narrows the vendor's `unknown` payload to the assessments this stage asked
+ * for.
+ *
+ * Every field is checked rather than cast. The vendor boundary guarantees the
+ * transport and the syntax, never the shape — and this is a model's output, so
+ * the posture is the one src/services/estimate.service.ts takes with
+ * `groundItemsInUsda`: an answer that is not the shape asked for is DISCARDED,
+ * never patched up into a usable one. An assessment naming a check this stage
+ * did not put to it is dropped, which is why the intersection is here and not
+ * left to the caller.
+ *
+ * @param requested the check names this stage asked about
+ * @throws CatalogReviewError when the payload is not an assessment set at all
+ */
+export const parseReviewAssessments = (
+    payload: unknown,
+    requested: readonly string[],
+    sourceKey: string,
+): ReviewAssessment[] => {
+    const assessments =
+        typeof payload === 'object' && payload !== null
+            ? (payload as { assessments?: unknown }).assessments
+            : undefined;
+
+    if (!Array.isArray(assessments)) {
+        throw new CatalogReviewError(
+            'review_response_unusable',
+            'the advisory review returned no assessment array, so it says nothing about any flag',
+            { sourceKey },
+        );
+    }
+
+    const seen = new Set<string>();
+    const parsed: ReviewAssessment[] = [];
+
+    for (const entry of assessments) {
+        if (typeof entry !== 'object' || entry === null) {
+            continue;
+        }
+        const { check, plausible, reason } = entry as Record<string, unknown>;
+        if (typeof check !== 'string' || !requested.includes(check) || seen.has(check)) {
+            continue;
+        }
+        if (typeof plausible !== 'boolean') {
+            continue;
+        }
+        seen.add(check);
+        parsed.push({
+            check,
+            plausible,
+            reason: typeof reason === 'string' ? reason.slice(0, REVIEW_REASON_LIMIT) : '',
+        });
+    }
+
+    return parsed;
+};
+
+/**
+ * The flags a confirmation may lift: the ones asked about AND answered
+ * plausible.
+ *
+ * Order follows `requested`, so the recorded list is this stage's own ordering
+ * rather than the model's, and a repeat cannot appear twice.
+ */
+export const confirmedCheckNames = (
+    assessments: readonly ReviewAssessment[],
+    requested: readonly string[],
+): string[] => {
+    const plausible = new Set(
+        assessments.filter((assessment) => assessment.plausible).map((assessment) => assessment.check),
+    );
+    return requested.filter((name) => plausible.has(name));
+};
+
+/** The outcome of one review, as the judgement and the record consume it. */
+export interface AdvisoryReviewOutcome {
+    /**
+     * What the checks may consult — `null` whenever the review confirmed
+     * nothing, failed, or was not usable, so a row is never published on an
+     * empty confirmation.
+     */
+    readonly review: CatalogAdvisoryReview | null;
+    /** What is stored in `llm_review`: advisory, and never a value. */
+    readonly record: Record<string, unknown>;
+}
+
+/**
+ * The advisory record for a review that ran.
+ *
+ * Records the model and prompt version that answered, what was put to it, and
+ * what it confirmed — so a reviewer can tell an unreviewed judgement (`null`)
+ * from a reviewed one that lifted nothing, and can attribute either. `advisory:
+ * true` is stated in the row itself because this column is the one place a
+ * model's opinion is stored next to sourced facts, and nothing downstream may
+ * read it as one.
+ */
+export const advisoryReviewRecord = (input: {
+    readonly model: string;
+    readonly promptVersion: string;
+    readonly reviewedAt: Date;
+    readonly requested: readonly string[];
+    readonly assessments: readonly ReviewAssessment[];
+    readonly confirmed: readonly string[];
+}): Record<string, unknown> => ({
+    advisory: true,
+    never_verified_nutrition: 'a plausibility answer, not a source; it lifts a review-tier flag and supplies no value',
+    model: input.model,
+    prompt_version: input.promptVersion,
+    reviewed_at: input.reviewedAt.toISOString(),
+    requested_checks: [...input.requested],
+    confirmed_checks: [...input.confirmed],
+    assessments: input.assessments.map((assessment) => ({
+        check: assessment.check,
+        plausible: assessment.plausible,
+        reason: assessment.reason,
+    })),
+});
+
+/** The advisory record for a review that was attempted and did not answer. */
+export const failedAdvisoryReviewRecord = (input: {
+    readonly model: string;
+    readonly promptVersion: string;
+    readonly reviewedAt: Date;
+    readonly requested: readonly string[];
+    readonly failure: CatalogReviewError;
+}): Record<string, unknown> => ({
+    advisory: true,
+    model: input.model,
+    prompt_version: input.promptVersion,
+    reviewed_at: input.reviewedAt.toISOString(),
+    requested_checks: [...input.requested],
+    confirmed_checks: [],
+    outcome: 'failed',
+    failure_code: input.failure.code,
+    // The failure KIND, never the vendor's error object, and no prompt or
+    // completion text: this column ships in a release artefact.
+    failure_kind: input.failure.context.kind ?? null,
+});
+
+/** The vendor seam, narrowed to the one call this stage makes (§9). */
+export interface ValidationReviewClient {
+    call(systemPrompt: string, userContent: string, jsonSchema: object, model: string): Promise<unknown>;
+}
+
+/**
+ * The budget ledger, in the §9 order: `reserve` before a call and `record`
+ * after it, on success AND on failure.
+ */
+export interface ValidationBudget {
+    reserve(input: {
+        runId: string;
+        batchKey: string;
+        category: string;
+        model: string;
+        promptVersion: string;
+        budgetLimit: number;
+        logger?: ScriptLogger;
+    }): Promise<{ reserved: number; remaining: number }>;
+    record(input: {
+        runId: string;
+        batchKey: string;
+        succeeded: boolean;
+        tokensUsed?: number;
+        logger?: ScriptLogger;
+    }): Promise<void>;
+}
 
 /** The identity facts the duplicate decision is derived from, row-shaped. */
 export interface ValidationIdentityFacts {
@@ -628,6 +1175,20 @@ type ValidationWriteOutcome =
  * able to CLOSE the canonical key, and catalog-release will not accept it as a
  * prerequisite.
  *
+ * `--review` is in the scope for a different reason from the other two, and it
+ * has to be. It does not change WHICH rows are considered; it changes what they
+ * are judged WITH, by putting a held review-tier flag to a second model. Left
+ * out of the key, the ordinary operator sequence would be broken by the
+ * completed-run no-op: `catalog:validate` succeeds, then `catalog:validate
+ * --review` claims that same succeeded key, does nothing at all, and reviews
+ * nothing — the flag would be unreachable in the one sequence anybody runs. In
+ * the key, it is its own pass over the same rows, which is what it is; and it
+ * stays out of the CANONICAL key, so a release still rests on a validation that
+ * consulted no model.
+ *
+ * `--dry-run` is deliberately NOT here: it claims no run at all (see THE DRY
+ * RUN), so it has no key to name.
+ *
  * The suffix is order- AND repetition-insensitive: the categories are sorted
  * and DEDUPLICATED, so `--category dairy --category dairy` names the same
  * considered set as `--category dairy` and therefore the same run, instead of
@@ -644,7 +1205,8 @@ export const validationRunScope = (
 ): string => {
     const canonical = canonicalValidationRunKey(coveragePlanVersion, inputIdentity);
     const categories = Array.from(new Set(options.categories)).sort();
-    const restricted = categories.length > 0 || options.revalidateQuarantined;
+    const review = advisoryReviewEnabled(options);
+    const restricted = categories.length > 0 || options.revalidateQuarantined || review;
 
     if (!restricted) {
         return canonical;
@@ -653,6 +1215,7 @@ export const validationRunScope = (
     const scope = JSON.stringify({
         categories,
         revalidateQuarantined: options.revalidateQuarantined,
+        review,
     });
 
     return `${canonical}${VALIDATION_SCOPE_SEPARATOR}${crypto
@@ -721,6 +1284,16 @@ export const validationPlanFingerprint = (input: {
 
 /** One checkpoint per hundred judged foods, which is the import's five-batch cadence (5 × 20 records). */
 const COUNTS_SAVE_EVERY_FOODS = 100;
+
+/**
+ * The run id a dry run reports.
+ *
+ * Not a uuid, and deliberately so: it appears in the log lines and the returned
+ * outcome of a pass that created no run row, and a plausible-looking id there
+ * would send an operator hunting for a `catalog_import_runs` row that does not
+ * exist. Parenthesised so it cannot be mistaken for one.
+ */
+export const DRY_RUN_RUN_ID = '(dry-run)';
 
 /**
  * A validation run left open against a catalog input that has since been
@@ -839,6 +1412,16 @@ const SKIP_REPORT_LIMIT = 50;
 export const runValidation = async (deps: RunValidationDeps): Promise<ValidationOutcome> => {
     const { logger, options, coveragePlan } = deps;
 
+    // THE DRY RUN. One flag, read once, and every write in this function is
+    // behind it. A dry run reads the graph, resolves duplicates and judges every
+    // row it considers, then writes NOTHING: no status, no validation record, no
+    // history, no run row, no cursor, no counters, no report file and no model
+    // call. It claims no run either, so it is never answered by the
+    // completed-run no-op — a what-if must always be able to say what it would
+    // do — and correspondingly it can never close a run or satisfy a release.
+    const dryRun = options.dryRun;
+    const reviewEnabled = advisoryReviewEnabled(options);
+
     const policy: CatalogValidationPolicy = {
         categories: coveragePlan.categories,
         validationBounds: coveragePlan.validationBounds,
@@ -883,25 +1466,51 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     // An open run for this same input is left strictly alone — that is this
     // pass's own resumable work, or a concurrent attempt, and the stage lock is
     // what decides between those.
-    await settleUnresumableValidationRuns({
-        runDb: deps.runDb,
-        coveragePlanVersion: coveragePlan.coveragePlanVersion,
-        currentInputPart: validationRunKeyInputPart(runScope),
-        logger,
-        now: deps.now,
-    });
+    //
+    // Skipped in a dry run: settling a run is a write, and closing somebody
+    // else's row is not something a what-if may do.
+    if (!dryRun) {
+        await settleUnresumableValidationRuns({
+            runDb: deps.runDb,
+            coveragePlanVersion: coveragePlan.coveragePlanVersion,
+            currentInputPart: validationRunKeyInputPart(runScope),
+            logger,
+            now: deps.now,
+        });
+    }
 
     // No initialCursor: the fingerprint the cursor is only meaningful against
     // covers the considered set, which is not known until the graph is read —
     // and the read must not happen at all for a run that is already settled.
     // An absent cursor means "nothing judged yet", which is exactly what a
     // resume from index 0 does.
-    const claim = await openOrResumeRun<ValidationCursor>(deps.runDb, {
-        kind: 'validation',
-        manifestVersion: runScope,
-        logger,
-        now: deps.now,
-    });
+    //
+    // A dry run claims nothing and synthesises the claim instead: creating the
+    // run row is itself a write, and a pass that will not judge durably has no
+    // business occupying the key a real one needs. `resumed: false` and an empty
+    // cursor make it a fresh sweep of the whole considered set, which is the
+    // only honest thing a what-if can report.
+    const claim: CatalogRunClaim<ValidationCursor> = dryRun
+        ? {
+              run: {
+                  id: DRY_RUN_RUN_ID,
+                  kind: 'validation' as const,
+                  manifestVersion: runScope,
+                  status: 'running' as const,
+                  startedAt: deps.now(),
+                  finishedAt: null,
+                  cursor: null,
+                  counts: {} as Readonly<Record<string, number>>,
+              },
+              resumed: false,
+              alreadyCompleted: false,
+          }
+        : await openOrResumeRun<ValidationCursor>(deps.runDb, {
+              kind: 'validation',
+              manifestVersion: runScope,
+              logger,
+              now: deps.now,
+          });
 
     if (claim.alreadyCompleted) {
         // Zero writes and zero work: not even the graph read below, because
@@ -1224,7 +1833,7 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
      * about the same run.
      */
     const flushPendingCounts = async (): Promise<void> => {
-        if (Object.keys(pendingCounts).length === 0) {
+        if (dryRun || Object.keys(pendingCounts).length === 0) {
             return;
         }
         const delta = pendingCounts;
@@ -1232,9 +1841,320 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         await recordCounts(deps.runDb, claim.run.id, delta);
     };
 
+    // THE ADVISORY REVIEW, RUN OUTSIDE THE JUDGEMENT TRANSACTION.
+    //
+    // Once the budget is exhausted no further call may be made, so the stop is
+    // remembered rather than rediscovered per food: the pass continues and
+    // judges everything on the deterministic checks alone, which is the correct
+    // reading of a row whose flag nothing has spoken for.
+    let reviewStopped = false;
+    let reviewStopReason: string | null = null;
+    const reviewSpend = { reserved: 0, used: 0, reviewed: 0, confirmed: 0, failed: 0, skippedAfterStop: 0 };
+
+    /**
+     * Records a spent call, and never lets the bookkeeping decide the pass.
+     *
+     * A ledger that will not record usage is reported loudly (§8) but does not
+     * discard an answer already paid for: the reservation stands either way, so
+     * the cap remains enforced, and the authoritative figure is the reserved
+     * aggregate rather than this mirror (lib/budget.ts).
+     */
+    const recordReviewUsage = async (
+        budget: ValidationBudget,
+        batchKey: string,
+        succeeded: boolean,
+        sourceKey: string,
+    ): Promise<void> => {
+        reviewSpend.used += 1;
+        try {
+            // `tokensUsed` is deliberately omitted: the vendor boundary returns
+            // the parsed document and surfaces no usage block, so a number here
+            // would be invented. budget.ts normalises the absence to 0.
+            await budget.record({ runId: claim.run.id, batchKey, succeeded, logger });
+        } catch (error) {
+            logger.error('advisory_review_usage_unrecorded', {
+                stage: STAGE,
+                runId: claim.run.id,
+                sourceKey,
+                error: safeError(asReviewFailure(error, 'review_ledger_mismatch', { sourceKey })),
+            });
+        }
+    };
+
+    /**
+     * Reviews one food, when a review could change its disposition at all.
+     *
+     * DELIBERATELY NOT INSIDE THE WRITE TRANSACTION. That transaction holds a
+     * `FOR UPDATE` row lock and is bounded by TRANSACTION_TIMEOUT_MS; an HTTP
+     * call to a model inside it would hold the lock for the vendor's latency and
+     * could exceed the timeout on a slow answer. So the call is made here, from
+     * the outer read, and its answer is carried INTO the transaction, where the
+     * verdict is recomputed from the freshly locked row.
+     *
+     * That ordering is safe in exactly one direction, which is the direction
+     * that matters: a confirmation names check names, and the re-verdict lifts a
+     * name only if that check is still a held review flag on the fresh row. A
+     * row whose facts moved so that a reject- or quarantine-tier check now
+     * fails, or that now carries a different review flag, is held — the answer
+     * can only ever lift less than it was obtained for, never more.
+     *
+     * @returns `null` when no review was made, so `llm_review` stays `null`
+     */
+    const reviewFood = async (
+        row: ValidationFoodRow,
+        provisional: CatalogValidationVerdict,
+    ): Promise<AdvisoryReviewOutcome | null> => {
+        if (!reviewEnabled || !advisoryReviewApplies(row, provisional)) {
+            return null;
+        }
+
+        const client = deps.review;
+        const budget = deps.budget;
+        const model = deps.reviewModel;
+        const budgetLimit = deps.modelCallBudget;
+
+        // A caller that asked for a review without supplying the seam gets told
+        // so once, and the pass judges deterministically. Silently reviewing
+        // nothing would look identical to a model that confirmed nothing.
+        if (client === undefined || budget === undefined || model === undefined || budgetLimit === undefined) {
+            if (!reviewStopped) {
+                reviewStopped = true;
+                reviewStopReason = 'review_client_unavailable';
+                logger.warn('advisory_review_unavailable', {
+                    stage: STAGE,
+                    runId: claim.run.id,
+                    reason: 'no review client, ledger, model or budget was supplied, so every row is judged on the deterministic checks alone',
+                });
+            }
+            return null;
+        }
+
+        if (reviewStopped) {
+            reviewSpend.skippedAfterStop += 1;
+            return null;
+        }
+
+        const requested = heldReviewFlags(provisional);
+        const batchKey = reviewBatchKey(claim.run.id, row.source_key);
+
+        // RESERVE BEFORE THE CALL (§9, and lib/budget.ts's own contract). An
+        // exhausted cap is a clean stop, not a defect: nothing has been spent,
+        // and the rest of the pass judges on the checks alone.
+        try {
+            const reservation = await budget.reserve({
+                runId: claim.run.id,
+                batchKey,
+                category: row.category,
+                model,
+                promptVersion: coveragePlan.reviewPromptVersion,
+                budgetLimit,
+                logger,
+            });
+            reviewSpend.reserved += 1;
+            logger.debug('advisory_review_reserved', {
+                stage: STAGE,
+                runId: claim.run.id,
+                sourceKey: row.source_key,
+                remaining: reservation.remaining,
+            });
+        } catch (error) {
+            if (error instanceof ModelBudgetError && error.code === 'budget_exhausted') {
+                reviewStopped = true;
+                reviewStopReason = 'budget_exhausted';
+                reviewSpend.skippedAfterStop += 1;
+                logger.warn('advisory_review_budget_exhausted', {
+                    stage: STAGE,
+                    runId: claim.run.id,
+                    sourceKey: row.source_key,
+                    budgetLimit,
+                    reserved: error.reserved,
+                    consequence:
+                        'no further advisory review call is made; every remaining row is judged on the deterministic checks alone and keeps the status they give it',
+                });
+                await appendRunLog(deps.runDb, claim.run.id, {
+                    event: 'advisory_review_budget_exhausted',
+                    sourceKey: row.source_key,
+                    budgetLimit,
+                });
+                return null;
+            }
+            // Anything else is a misconfigured or unusable ledger, which is not
+            // this row's problem to absorb (§8).
+            throw asReviewFailure(error, 'review_ledger_mismatch', { sourceKey: row.source_key });
+        }
+
+        const reviewedAt = deps.now();
+        let payload: unknown;
+        try {
+            payload = await client.call(
+                REVIEW_SYSTEM_PROMPT,
+                buildReviewUserContent(row, provisional, requested),
+                buildReviewSchema(requested),
+                model,
+            );
+        } catch (error) {
+            // THE RESERVATION IS NOT REFUNDED AND THE USAGE IS RECORDED ANYWAY:
+            // the vendor was called, so the tokens were spent whatever it
+            // answered, and a refund here would make every failure a free retry
+            // (src/services/entitlement.service.ts's reasoning, applied at
+            // operator scope).
+            await recordReviewUsage(budget, batchKey, false, row.source_key);
+            const failure = asReviewFailure(error, 'review_call_failed', { sourceKey: row.source_key });
+            reviewSpend.failed += 1;
+            // Degraded, not fatal: one unanswered flag leaves one row
+            // quarantined, which is the status the deterministic checks already
+            // gave it. The pass continues.
+            logger.warn('advisory_review_failed', {
+                stage: STAGE,
+                runId: claim.run.id,
+                sourceKey: row.source_key,
+                code: failure.code,
+                error: safeError(failure),
+            });
+            return {
+                review: null,
+                record: failedAdvisoryReviewRecord({
+                    model,
+                    promptVersion: coveragePlan.reviewPromptVersion,
+                    reviewedAt,
+                    requested,
+                    failure,
+                }),
+            };
+        }
+
+        await recordReviewUsage(budget, batchKey, true, row.source_key);
+
+        let assessments: ReviewAssessment[];
+        try {
+            assessments = parseReviewAssessments(payload, requested, row.source_key);
+        } catch (error) {
+            const failure = asReviewFailure(error, 'review_response_unusable', { sourceKey: row.source_key });
+            reviewSpend.failed += 1;
+            // The same distrust posture estimate.service.ts::groundItemsInUsda
+            // takes: a model answer that is not the shape asked for is
+            // discarded with a warning, never patched into a usable one.
+            logger.warn('advisory_review_unusable', {
+                stage: STAGE,
+                runId: claim.run.id,
+                sourceKey: row.source_key,
+                code: failure.code,
+                error: safeError(failure),
+            });
+            return {
+                review: null,
+                record: failedAdvisoryReviewRecord({
+                    model,
+                    promptVersion: coveragePlan.reviewPromptVersion,
+                    reviewedAt,
+                    requested,
+                    failure,
+                }),
+            };
+        }
+
+        const confirmed = confirmedCheckNames(assessments, requested);
+        reviewSpend.reviewed += 1;
+        if (confirmed.length > 0) {
+            reviewSpend.confirmed += 1;
+        }
+
+        logger.info('advisory_review_recorded', {
+            stage: STAGE,
+            runId: claim.run.id,
+            sourceKey: row.source_key,
+            requested,
+            confirmed,
+        });
+
+        return {
+            // An empty confirmation stays `null` rather than an empty object, so
+            // nothing downstream can read "reviewed and lifted nothing" as a
+            // reason to publish.
+            review: confirmed.length > 0 ? { confirmedCheckNames: confirmed } : null,
+            record: advisoryReviewRecord({
+                model,
+                promptVersion: coveragePlan.reviewPromptVersion,
+                reviewedAt,
+                requested,
+                assessments,
+                confirmed,
+            }),
+        };
+    };
+
+    /** What one row's judgement resolves to, before anything is written. */
+    interface RowJudgement {
+        readonly verdict: CatalogValidationVerdict;
+        readonly publicationStatus: string;
+        readonly extraAssumptions: string[];
+        readonly identityHeld: boolean;
+        readonly awaitingClassification: boolean;
+    }
+
+    /**
+     * The verdict and the two floors for one row, computed from whatever row
+     * state the caller is holding.
+     *
+     * Extracted so the write path and the dry run judge IDENTICALLY: the write
+     * path calls it on the freshly locked re-read, the dry run on the row from
+     * the outer read, and neither has a second copy of the floors. A dry run
+     * that judged by a different rule would be worthless as a preview.
+     */
+    const judgeRow = (candidateRow: ValidationFoodRow, advisory: AdvisoryReviewOutcome | null): RowJudgement => {
+        const verdict = validateCatalogCandidate(candidateFromRow(candidateRow), policy, {
+            duplicateOfSourceKey: duplicateOf.get(candidateRow.source_key) ?? null,
+            // ADVISORY, AND ONLY EVER SUBTRACTIVE. `resolveCatalogDisposition`
+            // consults this in the review branch alone — a reject- or
+            // quarantine-tier failure has already returned — so the most it can
+            // do is lift a review flag it was asked about on this very row.
+            advisoryReview: advisory?.review ?? null,
+        });
+
+        let publicationStatus: string = verdict.publicationStatus;
+        const extraAssumptions: string[] = [];
+        let identityHeld = false;
+        let awaitingClassification = false;
+
+        // Both floors are re-applied to the row the caller is holding: an import
+        // that changed `identity_status`, or that marked the row for a curator,
+        // changes the answer, and honouring a stale row's values would publish a
+        // food the current row says must not be.
+        if (publicationStatus === 'published' && !publishableIdentity(candidateRow.identity_status)) {
+            publicationStatus = 'quarantined';
+            identityHeld = true;
+            extraAssumptions.push(
+                `identity_status is "${candidateRow.identity_status}", so the food is held for review rather than published even though every check passed`,
+            );
+        }
+        if (publicationStatus === 'published' && curatorReviewRequired(candidateRow)) {
+            // The manifest's own word for this state: "imported as a candidate
+            // and left unpublished pending a curator".
+            publicationStatus = 'candidate';
+            awaitingClassification = true;
+            extraAssumptions.push(
+                'the description matched no classification rule, so the food carries the manifest fallback category and food group and stays a candidate until a curator classifies it',
+            );
+        }
+
+        return { verdict, publicationStatus, extraAssumptions, identityHeld, awaitingClassification };
+    };
+
     try {
         for (const index of queue) {
             const row = considered[index];
+
+            // THE REVIEW HAPPENS HERE, BEFORE THE TRANSACTION IS OPENED.
+            //
+            // A provisional verdict from the outer read is what decides whether
+            // a review could change anything at all, so no call is made for a
+            // row the checks settle. `reviewFood` returns `null` unless
+            // `--review` is on and this row is a generated candidate held by
+            // review-tier flags alone (see reviewFood and
+            // advisoryReviewApplies).
+            const advisory = reviewEnabled
+                ? await reviewFood(row, judgeRow(row, null).verdict)
+                : null;
 
             // ONE FOOD, ONE SHORT TRANSACTION, AND THE VERDICT COMPUTED INSIDE IT.
             //
@@ -1251,7 +2171,26 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             // The write is then guarded on the versions and the status that re-read
             // returned, so even if the lock were somehow lost the judgement can only
             // land on the facts it was computed from (see THE VERSION PREDICATE).
-            const written = await deps.db.$transaction(
+            //
+            // A DRY RUN TAKES NO LOCK AND OPENS NO TRANSACTION. There is nothing
+            // to protect: it judges the row from the outer read through the same
+            // `judgeRow` the write path uses and reports the disposition it
+            // would have written. It therefore also cannot report `raced` or
+            // `vanished` — those are properties of a write it never attempts.
+            const written: ValidationWriteOutcome = dryRun
+                ? ((): ValidationWriteOutcome => {
+                      const judged = judgeRow(row, advisory);
+                      return {
+                          outcome: 'judged',
+                          publicationStatus: judged.publicationStatus,
+                          previousStatus: row.publication_status,
+                          verdict: judged.verdict,
+                          identityHeld: judged.identityHeld,
+                          awaitingClassification: judged.awaitingClassification,
+                          category: row.category,
+                      };
+                  })()
+                : await deps.db.$transaction(
                 async (tx): Promise<ValidationWriteOutcome> => {
                     // Raw SQL because Prisma cannot express FOR UPDATE, and this is
                     // the lock that makes everything below a snapshot nobody else
@@ -1285,35 +2224,14 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
                         return { outcome: 'identity_moved' };
                     }
 
-                    const verdict = validateCatalogCandidate(candidateFromRow(fresh), policy, {
-                        duplicateOfSourceKey: duplicateOf.get(fresh.source_key) ?? null,
-                    });
-
-                    let publicationStatus: string = verdict.publicationStatus;
-                    const extraAssumptions: string[] = [];
-                    let identityHeld = false;
-                    let awaitingClassification = false;
-
-                    // Both floors are re-applied to the FRESH row: an import that
-                    // changed `identity_status`, or that marked the row for a
-                    // curator, changes the answer, and honouring the stale row's
-                    // values would publish a food the current row says must not be.
-                    if (publicationStatus === 'published' && !publishableIdentity(fresh.identity_status)) {
-                        publicationStatus = 'quarantined';
-                        identityHeld = true;
-                        extraAssumptions.push(
-                            `identity_status is "${fresh.identity_status}", so the food is held for review rather than published even though every check passed`,
-                        );
-                    }
-                    if (publicationStatus === 'published' && curatorReviewRequired(fresh)) {
-                        // The manifest's own word for this state: "imported as a
-                        // candidate and left unpublished pending a curator".
-                        publicationStatus = 'candidate';
-                        awaitingClassification = true;
-                        extraAssumptions.push(
-                            'the description matched no classification rule, so the food carries the manifest fallback category and food group and stays a candidate until a curator classifies it',
-                        );
-                    }
+                    // Judged from the FRESH row, and with the advisory answer
+                    // obtained for it before the lock was taken: the
+                    // confirmation names check names, so it can only lift a flag
+                    // that is still a held review flag here. A row whose facts
+                    // moved into a higher tier, or onto a flag nothing spoke
+                    // for, is held.
+                    const { verdict, publicationStatus, extraAssumptions, identityHeld, awaitingClassification } =
+                        judgeRow(fresh, advisory);
 
                     // THE VERSION PREDICATE. The write carries the two snapshot
                     // versions and the publication status the re-read returned, so
@@ -1350,7 +2268,14 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
                         await tx.catalog_validation_records.create({
                             data: {
                                 catalog_food_id: fresh.id,
-                                ...validationRecordSeed(fresh, verdict, publicationStatus, extraAssumptions, now),
+                                ...validationRecordSeed(
+                                    fresh,
+                                    verdict,
+                                    publicationStatus,
+                                    extraAssumptions,
+                                    now,
+                                    advisory?.record ?? null,
+                                ),
                                 history,
                             },
                         });
@@ -1364,6 +2289,7 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
                                     extraAssumptions,
                                     now,
                                     parseStoredAssumptions(fresh.catalog_validation_records?.nutrition_assumptions),
+                                    advisory?.record ?? null,
                                 ),
                                 history,
                             },
@@ -1447,11 +2373,16 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             // makes a resumed run judge no row twice; the extra cost is one small
             // locked write per food beside the four it already performs, and an
             // offline stage can afford that to keep its audit trail exact.
-            await saveCursor<ValidationCursor>(deps.runDb, claim.run.id, {
-                fingerprint,
-                nextIndex,
-                unjudged: sortedUnjudged(unjudgedPositions),
-            });
+            //
+            // A dry run has no run row to carry a cursor and nothing durable to
+            // resume, so it writes none.
+            if (!dryRun) {
+                await saveCursor<ValidationCursor>(deps.runDb, claim.run.id, {
+                    fingerprint,
+                    nextIndex,
+                    unjudged: sortedUnjudged(unjudgedPositions),
+                });
+            }
 
             // The counters are diagnostics rather than a resume point, so they are
             // flushed on the import's cadence instead: a hundred judged foods is
@@ -1489,8 +2420,13 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
 
     // The survivor keeps the identity, so the loser's names become its aliases
     // rather than disappearing with it.
+    //
+    // A dry run inserts none. The count it would report cannot be derived
+    // without attempting the insert — `skipDuplicates` means the rows offered
+    // are not the rows written — so `aliasesMerged` stays 0 rather than being
+    // guessed at, and the alias work is named in the report as not attempted.
     const survivorsWithNewAliases = new Set<string>();
-    for (const merge of dedupe.merges) {
+    for (const merge of dryRun ? [] : dedupe.merges) {
         if (merge.aliases.length === 0) {
             continue;
         }
@@ -1566,7 +2502,13 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         generatedAt: now.toISOString(),
         runId: claim.run.id,
         coveragePlanVersion: coveragePlan.coveragePlanVersion,
-        options: { categories: options.categories, revalidateQuarantined: options.revalidateQuarantined },
+        options: {
+            categories: options.categories,
+            revalidateQuarantined: options.revalidateQuarantined,
+            review: options.review,
+            dryRun: options.dryRun,
+            advisoryReviewEnabled: reviewEnabled,
+        },
         counts,
         failedChecks: byCheck,
         reviewFlags: reviewFlagCounts,
@@ -1618,13 +2560,66 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             publishedGapToTotal: Math.max(0, coveragePlan.publishedTargetTotal - counts.published),
             byCategory,
         },
+        // WHAT THE ADVISORY REVIEW SPENT AND WHAT IT CHANGED, reported as the
+        // counters this pass actually accumulated rather than as a claim about
+        // what it would have done.
+        //
+        // `reserved` and `used` come from this invocation's own calls; the
+        // authoritative totals for the run are the ledger's
+        // (`catalog_generation_batches`, which lib/budget.ts sums), and
+        // `counts.modelCallsReserved`/`counts.modelCallsUsed` mirror them onto
+        // the run row. `confirmedFoods` is the only figure that reflects a
+        // model having changed an outcome, and it can only ever be a review-tier
+        // flag lifted on a generated candidate — never a value.
         modelCalls: {
-            reserved: 0,
-            used: 0,
-            note: 'No advisory review call was made. Every row is a USDA record whose disposition the deterministic checks settle, and the advisory review never promotes a value, so a call would spend budget without changing an outcome. llm_review is recorded as null on every record, which is the honest value for a review that did not happen.',
+            enabled: reviewEnabled,
+            model: reviewEnabled ? (deps.reviewModel ?? null) : null,
+            promptVersion: reviewEnabled ? coveragePlan.reviewPromptVersion : null,
+            budgetLimit: reviewEnabled ? (deps.modelCallBudget ?? null) : null,
+            reserved: reviewSpend.reserved,
+            used: reviewSpend.used,
+            reviewedFoods: reviewSpend.reviewed,
+            confirmedFoods: reviewSpend.confirmed,
+            failedReviews: reviewSpend.failed,
+            // Rows a review could have changed but that were passed over after
+            // the review stopped — an exhausted cap, or a seam the caller never
+            // supplied. `stopReason` says which.
+            skippedAfterStop: reviewSpend.skippedAfterStop,
+            stopReason: reviewStopReason,
+            note: reviewEnabled
+                ? 'The advisory review is consulted only where a GENERATED candidate is held by review-tier flags alone, and it can only confirm such a flag: it supplies no value, and a reject-tier or quarantine-tier failure returns before it is reached. A confirmation is recorded in llm_review and is scoped to this judgement; durable publication of an atypical generated value is the curator path, not a stored model answer.'
+                : 'No advisory review call was made: --review was not passed (or --dry-run overrode it), so every disposition here is the deterministic checks alone and llm_review is recorded as null on every record — the honest value for a judgement that consulted no review.',
         },
+        // A dry run states plainly that nothing was written, because every other
+        // figure on this report reads identically to a pass that did write.
+        dryRun: dryRun
+            ? {
+                  wroteNothing: true,
+                  note: 'This pass claimed no run, wrote no publication status, no validation record, no history, no cursor and no counters, merged no alias and made no model call. Every disposition above is what a real pass would write from the rows as read; a row a concurrent writer moved would be re-judged under its lock by that real pass, so `raced` and `vanished` cannot appear here.',
+              }
+            : null,
     };
-    deps.writeReport(report);
+
+    // A dry run does not write the report file either: reports/latest is a
+    // committed artefact the release reconciles against, and a preview must not
+    // overwrite the record of the pass that actually judged the catalog. The
+    // figures reach the operator through the completion log line instead.
+    if (dryRun) {
+        logger.info('validation_dry_run_summary', {
+            stage: STAGE,
+            runScope,
+            considered: considered.length,
+            wouldPublish: counts.published,
+            wouldQuarantine: counts.quarantined,
+            wouldReject: counts.rejected,
+            wouldHoldAsCandidate: counts.candidatesHeld,
+            duplicateIdentities: dedupe.duplicateSourceKeys.length,
+            shortfallTotal: Object.values(byCategory).reduce((total, entry) => total + entry.shortfall, 0),
+            wroteNothing: true,
+        });
+    } else {
+        deps.writeReport(report);
+    }
 
     // The close carries what the checkpoints have NOT recorded yet — the last
     // interval's delta. Passing the running total instead would add every
@@ -1647,6 +2642,13 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         considered: considered.length - storedConsidered,
     };
     const unjudged = unjudgedPositions.size;
+
+    if (dryRun) {
+        // No run was claimed, so there is nothing to close — and a dry run
+        // cannot leave a row unjudged in the first place, since it attempts no
+        // write that could be raced.
+        return { runId: claim.run.id, counts, byCategory, alreadyCompleted: false, unjudged };
+    }
 
     if (unjudged > 0) {
         // A pass that could not judge every row it considered is NOT a
@@ -1763,13 +2765,21 @@ export const validationRecordPatch = (
     extraAssumptions: readonly string[],
     now: Date,
     priorAssumptions: readonly string[] = [],
+    advisoryReview: Record<string, unknown> | null = null,
 ): Record<string, unknown> => {
     const patch: Record<string, unknown> = {
         checks: verdict.checks,
         outcome: publicationStatus === 'published' ? verdict.outcome : nonPublishedOutcome(publicationStatus, verdict),
         publication_status: publicationStatus,
         reviewed_at: now,
-        llm_review: null,
+        // ADVISORY, AND SCOPED TO THIS JUDGEMENT. `null` whenever this pass
+        // consulted no review, which is the default, and it OVERWRITES a stored
+        // advisory rather than preserving one: the column describes the
+        // judgement the rest of this record states, so carrying a previous
+        // pass's model answer forward would make an unreviewed verdict look
+        // reviewed. The column is never a source — nothing here is a nutrient
+        // (src/types/catalog.ts::CatalogValidationRecord.llmReview).
+        llm_review: advisoryReview,
     };
 
     const merged = priorAssumptions.slice();
@@ -1803,8 +2813,9 @@ export const validationRecordSeed = (
     publicationStatus: string,
     extraAssumptions: readonly string[],
     now: Date,
+    advisoryReview: Record<string, unknown> | null = null,
 ): Record<string, unknown> => ({
-    ...validationRecordPatch(verdict, publicationStatus, extraAssumptions, now),
+    ...validationRecordPatch(verdict, publicationStatus, extraAssumptions, now, [], advisoryReview),
     canonical_identity: {
         source_key: row.source_key,
         canonical_name: row.canonical_name,
@@ -1947,12 +2958,20 @@ const describeFailure = (error: unknown): { code: string; error: { name: string;
     if (error instanceof ModelBudgetError) {
         return { code: error.code, error: safeError(error) };
     }
+    // The advisory review's own failures. A per-food one is degraded inside the
+    // pass (the row stays quarantined and the pass continues), so what reaches
+    // here is a configuration or ledger fault that stopped the stage — and it
+    // is reported under its own code rather than as `unexpected_error`.
+    if (error instanceof CatalogReviewError) {
+        return { code: error.code, error: safeError(error) };
+    }
     if (error instanceof CheckpointError) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof RateLimitConfigError) {
-        return { code: 'rate_limit_misconfigured', error: safeError(error) };
-    }
+    // No rate-limiter branch: this stage makes no rate-limited vendor request —
+    // the USDA limiter belongs to catalog-import-usda.ts — so a
+    // RateLimitConfigError cannot arise here, and a branch for one would claim a
+    // failure mode this stage does not have.
     return { code: 'unexpected_error', error: safeError(error) };
 };
 
@@ -1980,13 +2999,29 @@ const main = async (): Promise<number> => {
         database: origin.database,
         reason: origin.reason,
     });
+    const reviewEnabled = advisoryReviewEnabled(parsed.options);
+
     logger.info('stage_invoked', {
         stage: STAGE,
         categories: parsed.options.categories,
         revalidateQuarantined: parsed.options.revalidateQuarantined,
+        review: parsed.options.review,
+        dryRun: parsed.options.dryRun,
+        advisoryReviewEnabled: reviewEnabled,
     });
 
-    const gaps = preflight(defaultPreflightDeps());
+    // Said once, loudly, rather than left to be inferred from a spend of zero:
+    // `--dry-run` writes nothing, and reserving a call is a write.
+    if (parsed.options.review && parsed.options.dryRun) {
+        logger.warn('advisory_review_suppressed', {
+            stage: STAGE,
+            reason: '--dry-run writes nothing, and reserving a model call is a write, so --review makes no call in this pass',
+            consequence:
+                'every row is previewed on the deterministic checks alone; re-run with --review and without --dry-run to consult the advisory model',
+        });
+    }
+
+    const gaps = preflight(defaultPreflightDeps(parsed.options));
     if (gaps.length > 0) {
         logger.error('stage_prerequisites_unmet', gapFields(gaps));
         return 1;
@@ -1998,6 +3033,27 @@ const main = async (): Promise<number> => {
     const { prisma } = await import('../src/prisma/client');
 
     const coveragePlan = loadCoveragePlan();
+
+    // THE ADVISORY REVIEW'S WIRING, RESOLVED ONCE, BEFORE THE PASS (§9).
+    //
+    // The model name and the cap are read here and passed in, so the judgement
+    // loop never reads the environment (and, with `--review` off, the vendor
+    // boundary is never even asked for a configuration it does not have —
+    // `getReviewModel()` would throw on a machine with no key, which is exactly
+    // the machine a default pass must run on). `callOpenRouter`'s own default
+    // timeout bounds the call; nothing here is on a request path.
+    const reviewModel = reviewEnabled ? getReviewModel() : undefined;
+    const modelCallBudget = reviewEnabled ? getCatalogModelCallBudget(process.env) : undefined;
+
+    if (reviewEnabled) {
+        logger.info('advisory_review_configured', {
+            stage: STAGE,
+            model: reviewModel,
+            promptVersion: coveragePlan.reviewPromptVersion,
+            budgetLimit: modelCallBudget,
+            scope: 'a generated candidate held by review-tier flags alone; the review confirms a flag and never supplies a value',
+        });
+    }
 
     // THE STAGE CLAIM. Validation MUTATES the catalog graph — it moves
     // publication_status and rewrites validation records — so it holds the
@@ -2021,6 +3077,22 @@ const main = async (): Promise<number> => {
                 fs.mkdirSync(path.dirname(target), { recursive: true });
                 fs.writeFileSync(target, `${JSON.stringify(report, null, 2)}\n`, 'utf-8');
             },
+            // The vendor and the ledger are supplied only when a call may
+            // happen, so a default pass cannot make one even by accident.
+            review: reviewEnabled
+                ? {
+                      call: (systemPrompt, userContent, jsonSchema, model) =>
+                          callOpenRouter(systemPrompt, userContent, jsonSchema, model),
+                  }
+                : undefined,
+            budget: reviewEnabled
+                ? {
+                      reserve: (input) => reserveModelCall(prisma as unknown as CatalogRunDb, input),
+                      record: (input) => recordModelCallUsage(prisma as unknown as CatalogRunDb, input),
+                  }
+                : undefined,
+            reviewModel,
+            modelCallBudget,
         }),
     );
 

@@ -4273,6 +4273,11 @@ const validateOptions = (overrides: Partial<ValidateOptions> = {}): ValidateOpti
     help: false,
     categories: [],
     revalidateQuarantined: false,
+    // The stage's own defaults, so a case that names neither flag exercises the
+    // pass an operator gets from a bare `npm run catalog:validate`: judged on
+    // the deterministic checks alone, with no model call and every write made.
+    review: false,
+    dryRun: false,
     ...overrides,
 });
 

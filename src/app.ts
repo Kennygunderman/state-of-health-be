@@ -8,6 +8,8 @@ import recordRoutes from './routes/record.routes';
 import weighInRoutes from './routes/weighIn.routes';
 import nutritionRoutes from './routes/nutrition.routes';
 import foodRoutes from './routes/food.routes';
+import catalogRoutes from './routes/catalog.routes';
+import mealPlanningRoutes from './routes/mealPlanning.routes';
 import { authenticateFirebaseToken } from './middleware/auth';
 import { prisma } from './prisma/client';
 
@@ -49,5 +51,10 @@ app.use('/api', weighInRoutes);
 // nutrition's /macros/:date would otherwise swallow (date = "search-branded-foods").
 app.use('/api', foodRoutes);
 app.use('/api', nutritionRoutes);
+// Safe to mount last: these own /catalog, /recipes and /meal-planning, which
+// share no first path segment with any route above — nutrition's /macros/:date,
+// the only parameterized path that could swallow a sibling, cannot reach them.
+app.use('/api', catalogRoutes);
+app.use('/api', mealPlanningRoutes);
 
 export default app;
