@@ -5,11 +5,28 @@
  * for this stage, and each has a describe block below: a first seed, a no-op
  * rerun, a content change promoting a new version, a declared-versus-derived
  * mismatch, an unlisted oil named in the instructions, and an unknown
- * `source_key`. Two more are added because they are the ones a reviewer of the
- * schema would ask about: a STALE ingredient snapshot — separately for the
- * nutrition counter and for the metadata counter — must promote a version just
- * as changed content does (§0.5.1), and a single invalid file must leave the
- * whole run unpublished.
+ * `source_key`. The rest are the ones a reviewer of the schema would ask about:
+ * a STALE ingredient snapshot — separately for the nutrition counter and for
+ * the metadata counter — must promote a version just as changed content does
+ * (§0.5.1); a single invalid file must leave the whole run unpublished; the
+ * promotion must be ONE transaction, so a failure part-way through it must
+ * leave the recipe exactly as current as it was; the version chain must
+ * accumulate rather than be pruned; every clause of the publication gate must
+ * refuse on its own; and the stage's `development_or_confirmed` database policy
+ * must hold.
+ *
+ * WHAT THIS SUITE DELIBERATELY DOES NOT SETTLE. The coverage matrix — every
+ * diet x single-allergen x slot x time-tier cell, the §0.7.3 guaranteed and
+ * reduced thresholds, the slot-composition floors, and equality with the
+ * committed `data/meal-planning/recipes/coverage-report.json` — belongs to
+ * `src/__tests__/api/seed-rerun.test.ts`, which computes it from the REAL
+ * 42-recipe corpus. Restating a cell of it here would assert the same rule
+ * twice over a synthetic corpus that cannot satisfy it. What this suite keeps
+ * of the report is the WIRING only: that it was written to the injected path,
+ * that the committed artefact was left alone, and that a narrowed or dry run
+ * writes none. Recipe nutrition, badge derivation, provenance rollup and
+ * `isEligibleForPlanning` are pure functions owned by
+ * `src/services/__tests__/recipe.logic.test.ts`.
  *
  * WHY IT DRIVES `runSeed(deps)` RATHER THAN THE COMMAND. The stage's own
  * `main()` reads `process.argv`, classifies the ambient `DATABASE_URL` and calls
@@ -51,12 +68,19 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { loadCoveragePlan, writeJsonFile } from '../../../scripts/lib/manifest';
+import {
+    assertScriptDatabase,
+    classifyDatabaseOrigin,
+    DatabaseOriginError,
+    entryScriptName,
+    SCRIPT_DATABASE_POLICIES,
+} from '../../../scripts/lib/dbGuard';
+import { createLogger, safeError } from '../../../scripts/lib/logger';
+import { loadCoveragePlan, recipesDir, writeJsonFile } from '../../../scripts/lib/manifest';
 import type { CoveragePlan } from '../../../scripts/lib/manifest';
-import type { ScriptLogger } from '../../../scripts/lib/logger';
+import type { LogLevel, ScriptLogger } from '../../../scripts/lib/logger';
 import {
     buildIngredientVocabulary,
-    deriveCoverageReport,
     describeFailure,
     equivalentContent,
     findUnlistedInstructionTerms,
@@ -70,16 +94,12 @@ import {
     runSeed,
     sameStoredNumber,
 } from '../../../scripts/recipes-seed';
-import type {
-    CoverageRecipe,
-    SeedDb,
-    SeedDeps,
-    SeedOutcome,
-    SeedPreflightDeps,
-} from '../../../scripts/recipes-seed';
+import type { SeedDb, SeedDeps, SeedOutcome, SeedPreflightDeps } from '../../../scripts/recipes-seed';
 import { prisma } from '../../prisma/client';
 import { deriveRecipeVersionFields } from '../../services/recipe.logic';
 import type { RecipeAllergenStatus, RecipePublicationIngredient } from '../../services/recipe.logic';
+import { RECIPE_BADGES, RECIPE_ICON_KEYS } from '../../types/recipe';
+import type { RecipeBadge, RecipeIconKey } from '../../types/recipe';
 import { truncateFeatureTables } from '../setup/testDb';
 
 /** Database work per block is a handful of small statements; a hang is worth failing. */
@@ -97,6 +117,9 @@ const PUBLISHED_AT = new Date('2026-09-13T12:00:00.000Z');
 
 /** A second instant, so a promotion's `retired_at` is distinguishable from the first publication. */
 const PROMOTED_AT = new Date('2026-09-14T08:30:00.000Z');
+
+/** A third, so a chain of promotions is ordered by assertable timestamps rather than by row order. */
+const THIRD_PUBLISHED_AT = new Date('2026-09-15T17:45:00.000Z');
 
 const silentLogger: ScriptLogger = {
     debug: () => undefined,
@@ -224,6 +247,31 @@ const FOODS: readonly FoodFixture[] = [
         cost_class: 2,
     },
     {
+        // Publishable, and the one row whose diet tags do NOT include
+        // `gluten_free`: intersected with the chicken's `['gluten_free']` it
+        // derives an EMPTY diet-tag list, which is a real answer rather than a
+        // missing one (`deriveDietTags` over a disjoint pair).
+        source_key: 'test:wheat-flour',
+        canonical_name: 'wheat flour',
+        display_name: 'Wheat flour',
+        category: 'grain',
+        food_group: 'wheat_grain',
+        publication_status: 'published',
+        nutrition_provenance: 'source_backed',
+        allergen_status: 'known',
+        allergen_tags: ['wheat'],
+        diet_tags: ['pescatarian', 'vegan', 'vegetarian'],
+        calories: 364,
+        protein_g: 10.3,
+        carbs_g: 76.3,
+        fat_g: 1,
+        fiber_g: 2.7,
+        cost_class: 1,
+    },
+    // One row per clause of the publication gate, each differing from a
+    // publishable row in exactly ONE column, so a refusal below is attributable
+    // to that column and to nothing else.
+    {
         // Never published, so it may not back a NEW version — the publication
         // gate's first clause, and the reason this row exists.
         source_key: 'test:quinoa-candidate',
@@ -242,6 +290,86 @@ const FOODS: readonly FoodFixture[] = [
         fat_g: 1.9,
         fiber_g: 2.8,
         cost_class: 2,
+    },
+    {
+        // Published once and withdrawn by a later catalog release. It keeps
+        // backing the versions that already reference it — which is what makes
+        // a historical plan and its diary entries readable, and why a release
+        // retires rather than deletes — but a NEW version built on it would be
+        // unplannable from the moment it published.
+        source_key: 'test:barley-retired',
+        canonical_name: 'barley, pearled',
+        display_name: 'Barley, pearled',
+        category: 'grain',
+        food_group: 'wheat_grain',
+        publication_status: 'retired',
+        nutrition_provenance: 'source_backed',
+        allergen_status: 'known',
+        allergen_tags: ['wheat'],
+        diet_tags: ['pescatarian', 'vegan', 'vegetarian'],
+        calories: 123,
+        protein_g: 2.3,
+        carbs_g: 28.2,
+        fat_g: 0.4,
+        fiber_g: 3.8,
+        cost_class: 1,
+    },
+    {
+        source_key: 'test:peanut-sauce-estimated',
+        canonical_name: 'peanut sauce',
+        display_name: 'Peanut sauce',
+        category: 'condiment_sauce',
+        food_group: 'peanut',
+        publication_status: 'published',
+        nutrition_provenance: 'ai_estimated',
+        allergen_status: 'known',
+        allergen_tags: ['peanuts'],
+        diet_tags: ['vegan', 'vegetarian'],
+        calories: 220,
+        protein_g: 7.2,
+        carbs_g: 12.4,
+        fat_g: 16.1,
+        fiber_g: 1.8,
+        cost_class: 2,
+    },
+    {
+        source_key: 'test:vegetable-broth-derived',
+        canonical_name: 'vegetable broth',
+        display_name: 'Vegetable broth',
+        category: 'condiment_sauce',
+        food_group: 'soup',
+        publication_status: 'published',
+        nutrition_provenance: 'ingredient_derived',
+        allergen_status: 'known',
+        allergen_tags: [],
+        diet_tags: PLANT_DIET_TAGS,
+        calories: 6,
+        protein_g: 0.3,
+        carbs_g: 1,
+        fat_g: 0.1,
+        fiber_g: 0,
+        cost_class: 1,
+    },
+    {
+        source_key: 'test:blue-cheese-unreviewed',
+        canonical_name: 'blue cheese',
+        display_name: 'Blue cheese',
+        category: 'dairy',
+        food_group: 'blue_cheese',
+        publication_status: 'published',
+        nutrition_provenance: 'source_backed',
+        // Nobody has reviewed it, so it cannot be certified safe for any user
+        // whatever they selected — the tags being empty is not an absence of
+        // allergens, it is an absence of a review.
+        allergen_status: 'unknown',
+        allergen_tags: [],
+        diet_tags: ['vegetarian'],
+        calories: 353,
+        protein_g: 21.4,
+        carbs_g: 2.3,
+        fat_g: 28.7,
+        fiber_g: 0,
+        cost_class: 3,
     },
 ];
 
@@ -298,6 +426,14 @@ const resetCatalog = async (): Promise<void> => {
  * The synthetic corpus
  * ------------------------------------------------------------------------- */
 
+/**
+ * Typed against the closed set rather than written as a string, so a key this
+ * stage would refuse cannot reach a fixture through `typecheck:test`. The
+ * scenarios that DO need a refused value pass it through `overrides`, which is
+ * the honest shape for a value arriving from JSON.
+ */
+const FIXTURE_ICON_KEY: RecipeIconKey = 'bowl';
+
 interface PayloadOptions {
     readonly slug: string;
     readonly mealSlots: readonly string[];
@@ -306,6 +442,7 @@ interface PayloadOptions {
     readonly prepMinutes?: number;
     readonly cookMinutes?: number;
     readonly yieldServings?: number;
+    readonly iconKey?: RecipeIconKey;
     /** Applied last, so a scenario can break exactly one declared field. */
     readonly overrides?: Record<string, unknown>;
 }
@@ -377,7 +514,7 @@ const buildPayload = (options: PayloadOptions): Record<string, unknown> => {
         slug: options.slug,
         name: `Fixture ${options.slug}`,
         description: `A fixture recipe for ${options.slug}.`,
-        iconKey: 'bowl',
+        iconKey: options.iconKey ?? FIXTURE_ICON_KEY,
         instructions: [...options.instructions],
         yieldServings,
         servingDescription: '1 bowl',
@@ -428,6 +565,23 @@ const chickenPlate = (overrides: Partial<PayloadOptions> = {}): Record<string, u
         ...overrides,
     });
 
+const BREADED_CHICKEN_INSTRUCTIONS: readonly string[] = [
+    'Toss the chicken in the wheat flour until evenly coated.',
+    'Bake for twenty minutes, turning once, until cooked through.',
+];
+
+/** The one pair in the fixture catalog whose diet claims do not overlap. */
+const breadedChicken = (overrides: Partial<PayloadOptions> = {}): Record<string, unknown> =>
+    buildPayload({
+        slug: 'breaded-chicken-bake',
+        mealSlots: ['dinner'],
+        instructions: BREADED_CHICKEN_INSTRUCTIONS,
+        ingredientKeys: ['test:chicken-breast', 'test:wheat-flour'],
+        prepMinutes: 10,
+        cookMinutes: 20,
+        ...overrides,
+    });
+
 /* ---------------------------------------------------------------------------
  * The seams
  * ------------------------------------------------------------------------- */
@@ -436,6 +590,16 @@ let recipesDirectory: string;
 let reportDirectory: string;
 
 const reportPath = (): string => path.join(reportDirectory, 'coverage-report.json');
+
+/**
+ * The corpus this stage ships, reached through the manifest's own resolver
+ * rather than a relative path. Nothing here reads a recipe from it — the
+ * temporary directory is the corpus under test — and the ONE thing it is used
+ * for is proving the committed coverage report was not rewritten.
+ */
+const COMMITTED_REPORT = path.join(recipesDir(), 'coverage-report.json');
+
+let committedReportModifiedAt: number;
 
 /** Replaces the temporary corpus with exactly these payloads. */
 const writeCorpus = (payloads: readonly Record<string, unknown>[]): void => {
@@ -463,6 +627,97 @@ const seedDeps = (overrides: Partial<SeedDeps> = {}): SeedDeps => ({
     ...overrides,
 });
 
+/**
+ * The failure the atomicity scenario injects, as a class rather than a string
+ * so the assertion names a type (§8) and cannot pass on an unrelated error that
+ * happens to carry similar prose.
+ */
+class InjectedPublishFailure extends Error {
+    constructor(public readonly afterWrite: string) {
+        super(`injected failure after ${afterWrite}`);
+        this.name = 'InjectedPublishFailure';
+    }
+}
+
+/**
+ * The real client, with one write inside the publication transaction replaced by
+ * a throw.
+ *
+ * Injection through `SeedDeps.prisma` rather than a module mock: `publishRecipe`
+ * receives its client as an argument for exactly this reason, and the wrapper
+ * delegates `$transaction` to the real one so the rollback under test is
+ * PostgreSQL's, not a fake's.
+ */
+const failingAfter = (write: 'retire' | 'insert'): SeedDb => {
+    const real = prisma as unknown as SeedDb;
+
+    const wrapTx = (tx: SeedDb): SeedDb => ({
+        catalog_foods: tx.catalog_foods,
+        recipes: {
+            findUnique<Row>(args: unknown): Promise<Row | null> {
+                return tx.recipes.findUnique<Row>(args);
+            },
+            findMany<Row>(args: unknown): Promise<Row[]> {
+                return tx.recipes.findMany<Row>(args);
+            },
+            create(args: unknown): Promise<{ id: string }> {
+                return tx.recipes.create(args);
+            },
+            // The `current_version_id` move, which is a promotion's last write:
+            // failing here is what a caller that committed the retire and the
+            // insert in an earlier transaction would survive.
+            update(args: unknown): Promise<{ id: string }> {
+                return write === 'insert'
+                    ? Promise.reject(new InjectedPublishFailure('the new version was inserted'))
+                    : tx.recipes.update(args);
+            },
+        },
+        recipe_versions: {
+            create(args: unknown): Promise<{ id: string; version: number }> {
+                return write === 'retire'
+                    ? Promise.reject(new InjectedPublishFailure('the previous version was retired'))
+                    : tx.recipe_versions.create(args);
+            },
+            update(args: unknown): Promise<{ id: string }> {
+                return tx.recipe_versions.update(args);
+            },
+        },
+        $transaction<T>(work: (inner: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
+            return tx.$transaction(work, options);
+        },
+    });
+
+    return {
+        catalog_foods: real.catalog_foods,
+        recipes: real.recipes,
+        recipe_versions: real.recipe_versions,
+        $transaction<T>(work: (tx: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
+            return real.$transaction((tx) => work(wrapTx(tx)), options);
+        },
+    };
+};
+
+interface CapturedLine {
+    readonly level: LogLevel;
+    readonly line: string;
+    readonly entry: Record<string, unknown>;
+}
+
+/**
+ * A real `ScriptLogger` over a captured sink, so an assertion reads the bytes
+ * the stage would have emitted rather than the fields it passed in — the only
+ * form in which "the reason is reported and the connection string is not" is
+ * actually checkable.
+ */
+const capturingLogger = (captured: CapturedLine[]): ScriptLogger =>
+    createLogger('recipes-seed', {
+        level: 'debug',
+        now: () => PUBLISHED_AT,
+        write: (line, level) => {
+            captured.push({ level, line, entry: JSON.parse(line) as Record<string, unknown> });
+        },
+    });
+
 interface StoredState {
     readonly recipes: number;
     readonly versions: number;
@@ -477,6 +732,23 @@ const readCounts = async (): Promise<StoredState> => ({
     currentVersions: await prisma.recipe_versions.count({ where: { status: 'current' } }),
     retiredVersions: await prisma.recipe_versions.count({ where: { status: 'retired' } }),
     ingredients: await prisma.recipe_ingredients.count(),
+});
+
+interface StoredIdentity {
+    readonly recipes: { id: string; slug: string; current_version_id: string | null }[];
+    readonly versions: string[];
+    readonly ingredients: string[];
+}
+
+/** Every row's id, so a rerun can be shown to have reused rows rather than replaced them. */
+const readIdentity = async (): Promise<StoredIdentity> => ({
+    recipes: (await prisma.recipes.findMany({ orderBy: { slug: 'asc' } })).map((row) => ({
+        id: row.id,
+        slug: row.slug,
+        current_version_id: row.current_version_id,
+    })),
+    versions: (await prisma.recipe_versions.findMany({ orderBy: { id: 'asc' } })).map((row) => row.id),
+    ingredients: (await prisma.recipe_ingredients.findMany({ orderBy: { id: 'asc' } })).map((row) => row.id),
 });
 
 const readRecipe = async (slug: string) =>
@@ -505,6 +777,7 @@ const refusalFrom = async (deps: SeedDeps): Promise<RecipeSeedError> => {
 beforeAll(() => {
     recipesDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'recipes-seed-corpus-'));
     reportDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'recipes-seed-report-'));
+    committedReportModifiedAt = fs.statSync(COMMITTED_REPORT).mtimeMs;
 });
 
 afterAll(async () => {
@@ -606,22 +879,147 @@ describe('the first seed', () => {
         expect(version?.meal_slots).toEqual(['lunch', 'dinner']);
     });
 
+    // `icon_key` is TEXT with no constraint behind it, and the mobile client
+    // decodes an unrecognised key leniently into MealBowlIcon rather than
+    // failing — so this stage is the only place a key outside the set is ever
+    // caught, and what it stored is the fact that contract rests on.
+    it('stores an icon key and badges inside the closed sets the client decodes against', async () => {
+        const version = (await readRecipe('tofu-broccoli-bowl')).current_version;
+
+        expect(version?.icon_key).toBe(FIXTURE_ICON_KEY);
+        expect(RECIPE_ICON_KEYS as readonly string[]).toContain(version?.icon_key);
+        expect(version?.badges.length).toBeGreaterThan(0);
+        expect((version?.badges ?? []).filter((badge) => !(RECIPE_BADGES as readonly string[]).includes(badge))).toEqual(
+            [],
+        );
+    });
+
+    // The report's CONTENT — every cell of the diet x allergen x slot x
+    // time-tier table and the §0.7.3 thresholds over it — is
+    // src/__tests__/api/seed-rerun.test.ts's subject, against the real corpus.
+    // What is wiring, and so belongs here, is where the file went.
     it('writes the coverage report to the injected path, and the committed artefact is untouched', () => {
         expect(outcome.reportPath).toBe(reportPath());
         expect(outcome.reportSkippedReason).toBeNull();
         expect(fs.existsSync(reportPath())).toBe(true);
         expect(outcome.report?.recipeCount).toBe(2);
-        expect(outcome.report?.eligibleCounts).toHaveLength(640);
-        expect(outcome.report?.guaranteedCells).toHaveLength(140);
-        expect(outcome.report?.reducedCells).toHaveLength(124);
+        expect((JSON.parse(fs.readFileSync(reportPath(), 'utf8')) as { recipeCount: number }).recipeCount).toBe(2);
+        expect(fs.statSync(COMMITTED_REPORT).mtimeMs).toBe(committedReportModifiedAt);
+    });
+});
+
+describe('the catalog moving on under a published version', () => {
+    beforeAll(async () => {
+        await resetCatalog();
+        writeCorpus([tofuBowl()]);
+        await runSeed(seedDeps());
+
+        // Corrected nutrition, a renamed food and a re-reviewed allergen set,
+        // all WITHOUT touching either version counter: the shape of a catalog
+        // edit that has not yet been published as a new catalog version.
+        await prisma.catalog_foods.update({
+            where: { source_key: 'test:tofu-firm' },
+            data: {
+                calories: 999,
+                protein_g: 1.1,
+                carbs_g: 2.2,
+                fat_g: 3.3,
+                fiber_g: 4.4,
+                display_name: 'Tofu, extra firm',
+                allergen_tags: ['soy', 'sesame'],
+                diet_tags: [],
+            },
+        });
+    }, BLOCK_TIMEOUT_MS);
+
+    // A version records what a plan was built from and what a diary entry
+    // logged, so it is immutable: a plan generated last week must still read
+    // back the numbers it was planned against, whatever the catalog says today.
+    it('leaves the published snapshot exactly as it was taken', async () => {
+        const version = (await readRecipe('tofu-broccoli-bowl')).current_version;
+        const tofu = version?.recipe_ingredients.find((row) => row.sort_order === 0);
+
+        expect(tofu?.snapshot_name).toBe('Tofu, firm');
+        expect(tofu?.snapshot_per_100g).toEqual({
+            calories: 144,
+            protein_g: 17.3,
+            carbs_g: 2.8,
+            fat_g: 8.7,
+            fiber_g: 2.3,
+        });
+        expect(tofu?.snapshot_allergen_tags).toEqual(['soy']);
+        expect(tofu?.snapshot_diet_tags).toEqual([...PLANT_DIET_TAGS]);
+        expect(version?.allergen_tags).toEqual(['soy']);
+        expect(version?.diet_tags).toEqual([...PLANT_DIET_TAGS]);
+    });
+
+    it('still points the frozen row at the live catalog food', async () => {
+        const version = (await readRecipe('tofu-broccoli-bowl')).current_version;
+        const tofu = version?.recipe_ingredients.find((row) => row.sort_order === 0);
+        const live = await prisma.catalog_foods.findUniqueOrThrow({ where: { source_key: 'test:tofu-firm' } });
+
+        expect(tofu?.catalog_food_id).toBe(live.id);
+        expect(live.display_name).toBe('Tofu, extra firm');
+        expect(live.calories).toBe(999);
+    });
+
+    // Validation reads the LIVE catalog, not the snapshot, so the same file
+    // that published cleanly is now inconsistent with the food it names: an
+    // ingredient that has lost `vegan` and gained `sesame` makes the recipe's
+    // declarations false. The refusal is the point — publishing the file's own
+    // claims would ship a dish labelled vegan and sesame-free that is neither.
+    it('refuses the next run, naming the live ingredient the declarations no longer match', async () => {
+        const refusal = await refusalFrom(seedDeps({ now: () => PROMOTED_AT }));
+        const reported = refusal.problems.join('\n');
+
+        expect(refusal.code).toBe('recipes_invalid');
+        expect(reported).toContain('tofu-broccoli-bowl (recipes/tofu-broccoli-bowl.json)');
+        expect(reported).toContain('Tofu, extra firm');
+        expect(reported).toContain('allergen_tags does not declare "sesame"');
+        expect(reported).toContain('diet_tags declares "vegan"');
+
+        // And the already-published version survives the refusal intact, which
+        // is what keeps the plans and diary entries pointing at it readable.
+        expect(await readCounts()).toEqual({
+            recipes: 1,
+            versions: 1,
+            currentVersions: 1,
+            retiredVersions: 0,
+            ingredients: 3,
+        });
+    }, BLOCK_TIMEOUT_MS);
+});
+
+describe('a recipe whose ingredients share no diet claim', () => {
+    let outcome: SeedOutcome;
+
+    beforeAll(async () => {
+        await resetCatalog();
+        writeCorpus([breadedChicken()]);
+        outcome = await runSeed(seedDeps());
+    }, BLOCK_TIMEOUT_MS);
+
+    // The chicken claims `gluten_free` and the flour claims the three plant
+    // diets, so the intersection is empty. An empty list is the derivation's
+    // ANSWER — "no diet claim holds for every part of this dish" — and not a
+    // value that failed to arrive, so the declared-versus-derived gate has to
+    // accept a file that declares it.
+    it('publishes it with an empty diet_tags list and the unioned allergens', async () => {
+        expect(outcome.created).toEqual(['breaded-chicken-bake']);
+
+        const version = (await readRecipe('breaded-chicken-bake')).current_version;
+
+        expect(version?.diet_tags).toEqual([]);
+        expect(version?.allergen_tags).toEqual(['wheat']);
+        expect(version?.allergen_status).toBe('known');
     });
 });
 
 describe('an identical rerun', () => {
     let first: SeedOutcome;
     let second: SeedOutcome;
-    let firstVersionIds: string[];
-    let secondVersionIds: string[];
+    let firstIdentity: StoredIdentity;
+    let secondIdentity: StoredIdentity;
     let firstReport: string;
     let secondReport: string;
 
@@ -631,11 +1029,11 @@ describe('an identical rerun', () => {
 
         first = await runSeed(seedDeps());
         firstReport = fs.readFileSync(reportPath(), 'utf8');
-        firstVersionIds = (await prisma.recipe_versions.findMany({ orderBy: { id: 'asc' } })).map((row) => row.id);
+        firstIdentity = await readIdentity();
 
         second = await runSeed(seedDeps({ now: () => PROMOTED_AT }));
         secondReport = fs.readFileSync(reportPath(), 'utf8');
-        secondVersionIds = (await prisma.recipe_versions.findMany({ orderBy: { id: 'asc' } })).map((row) => row.id);
+        secondIdentity = await readIdentity();
     }, BLOCK_TIMEOUT_MS);
 
     it('publishes nothing and reports every recipe unchanged', () => {
@@ -646,8 +1044,13 @@ describe('an identical rerun', () => {
         expect(second.ingredientRows).toBe(0);
     });
 
+    // Identity, not just counts. A rerun that deleted a version's ingredient
+    // rows and recreated them — the reconciliation shape catalog-load.ts uses
+    // legitimately for aliases and portions — would keep every count and every
+    // version id while handing out six new `recipe_ingredients` ids, and a
+    // count-only assertion would call that a no-op.
     it('leaves the same rows in place, by id, so no plan or diary reference is invalidated', async () => {
-        expect(secondVersionIds).toEqual(firstVersionIds);
+        expect(secondIdentity).toEqual(firstIdentity);
         expect(await readCounts()).toEqual({
             recipes: 2,
             versions: 2,
@@ -704,6 +1107,108 @@ describe('a content change', () => {
         expect(current.total_minutes).toBe(35);
         expect(await prisma.recipe_ingredients.count({ where: { recipe_version_id: retired.id } })).toBe(3);
         expect(await prisma.recipe_ingredients.count({ where: { recipe_version_id: current.id } })).toBe(3);
+    });
+});
+
+describe('a promotion that fails part-way through', () => {
+    let published: StoredIdentity;
+
+    beforeEach(async () => {
+        await resetCatalog();
+        writeCorpus([tofuBowl()]);
+        await runSeed(seedDeps());
+        published = await readIdentity();
+        writeCorpus([tofuBowl({ prepMinutes: 25 })]);
+    }, BLOCK_TIMEOUT_MS);
+
+    // "One transaction" is the claim §0.5.1 makes and the partial unique index
+    // on (recipe_id) WHERE status = 'current' is only half of what enforces it:
+    // the index stops a SECOND current row, and nothing but the transaction
+    // stops a run that retired version 1 and then died from leaving the recipe
+    // with NO current version at all — unplannable, and invisible until a user
+    // opened their week.
+    it.each([
+        ['the previous version was retired', 'retire' as const],
+        ['the new version was inserted', 'insert' as const],
+    ])('rolls the whole promotion back when it fails after %s', async (_after: string, write) => {
+        await expect(runSeed(seedDeps({ prisma: failingAfter(write), now: () => PROMOTED_AT }))).rejects.toThrow(
+            InjectedPublishFailure,
+        );
+
+        expect(await readIdentity()).toEqual(published);
+        expect(await readCounts()).toEqual({
+            recipes: 1,
+            versions: 1,
+            currentVersions: 1,
+            retiredVersions: 0,
+            ingredients: 3,
+        });
+
+        const recipe = await readRecipe('tofu-broccoli-bowl');
+        expect(recipe.current_version?.version).toBe(1);
+        expect(recipe.current_version?.status).toBe('current');
+        expect(recipe.current_version?.retired_at).toBeNull();
+        expect(recipe.current_version?.total_minutes).toBe(15);
+    }, BLOCK_TIMEOUT_MS);
+
+    // A rollback has to leave the recipe publishable, not wedged: the retry
+    // that follows a transient fault must produce ONE promotion, not a second
+    // version 2 beside a half-written first attempt.
+    it('publishes exactly one promotion once the fault is removed', async () => {
+        await expect(runSeed(seedDeps({ prisma: failingAfter('insert'), now: () => PROMOTED_AT }))).rejects.toThrow(
+            InjectedPublishFailure,
+        );
+
+        const outcome = await runSeed(seedDeps({ now: () => PROMOTED_AT }));
+
+        expect(outcome.promoted).toEqual(['tofu-broccoli-bowl']);
+
+        const recipe = await readRecipe('tofu-broccoli-bowl');
+        expect(recipe.recipe_versions.map((version) => version.version)).toEqual([1, 2]);
+        expect(recipe.recipe_versions.map((version) => version.status)).toEqual(['retired', 'current']);
+        expect(recipe.current_version_id).toBe(recipe.recipe_versions[1].id);
+    }, BLOCK_TIMEOUT_MS);
+});
+
+describe('a third change to the same recipe', () => {
+    beforeAll(async () => {
+        await resetCatalog();
+        writeCorpus([tofuBowl()]);
+        await runSeed(seedDeps());
+        writeCorpus([tofuBowl({ prepMinutes: 25 })]);
+        await runSeed(seedDeps({ now: () => PROMOTED_AT }));
+        writeCorpus([tofuBowl({ prepMinutes: 25, cookMinutes: 40 })]);
+        await runSeed(seedDeps({ now: () => THIRD_PUBLISHED_AT }));
+    }, BLOCK_TIMEOUT_MS);
+
+    // The chain accumulates rather than being pruned: version 1 stays retired
+    // beside version 2 because a plan built in week one and the diary entries
+    // logged from it still reference it, and a version is never edited or
+    // deleted to tidy the table.
+    it('leaves versions 1 and 2 retired under version 3, each with its own timestamps', async () => {
+        const versions = (await readRecipe('tofu-broccoli-bowl')).recipe_versions;
+
+        expect(versions.map((version) => version.version)).toEqual([1, 2, 3]);
+        expect(versions.map((version) => version.status)).toEqual(['retired', 'retired', 'current']);
+        expect(versions.map((version) => version.published_at)).toEqual([
+            PUBLISHED_AT,
+            PROMOTED_AT,
+            THIRD_PUBLISHED_AT,
+        ]);
+        expect(versions.map((version) => version.retired_at)).toEqual([PROMOTED_AT, THIRD_PUBLISHED_AT, null]);
+        expect(versions.map((version) => version.total_minutes)).toEqual([15, 35, 65]);
+    });
+
+    it('keeps exactly one current version for the recipe, and its ingredient rows for every retired one', async () => {
+        const recipe = await readRecipe('tofu-broccoli-bowl');
+        const current = recipe.recipe_versions.filter((version) => version.status === 'current');
+
+        expect(current).toHaveLength(1);
+        expect(recipe.current_version_id).toBe(current[0].id);
+
+        for (const version of recipe.recipe_versions) {
+            expect(await prisma.recipe_ingredients.count({ where: { recipe_version_id: version.id } })).toBe(3);
+        }
     });
 });
 
@@ -890,6 +1395,220 @@ describe('an ingredient the catalog cannot back', () => {
         expect(refusal.problems.join('\n')).toContain('0 default catalog_food_portions rows');
         expect(await prisma.recipes.count()).toBe(0);
     }, BLOCK_TIMEOUT_MS);
+
+    // The gram weight every unit conversion and every grocery line is derived
+    // from. A portion that exists and states zero is worse than a missing one,
+    // because it divides rather than announcing itself.
+    it('refuses a food whose default portion states no positive gram weight', async () => {
+        await prisma.catalog_food_portions.updateMany({
+            where: { catalog_foods: { source_key: 'test:canola-oil' } },
+            data: { gram_weight: 0 },
+        });
+        writeCorpus([tofuBowl()]);
+
+        const refusal = await refusalFrom(seedDeps());
+
+        expect(refusal.code).toBe('recipes_invalid');
+        expect(refusal.problems.join('\n')).toContain('test:canola-oil');
+        expect(refusal.problems.join('\n')).toContain('gram_weight 0, which is not positive');
+        expect(await prisma.recipes.count()).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+
+    // An estimate never enters planning, so a recipe built on one could never be
+    // planned either — and its calories would be labelled as calculated from
+    // source-backed ingredients when they are not.
+    it.each([
+        ['an AI estimate', 'test:peanut-sauce-estimated', 'peanut sauce', 'ai_estimated'],
+        ['a figure derived from a composition', 'test:vegetable-broth-derived', 'vegetable broth', 'ingredient_derived'],
+    ])('refuses %s, naming the provenance it states', async (_case, sourceKey, name, provenance) => {
+        writeCorpus([
+            buildPayload({
+                slug: 'estimated-ingredient-bowl',
+                mealSlots: ['lunch'],
+                instructions: [`Stir the ${name} through the warm broccoli and serve.`],
+                ingredientKeys: ['test:broccoli-raw', sourceKey],
+            }),
+        ]);
+
+        const refusal = await refusalFrom(seedDeps());
+
+        expect(refusal.code).toBe('recipes_invalid');
+        expect(refusal.problems.join('\n')).toContain('estimated-ingredient-bowl');
+        expect(refusal.problems.join('\n')).toContain(sourceKey);
+        expect(refusal.problems.join('\n')).toContain(`nutrition_provenance is "${provenance}", not "source_backed"`);
+        expect(await prisma.recipes.count()).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+
+    // Unreviewed is not the same as free of allergens: a food nobody has
+    // reviewed cannot be certified safe for any user whatever they selected, so
+    // an empty `allergen_tags` beside `allergen_status = 'unknown'` must refuse
+    // rather than read as "contains nothing".
+    it('refuses a food whose allergens have never been reviewed', async () => {
+        writeCorpus([
+            buildPayload({
+                slug: 'blue-cheese-broccoli-bake',
+                mealSlots: ['dinner'],
+                instructions: ['Scatter the blue cheese over the broccoli and bake until bubbling.'],
+                ingredientKeys: ['test:broccoli-raw', 'test:blue-cheese-unreviewed'],
+            }),
+        ]);
+
+        const refusal = await refusalFrom(seedDeps());
+
+        expect(refusal.code).toBe('recipes_invalid');
+        expect(refusal.problems.join('\n')).toContain('test:blue-cheese-unreviewed');
+        expect(refusal.problems.join('\n')).toContain('allergen_status is "unknown", not "known"');
+        expect(await prisma.recipes.count()).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+
+    // How a food withdrawn by a later catalog release surfaces in this stage.
+    // The asymmetry is the whole point, and it is why a release retires rather
+    // than deletes: the retired row must keep backing the versions that already
+    // reference it — `recipe_ingredients` → `catalog_foods` is RESTRICT, and a
+    // historical plan and its diary entries read through those rows — while a
+    // NEW version built on it would be unplannable from the moment it published.
+    // catalog-load.test.ts owns retirement's effect on search and on the
+    // foreign keys; this is the seed-time half.
+    it('refuses a food a later release retired, while the versions already on it survive', async () => {
+        const barleyBowl = (): Record<string, unknown> =>
+            buildPayload({
+                slug: 'barley-broccoli-bowl',
+                mealSlots: ['lunch'],
+                instructions: ['Simmer the barley, fold the broccoli through and serve.'],
+                ingredientKeys: ['test:barley-retired', 'test:broccoli-raw'],
+            });
+
+        // Published while the food was still current...
+        await prisma.catalog_foods.update({
+            where: { source_key: 'test:barley-retired' },
+            data: { publication_status: 'published' },
+        });
+        writeCorpus([barleyBowl()]);
+        expect((await runSeed(seedDeps())).created).toEqual(['barley-broccoli-bowl']);
+
+        // ...and the release that retires it does not reach back into that version.
+        await prisma.catalog_foods.update({
+            where: { source_key: 'test:barley-retired' },
+            data: { publication_status: 'retired', metadata_version: 2 },
+        });
+
+        const refusal = await refusalFrom(seedDeps({ now: () => PROMOTED_AT }));
+
+        expect(refusal.code).toBe('recipes_invalid');
+        expect(refusal.problems.join('\n')).toContain('test:barley-retired');
+        expect(refusal.problems.join('\n')).toContain('publication_status is "retired", not "published"');
+
+        const recipe = await readRecipe('barley-broccoli-bowl');
+        expect(recipe.current_version?.version).toBe(1);
+        expect(recipe.current_version?.status).toBe('current');
+        expect(recipe.current_version?.recipe_ingredients).toHaveLength(2);
+    }, BLOCK_TIMEOUT_MS);
+});
+
+describe('a declaration outside a closed set', () => {
+    beforeEach(async () => {
+        await resetCatalog();
+    }, BLOCK_TIMEOUT_MS);
+
+    // The mobile client decodes an unrecognised `iconKey` leniently, and an
+    // unrecognised badge code is dropped, precisely so a future server value
+    // never breaks a whole response. That leniency is what makes strictness
+    // HERE the only gate: a typo published by this stage would render as a
+    // default bowl and a silently missing badge on every device, forever.
+    it('refuses an icon key outside RECIPE_ICON_KEYS, naming the permitted values', async () => {
+        writeCorpus([tofuBowl({ overrides: { iconKey: 'spatula' } })]);
+
+        const refusal = await refusalFrom(seedDeps());
+
+        // Exactly one problem: the only thing wrong with this file is the key,
+        // which is what makes the refusal attributable to it.
+        expect(refusal.code).toBe('recipes_invalid');
+        expect(refusal.problems).toHaveLength(1);
+        expect(refusal.problems[0]).toContain('tofu-broccoli-bowl (recipes/tofu-broccoli-bowl.json)');
+        expect(refusal.problems[0]).toContain('icon_key "spatula" is not one of');
+        for (const key of RECIPE_ICON_KEYS) {
+            expect(refusal.problems[0]).toContain(key);
+        }
+        expect(await prisma.recipes.count()).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses a badge outside RECIPE_BADGES while accepting the earned ones beside it', async () => {
+        // The derived badges plus one invented code, so the file disagrees with
+        // the derivation in exactly one place.
+        // Annotated, not inferred: the derivation's badge list must stay the
+        // closed union, so a widening of it to `string[]` fails typecheck here
+        // rather than reaching a device as a badge the client silently drops.
+        const earned: readonly RecipeBadge[] = deriveRecipeVersionFields(
+            ingredientRows(['test:tofu-firm', 'test:broccoli-raw', 'test:canola-oil']).map(publicationIngredient),
+            2,
+            5,
+            10,
+        ).badges;
+        writeCorpus([tofuBowl({ overrides: { badges: [...earned, 'keto'] } })]);
+
+        const refusal = await refusalFrom(seedDeps());
+
+        expect(refusal.code).toBe('recipes_invalid');
+        expect(refusal.problems).toHaveLength(1);
+        expect(refusal.problems[0]).toContain('tofu-broccoli-bowl (recipes/tofu-broccoli-bowl.json)');
+        expect(refusal.problems[0]).toContain('badges declares keto, which is not one of');
+        for (const badge of RECIPE_BADGES) {
+            expect(refusal.problems[0]).toContain(badge);
+        }
+        expect(await prisma.recipes.count()).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+});
+
+describe('what a refusal reports', () => {
+    let refusal: RecipeSeedError;
+    let captured: CapturedLine[];
+
+    beforeAll(async () => {
+        await resetCatalog();
+        writeCorpus([tofuBowl(), chickenPlate({ overrides: { dietTags: ['vegan'] } })]);
+        captured = [];
+        refusal = await refusalFrom(seedDeps({ logger: capturingLogger(captured) }));
+    }, BLOCK_TIMEOUT_MS);
+
+    // An operator fixing the corpus wants every defect, not the first, so the
+    // list travels on one error-level line as well as on the error.
+    it('emits every defect once, at error level, on a line an operator can grep', () => {
+        const rejected = captured.filter((entry) => entry.entry.event === 'recipes_rejected');
+
+        expect(rejected).toHaveLength(1);
+        expect(rejected[0].level).toBe('error');
+        expect(rejected[0].entry.problemCount).toBe(refusal.problems.length);
+        expect(rejected[0].entry.problems).toEqual([...refusal.problems]);
+        expect(rejected[0].entry.stage).toBe('recipes-seed');
+    });
+
+    // §8: never the raw error object. `safeError` is the shape the stage reports
+    // a failure in, and it carries exactly two members — a stack or a `cause`
+    // chain reaching a log is how a connection string escapes.
+    it('reduces the failure to a scrubbed name and message, with no stack', () => {
+        expect(describeFailure(refusal)).toEqual({ code: 'recipes_invalid', error: safeError(refusal) });
+        expect(Object.keys(safeError(refusal)).sort()).toEqual(['message', 'name']);
+        expect(safeError(refusal).name).toBe('RecipeSeedError');
+
+        for (const entry of captured) {
+            expect(entry.line).not.toContain('"stack"');
+        }
+    });
+
+    // The run that refused wrote nothing at all, which is what makes the
+    // validate-everything-then-write order worth having: the valid file in the
+    // same run stays unpublished rather than leaving a half-seeded corpus the
+    // planner would answer from.
+    it('leaves the database exactly as it found it', async () => {
+        expect(await readCounts()).toEqual({
+            recipes: 0,
+            versions: 0,
+            currentVersions: 0,
+            retiredVersions: 0,
+            ingredients: 0,
+        });
+        expect(captured.some((entry) => entry.entry.event === 'recipe_published')).toBe(false);
+    });
 });
 
 describe('a narrowed or dry run', () => {
@@ -1057,6 +1776,10 @@ describe('parseRecipePayload', () => {
         );
     });
 
+    // `deriveDietTags` intersects its ingredients' tags, so a genuinely
+    // disjoint pair — chicken and wheat flour share no diet — derives nothing.
+    // Empty is that answer, not a missing declaration, and a parser that read
+    // it as absent would refuse real recipes.
     it('accepts an empty dietTags list as the derivation\'s own answer', () => {
         const payload = parseRecipePayload('tofu-broccoli-bowl.json', { ...valid(), dietTags: [] });
 
@@ -1182,127 +1905,131 @@ describe('comparing a stored value with the value that was written', () => {
     });
 });
 
-describe('deriveCoverageReport', () => {
-    const recipe = (
-        slug: string,
-        mealSlots: readonly string[],
-        dietTags: readonly string[],
-        allergenTags: readonly string[],
-        totalMinutes: number,
-    ): CoverageRecipe => ({
-        slug,
-        mealSlots,
-        dietTags,
-        version: {
-            status: 'current',
-            nutrition_provenance: 'source_backed',
-            allergen_status: 'known',
-            total_minutes: totalMinutes,
-            meal_slots: mealSlots,
-            ingredients: [
-                {
-                    catalog_food_id: `${slug}-ingredient`,
-                    snapshot_name: `${slug} ingredient`,
-                    snapshot_provenance: 'source_backed',
-                    snapshot_allergen_tags: allergenTags,
-                    snapshot_diet_tags: dietTags,
-                    is_optional: false,
-                    food_group: 'tofu',
-                    allergen_status: 'known',
-                },
-            ],
-        },
+/* ---------------------------------------------------------------------------
+ * The database this stage is allowed to write to
+ * ------------------------------------------------------------------------- */
+
+// WHAT IS THIS BLOCK'S AND WHAT IS NOT. The verdict function's generic
+// mechanics under this policy — each refusal code, the accepted-logging shape —
+// are `catalog-load.test.ts`'s, asserted there over `evaluateScriptDatabase`.
+// What belongs here is the BINDING: `SCRIPT_DATABASE_POLICIES` is data, one
+// entry per script, and the entry that governs THIS stage has to be the
+// confirmed one and has to be in force through the callable the stage actually
+// reaches at module load. A reviewer asking "is recipes-seed guarded?" is not
+// answered by "catalog-load is".
+describe('the database policy the stage runs under', () => {
+    const SCRIPT = 'recipes-seed';
+
+    // `process.env` is never written here. The guard takes `argv` and `env` as
+    // arguments for exactly this reason, and mutating the real environment
+    // would break the identity check jestSetup.ts made before this file loaded.
+    const guard = (databaseUrl: string, argv: readonly string[] = [], logger?: ScriptLogger): void => {
+        assertScriptDatabase({
+            script: SCRIPT,
+            argv: ['node', 'jest', ...argv],
+            env: { DATABASE_URL: databaseUrl },
+            logger,
+        });
+    };
+
+    const refusalOf = (databaseUrl: string, argv: readonly string[] = []): DatabaseOriginError => {
+        try {
+            guard(databaseUrl, argv);
+        } catch (error) {
+            if (error instanceof DatabaseOriginError) {
+                return error;
+            }
+            throw error;
+        }
+        throw new Error('the guard allowed a target the scenario requires it to refuse');
+    };
+
+    // Synthetic, and deliberately not the ambient DATABASE_URL: the guard is
+    // being asked to classify a STRING, so a real credential would be a
+    // committed secret for no gain. `fixture-only` is what the logging
+    // assertion below looks for the absence of.
+    const CREDENTIALS = 'seeduser:fixture-only';
+    const DEVELOPMENT_URL = `postgresql://${CREDENTIALS}@127.0.0.1:5432/soh_dev`;
+    const TEST_URL = `postgresql://${CREDENTIALS}@127.0.0.1:5432/soh_test`;
+    const REMOTE_URL = `postgresql://${CREDENTIALS}@db.internal.example.com:5432/soh_production`;
+
+    it('is development_or_confirmed, because the stage writes shared catalog-derived rows', () => {
+        expect(SCRIPT_DATABASE_POLICIES[SCRIPT]).toBe('development_or_confirmed');
     });
 
-    const report = deriveCoverageReport([
-        recipe('vegan-quick', ['breakfast'], [...PLANT_DIET_TAGS], [], 10),
-        recipe('vegetarian-slow', ['breakfast', 'lunch'], ['pescatarian', 'vegetarian'], ['milk'], 50),
-        recipe('omnivore', ['dinner'], [], [], 30),
-    ]);
-
-    it('states every dimension of the table and one cell per combination', () => {
-        expect(report.dimensions).toEqual({
-            diets: ['none', 'vegetarian', 'vegan', 'pescatarian'],
-            allergens: ['none', 'milk', 'eggs', 'peanuts', 'tree_nuts', 'soy', 'wheat', 'fish', 'shellfish', 'sesame'],
-            slots: ['breakfast', 'lunch', 'dinner', 'snack'],
-            mainSlots: ['breakfast', 'lunch', 'dinner'],
-            timeTiers: [15, 30, 45, 60],
-        });
-        expect(report.eligibleCounts).toHaveLength(4 * 10 * 4 * 4);
-        expect(report.recipeCount).toBe(3);
-        expect(report.crossListedRecipeCount).toBe(1);
+    it('allows a development origin with no flag at all', () => {
+        expect(() => guard(DEVELOPMENT_URL)).not.toThrow();
+        expect(classifyDatabaseOrigin(DEVELOPMENT_URL).originClass).toBe('development');
     });
 
-    it('counts a cell through the production eligibility rule', () => {
-        const countAt = (diet: string, allergen: string, slot: string, timeTier: number): number | undefined =>
-            report.eligibleCounts.find(
-                (cell) =>
-                    cell.diet === diet &&
-                    cell.allergen === allergen &&
-                    cell.slot === slot &&
-                    cell.timeTier === timeTier,
-            )?.count;
+    it('refuses a recognised non-development origin until the operator names it', () => {
+        const refusal = refusalOf(TEST_URL);
 
-        // Both breakfast recipes at the loosest tier; only the 10-minute one at
-        // the tightest; the milk-bearing one disappears when milk is excluded;
-        // and the vegan one is the only breakfast a vegan may plan.
-        expect(countAt('none', 'none', 'breakfast', 60)).toBe(2);
-        expect(countAt('none', 'none', 'breakfast', 15)).toBe(1);
-        expect(countAt('none', 'milk', 'breakfast', 60)).toBe(1);
-        expect(countAt('vegan', 'none', 'breakfast', 60)).toBe(1);
+        expect(refusal.code).toBe('confirmation_required');
+        expect(refusal.origin).toMatchObject({
+            originClass: 'test',
+            host: '127.0.0.1',
+            database: 'soh_test',
+        });
+        // The remedy is in the message, with the name to type.
+        expect(refusal.message).toContain('--confirm-target soh_test');
     });
 
-    it('marks the guaranteed and reduced cells §0.7.3 names, and nothing else', () => {
-        expect(report.guaranteedCells).toHaveLength(140);
-        expect(report.reducedCells).toHaveLength(124);
-        expect(report.guaranteedCells.every((cell) => cell.threshold === 4)).toBe(true);
-        expect(report.reducedCells.every((cell) => cell.threshold === 2)).toBe(true);
+    it('refuses a flag that names a different database than the URL points at', () => {
+        // The operator typed the development database's name while the URL
+        // pointed at the test one — the near miss the flag exists to catch.
+        const refusal = refusalOf(TEST_URL, ['--confirm-target', 'soh_dev']);
 
-        const key = (cell: { diet: string; allergen: string; slot: string; timeTier: number }): string =>
-            `${cell.diet}|${cell.allergen}|${cell.slot}|${cell.timeTier}`;
-        const guaranteed = new Set(report.guaranteedCells.map(key));
-        expect(report.reducedCells.some((cell) => guaranteed.has(key(cell)))).toBe(false);
-
-        expect(report.guaranteedCells[0]).toMatchObject({
-            diet: 'none',
-            allergen: 'none',
-            slot: 'breakfast',
-            timeTier: 45,
-        });
-        expect(report.reducedCells[0]).toMatchObject({
-            diet: 'vegetarian',
-            allergen: 'milk',
-            slot: 'breakfast',
-            timeTier: 45,
-        });
+        expect(refusal.code).toBe('confirmation_mismatch');
+        expect(refusal.message).toContain('soh_dev');
+        expect(refusal.message).toContain('soh_test');
     });
 
-    it('splits each slot into the four strata and records the floors §0.7.3 states', () => {
-        expect(report.slotComposition.breakfast).toEqual({
-            dedicatedToSlot: 1,
-            totalEligible: 2,
-            composition: {
-                vegan: { floor: 4, count: 1 },
-                furtherVegetarian: { floor: 3, count: 1 },
-                furtherPescatarian: { floor: 2, count: 0 },
-                furtherOmnivore: { floor: 3, count: 0 },
-            },
-        });
-        // A floor of null is "§0.7.3 states none", which is not a floor of zero.
-        expect(report.slotComposition.snack.composition.furtherPescatarian.floor).toBeNull();
+    it('allows the same origin once the flag names it exactly', () => {
+        expect(() => guard(TEST_URL, ['--confirm-target', 'soh_test'])).not.toThrow();
+        expect(() => guard(TEST_URL, ['--confirm-target=soh_test'])).not.toThrow();
     });
 
-    it('carries the self-describing members the committed artefact is reviewed with', () => {
-        expect(report.schemaVersion).toBe(1);
-        expect(report.eligibilityRule.mirrors).toBe('src/services/recipe.logic.ts::isEligibleForPlanning');
-        expect(report.repeatRule).toMatchObject({
-            maxUsesPerWeek: 2,
-            consecutiveDaysAllowed: false,
-            minEligiblePerSlotForFullWeek: 4,
+    // There is no door for an origin the guard cannot classify: the flag
+    // confirms WHICH recognised database, never that an unknown one is safe.
+    it('refuses an unrecognised origin even when the flag names it correctly', () => {
+        const refusal = refusalOf(REMOTE_URL, ['--confirm-target', 'soh_production']);
+
+        expect(refusal.code).toBe('unrecognised_origin');
+        expect(refusal.origin.originClass).toBe('unknown');
+    });
+
+    it('reports the classification it accepted and never the connection string', () => {
+        const captured: CapturedLine[] = [];
+
+        guard(TEST_URL, ['--confirm-target', 'soh_test'], capturingLogger(captured));
+
+        const accepted = captured.filter((entry) => entry.entry.event === 'database_origin_accepted');
+        expect(accepted).toHaveLength(1);
+        expect(accepted[0].entry).toMatchObject({
+            script: SCRIPT,
+            policy: 'development_or_confirmed',
+            originClass: 'test',
+            host: '127.0.0.1',
+            database: 'soh_test',
         });
-        expect(report.boundary).toContain('supported at runtime but not guaranteed');
-        expect(report.boundary).toContain('no_matching_meals');
-        expect(report.boundary).toContain('editStep');
+
+        // The classification, never the URL it came from: the scheme, the user
+        // and the password are each absent from every line the guard emitted.
+        for (const entry of captured) {
+            expect(entry.line).not.toContain('postgresql://');
+            expect(entry.line).not.toContain('seeduser');
+            expect(entry.line).not.toContain('fixture-only');
+        }
+    });
+
+    it('is reached through the injected argv because the module-load guard no-ops under Jest', () => {
+        // dbGuard enforces at import time keyed on `entryScriptName(process.argv)`,
+        // and under Jest argv[1] is the jest binary — which is deliberate and
+        // load-bearing: importing a script for its `run*(deps)` entry point must
+        // never end a test run. The out-of-process proof of the guard that DOES
+        // protect this suite belongs to src/__tests__/setup/testDb.test.ts.
+        expect(entryScriptName(process.argv)).toBeNull();
     });
 });
 

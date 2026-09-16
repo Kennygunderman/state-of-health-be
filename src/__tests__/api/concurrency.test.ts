@@ -1,19 +1,37 @@
 // The write-safety model under real contention (Agent Action Plan §0.5.1 "Plan
 // write-safety model" and §0.9.2's `api/concurrency.test.ts` rows).
 //
-// WHICH LAYER THIS EXERCISES, AND WHY.
+// WHICH LAYER EACH CASE EXERCISES, AND WHY BOTH ARE HERE.
 //
-// The meal-planning HTTP boundary does not exist in this checkout — there is no
-// `src/routes/mealPlanning.routes.ts`, no `src/controllers/mealPlanning.
-// controller.ts`, and `src/app.ts` mounts neither; the plan records that
-// boundary as later work. That is no loss here: the advisory lock, the
+// The hazards themselves live in the SERVICE layer: the advisory lock, the
 // idempotency reservation, the compare-and-swap revision bumps and the
-// transaction that holds them together all live in the SERVICE layer, so this
-// is the layer where the hazards actually exist and where they are provable
-// today. Nothing here fakes or simulates a request layer. When the mount lands,
-// the request-level cases — two concurrent HTTP requests, and the
-// `postCommitAbort` socket seam §0.9.2 describes — are added to THIS file
-// beside the service cases.
+// transaction that holds them together. So every mechanism is proved there,
+// against real PostgreSQL, with an injected `now` that makes the fixture
+// clock-free — that is the first two thirds of this file.
+//
+// The CONTRACT the client is held to is decided one layer up, and the sections
+// that close this file prove it at the HTTP boundary: `mealPlanning.controller.ts` is the
+// only place a `StalePlanError` becomes `409 {error: 'stale_plan',
+// currentRevision}`, and an error class carries no status (Rule
+// backend-architecture §8). A refusal asserted only as a class is a refusal no
+// client has been shown, so the boundary sections assert STATUS, MACHINE CODE
+// and PAYLOAD for every code a race can produce, and race two genuine
+// supertest requests rather than two service calls. They need their own
+// fixture: the controller passes no `now`, so an HTTP request resolves "today"
+// from the real clock and the pinned week the service cases sit on would answer
+// `409 plan_not_active {reason: 'ended'}` — see {@link seedRequestWeek}. Three
+// sections sit there: the races themselves, the real publication stage
+// (`scripts/recipes-seed.ts::runSeed`) beside a real `POST /plans`, and a sweep
+// over a spread of refusals asserting none of them tells a client anything
+// only the server should know.
+//
+// Two seams deliberately stay out of this file. The post-commit abort
+// (`postCommitAbort` + `res.socket.destroy()`) belongs to `api/fault.test.ts`,
+// which owns both injected faults and the module-graph isolation Rule §9's
+// read-once config forces on anything that flips them; and the HTTP parallel
+// same-key LOG double tap belongs to `api/log.test.ts`, which already asserts
+// it (this file asserts the same pair below the controller). Nothing here
+// duplicates either.
 //
 // WHY THIS SUITE NEEDS MORE THAN ONE CLIENT. A lock can only be observed from a
 // session that is not the one holding it, so {@link contendingClient} is a
@@ -65,7 +83,13 @@
 // group, so neither user's recipes are ever eligible for the other.
 
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
+import { loadCoveragePlan } from '../../../scripts/lib/manifest';
+import { runSeed } from '../../../scripts/recipes-seed';
+import type { SeedDeps } from '../../../scripts/recipes-seed';
 import { PrismaClient, catalog_foods } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
 import {
@@ -93,10 +117,13 @@ import {
 import { withMealPlanningTransaction, withUserLock } from '../../services/mealPlanningAction.service';
 import { logPlannedMeal } from '../../services/plannedMealLog.service';
 import { savePreferences } from '../../services/preferences.service';
+import { deriveRecipeVersionFields } from '../../services/recipe.logic';
+import type { RecipePublicationIngredient } from '../../services/recipe.logic';
 import { getRecipeVersionForUser } from '../../services/recipe.service';
 import { SwapDataError, commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
 import { saveTargets } from '../../services/targets.service';
 import {
+    FIXTURE_ENDED_PLAN_START_DAY_KEY,
     FIXTURE_TARGETS,
     FIXTURE_USER_TARGET_COLUMNS,
     FixtureIngredientOptions,
@@ -108,6 +135,7 @@ import {
     makePreferences,
     makeRecipeVersion,
     makeUser,
+    utcTodayDayKey,
 } from '../setup/factories';
 import { asUser, request } from '../setup/testApp';
 import { truncateFeatureTables } from '../setup/testDb';
@@ -301,15 +329,23 @@ const seedWeek = async () => {
  * The plan's grocery rows, written by the real service under the real lock —
  * there is no grocery factory, and building the rows by hand would test a
  * fixture rather than the aggregation a swap has to reconcile against.
+ *
+ * The owner and the clock are parameters because the boundary section's week
+ * belongs to another user and is built around the REAL today; they default to
+ * the fixture week's pair so every existing call site reads as it did.
  */
-const buildGroceries = async (planId: string): Promise<void> => {
+const buildGroceries = async (
+    planId: string,
+    userId: string = USER_ID,
+    now: Date = NOW,
+): Promise<void> => {
     await withMealPlanningTransaction((tx) =>
-        withUserLock(tx, USER_ID, async (locked) =>
+        withUserLock(tx, userId, async (locked) =>
             rebuildPlanGroceries(locked, {
-                userId: USER_ID,
+                userId,
                 planId,
-                meals: await loadPlannedMealsForGroceries(locked, USER_ID, planId),
-                now: NOW,
+                meals: await loadPlannedMealsForGroceries(locked, userId, planId),
+                now,
             }),
         ),
     );
@@ -364,9 +400,9 @@ const generateBody = (startDate: string): Record<string, unknown> => ({
     expectedTargetsRevision: 1,
 });
 
-const storedEntries = () =>
+const storedEntries = (userId: string = USER_ID) =>
     prisma.meal_entries.findMany({
-        where: { user_id: USER_ID },
+        where: { user_id: userId },
         orderBy: [{ logged_at: 'asc' }, { id: 'asc' }],
     });
 
@@ -404,9 +440,9 @@ const readDay = async () => {
  * amount the user last acknowledged. Timestamps are excluded because they are
  * not part of any assertion here.
  */
-const groceryStateOf = async (planId: string) => {
+const groceryStateOf = async (planId: string, userId: string = USER_ID) => {
     const rows = await prisma.grocery_items.findMany({
-        where: { meal_plan_id: planId, user_id: USER_ID },
+        where: { meal_plan_id: planId, user_id: userId },
         orderBy: [{ catalog_food_id: 'asc' }, { food_state: 'asc' }],
     });
 
@@ -563,6 +599,18 @@ const seedPlannableWorld = async () => {
         disliked_food_groups: [WEEK_FOOD_GROUP],
     });
 
+    return seedRecipePool();
+};
+
+/**
+ * The catalog half of the world above, without the user.
+ *
+ * `recipe_versions` and `catalog_foods` are the tenant-less tables §0.5.1
+ * describes, so the pool serves whichever user asks for it — which is what lets
+ * the boundary section seed the same plannable universe for its own two
+ * identities without inheriting the pinned-clock user this one creates.
+ */
+const seedRecipePool = async () => {
     const staple = await poolFood('Concurrency Pool Staple');
     const pool: PoolRecipe[] = [];
 
@@ -2781,9 +2829,18 @@ describe('a recipe publication and a food retirement', () => {
     /**
      * The publication: the standing version is retired, its successor becomes
      * `current`, and `recipes.current_version_id` moves to it — the three writes
-     * §0.7.3 assigns to one transaction, driven here directly because
-     * `scripts/recipes-seed.ts` is a stage stub at this checkpoint and exports
-     * no runnable entry point.
+     * §0.7.3 assigns to one transaction.
+     *
+     * DRIVEN DIRECTLY HERE, AND THROUGH THE STAGE BELOW. These two rows need a
+     * promotion of a NAMED version at a moment they choose — the second one
+     * retires a version the fixture week holds on all seven days, which is what
+     * makes the retired-but-referenced case certain rather than a matter of what
+     * the search picked — and `scripts/recipes-seed.ts` decides for itself which
+     * recipe it promotes, from a corpus on disk. The production stage is raced
+     * against a real generation in "the recipe seed stage promoting a version
+     * while a week is generated" at the end of this file, which is where
+     * `runSeed`'s own transaction boundary is the subject; these two rows are
+     * about what a generation and a published week survive.
      */
     const promoteVersion = async (
         standing: { id: string; recipe_id: string },
@@ -3010,3 +3067,2092 @@ describe('a recipe publication and a food retirement', () => {
         ).toEqual([week.alternative.id, week.secondAlternative.id].sort());
     });
 });
+
+/* ===========================================================================
+ * THE SAME RACES AT THE HTTP BOUNDARY
+ *
+ * Everything above proves the MECHANISM where it lives. This section proves the
+ * CONTRACT where the client meets it: two genuine requests into the shipped app
+ * (`../setup/testApp` drives `src/app.ts` with its real mount order, and it
+ * never calls `listen`), and every refusal asserted as STATUS + MACHINE CODE +
+ * PAYLOAD rather than as an error class. The distinction is not ceremony —
+ * `mealPlanning.controller.ts` is the only place a `StalePlanError` becomes
+ * `409 {error: 'stale_plan', currentRevision}`, and Rule
+ * backend-architecture §8 keeps the class itself status-free, so a class
+ * assertion says nothing about what any client was told.
+ *
+ * WHY THE REQUESTS ARE REALLY CONCURRENT. `--runInBand` serialises SUITES, not
+ * the requests inside a test: each supertest call opens its own socket into the
+ * one in-process app, and `prisma.$transaction` draws its own pooled
+ * connection, so two requests fired together are two PostgreSQL sessions
+ * contending for one advisory lock. Every sender below returns a promise that
+ * has already been dispatched, so `Promise.all([a(), b()])` has both in flight.
+ *
+ * WHY THIS SECTION HAS ITS OWN WEEK. The controller passes no `now`, so every
+ * service defaults it to `new Date()` and an HTTP request resolves "today" from
+ * the real clock. The pinned week the service cases sit on would therefore be
+ * an ENDED plan — `409 plan_not_active {reason: 'ended'}` — and would prove
+ * nothing about a race. {@link seedRequestWeek} builds a current week around
+ * the real today instead, for users of its own.
+ * ========================================================================= */
+
+/** Owns the current week the swap, log, regenerate and grocery cases act on. */
+const REQUEST_PLAN_USER_ID = 'concurrency-suite-request-plan-user';
+
+/** Publishes weeks over HTTP, so it must own no plan of its own. */
+const REQUEST_PLANNING_USER_ID = 'concurrency-suite-request-planning-user';
+
+const PLANS_PATH = '/api/meal-planning/plans';
+const PREFERENCES_PATH = '/api/meal-planning/preferences';
+const TARGETS_PATH = '/api/meal-planning/targets';
+
+/** The untouched, pre-feature writer §0.5.1 calls the one writer outside the lock. */
+const LEGACY_TARGETS_PATH = '/api/user/targets';
+
+const planPath = (planId: string, suffix = ''): string => `${PLANS_PATH}/${planId}${suffix}`;
+
+const mealPath = (planId: string, mealId: string, suffix = ''): string =>
+    planPath(planId, `/meals/${mealId}${suffix}`);
+
+/**
+ * A response reduced to what a contract assertion may read.
+ *
+ * Narrowed deliberately: a case that could reach the headers or the raw text
+ * would be asserting the transport rather than the contract, and `body` is
+ * `Record<string, unknown>` so a missing member is `undefined` rather than a
+ * type error waiting for a cast.
+ */
+interface HttpAnswer {
+    readonly status: number;
+    readonly body: Record<string, unknown>;
+}
+
+/**
+ * Awaits a dispatched request and reduces it.
+ *
+ * Typed against `PromiseLike` rather than supertest's `Test` so the helper
+ * states exactly what it needs; a `Test` satisfies it, and nothing here can
+ * accidentally depend on the rest of that object.
+ */
+const answerOf = async (sent: PromiseLike<{ status: number; body: unknown }>): Promise<HttpAnswer> => {
+    const response = await sent;
+
+    return { status: response.status, body: (response.body ?? {}) as Record<string, unknown> };
+};
+
+/* The senders. Each dispatches immediately, which is what makes a race a race. */
+
+const postGenerate = (userId: string, body: Record<string, unknown>): Promise<HttpAnswer> =>
+    answerOf(asUser(request.post(PLANS_PATH), { uid: userId }).send(body));
+
+const postRegenerate = (
+    userId: string,
+    planId: string,
+    body: Record<string, unknown>,
+): Promise<HttpAnswer> =>
+    answerOf(asUser(request.post(planPath(planId, '/regenerate')), { uid: userId }).send(body));
+
+const postSwap = (
+    userId: string,
+    planId: string,
+    mealId: string,
+    body: Record<string, unknown>,
+): Promise<HttpAnswer> =>
+    answerOf(asUser(request.post(mealPath(planId, mealId, '/swap')), { uid: userId }).send(body));
+
+const postLog = (
+    userId: string,
+    planId: string,
+    mealId: string,
+    body: Record<string, unknown>,
+): Promise<HttpAnswer> =>
+    answerOf(asUser(request.post(mealPath(planId, mealId, '/log')), { uid: userId }).send(body));
+
+const putGroceryItem = (
+    userId: string,
+    planId: string,
+    itemId: string,
+    body: Record<string, unknown>,
+): Promise<HttpAnswer> =>
+    answerOf(asUser(request.put(planPath(planId, `/groceries/${itemId}`)), { uid: userId }).send(body));
+
+const postUncheckAll = (userId: string, planId: string): Promise<HttpAnswer> =>
+    answerOf(asUser(request.post(planPath(planId, '/groceries/uncheck-all')), { uid: userId }).send({}));
+
+const getGroceries = (userId: string, planId: string): Promise<HttpAnswer> =>
+    answerOf(asUser(request.get(planPath(planId, '/groceries')), { uid: userId }));
+
+const getPreview = (
+    userId: string,
+    planId: string,
+    mealId: string,
+    recipeVersionId: string,
+): Promise<HttpAnswer> =>
+    answerOf(
+        asUser(request.get(mealPath(planId, mealId, `/alternatives/${recipeVersionId}/preview`)), {
+            uid: userId,
+        }),
+    );
+
+const putPreferences = (userId: string, body: Record<string, unknown>): Promise<HttpAnswer> =>
+    answerOf(asUser(request.put(PREFERENCES_PATH), { uid: userId }).send(body));
+
+const putTargets = (userId: string, body: Record<string, unknown>): Promise<HttpAnswer> =>
+    answerOf(asUser(request.put(TARGETS_PATH), { uid: userId }).send(body));
+
+const getTargets = (userId: string): Promise<HttpAnswer> =>
+    answerOf(asUser(request.get(TARGETS_PATH), { uid: userId }));
+
+const putLegacyTargets = (userId: string, body: Record<string, unknown>): Promise<HttpAnswer> =>
+    answerOf(asUser(request.put(LEGACY_TARGETS_PATH), { uid: userId }).send(body));
+
+/* Request bodies, with the key minted per call unless a case holds one. */
+
+const requestGenerateBody = (
+    startDate: string,
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+    startDate,
+    idempotencyKey: randomUUID(),
+    expectedPreferencesRevision: 1,
+    expectedTargetsRevision: 1,
+    ...overrides,
+});
+
+const requestRegenerateBody = (
+    expectedPlanRevision: number,
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+    idempotencyKey: randomUUID(),
+    expectedPlanRevision,
+    expectedPreferencesRevision: 1,
+    expectedTargetsRevision: 1,
+    ...overrides,
+});
+
+const requestSwapBody = (
+    recipeVersionId: string,
+    expectedPlanRevision: number,
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+    recipeVersionId,
+    portionMultiplier: 1,
+    expectedPlanRevision,
+    idempotencyKey: randomUUID(),
+    ...overrides,
+});
+
+const requestLogBody = (
+    diaryMealId: string,
+    date: string,
+    expectedPlanRevision: number,
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+    servings: 1,
+    date,
+    diaryMealId,
+    expectedPlanRevision,
+    idempotencyKey: randomUUID(),
+    ...overrides,
+});
+
+/**
+ * The refusal as the client received it, compared STRICTLY: an extra member is
+ * a failure too, because §0.5.2 states each code's payload exactly and a body
+ * carrying more than it promises is how an internal detail reaches a client.
+ */
+const expectRefusal = (answer: HttpAnswer, status: number, body: Record<string, unknown>): void => {
+    expect({ status: answer.status, body: answer.body }).toStrictEqual({ status, body });
+};
+
+/**
+ * A raced set split by what the boundary answered, so a case can assert the
+ * outcome SET — "exactly one accepted, the rest refused with this code" —
+ * without naming which request won.
+ */
+const splitAnswers = (
+    answers: readonly HttpAnswer[],
+    acceptedStatus: number,
+): { accepted: HttpAnswer[]; refused: HttpAnswer[] } => ({
+    accepted: answers.filter((answer) => answer.status === acceptedStatus),
+    refused: answers.filter((answer) => answer.status !== acceptedStatus),
+});
+
+
+/**
+ * The diary bucket a log body names, obtained the way the client obtains it:
+ * `GET /api/macros/:date` self-heals the four buckets for any date, so this
+ * both creates and reads it.
+ */
+const diaryBucketId = async (userId: string, dayKey: string, name = 'Breakfast'): Promise<string> => {
+    const response = await asUser(request.get(`/api/macros/${dayKey}`), { uid: userId }).expect(200);
+    const bucket = (response.body as { meals: { id: string; name: string }[] }).meals.find(
+        (meal) => meal.name === name,
+    );
+
+    if (bucket === undefined) {
+        throw new Error(`GET /api/macros/${dayKey} returned no ${name} bucket for ${userId}`);
+    }
+
+    return bucket.id;
+};
+
+interface RequestWeek {
+    /** Today in UTC, read ONCE, so no two assertions in a case straddle midnight. */
+    readonly today: string;
+    readonly planId: string;
+    readonly breakfastMealId: string;
+    readonly lunchMealId: string;
+    readonly diaryMealId: string;
+    readonly groceryItemId: string;
+    /** The plannable universe both identities draw on; see {@link seedRecipePool}. */
+    readonly pool: readonly PoolRecipe[];
+    readonly staple: catalog_foods;
+}
+
+/**
+ * The boundary section's world: a plannable catalog, one user holding a CURRENT
+ * week with its shopping list, and one user holding nothing.
+ *
+ * TWO IDENTITIES, because the two halves of this section need opposite states —
+ * a generation may not overlap an active week, so the user it publishes for
+ * owns none; a regeneration, a swap, a log and a grocery write all act on an
+ * existing week.
+ *
+ * THE POOL RATHER THAN THE FIXTURE WEEK'S FIVE RECIPES, because every pool
+ * recipe is admissible in all three slots and lands a day on target at ×1: a
+ * swap on the LUNCH slot therefore has candidates, which the week fixture's
+ * breakfast-only alternatives could never supply, and that is what the
+ * different-meals race below needs. Both users dislike the week fixture's food
+ * group for the reason {@link WEEK_FOOD_GROUP} gives — `recipe_versions` has no
+ * owner, so without it `beforeEach`'s week would widen every alternatives list
+ * asserted here.
+ */
+const seedRequestWeek = async (): Promise<RequestWeek> => {
+    const today = utcTodayDayKey();
+    const { pool, staple } = await seedRecipePool();
+
+    for (const userId of [REQUEST_PLAN_USER_ID, REQUEST_PLANNING_USER_ID]) {
+        await makeUser({ id: userId, ...FIXTURE_USER_TARGET_COLUMNS });
+        await makePreferences(userId, {
+            time_zone: 'UTC',
+            disliked_food_groups: [WEEK_FOOD_GROUP],
+        });
+    }
+
+    const plan = await makePlan(REQUEST_PLAN_USER_ID, {
+        today,
+        slots: [
+            { slot: 'breakfast', slot_time: '08:00', recipeVersionId: pool[0].version.id },
+            { slot: 'lunch', slot_time: '12:30', recipeVersionId: pool[1].version.id },
+            { slot: 'dinner', slot_time: '18:30', recipeVersionId: pool[2].version.id },
+        ],
+    });
+
+    const day = plan.meal_plan_days.find((candidate) => dayKeyOf(candidate.date) === today);
+
+    if (day === undefined) {
+        throw new Error(`the request week does not contain today (${today}), so no write could name it`);
+    }
+
+    const breakfast = day.meal_plan_meals.find((meal) => meal.slot === 'breakfast');
+    const lunch = day.meal_plan_meals.find((meal) => meal.slot === 'lunch');
+
+    if (breakfast === undefined || lunch === undefined) {
+        throw new Error('the request week is missing one of the slots its cases act on');
+    }
+
+    // The real service under the real lock, at the real clock this section
+    // runs on — a hand-built row would not be the list a swap reconciles.
+    await buildGroceries(plan.id, REQUEST_PLAN_USER_ID, new Date());
+
+    const groceryItem = await prisma.grocery_items.findFirstOrThrow({
+        where: { meal_plan_id: plan.id, user_id: REQUEST_PLAN_USER_ID },
+        orderBy: { sort_order: 'asc' },
+    });
+
+    return {
+        today,
+        planId: plan.id,
+        breakfastMealId: breakfast.id,
+        lunchMealId: lunch.id,
+        diaryMealId: await diaryBucketId(REQUEST_PLAN_USER_ID, today),
+        groceryItemId: groceryItem.id,
+        pool,
+        staple,
+    };
+};
+
+/**
+ * A candidate the server itself offers for one slot, with the portion it
+ * recomputes — which is what a commit must send back, because the commit binds
+ * the PREVIEWED portion (`swap.logic.ts::requireBoundPortion`).
+ *
+ * Read rather than named: every pool recipe is nutritionally identical, so
+ * which one heads the ranked list is `swap.logic.ts`'s decision and not a
+ * fixture's to assume.
+ */
+const offeredAlternative = async (
+    userId: string,
+    planId: string,
+    mealId: string,
+): Promise<{ recipeVersionId: string; portionMultiplier: number }> => {
+    const [candidate] = await listedAlternatives(userId, planId, mealId);
+
+    if (candidate === undefined) {
+        throw new Error(`meal ${mealId} of plan ${planId} has no alternative to swap to`);
+    }
+
+    return {
+        recipeVersionId: candidate.recipeVersionId,
+        portionMultiplier: candidate.portionMultiplier,
+    };
+};
+
+/** Two distinct candidates for one slot, for the cases that need a losing one. */
+const twoOfferedAlternatives = async (
+    userId: string,
+    planId: string,
+    mealId: string,
+): Promise<{ first: string; second: string }> => {
+    const offers = await listedAlternatives(userId, planId, mealId);
+
+    if (offers.length < 2) {
+        throw new Error(
+            `meal ${mealId} of plan ${planId} offers ${offers.length} alternatives; this case needs two`,
+        );
+    }
+
+    return { first: offers[0].recipeVersionId, second: offers[1].recipeVersionId };
+};
+
+
+/* ---------------------------------------------------------------------------
+ * One key, two requests actually in flight
+ *
+ * The service-level pair above proves the reservation; this proves what the two
+ * CLIENTS were told. §0.5.1 stores the first response's status rather than
+ * inferring it, so the replay carries `201` for a generation, a regeneration
+ * and a log and `200` for a swap, and the two callers must be unable to tell
+ * which of them did the work.
+ *
+ * The LOG pair is not repeated here: `api/log.test.ts` asserts the same double
+ * tap at this boundary, and the service-level pair above covers it below the
+ * controller. Everything else in the four keyed writes is here.
+ * ------------------------------------------------------------------------- */
+
+describe('two parallel requests at the boundary carrying the same idempotency key', () => {
+    /** Both answers identical, by value and as bytes, at the persisted status. */
+    const expectIndistinguishable = (
+        first: HttpAnswer,
+        second: HttpAnswer,
+        status: number,
+    ): void => {
+        expect([first.status, second.status]).toEqual([status, status]);
+        expect(second.body).toEqual(first.body);
+        // §0.9.2's "byte-for-byte": one of the two came out of the `jsonb`
+        // snapshot column and the other from memory, and the two texts agree
+        // because both serialise a canonically ordered value
+        // (`mealPlanningAction.logic.ts::canonicalizeResponseBody`).
+        expect(JSON.stringify(second.body)).toBe(JSON.stringify(first.body));
+    };
+
+    it('publishes one week between them and answers both with the same stored 201', async () => {
+        const fixture = await seedRequestWeek();
+        const body = requestGenerateBody(fixture.today);
+
+        const [first, second] = await Promise.all([
+            postGenerate(REQUEST_PLANNING_USER_ID, body),
+            postGenerate(REQUEST_PLANNING_USER_ID, body),
+        ]);
+
+        expectIndistinguishable(first, second, 201);
+
+        const published = await theOnlyPlanOf(REQUEST_PLANNING_USER_ID);
+
+        expectWholeWeek(published);
+        expect(published.status).toBe(ACTIVE_PLAN);
+        expect(published.revision).toBe(1);
+        expect(dayKeyOf(published.start_date)).toBe(fixture.today);
+        // The column §0.5.1 gives a client for recognising its own committed
+        // generation after a lost response, and the second line of defence the
+        // unique `(user_id, generation_key)` makes of it.
+        expect(published.generation_key).toBe(body.idempotencyKey);
+        expect(
+            (await plansOf(REQUEST_PLANNING_USER_ID)).filter(
+                (plan) => plan.generation_key === body.idempotencyKey,
+            ),
+        ).toHaveLength(1);
+
+        const actions = await ledgerRows(REQUEST_PLANNING_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            action_type: 'generate',
+            idempotency_key: body.idempotencyKey,
+            response_status: 201,
+            plan_revision_after: 1,
+            meal_plan_id: published.id,
+        });
+        await expectOneActivePlanPerStartDate(REQUEST_PLANNING_USER_ID);
+    });
+
+    it('regenerates once between them and answers both with the same stored 201', async () => {
+        const fixture = await seedRequestWeek();
+        const body = requestRegenerateBody(1);
+
+        const [first, second] = await Promise.all([
+            postRegenerate(REQUEST_PLAN_USER_ID, fixture.planId, body),
+            postRegenerate(REQUEST_PLAN_USER_ID, fixture.planId, body),
+        ]);
+
+        expectIndistinguishable(first, second, 201);
+
+        const plans = await plansOf(REQUEST_PLAN_USER_ID);
+        const replacement = plans.filter((plan) => plan.status === ACTIVE_PLAN);
+        const superseded = plans.filter((plan) => plan.status === SUPERSEDED_PLAN);
+
+        // One replacement, not two: the week was rebuilt once however many
+        // requests asked for it.
+        expect(plans).toHaveLength(2);
+        expect(superseded.map((plan) => plan.id)).toEqual([fixture.planId]);
+        expect(replacement[0].replaced_plan_id).toBe(fixture.planId);
+        expect(replacement[0].generation_attempt).toBe(2);
+        expectWholeWeek(replacement[0]);
+        await expectIntactReplacementChains(REQUEST_PLAN_USER_ID);
+        await expectOneActivePlanPerStartDate(REQUEST_PLAN_USER_ID);
+
+        const actions = await ledgerRows(REQUEST_PLAN_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            action_type: 'regenerate',
+            idempotency_key: body.idempotencyKey,
+            response_status: 201,
+            meal_plan_id: replacement[0].id,
+        });
+    });
+
+    it('commits one swap between them and answers both with the same stored 200', async () => {
+        const fixture = await seedRequestWeek();
+        const offer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+        const body = requestSwapBody(offer.recipeVersionId, 1, {
+            portionMultiplier: offer.portionMultiplier,
+        });
+
+        const [first, second] = await Promise.all([
+            postSwap(REQUEST_PLAN_USER_ID, fixture.planId, fixture.breakfastMealId, body),
+            postSwap(REQUEST_PLAN_USER_ID, fixture.planId, fixture.breakfastMealId, body),
+        ]);
+
+        // 200 rather than 201: a swap creates no resource, and §0.5.1 replays
+        // the STORED status rather than one inferred from the action type.
+        expectIndistinguishable(first, second, 200);
+
+        const meal = await mealRow(fixture.breakfastMealId);
+
+        expect(meal.recipe_version_id).toBe(offer.recipeVersionId);
+        expect(meal.revision).toBe(2);
+        expect(await planRevision(fixture.planId)).toBe(2);
+
+        const actions = await ledgerRows(REQUEST_PLAN_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            action_type: 'swap',
+            response_status: 200,
+            plan_revision_after: 2,
+            meal_plan_meal_id: fixture.breakfastMealId,
+        });
+    });
+
+    it('writes one week for four requests fired at once', async () => {
+        const fixture = await seedRequestWeek();
+        const body = requestGenerateBody(fixture.today);
+        const senders = Array.from({ length: 4 }, () => () =>
+            postGenerate(REQUEST_PLANNING_USER_ID, body),
+        );
+
+        // A double tap plus the client's own automatic retry of an unconfirmed
+        // outcome (§0.2.5) is four requests under one key, and the answer must
+        // be one write and four identical responses.
+        const answers = await Promise.all(senders.map((send) => send()));
+
+        expect(answers.map((answer) => answer.status)).toEqual([201, 201, 201, 201]);
+        for (const answer of answers) {
+            expect(answer.body).toEqual(answers[0].body);
+        }
+
+        const published = await theOnlyPlanOf(REQUEST_PLANNING_USER_ID);
+
+        expectWholeWeek(published);
+        expect(published.revision).toBe(1);
+        expect(mealsOf(published)).toHaveLength(PLAN_DAY_COUNT * 3);
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toHaveLength(1);
+    });
+
+    it('refuses the one carrying a different body as idempotency_conflict', async () => {
+        const fixture = await seedRequestWeek();
+        const offers = await twoOfferedAlternatives(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+        const sharedKey = randomUUID();
+        const swapTo = (recipeVersionId: string): Record<string, unknown> =>
+            requestSwapBody(recipeVersionId, 1, { idempotencyKey: sharedKey });
+
+        const answers = await Promise.all([
+            postSwap(REQUEST_PLAN_USER_ID, fixture.planId, fixture.breakfastMealId, swapTo(offers.first)),
+            postSwap(REQUEST_PLAN_USER_ID, fixture.planId, fixture.breakfastMealId, swapTo(offers.second)),
+        ]);
+
+        const { accepted, refused } = splitAnswers(answers, 200);
+
+        // A different request wearing a used key is never a retry, so it is
+        // refused rather than replayed — and the code carries no data, because
+        // there is nothing about the first request this caller may learn.
+        expect(accepted).toHaveLength(1);
+        expect(refused).toHaveLength(1);
+        expectRefusal(refused[0], 409, { error: 'idempotency_conflict' });
+
+        const meal = await mealRow(fixture.breakfastMealId);
+
+        expect([offers.first, offers.second]).toContain(meal.recipe_version_id);
+        expect(meal.revision).toBe(2);
+        expect(await planRevision(fixture.planId)).toBe(2);
+        // The refusal wrote nothing: one ledger row, for the winner.
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toHaveLength(1);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A reservation that rolled back with its transaction
+ *
+ * §0.5.1: a reserved row is PENDING until the write completes, and because the
+ * reservation and the write share one transaction, a pending row is visible to
+ * other sessions only while that transaction is open and disappears with it on
+ * rollback. So a same-key request finds either no row (and proceeds) or a
+ * completed one (and replays) — never a half-written one.
+ *
+ * The refusal that proves it has to be raised INSIDE `work`, after the
+ * reservation: `plan_overlap` is (`requireNonConflictingWeek` runs under the
+ * lock), whereas an injected `MEAL_PLANNING_FAULT` throws in FRONT of the
+ * transaction and never reserves at all — which is why this case needs no
+ * fault, and why `api/fault.test.ts` keeps the flag mechanism Rule §9's
+ * read-once config forces on anything that flips one.
+ * ------------------------------------------------------------------------- */
+
+describe('a reservation rolled back inside its own transaction', () => {
+    it('leaves no trace, so the same key publishes on the next attempt', async () => {
+        const fixture = await seedRequestWeek();
+
+        // A week of the PLANNING user's own, so the generation below overlaps
+        // something and is refused after it has reserved.
+        const conflicting = await makePlan(REQUEST_PLANNING_USER_ID, {
+            today: fixture.today,
+            recipeVersionId: fixture.pool[0].version.id,
+        });
+        const intent = requestGenerateBody(fixture.today);
+
+        const refused = await postGenerate(REQUEST_PLANNING_USER_ID, intent);
+
+        expectRefusal(refused, 409, { error: 'plan_overlap', conflictingPlanId: conflicting.id });
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toEqual([]);
+
+        // The overlap removed. Marked directly because no endpoint retires a
+        // week without publishing a replacement, and what this case turns on is
+        // the KEY rather than how the conflict went away.
+        await prisma.meal_plans.update({
+            where: { id: conflicting.id },
+            data: { status: SUPERSEDED_PLAN },
+        });
+
+        const published = await postGenerate(REQUEST_PLANNING_USER_ID, intent);
+
+        // The same key, accepted: the rolled-back reservation left nothing for
+        // the `ON CONFLICT` to find, so this is a first attempt rather than a
+        // replay or a conflict.
+        expect(published.status).toBe(201);
+
+        const active = (await plansOf(REQUEST_PLANNING_USER_ID)).filter(
+            (plan) => plan.status === ACTIVE_PLAN,
+        );
+
+        expect(active).toHaveLength(1);
+        expectWholeWeek(active[0]);
+        expect(active[0].generation_key).toBe(intent.idempotencyKey);
+
+        const actions = await ledgerRows(REQUEST_PLANNING_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            idempotency_key: intent.idempotencyKey,
+            response_status: 201,
+            meal_plan_id: active[0].id,
+        });
+    });
+});
+
+
+/* ---------------------------------------------------------------------------
+ * Two generations at the boundary
+ *
+ * The partial unique index `unique_active_meal_plan_start_date` is a BACKSTOP
+ * (§0.5.1): the advisory lock plus `requireNonConflictingWeek` are the
+ * mechanism, so the user-visible answer must be the explicit machine code and
+ * never a unique-violation message. `expectRefusal` compares the whole body
+ * strictly, which is what makes "no constraint name reached the client" an
+ * assertion rather than a hope (Rule §4).
+ * ------------------------------------------------------------------------- */
+
+describe('two generations raced at the boundary', () => {
+    it('refuses the loser as plan_overlap, naming the week that published', async () => {
+        const fixture = await seedRequestWeek();
+        const secondWeek = addDaysToDayKey(fixture.today, 1);
+
+        const answers = await Promise.all([
+            postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today)),
+            postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(secondWeek)),
+        ]);
+
+        const { accepted, refused } = splitAnswers(answers, 201);
+        const published = await theOnlyPlanOf(REQUEST_PLANNING_USER_ID);
+
+        // Which start date survives is timing and is deliberately not
+        // asserted; that exactly one did, whole, and that the other caller was
+        // told which plan it collided with, is the contract.
+        expect(accepted).toHaveLength(1);
+        expect([fixture.today, secondWeek]).toContain(dayKeyOf(published.start_date));
+        expectWholeWeek(published);
+        expectRefusal(refused[0], 409, { error: 'plan_overlap', conflictingPlanId: published.id });
+
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toHaveLength(1);
+        await expectOneActivePlanPerStartDate(REQUEST_PLANNING_USER_ID);
+    });
+
+    it('refuses a second generation for the very same week the same way', async () => {
+        const fixture = await seedRequestWeek();
+        const body = requestGenerateBody(fixture.today);
+
+        expect((await postGenerate(REQUEST_PLANNING_USER_ID, body)).status).toBe(201);
+
+        const published = await theOnlyPlanOf(REQUEST_PLANNING_USER_ID);
+
+        // A DIFFERENT key, so this is a second intent rather than a retry — a
+        // shared key would be answered by the ledger and no conflict would ever
+        // be reached. Identical start dates are the case the partial unique
+        // index would catch, and the point is that it never has to: the answer
+        // is the same explicit code as any other overlap.
+        expectRefusal(await postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today)), 409, {
+            error: 'plan_overlap',
+            conflictingPlanId: published.id,
+        });
+
+        expect(await plansOf(REQUEST_PLANNING_USER_ID)).toHaveLength(1);
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toHaveLength(1);
+        await expectOneActivePlanPerStartDate(REQUEST_PLANNING_USER_ID);
+    });
+
+    it('refuses a second upcoming week as upcoming_exists and leaves the first standing', async () => {
+        const fixture = await seedRequestWeek();
+
+        // A current week of this user's own, so the week after it is UPCOMING
+        // rather than current.
+        const current = await makePlan(REQUEST_PLANNING_USER_ID, {
+            today: fixture.today,
+            recipeVersionId: fixture.pool[0].version.id,
+        });
+
+        const first = await postGenerate(
+            REQUEST_PLANNING_USER_ID,
+            requestGenerateBody(addDaysToDayKey(fixture.today, 7)),
+        );
+
+        expect(first.status).toBe(201);
+
+        const upcoming = (await plansOf(REQUEST_PLANNING_USER_ID)).find(
+            (plan) => plan.id !== current.id,
+        );
+
+        if (upcoming === undefined) {
+            throw new Error('the first upcoming week was not published');
+        }
+
+        // A free week beyond it, overlapping nothing, so the only rule left to
+        // refuse it is the at-most-one-upcoming rule — and no id travels with
+        // that code: §0.5.2 has the client reach the standing plan through the
+        // current-plan response instead.
+        expectRefusal(
+            await postGenerate(
+                REQUEST_PLANNING_USER_ID,
+                requestGenerateBody(addDaysToDayKey(fixture.today, 14)),
+            ),
+            409,
+            { error: 'upcoming_exists' },
+        );
+
+        const plans = await plansOf(REQUEST_PLANNING_USER_ID);
+
+        expect(plans.map((plan) => plan.id)).toEqual([current.id, upcoming.id]);
+        expect(plans.map((plan) => plan.revision)).toEqual([1, 1]);
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toHaveLength(1);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A generation pinning inputs that have already moved
+ *
+ * The two revisions a generation pins are re-read twice — once unlocked before
+ * the five-second search, and once under the per-user lock AND the owning user
+ * row's lock inside the publication transaction (`requirePinnedInputs`). Either
+ * one moving is `409 stale_revision` carrying BOTH counters, so the client can
+ * re-prepare from values it has rather than guessing which half moved.
+ * ------------------------------------------------------------------------- */
+
+describe('a generation pinning inputs that have moved', () => {
+    it('refuses a stale preferences revision and publishes nothing', async () => {
+        const fixture = await seedRequestWeek();
+
+        const saved = await putPreferences(REQUEST_PLANNING_USER_ID, {
+            cookingTimeLimitMin: 45,
+            timeZone: 'UTC',
+            expectedRevision: 1,
+        });
+
+        expect(saved.status).toBe(200);
+
+        // The body still pins revision 1, which the save has just advanced.
+        expectRefusal(
+            await postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today)),
+            409,
+            { error: 'stale_revision', preferencesRevision: 2, targetsRevision: 1 },
+        );
+
+        expect(await plansOf(REQUEST_PLANNING_USER_ID)).toEqual([]);
+        // Refused by the unlocked preflight, in front of the search and in
+        // front of the ledger, so there is nothing to roll back.
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toEqual([]);
+    });
+
+    it('refuses a stale targets revision and publishes nothing', async () => {
+        const fixture = await seedRequestWeek();
+
+        const saved = await putTargets(REQUEST_PLANNING_USER_ID, {
+            source: 'manual',
+            calories: FIXTURE_TARGETS.calories,
+            protein: FIXTURE_TARGETS.protein,
+            carbs: FIXTURE_TARGETS.carbs,
+            fat: FIXTURE_TARGETS.fat,
+            expectedTargetsRevision: 1,
+        });
+
+        expect(saved.status).toBe(200);
+
+        // The same four numbers, confirmed again: the VALUES are unchanged and
+        // the request is still refused, because what a generation pins is the
+        // revision the user confirmed at, not the numbers it happens to see.
+        expectRefusal(
+            await postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today)),
+            409,
+            { error: 'stale_revision', preferencesRevision: 1, targetsRevision: 2 },
+        );
+
+        expect(await plansOf(REQUEST_PLANNING_USER_ID)).toEqual([]);
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toEqual([]);
+    });
+});
+
+
+/* ---------------------------------------------------------------------------
+ * Two swaps on two different meals of one week
+ *
+ * The lock SERIALISES rather than rejects, and the compare-and-swap that then
+ * decides the outcome is the PLAN's (`meal_plans.revision`), not the meal's —
+ * §0.5.1 requires `expectedPlanRevision` on every swap, and `swap.service.ts`
+ * compares it before touching the meal. So the two orderings answer
+ * differently, and both answers are the contract:
+ *
+ *   DRIVEN IN TURN, each pinning the revision the previous commit returned,
+ *   both commit and the counter advances twice.
+ *
+ *   RACED, both pinning the same revision, exactly one commits and the other
+ *   is `409 stale_plan` — a swap on the breakfast slot really does invalidate a
+ *   pinned revision for the lunch slot, which is the property a client's
+ *   refetch-then-retry exists for.
+ * ------------------------------------------------------------------------- */
+
+describe('two swaps on two different meals of one week', () => {
+    it('commits both when each pins the revision the previous one returned', async () => {
+        const fixture = await seedRequestWeek();
+        const breakfastOffer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+
+        const firstSwap = await postSwap(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+            requestSwapBody(breakfastOffer.recipeVersionId, 1, {
+                portionMultiplier: breakfastOffer.portionMultiplier,
+            }),
+        );
+
+        expect(firstSwap.status).toBe(200);
+        expect(firstSwap.body.planRevision).toBe(2);
+
+        // The lunch candidate is read AFTER the breakfast swap, so the portion
+        // it carries is the one the server recomputes against the day as it now
+        // stands — which is what the commit binds.
+        const lunchOffer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.lunchMealId,
+        );
+        const secondSwap = await postSwap(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.lunchMealId,
+            requestSwapBody(lunchOffer.recipeVersionId, 2, {
+                portionMultiplier: lunchOffer.portionMultiplier,
+            }),
+        );
+
+        expect(secondSwap.status).toBe(200);
+        expect(secondSwap.body.planRevision).toBe(3);
+
+        const breakfast = await mealRow(fixture.breakfastMealId);
+        const lunch = await mealRow(fixture.lunchMealId);
+
+        // Both meals moved, each carrying its own revision bump, and the plan's
+        // counter advanced exactly twice.
+        expect(breakfast.recipe_version_id).toBe(breakfastOffer.recipeVersionId);
+        expect(lunch.recipe_version_id).toBe(lunchOffer.recipeVersionId);
+        expect([breakfast.revision, lunch.revision]).toEqual([2, 2]);
+        expect(await planRevision(fixture.planId)).toBe(3);
+
+        const actions = await ledgerRows(REQUEST_PLAN_USER_ID);
+
+        expect(actions.map((action) => action.action_type)).toEqual(['swap', 'swap']);
+        expect(actions.map((action) => action.plan_revision_after)).toEqual([2, 3]);
+        expect(actions.map((action) => action.meal_plan_meal_id)).toEqual([
+            fixture.breakfastMealId,
+            fixture.lunchMealId,
+        ]);
+    });
+
+    it('lets exactly one commit when both are raced against the same revision', async () => {
+        const fixture = await seedRequestWeek();
+        const breakfastOffer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+        const lunchOffer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.lunchMealId,
+        );
+
+        const answers = await Promise.all([
+            postSwap(
+                REQUEST_PLAN_USER_ID,
+                fixture.planId,
+                fixture.breakfastMealId,
+                requestSwapBody(breakfastOffer.recipeVersionId, 1, {
+                    portionMultiplier: breakfastOffer.portionMultiplier,
+                }),
+            ),
+            postSwap(
+                REQUEST_PLAN_USER_ID,
+                fixture.planId,
+                fixture.lunchMealId,
+                requestSwapBody(lunchOffer.recipeVersionId, 1, {
+                    portionMultiplier: lunchOffer.portionMultiplier,
+                }),
+            ),
+        ]);
+
+        const { accepted, refused } = splitAnswers(answers, 200);
+
+        expect(accepted).toHaveLength(1);
+        // The loser is told the revision it must re-pin, which is what makes
+        // the client's retry a single round trip rather than a poll.
+        expectRefusal(refused[0], 409, { error: 'stale_plan', currentRevision: 2 });
+
+        const breakfast = await mealRow(fixture.breakfastMealId);
+        const lunch = await mealRow(fixture.lunchMealId);
+        const moved = [breakfast, lunch].filter((meal) => meal.revision === 2);
+
+        // Exactly one slot moved, and the other is untouched — not merely
+        // unbumped: its recipe is still the one the week was published with.
+        expect(moved).toHaveLength(1);
+        expect(await planRevision(fixture.planId)).toBe(2);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toHaveLength(1);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A week no write may reach any more
+ *
+ * §0.5.1 gives the refusal TWO payloads, and they are not interchangeable: a
+ * superseded week names its replacement so a stale screen can follow it, while
+ * an ended week — still stored `active`, its last date simply passed — carries
+ * `reason: 'ended'` because there is nothing to follow. Both shapes are
+ * asserted here for all five write paths, because a single missing branch
+ * would leave one client stranded.
+ * ------------------------------------------------------------------------- */
+
+describe('a week no write may reach', () => {
+    /** The five write paths §0.5.1 names, each against one plan and one meal. */
+    const refusedWrites = async (
+        plan: { id: string; mealId: string; groceryItemId: string; dayKey: string },
+        recipeVersionId: string,
+    ): Promise<HttpAnswer[]> => {
+        const diaryMealId = await diaryBucketId(REQUEST_PLAN_USER_ID, plan.dayKey);
+
+        return Promise.all([
+            postSwap(
+                REQUEST_PLAN_USER_ID,
+                plan.id,
+                plan.mealId,
+                requestSwapBody(recipeVersionId, 1),
+            ),
+            postLog(
+                REQUEST_PLAN_USER_ID,
+                plan.id,
+                plan.mealId,
+                requestLogBody(diaryMealId, plan.dayKey, 1),
+            ),
+            postRegenerate(REQUEST_PLAN_USER_ID, plan.id, requestRegenerateBody(1)),
+            putGroceryItem(REQUEST_PLAN_USER_ID, plan.id, plan.groceryItemId, { isChecked: true }),
+            postUncheckAll(REQUEST_PLAN_USER_ID, plan.id),
+        ]);
+    };
+
+    /** A two-day week for one slot, with its shopping list, at a stated start. */
+    const seedWeekAt = async (
+        startDate: string,
+        recipeVersionId: string,
+        overrides: Record<string, unknown> = {},
+    ) => {
+        const plan = await makePlan(REQUEST_PLAN_USER_ID, {
+            startDate,
+            dayCount: 2,
+            slots: [{ slot: 'breakfast', slot_time: '08:00', recipeVersionId }],
+            ...overrides,
+        });
+
+        await buildGroceries(plan.id, REQUEST_PLAN_USER_ID, new Date());
+
+        const groceryItem = await prisma.grocery_items.findFirstOrThrow({
+            where: { meal_plan_id: plan.id, user_id: REQUEST_PLAN_USER_ID },
+        });
+
+        return {
+            id: plan.id,
+            mealId: plan.meal_plan_days[0].meal_plan_meals[0].id,
+            groceryItemId: groceryItem.id,
+            dayKey: dayKeyOf(plan.meal_plan_days[0].date),
+        };
+    };
+
+    it('refuses all five writes against an ended week with reason ended', async () => {
+        const fixture = await seedRequestWeek();
+        const ended = await seedWeekAt(
+            FIXTURE_ENDED_PLAN_START_DAY_KEY,
+            fixture.pool[0].version.id,
+        );
+        const entriesBefore = await storedEntries(REQUEST_PLAN_USER_ID);
+
+        for (const answer of await refusedWrites(ended, fixture.pool[4].version.id)) {
+            // No replacement id: nothing replaced this week, and inventing one
+            // would send the client after a plan that does not exist.
+            expectRefusal(answer, 409, { error: 'plan_not_active', reason: 'ended' });
+        }
+
+        // Stored `active`, and still refused: the verdict is the date, not the
+        // status column (§0.5.1's "ended for every rule").
+        const stored = await prisma.meal_plans.findUniqueOrThrow({ where: { id: ended.id } });
+
+        expect(stored.status).toBe(ACTIVE_PLAN);
+        expect(stored.revision).toBe(1);
+        expect(await storedEntries(REQUEST_PLAN_USER_ID)).toEqual(entriesBefore);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toEqual([]);
+        expect(
+            await prisma.grocery_items.count({ where: { meal_plan_id: ended.id, is_checked: true } }),
+        ).toBe(0);
+        // And the user's current week — the one these writes did not name — is
+        // exactly as it was.
+        expect(await planRevision(fixture.planId)).toBe(1);
+    });
+
+    it('refuses all five writes against a superseded week, naming its replacement', async () => {
+        const fixture = await seedRequestWeek();
+        const successorWeek = addDaysToDayKey(fixture.today, 13);
+        const superseded = await seedWeekAt(successorWeek, fixture.pool[0].version.id, {
+            status: SUPERSEDED_PLAN,
+        });
+        const replacement = await makePlan(REQUEST_PLAN_USER_ID, {
+            startDate: successorWeek,
+            dayCount: 2,
+            replaced_plan_id: superseded.id,
+            slots: [{ slot: 'breakfast', slot_time: '08:00', recipeVersionId: fixture.pool[1].version.id }],
+        });
+
+        for (const answer of await refusedWrites(superseded, fixture.pool[4].version.id)) {
+            expectRefusal(answer, 409, {
+                error: 'plan_not_active',
+                replacementPlanId: replacement.id,
+            });
+        }
+
+        expect(await planRevision(superseded.id)).toBe(1);
+        expect(await planRevision(replacement.id)).toBe(1);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toEqual([]);
+        await expectIntactReplacementChains(REQUEST_PLAN_USER_ID);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A replay that arrives after the plan has moved on
+ *
+ * `runKeyedAction` replays BEFORE every revision and status check, and this is
+ * the case that pins that ordering: the key's own body pins a revision two
+ * commits old, so a client whose response was lost would be answered
+ * `409 stale_plan` forever if the checks ran first — retrying something it had
+ * already done.
+ * ------------------------------------------------------------------------- */
+
+describe('a replay that arrives after the plan revision has advanced', () => {
+    it('returns the stored response rather than refusing the revision it pinned', async () => {
+        const fixture = await seedRequestWeek();
+        const breakfastOffer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+        const intent = requestSwapBody(breakfastOffer.recipeVersionId, 1, {
+            portionMultiplier: breakfastOffer.portionMultiplier,
+        });
+
+        const committed = await postSwap(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+            intent,
+        );
+
+        expect(committed.status).toBe(200);
+
+        // A second, unrelated commit moves the plan under the first client.
+        const lunchOffer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.lunchMealId,
+        );
+
+        expect(
+            (
+                await postSwap(
+                    REQUEST_PLAN_USER_ID,
+                    fixture.planId,
+                    fixture.lunchMealId,
+                    requestSwapBody(lunchOffer.recipeVersionId, 2, {
+                        portionMultiplier: lunchOffer.portionMultiplier,
+                    }),
+                )
+            ).status,
+        ).toBe(200);
+        expect(await planRevision(fixture.planId)).toBe(3);
+
+        const replayed = await postSwap(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+            intent,
+        );
+
+        // The stored answer, verbatim — including the revision it carried when
+        // it was first written, which is now two behind the plan.
+        expect(replayed.status).toBe(200);
+        expect(replayed.body).toEqual(committed.body);
+        expect(replayed.body.planRevision).toBe(2);
+
+        // And nothing happened a third time.
+        expect(await planRevision(fixture.planId)).toBe(3);
+        expect((await mealRow(fixture.breakfastMealId)).revision).toBe(2);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toHaveLength(2);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A commit whose portion the server does not recompute
+ *
+ * The discriminating pair — targets moved so the portion changes, versus
+ * targets moved so it does not — is proved against the service above, where
+ * the recomputation is visible. What this adds is the answer the client
+ * receives, and the assurance that the refusal cost nothing:
+ * `requireBoundPortion` fails closed for ANY value that is not the recomputed
+ * portion, and it runs inside `work` after the reservation, so the reservation
+ * must roll back with it.
+ * ------------------------------------------------------------------------- */
+
+describe('a commit whose portion the server does not recompute', () => {
+    it('refuses it as preview_stale and writes nothing at all', async () => {
+        const fixture = await seedRequestWeek();
+        const offer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+        const preview = await getPreview(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+            offer.recipeVersionId,
+        );
+
+        expect(preview.status).toBe(200);
+        expect(preview.body.planRevision).toBe(1);
+
+        const groceriesBefore = await groceryStateOf(fixture.planId, REQUEST_PLAN_USER_ID);
+        const unrecomputed = offer.portionMultiplier === 1 ? 1.5 : 1;
+
+        // An admissible multiplier (§0.7.3's set) that is simply not the one
+        // the server recomputes for this day — the shape a stale preview takes.
+        expectRefusal(
+            await postSwap(
+                REQUEST_PLAN_USER_ID,
+                fixture.planId,
+                fixture.breakfastMealId,
+                requestSwapBody(offer.recipeVersionId, 1, { portionMultiplier: unrecomputed }),
+            ),
+            409,
+            { error: 'preview_stale' },
+        );
+
+        const meal = await mealRow(fixture.breakfastMealId);
+
+        expect(meal.recipe_version_id).toBe(fixture.pool[0].version.id);
+        expect(meal.revision).toBe(1);
+        expect(meal.previous_recipe_version_id).toBeNull();
+        expect(await planRevision(fixture.planId)).toBe(1);
+        expect(await groceryStateOf(fixture.planId, REQUEST_PLAN_USER_ID)).toEqual(groceriesBefore);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toEqual([]);
+    });
+});
+
+
+/* ---------------------------------------------------------------------------
+ * The legacy target writer beside a generation
+ *
+ * `PUT /api/user/targets` is shipped API surface and stays untouched (§0.1.3),
+ * which makes it the one writer that reaches `users.target_*` WITHOUT taking
+ * the per-user advisory lock. Generation therefore re-reads those four columns
+ * inside its transaction and compares them with
+ * `meal_plan_preferences.confirmed_targets`; a mismatch is
+ * `409 targets_unconfirmed`, and that check is the only thing standing between
+ * a user and a week built on numbers nobody confirmed.
+ *
+ * Both orderings are driven, and then raced — and the raced case asserts an
+ * INVARIANT rather than a winner, because which side lands first is timing.
+ * ------------------------------------------------------------------------- */
+
+describe('the legacy target writer beside a generation', () => {
+    /** Four numbers that are not the confirmed ones, so a mismatch is visible. */
+    const LEGACY_TARGETS = { calories: 2400, protein: 170, carbs: 230, fat: 80 } as const;
+
+    /** `targets_snapshot` as the four wire values a plan stores. */
+    const snapshotOf = (plan: { targets_snapshot: unknown }): unknown => plan.targets_snapshot;
+
+    const confirmedTargetsOf = async (userId: string): Promise<unknown> =>
+        (
+            await prisma.meal_plan_preferences.findUniqueOrThrow({
+                where: { user_id: userId },
+                select: { confirmed_targets: true },
+            })
+        ).confirmed_targets;
+
+    it('refuses a generation whose targets the legacy writer has moved', async () => {
+        const fixture = await seedRequestWeek();
+
+        const legacy = await putLegacyTargets(REQUEST_PLANNING_USER_ID, LEGACY_TARGETS);
+
+        // The legacy route is untouched, so it answers exactly as it always
+        // has: the four columns it just wrote.
+        expect(legacy.status).toBe(200);
+        expect(legacy.body).toEqual(LEGACY_TARGETS);
+
+        // No id, no numbers: the client is told the targets are unconfirmed and
+        // sends the user to review them (§0.5.2).
+        expectRefusal(
+            await postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today)),
+            409,
+            { error: 'targets_unconfirmed' },
+        );
+
+        expect(await plansOf(REQUEST_PLANNING_USER_ID)).toEqual([]);
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toEqual([]);
+
+        // And the canonical read says why, without anything having been
+        // cleared: the values are complete, they simply were not confirmed here.
+        const read = await getTargets(REQUEST_PLANNING_USER_ID);
+
+        expect(read.status).toBe(200);
+        expect(read.body).toMatchObject({ source: 'legacy', complete: true, revision: 1 });
+        expect(read.body.targets).toEqual(LEGACY_TARGETS);
+    });
+
+    it('keeps the snapshot it committed when the legacy write lands after it', async () => {
+        const fixture = await seedRequestWeek();
+
+        expect(
+            (await postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today))).status,
+        ).toBe(201);
+
+        const published = await theOnlyPlanOf(REQUEST_PLANNING_USER_ID);
+        const confirmed = await confirmedTargetsOf(REQUEST_PLANNING_USER_ID);
+
+        expect(snapshotOf(published)).toEqual(confirmed);
+        expect(snapshotOf(published)).toEqual({ ...FIXTURE_TARGETS });
+
+        expect((await putLegacyTargets(REQUEST_PLANNING_USER_ID, LEGACY_TARGETS)).status).toBe(200);
+
+        // The week is history and stays as it was published: the snapshot is
+        // the plan's own record of what it was built from, not a view of the
+        // current columns.
+        const afterLegacyWrite = await prisma.meal_plans.findUniqueOrThrow({
+            where: { id: published.id },
+        });
+
+        expect(snapshotOf(afterLegacyWrite)).toEqual(snapshotOf(published));
+        expect(afterLegacyWrite.revision).toBe(1);
+        expect(await confirmedTargetsOf(REQUEST_PLANNING_USER_ID)).toEqual(confirmed);
+        expect((await getTargets(REQUEST_PLANNING_USER_ID)).body).toMatchObject({ source: 'legacy' });
+    });
+
+    it('never publishes a week built on unconfirmed numbers when the two are raced', async () => {
+        const fixture = await seedRequestWeek();
+
+        const [legacy, generation] = await Promise.all([
+            putLegacyTargets(REQUEST_PLANNING_USER_ID, LEGACY_TARGETS),
+            postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today)),
+        ]);
+
+        // The legacy writer takes no lock and pins no revision, so it cannot
+        // lose; the only question is which side of it the generation read.
+        expect(legacy.status).toBe(200);
+        expect([201, 409]).toContain(generation.status);
+
+        const plans = await plansOf(REQUEST_PLANNING_USER_ID);
+
+        if (generation.status === 409) {
+            expectRefusal(generation, 409, { error: 'targets_unconfirmed' });
+            expect(plans).toEqual([]);
+            expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toEqual([]);
+
+            return;
+        }
+
+        // THE INVARIANT, and the reason the locked re-read exists: a week that
+        // did publish was built on the values `confirmed_targets` held at its
+        // commit — never on the four the legacy writer put there.
+        expect(plans).toHaveLength(1);
+        expectWholeWeek(plans[0]);
+        expect(snapshotOf(plans[0])).toEqual({ ...FIXTURE_TARGETS });
+        expect(snapshotOf(plans[0])).not.toEqual(LEGACY_TARGETS);
+        expect(await confirmedTargetsOf(REQUEST_PLANNING_USER_ID)).toEqual({ ...FIXTURE_TARGETS });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Two clients saving the same revisioned state, at the boundary
+ *
+ * A REVISIONED SAVE IS NOT A KEYED WRITE, and the distinction is the point of
+ * this describe. `preferences.service.ts` and `targets.service.ts` take
+ * `withUserLock` ALONE — no `meal_plan_actions` reservation, no idempotency key
+ * in the request — so their conflict signal is the revision comparison and
+ * nothing else. Asserting a ledger row for either would be asserting a
+ * mechanism they deliberately do not use, so each case asserts the ABSENCE of
+ * one instead.
+ * ------------------------------------------------------------------------- */
+
+describe('two clients saving the same revisioned state at the boundary', () => {
+    it('lets exactly one preference save win and refuses the other as stale', async () => {
+        await seedRequestWeek();
+
+        const save = (cookingTimeLimitMin: number): Promise<HttpAnswer> =>
+            putPreferences(REQUEST_PLAN_USER_ID, {
+                cookingTimeLimitMin,
+                timeZone: 'UTC',
+                expectedRevision: 1,
+            });
+
+        const answers = await Promise.all([save(15), save(45)]);
+        const { accepted, refused } = splitAnswers(answers, 200);
+
+        expect(accepted).toHaveLength(1);
+        expectRefusal(refused[0], 409, { error: 'stale_revision', currentRevision: 2 });
+
+        const stored = await prisma.meal_plan_preferences.findUniqueOrThrow({
+            where: { user_id: REQUEST_PLAN_USER_ID },
+            select: { revision: true, cooking_time_limit_min: true },
+        });
+        const winner = accepted[0].body.preferences as { cookingTimeLimitMin: number };
+
+        // One update landed, and the stored value is the winner's rather than a
+        // blend of the two drafts.
+        expect(stored.revision).toBe(2);
+        expect([15, 45]).toContain(stored.cooking_time_limit_min);
+        expect(winner.cookingTimeLimitMin).toBe(stored.cooking_time_limit_min);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toEqual([]);
+    });
+
+    it('lets exactly one target save win and refuses the other as stale', async () => {
+        await seedRequestWeek();
+
+        const save = (calories: number): Promise<HttpAnswer> =>
+            putTargets(REQUEST_PLAN_USER_ID, {
+                source: 'manual',
+                calories,
+                protein: FIXTURE_TARGETS.protein,
+                carbs: FIXTURE_TARGETS.carbs,
+                fat: FIXTURE_TARGETS.fat,
+                expectedTargetsRevision: 1,
+            });
+
+        const answers = await Promise.all([save(1900), save(2300)]);
+        const { accepted, refused } = splitAnswers(answers, 200);
+
+        expect(accepted).toHaveLength(1);
+        // A DIFFERENT code from the preference save's, because the two counters
+        // are different: `targets_revision` moves on a target save alone.
+        expectRefusal(refused[0], 409, { error: 'stale_targets', currentRevision: 2 });
+
+        const preferences = await prisma.meal_plan_preferences.findUniqueOrThrow({
+            where: { user_id: REQUEST_PLAN_USER_ID },
+            select: { targets_revision: true, confirmed_targets: true, target_source: true },
+        });
+        const user = await prisma.users.findUniqueOrThrow({
+            where: { id: REQUEST_PLAN_USER_ID },
+            select: { target_calories: true },
+        });
+
+        expect(preferences.targets_revision).toBe(2);
+        expect(preferences.target_source).toBe('manual');
+        expect([1900, 2300]).toContain(user.target_calories);
+        // The two halves of the write agree, so no client can be shown a
+        // confirmed target the `users` row does not hold.
+        expect((preferences.confirmed_targets as { calories: number }).calories).toBe(
+            user.target_calories,
+        );
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toEqual([]);
+    });
+});
+
+
+/* ---------------------------------------------------------------------------
+ * The real publication stage, beside a real generation request
+ * ------------------------------------------------------------------------- */
+
+/**
+ * WHY THIS BLOCK EXISTS BESIDE THE PROMOTION RACE ABOVE. The earlier race drives
+ * the three promotion writes directly, which is enough to prove what a
+ * generation must survive; this one drives `scripts/recipes-seed.ts::runSeed` —
+ * the stage an operator actually runs, and the entry point §0.9.2 names ("seed
+ * and load driven through their exported `run*(deps)` entry points"). What the
+ * real stage adds is the transaction boundary IT chooses rather than the one a
+ * fixture would: `publishRecipe` decides the promotion, retires the standing
+ * version, inserts the successor WITH its ingredient rows and moves
+ * `recipes.current_version_id`, all inside one transaction that takes NO
+ * advisory lock, because `recipes` and `catalog_foods` are the tenant-less
+ * reference tables §0.5.1 describes. A generation running beside it therefore
+ * contends with a writer its own lock cannot exclude, and this case is the proof
+ * the week still comes out whole.
+ *
+ * WHY THE FOOD RETIREMENT IS NOT DRIVEN THROUGH `catalog-load.ts`. That stage
+ * retires a food only as the DIFFERENCE BETWEEN TWO SUCCESSIVE RELEASES — two
+ * directories, each with a manifest, five JSONL members and a digest per member
+ * — and `src/__tests__/scripts/catalog-load.test.ts` already owns exactly that
+ * scenario (a v1 → v2 upgrade retiring a food a newer release no longer
+ * contains, with search and `/catalog/status` asserted against v2's manifest).
+ * Reproducing its release-writing fixture here would duplicate that suite to
+ * reach the one column this suite cares about, so the race above flips
+ * `publication_status` directly — the state a load leaves behind — and this
+ * block races the promotion, which no other suite races.
+ *
+ * WHY THE CORPUS IS SYNTHETIC AND TEMPORARY. The committed corpus is 42 recipes
+ * against the committed release, and seeding it is `api/seed-rerun.test.ts`'s
+ * subject; here one payload in an `os.tmpdir()` directory keeps the case a unit
+ * of behaviour and puts the committed corpus and coverage report out of reach.
+ * `only: [slug]` narrows the stage to that one file — which also means the stage
+ * must write NO coverage report, because a narrowed run's table would replace
+ * forty-two recipes' numbers with one's. That is asserted by a `writeReport`
+ * that throws if it is ever called.
+ *
+ * WHY THE DECLARED FIELDS ARE GENERATED. The stage refuses a file whose declared
+ * `dietTags`, `allergenTags`, `allergenStatus`, `badges` or `budgetTier` differ
+ * from what `recipe.logic.ts::deriveRecipeVersionFields` computes over the
+ * resolved ingredients. The payload below declares that derivation's own output
+ * over the same rows the stage will resolve, so a fixture cannot fail the
+ * declared-versus-derived gate by accident and the only subject left in the case
+ * is the race.
+ */
+describe('the recipe seed stage promoting a version while a week is generated', () => {
+    const SEEDED_SLUG = 'concurrency-stage-plate';
+    const SEEDED_YIELD = 2;
+    const SEEDED_PREP = 5;
+    const SEEDED_COOK = 10;
+
+    /**
+     * Steps that name no ingredient-vocabulary term.
+     *
+     * `findUnlistedInstructionTerms` refuses a file whose instructions name a
+     * coverage-plan food group, or a published canonical name, that no listed
+     * ingredient accounts for — the gate that catches an unlisted oil. None of
+     * the 123 groups appears below as a whole token, and the only published
+     * canonical names in this fixture are the factory's multi-word
+     * `fixture food N`, so the steps clear it without naming the ingredients at
+     * all.
+     */
+    const SEEDED_INSTRUCTIONS: readonly string[] = [
+        'Warm a wide pan over a steady flame.',
+        'Add both listed amounts and stir until heated through.',
+        'Divide between two plates and serve at once.',
+    ];
+
+    /**
+     * The stage logs structurally; a test has nothing to read it with.
+     *
+     * Typed through `SeedDeps` rather than by importing the logger's own
+     * interface: the only contract this fixture owes is the stage's, and taking
+     * it from the stage's own type is one import fewer and one restatement
+     * fewer — if `SeedDeps['logger']` grows a method, this fails to compile,
+     * which is the point.
+     */
+    const silentLogger: SeedDeps['logger'] = {
+        debug: () => undefined,
+        info: () => undefined,
+        warn: () => undefined,
+        error: () => undefined,
+        child: () => silentLogger,
+    };
+
+    /**
+     * The REAL committed coverage plan, read once.
+     *
+     * Not synthesized: its 123 food groups are what `runSeed` builds the
+     * instruction vocabulary from, so a hand-made plan would leave the
+     * unlisted-ingredient gate checking the corpus against a taxonomy this test
+     * invented — passing for the wrong reason. Read once because it is a file,
+     * and reading it per case is file IO per case.
+     */
+    const coveragePlan: SeedDeps['coveragePlan'] = loadCoveragePlan();
+
+    /** Directories to remove in `afterAll`, so a failing case still cleans up. */
+    const corpusDirectories: string[] = [];
+
+    /** One declared ingredient row, in the payload's wire spelling. */
+    interface StageIngredientRow {
+        readonly sourceKey: string;
+        readonly quantity: number;
+        readonly unit: string;
+        readonly gramWeight: number;
+        readonly displayText: string;
+        readonly sortOrder: number;
+        readonly isOptional: boolean;
+    }
+
+    /**
+     * A published, source-backed, allergen-known food whose default portion is
+     * stated in GRAMS and whose per-100 g columns are the pool's.
+     *
+     * The columns matter twice over: the STAGE reads them to build the snapshot
+     * it freezes into `recipe_ingredients`, so they decide the seeded recipe's
+     * per-serving nutrition, and the values below are {@link POOL_MAIN_PER_100G}
+     * and {@link POOL_STAPLE_PER_100G} precisely so the seeded recipe lands on
+     * the same 700 kcal / 52 P / 70 C / 23 F per serving as every pool recipe —
+     * which is what keeps a week that picks it inside the day tolerance.
+     */
+    const stageFood = async (
+        displayName: string,
+        per100g: typeof POOL_MAIN_PER_100G,
+    ): Promise<catalog_foods> =>
+        makeCatalogFood({
+            display_name: displayName,
+            food_group: POOL_FOOD_GROUP,
+            calories: per100g.calories,
+            protein_g: per100g.protein_g,
+            carbs_g: per100g.carbs_g,
+            fat_g: per100g.fat_g,
+            fiber_g: per100g.fiber_g,
+            defaultPortion: { description: '100 g', amount: 100, unit: 'g', gram_weight: 100 },
+        });
+
+    /** The ingredient the derivation sees, assembled from the row the stage will resolve. */
+    const publicationIngredient = (
+        food: catalog_foods,
+        per100g: typeof POOL_MAIN_PER_100G,
+        row: StageIngredientRow,
+    ): RecipePublicationIngredient => ({
+        catalog_food_id: food.id,
+        snapshot_name: food.display_name,
+        snapshot_provenance: 'source_backed',
+        snapshot_allergen_tags: food.allergen_tags,
+        snapshot_diet_tags: food.diet_tags,
+        is_optional: row.isOptional,
+        food_group: food.food_group,
+        allergen_status: 'known',
+        cost_class: food.cost_class,
+        catalog_nutrition_version: food.nutrition_version,
+        catalog_metadata_version: food.metadata_version,
+        snapshot_per_100g: { ...per100g },
+        quantity: row.quantity,
+        unit: row.unit,
+        gram_weight: row.gramWeight,
+        display_text: row.displayText,
+        sort_order: row.sortOrder,
+        nutrition_basis: 'per_100g',
+        density_g_per_ml: null,
+    });
+
+    /** The two foods the seeded recipe is built from, and its declared rows. */
+    const stageIngredients = async () => {
+        const main = await stageFood('Concurrency Stage Base', POOL_MAIN_PER_100G);
+        const staple = await stageFood('Concurrency Stage Staple', POOL_STAPLE_PER_100G);
+        const rows: readonly StageIngredientRow[] = [
+            {
+                sourceKey: main.source_key,
+                quantity: POOL_MAIN_GRAMS,
+                unit: 'g',
+                gramWeight: POOL_MAIN_GRAMS,
+                displayText: `${POOL_MAIN_GRAMS} g`,
+                sortOrder: 0,
+                isOptional: false,
+            },
+            {
+                sourceKey: staple.source_key,
+                quantity: POOL_STAPLE_GRAMS,
+                unit: 'g',
+                gramWeight: POOL_STAPLE_GRAMS,
+                displayText: `${POOL_STAPLE_GRAMS} g`,
+                sortOrder: 1,
+                isOptional: false,
+            },
+        ];
+
+        return {
+            rows,
+            derived: deriveRecipeVersionFields(
+                [
+                    publicationIngredient(main, POOL_MAIN_PER_100G, rows[0]),
+                    publicationIngredient(staple, POOL_STAPLE_PER_100G, rows[1]),
+                ],
+                SEEDED_YIELD,
+                SEEDED_PREP,
+                SEEDED_COOK,
+            ),
+        };
+    };
+
+    type StageCorpus = Awaited<ReturnType<typeof stageIngredients>>;
+
+    /**
+     * The payload, with `description` the only thing a promotion changes.
+     *
+     * `equivalentContent` compares the stored version's name, description and
+     * icon key, so a changed description is the smallest honest content change —
+     * the same discriminator `recipes-seed.test.ts` uses for its promotion case.
+     */
+    const stagePayload = (corpus: StageCorpus, description: string): Record<string, unknown> => ({
+        slug: SEEDED_SLUG,
+        name: 'Concurrency Stage Plate',
+        description,
+        iconKey: 'bowl',
+        instructions: [...SEEDED_INSTRUCTIONS],
+        yieldServings: SEEDED_YIELD,
+        servingDescription: '1 plate',
+        prepMinutes: SEEDED_PREP,
+        cookMinutes: SEEDED_COOK,
+        mealSlots: ['breakfast', 'lunch', 'dinner'],
+        dietTags: corpus.derived.dietTags,
+        allergenTags: corpus.derived.allergenTags,
+        allergenStatus: corpus.derived.allergenStatus,
+        budgetTier: corpus.derived.budgetTier,
+        badges: corpus.derived.badges,
+        ingredients: corpus.rows.map((row) => ({ ...row })),
+    });
+
+    /** Replaces the corpus with exactly this payload. */
+    const writeCorpus = (directory: string, payload: Record<string, unknown>): void => {
+        fs.writeFileSync(
+            path.join(directory, `${SEEDED_SLUG}.json`),
+            `${JSON.stringify(payload, null, 2)}\n`,
+            'utf8',
+        );
+    };
+
+    /**
+     * The stage's four seams, and nothing else stubbed.
+     *
+     * `writeReport` THROWS on purpose: a run narrowed with `only` must not
+     * rewrite the whole-corpus coverage report, so the assertion that it did not
+     * is that this never fires.
+     */
+    const stageDeps = (directory: string): SeedDeps => ({
+        prisma: prisma as unknown as SeedDeps['prisma'],
+        recipesDir: directory,
+        now: () => new Date(),
+        options: { help: false, only: [SEEDED_SLUG], dryRun: false },
+        logger: silentLogger,
+        coveragePlan,
+        reportPath: path.join(directory, 'coverage-report.json'),
+        writeReport: () => {
+            throw new Error('a run narrowed to one slug must not rewrite the coverage report');
+        },
+    });
+
+    afterAll(() => {
+        for (const directory of corpusDirectories) {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+        corpusDirectories.length = 0;
+    });
+
+    it('publishes the successor and the week together, and every version the week holds stays readable', async () => {
+        const fixture = await seedRequestWeek();
+        const corpus = await stageIngredients();
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'concurrency-stage-'));
+
+        corpusDirectories.push(directory);
+        writeCorpus(directory, stagePayload(corpus, 'The standing version of the stage plate.'));
+
+        // The predecessor, published by the stage itself — a promotion can only
+        // race a generation if there is something to promote.
+        const first = await runSeed(stageDeps(directory));
+
+        expect(first.created).toEqual([SEEDED_SLUG]);
+        expect(first.promoted).toEqual([]);
+        expect(first.report).toBeNull();
+
+        const standing = await prisma.recipes.findUniqueOrThrow({
+            where: { slug: SEEDED_SLUG },
+            include: { recipe_versions: true },
+        });
+
+        expect(standing.recipe_versions).toHaveLength(1);
+        expect(standing.recipe_versions[0].status).toBe(CURRENT_VERSION);
+
+        const predecessorId = standing.recipe_versions[0].id;
+
+        // The content change the second run promotes.
+        writeCorpus(directory, stagePayload(corpus, 'The promoted version of the stage plate.'));
+
+        const [generated, promotion] = await Promise.all([
+            postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today)),
+            runSeed(stageDeps(directory)),
+        ]);
+
+        // NEITHER SIDE FAILS, in either interleaving. The stage's promotion is
+        // one transaction, so the recipe is never without a current version; and
+        // the generation inserts against version ids it read before its own
+        // transaction opened, which a status flip cannot invalidate — `RESTRICT`
+        // bites on a DELETE, and nothing here deletes.
+        expect(promotion.promoted).toEqual([SEEDED_SLUG]);
+        expect(promotion.created).toEqual([]);
+        expect(promotion.report).toBeNull();
+        expect(promotion.reportSkippedReason).toContain('narrowed');
+        expect(generated.status).toBe(201);
+
+        const published = await theOnlyPlanOf(REQUEST_PLANNING_USER_ID);
+
+        expectWholeWeek(published);
+        expect(published.status).toBe(ACTIVE_PLAN);
+        expect(published.revision).toBe(1);
+        expect(generated.body).toMatchObject({ id: published.id, revision: 1 });
+
+        // The stage did all three of its writes: the successor is current and
+        // stamped, the predecessor is retired and stamped, and the recipe points
+        // at the successor.
+        const afterPromotion = await prisma.recipes.findUniqueOrThrow({
+            where: { slug: SEEDED_SLUG },
+            include: { recipe_versions: { orderBy: { version: 'asc' } } },
+        });
+        const [predecessor, successor] = afterPromotion.recipe_versions;
+
+        expect(afterPromotion.recipe_versions).toHaveLength(2);
+        expect(predecessor.id).toBe(predecessorId);
+        expect(predecessor.status).toBe(RETIRED_VERSION);
+        expect(predecessor.retired_at).not.toBeNull();
+        expect(successor.status).toBe(CURRENT_VERSION);
+        expect(successor.published_at).not.toBeNull();
+        expect(successor.description).toBe('The promoted version of the stage plate.');
+        expect(afterPromotion.current_version_id).toBe(successor.id);
+        // The successor carries its own frozen ingredient rows, written in the
+        // same transaction as its status.
+        expect(
+            await prisma.recipe_ingredients.count({ where: { recipe_version_id: successor.id } }),
+        ).toBe(corpus.rows.length);
+
+        // `unique_current_recipe_version` holds for every recipe in the
+        // database, at this observation point and at each one below — and the
+        // count is read from `recipes` rather than named, so the assertion is
+        // "EXACTLY ONE current version per recipe, and none without one"
+        // whatever else the fixture has seeded.
+        const expectOneCurrentVersionPerRecipe = async (): Promise<void> => {
+            const grouped = await prisma.recipe_versions.groupBy({
+                by: ['recipe_id'],
+                where: { status: CURRENT_VERSION },
+                _count: { _all: true },
+            });
+
+            expect(grouped.map((row) => row._count._all)).toEqual(grouped.map(() => 1));
+            expect(grouped).toHaveLength(await prisma.recipes.count());
+        };
+
+        await expectOneCurrentVersionPerRecipe();
+
+        const referenced = [...new Set(mealsOf(published).map((meal) => meal.recipe_version_id))];
+        const plannable = [
+            ...fixture.pool.map((entry) => entry.version.id),
+            predecessorId,
+            successor.id,
+        ];
+
+        // Nothing invented: every meal points at a version this fixture
+        // published, whichever view of the recipe the search read.
+        expect(referenced.filter((versionId) => !plannable.includes(versionId))).toEqual([]);
+
+        for (const versionId of referenced) {
+            const read = await getRecipeVersionForUser(REQUEST_PLANNING_USER_ID, versionId);
+
+            // Readable whatever its status: if the search read the predecessor
+            // before the promotion retired it, the week's own history must still
+            // open — the clause a retired version's visibility rests on.
+            expect(read?.versionId).toBe(versionId);
+        }
+
+        const referencedRows = await prisma.recipe_versions.findMany({
+            where: { id: { in: referenced } },
+            select: { id: true, recipe_id: true, status: true },
+        });
+
+        expect(referencedRows).toHaveLength(referenced.length);
+        // ONE version per recipe: the plannable set is read in a single
+        // statement, so a week holding both versions of the promoted recipe
+        // would have been assembled from two different views of the catalog.
+        expect(new Set(referencedRows.map((row) => row.recipe_id)).size).toBe(referencedRows.length);
+
+        const ingredientFoodIds = new Set(
+            (
+                await prisma.recipe_ingredients.findMany({
+                    where: { recipe_version_id: { in: referenced } },
+                    select: { catalog_food_id: true },
+                })
+            ).map((row) => row.catalog_food_id),
+        );
+        const groceryFoodIds = (
+            await prisma.grocery_items.findMany({
+                where: { meal_plan_id: published.id, user_id: REQUEST_PLANNING_USER_ID },
+                select: { catalog_food_id: true },
+            })
+        ).map((row) => row.catalog_food_id);
+
+        // The list is derived from exactly the versions the plan references — no
+        // line for a recipe the week does not plan, and none missing, including
+        // when one of those versions has since been retired.
+        expect([...groceryFoodIds].sort()).toEqual([...ingredientFoodIds].sort());
+
+        const statusById = new Map(
+            (
+                await prisma.recipe_versions.findMany({ select: { id: true, status: true } })
+            ).map((row) => [row.id, row.status]),
+        );
+
+        for (const meal of published.meal_plan_days[0].meal_plan_meals) {
+            for (const alternative of await listedAlternatives(
+                REQUEST_PLANNING_USER_ID,
+                published.id,
+                meal.id,
+            )) {
+                // Selection has moved on even where the plan has not: the
+                // retired predecessor is gone from the sheet, and the successor
+                // is what its recipe is offered as.
+                expect(statusById.get(alternative.recipeVersionId)).toBe(CURRENT_VERSION);
+            }
+        }
+
+        const actions = await ledgerRows(REQUEST_PLANNING_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            action_type: 'generate',
+            response_status: 201,
+            plan_revision_after: 1,
+            meal_plan_id: published.id,
+        });
+
+        // A third run over the promoted corpus is a no-op, so the race left the
+        // stage's own idempotence intact rather than a half-applied promotion it
+        // would try to finish.
+        const third = await runSeed(stageDeps(directory));
+
+        expect(third.unchanged).toEqual([SEEDED_SLUG]);
+        expect(third.created).toEqual([]);
+        expect(third.promoted).toEqual([]);
+        expect(third.ingredientRows).toBe(0);
+        await expectOneCurrentVersionPerRecipe();
+    });
+});
+
+
+/* ---------------------------------------------------------------------------
+ * What a refusal is allowed to say, and who a write belongs to
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The two hygiene properties every refusal in this file rests on, asserted once
+ * across a spread of them rather than repeated in each case.
+ *
+ * WHY A CONTENTION SUITE IS WHERE THIS BELONGS. The bodies asserted above are
+ * compared strictly, so a case cannot silently accept an extra member — but a
+ * strict comparison only catches the shapes a case thought to provoke. A RACE
+ * can reach a refusal no case names: the partial unique index on active
+ * `(user_id, start_date)` and the `(user_id, idempotency_key)` unique are
+ * backstops behind the explicit checks (§0.5.1), and if an interleaving ever
+ * got past a check to the index, Prisma's violation would arrive at the
+ * controller's fallback. That is the one path in the feature that could put a
+ * constraint name, a statement fragment or a stack in front of a client, which
+ * Rule backend-architecture §4 forbids — so the sweep asserts every refusal is
+ * an EXPLICIT code below 500 whose body says nothing else.
+ *
+ * AND WHY THE IDENTITY CASE IS HERE. §4's other half is that the caller is the
+ * token, never the body. The two parsers treat an extra `userId` differently —
+ * the generate parser reads its four fields and ignores the rest, the swap
+ * parser names its keys and refuses an unknown one — and both must reach the
+ * same place: the write belongs to the authenticated user.
+ */
+describe('what a refusal is allowed to say', () => {
+    /**
+     * Substrings no refusal body may contain, lower-cased for the comparison.
+     *
+     * Each names something only the server should know: an ORM's fingerprint
+     * (`prisma`, its `Invalid \`` message prefix), a schema object (`constraint`,
+     * the `unique_`/`idx_` index prefixes), a lock or statement fragment
+     * (`pg_advisory`, `select `, `insert into`, `on conflict`), or a runtime
+     * trace (`stack`, `node_modules`, `at object.`).
+     */
+    const FORBIDDEN_IN_A_REFUSAL: readonly string[] = [
+        'prisma',
+        'invalid `',
+        'constraint',
+        'unique_',
+        'idx_',
+        'pg_advisory',
+        'select ',
+        'insert into',
+        'on conflict',
+        'stack',
+        'node_modules',
+        'at object.',
+    ];
+
+    /** Members no refusal body may carry, whatever their value. */
+    const FORBIDDEN_MEMBERS: readonly string[] = ['stack', 'name', 'meta', 'cause', 'clientVersion'];
+
+    interface CollectedRefusal {
+        readonly label: string;
+        readonly answer: HttpAnswer;
+    }
+
+    it('answers every refusal a race can reach with an explicit code and nothing else', async () => {
+        const fixture = await seedRequestWeek();
+        const offer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+        const { second: losingAlternative } = await twoOfferedAlternatives(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+        const sharedKey = randomUUID();
+        const collected: CollectedRefusal[] = [];
+        const collect = async (label: string, send: () => Promise<HttpAnswer>): Promise<void> => {
+            collected.push({ label, answer: await send() });
+        };
+
+        // Five refusals that write nothing, then one accepted swap, then the
+        // refusal that needs its reservation — so the order is the only thing
+        // the sequence assumes.
+        await collect('plan_overlap', () =>
+            postGenerate(REQUEST_PLAN_USER_ID, requestGenerateBody(fixture.today)),
+        );
+        await collect('invalid_request', () =>
+            postSwap(
+                REQUEST_PLAN_USER_ID,
+                fixture.planId,
+                fixture.breakfastMealId,
+                requestSwapBody(offer.recipeVersionId, 1, { userId: REQUEST_PLANNING_USER_ID }),
+            ),
+        );
+        await collect('a plan that is nobody’s', () =>
+            postSwap(
+                REQUEST_PLAN_USER_ID,
+                randomUUID(),
+                fixture.breakfastMealId,
+                requestSwapBody(offer.recipeVersionId, 1),
+            ),
+        );
+        await collect('stale_revision', () =>
+            postGenerate(
+                REQUEST_PLANNING_USER_ID,
+                requestGenerateBody(fixture.today, { expectedPreferencesRevision: 2 }),
+            ),
+        );
+        await collect('stale_plan', () =>
+            postSwap(
+                REQUEST_PLAN_USER_ID,
+                fixture.planId,
+                fixture.breakfastMealId,
+                requestSwapBody(offer.recipeVersionId, 2),
+            ),
+        );
+
+        const committed = await postSwap(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+            requestSwapBody(offer.recipeVersionId, 1, {
+                portionMultiplier: offer.portionMultiplier,
+                idempotencyKey: sharedKey,
+            }),
+        );
+
+        expect(committed.status).toBe(200);
+
+        await collect('idempotency_conflict', () =>
+            postSwap(
+                REQUEST_PLAN_USER_ID,
+                fixture.planId,
+                fixture.breakfastMealId,
+                requestSwapBody(losingAlternative, 1, { idempotencyKey: sharedKey }),
+            ),
+        );
+
+        // The codes, in the order provoked: every refusal is the check's own
+        // answer and not a constraint's.
+        expect(collected.map(({ answer }) => answer.body.error)).toEqual([
+            'plan_overlap',
+            'invalid_request',
+            'Plan not found',
+            'stale_revision',
+            'stale_plan',
+            'idempotency_conflict',
+        ]);
+
+        for (const { label, answer } of collected) {
+            const serialised = JSON.stringify(answer.body).toLowerCase();
+            const failure = `the ${label} refusal`;
+
+            // 4xx only. A 403 is never right here — an unowned resource is a
+            // 404 (Rule §1.5) — and a 5xx would mean a check was missed and the
+            // fallback answered instead.
+            expect({ [failure]: answer.status >= 400 && answer.status < 500 }).toEqual({
+                [failure]: true,
+            });
+            expect({ [failure]: answer.status }).not.toEqual({ [failure]: 403 });
+            expect({ [failure]: typeof answer.body.error }).toEqual({ [failure]: 'string' });
+
+            for (const needle of FORBIDDEN_IN_A_REFUSAL) {
+                expect({ [`${failure} names "${needle}"`]: serialised.includes(needle) }).toEqual({
+                    [`${failure} names "${needle}"`]: false,
+                });
+            }
+            for (const member of FORBIDDEN_MEMBERS) {
+                expect({ [`${failure} carries "${member}"`]: member in answer.body }).toEqual({
+                    [`${failure} carries "${member}"`]: false,
+                });
+            }
+        }
+
+        // And the sweep really did refuse rather than write: one swap, one
+        // ledger row, one plan each, and nothing at all for the identity whose
+        // generation was refused as stale.
+        expect((await mealRow(fixture.breakfastMealId)).revision).toBe(2);
+        expect(await planRevision(fixture.planId)).toBe(2);
+        expect((await ledgerRows(REQUEST_PLAN_USER_ID)).map((row) => row.idempotency_key)).toEqual([
+            sharedKey,
+        ]);
+        expect(await prisma.meal_plans.count({ where: { user_id: REQUEST_PLAN_USER_ID } })).toBe(1);
+        expect(await prisma.meal_plans.count({ where: { user_id: REQUEST_PLANNING_USER_ID } })).toBe(0);
+        expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toEqual([]);
+    });
+
+    it('decides who a write belongs to from the token and never from the body', async () => {
+        const fixture = await seedRequestWeek();
+
+        // The generate parser reads its four fields and ignores every other
+        // key, so an extra `userId` is not even a syntax error here — which is
+        // what makes this the honest test of the boundary rather than of the
+        // parser: the published week must belong to the AUTHENTICATED identity.
+        const generated = await postGenerate(
+            REQUEST_PLANNING_USER_ID,
+            requestGenerateBody(fixture.today, { userId: REQUEST_PLAN_USER_ID }),
+        );
+
+        expect(generated.status).toBe(201);
+
+        const published = await theOnlyPlanOf(REQUEST_PLANNING_USER_ID);
+
+        expect(generated.body).toMatchObject({ id: published.id });
+        expectWholeWeek(published);
+        // The identity the body named gained nothing: it still holds exactly the
+        // week the fixture gave it.
+        expect(
+            (
+                await prisma.meal_plans.findMany({
+                    where: { user_id: REQUEST_PLAN_USER_ID },
+                    select: { id: true },
+                })
+            ).map((plan) => plan.id),
+        ).toEqual([fixture.planId]);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toEqual([]);
+        expect((await ledgerRows(REQUEST_PLANNING_USER_ID)).map((row) => row.user_id)).toEqual([
+            REQUEST_PLANNING_USER_ID,
+        ]);
+
+        const offer = await offeredAlternative(
+            REQUEST_PLAN_USER_ID,
+            fixture.planId,
+            fixture.breakfastMealId,
+        );
+
+        // Where a parser DOES name its keys, the same body key is refused
+        // outright — one field code, no hint that the value was an id at all.
+        expectRefusal(
+            await postSwap(
+                REQUEST_PLAN_USER_ID,
+                fixture.planId,
+                fixture.breakfastMealId,
+                requestSwapBody(offer.recipeVersionId, 1, {
+                    portionMultiplier: offer.portionMultiplier,
+                    userId: REQUEST_PLANNING_USER_ID,
+                }),
+            ),
+            400,
+            { error: 'invalid_request', details: [{ field: 'userId', code: 'unknown_field' }] },
+        );
+        expect((await mealRow(fixture.breakfastMealId)).revision).toBe(1);
+        expect(await ledgerRows(REQUEST_PLAN_USER_ID)).toEqual([]);
+    });
+});
+
