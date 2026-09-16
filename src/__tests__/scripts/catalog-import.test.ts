@@ -40,8 +40,17 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { loadCoveragePlan, loadUsdaManifest } from '../../../scripts/lib/manifest';
+import {
+    ManifestError,
+    USDA_MANIFEST_FILE,
+    dataPath,
+    fixturePath,
+    loadCoveragePlan,
+    loadUsdaManifest,
+    readJsonFile,
+} from '../../../scripts/lib/manifest';
 import type { UsdaManifest, UsdaManifestFood } from '../../../scripts/lib/manifest';
+import { truncateFeatureTables } from '../setup/testDb';
 import type { UsdaFoodDetail, UsdaFoodPortion, UsdaFoodSummary } from '../../services/usda.service';
 import {
     CatalogImportError,
@@ -66,6 +75,7 @@ import type {
 // redaction contract is what makes handing it anything safe.
 import {
     createLogger,
+    hostOf,
     redactUrlUserinfo,
     safeError,
     sanitizeLogFields,
@@ -672,6 +682,44 @@ describe('describeFailure', () => {
 
         expect(described.code).toBe('manifest_version_mismatch');
         expect(described.error.name).toBe('CatalogImportError');
+    });
+
+    // The failures that reach this stage through its own libraries rather than
+    // through USDA. Each carries its reason as a TYPED FIELD, so the reported
+    // code is read off the error instead of parsed out of a message — which is
+    // what makes a refusal greppable by code and is the whole of §8's "typed
+    // errors carry data, not strings". `DatabaseOriginError` and
+    // `ModelBudgetError` are the ladder's remaining two branches and belong to
+    // the suites that own dbGuard and the model budget.
+    it('reports a manifest failure under the code the manifest error carries', () => {
+        const described = describeFailure(
+            new ManifestError('version_mismatch', 'usda-manifest.v1.json declares v2'),
+        );
+
+        expect(described.code).toBe('version_mismatch');
+        expect(described.error.name).toBe('ManifestError');
+    });
+
+    it('reports a checkpoint failure under the code the checkpoint error carries', () => {
+        const described = describeFailure(
+            new CheckpointError('run_already_finished', '00000000-0000-4000-8000-000000000001', 'succeeded'),
+        );
+
+        expect(described.code).toBe('run_already_finished');
+        expect(described.error.name).toBe('CheckpointError');
+    });
+
+    it('reports a rate-limit misconfiguration under a fixed code, because that error carries rates instead', () => {
+        // The one class in the ladder with no `code` of its own: its typed
+        // fields are the three rates, so this stage supplies the code. Falling
+        // through to `unexpected_error` would report a refusal an operator
+        // fixes in one environment variable as a defect in the importer.
+        const described = describeFailure(
+            new RateLimitConfigError('requestsPerHour must not exceed the vendor cap', 1001, 20, 1000),
+        );
+
+        expect(described.code).toBe('rate_limit_misconfigured');
+        expect(described.error.name).toBe('RateLimitConfigError');
     });
 });
 
@@ -6442,6 +6490,17 @@ describe('every catalog CLI refuses to run while another stage holds the graph (
      * because validation's prerequisite check runs before the lock and would
      * otherwise stop the child short of the thing under test — the budget is
      * never spent, since the lock refuses first.
+     *
+     * The two vendor keys are set for that same reason, and are the reason this
+     * block cannot simply inherit `process.env`: `jestSetup.ts` DELETES
+     * `USDA_API_KEY` and `OPENROUTER_API_KEY` so that an unintercepted vendor
+     * call fails closed, and each stage's `preflight` reports the missing key
+     * as a prerequisite gap BEFORE any lock is taken. Without them the import
+     * and validation children exit on `stage_prerequisites_unmet` and never
+     * reach the refusal under test. The values are deliberately unusable
+     * placeholders rather than the real credentials: the lock refuses first, so
+     * neither child ever opens a vendor request, and a real key here would put
+     * a live credential in a child's environment for no behaviour at all.
      */
     const runStageCli = (script: string, args: readonly string[]): Promise<ChildOutcome> =>
         new Promise((resolve, reject) => {
@@ -6457,6 +6516,8 @@ describe('every catalog CLI refuses to run while another stage holds the graph (
                         NODE_ENV: 'test',
                         DATABASE_URL: process.env.DATABASE_URL,
                         CATALOG_MODEL_CALL_BUDGET: '1',
+                        USDA_API_KEY: 'not-a-real-key-the-stage-lock-refuses-first',
+                        OPENROUTER_API_KEY: 'not-a-real-key-the-stage-lock-refuses-first',
                         TS_NODE_PROJECT: SCRIPTS_TSCONFIG,
                         TS_NODE_TRANSPILE_ONLY: '1',
                     },
@@ -6552,3 +6613,1573 @@ describe('every catalog CLI refuses to run while another stage holds the graph (
         expect(Number(rows[0]?.count ?? 0)).toBe(1);
     });
 });
+
+// ---------------------------------------------------------------------------
+// THE IMPORT AS A RUN, AGAINST THE REAL CATALOG TABLES.
+//
+// Everything above this line proves a decision: a pure function's answer, a
+// redaction, a ledger's arithmetic, a checkpoint's accounting. What none of it
+// proves is the WIRING — that `runImport` fetching a batch, normalising it and
+// upserting it converges on one row per vendor id, that a second identical run
+// writes nothing new, that an interruption leaves the work it finished behind,
+// and that a completed stage stays completed. Those are properties of the
+// orchestration and of nothing smaller, which is why they need a database
+// (Rule backend-architecture §11: integration coverage is for the wiring, and
+// a rule that needs a database is in the wrong layer).
+//
+// WHAT IS DELIBERATELY NOT ASSERTED HERE. No bound, tolerance or verdict:
+// `catalog.logic.test.ts` owns every check's threshold, and a second copy of
+// those numbers here would be two places to update and one to forget. The
+// cases below read a verdict only as a STATUS the run wrote — `candidate` or
+// `quarantined` — never as a judgement re-derived from the nutrients. The USDA
+// cache-key shapes and the service's own retry ladder belong to
+// `usda.service.test.ts`; what this section owns of the limiter is only the
+// accounting the SCRIPT wires, through `installRateLimiter`.
+// ---------------------------------------------------------------------------
+
+/**
+ * The run scope every case in this section claims.
+ *
+ * NOT the shipped `v1`, and that is load-bearing rather than tidy.
+ * `openOrResumeRun` claims `(kind, manifestVersion)` and `finishRun` closes it
+ * `succeeded`, after which that pair is a permanent no-op (checkpoint.ts's THE
+ * CLAIM). A case here that claimed `v1` and succeeded would therefore leave
+ * this database's canonical import key closed for ever, and the next real
+ * `npm run catalog:import` against it would report "already completed" and
+ * write nothing. Scoping the injected manifest's own version string keeps
+ * every claim below in a namespace no operator command can ever address.
+ */
+const IMPORT_RUN_SCOPE = 'v1+suite:run-import-orchestration';
+
+/** One fixed instant for every injected clock, so no assertion reads a wall clock. */
+const IMPORT_AT = new Date('2026-09-14T09:00:00.000Z');
+
+/**
+ * Nutrients that pass every check for the two categories the subjects below are
+ * drawn from, so a `quarantined` status anywhere in this section means the
+ * orchestration put it there rather than the numbers.
+ *
+ * The energy value is stated AND consistent with the macros: 4·3.09 + 4·3.26 +
+ * 9·0.34 is 28.46 against a stated 22, inside the plan's absolute 30 kcal
+ * energy-vs-macro allowance, and 22 sits inside both categories' review ranges.
+ * The two facts are asserted in `the subjects this section imports` below
+ * rather than trusted, because a coverage-plan edit that moved either range
+ * would otherwise turn every case here red for a reason none of them is about.
+ */
+const CLEAN_PROTEIN_G = 3.09;
+const CLEAN_CARBS_G = 3.26;
+const CLEAN_FAT_G = 0.34;
+const CLEAN_CALORIES = 22;
+
+/** 4·P + 4·C + 9·F, rounded as `prepareCatalogFood` rounds it. */
+const DERIVED_CALORIES =
+    Math.round((4 * CLEAN_PROTEIN_G + 4 * CLEAN_CARBS_G + 9 * CLEAN_FAT_G) * 100) / 100;
+
+type CuratedEntry = UsdaManifestFood & { fdcId: number };
+
+const curatedIn = (category: string): CuratedEntry[] =>
+    curatedEntries.filter((entry) => entry.category === category);
+
+/**
+ * Twenty-eight curated entries: eighteen vegetables and ten fruits, which is
+ * what makes the plan two batches at the manifest's twenty-per-batch limit
+ * rather than one. Both categories accept the nutrients above, so the split is
+ * free of any per-category special case.
+ */
+const IMPORT_SUBJECTS: readonly CuratedEntry[] = [
+    ...curatedIn('produce_vegetable'),
+    ...curatedIn('produce_fruit'),
+];
+
+const DETAIL_BATCH_SIZE = manifest.importLimits.detailBatchSize;
+
+/** A per-100 g record for one curated entry, in the search-flattened nutrient shape. */
+const cleanDetail = (entry: CuratedEntry, overrides: Partial<UsdaFoodDetail> = {}): UsdaFoodDetail => ({
+    fdcId: entry.fdcId,
+    description: entry.expectedUsdaDescription ?? entry.displayName,
+    dataType: entry.usdaDataType,
+    publicationDate: '4/1/2019',
+    foodNutrients: [
+        { nutrientNumber: manifest.nutrientNumbers.protein, value: CLEAN_PROTEIN_G },
+        { nutrientNumber: manifest.nutrientNumbers.fat, value: CLEAN_FAT_G },
+        { nutrientNumber: manifest.nutrientNumbers.carbs, value: CLEAN_CARBS_G },
+        { nutrientNumber: manifest.nutrientNumbers.calories, value: CLEAN_CALORIES },
+    ],
+    foodPortions: [],
+    ...overrides,
+});
+
+/**
+ * The manifest `runImport` is handed: this section's own scope, the chosen
+ * entries, and no dataset sweeps.
+ *
+ * Dropping the sweeps is what makes the plan exactly the entries passed in —
+ * `buildImportPlan` walks the curated list and then each sweep, so an empty
+ * sweep list means `listFoods` is never called and the batch membership is the
+ * argument rather than a vendor listing.
+ */
+const narrowedManifest = (entries: readonly CuratedEntry[]): UsdaManifest => ({
+    ...manifest,
+    usdaManifestVersion: IMPORT_RUN_SCOPE,
+    foods: entries,
+    datasetSweeps: [],
+});
+
+/** A vendor client that answers from a table of records and records what it was asked. */
+interface RecordingVendor {
+    readonly usda: RunImportDeps['usda'];
+    /** One entry per `getFoodsBatch` call, in call order, each the ids requested. */
+    readonly batchCalls: number[][];
+    readonly listCalls: number;
+}
+
+interface RecordingVendorOptions {
+    /** Answers for the ids requested; an id absent from the map is "missing from vendor". */
+    readonly records: ReadonlyMap<number, UsdaFoodDetail>;
+    /** Throws on this 1-based `getFoodsBatch` call, leaving earlier batches committed. */
+    readonly failOnCall?: number;
+    /** What the failure throws. Defaults to the vendor boundary's own error shape. */
+    readonly failWith?: () => Error;
+}
+
+const vendorError = (message: string): Error => {
+    const error = new Error(message);
+    // The boundary's class is matched by name, never by identity: importing
+    // `usda.service.ts`'s value side constructs a Prisma client, which is the
+    // load this script defers on purpose (see `isUsdaError` in the stage).
+    error.name = 'UsdaError';
+
+    return error;
+};
+
+const recordingVendor = (options: RecordingVendorOptions): RecordingVendor => {
+    const batchCalls: number[][] = [];
+    const state = { listCalls: 0 };
+    const fail = options.failWith ?? (() => vendorError('USDA returned 503 for this batch'));
+
+    const vendor: RecordingVendor = {
+        batchCalls,
+        get listCalls(): number {
+            return state.listCalls;
+        },
+        usda: {
+            listFoods: async (): Promise<UsdaFoodSummary[]> => {
+                state.listCalls += 1;
+
+                return [];
+            },
+            getFoodsBatch: async (fdcIds): Promise<UsdaFoodDetail[]> => {
+                batchCalls.push([...fdcIds]);
+                if (options.failOnCall !== undefined && batchCalls.length === options.failOnCall) {
+                    throw fail();
+                }
+
+                return fdcIds
+                    .map((fdcId) => options.records.get(fdcId))
+                    .filter((record): record is UsdaFoodDetail => record !== undefined);
+            },
+            describeBatchRetrieval: async (fdcIds): Promise<UsdaBatchRetrieval> => retrieval(fdcIds),
+        },
+    };
+
+    return vendor;
+};
+
+const recordsFor = (
+    entries: readonly CuratedEntry[],
+    overrides: ReadonlyMap<number, UsdaFoodDetail> = new Map(),
+): Map<number, UsdaFoodDetail> => {
+    const records = new Map<number, UsdaFoodDetail>();
+    for (const entry of entries) {
+        records.set(entry.fdcId, overrides.get(entry.fdcId) ?? cleanDetail(entry));
+    }
+
+    return records;
+};
+
+interface ImportRunHarness {
+    readonly deps: RunImportDeps;
+    readonly reports: unknown[];
+    readonly installs: number;
+    readonly restores: number;
+}
+
+interface ImportRunOptions {
+    readonly entries: readonly CuratedEntry[];
+    /**
+     * Anything that answers the stage's vendor seam. Narrowed to the seam
+     * itself rather than to `RecordingVendor`, because the pacing cases below
+     * hand it a client that reaches the transport instead of one that records
+     * the ids it was asked for.
+     */
+    readonly vendor: { readonly usda: RunImportDeps['usda'] };
+    readonly options?: Partial<ImportOptions>;
+    readonly logger?: ScriptLogger;
+    readonly installRateLimiter?: () => () => void;
+    readonly rateLimiterStats?: () => UsdaRequestStats;
+}
+
+/**
+ * The deps one case runs with, typed as `RunImportDeps` so a drift in the
+ * stage's declared seam fails `npm run typecheck:test` rather than at runtime.
+ *
+ * Only the Prisma client is cast, and only to `ImportDb`: the stage declares
+ * that seam structurally over four models, while the generated client's
+ * accessors are generic over their `select`, so the two are compatible in
+ * behaviour without being assignable in TypeScript. Every field this file
+ * authors stays checked.
+ */
+const importHarness = (runOptions: ImportRunOptions): ImportRunHarness => {
+    const reports: unknown[] = [];
+    const counters = { installs: 0, restores: 0 };
+
+    const installRateLimiter =
+        runOptions.installRateLimiter ??
+        ((): (() => void) => {
+            counters.installs += 1;
+
+            return (): void => {
+                counters.restores += 1;
+            };
+        });
+
+    const deps: RunImportDeps = {
+        db: prisma as unknown as ImportDb,
+        runDb: prisma,
+        usda: runOptions.vendor.usda,
+        manifest: narrowedManifest(runOptions.entries),
+        coveragePlan,
+        options: options(runOptions.options),
+        logger: runOptions.logger ?? silentLogger,
+        now: () => IMPORT_AT,
+        installRateLimiter,
+        rateLimiterStats: runOptions.rateLimiterStats,
+        writeReport: (report: unknown) => {
+            reports.push(report);
+        },
+    };
+
+    return {
+        deps,
+        reports,
+        get installs(): number {
+            return counters.installs;
+        },
+        get restores(): number {
+            return counters.restores;
+        },
+    };
+};
+
+interface StoredFoodRow {
+    id: string;
+    source_key: string;
+    usda_fdc_id: number | null;
+    publication_status: string;
+    canonical_name: string;
+    nutrition_basis: string;
+    basis_amount: number | null;
+    calories: number | null;
+    identity_source: string;
+    nutrition_provenance: string;
+    imported_at: Date | null;
+    updated_at: Date | null;
+}
+
+const storedFoods = async (): Promise<StoredFoodRow[]> =>
+    prisma.catalog_foods.findMany({
+        where: { identity_source: 'usda' },
+        orderBy: { source_key: 'asc' },
+        select: {
+            id: true,
+            source_key: true,
+            usda_fdc_id: true,
+            publication_status: true,
+            canonical_name: true,
+            nutrition_basis: true,
+            basis_amount: true,
+            calories: true,
+            identity_source: true,
+            nutrition_provenance: true,
+            imported_at: true,
+            updated_at: true,
+        },
+    }) as unknown as Promise<StoredFoodRow[]>;
+
+const storedFood = async (sourceKey: string): Promise<StoredFoodRow> => {
+    const rows = await storedFoods();
+    const row = rows.find((candidate) => candidate.source_key === sourceKey);
+    expect(row).toBeDefined();
+
+    return row as StoredFoodRow;
+};
+
+const importRunRow = async (): Promise<{
+    id: string;
+    status: string;
+    cursor: unknown;
+    counts: unknown;
+    finished_at: Date | null;
+} | null> =>
+    prisma.catalog_import_runs.findFirst({
+        where: { kind: 'usda_import', manifest_version: IMPORT_RUN_SCOPE },
+        select: { id: true, status: true, cursor: true, counts: true, finished_at: true },
+    }) as unknown as Promise<{
+        id: string;
+        status: string;
+        cursor: unknown;
+        counts: unknown;
+        finished_at: Date | null;
+    } | null>;
+
+describe('the subjects this section imports', () => {
+    it('draws two batches of curated entries from categories the nutrients suit', () => {
+        expect(IMPORT_SUBJECTS.length).toBeGreaterThan(DETAIL_BATCH_SIZE);
+        expect(new Set(IMPORT_SUBJECTS.map((entry) => entry.fdcId)).size).toBe(IMPORT_SUBJECTS.length);
+
+        // The premise the whole section rests on: these nutrients are inside
+        // every subject category's review range, so nothing below is
+        // quarantined by a bound. Asserted from the coverage plan rather than
+        // restated, so a plan edit reports itself here instead of as a dozen
+        // unexplained failures.
+        const ranges = [...new Set(IMPORT_SUBJECTS.map((entry) => entry.category))].map((category) => {
+            const row = coveragePlan.categories.find((candidate) => candidate.category === category);
+            expect(row).toBeDefined();
+
+            return row as { kcalReviewRange: { min: number; max: number } };
+        });
+
+        for (const range of ranges) {
+            expect(CLEAN_CALORIES).toBeGreaterThanOrEqual(range.kcalReviewRange.min);
+            expect(CLEAN_CALORIES).toBeLessThanOrEqual(range.kcalReviewRange.max);
+            expect(DERIVED_CALORIES).toBeGreaterThanOrEqual(range.kcalReviewRange.min);
+            expect(DERIVED_CALORIES).toBeLessThanOrEqual(range.kcalReviewRange.max);
+        }
+    });
+
+    it('keeps this section’s run scope away from the canonical import key', () => {
+        expect(IMPORT_RUN_SCOPE).not.toBe(manifest.usdaManifestVersion);
+        // Unrestricted options, so the scope is the manifest version verbatim —
+        // which is exactly why the injected version has to be the scoped one.
+        expect(importRunScope(IMPORT_RUN_SCOPE, options())).toBe(IMPORT_RUN_SCOPE);
+    });
+});
+
+/**
+ * "REPEAT IMPORTS CREATE NO DUPLICATE FOODS" (AAP §0.9.2), end to end.
+ *
+ * The stage's whole re-run safety rests on one claim in its header — "every
+ * write is an upsert on a key derived from the vendor's own id" — and that
+ * claim is about the orchestration, not about `persistPreparedFood` in
+ * isolation: the source key has to be derived, carried through the plan, and
+ * used as the conflict target, and `imported_at` has to survive the second
+ * write. A rerun that produced a second row, or the same row with a new
+ * identity, would break every `recipe_ingredients` and `meal_entries`
+ * reference pointing at the first one.
+ *
+ * Row IDENTITY is therefore asserted, not just row count: the repository's
+ * precedent for this is `food.service.ts`'s `findOrCreateBrandedFood`, which
+ * finds on the natural key before it creates, and the property that matters
+ * downstream is that the id a reference was taken against still resolves.
+ */
+describe('a repeated import converges on the same rows', () => {
+    const subjects = IMPORT_SUBJECTS.slice(0, 2);
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('writes one row per vendor id, with its aliases, portions and validation record', async () => {
+        const vendor = recordingVendor({ records: recordsFor(subjects) });
+        const harness = importHarness({ entries: subjects, vendor });
+
+        const outcome = await runImport(harness.deps);
+
+        expect(outcome.runId).not.toBeNull();
+        expect(outcome.resumed).toBe(false);
+        expect(outcome.plannedBatches).toBe(1);
+        expect(outcome.processedBatches).toBe(1);
+        expect(outcome.counts.planned).toBe(subjects.length);
+        expect(outcome.counts.inserted).toBe(subjects.length);
+        expect(outcome.counts.updated).toBe(0);
+        expect(outcome.counts.missingFromVendor).toBe(0);
+        // The stage does not publish, by design: a record every check accepts
+        // is a `candidate`, because the duplicate-identity decision needs a
+        // view of the whole table that a batch-at-a-time import cannot have.
+        // `catalog:validate` is the only stage that publishes.
+        expect(outcome.counts.candidates).toBe(subjects.length);
+        expect(outcome.counts.quarantined).toBe(0);
+        expect(outcome.counts.rejected).toBe(0);
+
+        const rows = await storedFoods();
+        expect(rows).toHaveLength(subjects.length);
+        expect(rows.map((row) => row.source_key)).toEqual(
+            subjects.map((entry) => `usda:${entry.fdcId}`).sort(),
+        );
+
+        for (const entry of subjects) {
+            const row = await storedFood(`usda:${entry.fdcId}`);
+            expect(row.usda_fdc_id).toBe(entry.fdcId);
+            expect(row.publication_status).toBe('candidate');
+            expect(row.canonical_name).toBe(entry.canonicalName);
+            expect(row.identity_source).toBe('usda');
+            // Every record this stage writes is source-backed by construction:
+            // an AI-estimated food can only come from `catalog:generate`.
+            expect(row.nutrition_provenance).toBe('source_backed');
+            expect(row.nutrition_basis).toBe('per_100g');
+            expect(Number(row.basis_amount)).toBe(100);
+            expect(Number(row.calories)).toBeCloseTo(CLEAN_CALORIES, 6);
+            expect(row.imported_at).toEqual(IMPORT_AT);
+
+            const aliases = await prisma.catalog_food_aliases.findMany({
+                where: { catalog_food_id: row.id },
+                select: { alias: true },
+            });
+            expect(aliases.length).toBeGreaterThan(0);
+
+            const portions = await prisma.catalog_food_portions.findMany({
+                where: { catalog_food_id: row.id },
+                select: { description: true, gram_weight: true, is_default: true, source: true },
+            });
+            // Exactly one default, always: `catalog_food_portions` carries a
+            // partial unique index on `(catalog_food_id) WHERE is_default`, so
+            // a second default is a write that FAILS the run's transaction
+            // rather than a row a later check could report.
+            expect(portions.filter((portion) => portion.is_default)).toHaveLength(1);
+            for (const portion of portions) {
+                expect(Number(portion.gram_weight)).toBeGreaterThan(0);
+            }
+
+            const record = await prisma.catalog_validation_records.findUnique({
+                where: { catalog_food_id: row.id },
+                select: { outcome: true, publication_status: true },
+            });
+            // AAP §0.1.1 requires a machine-readable validation record for
+            // every item, so the row and its record are written together or
+            // not at all.
+            expect(record).not.toBeNull();
+            expect(record?.publication_status).toBe('candidate');
+        }
+    });
+
+    it('leaves the generated search vector to the database and still lands searchable', async () => {
+        const vendor = recordingVendor({ records: recordsFor(subjects) });
+        const harness = importHarness({ entries: subjects, vendor });
+
+        await runImport(harness.deps);
+
+        // `search_vector` is `GENERATED ALWAYS AS ... STORED`, so PostgreSQL
+        // rejects any write that names it. The import completing at all is
+        // therefore the proof that it supplies only `search_text` — and the
+        // vector being populated is the proof the column is doing its job
+        // rather than sitting empty behind a column the stage forgot.
+        const rows = await prisma.$queryRaw<{ source_key: string; lexemes: number; search_text: string | null }[]>`
+            SELECT source_key,
+                   coalesce(array_length(tsvector_to_array(search_vector), 1), 0)::int AS lexemes,
+                   search_text
+            FROM catalog_foods
+            WHERE identity_source = 'usda'
+            ORDER BY source_key
+        `;
+
+        expect(rows).toHaveLength(subjects.length);
+        for (const row of rows) {
+            expect(row.search_text).not.toBeNull();
+            expect(Number(row.lexemes)).toBeGreaterThan(0);
+        }
+    });
+
+    it('answers a second run of a completed scope without fetching or writing again', async () => {
+        const first = importHarness({
+            entries: subjects,
+            vendor: recordingVendor({ records: recordsFor(subjects) }),
+        });
+        const firstOutcome = await runImport(first.deps);
+        const before = await storedFoods();
+        const runBefore = await importRunRow();
+        expect(runBefore?.status).toBe('succeeded');
+
+        // A fresh vendor and a fresh harness, so nothing carries over but the
+        // database — which is the only thing a real second invocation shares.
+        const secondVendor = recordingVendor({ records: recordsFor(subjects) });
+        const second = importHarness({ entries: subjects, vendor: secondVendor });
+        const secondOutcome = await runImport(second.deps);
+        const after = await storedFoods();
+        const runAfter = await importRunRow();
+
+        // A SUCCEEDED (kind, manifestVersion) pair is a permanent no-op, and
+        // the stage stops at the claim rather than redoing the scope: so the
+        // second invocation spends no vendor request at all. This is the
+        // cheapest and most decisive evidence that nothing was rewritten —
+        // stronger than comparing timestamps, which a fixed clock would make
+        // equal either way.
+        expect(secondVendor.batchCalls).toEqual([]);
+        expect(secondOutcome.resumed).toBe(true);
+        expect(secondOutcome.processedBatches).toBe(0);
+        // The counts it reports are the stored ones from the run that did the
+        // work, replayed verbatim — not a fresh zeroed set that would read as
+        // "this scope imported nothing".
+        expect(secondOutcome.counts.inserted).toBe(firstOutcome.counts.inserted);
+        expect(secondOutcome.runId).toBe(firstOutcome.runId);
+
+        expect(runAfter?.id).toBe(runBefore?.id);
+        expect(runAfter?.status).toBe('succeeded');
+        expect(runAfter?.finished_at).toEqual(runBefore?.finished_at);
+        expect(runAfter?.counts).toEqual(runBefore?.counts);
+
+        expect(after).toHaveLength(before.length);
+        expect(after.map((row) => row.id)).toEqual(before.map((row) => row.id));
+        // `imported_at` is written once on insert and never on update, so it is
+        // the field that would betray a row having been recreated.
+        expect(after.map((row) => row.imported_at)).toEqual(before.map((row) => row.imported_at));
+    });
+
+    it('collapses the same vendor id listed twice in the manifest to one row', async () => {
+        const [entry] = subjects;
+        const listedTwice = [entry, entry];
+        const vendor = recordingVendor({ records: recordsFor([entry]) });
+        const harness = importHarness({ entries: listedTwice, vendor });
+
+        const outcome = await runImport(harness.deps);
+
+        // Collapsed in the PLAN, not merely deduplicated by the upsert: the
+        // record is fetched once and counted once, so the duplicate costs no
+        // vendor request. Counting it twice would also overstate every
+        // per-category total in the report.
+        expect(outcome.counts.planned).toBe(1);
+        expect(outcome.counts.skippedDuplicateInPlan).toBe(1);
+        expect(outcome.counts.inserted).toBe(1);
+        expect(vendor.batchCalls).toEqual([[entry.fdcId]]);
+
+        const rows = await storedFoods();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].source_key).toBe(`usda:${entry.fdcId}`);
+    });
+
+    it('records a vendor id the batch did not answer for without writing a row', async () => {
+        const [present, absent] = subjects;
+        // The vendor answers for one of the two ids it was asked about, which
+        // FoodData Central really does when an id has been withdrawn.
+        const vendor = recordingVendor({ records: recordsFor([present]) });
+        const harness = importHarness({ entries: subjects, vendor });
+
+        const outcome = await runImport(harness.deps);
+
+        expect(outcome.counts.missingFromVendor).toBe(1);
+        expect(outcome.counts.inserted).toBe(1);
+
+        const rows = await storedFoods();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].source_key).toBe(`usda:${present.fdcId}`);
+        // A missing record is an absence, never a placeholder row: a food with
+        // no nutrients would reach search as a real result.
+        expect(rows.map((row) => row.source_key)).not.toContain(`usda:${absent.fdcId}`);
+    });
+});
+
+
+/**
+ * AN INTERRUPTION LEAVES THE WORK IT FINISHED BEHIND.
+ *
+ * The stage checkpoints so that "an interruption resumes rather than restarts",
+ * and the durable arithmetic of that — which cursor index is saved and how the
+ * batch totals accumulate — is pinned by the DB-F11 cases above, which run
+ * against a vendor that returns no records and a database that refuses every
+ * catalog write. This is the other half, and the half those cases cannot see:
+ * the batches that DID complete wrote rows inside their own transactions, and
+ * those rows have to still be there afterwards. A stage that rolled them back
+ * would make a twelve-thousand-record import an all-or-nothing operation, which
+ * is precisely what checkpointing exists to avoid.
+ *
+ * It is also where the upsert convergence is provable. With two batches the
+ * cursor is not saved until the run finishes (`CURSOR_SAVE_EVERY_BATCHES` is 5,
+ * and the final save happens at the last batch), so a failure on the second
+ * batch leaves the saved index at zero and the resume genuinely RE-PROCESSES
+ * the first batch. That is the stage's own promise — "the upserts make the
+ * repeat a no-op" — and the only path on which it can be observed end to end,
+ * because a scope that completed cleanly is answered by the claim instead.
+ */
+describe('an interrupted import keeps what it already wrote', () => {
+    const subjects = IMPORT_SUBJECTS;
+    const firstBatchIds = subjects.slice(0, DETAIL_BATCH_SIZE).map((entry) => entry.fdcId);
+    const secondBatchIds = subjects.slice(DETAIL_BATCH_SIZE).map((entry) => entry.fdcId);
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('plans two batches at the manifest’s batch size', () => {
+        expect(secondBatchIds.length).toBeGreaterThan(0);
+        expect(firstBatchIds).toHaveLength(DETAIL_BATCH_SIZE);
+        expect(firstBatchIds.length + secondBatchIds.length).toBe(subjects.length);
+    });
+
+    it('fails on the second batch as its own error, naming the batch that stopped', async () => {
+        const vendor = recordingVendor({ records: recordsFor(subjects), failOnCall: 2 });
+        const harness = importHarness({ entries: subjects, vendor });
+
+        const failure = await runImport(harness.deps).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        // Wrapped at the boundary (§9), so nothing upstream is left reading a
+        // shape `usda.service.ts` owns. The enumeration side of this is proven
+        // above and defers the batch side to a run against the real client —
+        // this is that run, and the batch context is what the vendor's own
+        // error cannot carry.
+        expect(failure).toBeInstanceOf(CatalogImportError);
+        const wrapped = failure as CatalogImportError;
+        expect(wrapped.code).toBe('usda_request_failed');
+        expect(wrapped.context.batchIndex).toBe(1);
+        expect(wrapped.context.fdcIds).toEqual(secondBatchIds);
+        expect((wrapped.underlying as Error).name).toBe('UsdaError');
+        expect(describeFailure(wrapped).code).toBe('usda_request_failed');
+    });
+
+    it('settles the run as failed and keeps the first batch’s rows', async () => {
+        const vendor = recordingVendor({ records: recordsFor(subjects), failOnCall: 2 });
+        const harness = importHarness({ entries: subjects, vendor });
+
+        await expect(runImport(harness.deps)).rejects.toBeInstanceOf(CatalogImportError);
+
+        const run = await importRunRow();
+        // 'failed', not 'running': a row left running for ever cannot be told
+        // from an attempt still in flight, which is exactly the read
+        // `catalog:validate`'s prerequisite check makes.
+        expect(run?.status).toBe('failed');
+        expect(run?.finished_at).not.toBeNull();
+
+        const rows = await storedFoods();
+        expect(rows).toHaveLength(firstBatchIds.length);
+        expect(rows.map((row) => row.source_key).sort()).toEqual(
+            firstBatchIds.map((fdcId) => `usda:${fdcId}`).sort(),
+        );
+
+        // And they are complete rows, not half-written ones: the per-batch
+        // transaction commits a food with its aliases, portions and validation
+        // record together or not at all.
+        for (const row of rows) {
+            expect(row.publication_status).toBe('candidate');
+            const portions = await prisma.catalog_food_portions.count({ where: { catalog_food_id: row.id } });
+            const record = await prisma.catalog_validation_records.count({ where: { catalog_food_id: row.id } });
+            expect(portions).toBeGreaterThan(0);
+            expect(record).toBe(1);
+        }
+    });
+
+    it('converges on the same rows when the resume re-processes the first batch', async () => {
+        const interrupted = recordingVendor({ records: recordsFor(subjects), failOnCall: 2 });
+        await expect(runImport(importHarness({ entries: subjects, vendor: interrupted }).deps)).rejects.toBeInstanceOf(
+            CatalogImportError,
+        );
+
+        const before = await storedFoods();
+        expect(before).toHaveLength(firstBatchIds.length);
+        const failedRun = await importRunRow();
+        expect(failedRun?.status).toBe('failed');
+
+        const resumed = recordingVendor({ records: recordsFor(subjects) });
+        const outcome = await runImport(importHarness({ entries: subjects, vendor: resumed }).deps);
+
+        // The same run row is continued rather than a second one opened beside
+        // it: `openOrResumeRun` reopens a failed row through its retry path.
+        expect(outcome.resumed).toBe(true);
+        expect(outcome.runId).toBe(failedRun?.id);
+        const settledRun = await importRunRow();
+        expect(settledRun?.id).toBe(failedRun?.id);
+        expect(settledRun?.status).toBe('succeeded');
+
+        // No cursor advanced before the failure, so this invocation re-does
+        // both batches — and re-doing the first one is the point.
+        expect(resumed.batchCalls).toEqual([firstBatchIds, secondBatchIds]);
+
+        const after = await storedFoods();
+        expect(after).toHaveLength(subjects.length);
+        // Twenty recognised and rewritten in place, eight new. If the repeat
+        // had inserted instead of updating, this would read 28 and 0 — and the
+        // table would carry duplicates.
+        expect(outcome.counts.updated).toBe(firstBatchIds.length);
+        expect(outcome.counts.inserted).toBe(secondBatchIds.length);
+
+        // Identity survives the repeat, which is what every
+        // `recipe_ingredients` and `meal_entries` reference taken against the
+        // first attempt depends on.
+        const byKey = new Map(after.map((row) => [row.source_key, row]));
+        for (const row of before) {
+            const survivor = byKey.get(row.source_key);
+            expect(survivor?.id).toBe(row.id);
+            expect(survivor?.imported_at).toEqual(row.imported_at);
+        }
+
+        // One row per vendor id across the whole plan, and one default portion
+        // each — the two invariants a duplicating repeat would break first.
+        expect(new Set(after.map((row) => row.source_key)).size).toBe(after.length);
+        for (const row of after) {
+            const defaults = await prisma.catalog_food_portions.count({
+                where: { catalog_food_id: row.id, is_default: true },
+            });
+            expect(defaults).toBe(1);
+        }
+    });
+});
+
+
+/**
+ * THE RECORDED VENDOR SHAPES, DRIVEN THROUGH THE RUN.
+ *
+ * `data/meal-planning/fixtures/usda-detail-samples.json` records the response
+ * shapes FoodData Central really returns, including the five awkward ones its
+ * own notes mark MANDATORY EDGE CASE. The cases below take those payloads
+ * verbatim and assert what the ORCHESTRATION does with them — which
+ * `publication_status` the row lands in, which counter moves, what reaches
+ * `catalog_food_portions`. What a check's bound is, and whether a number sits
+ * inside it, belongs to `catalog.logic.test.ts` and is not re-derived here.
+ *
+ * Only the `payload` member of a sample is vendor JSON. Every sibling — `note`,
+ * `endpoint`, `consumedBy`, `expected*` — is annotation written for a reader,
+ * and passing one to the stage would be asserting against the fixture's prose
+ * rather than against USDA's shape. The fixture's own `readingGuide` states
+ * that rule; these cases follow it.
+ */
+interface FixtureSample {
+    readonly payload: UsdaFoodDetail;
+}
+
+interface DetailSamplesFixture {
+    readonly fixtureVersion: string;
+    readonly nutrientNumbers: {
+        readonly protein: string;
+        readonly fat: string;
+        readonly carbs: string;
+        readonly calories: string;
+        readonly caloriesFallbackFormula: string;
+    };
+    readonly portionSamples: Readonly<Record<string, FixtureSample>>;
+    readonly detailResponses: Readonly<Record<string, FixtureSample>>;
+}
+
+const detailSamples: DetailSamplesFixture = readJsonFile<DetailSamplesFixture>(
+    fixturePath('usda-detail-samples.json'),
+);
+
+const portionSample = (name: string): UsdaFoodDetail => {
+    const sample = detailSamples.portionSamples[name];
+    expect(sample).toBeDefined();
+    expect(sample.payload).toBeDefined();
+
+    return sample.payload;
+};
+
+/**
+ * A curated entry standing in for a recorded payload's vendor id.
+ *
+ * The category comes from a real reviewed entry, so the record is judged
+ * against a real category's bounds rather than one invented here, and the
+ * payload supplies everything the import actually reads from the vendor: the
+ * per-100 g nutrients and the portions.
+ */
+const entryStandingIn = (category: string, fdcId: number): CuratedEntry => {
+    const base = curatedIn(category)[0];
+    expect(base).toBeDefined();
+
+    return { ...base, fdcId };
+};
+
+const withoutNutrient = (detail: UsdaFoodDetail, nutrientNumber: string): UsdaFoodDetail => ({
+    ...detail,
+    foodNutrients: (detail.foodNutrients ?? []).filter(
+        (entry) => String(entry.nutrient?.number ?? entry.nutrientNumber ?? '') !== nutrientNumber,
+    ),
+});
+
+const nutrientAmount = (detail: UsdaFoodDetail, nutrientNumber: string): number => {
+    const found = (detail.foodNutrients ?? []).find(
+        (entry) => String(entry.nutrient?.number ?? entry.nutrientNumber ?? '') === nutrientNumber,
+    );
+    expect(found).toBeDefined();
+    const amount = found?.amount ?? found?.value;
+    expect(typeof amount).toBe('number');
+
+    return amount as number;
+};
+
+interface SingleRecordRun {
+    readonly outcome: Awaited<ReturnType<typeof runImport>>;
+    readonly row: StoredFoodRow;
+}
+
+const importOneRecord = async (entry: CuratedEntry, payload: UsdaFoodDetail): Promise<SingleRecordRun> => {
+    const records = new Map<number, UsdaFoodDetail>([[entry.fdcId, payload]]);
+    const harness = importHarness({ entries: [entry], vendor: recordingVendor({ records }) });
+    const outcome = await runImport(harness.deps);
+
+    return { outcome, row: await storedFood(`usda:${entry.fdcId}`) };
+};
+
+const portionsOf = async (foodId: string): Promise<{ description: string; gram_weight: unknown; is_default: boolean; source: string | null }[]> =>
+    prisma.catalog_food_portions.findMany({
+        where: { catalog_food_id: foodId },
+        orderBy: { description: 'asc' },
+        select: { description: true, gram_weight: true, is_default: true, source: true },
+    }) as unknown as Promise<{ description: string; gram_weight: unknown; is_default: boolean; source: string | null }[]>;
+
+const assumptionsOf = async (foodId: string): Promise<string[]> => {
+    const record = await prisma.catalog_validation_records.findUnique({
+        where: { catalog_food_id: foodId },
+        select: { nutrition_assumptions: true },
+    });
+    const raw = (record as { nutrition_assumptions?: string | null } | null)?.nutrition_assumptions;
+    if (raw === null || raw === undefined) {
+        return [];
+    }
+
+    // A JSON-encoded array in a TEXT column, which is what the release
+    // exporter parses back to the array the release format states.
+    const parsed: unknown = JSON.parse(raw);
+
+    return Array.isArray(parsed) ? parsed.map((entry) => String(entry)) : [];
+};
+
+describe('the recorded vendor shapes the import has to survive', () => {
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('reads the fixture the manifest points at, at the version it declares', () => {
+        expect(detailSamples.fixtureVersion).toBe('v1');
+        // The numbers the stage selects on are the manifest's, and the fixture
+        // records the same four. A divergence between the two documents would
+        // make every case below assert against a nutrient nobody reads.
+        expect(detailSamples.nutrientNumbers.protein).toBe(manifest.nutrientNumbers.protein);
+        expect(detailSamples.nutrientNumbers.carbs).toBe(manifest.nutrientNumbers.carbs);
+        expect(detailSamples.nutrientNumbers.fat).toBe(manifest.nutrientNumbers.fat);
+        expect(detailSamples.nutrientNumbers.calories).toBe(manifest.nutrientNumbers.calories);
+        expect(detailSamples.nutrientNumbers.caloriesFallbackFormula).toBe(manifest.caloriesFallback);
+    });
+
+    it('takes per-100 g nutrients from the nested detail shape', async () => {
+        const payload = portionSample('srLegacyPortions');
+        const entry = entryStandingIn('produce_vegetable', payload.fdcId);
+
+        const { outcome, row } = await importOneRecord(entry, payload);
+
+        // A detail record nests the descriptor — `nutrient.number` with
+        // `amount` — where a search result flattens it. Both shapes reach this
+        // stage, and reading only the flat one would leave every Foundation and
+        // SR Legacy record with no nutrients at all.
+        expect(outcome.counts.inserted).toBe(1);
+        expect(Number(row.calories)).toBeCloseTo(nutrientAmount(payload, manifest.nutrientNumbers.calories), 6);
+        expect(row.nutrition_basis).toBe('per_100g');
+        expect(Number(row.basis_amount)).toBe(100);
+    });
+
+    describe('a record the source states no energy for', () => {
+        it('derives calories from the manifest’s documented fallback and records the assumption', async () => {
+            const complete = portionSample('srLegacyPortions');
+            const payload = withoutNutrient(complete, manifest.nutrientNumbers.calories);
+            const entry = entryStandingIn('produce_vegetable', payload.fdcId);
+
+            const protein = nutrientAmount(payload, manifest.nutrientNumbers.protein);
+            const carbs = nutrientAmount(payload, manifest.nutrientNumbers.carbs);
+            const fat = nutrientAmount(payload, manifest.nutrientNumbers.fat);
+            const expected = Math.round((4 * protein + 4 * carbs + 9 * fat) * 100) / 100;
+
+            const { outcome, row } = await importOneRecord(entry, payload);
+
+            // Imported, not refused: energy is the one core nutrient the stage
+            // can honestly reconstruct, because the manifest documents the
+            // formula it reconstructs it with.
+            expect(outcome.counts.inserted).toBe(1);
+            expect(outcome.counts.candidates).toBe(1);
+            expect(outcome.counts.quarantined).toBe(0);
+            expect(outcome.counts.rejected).toBe(0);
+            expect(row.publication_status).toBe('candidate');
+            expect(Number(row.calories)).toBeCloseTo(expected, 6);
+
+            // A derived number has to say so. The validation record is where a
+            // reader learns this food's energy was computed rather than stated,
+            // and a silent derivation would be indistinguishable from a
+            // source-stated value.
+            const assumptions = await assumptionsOf(row.id);
+            expect(assumptions.some((line) => line.includes(manifest.caloriesFallback))).toBe(true);
+        });
+    });
+
+    describe('a record whose portions carry no usable gram weight', () => {
+        /**
+         * Three distinct shapes, and the fixture keeps them separate because a
+         * guard written one way catches some and not others: a portion with no
+         * `gramWeight` member, one with an explicit `0`, one with a
+         * non-numeric string, plus the absent key and the empty array.
+         */
+        const weightless: readonly [string, string][] = [
+            ['portionsWithoutUsableGramWeight', 'produce_fruit'],
+            ['noFoodPortionsKey', 'grain'],
+            ['emptyFoodPortionsArray', 'produce_fruit'],
+        ];
+
+        it.each(weightless)('writes no weightless portion row for %s', async (sampleName, category) => {
+            const payload = portionSample(sampleName);
+            const entry = entryStandingIn(category, payload.fdcId);
+
+            const { row } = await importOneRecord(entry, payload);
+            const portions = await portionsOf(row.id);
+
+            // `gram_weight` is NOT NULL, so an unusable portion is not
+            // persisted as a zero that would later read as a fact and
+            // propagate into recipe nutrition and grocery quantities.
+            for (const portion of portions) {
+                expect(Number(portion.gram_weight)).toBeGreaterThan(0);
+            }
+
+            // What the food keeps instead is the source's own basis restated:
+            // the manifest's 100 g basis portion, which becomes the default
+            // only when the record states no household portion at all. That is
+            // the manifest's declared policy — "a 100 g portion is the source's
+            // own basis restated, not an invented weight" — and it is what lets
+            // a record with no published portions carry a default without one
+            // being fabricated.
+            const basis = manifest.sweepPortionPolicy.basisPortion;
+            const defaults = portions.filter((portion) => portion.is_default);
+            expect(defaults).toHaveLength(1);
+            expect(defaults[0].description).toBe(basis.description);
+            expect(Number(defaults[0].gram_weight)).toBe(basis.gramWeight);
+            expect(defaults[0].source).toBe(basis.source);
+        });
+    });
+
+    describe('a record missing a core nutrient', () => {
+        it('is quarantined, counted, and still written with its validation record', async () => {
+            const complete = portionSample('srLegacyPortions');
+            const payload = withoutNutrient(complete, manifest.nutrientNumbers.protein);
+            const entry = entryStandingIn('produce_vegetable', payload.fdcId);
+
+            const { outcome, row } = await importOneRecord(entry, payload);
+
+            // Quarantined rather than dropped: the row and its machine-readable
+            // record are what let an operator see WHY it is unpublishable and
+            // re-judge it on the next pass once the source fills the gap.
+            expect(row.publication_status).toBe('quarantined');
+            expect(outcome.counts.quarantined).toBe(1);
+            expect(outcome.counts.candidates).toBe(0);
+            expect(outcome.counts.inserted).toBe(1);
+
+            const record = await prisma.catalog_validation_records.findUnique({
+                where: { catalog_food_id: row.id },
+                select: { publication_status: true, outcome: true },
+            });
+            expect(record?.publication_status).toBe('quarantined');
+
+            // A missing nutrient is unknown, never zero: zero is a claim about
+            // the food and would reach a recipe as a real value.
+            expect(row.calories).not.toBeNull();
+            const stored = await prisma.catalog_foods.findUnique({
+                where: { id: row.id },
+                select: { protein_g: true },
+            });
+            expect(stored?.protein_g).toBeNull();
+        });
+    });
+
+    /**
+     * THE TWO NUTRIENT FAMILIES, WHICH MUST NEVER BE INTERCHANGED.
+     *
+     * The fixture's own reading guide calls this "the distinction the whole
+     * file turns on": a search result carries per-100 g nutrients in
+     * `foodNutrients`, while a detail response carries `labelNutrients` that
+     * are ALREADY per serving and are never scaled. The import reads
+     * `foodNutrients` and stores the row on a per-100 g basis; the running
+     * API's branded path reads `labelNutrients`. Confusing the two would not
+     * fail loudly — it would publish a plausible number on the wrong basis, and
+     * every recipe gram weight and grocery quantity derived from it afterwards
+     * would be wrong by the serving size. Nothing else in the suite would catch
+     * it, which is why this case exists.
+     */
+    describe('the per-100 g and per-serving families are never interchanged', () => {
+        it('ignores a per-serving label block sitting beside the per-100 g nutrients', async () => {
+            const perHundredGrams = portionSample('srLegacyPortions');
+            const decoy = detailSamples.detailResponses.brandedDetailComplete;
+            expect(decoy?.payload.labelNutrients).toBeDefined();
+
+            const payload: UsdaFoodDetail = {
+                ...perHundredGrams,
+                // A real recorded per-serving label block, carried alongside a
+                // real recorded per-100 g nutrient array, with the serving size
+                // that would scale it.
+                servingSize: decoy.payload.servingSize,
+                servingSizeUnit: decoy.payload.servingSizeUnit,
+                labelNutrients: decoy.payload.labelNutrients,
+            };
+            const entry = entryStandingIn('produce_vegetable', payload.fdcId);
+
+            const perServingCalories = decoy.payload.labelNutrients?.calories?.value;
+            const per100gCalories = nutrientAmount(perHundredGrams, manifest.nutrientNumbers.calories);
+            // The premise: the two families disagree, so the assertion below
+            // can tell which one was read.
+            expect(perServingCalories).toBeDefined();
+            expect(perServingCalories).not.toBe(per100gCalories);
+
+            const { row } = await importOneRecord(entry, payload);
+
+            expect(Number(row.calories)).toBeCloseTo(per100gCalories, 6);
+            expect(Number(row.calories)).not.toBeCloseTo(perServingCalories as number, 6);
+            expect(row.nutrition_basis).toBe('per_100g');
+            expect(Number(row.basis_amount)).toBe(100);
+        });
+
+        it('imports a generic record that carries no label block at all', async () => {
+            const payload = portionSample('foundationPortions');
+            expect(payload.labelNutrients).toBeUndefined();
+            const entry = entryStandingIn('produce_vegetable', payload.fdcId);
+
+            const { outcome, row } = await importOneRecord(entry, payload);
+
+            // Every Foundation and SR Legacy record is this shape, so a stage
+            // that needed `labelNutrients` would import none of them.
+            expect(outcome.counts.inserted).toBe(1);
+            expect(row.publication_status).toBe('candidate');
+            expect(Number(row.calories)).toBeCloseTo(
+                nutrientAmount(payload, manifest.nutrientNumbers.calories),
+                6,
+            );
+        });
+
+        it('is unaffected by a serving size the branded search path would refuse', async () => {
+            const payload: UsdaFoodDetail = { ...portionSample('srLegacyPortions'), servingSize: 0, servingSizeUnit: 'g' };
+            const entry = entryStandingIn('produce_vegetable', payload.fdcId);
+
+            const { outcome, row } = await importOneRecord(entry, payload);
+
+            // A zero serving size is fatal on the per-serving path — scaling by
+            // it would publish a zero-calorie food — and inert here, because
+            // this stage never derives its basis from `servingSize`. The two
+            // paths reading the same field differently is the point.
+            expect(outcome.counts.inserted).toBe(1);
+            expect(row.publication_status).toBe('candidate');
+            expect(Number(row.calories)).toBeCloseTo(
+                nutrientAmount(payload, manifest.nutrientNumbers.calories),
+                6,
+            );
+        });
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE PACING A RUN INSTALLS, AND WHERE IT SITS.
+//
+// `runImport` calls `deps.installRateLimiter()` once and takes it down in a
+// `finally`, and an installed limiter IS a replaced `globalThis.fetch`. WHERE
+// that gate sits is the contract: at the transport it sees every physical
+// attempt, so a logical call USDA answers unusably three times costs four
+// tokens; wrapped around the accessor instead it would see one token per
+// logical call and undercount by up to four. On a key with 1,000 requests an
+// hour that is the difference between staying inside the ceiling and being cut
+// off partway through a 10,000-record import.
+//
+// WHAT IS NOT ASSERTED HERE. The retry ladder's own rules — which statuses are
+// retried, how long it backs off, when it gives up — belong to
+// `src/services/usda.service.ts` and are asserted in `usda.service.test.ts`;
+// the client below reproduces the SHAPE only, driven by the statuses the
+// manifest documents, and exists solely to make one logical call cost several
+// physical ones. The limiter's own arithmetic, its pauses under an empty
+// bucket, its refusals, its URL matching and its configuration reading are all
+// proven above with no database at all. What is left, and lives only here, is
+// the wiring: the gate this stage installs counts attempts rather than calls,
+// spends nothing on a call that never leaves the process, and is taken back
+// down even when the run fails.
+// ---------------------------------------------------------------------------
+
+/**
+ * The retry policy the manifest documents. Read from the same document
+ * `loadUsdaManifest()` reads rather than restated here, and read through a
+ * local type because `UsdaImportLimits` does not declare these fields yet —
+ * so the numbers the cases below compute with are the reviewed ones, and a
+ * manifest edit reports itself in the premise case rather than as arithmetic
+ * that quietly stopped matching.
+ */
+interface UsdaRetryPolicy {
+    readonly maxPhysicalAttemptsPerRequest: number;
+    readonly retriedStatuses: readonly number[];
+    readonly limiterCountsPhysicalAttempts: boolean;
+}
+
+const usdaRetryPolicy: UsdaRetryPolicy = readJsonFile<{ readonly importLimits: UsdaRetryPolicy }>(
+    dataPath(USDA_MANIFEST_FILE),
+).importLimits;
+
+interface PacedTransport {
+    /** One entry per PHYSICAL call, in call order. */
+    readonly urls: string[];
+    readonly fetch: typeof globalThis.fetch;
+}
+
+/**
+ * A transport answering with the given statuses in order, then `fallbackStatus`
+ * once they run out. The ladder below branches on `ok`, so the number of
+ * physical attempts a logical call costs is decided by these answers rather
+ * than by a count written into the client.
+ */
+const pacedTransport = (answers: readonly number[], fallbackStatus: number = 200): PacedTransport => {
+    const urls: string[] = [];
+    const queue = [...answers];
+
+    const transport = async (input: unknown): Promise<Response> => {
+        urls.push(typeof input === 'string' ? input : String(input));
+        const status = queue.length > 0 ? (queue.shift() as number) : fallbackStatus;
+
+        return { ok: status >= 200 && status < 300, status } as unknown as Response;
+    };
+
+    return { urls, fetch: transport as unknown as typeof globalThis.fetch };
+};
+
+interface PacedVendor {
+    readonly usda: RunImportDeps['usda'];
+    /** Logical `getFoodsBatch` calls, however many physical attempts each cost. */
+    readonly logicalCalls: number;
+}
+
+interface PacedVendorOptions {
+    readonly records: ReadonlyMap<number, UsdaFoodDetail>;
+    /** When true the client answers from its own cache and reaches no transport. */
+    readonly servedFromCache?: boolean;
+}
+
+const pacedVendor = (options: PacedVendorOptions): PacedVendor => {
+    const state = { logicalCalls: 0 };
+
+    // `fetchFromUsda`'s shape in miniature: retry a documented status verbatim
+    // up to the manifest's ceiling, then give up as the vendor boundary's own
+    // error. Reproducing the shape is what makes one logical call cost more
+    // than one physical attempt; the rules it imitates are asserted elsewhere.
+    const reachVendor = async (fdcIds: readonly number[]): Promise<void> => {
+        const url = `https://${USDA_HOST}/fdc/v1/foods`;
+
+        for (let attempt = 1; attempt <= usdaRetryPolicy.maxPhysicalAttemptsPerRequest; attempt += 1) {
+            const response = await globalThis.fetch(url);
+            if (response.ok) {
+                return;
+            }
+            if (
+                attempt === usdaRetryPolicy.maxPhysicalAttemptsPerRequest ||
+                !usdaRetryPolicy.retriedStatuses.includes(response.status)
+            ) {
+                throw vendorError(`USDA returned ${response.status} for ${fdcIds.length} ids`);
+            }
+        }
+    };
+
+    return {
+        get logicalCalls(): number {
+            return state.logicalCalls;
+        },
+        usda: {
+            listFoods: async (): Promise<UsdaFoodSummary[]> => [],
+            getFoodsBatch: async (fdcIds): Promise<UsdaFoodDetail[]> => {
+                state.logicalCalls += 1;
+                if (options.servedFromCache !== true) {
+                    await reachVendor(fdcIds);
+                }
+
+                return fdcIds
+                    .map((fdcId) => options.records.get(fdcId))
+                    .filter((record): record is UsdaFoodDetail => record !== undefined);
+            },
+            describeBatchRetrieval: async (fdcIds): Promise<UsdaBatchRetrieval> => retrieval(fdcIds),
+        },
+    };
+};
+
+interface PacedInstallation {
+    readonly limiter: UsdaRateLimiter;
+    readonly transport: PacedTransport;
+    /** What `globalThis.fetch` must be again once the run has taken its gate down. */
+    readonly underlying: typeof globalThis.fetch;
+    readonly installRateLimiter: () => () => void;
+}
+
+/**
+ * The shipped configuration over a transport this file owns: the manifest's
+ * 900 requests an hour and the module's default burst, both far above the
+ * handful of attempts any case here makes, so nothing below pauses. Time is
+ * injected all the same, so a case that did pause would not wait for it.
+ */
+const pacedInstallation = (answers: readonly number[], fallbackStatus?: number): PacedInstallation => {
+    const transport = pacedTransport(answers, fallbackStatus);
+    globalThis.fetch = transport.fetch;
+
+    const clock = createClock();
+    const limiter = createUsdaRateLimiter({
+        requestsPerHour: manifest.importLimits.configuredRequestsPerHour,
+        burstCapacity: DEFAULT_BURST_CAPACITY,
+        now: clock.read,
+        sleep: clock.sleep,
+        ledger: createProcessLocalUsdaRateLedger({ scope: TEST_SCOPE }),
+    });
+
+    return {
+        limiter,
+        transport,
+        underlying: transport.fetch,
+        installRateLimiter: (): (() => void) => limiter.install(),
+    };
+};
+
+const reportedUsdaRequests = (report: unknown): Record<string, unknown> =>
+    (report as { usdaRequests: Record<string, unknown> }).usdaRequests;
+
+describe('the pacing a run installs at the transport', () => {
+    const originalFetch = globalThis.fetch;
+
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    // Unconditional, and not tidiness. An installed limiter is a replaced
+    // `globalThis.fetch`, and Jest runs every suite in this file in one
+    // process: a gate left standing would pace — and once its bucket emptied,
+    // stall for an hour of injected time it no longer controls — the fetch of
+    // every later suite, none of which asked to be paced.
+    afterEach(() => {
+        globalThis.fetch = originalFetch;
+    });
+
+    it('takes the physical-attempt policy from the manifest that documents it', () => {
+        // The premise the arithmetic below rests on, read rather than restated:
+        // a retryable answer is retried verbatim, so the token cost of one
+        // logical call is not one, and the limiter is declared to count the
+        // attempts rather than the calls.
+        expect(usdaRetryPolicy.limiterCountsPhysicalAttempts).toBe(true);
+        expect(usdaRetryPolicy.maxPhysicalAttemptsPerRequest).toBeGreaterThan(1);
+        expect(usdaRetryPolicy.retriedStatuses.length).toBeGreaterThanOrEqual(
+            usdaRetryPolicy.maxPhysicalAttemptsPerRequest,
+        );
+    });
+
+    it('spends one token per physical attempt, not one per logical call', async () => {
+        const entry = IMPORT_SUBJECTS[0];
+        // One unusable answer short of the ceiling, drawn from the statuses the
+        // manifest documents, so the attempt that finally succeeds is the last
+        // one the policy allows: the most expensive logical call there is.
+        const answers = usdaRetryPolicy.retriedStatuses.slice(
+            0,
+            usdaRetryPolicy.maxPhysicalAttemptsPerRequest - 1,
+        );
+        const paced = pacedInstallation(answers);
+        const vendor = pacedVendor({ records: new Map([[entry.fdcId, cleanDetail(entry)]]) });
+        const harness = importHarness({
+            entries: [entry],
+            vendor,
+            installRateLimiter: paced.installRateLimiter,
+            rateLimiterStats: () => paced.limiter.stats(),
+        });
+
+        const outcome = await runImport(harness.deps);
+        const expected = usdaRetryPolicy.maxPhysicalAttemptsPerRequest;
+
+        // The premise: one logical batch call that cost four physical fetches,
+        // because the transport answered unusably three times first.
+        expect(vendor.logicalCalls).toBe(1);
+        expect(paced.transport.urls).toHaveLength(expected);
+
+        const stats = paced.limiter.stats();
+        expect(stats.attempts).toBe(expected);
+        expect(stats.attempts).not.toBe(vendor.logicalCalls);
+        expect(stats.attemptsInWindow).toBe(expected);
+        expect(stats.pauses).toBe(0);
+        expect(stats.totalPausedMs).toBe(0);
+
+        // A retried answer is a successful call that cost more than one token,
+        // never a failed import.
+        expect(outcome.counts.inserted).toBe(1);
+        const row = await storedFood(`usda:${entry.fdcId}`);
+        expect(row.publication_status).toBe('candidate');
+
+        // The counters the report carries come from the limiter this run
+        // installed, which is what makes the reported figure the one the key's
+        // hour was really charged.
+        const block = reportedUsdaRequests(harness.reports[0]);
+        expect(block.attempts).toBe(expected);
+        expect(block.unmeasured).toBe(false);
+
+        expect(globalThis.fetch).toBe(paced.underlying);
+    });
+
+    it('spends nothing on a logical call it answers without reaching the vendor', async () => {
+        const entry = IMPORT_SUBJECTS[0];
+        const paced = pacedInstallation([]);
+        const vendor = pacedVendor({
+            records: new Map([[entry.fdcId, cleanDetail(entry)]]),
+            servedFromCache: true,
+        });
+        const harness = importHarness({
+            entries: [entry],
+            vendor,
+            installRateLimiter: paced.installRateLimiter,
+            rateLimiterStats: () => paced.limiter.stats(),
+        });
+
+        const outcome = await runImport(harness.deps);
+
+        // The logical call was made and the record landed, so the allowance was
+        // not saved by the stage simply doing less.
+        expect(vendor.logicalCalls).toBe(1);
+        expect(outcome.counts.inserted).toBe(1);
+
+        // A gate around the accessor would have charged the key's hour for a
+        // call that never left the process — and on a cache-warm rerun of the
+        // whole curation, for the entire hour.
+        expect(paced.transport.urls).toHaveLength(0);
+
+        const stats = paced.limiter.stats();
+        expect(stats.attempts).toBe(0);
+        expect(stats.attemptsInWindow).toBe(0);
+        expect(stats.firstAttemptAt).toBeNull();
+        expect(stats.lastAttemptAt).toBeNull();
+
+        // Reported as a measured zero, which here is a fact rather than an
+        // absence: the limiter was installed for the whole run and saw nothing.
+        const block = reportedUsdaRequests(harness.reports[0]);
+        expect(block.unmeasured).toBe(false);
+        expect(block.attempts).toBe(0);
+    });
+
+    it('takes its gate back down when the run fails', async () => {
+        const entry = IMPORT_SUBJECTS[0];
+        // Unusable on every attempt, so the ladder exhausts the ceiling and the
+        // vendor boundary gives up rather than the queue quietly running out.
+        const paced = pacedInstallation([], 503);
+        const vendor = pacedVendor({ records: new Map([[entry.fdcId, cleanDetail(entry)]]) });
+        const harness = importHarness({
+            entries: [entry],
+            vendor,
+            installRateLimiter: paced.installRateLimiter,
+        });
+
+        // That a vendor failure arrives as this stage's own error, naming the
+        // batch it stopped on, is asserted where the batch path is. Here it is
+        // only the precondition that the run really did fail.
+        await expect(runImport(harness.deps)).rejects.toBeInstanceOf(CatalogImportError);
+
+        // The point of the case: `restoreFetch()` sits in a `finally`, so a run
+        // that throws leaves no paced fetch behind for whatever runs next in
+        // the same process — the importer's own `main()` included.
+        expect(globalThis.fetch).toBe(paced.underlying);
+
+        // Allowance spent is allowance spent. The attempts USDA answered
+        // unusably still came off the key's hour, and a ledger that forgot them
+        // would let the next run overspend the ceiling by exactly what the
+        // failed one had already used.
+        expect(vendor.logicalCalls).toBe(1);
+        expect(paced.transport.urls).toHaveLength(usdaRetryPolicy.maxPhysicalAttemptsPerRequest);
+        expect(paced.limiter.stats().attempts).toBe(usdaRetryPolicy.maxPhysicalAttemptsPerRequest);
+
+        const run = await importRunRow();
+        expect(run?.status).toBe('failed');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// WHAT A FAILING RUN RECORDS, AND WHAT IT IS ALLOWED TO SAY.
+//
+// The redaction functions are proven above, exhaustively and without a
+// database, and so is the code every error class is reported under. Neither of
+// those proves the one thing an operator depends on: that a run which really
+// failed puts its reason somewhere durable, and that nothing it prints or
+// stores carries the credential the failure was quoting. Every case above runs
+// on `silentLogger` or on a recorder that captures field OBJECTS before they
+// are serialised, so a stage that logged `error` instead of `safeError(error)`
+// — or put the request URL in a field of its own — would pass all of them.
+//
+// This is the seam where the three writers meet: the thrown value a caller
+// pattern-matches, the JSON line a terminal and CI keep, and the entry
+// `finishRun` stores in `catalog_import_runs.log` for a reader who was not
+// there. They have to agree, and none of them may leak.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fictional vendor key and the request URL that would carry it.
+ *
+ * The value matches no real provider's format on purpose; the SHAPE is what
+ * matters. `usda.service.ts` puts `api_key` in the query string of every
+ * request it builds, so a value thrown from that boundary can quote the
+ * credential verbatim — and this stage's output is read in a terminal, retained
+ * by CI and stored in a JSONB column that gets copied into committed reports.
+ */
+const FAKE_VENDOR_KEY = 'zzNOTAREALKEYzzNOTAREALKEYzz0001';
+const VENDOR_REQUEST_URL = `https://${USDA_HOST}/fdc/v1/foods?api_key=${FAKE_VENDOR_KEY}&format=full`;
+
+interface CapturedLines {
+    readonly raw: string[];
+    readonly parsed: Record<string, unknown>[];
+    readonly logger: ScriptLogger;
+}
+
+/** The real `createLogger`, writing to this file instead of to a terminal. */
+const capturingLogger = (): CapturedLines => {
+    const raw: string[] = [];
+    const parsed: Record<string, unknown>[] = [];
+
+    const logger = createLogger('catalog-import', {
+        write: (line: string): void => {
+            raw.push(line);
+            parsed.push(JSON.parse(line) as Record<string, unknown>);
+        },
+        now: (): Date => IMPORT_AT,
+    });
+
+    return { raw, parsed, logger };
+};
+
+const emittedLine = (captured: CapturedLines, event: string): Record<string, unknown> => {
+    const found = captured.parsed.filter((line) => line.event === event);
+    expect(found).toHaveLength(1);
+
+    return found[0];
+};
+
+interface StoredRunLogEntry {
+    readonly at?: unknown;
+    readonly event?: unknown;
+    readonly error?: Record<string, unknown>;
+}
+
+const failedRunRecord = async (): Promise<{
+    status: string;
+    counts: Record<string, number>;
+    log: StoredRunLogEntry[];
+    rawLog: string;
+}> => {
+    const row = await prisma.catalog_import_runs.findFirst({
+        where: { kind: 'usda_import', manifest_version: IMPORT_RUN_SCOPE },
+        select: { status: true, counts: true, log: true },
+    });
+    expect(row).not.toBeNull();
+    const found = row as unknown as { status: string; counts: unknown; log: unknown };
+
+    return {
+        status: found.status,
+        counts: (found.counts ?? {}) as Record<string, number>,
+        log: Array.isArray(found.log) ? (found.log as StoredRunLogEntry[]) : [],
+        rawLog: JSON.stringify(found.log ?? null),
+    };
+};
+
+describe('what a failing run records and emits', () => {
+    beforeEach(async () => {
+        await truncateFeatureTables();
+    });
+
+    it('leaves a durable failure record, in the same words it printed', async () => {
+        const entry = IMPORT_SUBJECTS[0];
+        const captured = capturingLogger();
+        const vendor = recordingVendor({
+            records: recordsFor([entry]),
+            failOnCall: 1,
+            failWith: () => vendorError(`USDA returned 503 for ${VENDOR_REQUEST_URL}`),
+        });
+        const harness = importHarness({ entries: [entry], vendor, logger: captured.logger });
+
+        const failure = await runImport(harness.deps).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        // Class and typed field, never message text — and the vendor's own
+        // class reaches no caller (§9).
+        expect(failure).toBeInstanceOf(CatalogImportError);
+        expect((failure as CatalogImportError).code).toBe('usda_request_failed');
+        expect((failure as Error).name).not.toBe('UsdaError');
+
+        // THE DURABLE HALF. `finishRun` writes the reason in the same statement
+        // as the status, so a crashed attempt is distinguishable from one still
+        // in flight by a reader who was not at the terminal — which is exactly
+        // what `catalog:validate`'s prerequisite read has to decide.
+        const run = await failedRunRecord();
+        expect(run.status).toBe('failed');
+
+        const stored = run.log.filter((line) => line.event === 'run_failed');
+        expect(stored).toHaveLength(1);
+        // Members, not order. `sanitizeRunLogEntry` writes `at` and `event`
+        // first and says so, but the entry lands in a JSONB column and
+        // PostgreSQL keeps JSONB keys sorted by length then bytes, so a
+        // writer's ordering does not survive the round trip and asserting it
+        // here would pin a contract the database does not offer. The PRINTED
+        // line is a string and does keep its order; that is asserted below.
+        expect(Object.keys(stored[0]).sort()).toEqual(['at', 'error', 'event']);
+        expect(typeof stored[0].at).toBe('string');
+        // Exactly two members, which is what "never the raw error object" (§8)
+        // amounts to on the wire: a raw `Error` serialises to `{}` and a
+        // hand-rolled renderer keeping the stack would serialise three.
+        expect(Object.keys(stored[0].error ?? {})).toEqual(['name', 'message']);
+
+        // The partial work survives the closure. A run closed `failed` with an
+        // empty `counts` would say a run that planned work planned none.
+        expect(run.counts.planned).toBe(1);
+        expect(run.counts.inserted).toBe(0);
+
+        // THE PRINTED HALF, through the real logger: JSON Lines, and the four
+        // envelope members leading every line. A reader — or a CI log parser —
+        // gets the same four fields from every line this stage ever writes.
+        expect(captured.raw).not.toHaveLength(0);
+        for (const line of captured.parsed) {
+            expect(Object.keys(line).slice(0, 4)).toEqual(['ts', 'level', 'scope', 'event']);
+            expect(line.scope).toBe('catalog-import');
+            expect(line.ts).toBe(IMPORT_AT.toISOString());
+        }
+
+        const printed = emittedLine(captured, 'run_failed');
+        expect(printed.level).toBe('error');
+        expect(printed.code).toBe('usda_request_failed');
+        expect(Object.keys(printed.error as Record<string, unknown>)).toEqual(['name', 'message']);
+
+        // The two writers have to agree: an operator reading the terminal and
+        // one reading the row months later must be reading the same failure,
+        // not two renderings that diverged.
+        expect((printed.error as { message: string }).message).toBe(
+            (stored[0].error as { message: string }).message,
+        );
+
+        for (const line of captured.raw) {
+            expect(line).not.toContain(FAKE_VENDOR_KEY);
+        }
+        expect(run.rawLog).not.toContain(FAKE_VENDOR_KEY);
+
+        // WHAT MUST STILL APPEAR. The host is not a secret and is the first
+        // thing an operator needs — "which service refused" is the difference
+        // between reading the vendor's status page and reading code. So the
+        // assertion is deliberately not "no URL survives": the path and the
+        // non-credential query stay legible, and only the credential is
+        // replaced. `hostOf` is what a field carries the host as.
+        const message = (stored[0].error as { message: string }).message;
+        expect(message).toContain(hostOf(VENDOR_REQUEST_URL));
+        expect(message).toContain('api_key=');
+        expect(message).not.toContain(`api_key=${FAKE_VENDOR_KEY}`);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// This section's own guard, declared last so it runs last.
+//
+// `globalThis.fetch` is process-wide and the cases above replace it twice over
+// — once with a transport of their own, once more when the stage installs its
+// limiter over it. Jest runs every suite in this file in one process, so a
+// single unrestored installation would silently pace, and then stall, whatever
+// ran next. Each case restores, but "each case restores" is a claim, and this
+// is the one place it can be checked rather than asserted in a comment.
+// ---------------------------------------------------------------------------
+describe('this section leaves the process as it found it', () => {
+    // Captured while Jest is still collecting, so it is the reference the
+    // process started with rather than whatever some case left installed. The
+    // check is IDENTITY, not callability: a paced wrapper is callable too, and
+    // on Node 22 `globalThis.fetch` is itself a JavaScript function over
+    // undici rather than native code, so there is no shape to recognise — only
+    // the original object.
+    const pristineFetch = globalThis.fetch;
+
+    it('hands back the transport every other suite shares', () => {
+        expect(globalThis.fetch).toBe(pristineFetch);
+    });
+});
+
