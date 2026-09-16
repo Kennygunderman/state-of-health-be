@@ -1,5 +1,21 @@
 Backend platform for: https://github.com/Kennygunderman/state-of-health-tracker
 
+## Meal planning
+
+Meal planning is documented under `docs/meal-planning/`:
+
+- [`README.md`](./docs/meal-planning/README.md) — setup and every command in execution order; the catalog release and the recipe seed must be loaded and verified before the feature is enabled.
+- [`api.md`](./docs/meal-planning/api.md) — the endpoint contracts.
+- [`catalog-policy.md`](./docs/meal-planning/catalog-policy.md) — the coverage plan, validation checks and bounds, provenance model, evidence policy and benchmark thresholds.
+- [`planning-policy.md`](./docs/meal-planning/planning-policy.md) — the target-estimate, planning-constraint and grocery-aggregation policies.
+- [`release-and-recovery.md`](./docs/meal-planning/release-and-recovery.md) — the operator release order and rollback.
+- [`requirement-evidence-checklist.md`](./docs/meal-planning/requirement-evidence-checklist.md) — requirement → evidence mapping.
+
+Before running anything:
+
+- `MEAL_PLANNING_ENABLED` is off unless it is exactly `true`, and until it is set the meal-planning and recipe routes answer `503 feature_disabled`; `/catalog/*` and `/meal-planning/targets*` are never gated.
+- The schema is applied by `npx prisma migrate deploy` at container boot; `prisma/manual-migrations/meal-planning/` is a reference copy for operators that no tooling runs.
+
 ## Running the test suite
 
 The suite truncates tables, so it runs only against a database it has checked.
