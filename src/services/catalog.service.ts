@@ -100,15 +100,18 @@
 //    the response contract, which is `catalog.mapper.ts`'s `CatalogMappingError`
 //    and belongs to that boundary.
 //
-// THIS SERVICE IS THE MEASURED UNIT OF THE SEARCH BENCHMARK — BY CONTRACT, NOT
-// YET BY MEASUREMENT. `data/meal-planning/search-benchmark.v1.json` names
+// THIS SERVICE IS THE MEASURED UNIT OF THE SEARCH BENCHMARK.
+// `data/meal-planning/search-benchmark.v1.json` names
 // `catalog.service.searchPublishedFoods` as its `measuredUnit` and declares the
 // protocol around it: one untimed warm-up pass, three timed passes, sequential,
 // a single connection, timed in process so no HTTP round trip is included (AAP
 // §0.9.3). `scripts/search-benchmark.ts` is the runner that contract belongs to,
-// and at this checkpoint it validates its inputs and refuses with
-// `stage_pipeline_pending` — it does not import this module, time anything or
-// write a report — so NO p50/p95 figure for this service exists anywhere yet.
+// and it now carries that measurement body: it imports `searchPublishedFoods`,
+// times it in process under that protocol, scores the rank of every committed
+// query and writes `data/meal-planning/reports/latest/benchmark-report.json`.
+// The p50/p95 figures for this service are therefore whatever that report
+// records for the release and conditions it names — and nothing here may be
+// read as a measured figure on its own.
 //
 // The constraint that contract places on this file holds regardless of when the
 // runner's measurement body lands, because it is what makes a later measurement

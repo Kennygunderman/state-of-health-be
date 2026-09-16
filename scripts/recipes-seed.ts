@@ -56,9 +56,12 @@ import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib
 import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
 import { loadCoveragePlan, ManifestError, recipesDir, writeJsonFile } from './lib/manifest';
 import type { CoveragePlan } from './lib/manifest';
-import { ModelBudgetError } from './lib/budget';
-import { RateLimitConfigError } from './lib/rateLimiter';
-import { CheckpointError } from './lib/checkpoint';
+// Deliberately NOT imported: lib/budget, lib/rateLimiter and lib/checkpoint.
+// This stage reads files and writes rows — it makes no vendor call, meters no
+// model budget, paces no request and keeps no resumable checkpoint — so those
+// modules' error classes are unreachable here. Importing them to classify a
+// failure that cannot happen would load three unrelated modules at startup and
+// tell a reader this stage can exhaust a model budget, which it cannot.
 // The pure derivation layer. Every rule this stage applies to an ingredient set
 // comes from here, and this file adds none of its own (see the header).
 import { normalizeCanonicalName } from '../src/services/catalog.logic';
@@ -1563,6 +1566,24 @@ export interface JoinedRecipeRow {
  * full food row, its two version counters, and canonical names alone — and one
  * fixed return type for all three would be a fiction.
  */
+// WHY THESE WRITES CARRY NO OWNER PREDICATE. Rule backend-architecture §5.1
+// requires `user_id` in every `where`, including updates and deletes, because a
+// write found by id alone is a cross-user write waiting to happen. The recipe
+// and catalog tables are the sanctioned exception, and prisma/schema.prisma and
+// AAP §0.5.1 both say so at the model: `recipes`, `recipe_versions`,
+// `recipe_ingredients` and the two `catalog_*` tables read here hold SHARED
+// REFERENCE DATA with no `user_id` BY DESIGN — every user plans from the same
+// recipe corpus — so there is no tenant to scope to, and adding an owner column
+// would be a mistake rather than a fix. No request-scoped identity can reach
+// this file either: it runs only from an operator CLI, never behind
+// `authenticateFirebaseToken`, so there is no verified token to scope by.
+//
+// The compensating controls are therefore about WHICH DATABASE and WHICH ROW
+// rather than which user. scripts/lib/dbGuard.ts classifies `DATABASE_URL`
+// before any client exists and, because `recipes-seed` is registered
+// `development_or_confirmed`, demands `--confirm-target <dbname>` for any
+// non-development origin; `slug` (unique) selects the recipe and `source_key`
+// selects each ingredient's food, so no write here is found by a bare id.
 export interface SeedDb {
     catalog_foods: {
         findMany<Row = SeedCatalogFoodRow>(args: unknown): Promise<Row[]>;
@@ -2636,15 +2657,6 @@ export const describeFailure = (error: unknown): { code: string; error: { name: 
     }
     if (error instanceof UnitConversionError) {
         return { code: 'unit_conversion_failed', error: safeError(error) };
-    }
-    if (error instanceof ModelBudgetError) {
-        return { code: error.code, error: safeError(error) };
-    }
-    if (error instanceof CheckpointError) {
-        return { code: error.code, error: safeError(error) };
-    }
-    if (error instanceof RateLimitConfigError) {
-        return { code: 'rate_limit_misconfigured', error: safeError(error) };
     }
     return { code: 'unexpected_error', error: safeError(error) };
 };

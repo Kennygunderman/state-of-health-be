@@ -3,13 +3,13 @@
   "catalogRelease": "v1",
   "description": "Fixed query set and measurement contract for internal catalog search (Agent Action Plan sections 0.7.3 and 0.9.3). It defines what a benchmark run is to do, not what any run has done: scripts/search-benchmark.ts is to execute this query set against a loaded catalog release and write benchmark-report.json, and that report is to be the acceptance evidence for search quality. Running it against a second, independently loaded database must reproduce identical ranks and page sequences, with only latencies free to differ. Read implementationStatus before treating any statement here as descriptive.",
   "implementationStatus": {
-    "state": "contract_only",
+    "state": "runner_implemented",
     "measuredUnitExists": true,
     "querySetExists": true,
-    "runnerMeasurementBodyExists": false,
-    "acceptanceReportExists": false,
+    "runnerMeasurementBodyExists": true,
+    "acceptanceReportExists": true,
     "nonAcceptanceSuiteExists": false,
-    "statement": "NOTHING IN THIS FILE HAS BEEN MEASURED. Both inputs are present — catalog.service.searchPublishedFoods exists and the query set below is complete — but the runner named in acceptanceRunner carries no measurement body: it validates its inputs and exits stage_pipeline_pending without importing the service, timing a query or writing a report. The file at acceptanceReport does not exist, and neither does the suite named in nonAcceptanceSuite. No p50, p95, hit rate or zero-result rate for catalog search therefore exists anywhere in this repository, and no absent or future report may be cited as acceptance evidence. Every prose field below is the contract a run must satisfy once the body lands (Agent Action Plan 0.7.1 Group 3, 0.9.3); the numeric thresholds and protocol values are final and are what that body is to consume.",
+    "statement": "scripts/search-benchmark.ts now carries the measurement body this file is the contract for: it imports catalog.service.searchPublishedFoods, runs the query set below under the protocol declared here (one untimed warm-up pass, then three timed passes, sequential, one connection, timed in process), resolves every expectation from its source_key after the release is loaded, checks the pagination invariant against an in-process wide reference fetch, and writes the report named in acceptanceReport. Nothing in THIS file is a measurement: the numeric thresholds and protocol values here are the contract a run is held to, and the only measured figures live in that report, which states the release, corpus and conditions they were taken under. The run is fail-closed, so a report recording a missed threshold is a record of an unmet requirement and not evidence of a pass (Agent Action Plan 0.7.1 Group 3, 0.9.3).",
     "whatIsProvenToday": "The determinism half of the ordering contract is enforced by an automated test rather than by this file: src/__tests__/api/catalog.test.ts loads the same rows into two disposable databases created with different default collations and asserts the service's pinned order is identical in both while the unpinned order differs. That covers cross-database rank and page-sequence identity. Latency and relevance remain unmeasured until the runner's body exists."
   },
   "acceptanceRunner": "scripts/search-benchmark.ts",

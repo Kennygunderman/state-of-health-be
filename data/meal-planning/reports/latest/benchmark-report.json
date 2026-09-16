@@ -1,7 +1,7 @@
 {
   "stage": "search-benchmark",
   "reportVersion": "v1",
-  "generatedAt": "2026-09-15T04:29:24.051Z",
+  "generatedAt": "2026-09-16T11:15:39.466Z",
   "benchmarkVersion": "v1",
   "catalogRelease": "v1",
   "producedBy": "npm run search:benchmark",
@@ -15,37 +15,29 @@
       "maxZeroResultRate",
       "p95LatencyMs"
     ],
-    "statement": "Search quality does NOT meet the contract's acceptance bar: topThreeHitRate and topTenHitRate were missed. Under the contract's thresholdPolicy the benchmark fails closed, so this report must not be cited as evidence that catalog search meets its requirement. Retrieval, ordering determinism, the zero-result bound and the latency bound did meet their bars; the two hit-rate bounds did not. See diagnostics for what the misses are and are not.",
-    "remediationOwner": "Not settled here. The measured facts are that no expectation is unretrievable and that the misses concentrate in broad single-word queries over a corpus roughly eighty times larger than the one the query set was authored against (see contractStatementsNowStale). Whether the remedy is recalibrating data/meal-planning/search-benchmark.v1.json expectations, changing the ranking in src/services/catalog.service.ts, or both, belongs to the owners of those two files and is deliberately not decided by this report."
+    "statement": "Search quality does NOT meet the contract's acceptance bar: topThreeHitRate measured 0.622 against bound 0.9 and topTenHitRate measured 0.803 against bound 0.97. The run therefore fails closed and exits non-zero: this report is a record of an UNMET requirement and must not be cited as evidence that catalog search meets its bar. The figures are real measurements — the shortfall is reported rather than smoothed, and remedying it belongs to the owners of the query set and the search implementation."
   },
   "provenance": {
     "acceptanceRunner": "scripts/search-benchmark.ts",
     "acceptanceRunnerCommand": "npm run search:benchmark",
-    "runnerMeasurementBodyExists": false,
-    "howTheseFiguresWereObtained": "By driving the contract's measuredUnit (catalog.service.searchPublishedFoods) directly, in process, under the contract's protocol verbatim — one untimed warm-up pass, then three timed passes, sequential, one connection — over all 426 committed queries against the loaded release, in this checkout's sandbox.",
-    "honestyStatement": "scripts/search-benchmark.ts carries no measurement body in this checkout: it validates its inputs and exits stage_pipeline_pending without importing the service, timing a query or writing a report, and it says so in its own header. The command named in producedBy is therefore the DESIGNATED acceptance path and the one that must own this artefact, not the process that emitted these bytes. The figures here are a real measurement of the same unit under the same protocol, so the runner is expected to reproduce the ranks and page sequences exactly once its body lands; only latencies may differ. Nothing in this report is estimated, and no figure was carried over from any earlier document.",
-    "supersedes": "data/meal-planning/search-benchmark.v1.json implementationStatus.acceptanceReportExists is false and records that no p50, p95, hit rate or zero-result rate for catalog search exists anywhere in the repository. That was true when it was written and is superseded by this file; the contract's own numeric thresholds and protocol values were final already and were consumed, not altered."
+    "howTheseFiguresWereObtained": "By driving the contract's measuredUnit (catalog.service.searchPublishedFoods) directly, in process, under the contract's protocol — 1 untimed warm-up pass, then 3 timed passes, sequential, one connection — over all 426 committed queries against the catalog loaded in the database this command addressed."
   },
   "acceptanceEvidence": {
     "thisReportIsAcceptanceEvidence": true,
     "measuredAgainst": "the loaded catalog release v1, 11046 published foods",
     "nonAcceptanceSuite": {
       "path": "src/__tests__/api/benchmark.test.ts",
+      "presentInThisCheckout": false,
       "fixture": "data/meal-planning/fixtures/benchmark-synthetic-10k.json",
-      "existsInThisCheckout": false,
       "isAcceptanceEvidence": false,
-      "statement": "src/__tests__/api/benchmark.test.ts, against data/meal-planning/fixtures/benchmark-synthetic-10k.json, exercises the benchmark MECHANICS against a synthetic corpus only. It is NOT acceptance evidence and can pass while real search quality is unmeasured or failing: no token in that fixture is a real food name and its keys are prefixed synthetic-bench10k:. Only a run against the loaded release — this report — speaks to search quality. Neither the suite nor its expansion contributed any figure here."
+      "statement": "src/__tests__/api/benchmark.test.ts exercises the same search mechanics over a synthetic corpus and is explicitly NOT acceptance evidence: a synthetic corpus can demonstrate that paging, ranking and the zero-result path behave, but it cannot establish that real common-food searches find real foods. Only this report, produced by npm run search:benchmark against a loaded release, carries that claim."
     }
   },
   "dataLegality": {
     "status": "legal_to_commit",
-    "basis": "Every food reflected here is USDA FoodData Central data or self-generated generic catalog data. USDA FoodData Central is public domain with no retention restrictions, which is the in-repo determination this artefact relies on.",
-    "citations": [
-      "src/services/usda.service.ts:4-5 — \"USDA FoodData Central (public domain — no retention restrictions, so the snapshot-at-log-time model is fully legal for this data source).\"",
-      "prisma/schema.prisma:299-301 — the usda_api_cache model comment recording the same determination for the cached vendor payloads: \"USDA data is public domain with no retention restrictions\"."
-    ],
+    "basis": "This report aggregates catalog and search data only. The catalog it measures is USDA FoodData Central data, which is public domain, together with self-generated generic catalog data; the figures here are ranks, counts and timings over that corpus.",
     "containsUserOwnedData": false,
-    "userOwnedDataStatement": "This report aggregates catalog and search data exclusively. It carries no user identifier, no contact address, no diary content and no owner-scoped row of any kind. Every identity in it is a catalog source_key."
+    "userOwnedDataStatement": "No user identifier, contact address, diary entry, plan or credential is read or recorded by this stage. It queries only the shared catalog tables, which carry no user_id by design, and the conditions it records are machine characteristics rather than host or account identity — no hostname, address or connection string is written."
   },
   "conditions": {
     "catalogReleaseChecksum": {
@@ -71,9 +63,7 @@
           "name": "validation-records.jsonl",
           "sha256": "2251674dba5dacd7c5b02518110cf6e73545127af4f49ea12bba0016f72e0db4"
         }
-      ],
-      "verifiedAgainstCommittedFiles": true,
-      "note": "The release manifest carries no single release-level digest, only a per-file sha256, so none is invented here. All five committed files were re-hashed and matched the manifest, and catalog-load verified the same checksums and every row count before activating the release. manifestSha256 is the sha256 of manifest.json itself, which is this report's one portable digest of the whole file set because that file contains every per-file digest."
+      ]
     },
     "postgresVersion": "PostgreSQL 16.15 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
     "hostCpu": "INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz, 112 logical CPUs",
@@ -86,7 +76,7 @@
       "connections": 1,
       "timing": "in_process",
       "measuredUnit": "catalog.service.searchPublishedFoods",
-      "statement": "One untimed warm-up pass over the full query set settled the shared buffers and the GIN index into cache; the three timed passes that follow measure the steady state. Every call was timed IN PROCESS around catalog.service.searchPublishedFoods with process.hrtime.bigint(), so these latencies exclude network, Express and JSON-serialisation time and are NOT over-HTTP figures. Execution was sequential on a single connection (connection_limit=1), so a percentile describes the query rather than queueing behind other queries."
+      "statement": "1 untimed warm-up pass over the full query set settled the shared buffers and the GIN index into cache; the 3 timed passes that follow measure the steady state. Every call was timed IN PROCESS around catalog.service.searchPublishedFoods with process.hrtime.bigint(), so these latencies exclude network, Express and JSON-serialisation time and are NOT over-HTTP figures. Execution was sequential on a single connection (the datasource pool was pinned to connection_limit=1 before the client was constructed), so a percentile describes the query rather than queueing behind other queries."
     },
     "orderingCollation": {
       "collation": "C",
@@ -96,28 +86,31 @@
       ],
       "readBackFrom": "src/services/catalog.service.ts",
       "orderBy": "ORDER BY r.rank DESC, f.display_name COLLATE \"C\" ASC, f.source_key COLLATE \"C\" ASC",
-      "note": "Read back from the service's own ORDER BY rather than assumed, as the contract's collationEvidenceRule requires. C is byte order over the stored UTF-8, so it is identical on every server and is what makes the order a property of the release rather than of the database."
+      "note": "Read back from the service's own ORDER BY rather than assumed. C is byte order over the stored UTF-8, so it is identical on every server and is what makes the order a property of the release rather than of the database."
     },
     "databaseDefaultCollation": "en_US.utf8"
+  },
+  "notMeasured": {
+    "statement": "Everything the contract asks a run to report was measured. The items below are adjacent things this report deliberately does not claim, listed so its scope cannot be over-read.",
+    "items": [
+      "Over-HTTP latency. The stopwatch sits on the service function, so Express, JSON serialisation and network time are excluded by design and the figures are not end-to-end response times.",
+      "Relevance beyond the committed query set. The hit rates describe these 426 queries against this release, not search quality in general.",
+      "Cross-database rank identity, which one run cannot establish — see crossDatabaseReproduction for the procedure that does.",
+      "Concurrent-load behaviour. Execution was sequential on a single connection, so nothing here describes how the query behaves under parallel traffic."
+    ]
   },
   "corpus": {
     "publishedFoods": 11046,
     "manifestPublishedFoods": 11046,
     "countsAgree": true,
     "loadedBy": "npm run catalog:load -- --release v1",
-    "loadCounts": {
-      "foodsInserted": 11046,
-      "aliasesWritten": 15939,
-      "portionsWritten": 31899,
-      "validationRecordsWritten": 11046,
-      "componentsWritten": 0
-    },
     "expectationResolution": {
       "mode": "sourceKey",
       "expectations": 467,
-      "resolved": 467,
+      "distinctSourceKeys": 139,
+      "resolved": 139,
       "unresolved": 0,
-      "statement": "Every expectation resolved from its stable catalog_foods.source_key to a local id after the release was loaded. An unresolvable key would have failed the whole run by contract, never been skipped or scored as a miss."
+      "statement": "Every expectation resolved from its stable catalog_foods.source_key to a local id after the release was loaded. An unresolvable key fails the whole run by contract — it is never skipped and never scored as a miss."
     }
   },
   "thresholds": {
@@ -153,7 +146,7 @@
         "contractKey": "p95LatencyMs",
         "bound": 150,
         "comparison": "measured <= bound",
-        "measured": 83.687,
+        "measured": 84.944,
         "measuredAsCount": "1278 timed samples at limit 25",
         "verdict": "pass"
       }
@@ -166,25 +159,21 @@
     "zeroResultCount": 0,
     "zeroResultRate": 0,
     "beyondMeasuredPageCount": 50,
-    "rankStability": {
-      "queriesStableAcrossAllTimedPasses": 426,
-      "unstable": 0,
-      "statement": "Every query returned the same rank and the same match-set total on all three timed passes, so the ranks below are a property of the release and not of one pass."
-    },
+    "notRetrievedCount": 0,
     "perKind": [
+      {
+        "kind": "alias",
+        "queries": 95,
+        "topThreeHitRate": 0.695,
+        "topTenHitRate": 0.874,
+        "beyondMeasuredPage": 7
+      },
       {
         "kind": "exact",
         "queries": 153,
         "topThreeHitRate": 0.425,
         "topTenHitRate": 0.66,
         "beyondMeasuredPage": 32
-      },
-      {
-        "kind": "multi_word",
-        "queries": 65,
-        "topThreeHitRate": 0.754,
-        "topTenHitRate": 0.846,
-        "beyondMeasuredPage": 6
       },
       {
         "kind": "misspelling",
@@ -194,18 +183,11 @@
         "beyondMeasuredPage": 0
       },
       {
-        "kind": "alias",
-        "queries": 95,
-        "topThreeHitRate": 0.695,
-        "topTenHitRate": 0.874,
-        "beyondMeasuredPage": 7
-      },
-      {
-        "kind": "plural",
-        "queries": 32,
-        "topThreeHitRate": 0.688,
-        "topTenHitRate": 0.875,
-        "beyondMeasuredPage": 2
+        "kind": "multi_word",
+        "queries": 65,
+        "topThreeHitRate": 0.754,
+        "topTenHitRate": 0.846,
+        "beyondMeasuredPage": 6
       },
       {
         "kind": "partial",
@@ -213,21 +195,33 @@
         "topThreeHitRate": 0.575,
         "topTenHitRate": 0.85,
         "beyondMeasuredPage": 3
+      },
+      {
+        "kind": "plural",
+        "queries": 32,
+        "topThreeHitRate": 0.688,
+        "topTenHitRate": 0.875,
+        "beyondMeasuredPage": 2
       }
-    ]
+    ],
+    "rankStability": {
+      "queriesStableAcrossAllTimedPasses": 426,
+      "unstable": 0,
+      "statement": "Every query returned the same rank and the same match-set total on all 3 timed passes, so the ranks here are a property of the release and not of one pass."
+    }
   },
   "latency": {
     "measuredAtLimit": 25,
     "timing": "in_process",
     "measuredUnit": "catalog.service.searchPublishedFoods",
     "samples": 1278,
-    "p50LatencyMs": 77.019,
-    "p95LatencyMs": 83.687,
-    "p99LatencyMs": 89.09,
-    "minLatencyMs": 65.76,
-    "maxLatencyMs": 110.712,
+    "p50LatencyMs": 78.177,
+    "p95LatencyMs": 84.944,
+    "p99LatencyMs": 90.603,
+    "minLatencyMs": 66.152,
+    "maxLatencyMs": 112.718,
     "percentileMethod": "nearest-rank over all timed samples",
-    "contentionCaveat": "Measured on a shared host that runs up to 64 concurrent validation workloads against one PostgreSQL instance, so these figures carry contention noise and are an upper bound rather than an idle-machine number. The p95 bound is met with headroom regardless. Latency is the one class of figure the contract allows to differ between runs; ranks and page sequences are not."
+    "contentionCaveat": "Latency was measured on whatever host ran this command. A figure taken on a host running other workloads against the same PostgreSQL instance is an upper bound on the query, not a clean measurement of it; the relevance figures and page sequences are unaffected by load."
   },
   "paginationCheck": {
     "queryIds": [
@@ -256,7 +250,7 @@
     "pages": 3,
     "singlePageLimit": 75,
     "referenceMode": "in_process",
-    "referenceModeStatement": "The limit=75 reference page was read IN PROCESS through catalog.service.searchPublishedFoods, not over HTTP: GET /catalog/foods validates limit as 1 to 50 and would answer 400 invalid_request for 75. singlePageLimit was not lowered to make it routable, and the service deliberately does not apply the route cap, so the reference is untruncated.",
+    "referenceModeStatement": "The limit=75 reference page was read IN PROCESS through catalog.service.searchPublishedFoods, not over HTTP: GET /catalog/foods validates limit as 1..50, so a wider single fetch would answer 400 invalid_request. The limit was not lowered to 50 to make it routable, because that would weaken the invariant this check exists to prove.",
     "ordering": [
       "ts_rank DESC",
       "display_name COLLATE \"C\" ASC",
@@ -272,7 +266,7 @@
       16,
       674
     ],
-    "statement": "For all twenty queries, pages 1, 2 and 3 at limit 25 (offsets 0, 25 and 50) concatenated equal the first min(75, total) foods of the single limit=75 reference fetch, in the same order, with no id repeated and none missing. Seventeen of the twenty match sets are wide enough to fill all three pages, so multi-page traversal is genuinely exercised and not a vacuous pass.",
+    "statement": "For 20 of 20 queries, pages 1..3 at limit 25 concatenated equal the first min(75, total) ids of one wide fetch of the same query, in the same order, with no id repeated and none missing.",
     "perQuery": [
       {
         "id": "q008",
@@ -517,83 +511,96 @@
     ]
   },
   "crossDatabaseReproduction": {
-    "outcome": "reproduced",
-    "databasesCompared": 2,
-    "statement": "The release was loaded a second time into an independently created database and the whole query set re-run there. All 426 measured page sequences and all 20 pagination sequences were identical between the two databases, compared by source_key because the primary keys are gen_random_uuid() and differ per database. This is the evidence that ranks and page sequences belong to the release rather than to one machine.",
-    "defaultCollations": {
-      "firstDatabase": "en_US.utf8",
-      "secondDatabase": "C",
-      "note": "The two databases were deliberately created with DIFFERENT default collations, which is the case the contract's collationEvidenceRule calls readable: two runs that agree only because both databases were created the same way evidence nothing. The pinned COLLATE \"C\" on both text keys is what holds the order identical across them."
-    },
-    "publishedFoods": {
-      "firstDatabase": 11046,
-      "secondDatabase": 11046
-    },
-    "pageSequenceMismatches": 0,
-    "paginationSequenceMismatches": 0,
-    "latencyComparison": null,
-    "latencyComparisonReason": "Not compared. Both runs shared one host and one PostgreSQL instance under concurrent load, so a latency difference between them would measure contention rather than the release; the contract frees latency to differ between runs for this reason."
+    "outcome": "not_evaluated_by_a_single_run",
+    "statement": "Release determinism (AAP §0.9.3) is a property of two runs, not of one, so a single run cannot assert it. The ranks and page sequences here are computed from release-stable source_keys under an ordering whose final tiebreaker is the portable source_key, which is what makes them reproducible; the evidence is produced by running this same command against a second, independently loaded database and diffing the two reports.",
+    "howToReproduce": [
+      "Create a second database and apply the migrations.",
+      "npm run catalog:load -- --release v1 (against that database)",
+      "npm run search:benchmark -- --out <second-report.json>",
+      "Diff results[] and paginationCheck.perQuery between the two reports: ranks and page sequences must be identical, and only the latency block may differ."
+    ]
   },
   "diagnostics": {
     "beyondMeasuredPage": {
       "queries": 50,
-      "retrievableAtDeeperRank": 50,
-      "notRetrievableAtAll": 0,
-      "deepRankRange": [
-        26,
-        463
-      ],
-      "deepRankMedian": 54,
-      "statement": "Every one of the fifty misses is retrievable: the expected food is in the match set at a deeper rank (26 to 463, median 54), and none is unreachable. So no miss is a retrieval failure — the expected canonical food is outranked, not absent. This is measured by walking each full result set, not inferred.",
-      "concentration": "The misses concentrate in broad single-word queries whose match sets are now 26 to 674 foods wide, while the median match set across the whole query set is only 7. Curated misspellings, the most selective kind, score a 0.976 top-three rate; plain single-word exact queries score 0.425. Nine of the fifty expected foods rank within the last three positions of their own match set."
+      "statement": "These queries do retrieve their expected food — it is ranked past the measured page rather than absent, which makes them a ranking observation and not a retrieval failure. The ten worst-ranked are listed as the starting point for a ranking review.",
+      "worstRanked": [
+        {
+          "id": "q354",
+          "q": "salt",
+          "rankInFullResultSet": 463,
+          "matchSetTotal": 602
+        },
+        {
+          "id": "q385",
+          "q": "fish",
+          "rankInFullResultSet": 349,
+          "matchSetTotal": 392
+        },
+        {
+          "id": "q382",
+          "q": "chicken",
+          "rankInFullResultSet": 265,
+          "matchSetTotal": 674
+        },
+        {
+          "id": "q377",
+          "q": "rice",
+          "rankInFullResultSet": 226,
+          "matchSetTotal": 355
+        },
+        {
+          "id": "q008",
+          "q": "water",
+          "rankInFullResultSet": 214,
+          "matchSetTotal": 220
+        },
+        {
+          "id": "q378",
+          "q": "pasta",
+          "rankInFullResultSet": 209,
+          "matchSetTotal": 280
+        },
+        {
+          "id": "q379",
+          "q": "cheese",
+          "rankInFullResultSet": 187,
+          "matchSetTotal": 631
+        },
+        {
+          "id": "q001",
+          "q": "coffee",
+          "rankInFullResultSet": 131,
+          "matchSetTotal": 163
+        },
+        {
+          "id": "q380",
+          "q": "beans",
+          "rankInFullResultSet": 129,
+          "matchSetTotal": 364
+        },
+        {
+          "id": "q287",
+          "q": "pork loin",
+          "rankInFullResultSet": 125,
+          "matchSetTotal": 125
+        }
+      ]
     },
-    "interpretationLimits": "This report states what was measured and does not diagnose a cause. Two candidate explanations are consistent with the evidence — expectations calibrated against a far smaller corpus, and a ranking that favours elaborated names over the plain generic food — and distinguishing them requires judgement about intent that belongs to the owners of the query set and the search service."
+    "notRetrieved": {
+      "queries": 0,
+      "ids": [],
+      "statement": "Every expected food appears somewhere in its query result set, so nothing in this query set is unretrievable."
+    },
+    "interpretationLimits": "This report states what was measured and does not diagnose a cause. A hit-rate shortfall is consistent with either expectations authored against a smaller corpus or a ranking that buries the intended food, and this run cannot distinguish them; the per-kind rollup and the beyond-measured-page list are the evidence for that analysis, which belongs to the owners of the query set and of the search implementation."
   },
-  "notMeasured": {
-    "statement": "Everything the contract asks a run to report was measured. The items below are adjacent things this report deliberately does not claim, recorded so no reader infers them.",
-    "items": [
-      {
-        "item": "idleHostLatency",
-        "value": null,
-        "reason": "No idle-host latency figure exists. The only host available runs up to 64 concurrent validation workloads, so an idle number could not be measured and is not estimated."
-      },
-      {
-        "item": "overHttpLatency",
-        "value": null,
-        "reason": "Not measured by design. The contract times the service function, not an HTTP round trip, so no over-HTTP latency is reported and none may be inferred from these figures."
-      },
-      {
-        "item": "multiPageTraversalBeyondThreePages",
-        "value": null,
-        "reason": "Out of contract. The check specifies three pages at limit 25 against a limit=75 reference; deeper traversal was not part of it and was not measured."
-      }
-    ]
-  },
-  "contractStatementsNowStale": [
-    {
-      "field": "authoringBasis",
-      "says": "Release v1 publishes 139 foods.",
-      "measured": "The committed release publishes 11046 foods, confirmed independently by the manifest counts and by reports/latest/validation-report.json.",
-      "consequence": "The expectations still resolve — all 467 of them — but their expected RANKS were never validated against a corpus roughly eighty times larger. This is the single most important context for the two failed hit-rate thresholds and is why this report records the failure with diagnostics rather than as a bare red mark."
-    },
-    {
-      "field": "paginationCheck.breadthLimitation",
-      "says": "The widest query in this set matches 8 published foods, so no query fills even the first page and the check proves ordering stability rather than multi-page traversal.",
-      "measured": "The widest of the twenty pagination queries now matches 674 foods and seventeen of the twenty fill all three pages, so the check does now exercise real multi-page traversal.",
-      "consequence": "The limitation the contract records no longer applies. The ids were chosen by measured breadth so that the same twenty would exercise all three pages once the catalog reached its target, and they now do."
-    },
-    {
-      "field": "implementationStatus.acceptanceReportExists",
-      "says": "false — no acceptance report exists, and no p50, p95, hit rate or zero-result rate for catalog search exists anywhere in the repository.",
-      "measured": "This file now exists and carries all four.",
-      "consequence": "Stale as a statement of fact about the checkout. It remains correct about scripts/search-benchmark.ts, whose measurement body is still absent; see provenance."
-    }
-  ],
   "resultsSchema": {
-    "rank": "One-based position of the best-placed expected food within the measured page (limit 25). Null means no expected food appeared in that page; outcome then reads beyond_measured_page and rankInFullResultSet carries its real, measured position.",
-    "rankInFullResultSet": "The expected food's measured position in the complete ordered result set. Equal to rank for every query that placed within the measured page, because that page starts at offset 0.",
-    "expectedSourceKeys": "Acceptable answers, identified only by stable catalog_foods.source_key — never by a database-generated id, which would differ per database and destroy the cross-database comparison above. Plural because the contract's expectedSemantics allows several acceptable answers for a genuinely ambiguous term, with the best-placed member counting for the rank metrics.",
-    "matchedSourceKey": "The expected food that actually placed, or null when none placed within the measured page."
+    "rank": "One-based position of the best-placed expected food within the measured page (the limit the latency threshold is stated for). Null means no expected food placed inside that page.",
+    "rankInFullResultSet": "The expected food's position in the complete ordered result set, found by an untimed scan through the same service function. Equal to rank whenever the food placed inside the measured page; null only when no expected food appears anywhere in the result set.",
+    "expectedSourceKeys": "Acceptable answers, identified only by stable catalog_foods.source_key — never by a database-generated id, so the ranks are comparable across independently loaded databases.",
+    "matchedSourceKey": "The expected food that actually placed, or null when none placed within the measured page.",
+    "outcome": "top3 | top10 | in_measured_page | beyond_measured_page | not_retrieved | zero_results. not_retrieved is a retrieval failure; beyond_measured_page is a ranking one.",
+    "rankStableAcrossPasses": "Whether every timed pass returned the same rank and match-set total for this query. False means the ordering is not total and the figure must not be averaged away."
   },
   "results": [
     {
@@ -719,7 +726,7 @@
       "rank": 11,
       "rankInFullResultSet": 11,
       "matchSetTotal": 11,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -789,7 +796,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -817,7 +824,7 @@
       "rank": 25,
       "rankInFullResultSet": 25,
       "matchSetTotal": 29,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -831,7 +838,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 51,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -845,7 +852,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 51,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -873,7 +880,7 @@
       "rank": 20,
       "rankInFullResultSet": 20,
       "matchSetTotal": 25,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -929,7 +936,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 18,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -957,7 +964,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -971,7 +978,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1083,7 +1090,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1097,7 +1104,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1139,7 +1146,7 @@
       "rank": 11,
       "rankInFullResultSet": 11,
       "matchSetTotal": 57,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -1195,7 +1202,7 @@
       "rank": 10,
       "rankInFullResultSet": 10,
       "matchSetTotal": 11,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1209,7 +1216,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 5,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1307,7 +1314,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 19,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1321,7 +1328,7 @@
       "rank": 13,
       "rankInFullResultSet": 13,
       "matchSetTotal": 22,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -1405,7 +1412,7 @@
       "rank": 23,
       "rankInFullResultSet": 23,
       "matchSetTotal": 23,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -1447,7 +1454,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 4,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1489,7 +1496,7 @@
       "rank": 17,
       "rankInFullResultSet": 17,
       "matchSetTotal": 24,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -1517,7 +1524,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 12,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1545,7 +1552,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 5,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1559,7 +1566,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 19,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1629,7 +1636,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 19,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1643,7 +1650,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 12,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1671,7 +1678,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 8,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1713,7 +1720,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 13,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -1769,7 +1776,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 6,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1811,7 +1818,7 @@
       "rank": 22,
       "rankInFullResultSet": 22,
       "matchSetTotal": 27,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -1853,7 +1860,7 @@
       "rank": 10,
       "rankInFullResultSet": 10,
       "matchSetTotal": 14,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1909,7 +1916,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 13,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -1979,7 +1986,7 @@
       "rank": 13,
       "rankInFullResultSet": 13,
       "matchSetTotal": 63,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -2035,7 +2042,7 @@
       "rank": 13,
       "rankInFullResultSet": 13,
       "matchSetTotal": 13,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -2049,7 +2056,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 14,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -2147,7 +2154,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 4,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2175,7 +2182,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 4,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2217,7 +2224,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 34,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2231,7 +2238,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 15,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2427,7 +2434,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 124,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2441,7 +2448,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 24,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2539,7 +2546,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 16,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -2567,7 +2574,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 4,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2609,7 +2616,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2623,7 +2630,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2651,7 +2658,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 10,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2679,7 +2686,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2707,7 +2714,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 5,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2791,7 +2798,7 @@
       "rank": 10,
       "rankInFullResultSet": 10,
       "matchSetTotal": 10,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2805,7 +2812,7 @@
       "rank": 11,
       "rankInFullResultSet": 11,
       "matchSetTotal": 11,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -2833,7 +2840,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2861,7 +2868,7 @@
       "rank": 14,
       "rankInFullResultSet": 14,
       "matchSetTotal": 23,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -2917,7 +2924,7 @@
       "rank": 10,
       "rankInFullResultSet": 10,
       "matchSetTotal": 10,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -2931,7 +2938,7 @@
       "rank": 20,
       "rankInFullResultSet": 20,
       "matchSetTotal": 20,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -3029,7 +3036,7 @@
       "rank": 16,
       "rankInFullResultSet": 16,
       "matchSetTotal": 27,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -3099,7 +3106,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 126,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -3113,7 +3120,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 126,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -3183,7 +3190,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 77,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -3211,7 +3218,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 77,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -3393,7 +3400,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 52,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -3407,7 +3414,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 52,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -3617,7 +3624,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -3631,7 +3638,7 @@
       "rank": 13,
       "rankInFullResultSet": 13,
       "matchSetTotal": 265,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -3645,7 +3652,7 @@
       "rank": 13,
       "rankInFullResultSet": 13,
       "matchSetTotal": 265,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -3715,7 +3722,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 14,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -3771,7 +3778,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 12,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -3827,7 +3834,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 13,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4191,7 +4198,7 @@
       "rank": 13,
       "rankInFullResultSet": 13,
       "matchSetTotal": 13,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -4233,7 +4240,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 311,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4247,7 +4254,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 299,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4401,7 +4408,7 @@
       "rank": 23,
       "rankInFullResultSet": 23,
       "matchSetTotal": 60,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -4443,7 +4450,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4471,7 +4478,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 46,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4527,7 +4534,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 4,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4541,7 +4548,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 5,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4555,7 +4562,7 @@
       "rank": 16,
       "rankInFullResultSet": 16,
       "matchSetTotal": 16,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -4569,7 +4576,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 6,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4597,7 +4604,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 12,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -4653,7 +4660,7 @@
       "rank": 14,
       "rankInFullResultSet": 14,
       "matchSetTotal": 22,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -4779,7 +4786,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4807,7 +4814,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 8,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4821,7 +4828,7 @@
       "rank": 18,
       "rankInFullResultSet": 18,
       "matchSetTotal": 21,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -4835,7 +4842,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 4,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4863,7 +4870,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4891,7 +4898,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -4947,7 +4954,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5101,7 +5108,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 5,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5115,7 +5122,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 65,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5129,7 +5136,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 65,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5157,7 +5164,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5241,7 +5248,7 @@
       "rank": 17,
       "rankInFullResultSet": 17,
       "matchSetTotal": 51,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -5255,7 +5262,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5647,7 +5654,7 @@
       "rank": 12,
       "rankInFullResultSet": 12,
       "matchSetTotal": 30,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -5719,7 +5726,7 @@
       "rank": 17,
       "rankInFullResultSet": 17,
       "matchSetTotal": 18,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -5734,7 +5741,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 6,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5764,7 +5771,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 16,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5779,7 +5786,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5854,7 +5861,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 52,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -5869,7 +5876,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 30,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6050,7 +6057,7 @@
       "rank": 11,
       "rankInFullResultSet": 11,
       "matchSetTotal": 83,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -6078,7 +6085,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 6,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6106,7 +6113,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 23,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6162,7 +6169,7 @@
       "rank": 11,
       "rankInFullResultSet": 11,
       "matchSetTotal": 51,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -6176,7 +6183,7 @@
       "rank": 9,
       "rankInFullResultSet": 9,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6204,7 +6211,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 4,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6218,7 +6225,7 @@
       "rank": 5,
       "rankInFullResultSet": 5,
       "matchSetTotal": 5,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6274,7 +6281,7 @@
       "rank": 15,
       "rankInFullResultSet": 15,
       "matchSetTotal": 21,
-      "outcome": "top11_25",
+      "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -6316,7 +6323,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 9,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6386,7 +6393,7 @@
       "rank": 7,
       "rankInFullResultSet": 7,
       "matchSetTotal": 7,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6400,7 +6407,7 @@
       "rank": 6,
       "rankInFullResultSet": 6,
       "matchSetTotal": 45,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6414,7 +6421,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 53,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6442,7 +6449,7 @@
       "rank": 8,
       "rankInFullResultSet": 8,
       "matchSetTotal": 11,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -6598,7 +6605,7 @@
       "rank": 4,
       "rankInFullResultSet": 4,
       "matchSetTotal": 17,
-      "outcome": "top4_10",
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     }
   ]

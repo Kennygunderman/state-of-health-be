@@ -30,14 +30,24 @@
  * unresolved-batch fact is exercised against a database that holds no batch
  * ledger.
  *
- * WHAT IS DELIBERATELY NOT HERE. The real 11,046-food release is loaded ONCE
- * per environment by the operator command, and `npm run catalog:load -- --release v1`
- * run twice is §0.9.1's own acceptance check; putting that double load in this
- * suite would add minutes to every run for evidence the gate already produces.
- * The real artefact is covered here by a fast pass instead — its manifest's
- * internal consistency and its five measured digests, through a `--dry-run` that
- * writes nothing — and `src/__tests__/api/seed-rerun.test.ts` owns the
- * corpus-loadability claim. Equally absent, because they belong to other suites:
+ * THE REAL ARTEFACT IS LOADED HERE, WHOLE. The last block applies the committed
+ * 11,046-food release through `runLoad` and then applies it again, because
+ * §0.9.1's gate — the release loaded twice, the second run reporting no insert
+ * and no update — is the one claim no synthesized release can stand in for: it
+ * is what says the bytes in this repository reconcile against a database, and
+ * it is the acceptance signal §0.9.3 asks for. It costs roughly 80 seconds of
+ * the suite's runtime, which is why it is ONE test rather than the vehicle for
+ * every behavioural claim above it.
+ *
+ * It is also not covered anywhere else, which is worth stating because the
+ * neighbouring suite reads as though it were. `src/__tests__/api/seed-rerun.test.ts`
+ * verifies this release's manifest — every member's streamed digest, byte length
+ * and row count — but applies only the 69-food ingredient slice its recipes
+ * need, and does so through Prisma directly rather than through this loader,
+ * deferring the loader's own run here by name. Deferring back to it would leave
+ * the corpus-loadability claim owned by neither.
+ *
+ * WHAT IS DELIBERATELY NOT HERE, because it belongs to other suites:
  * the pure catalog rules (`catalog.logic.test.ts`), the `/catalog/*` HTTP
  * contract and search relevance (`api/catalog.test.ts`), import, generation and
  * seed behaviour (`scripts/catalog-import.test.ts`, `api/seed-rerun.test.ts`),
@@ -79,10 +89,13 @@ import {
     SCRIPT_DATABASE_POLICIES,
     assertScriptDatabase,
     classifyDatabaseOrigin,
+    entryScriptName,
     evaluateScriptDatabase,
 } from '../../../scripts/lib/dbGuard';
+import { createLogger } from '../../../scripts/lib/logger';
 import type { ScriptLogger } from '../../../scripts/lib/logger';
 import {
+    ManifestError,
     assertReleaseVersion,
     clearManifestCache,
     fixturePath,
@@ -664,6 +677,112 @@ describe('a tampered release is refused with nothing written', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The document a release is read through
+ *
+ * `loadReleaseManifest` is the only way this stage obtains a manifest, and it
+ * resolves under the repository's own data root from a release id alone — the
+ * path-taking loader beneath it is not exported. So these four refusals are
+ * exercised where the loader actually meets them, by writing a manifest into a
+ * scratch release directory inside the data root and removing it again. The id
+ * has to satisfy the release-id rule, so it is a version number no release uses.
+ *
+ * They assert the code and nothing else: each one sends the operator somewhere
+ * different — an unrun pipeline stage, a truncated write, a document this build
+ * cannot interpret — and the message is free to change.
+ * ------------------------------------------------------------------------- */
+
+describe('a release manifest that cannot be read', () => {
+    const SCRATCH_RELEASE = 'v9001';
+
+    const consistentManifest = (): Record<string, unknown> => ({
+        release_id: SCRATCH_RELEASE,
+        manifest_version: 'v1',
+        coverage_plan_version: 'v1',
+        generated_at: NOW.toISOString(),
+        produced_by: 'pipeline',
+        files: [],
+        counts: {},
+        source_datasets: [],
+        model_versions: {},
+        coverage: {},
+    });
+
+    /**
+     * Writes `body` as the scratch release's manifest — or leaves the directory
+     * empty when it is null — and removes the directory afterwards whatever the
+     * assertions do, because this one writes inside the working tree.
+     */
+    const withScratchManifest = (body: string | null, assertions: () => void): void => {
+        const directory = releaseDir(SCRATCH_RELEASE);
+        try {
+            fs.mkdirSync(directory, { recursive: true });
+            if (body !== null) {
+                fs.writeFileSync(path.join(directory, 'manifest.json'), body, 'utf-8');
+            }
+            clearManifestCache();
+            assertions();
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+            clearManifestCache();
+        }
+    };
+
+    const refusalOf = (release: string): ManifestError => {
+        try {
+            loadReleaseManifest(release);
+        } catch (error) {
+            return error as ManifestError;
+        }
+        throw new Error(`loadReleaseManifest('${release}') was expected to refuse, and returned a manifest.`);
+    };
+
+    it('reports a release directory that carries no manifest', () => {
+        withScratchManifest(null, () => {
+            const refusal = refusalOf(SCRATCH_RELEASE);
+            expect(refusal).toBeInstanceOf(ManifestError);
+            expect(refusal.code).toBe('file_not_found');
+        });
+    });
+
+    it('reports a manifest that is not JSON', () => {
+        withScratchManifest(`${JSON.stringify(consistentManifest()).slice(0, 40)}`, () => {
+            const refusal = refusalOf(SCRATCH_RELEASE);
+            expect(refusal).toBeInstanceOf(ManifestError);
+            expect(refusal.code).toBe('invalid_json');
+        });
+    });
+
+    it('reports a manifest that states no coverage-plan version', () => {
+        const { coverage_plan_version: _omitted, ...withoutVersion } = consistentManifest();
+
+        withScratchManifest(JSON.stringify(withoutVersion), () => {
+            const refusal = refusalOf(SCRATCH_RELEASE);
+            expect(refusal).toBeInstanceOf(ManifestError);
+            expect(refusal.code).toBe('missing_version_field');
+        });
+    });
+
+    it('reports a manifest produced from a coverage plan this build does not carry', () => {
+        withScratchManifest(JSON.stringify({ ...consistentManifest(), coverage_plan_version: 'v2' }), () => {
+            const refusal = refusalOf(SCRATCH_RELEASE);
+            expect(refusal).toBeInstanceOf(ManifestError);
+            expect(refusal.code).toBe('version_mismatch');
+        });
+    });
+
+    it('is not memoised, so the second read fails the same way as the first', () => {
+        // The cache is written only after every check has passed, which is what
+        // makes a refused manifest safe to leave on disk: the next reader is
+        // refused too, rather than served a document nothing validated.
+        withScratchManifest(JSON.stringify({ ...consistentManifest(), coverage_plan_version: 'v2' }), () => {
+            expect(refusalOf(SCRATCH_RELEASE).code).toBe('version_mismatch');
+            expect(refusalOf(SCRATCH_RELEASE).code).toBe('version_mismatch');
+        });
+    });
+});
+
+
+/* ---------------------------------------------------------------------------
  * The window between the two reads
  *
  * Verification and the apply pass each read the release from disk, so an edit
@@ -936,6 +1055,24 @@ describe('loading a release', () => {
         // Never written: the release carries no id and no search_vector, and the
         // generated column is the database's to compute.
         expect(stored?.id).toMatch(/^[0-9a-f-]{36}$/);
+        expect(FOOD_LINE_FIELDS).not.toContain('search_vector');
+
+        // And yet it is populated, from the `search_text` the release DOES
+        // state: the column is `GENERATED ALWAYS AS … STORED`, so a load that
+        // named it would be rejected by PostgreSQL outright, and one that omits
+        // it still produces a searchable row. Matched with `plainto_tsquery`
+        // rather than compared as text, so the claim is "this row is findable
+        // by its own search text" and not an assertion about stemmed output.
+        // Read through $queryRaw because Prisma models the column as
+        // `Unsupported("tsvector")` and cannot select it.
+        const [vector] = await prisma.$queryRaw<{ present: boolean; findable: boolean }[]>`
+            SELECT search_vector IS NOT NULL AS present,
+                   search_vector @@ plainto_tsquery('english', ${String(line.search_text)}) AS findable
+            FROM catalog_foods
+            WHERE source_key = ${SURVIVING_FOOD}
+        `;
+        expect(vector.present).toBe(true);
+        expect(vector.findable).toBe(true);
 
         const record = slice.validationRecords.find(
             (entry) => entry.food_source_key === SURVIVING_FOOD,
@@ -1413,6 +1550,52 @@ describe('a load that fails after partial progress', () => {
         expect(rerun.countChecks.every((check) => check.ok)).toBe(true);
         expect((await getActiveReleaseLoad(prisma))?.releaseId).toBe('v1');
         expect((await tableCounts()).foods).toBe(built.manifest.counts.foods);
+    });
+
+    it('leaves an already-active release active when the next one fails part-way', async () => {
+        // The operational shape of the invariant, and the one the null case
+        // above cannot make: an environment already serving v1 attempts v2, v2
+        // fails after writing some of itself, and `GET /api/catalog/status`
+        // must still report v1. A pointer that moved would name a release only
+        // half applied.
+        const first = writeRelease('v1', publishedSlice());
+        const settled = await runLoad(loadDeps(first));
+        const activeBefore = await getActiveReleaseLoad(prisma);
+        expect(activeBefore?.releaseId).toBe('v1');
+        expect(activeBefore?.runId).toBe(settled.runId);
+
+        const second = writeRelease('v2', upgradedSlice());
+        const injected = new Error('interrupted part-way through v2');
+
+        await expect(
+            runLoad(
+                loadDeps(second, {
+                    onFoodSettled: ({ index }) => {
+                        if (index === 10) {
+                            throw injected;
+                        }
+                    },
+                }),
+            ),
+        ).rejects.toBe(injected);
+
+        const runs = await runRows();
+        expect(runs).toHaveLength(2);
+        expect(runs[1].status).toBe('failed');
+        expect(runs[1].manifest_version).toBe('v2');
+
+        // Unmoved: still v1, still the run that actually completed.
+        const activeAfter = await getActiveReleaseLoad(prisma);
+        expect(activeAfter?.releaseId).toBe('v1');
+        expect(activeAfter?.runId).toBe(settled.runId);
+
+        // And the documented repair — rerunning the same release — carries the
+        // pointer over exactly once it succeeds.
+        const repaired = await runLoad(loadDeps(second));
+
+        expect(repaired.activated).toBe(true);
+        expect(repaired.countChecks.every((check) => check.ok)).toBe(true);
+        expect((await getActiveReleaseLoad(prisma))?.releaseId).toBe('v2');
     });
 
     it('resumes from the stored cursor rather than starting over', async () => {
@@ -2047,8 +2230,11 @@ describe('the command line', () => {
 });
 
 describe('the database-origin policy this stage runs under', () => {
-    const TEST_URL = 'postgresql://soh:soh@127.0.0.1:5433/soh_example_test';
-    const DEV_URL = 'postgresql://soh:soh@127.0.0.1:5433/soh_example_dev';
+    // Parse fixtures: only the host and the database name are ever classified,
+    // so the userinfo is a placeholder rather than any credential that opens
+    // anything — including the local one this suite itself connects with.
+    const TEST_URL = 'postgresql://example-user:example-password@127.0.0.1:5433/soh_example_test';
+    const DEV_URL = 'postgresql://example-user:example-password@127.0.0.1:5433/soh_example_dev';
 
     it('is development_or_confirmed', () => {
         expect(SCRIPT_DATABASE_POLICIES['catalog-load']).toBe('development_or_confirmed');
@@ -2079,6 +2265,67 @@ describe('the database-origin policy this stage runs under', () => {
         expect(
             evaluateScriptDatabase({ script: 'catalog-load', policy, origin, confirmTarget: origin.database }),
         ).toEqual({ allowed: true });
+    });
+
+    it('refuses an origin it cannot recognise even when --confirm-target names it', () => {
+        // The flag confirms a database the guard has classified; it is not a
+        // way to assert a classification. An unrecognised origin is therefore
+        // refused ahead of the policy, which is what stops `--confirm-target
+        // state_of_health` from being the one keystroke between a catalog load
+        // and production.
+        const origin = classifyDatabaseOrigin('postgresql://app:secret@db.example.com:5432/state_of_health');
+        expect(origin.originClass).toBe('unknown');
+
+        const confirmed = evaluateScriptDatabase({
+            script: 'catalog-load',
+            policy: 'development_or_confirmed',
+            origin,
+            confirmTarget: origin.database,
+        });
+
+        expect(confirmed.allowed).toBe(false);
+        expect(!confirmed.allowed && confirmed.code).toBe('unrecognised_origin');
+    });
+
+    it('is exercised through an injected argv because the module-load guard keyed on process.argv[1] is a no-op under Jest', () => {
+        // Asserted, not assumed: that no-op is what lets this file import
+        // `catalog-load.ts` at all, so if argv[1] ever resolved to a known
+        // script the import would refuse the run instead of this test failing.
+        expect(entryScriptName(process.argv)).toBeNull();
+    });
+
+    it('logs the fields it classified and never the connection URL', () => {
+        const lines: string[] = [];
+        const recorder = createLogger('guard', {
+            level: 'debug',
+            write: (line: string): void => {
+                lines.push(line);
+            },
+            now: () => NOW,
+        });
+        const url = 'postgresql://catalog_operator:tr0ub4dor@127.0.0.1:5433/soh_example_dev';
+
+        assertScriptDatabase({
+            script: 'catalog-load',
+            argv: ['node', 'scripts/catalog-load.ts', '--release', 'v1'],
+            env: { DATABASE_URL: url },
+            logger: recorder,
+        });
+
+        expect(lines).toHaveLength(1);
+        const entry = JSON.parse(lines[0]) as Record<string, unknown>;
+        expect(entry.event).toBe('database_origin_accepted');
+        expect(entry.script).toBe('catalog-load');
+        expect(entry.policy).toBe('development_or_confirmed');
+        expect(entry.originClass).toBe('development');
+        expect(entry.host).toBe('127.0.0.1');
+        expect(entry.database).toBe('soh_example_dev');
+
+        // The classified fields, and nothing the URL carried around them: no
+        // password, no userinfo, not even the URL itself.
+        expect(lines[0]).not.toContain('tr0ub4dor');
+        expect(lines[0]).not.toContain('catalog_operator');
+        expect(lines[0]).not.toContain(url);
     });
 
     it('applies the same rule through assertScriptDatabase with an injected argv and env', () => {
@@ -2164,5 +2411,109 @@ describe('the committed v1 release', () => {
             validationRecords: 0,
             runs: 0,
         });
+    });
+
+    it('loads whole, matches its manifest row for row, and reports nothing to do on the rerun', async () => {
+        // §0.9.1's gate, and the one claim a synthesized release cannot make:
+        // the bytes committed to this repository reconcile against a database,
+        // and doing it twice is a no-op. Roughly 80 seconds of the suite's
+        // runtime, which is why it is one test and not the vehicle for the
+        // behavioural claims above.
+        const manifest = loadReleaseManifest(REAL_RELEASE);
+        const deps: LoadDeps = {
+            db: prisma as unknown as LoadDb,
+            runDb: prisma,
+            release: REAL_RELEASE,
+            manifest,
+            releaseRoot: releaseDir(REAL_RELEASE),
+            logger: silentLogger,
+            now: () => NOW,
+            dryRun: false,
+        };
+
+        const first = await runLoad(deps);
+
+        expect(first.activated).toBe(true);
+        expect(first.countChecks.every((check) => check.ok)).toBe(true);
+        expect(first.counts.foodsInserted).toBe(manifest.counts.foods);
+        expect(first.counts.foodsUpdated).toBe(0);
+
+        // Every member's declared row count, against the table it lands in —
+        // read from the database rather than off the summary, so the manifest is
+        // compared with what is stored and not with what the loader counted.
+        const declaredRows = (member: string): number | undefined =>
+            manifest.files.find((file) => file.path === member)?.row_count;
+
+        expect(await tableCounts()).toEqual({
+            foods: declaredRows(FOODS_FILE),
+            aliases: declaredRows(ALIASES_FILE),
+            portions: declaredRows(PORTIONS_FILE),
+            components: declaredRows(COMPONENTS_FILE),
+            validationRecords: declaredRows(VALIDATION_RECORDS_FILE),
+            runs: 1,
+        });
+        // And against the `counts` block, which is the manifest's other
+        // statement of the same totals.
+        expect(await prisma.catalog_foods.count({ where: { publication_status: 'published' } })).toBe(
+            manifest.counts.published_foods,
+        );
+        expect(await prisma.catalog_food_aliases.count()).toBe(manifest.counts.aliases);
+        expect(await prisma.catalog_food_portions.count()).toBe(manifest.counts.portions);
+        expect(await prisma.catalog_validation_records.count()).toBe(manifest.counts.validation_records);
+        // The real release states no compositions at all: an empty member is
+        // data, so it loads to an empty table rather than being skipped.
+        expect(declaredRows(COMPONENTS_FILE)).toBe(0);
+        expect(manifest.counts.components).toBe(0);
+
+        // Exactly one default portion per food, each with a sourced gram weight:
+        // an equal total and an equal distinct count together leave no food with
+        // two defaults and none with zero.
+        const foods = manifest.counts.foods;
+        expect(await prisma.catalog_food_portions.count({ where: { is_default: true } })).toBe(foods);
+        const [defaults] = await prisma.$queryRaw<{ owners: bigint }[]>`
+            SELECT count(DISTINCT catalog_food_id) AS owners FROM catalog_food_portions WHERE is_default
+        `;
+        expect(Number(defaults.owners)).toBe(foods);
+        expect(
+            await prisma.catalog_food_portions.count({ where: { is_default: true, gram_weight: { lte: 0 } } }),
+        ).toBe(0);
+        // One validation record each, which the table's unique food reference
+        // makes a statement about coverage rather than about duplication.
+        expect(await prisma.catalog_validation_records.count()).toBe(foods);
+
+        const active = await getActiveReleaseLoad(prisma);
+        expect(active?.releaseId).toBe(REAL_RELEASE);
+        expect(active?.runId).toBe(first.runId);
+        const settled = await runRows();
+        expect(settled).toHaveLength(1);
+        expect(settled[0].status).toBe('succeeded');
+        expect(settled[0].kind).toBe('release_load');
+        expect(settled[0].manifest_version).toBe(manifest.release_id);
+
+        // THE GATE: the same release again, reporting no insert and no update.
+        const second = await runLoad(deps);
+
+        expect(second.counts.foodsInserted).toBe(0);
+        expect(second.counts.foodsUpdated).toBe(0);
+        expect(second.counts.foodsUnchanged).toBe(foods);
+        expect(second.counts.foodsRetired).toBe(0);
+        expect(second.counts.aliasesWritten).toBe(0);
+        expect(second.counts.aliasesRemoved).toBe(0);
+        expect(second.counts.portionsWritten).toBe(0);
+        expect(second.counts.portionsRemoved).toBe(0);
+        expect(second.counts.componentsWritten).toBe(0);
+        expect(second.counts.componentsRemoved).toBe(0);
+        expect(second.counts.validationRecordsWritten).toBe(0);
+        expect(second.activated).toBe(true);
+
+        expect(await tableCounts()).toEqual({
+            foods: declaredRows(FOODS_FILE),
+            aliases: declaredRows(ALIASES_FILE),
+            portions: declaredRows(PORTIONS_FILE),
+            components: declaredRows(COMPONENTS_FILE),
+            validationRecords: declaredRows(VALIDATION_RECORDS_FILE),
+            runs: 2,
+        });
+        expect((await getActiveReleaseLoad(prisma))?.runId).toBe(second.runId);
     });
 });
