@@ -81,7 +81,16 @@
 import { randomUUID } from 'node:crypto';
 
 import { prisma } from '../../prisma/client';
+// Namespace imports, and only for the two atomicity seams below. Both modules
+// are reached from `plannedMealLog.service.ts` as named imports, which compile
+// to property reads on the module object — so replacing the property is what
+// puts a failure at a chosen point INSIDE the transaction, and it is the only
+// mechanism that can, since the service takes no injectable step (the same
+// mechanism `api/targets.test.ts` uses to hold a publication open).
+import * as mealPlanMapper from '../../services/mealPlan.mapper';
+import * as nutritionService from '../../services/nutrition.service';
 import {
+    InvalidRequestDetail,
     LogPlannedMealResponse,
     MealPlanDayResponse,
     MealPlanMealResponse,
@@ -637,6 +646,141 @@ describe('a refused planned log', () => {
                 'idempotencyKey',
                 'mealName',
             ]);
+
+            await expectNothingWritten(week.plan.id);
+        });
+    });
+
+    /* -----------------------------------------------------------------------
+     * A malformed PARENT path id
+     *
+     * The body's five ids are covered above; the two the URL carries are not,
+     * and they are the ones every request to this route has. Unparsed, a
+     * non-UUID `planId` or `mealId` reaches a `where: { id }` predicate on a
+     * `uuid` column — a PostgreSQL cast error, surfacing as a `500` with a
+     * driver message where §0.5.2 promises a `400 invalid_request` naming the
+     * field — and it does so on a WRITE, past the advisory lock, the ledger
+     * reservation and `buildRequestFingerprint`. That is why
+     * `parseLogPlannedMealCall` is `logPlannedMeal`'s first statement, before
+     * any await.
+     *
+     * The ORDER of `details` is asserted as well as their content: the path is
+     * judged first and the body second, in one verdict, so a request with a bad
+     * id and a bad field is fixed in one round trip and the client renders its
+     * inline errors in the order the request reads.
+     * --------------------------------------------------------------------- */
+
+    describe('a malformed parent path id', () => {
+        /** Not a UUID of any version, and not an id this route could ever mint. */
+        const MALFORMED_ID = 'not-a-uuid';
+
+        const PLAN_ID_DETAIL: InvalidRequestDetail = { field: 'planId', code: 'invalid_id' };
+        const MEAL_ID_DETAIL: InvalidRequestDetail = { field: 'mealId', code: 'invalid_id' };
+
+        /**
+         * A case name, the two path ids it sends, what it overrides in an
+         * otherwise-valid body, and the details it must be answered with.
+         *
+         * The ids come from a THUNK because the fixture is seeded per case in
+         * `beforeEach`: a table holding `week.plan.id` would read it while the
+         * `describe` is still being collected, before any fixture exists.
+         */
+        type MalformedPathCase = [
+            string,
+            () => { planId: string; mealId: string },
+            Record<string, unknown>,
+            InvalidRequestDetail[],
+        ];
+
+        const pathCases: MalformedPathCase[] = [
+            [
+                'the planId',
+                () => ({ planId: MALFORMED_ID, mealId: week.breakfast.id }),
+                {},
+                [PLAN_ID_DETAIL],
+            ],
+            [
+                'the mealId',
+                () => ({ planId: week.plan.id, mealId: MALFORMED_ID }),
+                {},
+                [MEAL_ID_DETAIL],
+            ],
+            [
+                'both path ids',
+                () => ({ planId: MALFORMED_ID, mealId: MALFORMED_ID }),
+                {},
+                [PLAN_ID_DETAIL, MEAL_ID_DETAIL],
+            ],
+            [
+                // The path AND the body wrong together: the two path details
+                // come FIRST and the body's follow, which is the ordering
+                // `parseLogPlannedMealCall` composes and the reason a client
+                // never has to send the same request twice to learn both.
+                'both path ids beside a body field',
+                () => ({ planId: MALFORMED_ID, mealId: MALFORMED_ID }),
+                { servings: 0.1 },
+                [PLAN_ID_DETAIL, MEAL_ID_DETAIL, { field: 'servings', code: 'invalid_servings' }],
+            ],
+        ];
+
+        it.each(pathCases)(
+            'answers 400 invalid_request naming %s, and reserves nothing',
+            async (_case, pathIds, overrides, details) => {
+                const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+                const idempotencyKey = randomUUID();
+                const { planId, mealId } = pathIds();
+                const mealBefore = await mealRow(week.breakfast.id);
+
+                const response = await logRequest(planId, mealId, {
+                    ...logBody({ diaryMealId: bucketId, idempotencyKey }),
+                    ...overrides,
+                });
+
+                expect(response.status).toBe(400);
+                expect(response.body).toStrictEqual({ error: 'invalid_request', details });
+
+                await expectNothingWritten(week.plan.id);
+                // And the key itself is untouched, so the request the client
+                // repairs is still a FIRST attempt under it rather than a
+                // reservation nothing will complete.
+                expect(
+                    await prisma.meal_plan_actions.findMany({
+                        where: { user_id: USER_ID, idempotency_key: idempotencyKey },
+                    }),
+                ).toEqual([]);
+                // Byte-equal, not merely un-revisioned: no column of the meal
+                // row is touched by a refusal at the boundary.
+                expect(await mealRow(week.breakfast.id)).toEqual(mealBefore);
+            },
+        );
+
+        it('answers a malformed planId 400 rather than the 404 a plan that is absent gets', async () => {
+            // The distinction the client acts on, and the reason parsing is not
+            // interchangeable with querying: a `404 Plan not found` tells a
+            // client its plan is gone and sends it to regenerate, when in fact
+            // it built a bad URL and its plan is exactly where it was. A
+            // well-formed id that matches nothing is the genuine 404.
+            const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+
+            const malformed = await logRequest(
+                MALFORMED_ID,
+                week.breakfast.id,
+                logBody({ diaryMealId: bucketId }),
+            );
+            const absent = await logRequest(
+                randomUUID(),
+                week.breakfast.id,
+                logBody({ diaryMealId: bucketId }),
+            );
+
+            expect(malformed.status).toBe(400);
+            expect(absent.status).toBe(404);
+            expect(malformed.body).not.toEqual(absent.body);
+            expect(absent.body).toStrictEqual(PLAN_NOT_FOUND_BODY);
+            // Neither is a 500, which is what an unparsed id reaching the `uuid`
+            // predicate would be, and neither body names the column or the
+            // driver that would have produced one (Rule §4).
+            expect(JSON.stringify(malformed.body)).not.toMatch(/PrismaClient|Invalid `|uuid|meal_plan/i);
 
             await expectNothingWritten(week.plan.id);
         });
@@ -1563,6 +1707,372 @@ describe('the idempotency ledger', () => {
         expect(actions.map((action) => action.meal_entry_id).sort()).toEqual(
             entries.map((entry) => entry.id).sort(),
         );
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A failure AFTER the diary entry has been inserted
+ *
+ * §0.5.1 makes the whole keyed write one transaction: the reservation, the
+ * diary insert, the plan-revision bump and the ledger completion either all
+ * commit or none of them do. Every refusal above fails BEFORE the insert — the
+ * parser, the plan's status, the pinned revision, the diary bucket — so none of
+ * them can tell a transaction apart from four sequential statements that happen
+ * to be issued in the right order. The failure that would distinguish them is a
+ * partial one: an entry in the diary with no ledger row behind it (the key
+ * stranded, the retry answered `409 idempotency_conflict` forever), or a plan
+ * revision that moved for a log the diary never received (every client
+ * refetching at a number produced by nothing).
+ *
+ * TWO SEAMS, at the two steps that follow the insert, both installed as spies on
+ * the module boundary `plannedMealLog.service.ts` reaches these functions
+ * through — the only way to fail INSIDE its transaction, since the service
+ * exposes no injectable step:
+ *
+ *  1. `nutrition.service.ts::insertPlannedMealEntry` is CALLED THROUGH and then
+ *     throws. The row genuinely exists in the transaction's snapshot — the case
+ *     proves the id it was given, so a stub that merely refused to write cannot
+ *     be mistaken for this — and the revision bump never runs.
+ *  2. `mealPlan.mapper.ts::toMealPlanMealResponse` throws. It is reached from
+ *     `requireMealResponse`, which runs AFTER `bumpPlanRevision`, and
+ *     `bumpPlanRevision` is a compare-and-swap that THROWS unless it writes
+ *     exactly one row — so the mapper being reached at all is the proof that the
+ *     increment was applied. That makes this the case for the revision half:
+ *     the counter moved inside the transaction and must come back.
+ *
+ * Neither seam changes a rule, a predicate or a status: production code decides
+ * the answer to every request below, and the only thing injected is the moment
+ * of failure. Each case ends by proving the client's retry — the SAME key and
+ * the SAME body — commits exactly once, which is the half a rollback alone does
+ * not establish: rows can be absent because they were rolled back or because
+ * the key was quietly burned.
+ * ------------------------------------------------------------------------- */
+
+describe('a fault after the diary entry has been inserted', () => {
+    /**
+     * The body the controller maps an unrecognised throw on this route to.
+     *
+     * A 500 and not a 502: `mealPlanning.errors.ts` has no class for "this
+     * server's own write broke", and inventing a machine code for it would
+     * promise the client an action it does not have. So the answer is the ONE
+     * documented residual code every handler in
+     * `mealPlanning.controller.ts` shares (`INTERNAL_ERROR`) rather than this
+     * route's prose — §0.5.2 gives the client stable codes to map and no
+     * display text, and eighteen handlers spelling their own 500 gave it
+     * eighteen unmappable shapes. The route it failed on survives as the
+     * `action` of the server event, where it costs the client nothing.
+     *
+     * The body is asserted whole so the fault cannot answer with a leaked
+     * message either (Rule §4).
+     */
+    const WRITE_FAILED_BODY = { error: 'internal_error' };
+
+    /**
+     * Everything a rolled-back attempt must leave exactly as it found it: the
+     * four tables the transaction touches AND the two wire surfaces a client
+     * would have believed the log on.
+     *
+     * The wire halves are part of the snapshot rather than asserted as
+     * emptiness, because the third case starts from a table that already holds a
+     * committed log — and "unchanged" is the claim in every case.
+     */
+    const storedState = async () => ({
+        entries: await storedEntries(),
+        actions: await storedActions(),
+        revision: await planRevision(week.plan.id),
+        meal: await mealRow(week.breakfast.id),
+        loggedEntries: (await readMeal(week.plan.id, week.dayKey, week.breakfast.id)).loggedEntries,
+        diary: await diaryEntries(week.dayKey),
+    });
+
+    type StoredState = Awaited<ReturnType<typeof storedState>>;
+
+    /**
+     * An observation the injected fault had to make, reported rather than
+     * silently skipped.
+     *
+     * Every case checks its seam RAN before it concludes anything from the
+     * response: a 500 also arrives when the spy was never installed on the path
+     * the request took, and that 500 would make each assertion below pass while
+     * proving nothing about atomicity.
+     */
+    const requireObserved = (value: string | null, what: string): string => {
+        if (value === null) {
+            throw new Error(`the injected fault did not run: ${what} was never observed`);
+        }
+
+        return value;
+    };
+
+    /**
+     * Silences the controller's own `console.error` for one request and restores
+     * it afterwards, for the reason `api/requestParserWiring.test.ts` gives: the
+     * handler logs before it answers 500, and a passing run should stay
+     * readable. The response and the rows are the evidence, never the log.
+     */
+    const withSilencedErrorLog = async <TResult>(run: () => Promise<TResult>): Promise<TResult> => {
+        const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        try {
+            return await run();
+        } finally {
+            logged.mockRestore();
+        }
+    };
+
+    /**
+     * The complete no-trace proof for one rolled-back attempt.
+     *
+     * Compared against a snapshot taken with the same readers BEFORE the
+     * request rather than against emptiness, so a case that had already logged
+     * something proves "exactly the rows I had" instead of "none".
+     *
+     * `rolledBackEntryId` is the id the insert really produced inside the
+     * transaction: asserting that id resolves to nothing is sharper than a count
+     * of zero, because it names the row that existed.
+     */
+    const expectNoTraceOfAttempt = async (
+        before: StoredState,
+        idempotencyKey: string,
+        rolledBackEntryId: string,
+    ): Promise<void> => {
+        expect(await storedEntries()).toEqual(before.entries);
+        expect(await prisma.meal_entries.count({ where: { id: rolledBackEntryId } })).toBe(0);
+        // No ledger row for the key, so the key is still a FIRST attempt rather
+        // than a reservation nothing will ever complete — the state in which a
+        // retry is answered `409 idempotency_conflict` and the log can never be
+        // made to happen.
+        expect(await storedActions()).toEqual(before.actions);
+        expect(
+            await prisma.meal_plan_actions.findMany({ where: { user_id: USER_ID, idempotency_key: idempotencyKey } }),
+        ).toEqual([]);
+        expect(await planRevision(week.plan.id)).toBe(before.revision);
+        // The meal row is byte-equal, not merely un-revisioned: a log touches no
+        // column of it at all.
+        expect(await mealRow(week.breakfast.id)).toEqual(before.meal);
+
+        // And the same facts on the wire, which is where a client would have
+        // believed the log happened: the card carries exactly the entries it
+        // carried before — for the first two cases, none, so the slot is not
+        // LOGGED — the plan's revision has not moved, and the diary shows what
+        // it showed.
+        const meal = await readMeal(week.plan.id, week.dayKey, week.breakfast.id);
+
+        expect(meal.loggedEntries).toEqual(before.loggedEntries);
+        expect(meal.revision).toBe(before.meal.revision);
+
+        const plan = await readCurrentPlan();
+
+        expect(plan.revision).toBe(before.revision);
+        expect(plan.summary.loggedEntryCount).toBe(before.entries.length);
+        expect(await diaryEntries(week.dayKey)).toEqual(before.diary);
+    };
+
+    /**
+     * The other half of every case: the client's retry of the identical request
+     * commits once, all the way through.
+     *
+     * The ledger row is asserted as well as the entry, because "committed" for a
+     * keyed write means the action was COMPLETED — an entry beside a reserved
+     * but uncompleted row is the very state the rollback exists to prevent.
+     */
+    const expectCommittedExactlyOnce = async (
+        idempotencyKey: string,
+        body: unknown,
+    ): Promise<void> => {
+        const response = await logRequest(week.plan.id, week.breakfast.id, body);
+
+        expect(response.status).toBe(201);
+        expect((response.body as LogPlannedMealResponse).planRevision).toBe(2);
+
+        const entry = await storedEntry();
+        const actions = await storedActions();
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            idempotency_key: idempotencyKey,
+            action_type: 'log',
+            response_status: 201,
+            plan_revision_after: 2,
+            meal_plan_id: week.plan.id,
+            meal_plan_meal_id: week.breakfast.id,
+            meal_entry_id: entry.id,
+        });
+        expect(await planRevision(week.plan.id)).toBe(2);
+        expect((await mealRow(week.breakfast.id)).revision).toBe(1);
+        expect(
+            (await readMeal(week.plan.id, week.dayKey, week.breakfast.id)).loggedEntries.map(
+                (logged) => logged.entryId,
+            ),
+        ).toEqual([entry.id]);
+    };
+
+    it('rolls the diary entry back when the step after the insert fails', async () => {
+        const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+        const idempotencyKey = randomUUID();
+        const body = logBody({ diaryMealId: bucketId, idempotencyKey });
+        const before = await storedState();
+
+        // Stated so the shared no-trace proof below reads as the strong claim it
+        // is for this case: the slot is not logged, and after the rollback it
+        // must still report `loggedEntries: []`.
+        expect(before.entries).toHaveLength(0);
+        expect(before.loggedEntries).toEqual([]);
+
+        // The real function, captured before the spy replaces the property, so
+        // the insert that runs is production's own — including its single
+        // rounding of the snapshot.
+        const insertEntry = nutritionService.insertPlannedMealEntry;
+        let insertedEntryId: string | null = null;
+        let insertCalls = 0;
+
+        const response = await withSilencedErrorLog(async () => {
+            const insert = jest
+                .spyOn(nutritionService, 'insertPlannedMealEntry')
+                .mockImplementation(async (tx, params) => {
+                    insertCalls += 1;
+                    // Written on the transaction's OWN client, so the row is
+                    // visible to every statement that would have followed it,
+                    // and only then does the step after it fail.
+                    insertedEntryId = (await insertEntry(tx, params)).id;
+
+                    throw new Error('the diary entry was inserted and the next step then failed');
+                });
+
+            try {
+                return await logRequest(week.plan.id, week.breakfast.id, body);
+            } finally {
+                insert.mockRestore();
+            }
+        });
+
+        const rolledBackEntryId = requireObserved(insertedEntryId, 'the inserted entry id');
+
+        expect(insertCalls).toBe(1);
+        expect(response.status).toBe(500);
+        expect(response.body).toStrictEqual(WRITE_FAILED_BODY);
+
+        await expectNoTraceOfAttempt(before, idempotencyKey, rolledBackEntryId);
+        await expectCommittedExactlyOnce(idempotencyKey, body);
+    });
+
+    it('rolls the plan-revision bump back when the read-back after it fails', async () => {
+        const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+        const idempotencyKey = randomUUID();
+        const body = logBody({ diaryMealId: bucketId, idempotencyKey });
+        const before = await storedState();
+
+        expect(before.revision).toBe(1);
+        expect(before.loggedEntries).toEqual([]);
+
+        // What the mapper was handed, which is what makes this case evidence
+        // rather than an assertion about source order: the entries it receives
+        // are read INSIDE the transaction, so seeing the just-inserted row there
+        // shows the insert had happened, and reaching the mapper at all shows
+        // `bumpPlanRevision` had already written its one row (it throws
+        // otherwise).
+        let mappedEntryId: string | null = null;
+        let mapperCalls = 0;
+
+        const response = await withSilencedErrorLog(async () => {
+            const mapper = jest
+                .spyOn(mealPlanMapper, 'toMealPlanMealResponse')
+                .mockImplementation((_meal, _recipeVersion, loggedEntries) => {
+                    mapperCalls += 1;
+                    mappedEntryId = loggedEntries[loggedEntries.length - 1]?.entryId ?? null;
+
+                    throw new Error('the plan revision was bumped and the meal read-back then failed');
+                });
+
+            try {
+                return await logRequest(week.plan.id, week.breakfast.id, body);
+            } finally {
+                // Restored before anything is read back over HTTP: every plan
+                // read maps its meals through this same function, so a leaked
+                // spy would answer the day read with a 500 and the rollback
+                // would look like a broken route.
+                mapper.mockRestore();
+            }
+        });
+
+        const rolledBackEntryId = requireObserved(mappedEntryId, 'the entry the read-back saw');
+
+        expect(mapperCalls).toBe(1);
+        expect(response.status).toBe(500);
+        expect(response.body).toStrictEqual(WRITE_FAILED_BODY);
+
+        await expectNoTraceOfAttempt(before, idempotencyKey, rolledBackEntryId);
+        await expectCommittedExactlyOnce(idempotencyKey, body);
+    });
+
+    it('leaves an earlier committed log untouched when a later one fails after its insert', async () => {
+        // The same rollback against a NON-EMPTY table, which is the case a
+        // `count === 0` assertion could never make: one log has committed, and
+        // the failing attempt must remove its own row and nothing else — not the
+        // earlier entry, not the earlier ledger row, and not the revision that
+        // log legitimately produced.
+        const bucketId = await diaryBucketId(USER_ID, week.dayKey);
+        const committedKey = randomUUID();
+
+        await logOrThrow(
+            week.plan.id,
+            week.breakfast.id,
+            logBody({ diaryMealId: bucketId, idempotencyKey: committedKey, expectedPlanRevision: 1 }),
+        );
+
+        const before = await storedState();
+
+        expect(before.entries).toHaveLength(1);
+        expect(before.actions).toHaveLength(1);
+        expect(before.revision).toBe(2);
+        // The committed log IS on the card, so the no-trace proof below is
+        // asserting survival rather than absence.
+        expect(before.loggedEntries.map((logged) => logged.entryId)).toEqual([before.entries[0].id]);
+
+        const idempotencyKey = randomUUID();
+        const body = logBody({ diaryMealId: bucketId, idempotencyKey, expectedPlanRevision: 2 });
+        const insertEntry = nutritionService.insertPlannedMealEntry;
+        let insertedEntryId: string | null = null;
+
+        const response = await withSilencedErrorLog(async () => {
+            const insert = jest
+                .spyOn(nutritionService, 'insertPlannedMealEntry')
+                .mockImplementation(async (tx, params) => {
+                    insertedEntryId = (await insertEntry(tx, params)).id;
+
+                    throw new Error('the second diary entry was inserted and the next step then failed');
+                });
+
+            try {
+                return await logRequest(week.plan.id, week.breakfast.id, body);
+            } finally {
+                insert.mockRestore();
+            }
+        });
+
+        const rolledBackEntryId = requireObserved(insertedEntryId, 'the inserted entry id');
+
+        expect(response.status).toBe(500);
+        expect(response.body).toStrictEqual(WRITE_FAILED_BODY);
+
+        await expectNoTraceOfAttempt(before, idempotencyKey, rolledBackEntryId);
+
+        // The committed log is still exactly one entry, one completed action and
+        // the one revision it earned — and the failed attempt's own key is still
+        // free, so the second serving can be made to happen.
+        const retried = await logRequest(week.plan.id, week.breakfast.id, body);
+
+        expect(retried.status).toBe(201);
+        expect((retried.body as LogPlannedMealResponse).planRevision).toBe(3);
+
+        const entries = await storedEntries();
+        const actions = await storedActions();
+
+        expect(entries).toHaveLength(2);
+        expect(entries[0]).toEqual(before.entries[0]);
+        expect(actions.map((action) => action.idempotency_key)).toEqual([committedKey, idempotencyKey]);
+        expect(actions.map((action) => action.plan_revision_after)).toEqual([2, 3]);
+        expect(await planRevision(week.plan.id)).toBe(3);
     });
 });
 

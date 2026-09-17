@@ -32,6 +32,17 @@
 // facts moved anyway is left unjudged, counted and reported — never published on
 // a stale verdict.
 //
+// ONE FOOD IS ONE UNIT OF WORK, LEDGER INCLUDED. That per-food transaction
+// carries more than the judgement: this food's count delta, the cursor that
+// points past it and — for a row that could not be judged — the run-log entry
+// naming it all commit with it, through the transaction's own client (see
+// RunValidationDeps.runDbIn and THE PER-FOOD UNIT OF WORK). So there is no
+// window in which a food is judged and the record of it is not, or the reverse:
+// an interrupted pass resumes with its cursor, its counters and its per-check,
+// review-flag and per-category tallies agreeing about the same set of committed
+// judgements, and the report of a resumed run therefore states the WHOLE run
+// rather than the slice this invocation happened to walk.
+//
 // RE-RUNNING A SUCCEEDED PASS IS A NO-OP, BY DESIGN. The run is claimed under a
 // key derived from the coverage plan version and this invocation's options
 // (validationRunScope), and a claim that comes back already completed ends the
@@ -43,24 +54,64 @@
 // stage shares with generation (which is why the startup estimate there is two
 // calls per batch). What the review may do is bounded by construction rather
 // than by promise: AN AI PLAUSIBILITY REVIEW IS NEVER PRESENTED AS VERIFIED
-// NUTRITION. It supplies no value — nothing it returns reaches a nutrient, a
-// name, a portion or a provenance column — and it cannot overturn a failure,
-// because a reject-tier or quarantine-tier check returns from
-// `resolveCatalogDisposition` before the review branch is reached
-// (src/services/catalog.logic.ts). The single thing it can do is confirm a
-// REVIEW-TIER flag on a GENERATED candidate that nothing else holds, and even
-// then only a flag this stage put to it. Its answer is recorded in
-// `catalog_validation_records.llm_review` as advisory flags, where `null` is
-// the honest value for a judgement that consulted no review.
+// NUTRITION, and it CHANGES NO DISPOSITION. It supplies no value — nothing it
+// returns reaches a nutrient, a name, a portion or a provenance column — and it
+// lifts no flag: `resolveCatalogDisposition` takes no advisory parameter at all
+// (src/services/catalog.logic.ts), so there is no path from a model answer to a
+// publication decision. The one thing it produces is a RECORD: its answer is
+// written to `catalog_validation_records.llm_review` as advisory flags for a
+// curator to read, where `null` is the honest value for a judgement that
+// consulted no review.
+//
+// WHY IT MAY NOT LIFT A FLAG, when the flag it is asked about is exactly the
+// one holding the row. A review-tier hold on a GENERATED candidate says its
+// stated nutrition is atypical for its category — an AI-derived value nothing
+// outside the model has spoken for. Publishing it because the same class of
+// system calls it plausible would make the review the source of the claim it
+// was asked to assess, which is what Agent Action Plan §0.1.2 forbids in so
+// many words and §0.7.3's provenance model restates ("an advisory second-model
+// review writes `llm_review` flags and never promotes values"). The one route
+// out of a review-tier hold is therefore the CURATOR's
+// (`curatorAllowlistedCheckNames`), and the review's value is that it tells the
+// curator where to look.
+//
+// A REVIEW THIS PASS COULD NOT COMPLETE IS NOT A SUCCEEDED PASS. Three things
+// can leave a held flag unanswered: the shared cap is gone (the pipeline's
+// authorised spend, not this run's allowance — lib/budget.ts sums one budget
+// over generation and this review), a paid call's usage cannot be written to
+// the durable spend ledger, or a caller asked for a review without supplying
+// the seam. In each case the rows whose flags were never put to a model — or
+// whose answer had to be discarded — are recorded BY SOURCE KEY on the run's
+// cursor and the run is closed FAILED with a non-zero exit. It has to be:
+// a SUCCEEDED key can never be claimed again (see RE-RUNNING A SUCCEEDED PASS),
+// so recording such a pass as a success would put those flags permanently out
+// of reach and would tell an unattended caller that the review happened. The
+// rows keep the dispositions the deterministic checks gave them — the pass
+// judged them honestly, and it is the REVIEW that is unfinished, which is what
+// the run status and the report's `modelCalls.stopReason` then state.
 //
 // A USDA-sourced record never needs it: the vendor is authoritative, so such a
 // row publishes WITH its flag recorded, and no call is made for it.
 //
-// A confirmation is scoped to the judgement that obtained it. A later pass that
-// consults no review holds the row again, which is the correct reading of the
-// deterministic checks on their own; durable publication of an atypical
-// generated value is the CURATOR's path (`curatorAllowlistedCheckNames`), not
-// a stored model answer that would harden into verified nutrition over time.
+// A USDA-sourced record is not reviewed at all: the vendor is authoritative, so
+// such a row publishes WITH its flag recorded, and no call is made for it.
+//
+// A review is spent only where a curator could act on it — a generated
+// candidate held by review-tier flags alone, with a verified identity and no
+// pending classification (see advisoryReviewApplies) — because anywhere else
+// the deterministic checks settle the row whatever the model says, and paying
+// for an answer that cannot inform anyone is the appearance of scrutiny rather
+// than scrutiny.
+//
+// WHAT THE REVIEW PUTS IN THE LOG is bounded on purpose, and NO PER-FOOD LINE
+// OF IT REACHES NORMAL LEVEL: a handful of samples per event kind at `debug`,
+// the rest suppressed with their count kept, and one `advisory_review_summary`
+// at the end carrying the aggregates (see ADVISORY_REVIEW_LOG_SAMPLE_LIMIT). A
+// line per reviewed food repeated, for thousands of foods, detail that
+// `catalog_validation_records.llm_review` retains permanently — and buried the
+// one line an operator had to act on. The summary is therefore the ONLY
+// normal-level announcement the advisory review makes, which is why it rises to
+// `warn` whenever a review failed or the review stopped.
 //
 // WHY NO PRISMA PREDICATE IN THIS STAGE CARRIES AN OWNER (Rule
 // backend-architecture §5.1). Every table this file writes — `catalog_foods`,
@@ -96,7 +147,14 @@ import path from 'path';
 import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
 import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
 import type { LogFields, LogLevel } from './lib/logger';
-import { ManifestError, loadCoveragePlan, loadEvidenceAllowlist, reportPath } from './lib/manifest';
+import {
+    ManifestError,
+    loadCoveragePlan,
+    loadEvidenceAllowlist,
+    reportPath,
+    withArtifactPublicationLockSync,
+    writeJsonFile,
+} from './lib/manifest';
 import type { CatalogFoodState, CoveragePlan } from './lib/manifest';
 import {
     ModelBudgetError,
@@ -125,13 +183,27 @@ import type { ScriptLogger } from './lib/logger';
 
 // The checks themselves. Pure, so this import opens nothing; the Prisma client
 // is reached from main() because constructing it is a module-load side effect.
-import { dedupeIdentity, normalizeCanonicalName, validateCatalogCandidate } from '../src/services/catalog.logic';
+import {
+    CATALOG_CHECK_NAMES,
+    PER_100G_BASIS_AMOUNT,
+    catalogCheckTier,
+    dedupeIdentity,
+    normalizeCanonicalName,
+    validateCatalogCandidate,
+} from '../src/services/catalog.logic';
+// `CatalogAdvisoryReview` is deliberately NOT imported: the advisory answer has
+// no type-level route into a judgement any more, so this file carries the
+// confirmed names as plain strings for the record and its counters, and nothing
+// here can be handed to the checks (see ON THE ADVISORY REVIEW).
 import type {
-    CatalogAdvisoryReview,
+    CatalogCheckName,
     CatalogFoodCandidate,
+    CatalogIdentityCandidate,
+    CatalogIdentityMerge,
     CatalogValidationPolicy,
     CatalogValidationVerdict,
 } from '../src/services/catalog.logic';
+import type { CatalogValidationCheck } from '../src/types/catalog';
 
 // The advisory review's one route to a paid vendor (§9). Nothing else in this
 // file may reach OpenRouter, and every failure leaving that boundary is an
@@ -195,7 +267,17 @@ const asReviewFailure = (
     }
 
     if (error instanceof OpenRouterError) {
-        return new CatalogReviewError(code, `OpenRouter call failed (${error.kind}): ${error.message}`, {
+        // `error.safeMessage`, NEVER `error.message` — the same rule as
+        // catalog-generate-ai.ts::asGenerationFailure, and for a wider blast
+        // radius: this error is warned per reviewed food
+        // (`advisory_review_failed`, `advisory_review_unusable`), raised on the
+        // fatal `stage_failed` path, and handed to
+        // `failedAdvisoryReviewRecord`, whose output ships in a release
+        // artefact. The vendor boundary keeps up to 300 characters of the
+        // failed response body in `message` for the estimate endpoints' 502
+        // text alone; a validation pass over thousands of rows must carry the
+        // stage code, the vendor kind and the numeric status instead.
+        return new CatalogReviewError(code, error.safeMessage, {
             ...context,
             kind: error.kind,
             status: error.status,
@@ -247,9 +329,10 @@ export interface ValidateOptions {
     readonly revalidateQuarantined: boolean;
     /**
      * `--review`: consult the advisory second model on a generated candidate
-     * held by review-tier flags alone. OFF BY DEFAULT — it is the only part of
-     * this stage that spends money, and the deterministic checks settle every
-     * other disposition without it (see ON THE ADVISORY REVIEW).
+     * held by review-tier flags alone, and RECORD its answer for a curator.
+     * OFF BY DEFAULT — it is the only part of this stage that spends money, and
+     * the deterministic checks settle every disposition without it, this one
+     * included (see ON THE ADVISORY REVIEW).
      */
     readonly review: boolean;
     /**
@@ -401,9 +484,10 @@ export const describeUsage = (): string =>
         'over every row it owns, writes one validation record per judged food, and',
         'reports the counts and the exact per-category shortfall.',
         '',
-        'No model call is made unless --review is passed: every disposition is',
-        'settled deterministically, and the advisory review never promotes a value,',
-        'so llm_review is recorded as null for a judgement that consulted none.',
+        'No model call is made unless --review is passed, and every disposition is',
+        'settled deterministically either way: the advisory review is recorded for a',
+        'curator, promotes no value and lifts no flag, and llm_review is null for a',
+        'judgement that consulted none.',
         '',
         'Options:',
         '  --category <name>           Restrict validation to one coverage-plan',
@@ -414,9 +498,11 @@ export const describeUsage = (): string =>
         '                              Default: off (candidates only).',
         '  --review                    Consult the advisory second model where a',
         '                              GENERATED candidate is held by review-tier flags',
-        '                              alone. It can confirm such a flag and nothing',
-        '                              else: it never supplies a value and never',
-        '                              overturns a reject or a quarantine. Spends the',
+        '                              alone, and record its answer in llm_review for a',
+        '                              curator. It changes NO disposition: it supplies no',
+        '                              value, lifts no flag, and cannot overturn a reject',
+        '                              or a quarantine. Only a curator allowlist releases',
+        '                              a review-tier hold. Spends the',
         '                              CATALOG_MODEL_CALL_BUDGET cap shared with',
         '                              catalog:generate. Default: off.',
         '  --dry-run                   Judge everything and write nothing — no status,',
@@ -595,6 +681,20 @@ export interface ValidationFoodRow {
     readonly density_g_per_ml: number | null;
     readonly allergen_status: string;
     readonly allergen_tags: string[];
+    /**
+     * Read for the same reason as `allergen_tags`: both are safety metadata the
+     * checks judge against a closed vocabulary, and a diet claim that
+     * contradicts the allergen list cannot be published
+     * (src/services/catalog.logic.ts).
+     *
+     * Optional on the TYPE and always present in practice — the `selection`
+     * below names it, so every row this stage reads carries it. The optionality
+     * is for a row assembled by hand: an absent list means the diet column was
+     * never read, and a check whose input is unavailable is omitted rather than
+     * recorded as a pass (the same convention catalog.logic.ts applies to the
+     * duplicate and portion checks).
+     */
+    readonly diet_tags?: string[];
     readonly publication_status: string;
     /**
      * The snapshot counters the import bumps when it changes a row's nutrients
@@ -624,6 +724,13 @@ export interface ValidationFoodRow {
          * method stating a derivation no assumption accounts for.
          */
         readonly nutrition_assumptions: string | null;
+        /**
+         * The advisory review this row's LAST judgement recorded, read so a
+         * later attempt of the same run can tell which rows it still owes a
+         * review WITHOUT relying on the cursor's capped list of names (see
+         * {@link reviewOwedByRun}).
+         */
+        readonly llm_review: unknown;
     } | null;
 }
 
@@ -648,6 +755,20 @@ export interface ValidateDb {
         create(args: unknown): Promise<{ id: string }>;
         update(args: unknown): Promise<{ id: string }>;
         updateMany(args: unknown): Promise<{ count: number }>;
+        /**
+         * The one read this stage makes of its own committed judgements, and it
+         * happens on the resume path alone (see THE RUN IDENTIFIES THE WORK).
+         *
+         * OPTIONAL, because it is the only member of this slice a caller can
+         * omit without being wrong. Every other member is part of judging a
+         * food, so a client that lacked one could not run the stage at all;
+         * this one rebuilds REPORT dimensions for a run whose cursor tallies
+         * cannot be trusted, and a caller that supplies a graph double without
+         * it gets a report whose `figureScope` says the dimensions cover this
+         * invocation rather than a pass that refuses to continue. Production
+         * passes a Prisma client, which has it.
+         */
+        findMany?(args: unknown): Promise<JudgedValidationRecord[]>;
     };
     /**
      * Raw SQL, because Prisma cannot express `FOR UPDATE` and the row lock is
@@ -662,6 +783,28 @@ export interface ValidateDb {
 export interface RunValidationDeps {
     readonly db: ValidateDb;
     readonly runDb: CatalogRunDb;
+    /**
+     * Which client the run row's cursor, counts and log are written through
+     * from INSIDE a food's judgement transaction.
+     *
+     * THE ATOMICITY OF ONE FOOD IS A PROPERTY OF ONE SHARED CLIENT, and this
+     * seam is where that fact is stated instead of assumed. A food's judgement
+     * and the ledger entries that say it happened must commit together (see THE
+     * PER-FOOD UNIT OF WORK), which is only possible when the graph and the
+     * ledger live behind the same connection: handed the transaction client,
+     * `lib/checkpoint.ts`'s writers run IN PLACE and their locks are held until
+     * this transaction commits. `main()` passes one Prisma singleton as both
+     * `db` and `runDb`, so production takes that path by default.
+     *
+     * A caller that splits the two — a fake graph with a real ledger, which is
+     * what a script suite drives the stage with — CANNOT have that atomicity,
+     * because no transaction can span two clients. The default says so by
+     * falling back to `runDb`, which keeps such a caller correct (the writes
+     * still land, in their own transactions) without pretending they are
+     * atomic. Overriding it is for a suite that wants to observe the seam
+     * itself.
+     */
+    readonly runDbIn?: (tx: ValidateDb) => CatalogRunDb;
     readonly coveragePlan: CoveragePlan;
     readonly options: ValidateOptions;
     readonly logger: ScriptLogger;
@@ -705,6 +848,22 @@ export interface ValidationOutcome {
      * its considered set and is closed as failed so a re-run resumes it.
      */
     readonly unjudged: number;
+    /**
+     * Rows whose held review-tier flags this invocation could not put to the
+     * advisory model, or whose paid answer it had to discard because the spend
+     * could not be recorded (see THE ADVISORY REVIEW and reviewFood). Always
+     * zero without `--review`. Anything else means the run is NOT the review
+     * pass it was asked for and is closed as failed, for the same reason an
+     * unjudged row closes it failed: a succeeded key is a permanent no-op.
+     */
+    readonly unresolvedReviews: number;
+    /**
+     * Why the advisory review stopped, or `null` when it did not — the same
+     * value the report carries as `modelCalls.stopReason`. Part of the outcome
+     * because a caller that sees `unresolvedReviews > 0` needs the cause to
+     * know whether its next move is to raise the cap or to repair the ledger.
+     */
+    readonly reviewStopReason: ValidationReviewStopCause | null;
 }
 
 /**
@@ -732,6 +891,7 @@ export const candidateFromRow = (row: ValidationFoodRow): CatalogFoodCandidate =
     nutrition_provenance: row.nutrition_provenance as 'source_backed' | 'ingredient_derived' | 'ai_estimated',
     allergen_status: row.allergen_status as 'known' | 'unknown',
     allergen_tags: row.allergen_tags,
+    diet_tags: row.diet_tags,
     nutrition_basis: row.nutrition_basis as 'per_100g' | 'per_100ml' | 'per_serving',
     basis_amount: row.basis_amount,
     calories: row.calories,
@@ -787,32 +947,33 @@ export const curatorReviewRequired = (row: ValidationFoodRow): boolean => {
  * `reviewFlags` lists every failed review-tier check whether or not it held the
  * row (a USDA record publishes with its flags recorded), so the held set is the
  * intersection with the checks that decided the disposition. Those are the only
- * names a model is ever asked about, and — because
- * `resolveCatalogDisposition` lifts a flag only from that same list — the only
- * names an answer could affect.
+ * names a model is ever asked about — asking about a flag that is not holding
+ * the row would spend a call on a question whose answer changes nothing for
+ * anyone, including the curator who reads it.
  */
 export const heldReviewFlags = (verdict: CatalogValidationVerdict): string[] =>
     verdict.decidingCheckNames.filter((name) => verdict.reviewFlags.includes(name));
 
 /**
- * Whether the advisory review could change this row's disposition at all.
+ * Whether an advisory review of this row could inform a curator's decision at
+ * all — which is the only thing a review is for (see ON THE ADVISORY REVIEW).
  *
- * Five conditions, and each one is a reason NOT to spend money rather than a
- * preference:
+ * It decides nothing about the disposition: the row is judged identically
+ * whether or not a call is made. What it decides is whether to SPEND, and each
+ * of its conditions is a reason not to rather than a preference:
  *
  *  * `ai_generated` only — THE USDA/AI SPLIT. A USDA-sourced record publishes
  *    with its review flag recorded, because the vendor asserted the value and
- *    the flag is informational; a generated one is held until something
- *    outside the model's own output speaks for it. Reviewing a USDA row could
- *    therefore change nothing, and asking a model to vouch for a record that
- *    already publishes would be spending for the appearance of scrutiny.
- *  * held at all — a row the checks passed needs nothing.
+ *    the flag is informational; a generated one is held until a curator speaks
+ *    for it. A USDA row has no curator decision pending, so a review of it
+ *    would inform nobody.
+ *  * held at all — a row the checks passed needs no curator.
  *  * held by review-tier flags ALONE — if any deciding check is reject- or
- *    quarantine-tier the disposition stands whatever a model says, so the call
- *    would be pure cost.
+ *    quarantine-tier the row stays held whatever anyone says about the review
+ *    flag, so the answer could not inform a decision that exists.
  *  * a verified identity and no pending curator classification — both are
- *    floors this stage applies after the checks and no confirmation lifts
- *    them, so the row cannot publish on this pass either way.
+ *    floors this stage applies after the checks, and neither moves for a
+ *    review-flag allowlist, so the row cannot publish on this pass either way.
  */
 export const advisoryReviewApplies = (row: ValidationFoodRow, verdict: CatalogValidationVerdict): boolean => {
     if (row.identity_source !== 'ai_generated') {
@@ -1007,14 +1168,19 @@ export const confirmedCheckNames = (
     return requested.filter((name) => plausible.has(name));
 };
 
-/** The outcome of one review, as the judgement and the record consume it. */
+/** The outcome of one review, as the record and this stage's counters consume it. */
 export interface AdvisoryReviewOutcome {
     /**
-     * What the checks may consult — `null` whenever the review confirmed
-     * nothing, failed, or was not usable, so a row is never published on an
-     * empty confirmation.
+     * The review-tier check names the model called plausible, for the record
+     * and for the run's counters.
+     *
+     * NOT AN INPUT TO ANY JUDGEMENT. `judgeRow` neither takes nor reads this:
+     * the verdict is computed from the row and the policy alone, so a
+     * confirmation here is information a curator may act on and nothing a
+     * publication decision is ever made from (see ON THE ADVISORY REVIEW).
+     * Empty whenever the review confirmed nothing, failed, or was unusable.
      */
-    readonly review: CatalogAdvisoryReview | null;
+    readonly confirmed: readonly string[];
     /** What is stored in `llm_review`: advisory, and never a value. */
     readonly record: Record<string, unknown>;
 }
@@ -1023,11 +1189,13 @@ export interface AdvisoryReviewOutcome {
  * The advisory record for a review that ran.
  *
  * Records the model and prompt version that answered, what was put to it, and
- * what it confirmed — so a reviewer can tell an unreviewed judgement (`null`)
- * from a reviewed one that lifted nothing, and can attribute either. `advisory:
- * true` is stated in the row itself because this column is the one place a
- * model's opinion is stored next to sourced facts, and nothing downstream may
- * read it as one.
+ * what it called plausible — so a CURATOR reading the held row can see which
+ * flag was questioned, by which model, and on what stated reason, and can tell
+ * an unreviewed judgement (`null`) from a reviewed one. `advisory: true` is
+ * stated in the row itself because this column is the one place a model's
+ * opinion is stored next to sourced facts, and nothing downstream may read it
+ * as one; the row's `publication_status` beside it was decided without this
+ * column being consulted at all.
  */
 export const advisoryReviewRecord = (input: {
     readonly model: string;
@@ -1038,7 +1206,8 @@ export const advisoryReviewRecord = (input: {
     readonly confirmed: readonly string[];
 }): Record<string, unknown> => ({
     advisory: true,
-    never_verified_nutrition: 'a plausibility answer, not a source; it lifts a review-tier flag and supplies no value',
+    never_verified_nutrition:
+        'a plausibility answer, not a source; it is recorded for a curator and changes no status, no flag and no value',
     model: input.model,
     prompt_version: input.promptVersion,
     reviewed_at: input.reviewedAt.toISOString(),
@@ -1071,6 +1240,34 @@ export const failedAdvisoryReviewRecord = (input: {
     // completion text: this column ships in a release artefact.
     failure_kind: input.failure.context.kind ?? null,
 });
+
+/**
+ * Why the advisory review stopped for the rest of a pass.
+ *
+ * Every cause names something the pass cannot recover from on its own, which is
+ * why there is no code here for a single unanswered call: a vendor failure or an
+ * unusable answer is degraded and recorded per row, and the pass continues
+ * (see reviewFood). These four end the review, and each one is a different
+ * operator action — raise the cap, repair the ledger, find out what spent
+ * without metering, or supply the seam — so they are reported apart rather than
+ * as one "stopped".
+ *
+ *  * `budget_exhausted` — the SHARED CATALOG_MODEL_CALL_BUDGET for this coverage
+ *    plan is gone, across generation and this review (lib/budget.ts).
+ *  * `usage_unrecorded` — a paid call's usage would not write to the durable
+ *    ledger, twice.
+ *  * `usage_unmetered` — the ledger refused the usage because nothing was
+ *    reserved under that key, or the key belongs to another run: a call was
+ *    spent without metering, which is the one thing the ledger exists to
+ *    prevent.
+ *  * `review_client_unavailable` — `--review` was asked for with no review
+ *    client, ledger, model or budget supplied.
+ */
+export type ValidationReviewStopCause =
+    | 'budget_exhausted'
+    | 'usage_unrecorded'
+    | 'usage_unmetered'
+    | 'review_client_unavailable';
 
 /** The vendor seam, narrowed to the one call this stage makes (§9). */
 export interface ValidationReviewClient {
@@ -1139,7 +1336,7 @@ export const identityGroupMoved = (
     normalizeCanonicalName(before.canonical_name) !== normalizeCanonicalName(after.canonical_name);
 
 /** What one food's write transaction reports back, so the tallies happen after it commits. */
-type ValidationWriteOutcome =
+export type ValidationWriteOutcome =
     | {
           readonly outcome: 'judged';
           readonly publicationStatus: string;
@@ -1151,6 +1348,324 @@ type ValidationWriteOutcome =
           readonly category: string;
       }
     | { readonly outcome: 'vanished' | 'raced' | 'identity_moved' };
+
+/**
+ * The counter delta one food's committed outcome earns — the whole of it,
+ * derived from nothing but that outcome.
+ *
+ * PURE, AND THAT IS WHAT MAKES THE PER-FOOD UNIT OF WORK POSSIBLE (Rule
+ * backend-architecture §1.2, §7). The same delta is written to the run row
+ * INSIDE the food's transaction and added to this invocation's in-memory
+ * counters AFTER it commits, so the two cannot disagree: they are the same
+ * value applied twice rather than two tallies of one event. Counting inside the
+ * loop from mutable state, as the previous revision did, made that impossible
+ * to state — and a delta computed from the row rather than from the outcome
+ * would count a judgement that rolled back.
+ *
+ * A skipped row earns exactly one counter, which is why it is visible at all:
+ * `unjudged` is derived from these three (see the close).
+ */
+export const validationCountDelta = (written: ValidationWriteOutcome): Readonly<Record<string, number>> => {
+    if (written.outcome !== 'judged') {
+        if (written.outcome === 'vanished') {
+            return { vanished: 1 };
+        }
+        return written.outcome === 'raced' ? { raced: 1 } : { identityGroupMoved: 1 };
+    }
+
+    const delta: Record<string, number> = { judged: 1 };
+
+    if (written.identityHeld) {
+        delta.identityNotVerified = 1;
+    }
+    if (written.awaitingClassification) {
+        delta.awaitingClassification = 1;
+    }
+
+    if (written.publicationStatus === 'published') {
+        delta.published = 1;
+    } else if (written.publicationStatus === 'quarantined') {
+        delta.quarantined = 1;
+    } else if (written.publicationStatus === 'rejected') {
+        delta.rejected = 1;
+    } else if (written.publicationStatus === 'candidate') {
+        delta.candidatesHeld = 1;
+    }
+
+    if (written.publicationStatus === written.previousStatus) {
+        delta.unchanged = 1;
+    }
+
+    return delta;
+};
+
+/**
+ * The three dimensions the report's `failedChecks`, `reviewFlags` and
+ * `coverage.byCategory.published` are built from.
+ *
+ * Kept together and carried in the cursor (see ValidationCursor) because they
+ * are accumulated per food and read once at the end: a resumed pass skips the
+ * rows a previous attempt judged, so a dimension held only in memory would
+ * describe the last slice of a run while `counts` described all of it, and the
+ * one report would state both as though they covered the same thing.
+ */
+export interface ValidationDimensions {
+    readonly byCheck: Readonly<Record<string, number>>;
+    readonly reviewFlags: Readonly<Record<string, number>>;
+    readonly publishedByCategory: Readonly<Record<string, number>>;
+}
+
+/** The dimensions of a run that has judged nothing. */
+export const emptyValidationDimensions = (): ValidationDimensions => ({
+    byCheck: {},
+    reviewFlags: {},
+    publishedByCategory: {},
+});
+
+const withIncrement = (
+    map: Readonly<Record<string, number>>,
+    keys: readonly string[],
+): Readonly<Record<string, number>> => {
+    if (keys.length === 0) {
+        return map;
+    }
+    const next: Record<string, number> = { ...map };
+    for (const key of keys) {
+        next[key] = (next[key] ?? 0) + 1;
+    }
+    return next;
+};
+
+/**
+ * The dimensions a run holds once this food's outcome is added to them.
+ *
+ * Pure and non-mutating for the same reason as `validationCountDelta`: the
+ * result is written to the cursor inside the food's transaction and adopted in
+ * memory only after that transaction commits, so an interrupted food leaves
+ * both the durable and the in-memory figures on the last COMMITTED state rather
+ * than on a judgement that never landed.
+ *
+ * A skipped row adds nothing: it was not judged, so no check of it failed and
+ * no category gained a published row.
+ */
+export const applyDimensionDelta = (
+    dimensions: ValidationDimensions,
+    written: ValidationWriteOutcome,
+): ValidationDimensions => {
+    if (written.outcome !== 'judged') {
+        return dimensions;
+    }
+
+    return {
+        byCheck: withIncrement(
+            dimensions.byCheck,
+            written.verdict.checks.filter((check) => !check.pass).map((check) => check.name),
+        ),
+        reviewFlags: withIncrement(dimensions.reviewFlags, written.verdict.reviewFlags),
+        publishedByCategory:
+            written.publicationStatus === 'published'
+                ? withIncrement(dimensions.publishedByCategory, [written.category])
+                : dimensions.publishedByCategory,
+    };
+};
+
+/**
+ * One committed validation record, as the dimension rebuild reads it back.
+ *
+ * Exactly the four facts a judgement left behind that the report's dimensions
+ * are derived from, and nothing else: the checks it recorded, the status it
+ * wrote, the food's category, and the history that names the run which wrote
+ * them. `checks` and `history` are `unknown` because the columns are JSONB —
+ * whatever is in them is read leniently rather than asserted (see
+ * dimensionsFromJudgedRecords).
+ */
+export interface JudgedValidationRecord {
+    readonly checks: unknown;
+    readonly publication_status: string;
+    readonly history: unknown;
+    readonly catalog_foods: { readonly category: string };
+}
+
+/** What a rebuild of a run's dimensions recovered, and from how much. */
+export interface RebuiltValidationDimensions {
+    readonly dimensions: ValidationDimensions;
+    /** Records whose history names the run: the foods it has judged. */
+    readonly judgedFoods: number;
+    /** Records examined, so the cost of the rebuild is visible in the log. */
+    readonly recordsRead: number;
+}
+
+/**
+ * The failed check names a stored `checks` array holds.
+ *
+ * Lenient for the same reason `readValidationCursor` is: the column is JSONB
+ * and this derivation runs to make a REPORT true, so a record with an
+ * unreadable entry contributes the entries that are readable instead of
+ * aborting a resumed pass. `pass` must be exactly `false` — an entry that does
+ * not state it is not a failure.
+ */
+const storedFailedCheckNames = (checks: unknown): string[] => {
+    if (!Array.isArray(checks)) {
+        return [];
+    }
+
+    const failed: string[] = [];
+    for (const entry of checks) {
+        if (typeof entry !== 'object' || entry === null) {
+            continue;
+        }
+        const { name, pass } = entry as { name?: unknown; pass?: unknown };
+        if (typeof name === 'string' && pass === false) {
+            failed.push(name);
+        }
+    }
+    return failed;
+};
+
+/**
+ * Whether a failed check is a review-tier one, read from the CURRENT tier map.
+ *
+ * `catalog.logic.ts` owns the tiers and the stage holds none of its own, so the
+ * review-flag dimension is derived the same way `resolveCatalogDisposition`
+ * derives `verdict.reviewFlags` — from the tier the check name carries now,
+ * never from a `tier` field a stored record happens to repeat. A name no
+ * current check declares has no tier and is therefore not a review flag; it is
+ * still counted as a failed check, which is exactly how
+ * `applyDimensionDelta` treats it.
+ */
+const storedReviewFlagNames = (failed: readonly string[]): string[] =>
+    failed.filter((name) => catalogCheckTier(name as CatalogCheckName) === 'review');
+
+/**
+ * This run's own history entry on a record, or `null`.
+ *
+ * `runHasJudgedFood` only has to answer "did it?"; a rebuilt dimension has to
+ * know WHAT the run decided, and the entry `appendValidationHistory` writes
+ * carries exactly that — `to` is the status this run gave the food and
+ * `review_flags` the flags its verdict raised. One entry per run per food, by
+ * construction: the append filters this run's earlier entry out before adding
+ * the new one.
+ */
+const runHistoryEntry = (history: unknown, runId: string): Record<string, unknown> | null => {
+    if (!Array.isArray(history)) {
+        return null;
+    }
+
+    for (const entry of history) {
+        if (historyEntryBelongsToRun(entry, runId)) {
+            return entry as Record<string, unknown>;
+        }
+    }
+    return null;
+};
+
+/**
+ * The review flags a history entry states, or `null` when it states none.
+ *
+ * `null` and an empty array are different answers and the caller needs both
+ * apart: an entry written before the field existed cannot say what the verdict
+ * raised (so the derivation from the record's checks is the only source left),
+ * while an entry that says `[]` is stating that the verdict raised nothing.
+ */
+const storedEntryReviewFlags = (entry: Record<string, unknown>): string[] | null => {
+    const flags = entry.review_flags;
+    if (!Array.isArray(flags)) {
+        return null;
+    }
+    return flags.filter((flag): flag is string => typeof flag === 'string');
+};
+
+/**
+ * THE REPORT'S DIMENSIONS, REBUILT FROM THE RUN'S OWN COMMITTED RECORDS.
+ *
+ * WHY THIS EXISTS. The cursor carries the dimensions so a resumed pass reports
+ * the run (see ValidationCursor's `tallies`), and on the ordinary resume it is
+ * read straight from there. But the cursor's POSITIONS are only meaningful
+ * against the work list they were saved for, and ordinary judgement changes
+ * that list: a row this pass rejects leaves the considered set, so the plan
+ * fingerprint stops matching and the positions — and with them the tallies
+ * saved beside them — have to be dropped. The run is still the same run: it is
+ * keyed by `validationRunScope`, and `runHasJudgedFood` guarantees no row is
+ * judged twice within it, so the rows an earlier attempt judged are skipped
+ * whatever the fingerprint says. Dimensions that started empty there would
+ * describe a fraction of a catalog the database had in fact judged, and
+ * labelling that fraction "invocation-scoped" describes the defect rather than
+ * fixing it.
+ *
+ * WHY THE RECORDS CAN ANSWER IT. Everything the dimensions need is durable and
+ * was written inside the judgement's own transaction: the `history` names the
+ * run that judged the food — the same fact, read the same way, that the
+ * judgement queue consults — and the entry it names carries that run's own
+ * decision, while the stored `checks` carry the verdict's detail.
+ *
+ * THE RUN'S ENTRY DECIDES, NOT THE RECORD'S CURRENT STATE, wherever the entry
+ * can answer. These figures have one meaning, and the in-memory path fixes it:
+ * `applyDimensionDelta` counts the status THIS RUN WROTE (`written`) and the
+ * flags THIS RUN'S VERDICT raised, at the moment it wrote them. The same report
+ * field must not change meaning according to whether the pass resumed from a
+ * cursor or rebuilt from records, so the rebuild reads the entry's `to` and
+ * `review_flags`. Within one run the two sources agree — a row is judged once
+ * and the stage lock keeps passes apart — but they can diverge afterwards,
+ * because a differently-keyed pass over the same input (`--category`,
+ * `--review`) may judge a row between this run's interruption and its resume.
+ * The entry is then still right about this run and the record is not.
+ *
+ * ONE FIGURE IS DERIVED FROM THE RECORD, and the asymmetry is stated rather
+ * than hidden: `byCheck` counts EVERY failed check, and the entry carries only
+ * `deciding_checks`, the subset that settled the disposition. So the failed
+ * names come from the record's stored `checks`, which is this run's verdict
+ * except in that same divergence — the closest available source, and the one
+ * the report has always used. An entry from before `to`/`review_flags` were
+ * written falls back to the record for its figures too, since a legacy entry
+ * cannot answer and a resumed pass must still report.
+ *
+ * WHY IT CANNOT DOUBLE COUNT. Every record it counts belongs to a food this run
+ * has already judged, and such a food is either filtered out of the queue by
+ * `runHasJudgedFood` or (having been rejected) is not in the considered set at
+ * all. So no food counted here can be judged again in this invocation and
+ * counted a second time.
+ *
+ * Pure and exported so the derivation is asserted on rows rather than on a
+ * database (Rule backend-architecture §7, §11).
+ *
+ * @param records every validation record the caller read, filtered here
+ * @param runId the run whose judgements are wanted
+ */
+export const dimensionsFromJudgedRecords = (
+    records: readonly JudgedValidationRecord[],
+    runId: string,
+): RebuiltValidationDimensions => {
+    let dimensions = emptyValidationDimensions();
+    let judgedFoods = 0;
+
+    for (const record of records) {
+        const entry = runHistoryEntry(record.history, runId);
+        if (entry === null) {
+            continue;
+        }
+
+        judgedFoods += 1;
+        const failed = storedFailedCheckNames(record.checks);
+
+        // The status this run gave the food, and the record's current status
+        // only when the entry predates the field.
+        const published =
+            typeof entry.to === 'string' ? entry.to === 'published' : record.publication_status === 'published';
+        // The flags this run's verdict raised; derived from the failed checks
+        // only when the entry cannot say.
+        const reviewFlags = storedEntryReviewFlags(entry) ?? storedReviewFlagNames(failed);
+
+        dimensions = {
+            byCheck: withIncrement(dimensions.byCheck, failed),
+            reviewFlags: withIncrement(dimensions.reviewFlags, reviewFlags),
+            publishedByCategory: published
+                ? withIncrement(dimensions.publishedByCategory, [record.catalog_foods.category])
+                : dimensions.publishedByCategory,
+        };
+    }
+
+    return { dimensions, judgedFoods, recordsRead: records.length };
+};
 
 /**
  * The checkpoint key this invocation may claim.
@@ -1234,16 +1749,334 @@ export const validationRunScope = (
  * saved against a different work list is recognised as meaningless instead of
  * resumed into the wrong row.
  *
+ * THE FINGERPRINT GOVERNS THE POSITIONS AND NOTHING ELSE. It cannot decide
+ * whether this invocation is continuing the run's work, because ordinary
+ * judgement changes the very thing it covers — a rejected row leaves the
+ * considered set, and every position after it shifts. What identifies the work
+ * is the RUN (`validationRunScope`), and `runHasJudgedFood` is what keeps a row
+ * from being judged twice inside it. So a fingerprint mismatch discards
+ * `nextIndex` and `unjudged`, which are the only two fields it can speak for,
+ * and the run-scoped figures are seeded regardless: `counts` from the run row,
+ * and the dimensions below from the records when the tallies beside those
+ * positions cannot be trusted (see dimensionsFromJudgedRecords).
+ *
  * `unjudged` carries the positions this run skipped without judging — a row
  * that vanished, lost the compare-and-set or moved identity group. They are
  * revisited FIRST on the next attempt, because the tail pointer has already
  * moved past them and nothing else would ever come back to them.
+ *
+ * `tallies` is WHY THE REPORT OF A RESUMED RUN IS TRUE WITHOUT A SECOND READ.
+ * The per-check, review-flag and per-category figures are accumulated one food
+ * at a time and read once, at the end — and a resumed pass deliberately does
+ * not re-judge what a previous attempt judged, so figures held only in memory
+ * would describe the last slice while `counts` (seeded from the run row)
+ * described the whole run. They ride the cursor, written in the SAME
+ * transaction as the judgement they describe (see THE PER-FOOD UNIT OF WORK),
+ * which is what keeps them from either over- or under-counting a food whose
+ * write rolled back — and what makes the ordinary resume cost no extra query at
+ * all. They are a CACHE of a durable fact rather than the only copy of it:
+ * where they are missing or cannot be trusted, the same figures are derived
+ * from the records the judgements wrote (see dimensionsFromJudgedRecords),
+ * which is one read on that path and none on this one.
  */
 export interface ValidationCursor {
     readonly fingerprint: string;
     readonly nextIndex: number;
     readonly unjudged: readonly number[];
+    readonly tallies: ValidationCursorTallies;
+    /**
+     * The foods whose advisory review this run left unresolved, BY SOURCE KEY
+     * rather than by position — and the difference is load-bearing.
+     *
+     * An unjudged row kept the status it already had, so it still sits at the
+     * same place in the same considered list and a position names it. A row
+     * passed over by the review was JUDGED: the status this pass wrote can move
+     * it inside the next attempt's considered list, or out of it altogether (a
+     * quarantined row is only reconsidered with `--revalidate-quarantined`), and
+     * a position would then name a different food. A key names the same food
+     * whatever list the next attempt builds, which is why these are read back
+     * WITHOUT the fingerprint check the index needs.
+     *
+     * The next attempt queues them first and re-judges them with the review it
+     * owes them. It also WIDENS its considered set to include quarantined rows
+     * whenever any debt is carried, so these keys resolve under this same run
+     * key rather than falling outside the set the pass's own writes created —
+     * see the considered filter and `reviewOwedByRun`.
+     */
+    readonly reviewUnresolved: readonly string[];
+    /**
+     * How many more reviews are unresolved than `reviewUnresolved` can carry
+     * (see REVIEW_UNRESOLVED_CURSOR_LIMIT).
+     *
+     * A COUNT, AND IT IS NOT WHAT MAKES THOSE ROWS RECOVERABLE. It is carried
+     * so a later attempt can never close the run as a completed review on the
+     * strength of a truncated list; the rows themselves are found again by
+     * `reviewOwedByRun`, which reads each row's own recorded review instead of
+     * a list with a cap. A non-zero value here is also what widens the next
+     * attempt's considered set, so the unnamed rows are in the list to be found.
+     */
+    readonly reviewUnresolvedOverflow: number;
+    /**
+     * The cause the review stopped for, carried so a later attempt that settles
+     * none of the debt still reports the ORIGINAL cause rather than defaulting
+     * to whatever this attempt happened to encounter. Null when no review has
+     * stopped on this run.
+     */
+    readonly reviewStopCause: ValidationReviewStopCause | null;
 }
+
+/** What a previous attempt of this run left the review owing. */
+export interface CarriedReviewDebt {
+    /** Source keys named on the cursor, de-duplicated and sorted. */
+    readonly keys: string[];
+    /** Unresolved reviews the cursor could not name (see reviewUnresolvedOverflow). */
+    readonly overflow: number;
+    /** The cause the review stopped for, or null when it never stopped. */
+    readonly stopCause: ValidationReviewStopCause | null;
+    /** Whether anything is owed at all — what widens the considered set. */
+    readonly any: boolean;
+}
+
+const REVIEW_STOP_CAUSES: readonly ValidationReviewStopCause[] = [
+    'budget_exhausted',
+    'usage_unrecorded',
+    'usage_unmetered',
+    'review_client_unavailable',
+];
+
+/**
+ * Reads the review debt off a saved cursor, WITHOUT the fingerprint check the
+ * index needs.
+ *
+ * That is the whole point of keying the debt by `source_key`: a key names the
+ * same food in any considered list, so a plan change that makes the saved INDEX
+ * meaningless leaves the debt perfectly meaningful. Forgetting it on a restart
+ * is how a run would close as a completed review having never made the calls it
+ * owed.
+ *
+ * Read BEFORE the considered set is built, because the debt is what decides
+ * whether that set includes quarantined rows — a pass's own writes quarantine
+ * the rows it passed over, and the default filter would then put the very rows
+ * it owes outside its own reach.
+ */
+export const carriedReviewDebtOf = (cursor: unknown): CarriedReviewDebt => {
+    const empty: CarriedReviewDebt = { keys: [], overflow: 0, stopCause: null, any: false };
+    if (cursor === null || typeof cursor !== 'object') {
+        return empty;
+    }
+
+    const saved = cursor as Partial<ValidationCursor>;
+
+    const keys = Array.isArray(saved.reviewUnresolved)
+        ? Array.from(
+              new Set(
+                  saved.reviewUnresolved.filter(
+                      (sourceKey): sourceKey is string => typeof sourceKey === 'string' && sourceKey.length > 0,
+                  ),
+              ),
+          ).sort()
+        : [];
+
+    const overflow =
+        typeof saved.reviewUnresolvedOverflow === 'number' &&
+        Number.isInteger(saved.reviewUnresolvedOverflow) &&
+        saved.reviewUnresolvedOverflow > 0
+            ? saved.reviewUnresolvedOverflow
+            : 0;
+
+    const stopCause = REVIEW_STOP_CAUSES.includes(saved.reviewStopCause as ValidationReviewStopCause)
+        ? (saved.reviewStopCause as ValidationReviewStopCause)
+        : null;
+
+    return { keys, overflow, stopCause, any: keys.length > 0 || overflow > 0 };
+};
+
+/**
+ * The advisory review's aggregates, as the cursor carries them and the report
+ * and the end-of-pass summary read them.
+ *
+ * Mutable by design: this is the accumulator the review path increments, and a
+ * snapshot of it is what reaches the cursor. `stopReason` is deliberately NOT
+ * here — a stop describes the attempt that hit it (an exhausted cap, a missing
+ * seam), and a later attempt re-reserves under its own cap, so carrying a
+ * previous attempt's reason forward would label this pass with a stop it never
+ * had.
+ */
+export interface AdvisoryReviewSpend {
+    reserved: number;
+    used: number;
+    reviewed: number;
+    confirmed: number;
+    failed: number;
+    skippedAfterStop: number;
+}
+
+/** The dimensions and the review aggregates one cursor carries for the whole run. */
+export interface ValidationCursorTallies extends ValidationDimensions {
+    readonly advisoryReview: AdvisoryReviewSpend;
+}
+
+/** An advisory review that has spent and produced nothing yet. */
+export const emptyAdvisoryReviewSpend = (): AdvisoryReviewSpend => ({
+    reserved: 0,
+    used: 0,
+    reviewed: 0,
+    confirmed: 0,
+    failed: 0,
+    skippedAfterStop: 0,
+});
+
+/**
+ * Where this invocation starts, and what the run has already tallied.
+ *
+ * Three answers rather than two, because "no cursor" and "a cursor for
+ * different work" are different facts and the pass says so: a fresh start is
+ * silent, a RESTART is warned about and recorded in the run log (the considered
+ * set or the policy moved, so the saved index names a different food), and a
+ * RESUME carries the position and the run-scoped tallies forward.
+ */
+export type ValidationCursorRead =
+    | { readonly kind: 'fresh' }
+    | { readonly kind: 'restart'; readonly savedFingerprint: string }
+    | {
+          readonly kind: 'resume';
+          readonly nextIndex: number;
+          readonly unjudged: readonly number[];
+          readonly tallies: ValidationCursorTallies;
+          /**
+           * Whether the stored cursor carried tallies this pass may ADOPT: they
+           * were present and every counter in the three dimension maps was
+           * readable. False for a cursor written before the tallies were
+           * persisted, and false for one whose maps are garbled — two different
+           * causes with one consequence, which is that the figures have to come
+           * from somewhere else. They do: the stage rebuilds them from the run's
+           * own committed records (see dimensionsFromJudgedRecords), so this
+           * flag decides WHERE the dimensions come from and no longer decides
+           * whether the report is complete.
+           *
+           * The advisory-review spend is deliberately not part of the test.
+           * Nothing can rebuild it — the per-food records are not a spend ledger
+           * — so a garbled spend block reads as zeros either way, and letting it
+           * condemn three readable maps would cost the report figures it could
+           * have had.
+           */
+          readonly talliesRestored: boolean;
+      };
+
+/** A JSONB map of counters, as a stored cursor may or may not turn out to hold. */
+interface StoredCounterMap {
+    readonly map: Readonly<Record<string, number>>;
+    /**
+     * False when the stored value was there but unusable: not a map at all, or
+     * a map with a counter that is not a count. `undefined` — the member was
+     * never written — is usable and means the empty map, which is what a run
+     * that has judged nothing has.
+     */
+    readonly usable: boolean;
+}
+
+const readCounterMap = (value: unknown): StoredCounterMap => {
+    if (value === undefined) {
+        return { map: {}, usable: true };
+    }
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return { map: {}, usable: false };
+    }
+
+    const map: Record<string, number> = {};
+    let usable = true;
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        // A negative or non-finite counter is not a smaller count, it is a
+        // corrupt one, and carrying it forward would make every figure derived
+        // from it wrong in a way nobody could see. Dropped — and the map it came
+        // from is reported unusable, so the dimensions are rebuilt from the
+        // records instead of resuming from a figure with a hole in it.
+        if (typeof entry === 'number' && Number.isFinite(entry) && entry >= 0) {
+            map[key] = entry;
+        } else {
+            usable = false;
+        }
+    }
+    return { map, usable };
+};
+
+const readSpendCounter = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+
+const readAdvisoryReviewSpend = (value: unknown): AdvisoryReviewSpend => {
+    const stored = (value === null || typeof value !== 'object' ? {} : value) as Record<string, unknown>;
+    return {
+        reserved: readSpendCounter(stored.reserved),
+        used: readSpendCounter(stored.used),
+        reviewed: readSpendCounter(stored.reviewed),
+        confirmed: readSpendCounter(stored.confirmed),
+        failed: readSpendCounter(stored.failed),
+        skippedAfterStop: readSpendCounter(stored.skippedAfterStop),
+    };
+};
+
+/**
+ * Reads a stored cursor, LENIENTLY, and decides where this invocation begins.
+ *
+ * Pure, so the one rule that decides whether an interrupted pass resumes or
+ * restarts is testable without a database (Rule backend-architecture §1.2).
+ *
+ * LENIENT IS THE REQUIREMENT, NOT A CONVENIENCE. The column is JSONB written by
+ * an earlier version of this file, and the two things that can be wrong with it
+ * have the same remedy: a cursor from before the tallies existed resumes with
+ * empty ones, and a value that is not the shape this function expects is read
+ * for the parts that ARE usable and defaulted for the rest. Nothing here
+ * throws, because a run left resumable must never become unresumable on account
+ * of a figure that only affects a report — the alternative is an operator with
+ * a half-judged catalog and a stage that refuses to continue it.
+ *
+ * `nextIndex` is clamped into the considered set, and a skipped position outside
+ * `[0, nextIndex)` is dropped: a position at or past the tail pointer will be
+ * walked anyway, and one below zero names no food.
+ */
+export const readValidationCursor = (
+    stored: unknown,
+    fingerprint: string,
+    consideredCount: number,
+): ValidationCursorRead => {
+    if (stored === null || stored === undefined || typeof stored !== 'object') {
+        return { kind: 'fresh' };
+    }
+
+    const cursor = stored as Partial<ValidationCursor> & { tallies?: unknown };
+
+    if (cursor.fingerprint !== fingerprint || typeof cursor.nextIndex !== 'number') {
+        return { kind: 'restart', savedFingerprint: String(cursor.fingerprint ?? '') };
+    }
+
+    const nextIndex = Math.max(0, Math.min(Math.trunc(cursor.nextIndex), consideredCount));
+    const unjudged = Array.isArray(cursor.unjudged)
+        ? cursor.unjudged
+              .filter((index): index is number => Number.isInteger(index) && index >= 0 && index < nextIndex)
+              .sort((left, right) => left - right)
+        : [];
+
+    const talliesPresent =
+        cursor.tallies !== null && typeof cursor.tallies === 'object' && !Array.isArray(cursor.tallies);
+    const talliesValue = (talliesPresent ? cursor.tallies : {}) as Record<string, unknown>;
+
+    const byCheck = readCounterMap(talliesValue.byCheck);
+    const reviewFlags = readCounterMap(talliesValue.reviewFlags);
+    const publishedByCategory = readCounterMap(talliesValue.publishedByCategory);
+
+    return {
+        kind: 'resume',
+        nextIndex,
+        unjudged,
+        tallies: {
+            byCheck: byCheck.map,
+            reviewFlags: reviewFlags.map,
+            publishedByCategory: publishedByCategory.map,
+            advisoryReview: readAdvisoryReviewSpend(talliesValue.advisoryReview ?? null),
+        },
+        talliesRestored: talliesPresent && byCheck.usable && reviewFlags.usable && publishedByCategory.usable,
+    };
+};
 
 /**
  * How many skipped positions the cursor carries.
@@ -1255,6 +2088,23 @@ export interface ValidationCursor {
  * reported but not queued.
  */
 const UNJUDGED_CURSOR_LIMIT = 500;
+
+/**
+ * How many unresolved reviews the cursor names individually.
+ *
+ * The same bound as the skipped positions above, for the same reason and with
+ * one difference worth stating: a source key is longer than an index, and the
+ * cursor is written once per food, so an unbounded list would grow the per-food
+ * write by the size of the whole stopped set. Past this many the remedy is not a
+ * per-row revisit either — a review that was cut off for hundreds of rows is
+ * re-run against a raised cap over the whole set — so the overflow is COUNTED on
+ * the cursor (`reviewUnresolvedOverflow`) and keeps the run failed, rather than
+ * being dropped and silently forgiven.
+ */
+const REVIEW_UNRESOLVED_CURSOR_LIMIT = 500;
+
+/** How many unresolved reviews the report names, matching the skipped lists. */
+const REVIEW_UNRESOLVED_REPORT_LIMIT = 50;
 
 /**
  * The fingerprint the cursor is only meaningful against.
@@ -1282,8 +2132,109 @@ export const validationPlanFingerprint = (input: {
         )
         .digest('hex');
 
-/** One checkpoint per hundred judged foods, which is the import's five-batch cadence (5 × 20 records). */
-const COUNTS_SAVE_EVERY_FOODS = 100;
+/**
+ * One progress line per hundred processed foods, which is the import's
+ * five-batch cadence (5 × 20 records).
+ *
+ * It is a LOG cadence and nothing more. The counters it reports are no longer
+ * flushed on it: a food's count delta is written inside that food's own
+ * transaction (see THE PER-FOOD UNIT OF WORK), so there is no interval of
+ * unrecorded judgements left for a periodic flush to lose.
+ */
+const PROGRESS_LOG_EVERY_FOODS = 100;
+
+/**
+ * How many advisory-review lines of one kind this pass emits at all, and it
+ * emits them at DEBUG.
+ *
+ * A review is per food, and a catalog-scale pass reviews thousands of them, so
+ * a line per reviewed food is thousands of lines that duplicate detail
+ * `catalog_validation_records.llm_review` already retains permanently — and
+ * bury the lines an operator actually has to act on. Emitting the first few of
+ * each kind at the caller's own level, as the previous revision did, still put
+ * three handfuls of per-food lines in a normal-level log; a per-food advisory
+ * line is not the grain at which this pass reports to an operator, whichever
+ * food it is about.
+ *
+ * So the shape is: the first `ADVISORY_REVIEW_LOG_SAMPLE_LIMIT` of each event
+ * kind at `logger.debug` (suppressed by the default `info` level, available in
+ * full with `--log-level debug`) as SAMPLES for whoever is debugging a pass,
+ * every later one suppressed with its count kept, the aggregate carried by the
+ * end-of-pass `advisory_review_summary` — which rises to `warn` when anything
+ * failed — and the per-food detail left in the validation record where it
+ * already lives. Five is enough to show the shape of a failure to someone
+ * already looking at debug output.
+ */
+const ADVISORY_REVIEW_LOG_SAMPLE_LIMIT = 5;
+
+/**
+ * Holds the counter delta that has NOT yet reached the run row, and gives it up
+ * only to a write that succeeded.
+ *
+ * WHY IT EXISTS AT ALL now that a food's counts are written inside its own
+ * transaction: the tallies raised OUTSIDE any judgement transaction still need
+ * a home. The alias merge runs after the loop — a survivor's names cannot be
+ * moved onto it until its own record is written — and its counts belong to the
+ * run just as much as a judgement's do.
+ *
+ * WHY IT SETTLES SUBTRACTIVELY, AND ONLY AFTER THE WRITE. The previous revision
+ * emptied the holder and then awaited `recordCounts`, so a write that threw
+ * took the interval with it: the run row was short by that delta for good, and
+ * a report built from a row seeded that way understated work the database had
+ * in fact done. Awaiting first and subtracting the SNAPSHOT second fixes both
+ * halves of that — a failed write leaves the delta intact for the next flush,
+ * and a tally raised while the write was in flight is not erased by the
+ * settlement of an earlier one, because only what was actually written is
+ * subtracted.
+ *
+ * The writer is injected rather than reached for, so the guarantee is testable
+ * against a writer that throws (Rule backend-architecture §1.2, §11).
+ */
+export interface PendingCountHolder {
+    /** Adds to the delta awaiting a write. */
+    add(key: string, amount: number): void;
+    /** The delta not yet written, as a snapshot. */
+    pending(): Readonly<Record<string, number>>;
+    /**
+     * Writes the delta and settles it. Rejects with whatever the writer threw,
+     * having changed nothing — the delta is still pending.
+     */
+    flush(): Promise<void>;
+}
+
+export const createPendingCountHolder = (
+    write: (delta: Record<string, number>) => Promise<unknown>,
+): PendingCountHolder => {
+    const pending: Record<string, number> = {};
+
+    return {
+        add: (key: string, amount: number): void => {
+            pending[key] = (pending[key] ?? 0) + amount;
+        },
+        pending: (): Readonly<Record<string, number>> => ({ ...pending }),
+        flush: async (): Promise<void> => {
+            const delta = { ...pending };
+            const keys = Object.keys(delta);
+            if (keys.length === 0) {
+                return;
+            }
+
+            // The write first. Everything below this line is the settlement of
+            // a delta that is now durable; nothing above it has changed the
+            // holder, so a rejection leaves the delta exactly where it was.
+            await write(delta);
+
+            for (const key of keys) {
+                const remaining = (pending[key] ?? 0) - delta[key];
+                if (remaining <= 0) {
+                    delete pending[key];
+                } else {
+                    pending[key] = remaining;
+                }
+            }
+        },
+    };
+};
 
 /**
  * The run id a dry run reports.
@@ -1383,6 +2334,477 @@ export const settleUnresumableValidationRuns = async (input: {
  */
 const SKIP_RUN_LOG_LIMIT = 10;
 const SKIP_REPORT_LIMIT = 50;
+
+/* ---------------------------------------------------------------------------
+ * Duplicate-identity accounting
+ *
+ * THREE DIFFERENT THINGS ARE COUNTED HERE AND THEY MUST NEVER BE ADDED UP.
+ *
+ *   * a lost IDENTITY  — one source key that `dedupeIdentity` did not choose as
+ *                        the survivor of its identity group;
+ *   * an alias ROW     — one row inserted into `catalog_food_aliases`; a losing
+ *                        identity can contribute several, or none at all when
+ *                        the survivor already answers to every one of its
+ *                        names (`skipDuplicates`);
+ *   * a validation RECORD — one `catalog_validation_records` row restated so
+ *                        the shipped ledger lists the names the food now
+ *                        answers to.
+ *
+ * Reported together and unlabelled, those three read as one quantity, and the
+ * arithmetic between them looks like it should close when it cannot: 117 losers,
+ * 107 newly quarantined rows and 2 inserted alias rows describe three different
+ * populations. So every field below names its unit, each is measured
+ * independently, and the prose is generated FROM the measurements rather than
+ * told as a story about them.
+ *
+ * The residue — a loser this pass did not have to move — is classified, never
+ * subtracted: each losing source key is looked up in the pass's own read of the
+ * table and filed under the status it ALREADY held, so "ten losers are
+ * unaccounted for" cannot happen.
+ * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * WHOSE NAMES MAY BECOME A SURVIVOR'S ALIASES
+ *
+ * An alias is an identity claim: it says a food ALSO answers to this name.
+ * `catalog_food_aliases` carries no provenance column, so once a name sits on a
+ * published food nothing downstream can say where it came from — search ranks
+ * it, `aliases.jsonl` ships it, and a reader sees it beside the names the
+ * vendor record itself supplied.
+ *
+ * So a losing identity lends its names only when its OWN identity is sourced. A
+ * generated candidate whose evidence retrieval found nothing carries
+ * `identity_status = 'unsourced'` and is quarantined for exactly that reason
+ * (the evidence policy in docs/meal-planning/catalog-policy.md, Agent Action
+ * Plan §0.7.3). Merging its model-proposed synonyms onto the published,
+ * source-backed food that beat it would put those names into search under the
+ * survivor's provenance — the one outcome that policy exists to prevent. They
+ * are withheld, and the withholding is MEASURED, so the artefact states what
+ * the policy declined instead of quietly showing a smaller number.
+ *
+ * WHY A SECOND DEDUPE RATHER THAN A SKIP IN THE WRITE LOOP. `dedupeIdentity`
+ * de-duplicates a group's names ACROSS its losers in source-key order, so a
+ * name two losers both carry is attributed to whichever is processed first —
+ * and a generated key (`ai:...`) sorts before a vendor key (`usda:...`).
+ * Skipping the generated loser at write time would therefore drop a name the
+ * vendor loser also carried and would otherwise have contributed. Planning the
+ * merge over the SOURCED identities alone reproduces exactly the writes that
+ * would have happened had the unsourced rows never been inserted, which is the
+ * property that matters here: enabling generation must not change the alias set
+ * of a published catalog.
+ *
+ * A group with no sourced member at all is left to the full plan. Its survivor
+ * is itself unsourced and therefore unpublishable under the identity floor, so
+ * no sourced identity can be contaminated, and keeping the names there leaves
+ * the quarantined set's own bookkeeping intact for the later pass that
+ * publishes it once its evidence arrives.
+ *
+ * FAIL-CLOSED. A loser this pass's read did not return, and a sourced-only plan
+ * that names a different survivor than the full plan — which would put the
+ * alias write and the `duplicate_identity` check on different survivors — are
+ * both withheld and counted rather than merged on an assumption.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The `identity_status` that means the row carries NO retrieval record. It is
+ * the same value the identity floor holds a candidate on, so the alias policy
+ * and the publication policy refuse the same evidence gap.
+ */
+const IDENTITY_STATUS_WITHOUT_EVIDENCE = 'unsourced';
+
+/**
+ * Why one losing identity's names were withheld. Each label is true of its own
+ * case only — there is no catch-all that reads as an evidence judgement when
+ * the pass did not make one.
+ */
+export type AliasMergeWithholdingReason =
+    /** The loser's identity carries no retrieval record. */
+    | 'no_retrieval_record'
+    /** Fail-closed: this pass's read did not return the loser, so it cannot be classified. */
+    | 'loser_not_in_this_pass_read'
+    /** Fail-closed: the two plans name different survivors for this loser. */
+    | 'survivor_disagreement'
+    /** The sourced-only plan did not contain the loser, for none of the reasons above. */
+    | 'not_planned_over_sourced_identities';
+
+export interface AliasMergeWithholding {
+    readonly loserSourceKey: string;
+    readonly survivorSourceKey: string;
+    readonly reason: AliasMergeWithholdingReason;
+    /** The status as this pass read it; `null` when the read did not return the row. */
+    readonly loserIdentityStatus: string | null;
+    /** NAMES the full plan would have offered and this policy did not. Not rows. */
+    readonly aliasNamesWithheld: number;
+}
+
+export interface AliasMergePartitionInput {
+    /** The merge plan over every non-rejected identity: what the dedupe decided. */
+    readonly mergesOverEveryIdentity: readonly CatalogIdentityMerge[];
+    /**
+     * The merge plan over the SOURCED identities alone — the same dedupe run
+     * over the subset whose `identity_status` is not the unsourced value.
+     */
+    readonly mergesOverSourcedIdentities: readonly CatalogIdentityMerge[];
+    /** `identity_status` by source key, from this pass's own read of the table. */
+    readonly identityStatusBySourceKey: ReadonlyMap<string, string>;
+}
+
+export interface AliasMergePartition {
+    /** The merges whose names this pass will offer to `catalog_food_aliases`. */
+    readonly mergeable: readonly CatalogIdentityMerge[];
+    readonly withheld: readonly AliasMergeWithholding[];
+    readonly offeredLoserIdentities: number;
+    readonly withheldLoserIdentities: number;
+    readonly withheldAliasNames: number;
+    readonly withheldByReason: Record<AliasMergeWithholdingReason, number>;
+    /** Generated from the figures above, so it cannot overstate them. */
+    readonly policyNote: string;
+}
+
+/**
+ * Splits the dedupe's merge plan into the merges this pass may write and the
+ * ones the evidence policy withholds.
+ *
+ * Pure, and exported so the policy can be pinned by a unit test rather than
+ * inferred from an alias count in a committed release.
+ */
+export const partitionAliasMerges = (input: AliasMergePartitionInput): AliasMergePartition => {
+    // One merge per losing identity, so a loser identifies its merge uniquely
+    // in either plan.
+    const survivorByLoser = new Map<string, string>();
+    for (const merge of input.mergesOverEveryIdentity) {
+        survivorByLoser.set(merge.duplicateSourceKey, merge.survivorSourceKey);
+    }
+
+    const mergeableByLoser = new Map<string, CatalogIdentityMerge>();
+    const survivorDisagreements = new Set<string>();
+
+    // Every group holding at least one sourced identity, planned as if the
+    // unsourced rows had never been inserted.
+    for (const merge of input.mergesOverSourcedIdentities) {
+        if (survivorByLoser.get(merge.duplicateSourceKey) !== merge.survivorSourceKey) {
+            survivorDisagreements.add(merge.duplicateSourceKey);
+            continue;
+        }
+        mergeableByLoser.set(merge.duplicateSourceKey, merge);
+    }
+
+    // Groups with no sourced member: the survivor is unsourced, so no sourced
+    // identity is on the receiving end and the full plan stands.
+    for (const merge of input.mergesOverEveryIdentity) {
+        if (
+            mergeableByLoser.has(merge.duplicateSourceKey) ||
+            survivorDisagreements.has(merge.duplicateSourceKey)
+        ) {
+            continue;
+        }
+        if (input.identityStatusBySourceKey.get(merge.survivorSourceKey) === IDENTITY_STATUS_WITHOUT_EVIDENCE) {
+            mergeableByLoser.set(merge.duplicateSourceKey, merge);
+        }
+    }
+
+    const withheld: AliasMergeWithholding[] = [];
+    const withheldByReason: Record<AliasMergeWithholdingReason, number> = {
+        loser_not_in_this_pass_read: 0,
+        no_retrieval_record: 0,
+        not_planned_over_sourced_identities: 0,
+        survivor_disagreement: 0,
+    };
+    let withheldAliasNames = 0;
+
+    for (const merge of input.mergesOverEveryIdentity) {
+        if (mergeableByLoser.has(merge.duplicateSourceKey)) {
+            continue;
+        }
+        const status = input.identityStatusBySourceKey.get(merge.duplicateSourceKey);
+        const reason: AliasMergeWithholdingReason = survivorDisagreements.has(merge.duplicateSourceKey)
+            ? 'survivor_disagreement'
+            : status === undefined
+              ? 'loser_not_in_this_pass_read'
+              : status === IDENTITY_STATUS_WITHOUT_EVIDENCE
+                ? 'no_retrieval_record'
+                : 'not_planned_over_sourced_identities';
+
+        withheldByReason[reason] += 1;
+        withheldAliasNames += merge.aliases.length;
+        withheld.push({
+            loserSourceKey: merge.duplicateSourceKey,
+            survivorSourceKey: merge.survivorSourceKey,
+            reason,
+            loserIdentityStatus: status ?? null,
+            aliasNamesWithheld: merge.aliases.length,
+        });
+    }
+
+    const mergeable = Array.from(mergeableByLoser.values()).sort((a, b) =>
+        a.duplicateSourceKey < b.duplicateSourceKey ? -1 : a.duplicateSourceKey > b.duplicateSourceKey ? 1 : 0,
+    );
+
+    const describeReasons = Object.keys(withheldByReason)
+        .sort()
+        .filter((reason) => withheldByReason[reason as AliasMergeWithholdingReason] > 0)
+        .map((reason) => `${reason} ${String(withheldByReason[reason as AliasMergeWithholdingReason])}`);
+
+    return {
+        mergeable,
+        withheld,
+        offeredLoserIdentities: mergeable.length,
+        withheldLoserIdentities: withheld.length,
+        withheldAliasNames,
+        withheldByReason,
+        policyNote:
+            'A losing identity lends its names to its survivor only when its own identity is sourced: ' +
+            'catalog_food_aliases has no provenance column, so a name merged onto a published, source-backed food ' +
+            'becomes indistinguishable from the names the vendor record supplied. ' +
+            `${String(mergeable.length)} losing identity(ies) were offered to the merge and ` +
+            `${String(withheld.length)} withheld` +
+            (describeReasons.length === 0 ? '' : ` (${describeReasons.join(', ')})`) +
+            `, holding back ${String(withheldAliasNames)} alias NAME(s) the dedupe would otherwise have offered. ` +
+            'The offered set is planned over the sourced identities alone, which reproduces the writes that would ' +
+            'have happened had the unsourced rows never been inserted, so a generation run cannot change the alias ' +
+            'set of a published catalog.',
+    };
+};
+
+/**
+ * How many withheld identities the accounting lists by source key. A bound is
+ * stated rather than assumed unnecessary: the list is evidence, and an artefact
+ * that silently truncated it would be worse than one that says how many it left
+ * out. The omitted figure is emitted beside it, so a reader never has to infer
+ * completeness.
+ */
+const ALIAS_MERGE_WITHHELD_IDENTITY_CAP = 1000;
+
+/** The statuses that mean a row was already being withheld before this pass. */
+const WITHHELD_STATUSES_BEFORE_THIS_RUN: readonly string[] = ['quarantined', 'rejected'];
+
+/** The bucket a losing source key falls in when this pass's read did not return it. */
+const LOSER_NOT_IN_THIS_READ = 'not_in_this_pass_read';
+
+export interface DuplicateIdentityAccountingInput {
+    /** One entry per lost IDENTITY: the source keys `dedupeIdentity` did not keep. */
+    readonly loserSourceKeys: readonly string[];
+    /**
+     * The `publication_status` each row held when this pass read the table,
+     * keyed by source key. A losing key absent from this map was not in that
+     * read and is filed as such rather than guessed at.
+     */
+    readonly statusBeforeThisRunBySourceKey: ReadonlyMap<string, string>;
+    /** The source keys this pass put on its work list. */
+    readonly consideredSourceKeys: ReadonlySet<string>;
+    /** Losing identities this pass judged, counted by the status it wrote. */
+    readonly judgedByStatus: Readonly<Record<string, number>>;
+    /**
+     * Of those it quarantined, the ones whose verdict carried a FAILING
+     * `duplicate_identity` check — the only figure that means "quarantined
+     * BECAUSE it lost the identity" rather than "quarantined for some other
+     * reason while also being a loser".
+     */
+    readonly quarantinedForDuplicateIdentity: number;
+    /** Losing identities that contributed at least one alias ROW to their survivor. */
+    readonly losersContributingAliasRows: number;
+    /** Surviving foods that received at least one alias ROW. */
+    readonly survivorsReceivingAliasRows: number;
+    /** Alias ROWS inserted into `catalog_food_aliases`. Never a count of identities. */
+    readonly aliasRowsInserted: number;
+    /** Survivor validation RECORDS restated after the merge. */
+    readonly survivorValidationRecordsRestated: number;
+    /**
+     * What the evidence policy offered to the merge and what it withheld, from
+     * {@link partitionAliasMerges}. Reported so the alias figures above are
+     * read against the population they were drawn from rather than against the
+     * whole loser set.
+     */
+    readonly aliasMerge: AliasMergePartition;
+    /** True when this pass wrote nothing, which is why every write-side figure is 0. */
+    readonly dryRun: boolean;
+}
+
+export interface DuplicateIdentityAccounting {
+    readonly unitsNote: string;
+    /** Which figures cover this invocation and which total the whole run. */
+    readonly scopeNote: string;
+    readonly lostIdentitiesTotal: number;
+    readonly lostIdentitiesByStatusBeforeThisRun: Record<string, number>;
+    readonly lostIdentitiesAlreadyWithheldBeforeThisRun: number;
+    readonly lostIdentitiesConsideredByThisRun: number;
+    readonly lostIdentitiesNotConsideredByThisRun: number;
+    readonly lostIdentitiesJudgedByThisRunByStatus: Record<string, number>;
+    readonly lostIdentitiesJudgedByThisRun: number;
+    readonly lostIdentitiesNewlyQuarantinedForDuplicateIdentity: number;
+    readonly lostIdentitiesOfferedToAliasMerge: number;
+    readonly lostIdentitiesWithheldFromAliasMerge: number;
+    readonly lostIdentitiesWithheldFromAliasMergeByReason: Record<AliasMergeWithholdingReason, number>;
+    readonly aliasNamesWithheldFromMerge: number;
+    /**
+     * Every withheld identity by source key, so the withholding is auditable
+     * from the artefact rather than only countable. Capped, with the omission
+     * stated, for the same reason the withheld-identity audit is.
+     */
+    readonly aliasMergeWithheldIdentities: readonly AliasMergeWithholding[];
+    readonly aliasMergeWithheldIdentityCap: number;
+    readonly aliasMergeWithheldIdentitiesOmittedByCap: number;
+    readonly aliasMergePolicyNote: string;
+    readonly lostIdentitiesContributingAliasRows: number;
+    readonly survivingFoodsReceivingAliasRows: number;
+    readonly aliasRowsInserted: number;
+    readonly survivorValidationRecordsRestated: number;
+    readonly reconciliation: {
+        readonly statusesBeforeThisRunSumToTotal: boolean;
+        readonly consideredPlusNotConsideredEqualsTotal: boolean;
+        readonly judgedNoMoreThanConsidered: boolean;
+        readonly quarantinedForDuplicateIdentityNoMoreThanQuarantined: boolean;
+        readonly aliasContributorsNoMoreThanTotal: boolean;
+        readonly aliasMergeOfferedPlusWithheldEqualsTotal: boolean;
+        readonly aliasContributorsNoMoreThanOffered: boolean;
+        readonly everyCheckHolds: boolean;
+        readonly statement: string;
+    };
+    readonly note: string;
+}
+
+/**
+ * The duplicate-identity figures, each in its own unit, reconciling by
+ * construction.
+ *
+ * Pure so the arithmetic that must close can be pinned by a unit test rather
+ * than inspected in a committed artefact after the fact.
+ */
+export const buildDuplicateIdentityAccounting = (
+    input: DuplicateIdentityAccountingInput,
+): DuplicateIdentityAccounting => {
+    const total = input.loserSourceKeys.length;
+
+    const byStatusBefore: Record<string, number> = {};
+    let alreadyWithheld = 0;
+    let considered = 0;
+    let notConsidered = 0;
+
+    for (const sourceKey of input.loserSourceKeys) {
+        const status = input.statusBeforeThisRunBySourceKey.get(sourceKey) ?? LOSER_NOT_IN_THIS_READ;
+        byStatusBefore[status] = (byStatusBefore[status] ?? 0) + 1;
+        if (WITHHELD_STATUSES_BEFORE_THIS_RUN.includes(status)) {
+            alreadyWithheld += 1;
+        }
+        if (input.consideredSourceKeys.has(sourceKey)) {
+            considered += 1;
+        } else {
+            notConsidered += 1;
+        }
+    }
+
+    const judgedByStatus: Record<string, number> = {};
+    for (const status of Object.keys(input.judgedByStatus).sort()) {
+        judgedByStatus[status] = input.judgedByStatus[status];
+    }
+    const judged = Object.values(judgedByStatus).reduce((sum, count) => sum + count, 0);
+    const quarantinedByThisRun = judgedByStatus.quarantined ?? 0;
+
+    const statusesSum = Object.values(byStatusBefore).reduce((sum, count) => sum + count, 0);
+    const reconciliationChecks = {
+        statusesBeforeThisRunSumToTotal: statusesSum === total,
+        consideredPlusNotConsideredEqualsTotal: considered + notConsidered === total,
+        judgedNoMoreThanConsidered: judged <= considered,
+        quarantinedForDuplicateIdentityNoMoreThanQuarantined:
+            input.quarantinedForDuplicateIdentity <= quarantinedByThisRun,
+        aliasContributorsNoMoreThanTotal: input.losersContributingAliasRows <= total,
+        // The alias policy partitions the SAME loser set, so the two halves
+        // must close on it — an offered-plus-withheld figure that misses the
+        // total would mean a losing identity the policy neither offered nor
+        // declined, which is the shape of gap this whole block exists to make
+        // impossible.
+        aliasMergeOfferedPlusWithheldEqualsTotal:
+            input.aliasMerge.offeredLoserIdentities + input.aliasMerge.withheldLoserIdentities === total,
+        // A contributor had to be offered first, so the contributing figure is
+        // bounded by the offered population rather than by the whole loser set.
+        aliasContributorsNoMoreThanOffered:
+            input.losersContributingAliasRows <= input.aliasMerge.offeredLoserIdentities,
+    };
+    const everyCheckHolds = Object.values(reconciliationChecks).every((holds) => holds);
+
+    const describe = (record: Readonly<Record<string, number>>): string => {
+        const entries = Object.keys(record)
+            .sort()
+            .map((key) => `${key} ${String(record[key])}`);
+        return entries.length === 0 ? 'none' : entries.join(', ');
+    };
+
+    // Sorted on the source key, so a rerun over unchanged data emits the same
+    // list in the same order and a diff in review means the data moved.
+    const withheldIdentitiesListed = [...input.aliasMerge.withheld]
+        .sort((a, b) => (a.loserSourceKey < b.loserSourceKey ? -1 : a.loserSourceKey > b.loserSourceKey ? 1 : 0))
+        .slice(0, ALIAS_MERGE_WITHHELD_IDENTITY_CAP);
+
+    return {
+        unitsNote:
+            'Four units appear here and none of them converts into another: an IDENTITY is one source key that ' +
+            'lost its identity group, a NAME is one alias the dedupe planned to offer, a ROW is one inserted ' +
+            'catalog_food_aliases row, and a RECORD is one restated catalog_validation_records row. Offered NAMES ' +
+            'exceed inserted ROWS whenever the survivor already answered to a name (skipDuplicates). Every field ' +
+            'name says which unit it counts.',
+        // The same distinction `invocation.invocationOnlyFigures` draws for the
+        // per-check tallies, drawn again here: a resumed attempt seeds
+        // `counts` from the run row, so the two alias figures taken from it
+        // total the run while the dispositions accumulated in memory describe
+        // this invocation. On an uninterrupted pass they coincide, which is the
+        // normal case and is why it is stated rather than left to be assumed.
+        scopeNote:
+            'lostIdentitiesTotal and lostIdentitiesByStatusBeforeThisRun cover the whole table this pass read. ' +
+            'aliasRowsInserted and survivorValidationRecordsRestated are read from the run counters, so on a ' +
+            'resumed attempt they total the run. Every other figure here was accumulated by THIS invocation over ' +
+            'the losing identities it judged.',
+        lostIdentitiesTotal: total,
+        lostIdentitiesByStatusBeforeThisRun: byStatusBefore,
+        lostIdentitiesAlreadyWithheldBeforeThisRun: alreadyWithheld,
+        lostIdentitiesConsideredByThisRun: considered,
+        lostIdentitiesNotConsideredByThisRun: notConsidered,
+        lostIdentitiesJudgedByThisRunByStatus: judgedByStatus,
+        lostIdentitiesJudgedByThisRun: judged,
+        lostIdentitiesNewlyQuarantinedForDuplicateIdentity: input.quarantinedForDuplicateIdentity,
+        lostIdentitiesOfferedToAliasMerge: input.aliasMerge.offeredLoserIdentities,
+        lostIdentitiesWithheldFromAliasMerge: input.aliasMerge.withheldLoserIdentities,
+        lostIdentitiesWithheldFromAliasMergeByReason: input.aliasMerge.withheldByReason,
+        aliasNamesWithheldFromMerge: input.aliasMerge.withheldAliasNames,
+        aliasMergeWithheldIdentities: withheldIdentitiesListed,
+        aliasMergeWithheldIdentityCap: ALIAS_MERGE_WITHHELD_IDENTITY_CAP,
+        aliasMergeWithheldIdentitiesOmittedByCap:
+            input.aliasMerge.withheld.length - withheldIdentitiesListed.length,
+        aliasMergePolicyNote: input.aliasMerge.policyNote,
+        lostIdentitiesContributingAliasRows: input.losersContributingAliasRows,
+        survivingFoodsReceivingAliasRows: input.survivorsReceivingAliasRows,
+        aliasRowsInserted: input.aliasRowsInserted,
+        survivorValidationRecordsRestated: input.survivorValidationRecordsRestated,
+        reconciliation: {
+            ...reconciliationChecks,
+            everyCheckHolds,
+            statement:
+                `${String(total)} lost identity(ies) classified by the status each held before this pass ` +
+                `(${describe(byStatusBefore)}); ${String(considered)} considered by this pass and ` +
+                `${String(notConsidered)} not; ${String(judged)} judged ` +
+                `(${describe(judgedByStatus)}); ${String(input.aliasMerge.offeredLoserIdentities)} offered to the ` +
+                `alias merge and ${String(input.aliasMerge.withheldLoserIdentities)} withheld from it. Each figure ` +
+                'is counted over the losing source keys themselves, so no residue is left to be inferred by ' +
+                'subtraction.',
+        },
+        // Generated from the figures above, so it cannot state a relationship
+        // the measurements do not show.
+        note:
+            `${String(total)} identity(ies) lost the identity dedupe. ` +
+            `${String(input.quarantinedForDuplicateIdentity)} of them were quarantined by this pass with a failing ` +
+            `duplicate_identity check, and ${String(alreadyWithheld)} were already being withheld when this pass ` +
+            `read the table (${describe(byStatusBefore)}). Alias work is counted in rows and records, not ` +
+            `identities: ${String(input.aliasRowsInserted)} alias row(s) were inserted from ` +
+            `${String(input.losersContributingAliasRows)} losing identity(ies) onto ` +
+            `${String(input.survivorsReceivingAliasRows)} surviving food(s), and ` +
+            `${String(input.survivorValidationRecordsRestated)} survivor validation record(s) were restated to ` +
+            'match. A losing identity contributes no alias row when the survivor already answers to every name it ' +
+            `carried. ${input.aliasMerge.policyNote}` +
+            (input.dryRun
+                ? ' This pass was a dry run: it wrote no publication status and inserted no alias row, so every ' +
+                  'write-side figure above is zero by construction rather than by measurement of an attempt.'
+                : ''),
+    };
+};
 
 /**
  * Runs the checks over every row this invocation owns and writes the outcome.
@@ -1529,7 +2951,13 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             coveragePlanVersion: coveragePlan.coveragePlanVersion,
             catalogInput: inputIdentity,
             finishedAt: claim.run.finishedAt === null ? null : claim.run.finishedAt.toISOString(),
-            counts: JSON.stringify(claim.run.counts),
+            // The counter map itself, not a JSON string of it: `counts` is one
+            // field across this pipeline's events — checkpoint.ts emits it as an
+            // object on `run_finished` — and a field whose type changes between
+            // events cannot be aggregated without knowing which event produced
+            // it. The string form also opted the map out of the logger's
+            // key-aware sanitization pass for nothing.
+            counts: claim.run.counts,
             remedy:
                 'This catalog has already been judged under this coverage plan. A newer catalog:import or catalog:load, ' +
                 'or a new coveragePlanVersion, each creates a new validation run; re-running this stage against the same ' +
@@ -1542,6 +2970,12 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             byCategory: {},
             alreadyCompleted: true,
             unjudged: 0,
+            // Zero and null because this invocation did nothing, not because the
+            // run that closed succeeded left nothing outstanding: a run is only
+            // ever closed succeeded with every row judged and every review
+            // resolved (see the close), so there is nothing here to inherit.
+            unresolvedReviews: 0,
+            reviewStopReason: null,
         };
     }
 
@@ -1565,6 +2999,7 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         density_g_per_ml: true,
         allergen_status: true,
         allergen_tags: true,
+        diet_tags: true,
         publication_status: true,
         nutrition_version: true,
         metadata_version: true,
@@ -1580,7 +3015,17 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             },
         },
         catalog_validation_records: {
-            select: { id: true, history: true, canonical_identity: true, nutrition_assumptions: true },
+            select: {
+                id: true,
+                history: true,
+                canonical_identity: true,
+                nutrition_assumptions: true,
+                // The review the row's last judgement recorded. Selected so a
+                // retry can RECONSTRUCT the review debt from the table instead
+                // of trusting the cursor's capped list of names — see
+                // reviewOwedByRun and REVIEW_UNRESOLVED_CURSOR_LIMIT.
+                llm_review: true,
+            },
         },
     };
 
@@ -1592,16 +3037,16 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         orderBy: { source_key: 'asc' },
     });
 
-    const dedupe = dedupeIdentity(
-        allRows.map((row) => ({
-            source_key: row.source_key,
-            canonical_name: row.canonical_name,
-            food_state: row.food_state as CatalogFoodState,
-            identity_source: row.identity_source as 'usda' | 'ai_generated',
-            display_name: row.display_name,
-            aliases: row.catalog_food_aliases.map(({ alias }) => alias),
-        })),
-    );
+    const identityCandidateOf = (row: (typeof allRows)[number]): CatalogIdentityCandidate => ({
+        source_key: row.source_key,
+        canonical_name: row.canonical_name,
+        food_state: row.food_state as CatalogFoodState,
+        identity_source: row.identity_source as 'usda' | 'ai_generated',
+        display_name: row.display_name,
+        aliases: row.catalog_food_aliases.map(({ alias }) => alias),
+    });
+
+    const dedupe = dedupeIdentity(allRows.map(identityCandidateOf));
 
     const duplicateOf = new Map<string, string>();
     for (const merge of dedupe.merges) {
@@ -1613,13 +3058,53 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         duplicates: dedupe.duplicateSourceKeys.length,
     });
 
+    // WHICH OF THOSE DUPLICATES MAY LEND ITS NAMES (see WHOSE NAMES MAY BECOME
+    // A SURVIVOR'S ALIASES). The full plan above decides the identity and drives
+    // the `duplicate_identity` check; the partition below decides the alias
+    // WRITES, and it is planned a second time over the sourced identities alone
+    // so an unsourced candidate cannot put a model-proposed name onto the
+    // published, source-backed food that beat it.
+    const identityStatusBySourceKey = new Map(allRows.map((row) => [row.source_key, row.identity_status]));
+    const aliasMergePlan = partitionAliasMerges({
+        mergesOverEveryIdentity: dedupe.merges,
+        mergesOverSourcedIdentities: dedupeIdentity(
+            allRows
+                .filter((row) => row.identity_status !== IDENTITY_STATUS_WITHOUT_EVIDENCE)
+                .map(identityCandidateOf),
+        ).merges,
+        identityStatusBySourceKey,
+    });
+    logger.info('alias_merge_partitioned', {
+        stage: STAGE,
+        offeredLoserIdentities: aliasMergePlan.offeredLoserIdentities,
+        withheldLoserIdentities: aliasMergePlan.withheldLoserIdentities,
+        withheldAliasNames: aliasMergePlan.withheldAliasNames,
+        withheldByReason: JSON.stringify(aliasMergePlan.withheldByReason),
+    });
+    // WHAT A PREVIOUS ATTEMPT OF THIS RUN LEFT THE REVIEW OWING.
+    //
+    // Read before the considered set, because it is what decides whether that
+    // set includes quarantined rows. A row the review passed over was judged on
+    // the deterministic checks alone and the status that wrote is `quarantined`
+    // — so the default filter would put every row this run owes a review
+    // outside its own next attempt's reach, and the debt could never be worked
+    // off under this run key. `--revalidate-quarantined` is not the remedy: it
+    // is part of validationRunScope, so it claims a DIFFERENT run rather than
+    // continuing this one.
+    const carriedReviewDebt = carriedReviewDebtOf(claim.resumed ? claim.run.cursor : null);
+
     const wantedCategories = new Set(options.categories);
     const considered = allRows.filter((row) => {
         if (wantedCategories.size > 0 && !wantedCategories.has(row.category)) {
             return false;
         }
         if (row.publication_status === 'quarantined') {
-            return options.revalidateQuarantined;
+            // Owed a review under this key, so the rows it owes are in the list
+            // whether or not the operator asked to revalidate quarantined rows.
+            // Widening is what makes the debt reachable; what stops it from
+            // re-judging everything is the already-judged filter below, which
+            // only exempts a row that still owes a review (reviewOwedByRun).
+            return options.revalidateQuarantined || carriedReviewDebt.any;
         }
         // A published row is re-judged too: a bounds change or a newly detected
         // duplicate must be able to take it back out of the published set.
@@ -1634,6 +3119,20 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     // says so, exactly as catalog-import-usda.ts handles a changed plan. The
     // re-judgement a restart costs is idempotent for everything except the
     // history append, which is the whole reason the cursor exists.
+    //
+    // THE RUN IDENTIFIES THE WORK, NOT THE FINGERPRINT, and the distinction is
+    // load-bearing because ORDINARY JUDGEMENT CHANGES WHAT THE FINGERPRINT
+    // COVERS. `considered` is filtered by publication status, so a row this
+    // pass REJECTS is gone from `allRows` next time and a quarantined one needs
+    // `--revalidate-quarantined` to come back; every position after it shifts,
+    // and the fingerprint taken over the source keys stops matching. What
+    // continues is the RUN — keyed by `validationRunScope`, resumed under that
+    // key, and guaranteed by `runHasJudgedFood` to judge no row twice. So a
+    // mismatch invalidates the POSITIONS (`nextIndex`, `unjudged`) and nothing
+    // else: the run's counts are still seeded from the row, and its dimensions
+    // are rebuilt from the records it has already written. A report that
+    // started those figures over would state that a run which judged a
+    // catalog's worth of rows had judged the tail of it.
     const fingerprint = validationPlanFingerprint({
         coveragePlanVersion: coveragePlan.coveragePlanVersion,
         policy,
@@ -1643,50 +3142,129 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     let startIndex = 0;
     let retryIndexes: number[] = [];
     let restarted = false;
-    const savedCursor = claim.run.cursor;
+    /** Source keys a previous attempt of this run owes a review (see ValidationCursor). */
+    const carriedReviewUnresolved: string[] = carriedReviewDebt.keys;
+    /** Unresolved reviews a previous attempt could not name individually. */
+    const carriedReviewOverflow = carriedReviewDebt.overflow;
 
-    if (claim.resumed && savedCursor !== null && typeof savedCursor === 'object') {
-        const cursor = savedCursor as Partial<ValidationCursor>;
-        if (cursor.fingerprint === fingerprint && typeof cursor.nextIndex === 'number') {
-            startIndex = Math.max(0, Math.min(cursor.nextIndex, considered.length));
-            retryIndexes = Array.isArray(cursor.unjudged)
-                ? cursor.unjudged
-                      .filter(
-                          (index): index is number =>
-                              Number.isInteger(index) && index >= 0 && index < startIndex,
-                      )
-                      .sort((left, right) => left - right)
-                : [];
+    // Seeded from the cursor on a resume whose tallies can be adopted, so the
+    // report's per-check, review-flag and per-category figures cover the whole
+    // run rather than this invocation's slice of it (see ValidationCursor's
+    // `tallies`). Null means they have to be derived instead.
+    let resumedTallies: ValidationCursorTallies | null = null;
+    // The same three figures, derived from the run's committed records when the
+    // cursor cannot supply them. Null means neither source was available.
+    let rebuiltDimensions: ValidationDimensions | null = null;
+
+    if (claim.resumed) {
+        const read = readValidationCursor(claim.run.cursor, fingerprint, considered.length);
+
+        if (read.kind === 'resume') {
+            startIndex = read.nextIndex;
+            retryIndexes = [...read.unjudged];
+            resumedTallies = read.talliesRestored ? read.tallies : null;
             logger.info('validation_resumed', {
                 stage: STAGE,
                 runId: claim.run.id,
                 startIndex,
                 ofFoods: considered.length,
                 revisitingSkipped: retryIndexes.length,
+                // Says where the run-scoped dimensions below come from, because
+                // an operator reading the report cannot tell the cursor's cached
+                // figures from the derived ones by looking at the numbers.
+                talliesRestored: read.talliesRestored,
+                revisitingUnresolvedReviews: carriedReviewUnresolved.length,
             });
-        } else {
+        } else if (read.kind === 'restart') {
             // The considered set or the policy changed between attempts, so the
-            // saved index names a different food than it did. Restarting is the
-            // only correct reading of that, and saying so is better than
-            // resuming into the wrong place.
+            // saved index names a different food than it did. Restarting the
+            // TRAVERSAL is the only correct reading of that, and saying so is
+            // better than resuming into the wrong place. The stored tallies go
+            // with the positions they were saved beside — but the run's figures
+            // do not restart with them: they are rebuilt below from what this
+            // run has already committed (see THE RUN IDENTIFIES THE WORK).
             restarted = true;
             logger.warn('cursor_plan_changed', {
                 stage: STAGE,
                 runId: claim.run.id,
-                savedFingerprint: String(cursor.fingerprint ?? '').slice(0, 16),
+                savedFingerprint: read.savedFingerprint.slice(0, 16),
                 planFingerprint: fingerprint.slice(0, 16),
+                consequence:
+                    'the saved position is discarded and this invocation sweeps the considered set from the start; the rows this run already judged are skipped by their own history, and the report\'s run-scoped figures are rebuilt from their validation records',
+                // A review retry changes the set BY DESIGN: carrying debt
+                // widens the considered set to include quarantined rows, so the
+                // saved index is expected to be meaningless and the restart is
+                // the intended path rather than a sign of a moved catalog.
+                reviewDebtWidenedConsidered: carriedReviewDebt.any,
             });
             await appendRunLog(deps.runDb, claim.run.id, {
                 event: 'cursor_plan_changed',
                 planFingerprint: fingerprint,
+                reviewDebtWidenedConsidered: carriedReviewDebt.any,
             });
+        }
+
+        // THE ONE EXTRA READ, AND WHERE IT IS NOT MADE.
+        //
+        // Only here: a resumed run whose cursor tallies cannot be adopted —
+        // discarded with a restart's positions, never written by an older
+        // release, or garbled. The fingerprint-matching resume above has the
+        // figures already and asks the database for nothing, and a fresh run has
+        // nothing to rebuild. What makes the derivation sound is that a row is
+        // judged at most once per run, so the record's current state IS this
+        // run's judgement of it (see dimensionsFromJudgedRecords).
+        //
+        // Read through the graph client, because validation records are graph
+        // rows; unfiltered, because the authority on what this run judged is the
+        // `history` array a Prisma predicate cannot express, and narrowing by
+        // anything else — a timestamp, the rows still in `allRows` — would trade
+        // an exact figure for an assumption. It is one read on a path that runs
+        // at most once per invocation, against a table the pass has already read
+        // the whole of.
+        if (resumedTallies === null) {
+            const readRecords = deps.db.catalog_validation_records.findMany;
+            if (readRecords === undefined) {
+                logger.warn('validation_dimensions_not_rebuilt', {
+                    stage: STAGE,
+                    runId: claim.run.id,
+                    reason: 'this graph client exposes no validation-record read, so the run-scoped dimensions cannot be derived',
+                    consequence:
+                        'failedChecks, reviewFlags and coverage.byCategory.published cover this invocation only, and the report says so in invocation.figureScope',
+                });
+            } else {
+                // Called through the captured reference with its own delegate as
+                // the receiver: the seam is optional, and re-reading the property
+                // to call it would be a second access the narrowing above does
+                // not speak for.
+                const records = await readRecords.call(deps.db.catalog_validation_records, {
+                    select: {
+                        checks: true,
+                        publication_status: true,
+                        history: true,
+                        catalog_foods: { select: { category: true } },
+                    },
+                });
+                const rebuilt = dimensionsFromJudgedRecords(records, claim.run.id);
+                rebuiltDimensions = rebuilt.dimensions;
+                logger.info('validation_dimensions_rebuilt', {
+                    stage: STAGE,
+                    runId: claim.run.id,
+                    judgedFoods: rebuilt.judgedFoods,
+                    recordsRead: rebuilt.recordsRead,
+                    reason: restarted
+                        ? 'the considered set changed, so the cursor position and the tallies saved beside it were discarded'
+                        : 'the stored cursor carried no usable tallies',
+                    effect: 'the per-check, review-flag and per-category figures below cover every judgement this run has committed',
+                });
+            }
         }
     }
 
-    // A continued attempt of the same work list; a restart is a fresh sweep of a
-    // changed one, and its report describes the sweep it ran rather than adding
-    // to totals taken over different rows.
-    const continuedRun = claim.resumed && !restarted;
+    // WHETHER THIS INVOCATION IS CONTINUING THE RUN'S WORK, which is a question
+    // about the RUN and not about the work list: a resumed claim continues the
+    // run however much the considered set shifted underneath it (see THE RUN
+    // IDENTIFIES THE WORK). A restart is a fresh traversal, not a fresh run.
+    const continuedRun = claim.resumed;
 
     // THIS INVOCATION'S COUNTERS, AND WHY THEY START WHERE THEY DO.
     //
@@ -1695,6 +3273,14 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     // slice alone would therefore state a fraction of what the run recorded, and
     // the two would disagree about the same run — so a continued attempt seeds
     // its counters from the row and adds to them.
+    //
+    // DOUBLE COUNTING IS IMPOSSIBLE, INCLUDING AFTER A RESTART, and that is why
+    // the seeding does not depend on the fingerprint. The row holds what
+    // previous attempts recorded, this invocation adds only what it judges
+    // itself, and a food this run has already judged is dropped from the queue
+    // by its own history — so no judgement can reach these counters twice, and
+    // the only figure a restart would change is the one non-additive one
+    // (`considered`), which is written as a difference in the close.
     const counts: Record<string, number> = mergeCounts(continuedRun ? claim.run.counts : {}, {
         published: 0,
         quarantined: 0,
@@ -1717,30 +3303,184 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     // that is what lands the column on the size exactly.
     counts.considered = considered.length;
 
-    const byCheck: Record<string, number> = {};
-    const reviewFlagCounts: Record<string, number> = {};
-    const publishedByCategory: Record<string, number> = {};
+    // THE RUN-SCOPED DIMENSIONS. Seeded for the same reason `counts` is seeded
+    // from the run row: a resumed pass does not re-judge what a previous attempt
+    // judged, so a figure that started empty here would describe the slice while
+    // `counts` described the run, and the one report would state both as if they
+    // covered the same set. The cursor's cached tallies first, the derivation
+    // from the run's own records second, and empty only for a fresh run — or for
+    // a resumed one whose graph client cannot be read back, which the report
+    // names rather than glosses.
+    let dimensions: ValidationDimensions = resumedTallies ?? rebuiltDimensions ?? emptyValidationDimensions();
+
+    // THE DUPLICATE-IDENTITY POPULATIONS, measured as this pass goes.
+    //
+    // `duplicateOf` says which rows lost their identity group; these say what
+    // this pass then DID with each of them. Both are needed, because the two
+    // answer different questions and a report that stated only the first would
+    // leave a reader to infer the second by subtraction — which is exactly how
+    // a residue of losers ends up unaccounted for (see
+    // buildDuplicateIdentityAccounting).
+    const loserJudgedByStatus: Record<string, number> = {};
+    let loserQuarantinedForDuplicateIdentity = 0;
+
+    // The status each row held when the read above returned it — before this
+    // pass wrote anything. Taken from that same read, so a loser this pass
+    // never had to move is classified by the status it ALREADY held.
+    const statusBeforeThisRun = new Map(allRows.map((row) => [row.source_key, row.publication_status]));
 
     const rowsBySourceKey = new Map(allRows.map((row) => [row.source_key, row]));
     const now = deps.now();
 
-    // Counters recorded on the run row at the next checkpoint. Held separately
-    // from `counts` because the row accumulates: what it must receive is the
-    // INTERVAL's delta, never the running total.
-    let pendingCounts: Record<string, number> = {};
+    /**
+     * Which client the run row is written through from inside a food's
+     * transaction (see `RunValidationDeps.runDbIn`).
+     *
+     * The cast is what makes the atomicity real and it is sound exactly when
+     * the two seams are one client: `ValidateDb` is a structural slice of the
+     * Prisma client, so a transaction client of that client satisfies
+     * `CatalogRunDb` — and `lib/checkpoint.ts` detects it (no `$transaction`
+     * member) and runs its locked read-modify-writes IN PLACE, holding their
+     * locks until this transaction commits.
+     */
+    const runDbIn =
+        deps.runDbIn ??
+        ((tx: ValidateDb): CatalogRunDb =>
+            // Compared as values rather than as types: `ValidateDb` is a
+            // structural slice and `CatalogRunDb` the Prisma client, so the two
+            // annotations do not overlap even when — as in `main()` — they are
+            // two casts of ONE object, which is precisely the case being
+            // detected.
+            (deps.db as unknown) === (deps.runDb as unknown) ? (tx as unknown as CatalogRunDb) : deps.runDb);
+
+    // The tallies raised OUTSIDE a judgement transaction — the alias merge after
+    // the loop — and nothing else. A judgement's counts are written inside its
+    // own transaction (see THE PER-FOOD UNIT OF WORK); this holder exists for
+    // the work that has no such transaction, and it keeps its delta when a
+    // write fails (see createPendingCountHolder).
+    const pendingCounts = createPendingCountHolder((delta) => recordCounts(deps.runDb, claim.run.id, delta));
     const tally = (key: string, amount = 1): void => {
         counts[key] = (counts[key] ?? 0) + amount;
-        pendingCounts[key] = (pendingCounts[key] ?? 0) + amount;
+        if (!dryRun) {
+            pendingCounts.add(key, amount);
+        }
+    };
+
+    /**
+     * Adds a committed outcome's delta to this invocation's own counters.
+     *
+     * Called only after the transaction that wrote the same delta to the run row
+     * has returned, so the two figures are one value applied twice rather than
+     * two independent tallies — and a dry run, which writes nothing, applies it
+     * here alone.
+     */
+    const applyCountDelta = (delta: Readonly<Record<string, number>>): void => {
+        for (const [key, amount] of Object.entries(delta)) {
+            counts[key] = (counts[key] ?? 0) + amount;
+        }
     };
 
     // The positions this run has considered but not judged. Seeded from the
     // cursor, so a skipped row is revisited by the next attempt instead of being
     // stranded behind the tail pointer.
-    const unjudgedPositions = new Set<number>(retryIndexes);
-    // Skipped positions first: the tail pointer has already moved past them.
-    const plannedQueue: number[] = [...retryIndexes];
-    for (let index = startIndex; index < considered.length; index += 1) {
+    let unjudgedPositions = new Set<number>(retryIndexes);
+
+    // WHERE THE REVIEWS THIS RUN OWES SIT IN *THIS* ATTEMPT'S LIST.
+    //
+    // The carried record is keyed by `source_key` precisely so it survives a
+    // list that moved (see ValidationCursor), and this attempt's considered set
+    // was WIDENED to include quarantined rows because the debt exists — so the
+    // rows this run passed over are in the list rather than outside it.
+    //
+    // A key that is still not in the list is genuinely beyond this attempt: the
+    // only rows the widened set excludes are `rejected` ones and rows that have
+    // since vanished, and a rejected row cannot owe a review at all (a
+    // reject-tier flag decided it, so advisoryReviewApplies refuses it). Such a
+    // key is counted as unreachable, kept in the unresolved set and named in the
+    // report, and the run stays failed rather than closing as a review that
+    // silently skipped it.
+    const positionBySourceKey = new Map(considered.map((row, index) => [row.source_key, index]));
+    const reviewRevisitPositions: number[] = [];
+    const reviewUnreachableKeys: string[] = [];
+    for (const sourceKey of carriedReviewUnresolved) {
+        const position = positionBySourceKey.get(sourceKey);
+        if (position === undefined) {
+            reviewUnreachableKeys.push(sourceKey);
+            continue;
+        }
+        reviewRevisitPositions.push(position);
+    }
+
+    // AND THE DEBT THE CURSOR COULD NOT NAME, recovered from the rows.
+    //
+    // The cursor's list is capped (REVIEW_UNRESOLVED_CURSOR_LIMIT), so a review
+    // stopped over more foods than it can hold leaves rows with no name. A
+    // count of them can never be worked off, which would make a large stopped
+    // review permanently non-convergent — so when any debt is carried, every
+    // considered row that this run judged and still owes a review is queued
+    // too, read from the review its own judgement recorded
+    // (`reviewOwedByRun`). That reconstruction is bounded by the table rather
+    // than by a list, so it covers the named rows, the unnamed ones, and
+    // nothing else: a row whose review completed is not re-reviewed and is not
+    // paid for twice.
+    const reviewRescanPositions: number[] = [];
+    if (carriedReviewDebt.any) {
+        for (let index = 0; index < considered.length; index += 1) {
+            if (reviewOwedByRun(considered[index], claim.run.id)) {
+                reviewRescanPositions.push(index);
+            }
+        }
+        logger.info('advisory_review_debt_rescan', {
+            stage: STAGE,
+            runId: claim.run.id,
+            carriedNamed: carriedReviewUnresolved.length,
+            carriedNotNamed: carriedReviewOverflow,
+            stopCause: carriedReviewDebt.stopCause,
+            rowsStillOwed: reviewRescanPositions.length,
+            basis: 'every considered row this run judged whose recorded llm_review is absent or failed, so the debt is recovered from the rows rather than from the cursor list, which is capped',
+        });
+    }
+
+    const reviewRevisitSet = new Set<number>([...reviewRevisitPositions, ...reviewRescanPositions]);
+    if (reviewUnreachableKeys.length > 0) {
+        logger.warn('advisory_review_unresolved_unreachable', {
+            stage: STAGE,
+            runId: claim.run.id,
+            unreachable: reviewUnreachableKeys.length,
+            sourceKeys: reviewUnreachableKeys.slice(0, REVIEW_UNRESOLVED_REPORT_LIMIT),
+            reason: 'these rows are not in this attempt\'s considered set even with quarantined rows included, so they were rejected or have vanished from the catalog since the attempt that owed them a review',
+            remedy: 'a rejected row is held out by a reject-tier check that no review can lift; re-run catalog:import to restore a vanished row, or publish a new coveragePlanVersion',
+        });
+    }
+
+    // Skipped positions first — the tail pointer has already moved past them —
+    // then the rows this run owes a review, then the tail. `enqueue` keeps the
+    // list unique, because a row can be in two of those three sets at once: one
+    // whose review was passed over and whose write then lost the version check
+    // is both owed a review and unjudged.
+    const plannedQueue: number[] = [];
+    const queued = new Set<number>();
+    const enqueue = (index: number): void => {
+        if (queued.has(index)) {
+            return;
+        }
+        queued.add(index);
         plannedQueue.push(index);
+    };
+    for (const index of retryIndexes) {
+        enqueue(index);
+    }
+    // The named debt first, because those are the rows an operator was told
+    // about, then the rows recovered from the table for the debt the cursor
+    // could not name.
+    for (const index of reviewRevisitPositions) {
+        enqueue(index);
+    }
+    for (const index of reviewRescanPositions) {
+        enqueue(index);
+    }
+    for (let index = startIndex; index < considered.length; index += 1) {
+        enqueue(index);
     }
 
     // WHAT THIS RUN HAS ALREADY JUDGED IS A FACT ABOUT THE ROW, NOT A POSITION.
@@ -1749,8 +3489,10 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     // cannot be the authority, for two reasons that both end in a duplicated
     // history entry — the one thing a judgement is not idempotent about:
     //
-    //   * the status write commits before the cursor does, so a crash between
-    //     them leaves a judged row behind the pointer; and
+    //   * the cursor commits WITH the judgement when the graph and the ledger
+    //     are one client (see THE PER-FOOD UNIT OF WORK) — but a caller that
+    //     splits them cannot have that, so a judged row behind the pointer
+    //     remains reachable and must still not be judged twice; and
     //   * the considered list is filtered by publication status and THIS PASS
     //     CHANGES THAT STATUS, so a candidate this pass rejected is gone from
     //     the list next time and every position after it has shifted — which is
@@ -1761,7 +3503,17 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     // already judged is dropped whatever the index says. The predicate reads the
     // record the judgement itself wrote, so it cannot drift from the table the
     // way a separately maintained pointer can.
-    const queue = plannedQueue.filter((index) => !runHasJudgedFood(considered[index], claim.run.id));
+    //
+    // THE ONE EXEMPTION IS A ROW THIS RUN OWES A REVIEW. It was judged, so the
+    // filter would drop it — and dropping it is exactly what would make the
+    // review debt unpayable, because only a fresh judgement can apply an
+    // answer. So it is re-judged, and the second history entry that costs is
+    // the honest record of the second judgement: the first was made on the
+    // deterministic checks alone because no model could be reached, and this one
+    // is made with the review the run was asked for.
+    const queue = plannedQueue.filter(
+        (index) => reviewRevisitSet.has(index) || !runHasJudgedFood(considered[index], claim.run.id),
+    );
     const alreadyJudgedByThisRun = plannedQueue.length - queue.length;
     if (alreadyJudgedByThisRun > 0) {
         logger.info('validation_skipping_already_judged', {
@@ -1769,6 +3521,9 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             runId: claim.run.id,
             alreadyJudged: alreadyJudgedByThisRun,
             queued: queue.length,
+            rejudgedForReview: reviewRevisitSet.size,
+            rejudgedForNamedDebt: reviewRevisitPositions.length,
+            rejudgedForRecoveredDebt: reviewRescanPositions.length,
         });
     }
 
@@ -1783,102 +3538,360 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     };
     let skipLogEntries = 0;
 
-    const recordSkip = async (
-        kind: 'vanished' | 'raced' | 'identity_moved',
-        row: ValidationFoodRow,
-    ): Promise<void> => {
+    /**
+     * Names a skipped row where an operator will meet it: the report's capped
+     * per-reason lists and one warning line.
+     *
+     * Its COUNT and its run-log entry are not here — they are written inside the
+     * transaction that established the skip, alongside the cursor entry that
+     * sends the next attempt back to it (see THE PER-FOOD UNIT OF WORK), so the
+     * three records of one skipped row cannot disagree. This function is called
+     * after that transaction has returned, which is why it is synchronous.
+     */
+    const recordSkip = (kind: 'vanished' | 'raced' | 'identity_moved', row: ValidationFoodRow): void => {
         if (kind === 'vanished') {
-            tally('vanished');
             if (skipped.vanished.length < SKIP_REPORT_LIMIT) {
                 skipped.vanished.push(row.source_key);
             }
         } else if (kind === 'raced') {
-            tally('raced');
             if (skipped.raced.length < SKIP_REPORT_LIMIT) {
                 skipped.raced.push(row.source_key);
             }
-        } else {
-            tally('identityGroupMoved');
-            if (skipped.identityMoved.length < SKIP_REPORT_LIMIT) {
-                skipped.identityMoved.push(row.source_key);
-            }
+        } else if (skipped.identityMoved.length < SKIP_REPORT_LIMIT) {
+            skipped.identityMoved.push(row.source_key);
         }
 
         logger.warn('food_not_judged', { stage: STAGE, runId: claim.run.id, sourceKey: row.source_key, reason: kind });
-
-        if (skipLogEntries < SKIP_RUN_LOG_LIMIT) {
-            skipLogEntries += 1;
-            await appendRunLog(deps.runDb, claim.run.id, {
-                event: 'food_not_judged',
-                reason: kind,
-                sourceKey: row.source_key,
-            });
-        }
     };
 
     /**
-     * Records the counter interval this invocation has accumulated but not yet
-     * written to the run row, and empties it so the next flush carries only the
-     * next interval.
+     * Writes whatever counts are still held outside a judgement transaction.
      *
-     * Called on the cadence below, and once more if the judgement loop fails.
-     * That second caller is what keeps a RESUMED run's totals true. The cursor
-     * advances per food, so an interrupted attempt's judgements are durable and
-     * are never repeated — but the counters flush on an interval, and a
-     * continued attempt seeds its own from the run row (see THIS INVOCATION'S
-     * COUNTERS). An interval lost to the interruption would therefore be lost
-     * for good, and the eventually-succeeded run would state fewer judged foods
-     * than it considered for a set it had in fact judged completely. Flushing as
-     * the error leaves keeps the row, the report and the work done agreeing
-     * about the same run.
+     * A dry run writes nothing at all, so it does not flush; everything else
+     * about the holder's guarantee — that a failed write keeps its delta for the
+     * next flush — is the holder's own (see createPendingCountHolder).
      */
     const flushPendingCounts = async (): Promise<void> => {
-        if (dryRun || Object.keys(pendingCounts).length === 0) {
+        if (dryRun) {
             return;
         }
-        const delta = pendingCounts;
-        pendingCounts = {};
-        await recordCounts(deps.runDb, claim.run.id, delta);
+        await pendingCounts.flush();
     };
 
     // THE ADVISORY REVIEW, RUN OUTSIDE THE JUDGEMENT TRANSACTION.
     //
-    // Once the budget is exhausted no further call may be made, so the stop is
+    // Once the review stops no further call may be made, so the stop is
     // remembered rather than rediscovered per food: the pass continues and
     // judges everything on the deterministic checks alone, which is the correct
-    // reading of a row whose flag nothing has spoken for.
+    // reading of a row whose flag nothing has spoken for. What the pass may NOT
+    // do is report that as a completed review — every row it passes over is
+    // recorded below by source key, and while any remain the run is closed
+    // FAILED (see A REVIEW THIS PASS COULD NOT COMPLETE in the header, and the
+    // close).
     let reviewStopped = false;
-    let reviewStopReason: string | null = null;
-    const reviewSpend = { reserved: 0, used: 0, reviewed: 0, confirmed: 0, failed: 0, skippedAfterStop: 0 };
+    /**
+     * Why the review stopped — this pass's own cause, seeded from the cursor.
+     *
+     * Carried rather than recomputed so an attempt that settles none of the
+     * debt still reports the cause that created it: a retry made while the cap
+     * is still exhausted would otherwise fall back to whatever cause this
+     * attempt happened to reach, and an exhausted budget would be reported as a
+     * missing review client.
+     */
+    let reviewStopReason: ValidationReviewStopCause | null = carriedReviewDebt.stopCause;
+    // Seeded from the cursor's tallies where this pass could adopt them, so the
+    // aggregates the report and the end-of-pass summary carry describe the RUN's
+    // review rather than the slice of it this invocation reviewed. Where it
+    // could not, they start empty and `invocation.figureScope.modelCalls` says
+    // `invocation`: the record-based rebuild that restores the DIMENSIONS cannot
+    // restore a spend, because a per-food `llm_review` records what was asked
+    // and answered and not what was reserved or paid for. The ledger
+    // (`catalog_generation_batches`, which lib/budget.ts sums) stays the
+    // authority on spend: a call whose food's transaction then rolled back is
+    // counted there and not here, which is the correct direction for a figure
+    // that must never understate what was paid for.
+    const reviewSpend: AdvisoryReviewSpend = { ...(resumedTallies?.advisoryReview ?? emptyAdvisoryReviewSpend()) };
+
+    // HOW MANY PER-FOOD LINES OF EACH KIND THIS PASS HAS RAISED, and how many of
+    // them it emitted nothing for — both reported by the end-of-pass summary, so
+    // an operator learns there was more than they were shown rather than
+    // inferring it from a gap.
+    const advisoryLineCounts: Record<string, number> = {};
+    let advisorySamplesEmitted = 0;
+    let advisoryLinesSuppressed = 0;
 
     /**
-     * Records a spent call, and never lets the bookkeeping decide the pass.
+     * Records one per-food advisory-review event, and emits at most a bounded
+     * sample of each kind — at DEBUG, never at a normal level.
      *
-     * A ledger that will not record usage is reported loudly (§8) but does not
-     * discard an answer already paid for: the reservation stands either way, so
-     * the cap remains enforced, and the authoritative figure is the reserved
-     * aggregate rather than this mirror (lib/budget.ts).
+     * A REVIEW IS PER FOOD AND A CATALOG IS TEN THOUSAND OF THEM, so a line per
+     * reviewed food is thousands of lines whose detail
+     * `catalog_validation_records.llm_review` retains permanently anyway — and
+     * an operator scanning for the one line that matters cannot find it in that
+     * volume. The first `ADVISORY_REVIEW_LOG_SAMPLE_LIMIT` of each EVENT KIND
+     * therefore go to `logger.debug`, which the default `info` level suppresses
+     * and a debug level shows; every later one is suppressed outright and
+     * counted.
+     *
+     * NO PER-FOOD LINE AT A NORMAL LEVEL, INCLUDING A FAILURE. The caller's
+     * severity is carried by the EVENT NAME and by the counters, not by the
+     * level of a line about one food out of ten thousand. What tells the
+     * operator a review failed is `advisory_review_summary`, which is emitted
+     * unconditionally, carries `failed`, `stopReason` and the suppressed count,
+     * and rises to `warn` on either — it is now the ONLY normal-level
+     * announcement this pass makes about the review, which is exactly why it
+     * must keep rising. The detail of any individual food is in its validation
+     * record, and a pass being debugged shows the samples in full.
+     */
+    const sampleAdvisoryLine = (event: string, fields: LogFields): void => {
+        const raised = (advisoryLineCounts[event] ?? 0) + 1;
+        advisoryLineCounts[event] = raised;
+
+        if (raised > ADVISORY_REVIEW_LOG_SAMPLE_LIMIT) {
+            advisoryLinesSuppressed += 1;
+            return;
+        }
+
+        advisorySamplesEmitted += 1;
+        logger.debug(event, {
+            ...fields,
+            sample: raised,
+            sampleLimit: ADVISORY_REVIEW_LOG_SAMPLE_LIMIT,
+            grain: 'one food; the pass reports to an operator through advisory_review_summary, and this line is a debug sample of the detail already held in catalog_validation_records.llm_review',
+        });
+    };
+
+    /**
+     * The one line that accounts for the whole advisory review, emitted once.
+     *
+     * THE ONLY NORMAL-LEVEL ANNOUNCEMENT THE REVIEW MAKES, now that no per-food
+     * line reaches one (see sampleAdvisoryLine). That is why it is emitted
+     * whenever the review was ENABLED — a default pass makes no call, and a
+     * summary of nothing is noise — why it carries the failure count, the
+     * suppressed-line count and the stop reason, and why it rises to `warn` when
+     * a review failed or the review stopped: with the per-food warnings gone,
+     * this line is what keeps a failure visible at all. The aggregates are
+     * run-scoped (see reviewSpend); `stopReason` is this invocation's.
+     *
+     * Called on the way out of the pass, and on the failure path too: an
+     * interrupted pass has still spent what it spent, and the run's failure
+     * record says nothing about how much of that went to the model.
+     */
+    let advisorySummaryEmitted = false;
+    const logAdvisoryReviewSummary = (): void => {
+        if (!reviewEnabled || advisorySummaryEmitted) {
+            return;
+        }
+        advisorySummaryEmitted = true;
+
+        const summary: LogFields = {
+            stage: STAGE,
+            runId: claim.run.id,
+            reserved: reviewSpend.reserved,
+            used: reviewSpend.used,
+            reviewed: reviewSpend.reviewed,
+            confirmed: reviewSpend.confirmed,
+            failed: reviewSpend.failed,
+            skippedAfterStop: reviewSpend.skippedAfterStop,
+            stopReason: reviewStopReason,
+            sampleLimit: ADVISORY_REVIEW_LOG_SAMPLE_LIMIT,
+            samplesEmitted: advisorySamplesEmitted,
+            linesSuppressed: advisoryLinesSuppressed,
+            scope: 'reserved, used, reviewed, confirmed, failed and skippedAfterStop total the RUN (carried in the cursor); stopReason, samplesEmitted and linesSuppressed are this invocation\'s',
+            logVolume:
+                'no per-food advisory line is emitted at a normal level: the first few of each kind are debug samples and the rest are suppressed, so this line is the whole of what an info-level log says about the review. The per-food detail is in catalog_validation_records.llm_review.',
+            effect: 'no figure here changed a disposition: the review supplies no value and lifts no flag, and every status on this pass is the deterministic checks alone',
+        };
+
+        if (reviewSpend.failed > 0 || reviewStopReason !== null) {
+            logger.warn('advisory_review_summary', summary);
+            return;
+        }
+        logger.info('advisory_review_summary', summary);
+    };
+
+    /**
+     * The foods this run owes a review, seeded from the cursor so an attempt
+     * inherits the debt of every attempt before it.
+     *
+     * A key is IN this set while the row's held flags have not been put to the
+     * model, or while an answer that was obtained had to be discarded. It leaves
+     * the set when the review SETTLES — it answered, it answered nothing usable
+     * (the degraded per-row path this pass is entitled to continue past), or the
+     * row's flags no longer call for one. The run's closure is decided on
+     * membership rather than on a counter, because a counter cannot tell the
+     * next attempt WHICH rows it counted.
+     */
+    const reviewUnresolved = new Set<string>(carriedReviewUnresolved);
+
+    /** This row's review is settled for this run, however it settled. */
+    const markReviewResolved = (sourceKey: string): void => {
+        reviewUnresolved.delete(sourceKey);
+    };
+
+    /** This row's held flags did not reach a model, or its answer was discarded. */
+    const markReviewUnresolved = (sourceKey: string): void => {
+        reviewUnresolved.add(sourceKey);
+    };
+
+    /**
+     * Ends the review for the rest of the pass, recording WHY once.
+     *
+     * The cause outlives the log line: it decides the operator's next move, so
+     * the run's failure record, the report's `modelCalls.stopReason` and the
+     * returned outcome all state the same one.
+     */
+    const stopReview = (cause: ValidationReviewStopCause): void => {
+        if (reviewStopped) {
+            return;
+        }
+        reviewStopped = true;
+        reviewStopReason = cause;
+    };
+
+    /** A row a review could have changed, passed over because the review stopped. */
+    const passOverReview = (sourceKey: string): void => {
+        reviewSpend.skippedAfterStop += 1;
+        markReviewUnresolved(sourceKey);
+    };
+
+    /** Whether a spent call's usage reached the durable ledger. */
+    type ReviewUsageOutcome = 'recorded' | 'unrecorded';
+
+    /**
+     * Writes one spent call into the durable spend ledger, and treats a write
+     * that will not land as the fault it is.
+     *
+     * THE CALL IS PAID FOR BY THE TIME THIS RUNS. There is nothing to undo and
+     * the reservation is never refunded — releasing it would make a failure a
+     * free retry and the cap unenforceable (lib/budget.ts, and
+     * src/services/entitlement.service.ts's reasoning at operator scope). What
+     * is at stake is the RECORD of the spend: a pass that publishes on a review
+     * it cannot account for and then closes succeeded leaves money spent that no
+     * ledger shows, which Rule backend-architecture §8 forbids swallowing.
+     *
+     * So the write is attempted, retried ONCE, and then treated as a hard ledger
+     * fault: the review stops, the caller discards the answer it paid for, and
+     * the run closes failed. Exactly one retry, because the durable write is a
+     * single `updateMany` plus a JSONB mirror — a blip is worth a second
+     * statement on a connection the pool re-acquires, and a fault that outlives
+     * that is not transient. A stage holding the catalog-graph lock exclusively
+     * has no business sitting in a backoff loop over bookkeeping either.
+     *
+     * `batch_not_found` and `batch_run_mismatch` are NOT retried. They say that
+     * a call was spent against a key nothing reserved, or against a key another
+     * run owns — the one mistake the ledger exists to catch, and one a second
+     * identical statement can only repeat — so they stop the review at once and
+     * under their own cause.
+     *
+     * @returns whether the spend is recorded; `unrecorded` obliges the caller to
+     *          discard the answer, because nothing unaccounted for may change a
+     *          disposition
      */
     const recordReviewUsage = async (
         budget: ValidationBudget,
         batchKey: string,
         succeeded: boolean,
         sourceKey: string,
-    ): Promise<void> => {
+    ): Promise<ReviewUsageOutcome> => {
         reviewSpend.used += 1;
-        try {
-            // `tokensUsed` is deliberately omitted: the vendor boundary returns
-            // the parsed document and surfaces no usage block, so a number here
-            // would be invented. budget.ts normalises the absence to 0.
-            await budget.record({ runId: claim.run.id, batchKey, succeeded, logger });
-        } catch (error) {
+
+        // A tagged outcome rather than "the error, or null": a thrown value can
+        // itself be null or undefined (which is why logger.ts's safeError
+        // guards against one), and a sentinel would then read as a write that
+        // landed — on the one path where being wrong means spending without a
+        // record.
+        type UsageWriteAttempt = { readonly ok: true } | { readonly ok: false; readonly error: unknown };
+
+        const attemptWrite = async (): Promise<UsageWriteAttempt> => {
+            try {
+                // `tokensUsed` is deliberately omitted: the vendor boundary
+                // returns the parsed document and surfaces no usage block, so a
+                // number here would be invented. budget.ts normalises the
+                // absence to 0.
+                await budget.record({ runId: claim.run.id, batchKey, succeeded, logger });
+                return { ok: true };
+            } catch (error) {
+                return { ok: false, error };
+            }
+        };
+
+        const spentWithoutMetering = (error: unknown): boolean =>
+            error instanceof ModelBudgetError &&
+            (error.code === 'batch_not_found' || error.code === 'batch_run_mismatch');
+
+        const ledgerFault = async (error: unknown, attempts: number): Promise<ReviewUsageOutcome> => {
+            const unmetered = spentWithoutMetering(error);
+            const cause: ValidationReviewStopCause = unmetered ? 'usage_unmetered' : 'usage_unrecorded';
+            stopReview(cause);
+            markReviewUnresolved(sourceKey);
+
             logger.error('advisory_review_usage_unrecorded', {
                 stage: STAGE,
                 runId: claim.run.id,
                 sourceKey,
+                batchKey,
+                cause,
+                attempts,
+                consequence:
+                    'the call is paid for and its reservation stands, so the cap is still enforced; its answer is discarded so nothing it said can change a disposition, no further review call is made, and the run is closed failed so the unrecorded spend is visible instead of absorbed',
                 error: safeError(asReviewFailure(error, 'review_ledger_mismatch', { sourceKey })),
             });
+
+            // Durable beside the run, because the log line lives in a terminal
+            // and the operator meets this fault on the run row. Guarded: the
+            // write that just failed may have failed because the database is
+            // unreachable, and an append that throws here would replace the
+            // fault with its own — the failure record the close writes is the
+            // backstop either way.
+            try {
+                await appendRunLog(deps.runDb, claim.run.id, {
+                    event: 'advisory_review_usage_unrecorded',
+                    cause,
+                    sourceKey,
+                    batchKey,
+                });
+            } catch (appendError) {
+                logger.warn('advisory_review_fault_unlogged', {
+                    stage: STAGE,
+                    runId: claim.run.id,
+                    sourceKey,
+                    error: safeError(appendError),
+                });
+            }
+
+            return 'unrecorded';
+        };
+
+        const first = await attemptWrite();
+        if (first.ok) {
+            return 'recorded';
         }
+        if (spentWithoutMetering(first.error)) {
+            return ledgerFault(first.error, 1);
+        }
+
+        logger.warn('advisory_review_usage_write_retried', {
+            stage: STAGE,
+            runId: claim.run.id,
+            sourceKey,
+            batchKey,
+            reason: 'the durable usage write did not land; retrying it once before treating the spend as unrecorded',
+            error: safeError(asReviewFailure(first.error, 'review_ledger_mismatch', { sourceKey })),
+        });
+
+        const second = await attemptWrite();
+        if (second.ok) {
+            logger.info('advisory_review_usage_recorded_on_retry', {
+                stage: STAGE,
+                runId: claim.run.id,
+                sourceKey,
+                batchKey,
+            });
+            return 'recorded';
+        }
+
+        return ledgerFault(second.error, 2);
     };
 
     /**
@@ -1905,6 +3918,12 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         provisional: CatalogValidationVerdict,
     ): Promise<AdvisoryReviewOutcome | null> => {
         if (!reviewEnabled || !advisoryReviewApplies(row, provisional)) {
+            // Nothing a review could change here, so there is no debt to carry:
+            // a row a previous attempt owed a review and whose flags have since
+            // settled — the bounds moved, a curator classified it, its identity
+            // was verified — is resolved by that, not left to fail the run for
+            // a call it no longer needs.
+            markReviewResolved(row.source_key);
             return null;
         }
 
@@ -1915,31 +3934,43 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
 
         // A caller that asked for a review without supplying the seam gets told
         // so once, and the pass judges deterministically. Silently reviewing
-        // nothing would look identical to a model that confirmed nothing.
+        // nothing would look identical to a model that confirmed nothing — and
+        // it is not a completed review either, so every row it passes over is
+        // recorded and the run closes failed.
         if (client === undefined || budget === undefined || model === undefined || budgetLimit === undefined) {
             if (!reviewStopped) {
-                reviewStopped = true;
-                reviewStopReason = 'review_client_unavailable';
+                stopReview('review_client_unavailable');
                 logger.warn('advisory_review_unavailable', {
                     stage: STAGE,
                     runId: claim.run.id,
                     reason: 'no review client, ledger, model or budget was supplied, so every row is judged on the deterministic checks alone',
+                    consequence:
+                        'the rows whose held review flags were never put to a model are recorded on the cursor and the run is closed failed, so this key is not spent on a review that did not happen',
                 });
             }
+            passOverReview(row.source_key);
             return null;
         }
 
         if (reviewStopped) {
-            reviewSpend.skippedAfterStop += 1;
+            passOverReview(row.source_key);
             return null;
         }
 
         const requested = heldReviewFlags(provisional);
         const batchKey = reviewBatchKey(claim.run.id, row.source_key);
 
-        // RESERVE BEFORE THE CALL (§9, and lib/budget.ts's own contract). An
-        // exhausted cap is a clean stop, not a defect: nothing has been spent,
-        // and the rest of the pass judges on the checks alone.
+        // RESERVE BEFORE THE CALL (§9, and lib/budget.ts's own contract).
+        //
+        // An exhausted cap spends nothing — the refusal is thrown before any
+        // increment and before the vendor is reached — so the rows after it are
+        // judged on the checks alone and keep what those checks give them. It is
+        // NOT a clean stop for the pass, though: the cap it reports is the
+        // PIPELINE'S authorised spend for this coverage plan, shared with
+        // catalog:generate (lib/budget.ts derives the budget scope from the run's
+        // manifest_version), so what it says is "there is no authorised money
+        // left to review with", and a pass that cannot make the calls it was
+        // asked to make is recorded as the incomplete review it is.
         try {
             const reservation = await budget.reserve({
                 runId: claim.run.id,
@@ -1951,7 +3982,10 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
                 logger,
             });
             reviewSpend.reserved += 1;
-            logger.debug('advisory_review_reserved', {
+            // Per food, and therefore sampled like every other per-food
+            // advisory line: the reservation that matters to an operator is the
+            // aggregate the summary carries and the ledger holds, not one row's.
+            sampleAdvisoryLine('advisory_review_reserved', {
                 stage: STAGE,
                 runId: claim.run.id,
                 sourceKey: row.source_key,
@@ -1959,22 +3993,28 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             });
         } catch (error) {
             if (error instanceof ModelBudgetError && error.code === 'budget_exhausted') {
-                reviewStopped = true;
-                reviewStopReason = 'budget_exhausted';
-                reviewSpend.skippedAfterStop += 1;
+                stopReview('budget_exhausted');
+                passOverReview(row.source_key);
                 logger.warn('advisory_review_budget_exhausted', {
                     stage: STAGE,
                     runId: claim.run.id,
                     sourceKey: row.source_key,
                     budgetLimit,
-                    reserved: error.reserved,
+                    // The SHARED cap's consumption across this coverage plan's
+                    // generation and advisory-review runs, which is what
+                    // lib/budget.ts measures the cap against — not this run's
+                    // own reservations.
+                    scopeReserved: error.reserved,
                     consequence:
-                        'no further advisory review call is made; every remaining row is judged on the deterministic checks alone and keeps the status they give it',
+                        'the pipeline has no authorised model spend left for this coverage plan, so no further advisory review call is made; every remaining row is judged on the deterministic checks alone and keeps the status they give it, and the rows whose held review flags were never put to the model are recorded on the cursor',
+                    remedy:
+                        'raise CATALOG_MODEL_CALL_BUDGET and re-run catalog:validate --review, which retries this same failed run and revisits exactly those rows first',
                 });
                 await appendRunLog(deps.runDb, claim.run.id, {
                     event: 'advisory_review_budget_exhausted',
                     sourceKey: row.source_key,
                     budgetLimit,
+                    scopeReserved: error.reserved,
                 });
                 return null;
             }
@@ -1998,21 +4038,29 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             // answered, and a refund here would make every failure a free retry
             // (src/services/entitlement.service.ts's reasoning, applied at
             // operator scope).
-            await recordReviewUsage(budget, batchKey, false, row.source_key);
+            const usage = await recordReviewUsage(budget, batchKey, false, row.source_key);
             const failure = asReviewFailure(error, 'review_call_failed', { sourceKey: row.source_key });
             reviewSpend.failed += 1;
             // Degraded, not fatal: one unanswered flag leaves one row
             // quarantined, which is the status the deterministic checks already
-            // gave it. The pass continues.
-            logger.warn('advisory_review_failed', {
+            // gave it. The pass continues — the row's review SETTLED here, with
+            // no usable answer, which is a per-row outcome and not a reason to
+            // hold the whole run open. `recordReviewUsage` has already recorded
+            // the opposite where it applies: a spend it could not account for
+            // leaves this row unresolved and stops the review.
+            if (usage === 'recorded') {
+                markReviewResolved(row.source_key);
+            }
+            sampleAdvisoryLine('advisory_review_failed', {
                 stage: STAGE,
                 runId: claim.run.id,
                 sourceKey: row.source_key,
                 code: failure.code,
+                usage,
                 error: safeError(failure),
             });
             return {
-                review: null,
+                confirmed: [],
                 record: failedAdvisoryReviewRecord({
                     model,
                     promptVersion: coveragePlan.reviewPromptVersion,
@@ -2023,7 +4071,35 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             };
         }
 
-        await recordReviewUsage(budget, batchKey, true, row.source_key);
+        const usage = await recordReviewUsage(budget, batchKey, true, row.source_key);
+
+        // THE ANSWER IS DISCARDED WHEN THE SPEND IS NOT ON THE LEDGER, and the
+        // direction is the conservative one: a call nothing can account for must
+        // not be able to lift a held flag and publish an AI-estimated value, so
+        // the row keeps the status the deterministic checks gave it. The
+        // reservation stands and is never refunded, the review is stopped for
+        // the rest of the pass, and this row is one of the unresolved ones the
+        // close reports — `recordReviewUsage` recorded all three. The record
+        // still states what happened, because leaving `llm_review` null would
+        // read as "no review was consulted" for a call that was made and paid
+        // for.
+        if (usage === 'unrecorded') {
+            reviewSpend.failed += 1;
+            return {
+                confirmed: [],
+                record: failedAdvisoryReviewRecord({
+                    model,
+                    promptVersion: coveragePlan.reviewPromptVersion,
+                    reviewedAt,
+                    requested,
+                    failure: new CatalogReviewError(
+                        'review_ledger_mismatch',
+                        'the advisory review answered, but its spend could not be written to the durable ledger, so the answer was discarded instead of being allowed to change a disposition',
+                        { sourceKey: row.source_key },
+                    ),
+                }),
+            };
+        }
 
         let assessments: ReviewAssessment[];
         try {
@@ -2031,10 +4107,14 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         } catch (error) {
             const failure = asReviewFailure(error, 'review_response_unusable', { sourceKey: row.source_key });
             reviewSpend.failed += 1;
+            // Settled, like the vendor failure above: the flag was put to the
+            // model and came back with nothing usable, which is a recorded per-row
+            // outcome rather than a review this run still owes.
+            markReviewResolved(row.source_key);
             // The same distrust posture estimate.service.ts::groundItemsInUsda
             // takes: a model answer that is not the shape asked for is
             // discarded with a warning, never patched into a usable one.
-            logger.warn('advisory_review_unusable', {
+            sampleAdvisoryLine('advisory_review_unusable', {
                 stage: STAGE,
                 runId: claim.run.id,
                 sourceKey: row.source_key,
@@ -2042,7 +4122,7 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
                 error: safeError(failure),
             });
             return {
-                review: null,
+                confirmed: [],
                 record: failedAdvisoryReviewRecord({
                     model,
                     promptVersion: coveragePlan.reviewPromptVersion,
@@ -2058,8 +4138,11 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         if (confirmed.length > 0) {
             reviewSpend.confirmed += 1;
         }
+        // The review this run owed for this row is paid: it was reserved,
+        // called, recorded and answered.
+        markReviewResolved(row.source_key);
 
-        logger.info('advisory_review_recorded', {
+        sampleAdvisoryLine('advisory_review_recorded', {
             stage: STAGE,
             runId: claim.run.id,
             sourceKey: row.source_key,
@@ -2068,10 +4151,10 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         });
 
         return {
-            // An empty confirmation stays `null` rather than an empty object, so
-            // nothing downstream can read "reviewed and lifted nothing" as a
-            // reason to publish.
-            review: confirmed.length > 0 ? { confirmedCheckNames: confirmed } : null,
+            // Carried for the record and the counters only. Nothing reads it to
+            // decide a status: `judgeRow` below takes no advisory argument, so
+            // "reviewed and called plausible" cannot become "published".
+            confirmed,
             record: advisoryReviewRecord({
                 model,
                 promptVersion: coveragePlan.reviewPromptVersion,
@@ -2100,15 +4183,18 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
      * path calls it on the freshly locked re-read, the dry run on the row from
      * the outer read, and neither has a second copy of the floors. A dry run
      * that judged by a different rule would be worthless as a preview.
+     *
+     * THE ROW AND THE POLICY, AND NOTHING ELSE. There is no advisory parameter:
+     * a `--review` pass and a default pass compute the same verdict for the
+     * same row, and the review's answer reaches only
+     * `catalog_validation_records.llm_review` (see ON THE ADVISORY REVIEW). The
+     * one input that can release a review-tier hold is a curator allowlist,
+     * which `catalog.logic.ts` takes and this stage does not supply from any
+     * model output.
      */
-    const judgeRow = (candidateRow: ValidationFoodRow, advisory: AdvisoryReviewOutcome | null): RowJudgement => {
+    const judgeRow = (candidateRow: ValidationFoodRow): RowJudgement => {
         const verdict = validateCatalogCandidate(candidateFromRow(candidateRow), policy, {
             duplicateOfSourceKey: duplicateOf.get(candidateRow.source_key) ?? null,
-            // ADVISORY, AND ONLY EVER SUBTRACTIVE. `resolveCatalogDisposition`
-            // consults this in the review branch alone — a reject- or
-            // quarantine-tier failure has already returned — so the most it can
-            // do is lift a review flag it was asked about on this very row.
-            advisoryReview: advisory?.review ?? null,
         });
 
         let publicationStatus: string = verdict.publicationStatus;
@@ -2140,21 +4226,196 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         return { verdict, publicationStatus, extraAssumptions, identityHeld, awaitingClassification };
     };
 
+    /**
+     * What one food's committed unit of work leaves for the loop to adopt.
+     *
+     * Everything here was computed INSIDE the transaction that committed it, so
+     * adopting it afterwards cannot disagree with what the run row received —
+     * the loop applies values rather than recomputing them.
+     */
+    interface CommittedFood {
+        readonly written: ValidationWriteOutcome;
+        readonly delta: Readonly<Record<string, number>>;
+        readonly dimensions: ValidationDimensions;
+        readonly nextIndex: number;
+        readonly unjudged: Set<number>;
+        /** Whether this food's skip took one of the run log's bounded entries. */
+        readonly skipLogged: boolean;
+    }
+
+    /**
+     * Where the tail pointer stands once this position has been dealt with.
+     *
+     * A revisited skip sits BELOW the tail pointer (see the planned queue), and
+     * dealing with it must not move the pointer backwards — hence the guard on
+     * `startIndex` and the `Math.max`.
+     */
+    const advancedCursorIndex = (index: number): number =>
+        index >= startIndex ? Math.max(nextIndex, index + 1) : nextIndex;
+
+    /**
+     * The unjudged set once this position's outcome is included in it.
+     *
+     * A COPY, never the live set: it is computed inside the food's transaction
+     * to be written into the cursor, and a transaction that then rolls back must
+     * leave the pass's own view of what is unjudged exactly as it was.
+     */
+    const nextUnjudgedPositions = (index: number, written: ValidationWriteOutcome): Set<number> => {
+        const positions = new Set(unjudgedPositions);
+        if (written.outcome === 'judged') {
+            positions.delete(index);
+        } else {
+            positions.add(index);
+        }
+        return positions;
+    };
+
+    /**
+     * Judges one food under its own row lock and writes what the judgement
+     * left: the publication status, the validation record and the history
+     * entry.
+     *
+     * THE GRAPH HALF OF THE PER-FOOD UNIT OF WORK. It takes the transaction
+     * client rather than reaching for `deps.db`, because none of what it does
+     * may happen outside a transaction — and because the caller adds the LEDGER
+     * half (this food's count delta, the cursor that points past it and, for a
+     * skipped row, its run-log entry) to that same transaction, so the graph and
+     * the record of what was done to it commit together or not at all.
+     */
+    const judgeUnderLock = async (
+        tx: ValidateDb,
+        row: ValidationFoodRow,
+        advisory: AdvisoryReviewOutcome | null,
+    ): Promise<ValidationWriteOutcome> => {
+        // Raw SQL because Prisma cannot express FOR UPDATE, and this is the lock that
+        // makes everything below a snapshot nobody else can move:
+        // lib/checkpoint.ts::lockRunForUpdate is the in-repo pattern, down to binding
+        // the id and casting it in the statement. An empty result means the row was
+        // DELETED under this pass — not "no such food", since the read above returned
+        // it — and there is nothing left to judge.
+        const locked = await tx.$queryRaw<{ id: string }[]>`
+            SELECT id FROM catalog_foods WHERE id = ${row.id}::uuid FOR UPDATE
+        `;
+        if (locked.length === 0) {
+            return { outcome: 'vanished' };
+        }
+
+        // Re-read through the SAME selection object the outer read used, so
+        // `candidateFromRow` and the record writers below keep working on one shape and
+        // cannot drift apart.
+        const fresh = await tx.catalog_foods.findUnique({ where: { id: row.id }, select: selection });
+        if (fresh === null) {
+            // Unreachable while the row lock is held; kept as the guarantee itself
+            // rather than as a comment, which is how lib/checkpoint.ts writes the same
+            // situation.
+            return { outcome: 'vanished' };
+        }
+
+        if (identityGroupMoved(row, fresh)) {
+            // The duplicate decision this pass is holding was taken for a different
+            // identity, and it cannot be recomputed from one row (see
+            // identityGroupMoved).
+            return { outcome: 'identity_moved' };
+        }
+
+        // Judged from the FRESH row. The advisory answer obtained before the lock was
+        // taken is not an argument here and cannot become one: a row held by a
+        // review-tier flag is held whatever the model said about it, and the only thing
+        // the answer is carried for is the record written below.
+        const { verdict, publicationStatus, extraAssumptions, identityHeld, awaitingClassification } =
+            judgeRow(fresh);
+
+        // THE VERSION PREDICATE. The write carries the two snapshot versions and the
+        // publication status the re-read returned, so it applies to that row state and
+        // to no other. Under the row lock a zero count is unreachable; the predicate
+        // stays because it IS the guarantee — if the lock were ever lost or the
+        // isolation weakened, this is what keeps a stale judgement out of the table,
+        // and the assertion below is how that guarantee is stated (the pattern
+        // lib/checkpoint.ts::closeRunOnce uses).
+        const updated = await tx.catalog_foods.updateMany({
+            where: {
+                id: fresh.id,
+                nutrition_version: fresh.nutrition_version,
+                metadata_version: fresh.metadata_version,
+                publication_status: fresh.publication_status,
+            },
+            data: { publication_status: publicationStatus, updated_at: now },
+        });
+        if (updated.count === 0) {
+            return { outcome: 'raced' };
+        }
+
+        // The history entry is derived from the FRESH row too, so `from` names the
+        // status the transition actually left.
+        const history = appendValidationHistory(fresh, publicationStatus, verdict, now, claim.run.id);
+
+        // Create and update are separate calls rather than one upsert: Prisma validates
+        // an upsert's `create` branch whether or not it runs, so a create carrying only
+        // the judgement fields is rejected for the required columns it does not restate
+        // — and restating them on every update would overwrite what the import
+        // established with values re-derived from the row.
+        if (fresh.catalog_validation_records === null) {
+            await tx.catalog_validation_records.create({
+                data: {
+                    catalog_food_id: fresh.id,
+                    ...validationRecordSeed(
+                        fresh,
+                        verdict,
+                        publicationStatus,
+                        extraAssumptions,
+                        now,
+                        advisory?.record ?? null,
+                    ),
+                    history,
+                },
+            });
+        } else {
+            await tx.catalog_validation_records.update({
+                where: { catalog_food_id: fresh.id },
+                data: {
+                    ...validationRecordPatch(
+                        verdict,
+                        publicationStatus,
+                        extraAssumptions,
+                        now,
+                        parseStoredAssumptions(fresh.catalog_validation_records?.nutrition_assumptions),
+                        advisory?.record ?? null,
+                        // The locked re-read's own basis — the facts the verdict
+                        // beside it was computed from.
+                        { nutritionBasis: fresh.nutrition_basis, basisAmount: fresh.basis_amount },
+                    ),
+                    history,
+                },
+            });
+        }
+
+        return {
+            outcome: 'judged',
+            publicationStatus,
+            previousStatus: fresh.publication_status,
+            verdict,
+            identityHeld,
+            awaitingClassification,
+            category: fresh.category,
+        };
+    };
+
     try {
         for (const index of queue) {
             const row = considered[index];
 
-            // THE REVIEW HAPPENS HERE, BEFORE THE TRANSACTION IS OPENED.
+            // THE REVIEW HAPPENS HERE, BEFORE THE TRANSACTION IS OPENED, AND
+            // IT DECIDES NOTHING.
             //
             // A provisional verdict from the outer read is what decides whether
-            // a review could change anything at all, so no call is made for a
+            // a review would inform a curator at all, so no call is made for a
             // row the checks settle. `reviewFood` returns `null` unless
             // `--review` is on and this row is a generated candidate held by
             // review-tier flags alone (see reviewFood and
-            // advisoryReviewApplies).
-            const advisory = reviewEnabled
-                ? await reviewFood(row, judgeRow(row, null).verdict)
-                : null;
+            // advisoryReviewApplies). Its answer travels to `llm_review` and to
+            // this run's counters — never into the verdict below, which is
+            // computed from the row and the policy alone.
+            const advisory = reviewEnabled ? await reviewFood(row, judgeRow(row).verdict) : null;
 
             // ONE FOOD, ONE SHORT TRANSACTION, AND THE VERDICT COMPUTED INSIDE IT.
             //
@@ -2166,21 +4427,39 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             // published against facts it never saw: exactly the wrong judgement, on
             // a row that looks judged. So the row is locked, re-read WITH its
             // children through the same `selection`, and the verdict recomputed
-            // from what the lock is holding.
+            // from what the lock is holding (see judgeUnderLock).
             //
-            // The write is then guarded on the versions and the status that re-read
-            // returned, so even if the lock were somehow lost the judgement can only
-            // land on the facts it was computed from (see THE VERSION PREDICATE).
+            // THE PER-FOOD UNIT OF WORK, AND WHY THE LEDGER WRITES ARE IN HERE.
+            // The judgement and the three records of it — this food's count delta,
+            // the cursor that points past it, and the run-log entry a skipped row
+            // earns — are ONE atomic unit. They used to be two: the judgement
+            // committed, and then the cursor committed in a transaction of its own,
+            // so a process that died in between left a food judged with no cursor
+            // (work repeated, and a second history entry the audit trail cannot
+            // justify) while a counter interval that flushed after a judgement that
+            // then rolled back left the run row claiming work the tables did not
+            // hold. Neither is recoverable after the fact, because nothing records
+            // which of the two happened. Committing them together removes the
+            // window rather than narrowing it: `lib/checkpoint.ts`'s writers, handed
+            // this transaction's client, run IN PLACE and hold their row locks until
+            // this transaction commits (see RunValidationDeps.runDbIn for the one
+            // condition that makes it possible, and what a caller that splits the
+            // two clients gets instead).
+            //
+            // The order inside the transaction is deliberate: the graph first, then
+            // the ledger, and the cursor LAST. A cursor is a claim that everything
+            // before it is done, so it is written after the things it claims.
             //
             // A DRY RUN TAKES NO LOCK AND OPENS NO TRANSACTION. There is nothing
             // to protect: it judges the row from the outer read through the same
             // `judgeRow` the write path uses and reports the disposition it
-            // would have written. It therefore also cannot report `raced` or
-            // `vanished` — those are properties of a write it never attempts.
-            const written: ValidationWriteOutcome = dryRun
-                ? ((): ValidationWriteOutcome => {
-                      const judged = judgeRow(row, advisory);
-                      return {
+            // would have written, writing no status, no record, no count and no
+            // cursor. It therefore also cannot report `raced` or `vanished` —
+            // those are properties of a write it never attempts.
+            const committed: CommittedFood = dryRun
+                ? ((): CommittedFood => {
+                      const judged = judgeRow(row);
+                      const written: ValidationWriteOutcome = {
                           outcome: 'judged',
                           publicationStatus: judged.publicationStatus,
                           previousStatus: row.publication_status,
@@ -2189,207 +4468,150 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
                           awaitingClassification: judged.awaitingClassification,
                           category: row.category,
                       };
+                      return {
+                          written,
+                          delta: validationCountDelta(written),
+                          dimensions: applyDimensionDelta(dimensions, written),
+                          nextIndex: advancedCursorIndex(index),
+                          unjudged: nextUnjudgedPositions(index, written),
+                          skipLogged: false,
+                      };
                   })()
                 : await deps.db.$transaction(
-                async (tx): Promise<ValidationWriteOutcome> => {
-                    // Raw SQL because Prisma cannot express FOR UPDATE, and this is
-                    // the lock that makes everything below a snapshot nobody else
-                    // can move: lib/checkpoint.ts::lockRunForUpdate is the in-repo
-                    // pattern, down to binding the id and casting it in the
-                    // statement. An empty result means the row was DELETED under
-                    // this pass — not "no such food", since the read above returned
-                    // it — and there is nothing left to judge.
-                    const locked = await tx.$queryRaw<{ id: string }[]>`
-                        SELECT id FROM catalog_foods WHERE id = ${row.id}::uuid FOR UPDATE
-                    `;
-                    if (locked.length === 0) {
-                        return { outcome: 'vanished' };
-                    }
+                      async (tx): Promise<CommittedFood> => {
+                          const written = await judgeUnderLock(tx, row, advisory);
 
-                    // Re-read through the SAME selection object the outer read used,
-                    // so `candidateFromRow` and the record writers below keep
-                    // working on one shape and cannot drift apart.
-                    const fresh = await tx.catalog_foods.findUnique({ where: { id: row.id }, select: selection });
-                    if (fresh === null) {
-                        // Unreachable while the row lock is held; kept as the
-                        // guarantee itself rather than as a comment, which is how
-                        // lib/checkpoint.ts writes the same situation.
-                        return { outcome: 'vanished' };
-                    }
+                          // The run row, through the client that makes this one
+                          // unit of work (see RunValidationDeps.runDbIn).
+                          const ledger = runDbIn(tx);
 
-                    if (identityGroupMoved(row, fresh)) {
-                        // The duplicate decision this pass is holding was taken for
-                        // a different identity, and it cannot be recomputed from one
-                        // row (see identityGroupMoved).
-                        return { outcome: 'identity_moved' };
-                    }
+                          // Both derived from the outcome alone, so the figure
+                          // written here and the figure adopted in memory after the
+                          // commit are the same value rather than two tallies of
+                          // one event.
+                          const delta = validationCountDelta(written);
+                          const nextDimensions = applyDimensionDelta(dimensions, written);
+                          const positions = nextUnjudgedPositions(index, written);
+                          const advanced = advancedCursorIndex(index);
 
-                    // Judged from the FRESH row, and with the advisory answer
-                    // obtained for it before the lock was taken: the
-                    // confirmation names check names, so it can only lift a flag
-                    // that is still a held review flag here. A row whose facts
-                    // moved into a higher tier, or onto a flag nothing spoke
-                    // for, is held.
-                    const { verdict, publicationStatus, extraAssumptions, identityHeld, awaitingClassification } =
-                        judgeRow(fresh, advisory);
+                          // A skipped row's run-log entry belongs to the same
+                          // commit as the count and the cursor position that say
+                          // it was skipped. Bounded: the run log holds 200 entries
+                          // in total (lib/checkpoint.ts), and an unbounded append
+                          // would push out every entry describing what the run did.
+                          let skipLogged = false;
+                          if (written.outcome !== 'judged' && skipLogEntries < SKIP_RUN_LOG_LIMIT) {
+                              await appendRunLog(ledger, claim.run.id, {
+                                  event: 'food_not_judged',
+                                  reason: written.outcome,
+                                  sourceKey: row.source_key,
+                              });
+                              skipLogged = true;
+                          }
 
-                    // THE VERSION PREDICATE. The write carries the two snapshot
-                    // versions and the publication status the re-read returned, so
-                    // it applies to that row state and to no other. Under the row
-                    // lock a zero count is unreachable; the predicate stays because
-                    // it IS the guarantee — if the lock were ever lost or the
-                    // isolation weakened, this is what keeps a stale judgement out
-                    // of the table, and the assertion below is how that guarantee is
-                    // stated (the pattern lib/checkpoint.ts::closeRunOnce uses).
-                    const updated = await tx.catalog_foods.updateMany({
-                        where: {
-                            id: fresh.id,
-                            nutrition_version: fresh.nutrition_version,
-                            metadata_version: fresh.metadata_version,
-                            publication_status: fresh.publication_status,
-                        },
-                        data: { publication_status: publicationStatus, updated_at: now },
-                    });
-                    if (updated.count === 0) {
-                        return { outcome: 'raced' };
-                    }
+                          await recordCounts(ledger, claim.run.id, { ...delta });
 
-                    // The history entry is derived from the FRESH row too, so `from`
-                    // names the status the transition actually left.
-                    const history = appendValidationHistory(fresh, publicationStatus, verdict, now, claim.run.id);
+                          // THE CURSOR ADVANCES PER FOOD, not per interval, and
+                          // that is a deliberate departure from the import's
+                          // five-batch cadence. The import's unit of work is a
+                          // batch of twenty vendor records whose writes are
+                          // upserts, so repeating one costs a request and changes
+                          // nothing; here the unit is one food and repeating it
+                          // APPENDS A SECOND HISTORY ENTRY to its validation
+                          // record. Advancing per food is what makes a resumed run
+                          // judge no row twice, and it costs one small write
+                          // inside a transaction this food already opened.
+                          await saveCursor<ValidationCursor>(ledger, claim.run.id, {
+                              fingerprint,
+                              nextIndex: advanced,
+                              unjudged: sortedUnjudged(positions),
+                              tallies: { ...nextDimensions, advisoryReview: { ...reviewSpend } },
+                              // Written on the same cadence as the position, and
+                              // for the same reason: the review debt has to be
+                              // durable the moment it is incurred, because the
+                              // attempt that incurs it can be the one that dies.
+                              reviewUnresolved: namedReviewUnresolved(reviewUnresolved),
+                              reviewUnresolvedOverflow: reviewUnresolvedOverflowOf(
+                                  reviewUnresolved,
+                                  carriedReviewOverflow,
+                              ),
+                              // Durable the moment the review stops, for the same
+                              // reason as the debt itself: a retry must report the
+                              // cause that created the debt rather than one of its
+                              // own.
+                              reviewStopCause: reviewStopReason,
+                          });
 
-                    // Create and update are separate calls rather than one upsert:
-                    // Prisma validates an upsert's `create` branch whether or not
-                    // it runs, so a create carrying only the judgement fields is
-                    // rejected for the required columns it does not restate — and
-                    // restating them on every update would overwrite what the
-                    // import established with values re-derived from the row.
-                    if (fresh.catalog_validation_records === null) {
-                        await tx.catalog_validation_records.create({
-                            data: {
-                                catalog_food_id: fresh.id,
-                                ...validationRecordSeed(
-                                    fresh,
-                                    verdict,
-                                    publicationStatus,
-                                    extraAssumptions,
-                                    now,
-                                    advisory?.record ?? null,
-                                ),
-                                history,
-                            },
-                        });
-                    } else {
-                        await tx.catalog_validation_records.update({
-                            where: { catalog_food_id: fresh.id },
-                            data: {
-                                ...validationRecordPatch(
-                                    verdict,
-                                    publicationStatus,
-                                    extraAssumptions,
-                                    now,
-                                    parseStoredAssumptions(fresh.catalog_validation_records?.nutrition_assumptions),
-                                    advisory?.record ?? null,
-                                ),
-                                history,
-                            },
-                        });
-                    }
+                          return {
+                              written,
+                              delta,
+                              dimensions: nextDimensions,
+                              nextIndex: advanced,
+                              unjudged: positions,
+                              skipLogged,
+                          };
+                      },
+                      { timeout: TRANSACTION_TIMEOUT_MS },
+                  );
 
-                    return {
-                        outcome: 'judged',
-                        publicationStatus,
-                        previousStatus: fresh.publication_status,
-                        verdict,
-                        identityHeld,
-                        awaitingClassification,
-                        category: fresh.category,
-                    };
-                },
-                { timeout: TRANSACTION_TIMEOUT_MS },
-            );
-
-            processedThisInvocation += 1;
-            if (index >= startIndex) {
-                nextIndex = Math.max(nextIndex, index + 1);
-            }
-
-            // EVERY TALLY HAPPENS HERE, after the transaction has committed and from
-            // what it returned. Counting before the write meant counting a
+            // EVERY TALLY HAPPENS HERE, after the transaction has committed and
+            // from what it returned. Counting before the write meant counting a
             // judgement that could still roll back — and now that a row can be
             // skipped outright, it would also mean counting one that never
             // happened. The report is the record an operator reads to decide
             // whether a release is complete, so it states what the database was
             // actually left holding.
-            if (written.outcome === 'judged') {
+            //
+            // Every figure adopted here was computed inside that transaction from
+            // the outcome it committed, so the run row and this invocation's
+            // counters cannot drift: what the row received and what memory adopts
+            // are one value.
+            processedThisInvocation += 1;
+            nextIndex = committed.nextIndex;
+            unjudgedPositions = committed.unjudged;
+            dimensions = committed.dimensions;
+            applyCountDelta(committed.delta);
+            if (committed.skipLogged) {
+                skipLogEntries += 1;
+            }
+
+            if (committed.written.outcome === 'judged') {
                 judgedThisInvocation += 1;
-                tally('judged');
-                unjudgedPositions.delete(index);
 
-                if (written.identityHeld) {
-                    tally('identityNotVerified');
-                }
-                if (written.awaitingClassification) {
-                    tally('awaitingClassification');
-                }
+                // A losing identity's disposition, recorded per loser rather
+                // than per quarantine: `counts.quarantined` counts every row
+                // this pass quarantined for ANY reason, so it cannot answer how
+                // many losers this pass moved, and the failing
+                // `duplicate_identity` check is what distinguishes "quarantined
+                // because it lost the identity" from "a loser that was
+                // quarantined for something else". Read from the committed
+                // outcome, like every other figure here, so a rolled-back
+                // judgement contributes nothing.
+                if (duplicateOf.has(row.source_key)) {
+                    loserJudgedByStatus[committed.written.publicationStatus] =
+                        (loserJudgedByStatus[committed.written.publicationStatus] ?? 0) + 1;
 
-                for (const check of written.verdict.checks) {
-                    if (!check.pass) {
-                        byCheck[check.name] = (byCheck[check.name] ?? 0) + 1;
+                    if (
+                        committed.written.publicationStatus === 'quarantined' &&
+                        committed.written.verdict.checks.some(
+                            (check) => check.name === CATALOG_CHECK_NAMES.DUPLICATE_IDENTITY && !check.pass,
+                        )
+                    ) {
+                        loserQuarantinedForDuplicateIdentity += 1;
                     }
                 }
-                for (const flag of written.verdict.reviewFlags) {
-                    reviewFlagCounts[flag] = (reviewFlagCounts[flag] ?? 0) + 1;
-                }
-
-                if (written.publicationStatus === 'published') {
-                    tally('published');
-                    publishedByCategory[written.category] = (publishedByCategory[written.category] ?? 0) + 1;
-                } else if (written.publicationStatus === 'quarantined') {
-                    tally('quarantined');
-                } else if (written.publicationStatus === 'rejected') {
-                    tally('rejected');
-                } else if (written.publicationStatus === 'candidate') {
-                    tally('candidatesHeld');
-                }
-                if (written.publicationStatus === written.previousStatus) {
-                    tally('unchanged');
-                }
             } else {
-                // Skipped, and therefore VISIBLE: counted, logged, kept in the run
-                // log up to its cap, reported by source key, and left in the
-                // cursor's unjudged set so the next attempt revisits it. A row
-                // silently absent from the report is the failure this replaces.
-                unjudgedPositions.add(index);
-                await recordSkip(written.outcome, row);
+                // Skipped, and therefore VISIBLE: counted and pointed back to in
+                // the commit above, and named here in the warning line and the
+                // report's capped per-reason lists. A row silently absent from the
+                // report is the failure this replaces.
+                recordSkip(committed.written.outcome, row);
             }
 
-            // THE CURSOR ADVANCES PER FOOD, not per interval, and that is a
-            // deliberate departure from the import's five-batch cadence. The
-            // import's unit of work is a batch of twenty vendor records whose
-            // writes are upserts, so repeating one costs a request and changes
-            // nothing; here the unit is one food and repeating it APPENDS A SECOND
-            // HISTORY ENTRY to its validation record. Advancing per food is what
-            // makes a resumed run judge no row twice; the extra cost is one small
-            // locked write per food beside the four it already performs, and an
-            // offline stage can afford that to keep its audit trail exact.
-            //
-            // A dry run has no run row to carry a cursor and nothing durable to
-            // resume, so it writes none.
-            if (!dryRun) {
-                await saveCursor<ValidationCursor>(deps.runDb, claim.run.id, {
-                    fingerprint,
-                    nextIndex,
-                    unjudged: sortedUnjudged(unjudgedPositions),
-                });
-            }
-
-            // The counters are diagnostics rather than a resume point, so they are
-            // flushed on the import's cadence instead: a hundred judged foods is
-            // five batches of twenty records, and the interval's DELTA is what the
-            // accumulating column may receive.
-            if (processedThisInvocation % COUNTS_SAVE_EVERY_FOODS === 0) {
-                await flushPendingCounts();
+            // Progress only. The counters it reports are already durable — each
+            // was written inside its own food's transaction — so this cadence
+            // carries no risk of losing an interval (see PROGRESS_LOG_EVERY_FOODS).
+            if (processedThisInvocation % PROGRESS_LOG_EVERY_FOODS === 0) {
                 logger.info('validation_progress', {
                     stage: STAGE,
                     runId: claim.run.id,
@@ -2402,10 +4624,17 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             }
         }
     } catch (error) {
-        // The interval first, then the original error — and a flush that fails
-        // must not replace what actually went wrong: the counters are
-        // diagnostics, while the judgement failure is the fact the operator has
-        // to act on.
+        // Whatever the holder is still carrying, then the original error — and a
+        // flush that fails must not replace what actually went wrong: the
+        // counters are diagnostics, while the judgement failure is the fact the
+        // operator has to act on.
+        //
+        // A judgement's own counts are not at stake here: they were written
+        // inside their food's transaction, so an interruption can no longer
+        // strand an unrecorded interval (see THE PER-FOOD UNIT OF WORK). What
+        // this flush is for is anything tallied outside one — and, should the
+        // write fail, the holder keeps the delta rather than dropping it, so the
+        // close below still carries it (see createPendingCountHolder).
         try {
             await flushPendingCounts();
         } catch (flushError) {
@@ -2415,8 +4644,16 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
                 error: safeError(flushError),
             });
         }
+        // What the review spent before the pass died, which the run's failure
+        // record does not carry and no per-food line adds up to.
+        logAdvisoryReviewSummary();
         throw error;
     }
+
+    // The advisory review is confined to the loop, so this accounts for all of
+    // it: the one normal-level line carrying the aggregates that the per-food
+    // lines deliberately no longer repeat at any level (see sampleAdvisoryLine).
+    logAdvisoryReviewSummary();
 
     // The survivor keeps the identity, so the loser's names become its aliases
     // rather than disappearing with it.
@@ -2426,7 +4663,12 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     // are not the rows written — so `aliasesMerged` stays 0 rather than being
     // guessed at, and the alias work is named in the report as not attempted.
     const survivorsWithNewAliases = new Set<string>();
-    for (const merge of dryRun ? [] : dedupe.merges) {
+    // Losing identities that actually contributed a row, counted separately
+    // from the rows themselves: `skipDuplicates` means a loser whose every name
+    // the survivor already answers to contributes none, so the two figures are
+    // different quantities and neither can be derived from the other.
+    let losersContributingAliasRows = 0;
+    for (const merge of dryRun ? [] : aliasMergePlan.mergeable) {
         if (merge.aliases.length === 0) {
             continue;
         }
@@ -2440,6 +4682,7 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         });
         tally('aliasesMerged', inserted.count);
         if (inserted.count > 0) {
+            losersContributingAliasRows += 1;
             survivorsWithNewAliases.add(survivor.id);
         }
     }
@@ -2486,9 +4729,85 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
         }
     }
 
+    // WHAT THE REVIEW STILL OWES, resolved once and read by the report, the
+    // closure and the returned outcome, so the three cannot disagree about the
+    // same pass.
+    //
+    // THE CARRIED OVERFLOW IS NOT ADDED HERE, and that is what makes a large
+    // stopped review converge. The judgement loop has finished, so every row
+    // this attempt owed a review was either settled or passed over BY NAME into
+    // `reviewUnresolved` — including the rows a previous attempt could not name,
+    // which the rescan above queued from the table. What remains beyond the
+    // cursor's cap is therefore recomputed from the live set, and a debt that
+    // was worked off leaves no residue behind. Carrying the old figure here
+    // instead would keep the run failed forever, because nothing could ever
+    // decrement a number whose rows had no names.
+    const reviewUnresolvedNamed = namedReviewUnresolved(reviewUnresolved);
+    const reviewUnresolvedUnnamed = reviewUnresolvedOverflowOf(reviewUnresolved, 0);
+    const unresolvedReviews = reviewUnresolved.size;
+
+    // The cause reported for the debt: this attempt's own if it stopped, else
+    // the one the cursor carried. Null when nothing is owed, so a settled retry
+    // never reports the cause that an earlier attempt created.
+    const reportedReviewStopReason: ValidationReviewStopCause | null =
+        unresolvedReviews > 0 ? reviewStopReason : null;
+
+    // THE SETTLED CURSOR, written once after the sweep.
+    //
+    // The per-food writes inside the loop carry the debt forward while the
+    // sweep is incomplete, which is what makes it durable the moment it is
+    // incurred. Only here is the sweep known to have finished, so only here can
+    // the recomputed figures — and a cleared overflow — be recorded. Without
+    // this write a worked-off debt would stay on the row and every later
+    // attempt would widen its considered set and re-judge for a debt that no
+    // longer exists.
+    if (!dryRun) {
+        await saveCursor<ValidationCursor>(deps.runDb, claim.run.id, {
+            fingerprint,
+            nextIndex,
+            unjudged: sortedUnjudged(unjudgedPositions),
+            reviewUnresolved: reviewUnresolvedNamed,
+            reviewUnresolvedOverflow: reviewUnresolvedUnnamed,
+            reviewStopCause: reportedReviewStopReason,
+            // The run-scoped dimensions this pass settled on, so a later
+            // attempt adopts them rather than re-deriving them.
+            tallies: { ...dimensions, advisoryReview: { ...reviewSpend } },
+        });
+    }
+
+    // Built after the alias merge, because the merge is where the row and
+    // record figures come from, and from the counters this pass accumulated
+    // rather than from any figure re-derived at report time.
+    const duplicateIdentityAccounting = buildDuplicateIdentityAccounting({
+        loserSourceKeys: dedupe.duplicateSourceKeys,
+        statusBeforeThisRunBySourceKey: statusBeforeThisRun,
+        consideredSourceKeys: new Set(considered.map((row) => row.source_key)),
+        judgedByStatus: loserJudgedByStatus,
+        quarantinedForDuplicateIdentity: loserQuarantinedForDuplicateIdentity,
+        losersContributingAliasRows,
+        survivorsReceivingAliasRows: survivorsWithNewAliases.size,
+        aliasRowsInserted: counts.aliasesMerged ?? 0,
+        survivorValidationRecordsRestated: counts.aliasRecordsRestated ?? 0,
+        aliasMerge: aliasMergePlan,
+        dryRun,
+    });
+
+    if (!duplicateIdentityAccounting.reconciliation.everyCheckHolds) {
+        // Logged rather than thrown: the figures are still each individually
+        // measured and the report states them, and refusing to write the report
+        // would destroy the evidence of the disagreement. A reader and a gate
+        // both see `everyCheckHolds: false` in the artefact itself.
+        logger.warn('duplicate_identity_accounting_unreconciled', {
+            stage: STAGE,
+            runId: claim.run.id,
+            lostIdentitiesTotal: duplicateIdentityAccounting.lostIdentitiesTotal,
+            statement: duplicateIdentityAccounting.reconciliation.statement,
+        });
+    }
+
     const byCategory: Record<string, { published: number; target: number; shortfall: number }> = {};
     for (const category of coveragePlan.categories) {
-        const published = publishedByCategory[category.category] ?? 0;
+        const published = dimensions.publishedByCategory[category.category] ?? 0;
         byCategory[category.category] = {
             published,
             target: category.publishedTarget,
@@ -2496,6 +4815,28 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             shortfall: Math.max(0, category.publishedTarget - published),
         };
     }
+
+    // WHAT SCOPE THIS REPORT'S AGGREGATES ACTUALLY HAVE, derived once and
+    // stated in `invocation.figureScope` below.
+    //
+    // `counts` is seeded from the run row on every resumed claim, a restart
+    // included, so it totals the run — and a fresh run's counters cover the run
+    // because the invocation IS the run. The three DIMENSIONS total the run
+    // whenever they could be seeded: from the cursor's cached tallies, or from
+    // the run's committed records when those tallies were unusable. The one
+    // remaining case is a resumed run whose graph client exposes no record read
+    // (`ValidateDb.catalog_validation_records.findMany`), where the dimensions
+    // genuinely cover this invocation and the label says so rather than
+    // claiming a figure the pass does not have.
+    //
+    // The ADVISORY-REVIEW aggregates are labelled separately, because the
+    // rebuild does not reach them: the per-food records are not a spend ledger
+    // (see `modelCalls`), so on a resume that had to derive its dimensions the
+    // spend figures are this invocation's while the dimensions are the run's.
+    const countsScope = 'run';
+    const dimensionScope =
+        !claim.resumed || resumedTallies !== null || rebuiltDimensions !== null ? 'run' : 'invocation';
+    const modelCallScope = !claim.resumed || resumedTallies !== null ? 'run' : 'invocation';
 
     const report = {
         stage: STAGE,
@@ -2510,19 +4851,49 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             advisoryReviewEnabled: reviewEnabled,
         },
         counts,
-        failedChecks: byCheck,
-        reviewFlags: reviewFlagCounts,
+        failedChecks: dimensions.byCheck,
+        reviewFlags: dimensions.reviewFlags,
         duplicateIdentities: dedupe.duplicateSourceKeys.length,
+        // The unit of `duplicateIdentities` above, and every other quantity the
+        // dedupe produced, each measured on its own population: lost
+        // identities, what this pass did with each of them, alias ROWS
+        // inserted, survivor RECORDS restated. Added rather than replacing that
+        // scalar, which the release and the sibling reports reconcile against.
+        duplicateIdentityAccounting,
         // WHAT COVERS THE WHOLE RUN AND WHAT COVERS ONLY THIS INVOCATION.
         //
-        // `counts` totals the run: they are seeded from the run row when this
-        // invocation continued an interrupted attempt. The per-check and
-        // review-flag tallies and the per-category published figures are
-        // accumulated in memory from the foods THIS invocation judged, because
-        // nothing durable records them at that grain — so on a continued
-        // attempt they describe the slice, not the run. On a fresh,
-        // uninterrupted pass the two coincide, which is the normal case; they
-        // are named here rather than left to be assumed.
+        // EVERY AGGREGATE ON THIS REPORT IS RUN-SCOPED, AND A CHANGED WORK LIST
+        // DOES NOT ALTER THAT. `counts` is seeded from the run row on every
+        // resumed claim; the per-check and review-flag tallies and the
+        // per-category published figures are seeded from the cursor, and where
+        // the cursor's copy was discarded with its positions or was never
+        // written, they are DERIVED from the validation records this run
+        // committed (see dimensionsFromJudgedRecords). Two earlier revisions got
+        // this wrong in the same direction: the first accumulated the three in
+        // memory only, so a continued attempt reported the slice it ran while
+        // `counts` reported the run; the second persisted them in the cursor but
+        // still restarted them whenever the plan fingerprint moved — which
+        // ORDINARY JUDGEMENT makes it do, because a rejected row leaves the
+        // considered set — while the rows they describe were skipped as already
+        // judged. `failedChecks`, `reviewFlags`, `coverage.byCategory.published`
+        // and every shortfall derived from them then understated a catalog that
+        // had in fact been judged, and naming the understatement
+        // invocation-scoped described the defect rather than fixing it.
+        //
+        // What remains invocation-scoped is the block below and the `skipped`
+        // lists: they describe THIS attempt's traversal — where it began, how
+        // many rows it judged, which rows it could not — and there is no sense
+        // in which a traversal totals across attempts.
+        //
+        // `figureScope` states which scope each aggregate ACTUALLY has on THIS
+        // report rather than in general, because two cases still make the
+        // general answer wrong. A resumed run whose graph client exposes no
+        // validation-record read has dimensions it could neither restore nor
+        // derive, so they cover this invocation. And the ADVISORY-REVIEW
+        // aggregates are only ever restored from the cursor — nothing can derive
+        // a spend from per-food records — so a pass that rebuilt its dimensions
+        // reports run-scoped dimensions beside invocation-scoped model calls.
+        // One label per figure cannot contradict itself the way two lists could.
         invocation: {
             runScope,
             resumed: claim.resumed,
@@ -2531,7 +4902,31 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             revisitedSkipped: retryIndexes.length,
             judged: judgedThisInvocation,
             planFingerprint: fingerprint,
-            invocationOnlyFigures: ['failedChecks', 'reviewFlags', 'coverage.byCategory.published'],
+            // WHERE THE RUN-SCOPED DIMENSIONS ON THIS REPORT CAME FROM, as two
+            // facts rather than one: the cursor's cached tallies, or the
+            // derivation from the run's committed records. Exactly one of them
+            // is true on a resumed pass that has them at all, and both are false
+            // on a fresh run (which needs neither) and on a resumed pass whose
+            // client could not be read back (which is the one case the
+            // dimensions cover this invocation only).
+            talliesRestoredFromCursor: resumedTallies !== null,
+            talliesRebuiltFromRecords: rebuiltDimensions !== null,
+            figureScope: {
+                counts: countsScope,
+                failedChecks: dimensionScope,
+                reviewFlags: dimensionScope,
+                'coverage.byCategory.published': dimensionScope,
+                'duplicateIdentityAccounting.lostIdentitiesJudgedByThisRunByStatus': 'invocation',
+                'duplicateIdentityAccounting.lostIdentitiesJudgedByThisRun': 'invocation',
+                'duplicateIdentityAccounting.lostIdentitiesNewlyQuarantinedForDuplicateIdentity': 'invocation',
+                'duplicateIdentityAccounting.lostIdentitiesContributingAliasRows': 'invocation',
+                'duplicateIdentityAccounting.survivingFoodsReceivingAliasRows': 'invocation',
+                'coverage.shortfallTotal': dimensionScope,
+                modelCalls: modelCallScope,
+                'invocation.judged': 'invocation',
+                'invocation.startIndex': 'invocation',
+                skipped: 'invocation',
+            },
         },
         // Rows this pass did NOT judge, by source key (capped per reason; the
         // counts above are exact). Reported rather than omitted: a row that was
@@ -2560,17 +4955,31 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             publishedGapToTotal: Math.max(0, coveragePlan.publishedTargetTotal - counts.published),
             byCategory,
         },
-        // WHAT THE ADVISORY REVIEW SPENT AND WHAT IT CHANGED, reported as the
-        // counters this pass actually accumulated rather than as a claim about
-        // what it would have done.
+        // WHAT THE ADVISORY REVIEW SPENT, AND WHAT IT LEFT FOR A CURATOR,
+        // reported as the counters this run actually accumulated rather than as
+        // a claim about what it would have done.
         //
-        // `reserved` and `used` come from this invocation's own calls; the
-        // authoritative totals for the run are the ledger's
-        // (`catalog_generation_batches`, which lib/budget.ts sums), and
-        // `counts.modelCallsReserved`/`counts.modelCallsUsed` mirror them onto
-        // the run row. `confirmedFoods` is the only figure that reflects a
-        // model having changed an outcome, and it can only ever be a review-tier
-        // flag lifted on a generated candidate — never a value.
+        // RUN-SCOPED WHEN THE CURSOR CARRIED THEM: these ride the cursor and are
+        // seeded on a resume, so a pass that was interrupted and continued
+        // reports the run's review rather than the slice it reviewed itself.
+        // They are the one aggregate here the record-based rebuild cannot
+        // recover — a per-food `llm_review` says what was asked and answered,
+        // not what was reserved or paid for, and inventing a spend from it would
+        // contradict the ledger below — so on a resume that had to derive its
+        // dimensions these figures cover this invocation, and
+        // `invocation.figureScope.modelCalls` says so. The LEDGER remains the
+        // authority on spend
+        // (`catalog_generation_batches`, which lib/budget.ts sums, mirrored onto
+        // the run row as `counts.modelCallsReserved`/`counts.modelCallsUsed`):
+        // a call whose food's transaction then rolled back is counted there and
+        // not here, which is the correct direction for a figure that must never
+        // understate what was paid for. `stopReason` is the one exception and
+        // says so below — a stop belongs to the attempt that hit it.
+        //
+        // NO FIGURE HERE REFLECTS A CHANGED OUTCOME, because the review changes
+        // none: `confirmedFoods` counts the held generated rows a model called
+        // plausible, which is a queue for the curator path and not a count of
+        // publications.
         modelCalls: {
             enabled: reviewEnabled,
             model: reviewEnabled ? (deps.reviewModel ?? null) : null,
@@ -2581,14 +4990,39 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             reviewedFoods: reviewSpend.reviewed,
             confirmedFoods: reviewSpend.confirmed,
             failedReviews: reviewSpend.failed,
-            // Rows a review could have changed but that were passed over after
-            // the review stopped — an exhausted cap, or a seam the caller never
-            // supplied. `stopReason` says which.
+            // Rows a review would have been recorded for but that were passed
+            // over after the review stopped — an exhausted cap, or a seam the
+            // caller never supplied. Their disposition is unaffected: they carry
+            // the status the deterministic checks gave them, exactly as the
+            // reviewed rows do. `stopReason` says which stop it was.
             skippedAfterStop: reviewSpend.skippedAfterStop,
-            stopReason: reviewStopReason,
+            // THIS invocation's stop, never an earlier attempt's: a resumed
+            // pass re-reserves under its own cap, so carrying a previous
+            // `budget_exhausted` forward would label a pass that spent freely
+            // with a stop it never hit.
+            // Null once nothing is owed, so a retry that worked the debt off
+            // does not publish the cause that created it (see
+            // reportedReviewStopReason).
+            stopReason: reportedReviewStopReason,
+            // THE REVIEWS THIS RUN STILL OWES, which is why the run below is
+            // closed failed whenever `count` is not zero.
+            //
+            // `count` totals the run, because the debt is carried on the cursor
+            // across attempts; `foods` names as many as a report should carry
+            // and `notNamed` counts what neither this list nor the cursor could;
+            // `unreachable` counts the rows a previous attempt judged into a
+            // status that puts them outside this attempt's considered set, which
+            // is the one case a retry of this key cannot resolve on its own.
+            unresolvedReviews: {
+                count: unresolvedReviews,
+                foods: reviewUnresolvedNamed.slice(0, REVIEW_UNRESOLVED_REPORT_LIMIT),
+                notNamed: reviewUnresolvedUnnamed,
+                unreachable: reviewUnreachableKeys.length,
+                note: 'Each of these rows is held by review-tier flags the advisory model never answered, and each keeps the status the deterministic checks gave it. The run is closed failed so re-running the IDENTICAL catalog:validate --review command retries that same run: it widens its considered set to include quarantined rows because this debt exists, revisits the foods named here first, and recovers the ones `notNamed` from each row own recorded llm_review, so a debt larger than the cursor can name is still worked off. Fix the cause first (`stopReason`) — an exhausted cap needs a raised CATALOG_MODEL_CALL_BUDGET. An `unreachable` row is one the widened set still does not contain: it was rejected, which no review can lift, or it has vanished from the catalog.',
+            },
             note: reviewEnabled
-                ? 'The advisory review is consulted only where a GENERATED candidate is held by review-tier flags alone, and it can only confirm such a flag: it supplies no value, and a reject-tier or quarantine-tier failure returns before it is reached. A confirmation is recorded in llm_review and is scoped to this judgement; durable publication of an atypical generated value is the curator path, not a stored model answer.'
-                : 'No advisory review call was made: --review was not passed (or --dry-run overrode it), so every disposition here is the deterministic checks alone and llm_review is recorded as null on every record — the honest value for a judgement that consulted no review.',
+                ? 'The advisory review is consulted only where a GENERATED candidate is held by review-tier flags alone, and it changes nothing: it supplies no value, lifts no flag and overturns no tier. Its answer is recorded in llm_review for a curator, and every disposition on this report is the deterministic checks alone. A held atypical generated value publishes only through the curator allowlist, never through a stored model answer.'
+                : 'No advisory review call was made: --review was not passed (or --dry-run overrode it), so llm_review is recorded as null on every record — the honest value for a judgement that consulted no review. Every disposition here is the deterministic checks alone, which is also true of a pass that did review.',
         },
         // A dry run states plainly that nothing was written, because every other
         // figure on this report reads identically to a pass that did write.
@@ -2638,7 +5072,7 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             ? claim.run.counts.considered
             : 0;
     const closingCounts: Record<string, number> = {
-        ...pendingCounts,
+        ...pendingCounts.pending(),
         considered: considered.length - storedConsidered,
     };
     const unjudged = unjudgedPositions.size;
@@ -2646,8 +5080,48 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
     if (dryRun) {
         // No run was claimed, so there is nothing to close — and a dry run
         // cannot leave a row unjudged in the first place, since it attempts no
-        // write that could be raced.
-        return { runId: claim.run.id, counts, byCategory, alreadyCompleted: false, unjudged };
+        // write that could be raced. It reserves no model call either
+        // (advisoryReviewEnabled is false under --dry-run), so it owes no
+        // review and both figures are structurally zero here.
+        return {
+            runId: claim.run.id,
+            counts,
+            byCategory,
+            alreadyCompleted: false,
+            unjudged,
+            unresolvedReviews,
+            reviewStopReason: reportedReviewStopReason,
+        };
+    }
+
+    // A REVIEW THIS PASS COULD NOT COMPLETE IS RECORDED BESIDE THE RUN BEFORE
+    // IT CLOSES, because `appendRunLog` needs the run still open and because the
+    // closure below can only carry one error: when rows were also left unjudged
+    // that error names them (a row with no judgement at all is the graver
+    // incompleteness), and this entry is what keeps the review's own cause,
+    // count and remedy on the row in that case.
+    if (unresolvedReviews > 0) {
+        logger.error('validation_review_unresolved', {
+            stage: STAGE,
+            runId: claim.run.id,
+            stopReason: reportedReviewStopReason,
+            unresolvedReviews,
+            named: reviewUnresolvedNamed.length,
+            notNamed: reviewUnresolvedUnnamed,
+            unreachable: reviewUnreachableKeys.length,
+            foods: reviewUnresolvedNamed.slice(0, REVIEW_UNRESOLVED_REPORT_LIMIT),
+            consequence:
+                'the run is closed failed: these rows keep the dispositions the deterministic checks gave them, and closing the run succeeded would make this key a permanent no-op with their held review flags never put to a model',
+            remedy:
+                'fix the cause named by stopReason, then re-run the identical catalog:validate --review command: it continues this same run, reconsiders quarantined rows because the debt exists, and recovers even the rows this list could not name',
+        });
+        await appendRunLog(deps.runDb, claim.run.id, {
+            event: 'validation_review_unresolved',
+            stopReason: reportedReviewStopReason,
+            unresolvedReviews,
+            notNamed: reviewUnresolvedUnnamed,
+            unreachable: reviewUnreachableKeys.length,
+        });
     }
 
     if (unjudged > 0) {
@@ -2675,11 +5149,44 @@ export const runValidation = async (deps: RunValidationDeps): Promise<Validation
             error: incomplete,
             logger,
         });
+    } else if (unresolvedReviews > 0) {
+        // THE PASS JUDGED ITS WHOLE SET AND STILL DID NOT DO WHAT IT WAS ASKED.
+        //
+        // `--review` is part of the run key (see validationRunScope), so this
+        // key IS the review pass; closing it succeeded would make it a permanent
+        // no-op (see RE-RUNNING A SUCCEEDED PASS) and the held review-tier flags
+        // on these rows could never be put to a model again under it. Failed is
+        // therefore the only honest closure, and it is also the useful one:
+        // checkpoint.ts::retryFailedRun continues this same run row, and the
+        // cursor names the foods so the retry reviews exactly them first.
+        //
+        // The dispositions this pass wrote are left exactly as they are. They
+        // were judged honestly on the deterministic checks — what is incomplete
+        // is the review, which is what the failure record states.
+        const unresolved = new ValidationReviewUnresolvedError(
+            reportedReviewStopReason ?? 'review_client_unavailable',
+            unresolvedReviews,
+            reviewUnresolvedNamed.length,
+            considered.length,
+        );
+        await finishRun(deps.runDb, claim.run.id, 'failed', {
+            counts: closingCounts,
+            error: unresolved,
+            logger,
+        });
     } else {
         await finishRun(deps.runDb, claim.run.id, 'succeeded', { counts: closingCounts, logger });
     }
 
-    return { runId: claim.run.id, counts, byCategory, alreadyCompleted: false, unjudged };
+    return {
+        runId: claim.run.id,
+        counts,
+        byCategory,
+        alreadyCompleted: false,
+        unjudged,
+        unresolvedReviews,
+        reviewStopReason: reportedReviewStopReason,
+    };
 };
 
 /**
@@ -2706,11 +5213,101 @@ export class ValidationIncompleteError extends Error {
     }
 }
 
+/**
+ * A pass whose advisory review did not happen for every row that needed one.
+ *
+ * The sibling of `ValidationIncompleteError`, and carried the same way: into the
+ * run's failure record rather than thrown, after the report is written and the
+ * counts are recorded, because those are what say WHICH rows are affected. The
+ * distinction between the two is the one an operator acts on — there, rows that
+ * were never judged; here, rows that WERE judged, on the deterministic checks
+ * alone, while the review they were held for never reached a model.
+ *
+ * The message names the cause first, because the cause decides the remedy: more
+ * authorised spend, a repaired ledger, or a caller that supplies the seam. It
+ * then names why a failed closure is the right record of it — a succeeded review
+ * key can never be claimed again, so a success here would be a permanent no-op
+ * over rows whose flags nothing ever answered.
+ */
+export class ValidationReviewUnresolvedError extends Error {
+    public readonly code = 'validation_review_unresolved';
+
+    public constructor(
+        public readonly stopCause: ValidationReviewStopCause,
+        public readonly unresolved: number,
+        public readonly named: number,
+        public readonly considered: number,
+    ) {
+        super(
+            `${unresolved} of ${considered} considered food(s) are held by review-tier flags that this pass never put ` +
+                `to the advisory model: ${reviewStopExplanation(stopCause)} Their deterministic dispositions stand — ` +
+                'the checks judged them honestly — but the review this run key names did not happen for them, so the ' +
+                'run is left FAILED rather than succeeded: a succeeded run key is never claimed again, which would ' +
+                'put those flags permanently out of reach. Fix the cause above, then re-run the IDENTICAL ' +
+                'catalog:validate --review command: it retries this same run, reconsiders quarantined rows because ' +
+                `this debt exists, revisits first the ${named} food(s) the cursor names, and recovers any beyond ` +
+                'that list from each row own recorded review — so the debt is worked off under this key rather than ' +
+                'needing --revalidate-quarantined, which would claim a different run.',
+        );
+        this.name = 'ValidationReviewUnresolvedError';
+    }
+}
+
+/** The cause of a stopped review, and the operator action it calls for. */
+const reviewStopExplanation = (cause: ValidationReviewStopCause): string => {
+    switch (cause) {
+        case 'budget_exhausted':
+            return (
+                'CATALOG_MODEL_CALL_BUDGET is exhausted for this coverage plan — one cap covers catalog:generate and ' +
+                'this advisory review together (scripts/lib/budget.ts), so the pipeline has no authorised model ' +
+                'spend left at all. Raise it, or publish a new coveragePlanVersion, which is new work with a budget ' +
+                'of its own.'
+            );
+        case 'usage_unrecorded':
+            return (
+                'a paid review call could not be written to the durable spend ledger after a retry, so the review ' +
+                'was stopped and that answer discarded rather than left to change a disposition on spend nothing ' +
+                'records. Repair the ledger write before re-running.'
+            );
+        case 'usage_unmetered':
+            return (
+                'the spend ledger refused a paid review call because no reservation exists under its batch key, or ' +
+                'because that key belongs to another run — a call was spent without being metered, which is the one ' +
+                'thing the reserve-before-spend order exists to prevent. Find out what spent it before re-running.'
+            );
+        case 'review_client_unavailable':
+            return (
+                '--review was requested but no review client, ledger, model or budget was supplied, so no call could ' +
+                'be made at all. Supply the review seam (catalog-validate.ts main() resolves it from the OpenRouter ' +
+                'boundary and CATALOG_MODEL_CALL_BUDGET) and re-run.'
+            );
+    }
+};
+
 /** The cursor's skipped positions: ascending and capped (see UNJUDGED_CURSOR_LIMIT). */
 const sortedUnjudged = (positions: ReadonlySet<number>): number[] =>
     Array.from(positions)
         .sort((left, right) => left - right)
         .slice(0, UNJUDGED_CURSOR_LIMIT);
+
+/**
+ * The unresolved reviews the cursor names: sorted, so the list is stable across
+ * attempts rather than reordered by insertion, and capped (see
+ * REVIEW_UNRESOLVED_CURSOR_LIMIT).
+ */
+const namedReviewUnresolved = (sourceKeys: ReadonlySet<string>): string[] =>
+    Array.from(sourceKeys).sort().slice(0, REVIEW_UNRESOLVED_CURSOR_LIMIT);
+
+/**
+ * The unresolved reviews the cursor cannot name: what this attempt could not
+ * fit, plus what an earlier attempt already could not fit.
+ *
+ * Carried forward rather than recomputed, because an unnamed row is exactly the
+ * one no later attempt can go back to — dropping the figure would let a run
+ * close as a completed review on the strength of a list that was truncated.
+ */
+const reviewUnresolvedOverflowOf = (sourceKeys: ReadonlySet<string>, carried: number): number =>
+    carried + Math.max(0, sourceKeys.size - REVIEW_UNRESOLVED_CURSOR_LIMIT);
 
 /**
  * 30 s: one food is six statements — the row lock, the re-read, the guarded
@@ -2737,6 +5334,125 @@ export const parseStoredAssumptions = (encoded: string | null | undefined): stri
     } catch {
         return [];
     }
+};
+
+/* ---------------------------------------------------------------------------
+ * THE CHECKS A SUCCESSFUL NORMALISATION EXECUTED, AND WHY THEY HAVE TO BE
+ * WRITTEN DOWN HERE
+ *
+ * `CatalogValidationVerdict.checks` declares its own contract: "Every check
+ * that was EVALUATED, passing and failing alike. A check whose inputs were
+ * unavailable is absent rather than recorded as a pass." Two names in the
+ * vocabulary do not meet it. `normalizeToPer100g` (src/services/catalog.logic.ts)
+ * tests `invalid_basis_amount` on EVERY candidate it is handed, and on the way
+ * to a per-100 g result it also tests `non_finite_computed_value` three times —
+ * the basis mass, the rescale factor, and every rescaled nutrient. Each test
+ * returns a `{kind: 'error', check}` on failure and the success path returns
+ * `{kind: 'ok', normalized}` with NO check recorded. So both names are present
+ * on a record only when they failed, and a reader of a passing record cannot
+ * tell whether the test ran and passed or never ran at all.
+ *
+ * That ambiguity is not harmless: the report downstream has to decide, for
+ * every vocabulary name absent from an item's record, whether the item's own
+ * facts show the check could not apply. Read as "could not apply", these two
+ * are filed as NOT APPLICABLE on EVERY published item — an `applicable: false`
+ * claim about two checks that in fact ran and passed on every one of them.
+ * That is what the v1 release's report said about all 11,046 of its items
+ * before this was written down.
+ *
+ * The derivation below is the validator's own success signal, not a
+ * re-implementation of its arithmetic: `verdict.normalizedNutrition` is
+ * non-null precisely when `normalizeToPer100g` returned `kind: 'ok'`
+ * (validateCatalogCandidate assigns it from `conversion.kind === 'ok'`), which
+ * is precisely when the basis test and all three finiteness guards passed.
+ * Nothing is inferred about a check the validator did not reach: a conversion
+ * that FAILED leaves `normalizedNutrition` null, this appends nothing, and the
+ * one check that stopped it stays the only entry — a `per_100ml` row held for
+ * `missing_density` never gains a `non_finite_computed_value` pass it never
+ * earned.
+ *
+ * It belongs in this file rather than in `catalog.logic.ts` because that module
+ * is owned elsewhere in this checkpoint; the gap between its documented
+ * contract and its ok-path is reported as a seam, and this stage — the one that
+ * writes the record — closes it at the boundary where the record is written.
+ * The appended entries carry the same `name`, `tier` and `bound` the failure
+ * path would have carried, `pass: true`, and the observed value that satisfied
+ * the bound, so the record stays replayable without consulting the code.
+ * ------------------------------------------------------------------------- */
+
+/** The stored basis a normalisation converted from, for the observed values below. */
+export interface NormalizationInputs {
+    readonly nutritionBasis: string;
+    readonly basisAmount: number;
+}
+
+/**
+ * The two vocabulary names `normalizeToPer100g` evaluates without recording a
+ * pass, with the bound each one's failure path states verbatim.
+ *
+ * Held as data so the pair is a list a reader can check against that function,
+ * and so adding a third silently-passing check is a one-line data change.
+ */
+const CHECKS_EVALUATED_WITHOUT_RECORDING_A_PASS: readonly {
+    readonly name: CatalogCheckName;
+    readonly bound: string;
+    readonly observed: (inputs: NormalizationInputs) => string;
+}[] = [
+    {
+        name: CATALOG_CHECK_NAMES.INVALID_BASIS_AMOUNT,
+        // The failure path's bound, word for word, so the pass and the failure
+        // are the same test stated once.
+        bound: 'a finite basis_amount greater than 0',
+        observed: (inputs) => `basis_amount ${String(inputs.basisAmount)} on a ${inputs.nutritionBasis} basis`,
+    },
+    {
+        name: CATALOG_CHECK_NAMES.NON_FINITE_COMPUTED_VALUE,
+        bound: 'finite per-100g values',
+        observed: (inputs) =>
+            `basis mass, the ${String(PER_100G_BASIS_AMOUNT)}/basisGrams rescale factor and every rescaled ` +
+            `nutrient were finite converting a ${inputs.nutritionBasis} basis of ${String(inputs.basisAmount)}`,
+    },
+];
+
+/**
+ * The checks the record should state: the ones the verdict carries, plus the
+ * ones a successful normalisation ran and left unrecorded.
+ *
+ * Pure, and defensive in both directions. It appends only where
+ * `normalizedNutrition` is non-null — the conversion's own success signal — and
+ * only where the verdict does not already carry the name, so a future
+ * `catalog.logic.ts` that records its own passes makes this a no-op rather than
+ * producing a duplicate entry. `resolveCatalogDisposition` reads `!check.pass`
+ * exclusively, so an appended PASS cannot move a publication status; the
+ * disposition is computed before this runs in any case.
+ *
+ * Appended at the end in list order, so the stored array is byte-stable across
+ * re-validations of the same row.
+ */
+export const recordedChecks = (
+    verdict: CatalogValidationVerdict,
+    normalization: NormalizationInputs | null,
+): CatalogValidationCheck[] => {
+    const checks: CatalogValidationCheck[] = [...verdict.checks];
+    if (verdict.normalizedNutrition === null || normalization === null) {
+        return checks;
+    }
+
+    const alreadyRecorded = new Set(checks.map((check) => check.name));
+    for (const executed of CHECKS_EVALUATED_WITHOUT_RECORDING_A_PASS) {
+        if (alreadyRecorded.has(executed.name)) {
+            continue;
+        }
+        checks.push({
+            name: executed.name,
+            pass: true,
+            observed: executed.observed(normalization),
+            bound: executed.bound,
+            tier: catalogCheckTier(executed.name),
+        });
+    }
+
+    return checks;
 };
 
 /**
@@ -2766,9 +5482,13 @@ export const validationRecordPatch = (
     now: Date,
     priorAssumptions: readonly string[] = [],
     advisoryReview: Record<string, unknown> | null = null,
+    normalization: NormalizationInputs | null = null,
 ): Record<string, unknown> => {
     const patch: Record<string, unknown> = {
-        checks: verdict.checks,
+        // Not `verdict.checks` directly: see THE CHECKS A SUCCESSFUL
+        // NORMALISATION EXECUTED above for the two names the verdict evaluates
+        // on every candidate and records only on failure.
+        checks: recordedChecks(verdict, normalization),
         outcome: publicationStatus === 'published' ? verdict.outcome : nonPublishedOutcome(publicationStatus, verdict),
         publication_status: publicationStatus,
         reviewed_at: now,
@@ -2815,7 +5535,10 @@ export const validationRecordSeed = (
     now: Date,
     advisoryReview: Record<string, unknown> | null = null,
 ): Record<string, unknown> => ({
-    ...validationRecordPatch(verdict, publicationStatus, extraAssumptions, now, [], advisoryReview),
+    ...validationRecordPatch(verdict, publicationStatus, extraAssumptions, now, [], advisoryReview, {
+        nutritionBasis: row.nutrition_basis,
+        basisAmount: row.basis_amount,
+    }),
     canonical_identity: {
         source_key: row.source_key,
         canonical_name: row.canonical_name,
@@ -2930,20 +5653,88 @@ export const runHasJudgedFood = (row: ValidationFoodRow, runId: string): boolean
     return Array.isArray(history) && history.some((entry) => historyEntryBelongsToRun(entry, runId));
 };
 
+/**
+ * Whether this run judged the row WITHOUT completing the advisory review it
+ * owes it — read from the row itself, not from the cursor.
+ *
+ * WHY A TABLE-DERIVED PREDICATE EXISTS AT ALL. The cursor names unresolved
+ * reviews by source key, and that list is capped
+ * (REVIEW_UNRESOLVED_CURSOR_LIMIT). A cap means a stopped review of more foods
+ * than it can hold would leave rows with no name by which any later attempt
+ * could go back to them, and a count alone can never be worked off: the run
+ * would be permanently non-convergent. This predicate is the reconstruction
+ * that removes the cap from the recovery path — the cursor's list becomes an
+ * ORDERING HINT and a report diagnostic, and the authority on "does this row
+ * still owe a review" is the record its own judgement wrote.
+ *
+ * `llm_review` is rewritten by every judgement of the row (null when no review
+ * was consulted), so on a row this run judged it describes THIS run's attempt:
+ *
+ *   * `null` — no review call was made for it. Either the review had stopped
+ *     before it (a passed-over row) or none was applicable. Owed.
+ *   * `outcome: 'failed'` — a call was made and could not be used: a vendor
+ *     failure, an unusable answer, or spend that would not record
+ *     (`review_ledger_mismatch`). Owed, because a retry can succeed.
+ *   * anything else — a review was completed and recorded, whether it confirmed
+ *     the flag or lifted it. NOT owed, and re-reviewing it would pay twice for
+ *     an answer already held.
+ *
+ * Narrowed to a GENERATED, still-quarantined row, which is the only population
+ * `advisoryReviewApplies` can hold: a USDA row publishes with its review flag
+ * recorded and a published row is not held at all, so neither can owe anything.
+ * A row held by a quarantine- or reject-tier flag also matches this narrowing
+ * and is re-judged at no vendor cost, because `advisoryReviewApplies` refuses
+ * it before any reservation.
+ */
+export const reviewOwedByRun = (row: ValidationFoodRow, runId: string): boolean => {
+    if (row.identity_source !== 'ai_generated' || row.publication_status !== 'quarantined') {
+        return false;
+    }
+    if (!runHasJudgedFood(row, runId)) {
+        // Never judged by this run, so the ordinary queue reaches it and no
+        // exemption is needed; saying "owed" here would claim a debt the run
+        // has not yet had the chance to incur.
+        return false;
+    }
+
+    const review = row.catalog_validation_records?.llm_review;
+    if (review === null || review === undefined) {
+        return true;
+    }
+    if (typeof review !== 'object') {
+        // An unreadable value is treated as no review rather than as a
+        // completed one: the cost of being wrong is one re-judgement, and the
+        // cost of the other reading is a flag nothing ever answers.
+        return true;
+    }
+
+    return (review as { outcome?: unknown }).outcome === 'failed';
+};
+
 // ---------------------------------------------------------------------------
 // Reporting.
 // ---------------------------------------------------------------------------
 
-const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
-    const fields: LogFields = { stage: STAGE, gapCount: gaps.length };
-    for (const gap of gaps) {
-        fields[`gap_${gap.code}`] =
-            gap.detail === undefined
-                ? `${gap.requirement}. ${gap.remedy}`
-                : `${gap.requirement}. ${gap.remedy} [${gap.detail}]`;
-    }
-    return fields;
-};
+// One structured entry per gap under a single neutral key — the same shape as
+// catalog-generate-ai.ts, and for the same reason: a field NAME must be a fixed
+// identifier and never derived from data, because the logger redacts the value
+// of any key whose name reads as a credential and matches credential phrases
+// anywhere in it (scripts/lib/logger.ts holds the contract). This stage's
+// `openrouter_api_key_missing` gap became
+// `"gap_openrouter_api_key_missing":"***"`, hiding the one sentence that says
+// which variable to set, and `model_call_budget_unresolved` lost its detail the
+// same way. The code belongs in a value; the prose then survives, while the
+// value rules still scrub a real credential appearing inside it.
+const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => ({
+    stage: STAGE,
+    gapCount: gaps.length,
+    gaps: gaps.map((gap) => ({
+        code: gap.code,
+        requirement: gap.requirement,
+        remedy: gap.remedy,
+        detail: gap.detail ?? null,
+    })),
+});
 
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
@@ -3073,9 +5864,17 @@ const main = async (): Promise<number> => {
             logger,
             now: () => new Date(),
             writeReport: (report) => {
+                // Published, not written in place: this artefact is evidence a
+                // reviewer reads, and `catalog-report.ts` publishes the same
+                // file with its own half. So the write takes the artefact
+                // directory's lock (no two publishers interleaved) and lands
+                // through the staged-then-renamed write in
+                // scripts/lib/manifest.ts, which leaves the previous complete
+                // report in place if this run is interrupted.
                 const target = reportPath('validation-report.json');
-                fs.mkdirSync(path.dirname(target), { recursive: true });
-                fs.writeFileSync(target, `${JSON.stringify(report, null, 2)}\n`, 'utf-8');
+                withArtifactPublicationLockSync(path.dirname(target), `${STAGE}:report`, () => {
+                    writeJsonFile(target, report);
+                });
             },
             // The vendor and the ledger are supplied only when a call may
             // happen, so a default pass cannot make one even by accident.
@@ -3105,15 +5904,24 @@ const main = async (): Promise<number> => {
         // NO-OP), or a pass that left rows unjudged and is recorded as failed.
         alreadyCompleted: outcome.alreadyCompleted,
         unjudged: outcome.unjudged,
-        counts: JSON.stringify(outcome.counts),
+        // The fourth outcome, and it is not interchangeable with the others
+        // either: every row judged, and rows whose held review-tier flags the
+        // advisory model never answered — a pass recorded as failed so the
+        // review can be retried (see A REVIEW THIS PASS COULD NOT COMPLETE).
+        unresolvedReviews: outcome.unresolvedReviews,
+        reviewStopReason: outcome.reviewStopReason,
+        // The object, for the reason given at `run_already_completed` above.
+        counts: outcome.counts,
     });
 
     await prisma.$disconnect();
 
-    // A pass that left rows unjudged closed its run as failed, so the exit code
-    // has to agree with the record: the operator's next action is to re-run,
-    // which retries that run.
-    return outcome.unjudged > 0 ? 1 : 0;
+    // A pass that left rows unjudged, or that left a review it was asked for
+    // unresolved, closed its run as failed — so the exit code has to agree with
+    // the record, or an unattended caller would read a failed run as a success.
+    // The operator's next action in both cases is to re-run, which retries that
+    // same run.
+    return outcome.unjudged > 0 || outcome.unresolvedReviews > 0 ? 1 : 0;
 };
 
 // Guarded so importing this module for parseArgs, preflight or describeUsage

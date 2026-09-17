@@ -53,6 +53,7 @@ import {
     PlanRecipeCandidate,
     PlanSearchBudget,
     PlanSearchOutcome,
+    PlannedMealAssignment,
     PlanSeedInputs,
     REUSE_BONUS_CAP,
     SNACK_PORTION_MULTIPLIERS,
@@ -904,12 +905,41 @@ describe('violatesRepetitionRule', () => {
         expect(violatesRepetitionRule('r', 1, new Set(['r']), none)).toBe(true);
     });
 
-    it('refuses a recipe already placed today, which is zero days apart', () => {
-        expect(violatesRepetitionRule('r', 1, none, new Set(['r']))).toBe(true);
-    });
-
     it('ignores other recipes in either day', () => {
         expect(violatesRepetitionRule('r', 0, new Set(['other']), new Set(['another']))).toBe(false);
+    });
+
+    describe('§0.7.3 is two clauses — the same day is not a third', () => {
+        // The rule the AAP states is "at most twice in the week and never on
+        // consecutive days". Twice in ONE day, in two different slots, breaks
+        // neither, and refusing it turned feasible weeks into
+        // `no_matching_meals`.
+        it('permits a second use on the day a recipe is already placed', () => {
+            expect(violatesRepetitionRule('r', 1, none)).toBe(false);
+        });
+
+        it('still refuses the third use, wherever the first two fell', () => {
+            expect(violatesRepetitionRule('r', MAX_RECIPE_USES_PER_WEEK, none)).toBe(true);
+        });
+
+        it('still refuses a same-day second use when yesterday holds the recipe', () => {
+            // The spacing clause is independent of the cap: a recipe on day
+            // n − 1 is refused on day n whether or not day n already holds it.
+            expect(violatesRepetitionRule('r', 1, new Set(['r']))).toBe(true);
+        });
+    });
+
+    describe('the optional caller-supplied exclusion set', () => {
+        // `swap.logic.ts` is the one caller that passes it — the alternatives
+        // sheet narrows its own eight-row list by the rest of that day.
+        it('excludes a recipe the caller names, inside the rule', () => {
+            expect(violatesRepetitionRule('r', 0, none, new Set(['r']))).toBe(true);
+        });
+
+        it('defaults to excluding nothing when the caller omits it', () => {
+            expect(violatesRepetitionRule('r', 0, none)).toBe(false);
+            expect(violatesRepetitionRule('r', 1, new Set(['other']))).toBe(false);
+        });
     });
 });
 
@@ -2138,69 +2168,72 @@ describe('generateWeeklyPlan', () => {
         // boundary. Asserting the property rather than a hand-traced day/slot
         // keeps the test honest if the move order ever shifts.
         //
-        // The catalog mixes protein-, carb- and fat-dense profiles so the day
-        // tolerance binds on all four macros at once (these recipes deliberately
-        // do NOT use `proportional`). A day therefore needs a specific MIX, and
-        // because the no-consecutive-days rule decides which recipes a day may
-        // draw on, one day's assignment constrains the next day's — the coupling
-        // that makes a week-level dead end possible at all.
+        // The catalog mixes protein-, carb-, fat-dense, hearty, lean and balanced
+        // profiles so the day tolerance binds on all four macros at once (these
+        // recipes deliberately do NOT use `proportional`). A day therefore needs
+        // a specific MIX, and because the no-consecutive-days rule decides which
+        // recipes a day may draw on, one day's assignment constrains the next
+        // day's — the coupling that makes a week-level dead end possible at all.
         const PROTEIN_DENSE: MealPlanMacroTotals = { calories: 600, protein: 80, carbs: 20, fat: 15 };
         const CARB_DENSE: MealPlanMacroTotals = { calories: 450, protein: 10, carbs: 85, fat: 6 };
-        const CARB_DENSE_LARGE: MealPlanMacroTotals = { calories: 600, protein: 15, carbs: 110, fat: 10 };
         const FAT_DENSE: MealPlanMacroTotals = { calories: 600, protein: 20, carbs: 25, fat: 45 };
         const BALANCED: MealPlanMacroTotals = { calories: 800, protein: 55, carbs: 70, fat: 28 };
+        const HEARTY: MealPlanMacroTotals = { calories: 700, protein: 45, carbs: 80, fat: 20 };
+        const LEAN: MealPlanMacroTotals = { calories: 500, protein: 60, carbs: 45, fat: 10 };
 
-        // Every recipe here is load-bearing: greedy minimisation could not drop
-        // one without the week becoming solvable day-by-day (or unsolvable).
+        // Every recipe here is load-bearing: dropping ANY single one leaves the
+        // real search unable to close the week at all (it exhausts the per-day
+        // allowance), which is asserted below rather than left as a claim.
         // The slugs are load-bearing too — they ARE the portable pre-order, so
-        // renaming them reshuffles the move order and the property is lost.
+        // renaming them reshuffles the move order and the property is lost. The
+        // suffix names the slots the recipe declares: b breakfast, l lunch,
+        // d dinner.
         const catalog = (): PlanRecipeCandidate[] => [
-            makeRecipe({ slug: 'lunch-balanced', slots: ['lunch'], calories: 0, nutrition: BALANCED }),
-            makeRecipe({ slug: 'breakfast-carb', slots: ['breakfast'], calories: 0, nutrition: CARB_DENSE }),
             makeRecipe({
-                slug: 'shared-carb',
-                slots: ['breakfast', 'lunch'],
-                calories: 0,
-                nutrition: CARB_DENSE,
-            }),
-            makeRecipe({ slug: 'dinner-balanced', slots: ['dinner'], calories: 0, nutrition: BALANCED }),
-            makeRecipe({ slug: 'breakfast-fat', slots: ['breakfast'], calories: 0, nutrition: FAT_DENSE }),
-            makeRecipe({
-                slug: 'shared-protein-bd',
-                slots: ['breakfast', 'dinner'],
-                calories: 0,
-                nutrition: PROTEIN_DENSE,
-            }),
-            makeRecipe({
-                slug: 'shared-protein-ld',
+                slug: 'balanced-ld',
                 slots: ['lunch', 'dinner'],
                 calories: 0,
-                nutrition: PROTEIN_DENSE,
+                nutrition: BALANCED,
             }),
             makeRecipe({
-                slug: 'shared-fat',
-                slots: ['breakfast', 'lunch'],
+                slug: 'fat-bd',
+                slots: ['breakfast', 'dinner'],
                 calories: 0,
                 nutrition: FAT_DENSE,
             }),
+            makeRecipe({ slug: 'balanced-l', slots: ['lunch'], calories: 0, nutrition: BALANCED }),
             makeRecipe({
-                slug: 'breakfast-protein',
-                slots: ['breakfast'],
-                calories: 0,
-                nutrition: PROTEIN_DENSE,
-            }),
-            makeRecipe({ slug: 'dinner-protein', slots: ['dinner'], calories: 0, nutrition: PROTEIN_DENSE }),
-            makeRecipe({
-                slug: 'shared-carb-big',
+                slug: 'carb-bl',
                 slots: ['breakfast', 'lunch'],
                 calories: 0,
-                nutrition: CARB_DENSE_LARGE,
+                nutrition: CARB_DENSE,
             }),
+            makeRecipe({ slug: 'balanced-d', slots: ['dinner'], calories: 0, nutrition: BALANCED }),
+            makeRecipe({ slug: 'protein-d', slots: ['dinner'], calories: 0, nutrition: PROTEIN_DENSE }),
+            makeRecipe({ slug: 'hearty-l', slots: ['lunch'], calories: 0, nutrition: HEARTY }),
             makeRecipe({
-                slug: 'shared-carb-bd',
+                slug: 'lean-bd',
                 slots: ['breakfast', 'dinner'],
                 calories: 0,
-                nutrition: CARB_DENSE,
+                nutrition: LEAN,
+            }),
+            makeRecipe({
+                slug: 'balanced-bl',
+                slots: ['breakfast', 'lunch'],
+                calories: 0,
+                nutrition: BALANCED,
+            }),
+            makeRecipe({
+                slug: 'lean-bl',
+                slots: ['breakfast', 'lunch'],
+                calories: 0,
+                nutrition: LEAN,
+            }),
+            makeRecipe({
+                slug: 'hearty-bl',
+                slots: ['breakfast', 'lunch'],
+                calories: 0,
+                nutrition: HEARTY,
             }),
         ];
 
@@ -2226,7 +2259,10 @@ describe('generateWeeklyPlan', () => {
 
             for (let dayIndex = 0; dayIndex < PLAN_DAY_COUNT; dayIndex += 1) {
                 const placed: PlanCandidate[] = [];
-                const currentDayRecipeIds = new Set<string>();
+                // Counted, not a flag, for the reason `searchPlanWeek` counts:
+                // §0.7.3 permits two same-day uses, so a day's membership
+                // survives unwinding one of them.
+                const currentDayRecipeCounts = new Map<string, number>();
 
                 const fillSlot = (slotIndex: number): boolean => {
                     const soFar = computeDayTotals(placed.map((entry) => ({ planned: entry.nutrition })));
@@ -2251,7 +2287,6 @@ describe('generateWeeklyPlan', () => {
                                     candidate.recipe.recipe_id,
                                     usesByRecipeId.get(candidate.recipe.recipe_id) ?? 0,
                                     previousDayRecipeIds,
-                                    currentDayRecipeIds,
                                 ),
                         )
                         .map((candidate) => ({
@@ -2271,7 +2306,7 @@ describe('generateWeeklyPlan', () => {
                         const recipeId = move.candidate.recipe.recipe_id;
 
                         placed.push(move.candidate);
-                        currentDayRecipeIds.add(recipeId);
+                        currentDayRecipeCounts.set(recipeId, (currentDayRecipeCounts.get(recipeId) ?? 0) + 1);
                         usesByRecipeId.set(recipeId, (usesByRecipeId.get(recipeId) ?? 0) + 1);
 
                         if (fillSlot(slotIndex + 1)) {
@@ -2279,7 +2314,14 @@ describe('generateWeeklyPlan', () => {
                         }
 
                         placed.pop();
-                        currentDayRecipeIds.delete(recipeId);
+
+                        const remainingToday = (currentDayRecipeCounts.get(recipeId) ?? 1) - 1;
+                        if (remainingToday <= 0) {
+                            currentDayRecipeCounts.delete(recipeId);
+                        } else {
+                            currentDayRecipeCounts.set(recipeId, remainingToday);
+                        }
+
                         usesByRecipeId.set(recipeId, (usesByRecipeId.get(recipeId) ?? 0) - 1);
                     }
 
@@ -2290,7 +2332,7 @@ describe('generateWeeklyPlan', () => {
                     return { solved: false, failedDayIndex: dayIndex };
                 }
 
-                previousDayRecipeIds = new Set(currentDayRecipeIds);
+                previousDayRecipeIds = new Set(currentDayRecipeCounts.keys());
             }
 
             return { solved: true, failedDayIndex: -1 };
@@ -2299,10 +2341,22 @@ describe('generateWeeklyPlan', () => {
         it('cannot be solved by a search that never revisits an earlier day', () => {
             const outcome = solveWithoutCrossDayBacktracking(catalog());
 
-            // Days 0-4 each close on their own; day 5 is where committing those
-            // earlier days becomes unrecoverable.
+            // Days 0-5 each close on their own; day 6 is where committing those
+            // earlier days becomes unrecoverable — the week-level dead end
+            // §0.7.3 names.
             expect(outcome.solved).toBe(false);
-            expect(outcome.failedDayIndex).toBe(5);
+            expect(outcome.failedDayIndex).toBe(PLAN_DAY_COUNT - 1);
+        });
+
+        it('needs every recipe in the catalog', () => {
+            // The minimality claim above, asserted: with any one recipe removed
+            // the real search cannot close the week at all, so no recipe here is
+            // padding that could be masking the property.
+            for (const removed of catalog()) {
+                const withoutOne = catalog().filter((recipe) => recipe.slug !== removed.slug);
+
+                expect(searchFor(withoutOne).days).toBeNull();
+            }
         });
 
         it('completes the week by revisiting an earlier day', () => {
@@ -2369,6 +2423,51 @@ describe('generateWeeklyPlan', () => {
 
             expect(shape(second)).toBe(shape(first));
             expect(second.evaluations).toBe(first.evaluations);
+        });
+
+        it('plans a recipe in two slots of one day, which §0.7.3 permits', () => {
+            // The end-to-end half of the repetition rule: this week is closed
+            // with same-day pairs, so a generator carrying the old unwritten
+            // same-day ban could not have returned it at all. Both uses are
+            // inside the weekly cap, which the test above asserts for the same
+            // week.
+            const result = plan(catalog());
+            const daysWithARepeat = result.days.filter((day) => {
+                const slugs = day.meals.map((meal) => meal.slug);
+
+                return new Set(slugs).size < slugs.length;
+            });
+
+            expect(daysWithARepeat.length).toBeGreaterThan(0);
+
+            for (const day of daysWithARepeat) {
+                expect(isDayWithinTolerance(day.plannedTotals, TARGETS)).toBe(true);
+            }
+        });
+
+        it('keeps the day-after exclusion for a recipe whose same-day pair was unwound', () => {
+            // THE REFERENCE-COUNTING REGRESSION GUARD. Placing a recipe twice in
+            // one day and then unwinding one of the two must leave the day still
+            // holding it, or the following day's adjacent-day exclusion silently
+            // stops seeing it — a consecutive-day repeat the rule forbids. This
+            // catalog's search does place same-day pairs and does backtrack out
+            // of placements (64 evaluations for 21 meals), so the unwind path is
+            // exercised; with per-day membership kept as a plain set rather than
+            // a count, the week below comes back with a recipe on two
+            // consecutive days.
+            const result = plan(catalog());
+
+            result.days.forEach((day, dayIndex) => {
+                if (dayIndex === 0) {
+                    return;
+                }
+
+                const yesterday = new Set(result.days[dayIndex - 1].meals.map((meal) => meal.slug));
+
+                for (const meal of day.meals) {
+                    expect(yesterday.has(meal.slug)).toBe(false);
+                }
+            });
         });
     });
 
@@ -2766,10 +2865,256 @@ describe('searchPlanWeek', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * searchPlanWeek — §0.7.3's two repetition clauses, and only those two
+ *
+ * The rule permits a recipe twice in one week and forbids it on consecutive
+ * days. Two slots of the SAME day are therefore a legal pair, and these two
+ * fixtures are the ones that would fail under the unwritten same-day ban the
+ * generator used to carry: the first because the day only closes with a pair,
+ * the second because a pair that is partly unwound must still count against
+ * the following day.
+ *
+ * Both run over a SHORT week rather than seven days. The day count is an input
+ * to `searchPlanWeek`, and a short run is the smallest thing that can state
+ * each property — one day for "the pair is what closes it", and three for "the
+ * day after a partly unwound pair still sees it", which needs a day to pair on,
+ * the day that must refuse it, and one more for the search to have somewhere to
+ * backtrack from.
+ * ------------------------------------------------------------------------- */
+
+describe('searchPlanWeek — same-day repetition', () => {
+    const CARB_DENSE: MealPlanMacroTotals = { calories: 450, protein: 10, carbs: 85, fat: 6 };
+    const FAT_DENSE: MealPlanMacroTotals = { calories: 600, protein: 20, carbs: 25, fat: 45 };
+    const HUGE: MealPlanMacroTotals = { calories: 1000, protein: 75, carbs: 100, fat: 33 };
+    const BIG: MealPlanMacroTotals = { calories: 900, protein: 70, carbs: 95, fat: 30 };
+    const BALANCED: MealPlanMacroTotals = { calories: 800, protein: 55, carbs: 70, fat: 28 };
+    const LEAN: MealPlanMacroTotals = { calories: 500, protein: 60, carbs: 45, fat: 10 };
+    const PROTEIN_DENSE: MealPlanMacroTotals = { calories: 600, protein: 80, carbs: 20, fat: 15 };
+
+    /**
+     * The production search over the first `dayCount` days of the week.
+     *
+     * Everything except `dates` is assembled exactly as {@link generateWeeklyPlan}
+     * assembles it, so the rules under test are the shipped ones; the shorter
+     * date list only keeps the fixtures small enough to reason about by hand.
+     */
+    const searchDays = (recipes: PlanRecipeCandidate[], dayCount: number): PlanSearchOutcome => {
+        const seedInputs = makeSeedInputs();
+        const preferences = makePreferences();
+        const slots = resolveSlotSchedule(preferences.meal_schedule, preferences.meal_times);
+        const candidates = buildPlanCandidates(recipes, preferences, derivePlanSeed(seedInputs));
+
+        return searchPlanWeek({
+            dates: planDatesFrom(seedInputs.startDate).slice(0, dayCount),
+            slots,
+            candidatesBySlot: new Map(
+                slots.map((slot) => [slot.slot, candidatesForSlot(candidates, preferences, slot.slot)] as const),
+            ),
+            targets: TARGETS,
+            userBudgetTier: resolveUserBudgetTier(
+                preferences.budget,
+                preferences.no_budget_preference,
+                preferences.meal_schedule,
+            ),
+        });
+    };
+
+    describe('a day only a same-day pair can close', () => {
+        // Four recipes, and the macro geometry admits no assignment of this day
+        // that uses three DIFFERENT recipes — asserted below by enumerating
+        // every candidate triple rather than asserted by construction. Under
+        // the removed same-day clause this day, and so the whole week, was
+        // `422 no_matching_meals`.
+        const catalog = (): PlanRecipeCandidate[] => [
+            makeRecipe({
+                slug: 'carb-bl',
+                slots: ['breakfast', 'lunch'],
+                calories: 0,
+                nutrition: CARB_DENSE,
+            }),
+            makeRecipe({ slug: 'fat-d', slots: ['dinner'], calories: 0, nutrition: FAT_DENSE }),
+            makeRecipe({
+                slug: 'fat-bd',
+                slots: ['breakfast', 'dinner'],
+                calories: 0,
+                nutrition: FAT_DENSE,
+            }),
+            makeRecipe({
+                slug: 'huge-bld',
+                slots: ['breakfast', 'lunch', 'dinner'],
+                calories: 0,
+                nutrition: HUGE,
+            }),
+        ];
+
+        const pools = (): PlanCandidate[][] => {
+            const preferences = makePreferences();
+            const candidates = buildPlanCandidates(catalog(), preferences, derivePlanSeed(makeSeedInputs()));
+
+            return (['breakfast', 'lunch', 'dinner'] as MealSlot[]).map((slot) =>
+                candidatesForSlot(candidates, preferences, slot),
+            );
+        };
+
+        it('has more than one recipe in every slot, so this is not a coverage failure', () => {
+            // The claim the removed clause rested on — "needing one recipe twice
+            // in one day means a slot has fewer than two recipes" — stated and
+            // refuted: every slot here offers two or three distinct recipes.
+            const preferences = makePreferences();
+            const candidates = buildPlanCandidates(catalog(), preferences, derivePlanSeed(makeSeedInputs()));
+
+            for (const slot of ['breakfast', 'lunch', 'dinner'] as MealSlot[]) {
+                expect(eligibleRecipeCountForSlot(candidates, preferences, slot)).toBeGreaterThan(1);
+            }
+        });
+
+        it('has no assignment of three different recipes inside the day tolerance', () => {
+            const [breakfasts, lunches, dinners] = pools();
+            let feasible = 0;
+
+            for (const breakfast of breakfasts) {
+                for (const lunch of lunches) {
+                    for (const dinner of dinners) {
+                        const totals = computeDayTotals([
+                            { planned: breakfast.nutrition },
+                            { planned: lunch.nutrition },
+                            { planned: dinner.nutrition },
+                        ]);
+
+                        if (!isDayWithinTolerance(totals, TARGETS)) {
+                            continue;
+                        }
+
+                        feasible += 1;
+
+                        const recipeIds = new Set([
+                            breakfast.recipe.recipe_id,
+                            lunch.recipe.recipe_id,
+                            dinner.recipe.recipe_id,
+                        ]);
+
+                        expect(recipeIds.size).toBeLessThan(3);
+                    }
+                }
+            }
+
+            // The day IS closable — the assertion above would be vacuous for a
+            // catalog nothing can close.
+            expect(feasible).toBeGreaterThan(0);
+        });
+
+        it('closes the day with one recipe in two slots', () => {
+            const outcome = searchDays(catalog(), 1);
+
+            expect(outcome.aborted).toBe(false);
+            expect(outcome.exhausted).toBe(false);
+            expect(outcome.days).not.toBeNull();
+
+            const day = (outcome.days as PlannedMealAssignment[][])[0];
+            const slugs = day.map((meal) => meal.slug);
+
+            expect(day).toHaveLength(3);
+            expect(new Set(slugs).size).toBeLessThan(slugs.length);
+            expect(isDayWithinTolerance(computeDayTotals(day), TARGETS)).toBe(true);
+        });
+
+        it('still holds the pair to the weekly cap', () => {
+            const outcome = searchDays(catalog(), 1);
+            const day = (outcome.days as PlannedMealAssignment[][])[0];
+            const uses = new Map<string, number>();
+
+            for (const meal of day) {
+                uses.set(meal.slug, (uses.get(meal.slug) ?? 0) + 1);
+            }
+
+            for (const count of uses.values()) {
+                expect(count).toBeLessThanOrEqual(MAX_RECIPE_USES_PER_WEEK);
+            }
+        });
+    });
+
+    describe('a same-day pair that is partly unwound', () => {
+        // THE REFERENCE-COUNTING REGRESSION GUARD, and it is a real one: with
+        // the per-day membership held as a plain set — added on every placement
+        // and deleted on every unwind — this three-day search comes back with
+        // `protein-bd` on day 1 AND day 2, because unwinding the second of a
+        // same-day pair erased the recipe from the day while the first was still
+        // placed, and day 2's adjacent-day exclusion then could not see it.
+        // Counting the placements per day is what keeps that exclusion true.
+        const catalog = (): PlanRecipeCandidate[] => [
+            makeRecipe({
+                slug: 'lean-bld',
+                slots: ['breakfast', 'lunch', 'dinner'],
+                calories: 0,
+                nutrition: LEAN,
+            }),
+            makeRecipe({ slug: 'big-ld', slots: ['lunch', 'dinner'], calories: 0, nutrition: BIG }),
+            makeRecipe({
+                slug: 'balanced-ld',
+                slots: ['lunch', 'dinner'],
+                calories: 0,
+                nutrition: BALANCED,
+            }),
+            makeRecipe({ slug: 'big-l', slots: ['lunch'], calories: 0, nutrition: BIG }),
+            makeRecipe({
+                slug: 'protein-bd',
+                slots: ['breakfast', 'dinner'],
+                calories: 0,
+                nutrition: PROTEIN_DENSE,
+            }),
+            makeRecipe({ slug: 'carb-ld', slots: ['lunch', 'dinner'], calories: 0, nutrition: CARB_DENSE }),
+        ];
+
+        const week = (): PlannedMealAssignment[][] => {
+            const outcome = searchDays(catalog(), 3);
+
+            expect(outcome.days).not.toBeNull();
+
+            return outcome.days as PlannedMealAssignment[][];
+        };
+
+        it('places a same-day pair, so the unwind path is exercised', () => {
+            const days = week();
+            const paired = days.filter((day) => {
+                const slugs = day.map((meal) => meal.slug);
+
+                return new Set(slugs).size < slugs.length;
+            });
+
+            expect(paired.length).toBeGreaterThan(0);
+        });
+
+        it('refuses the paired recipe on the following day', () => {
+            const days = week();
+
+            days.forEach((day, dayIndex) => {
+                if (dayIndex === 0) {
+                    return;
+                }
+
+                const yesterday = new Set(days[dayIndex - 1].map((meal) => meal.slug));
+
+                for (const meal of day) {
+                    expect(yesterday.has(meal.slug)).toBe(false);
+                }
+            });
+        });
+
+        it('keeps every day inside the tolerance it was accepted under', () => {
+            for (const day of week()) {
+                expect(day).toHaveLength(3);
+                expect(isDayWithinTolerance(computeDayTotals(day), TARGETS)).toBe(true);
+            }
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * Limiting-constraint analysis
  * ------------------------------------------------------------------------- */
 
 describe('analyzeLimitingConstraints', () => {
+    /** The verdict's rows — what every case below is about. */
     const analyze = (
         recipes: PlanRecipeCandidate[],
         preferences: PlanGenerationPreferences = makePreferences(),
@@ -2779,7 +3124,7 @@ describe('analyzeLimitingConstraints', () => {
             preferences,
             targets: TARGETS,
             recipes,
-        });
+        }).constraints;
 
     const keys = (recipes: PlanRecipeCandidate[], preferences?: PlanGenerationPreferences) =>
         analyze(recipes, preferences).map((constraint) => constraint.constraintKey);
@@ -3107,7 +3452,7 @@ describe('analyzeLimitingConstraints', () => {
     });
 
     it('keeps relaxation probes quiet once the deadline has passed', () => {
-        const constraints = analyzeLimitingConstraints({
+        const { constraints } = analyzeLimitingConstraints({
             seedInputs: makeSeedInputs(),
             preferences: makePreferences({ cooking_time_limit_min: 30 }),
             targets: TARGETS,
@@ -3117,6 +3462,324 @@ describe('analyzeLimitingConstraints', () => {
 
         expect(constraints.map((constraint) => constraint.constraintKey)).not.toContain('cooking_time');
         expect(constraints.length).toBeGreaterThan(0);
+    });
+
+    describe('the request-scoped probe budget', () => {
+        /**
+         * Sixty recipes no portion of which can reach the day target, all at 45
+         * cooking minutes. Against a 30-minute limit every slot is EMPTY, so the
+         * relaxation to the 45-minute tier is the probe that runs — and it
+         * searches a catalog it cannot close, which is what makes it spend
+         * whatever allowance it is given instead of a handful of evaluations.
+         */
+        const unclosableAt45Minutes = (): PlanRecipeCandidate[] =>
+            (['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) =>
+                Array.from({ length: 20 }, (_unused, index) =>
+                    makeRecipe({
+                        slug: `${slot}-${String(index).padStart(2, '0')}`,
+                        slots: [slot],
+                        calories: 60 + index,
+                        totalMinutes: 45,
+                    }),
+                ),
+            );
+
+        /** Two relaxations to probe, in the order the verdict tries them. */
+        const twoProbePreferences = makePreferences({
+            cooking_time_limit_min: 30,
+            disliked_food_ids: ['blocked-food'],
+        });
+
+        it('runs no probe at all once the primary search has spent the per-plan bound', () => {
+            const verdict = analyzeLimitingConstraints({
+                seedInputs: makeSeedInputs(),
+                preferences: twoProbePreferences,
+                targets: TARGETS,
+                recipes: unclosableAt45Minutes(),
+                diagnostics: {
+                    exhausted: true,
+                    exhaustedBy: 'plan',
+                    frontierDayIndex: 0,
+                    evaluations: MAX_EVALUATIONS_PER_PLAN,
+                },
+            });
+
+            expect(verdict.probeEvaluations).toBe(0);
+            expect(verdict.probeOutcome).toBe('budget_exhausted');
+
+            // The verdict still answers. An exhausted pool costs rows that
+            // needed a witness, never the response's promise of something to act
+            // on.
+            expect(verdict.constraints.length).toBeGreaterThan(0);
+        });
+
+        it('holds every probe together to the remaining allowance', () => {
+            const remaining = 120;
+            const verdict = analyzeLimitingConstraints({
+                seedInputs: makeSeedInputs(),
+                preferences: twoProbePreferences,
+                targets: TARGETS,
+                recipes: unclosableAt45Minutes(),
+                probeEvaluationBudget: remaining,
+            });
+
+            expect(verdict.probeEvaluations).toBeLessThanOrEqual(remaining);
+
+            // The first probe spends the pool and the second never runs, which
+            // is the state `budget_exhausted` names.
+            expect(verdict.probeEvaluations).toBe(remaining);
+            expect(verdict.probeOutcome).toBe('budget_exhausted');
+            expect(verdict.constraints.length).toBeGreaterThan(0);
+        });
+
+        it('refuses a pool that is not a whole number of evaluations', () => {
+            for (const probeEvaluationBudget of [-1, 1.5, Number.NaN]) {
+                expect(() =>
+                    analyzeLimitingConstraints({
+                        seedInputs: makeSeedInputs(),
+                        preferences: twoProbePreferences,
+                        targets: TARGETS,
+                        recipes: unclosableAt45Minutes(),
+                        probeEvaluationBudget,
+                    }),
+                ).toThrow(MealPlanInputError);
+            }
+        });
+
+        it('keeps the primary search and the probes inside one per-plan bound', () => {
+            // The statement §0.7.3 actually makes about a request, asserted end
+            // to end: the search that failed plus every probe that explained it.
+            // This catalog is the only one here that makes both halves spend —
+            // twenty unclosable recipes per slot INSIDE the 30-minute limit, so
+            // the primary search burns its allowance, and twenty more per slot
+            // at 45 minutes, so the relaxation probe has a larger unclosable
+            // catalog of its own to burn through.
+            const bothHalvesSpend = (): PlanRecipeCandidate[] => [
+                ...unclosableAt45Minutes(),
+                ...(['breakfast', 'lunch', 'dinner'] as MealSlot[]).flatMap((slot) =>
+                    Array.from({ length: 20 }, (_unused, index) =>
+                        makeRecipe({
+                            slug: `quick-${slot}-${String(index).padStart(2, '0')}`,
+                            slots: [slot],
+                            calories: 60 + index,
+                            totalMinutes: 20,
+                        }),
+                    ),
+                ),
+            ];
+
+            const primary = searchFor(bothHalvesSpend(), undefined, twoProbePreferences);
+
+            expect(primary.days).toBeNull();
+            expect(primary.exhausted).toBe(true);
+
+            const verdict = analyzeLimitingConstraints({
+                seedInputs: makeSeedInputs(),
+                preferences: twoProbePreferences,
+                targets: TARGETS,
+                recipes: bothHalvesSpend(),
+                diagnostics: {
+                    exhausted: primary.exhausted,
+                    exhaustedBy: primary.exhaustedBy,
+                    frontierDayIndex: primary.frontierDayIndex,
+                    evaluations: primary.evaluations,
+                },
+            });
+
+            expect(verdict.probeEvaluations).toBeGreaterThan(0);
+            expect(primary.evaluations + verdict.probeEvaluations).toBeLessThanOrEqual(
+                MAX_EVALUATIONS_PER_PLAN,
+            );
+            expect(verdict.probeEvaluations).toBeLessThanOrEqual(
+                MAX_EVALUATIONS_PER_PLAN - primary.evaluations,
+            );
+        });
+
+        it('leaves the probes only what a nearly spent primary search did not use', () => {
+            // The case the bound exists for: a primary search that spent almost
+            // the whole per-plan allowance. The probes get the remainder and
+            // nothing more, so the request still totals no more than
+            // MAX_EVALUATIONS_PER_PLAN — where a probe with its own fresh
+            // budget would add thousands on top.
+            const spentByPrimary = MAX_EVALUATIONS_PER_PLAN - 50;
+            const verdict = analyzeLimitingConstraints({
+                seedInputs: makeSeedInputs(),
+                preferences: twoProbePreferences,
+                targets: TARGETS,
+                recipes: unclosableAt45Minutes(),
+                diagnostics: {
+                    exhausted: true,
+                    exhaustedBy: 'plan',
+                    frontierDayIndex: PLAN_DAY_COUNT - 1,
+                    evaluations: spentByPrimary,
+                },
+            });
+
+            expect(verdict.probeEvaluations).toBe(50);
+            expect(spentByPrimary + verdict.probeEvaluations).toBe(MAX_EVALUATIONS_PER_PLAN);
+            expect(verdict.probeOutcome).toBe('budget_exhausted');
+        });
+
+        describe('an aborted probe is inconclusive, never a negative claim', () => {
+            // A catalog whose dinners all carry the disliked food, so ignoring
+            // the dislike is a relaxation that genuinely opens the week and earns
+            // its row — which is what makes the row's ABSENCE below evidence
+            // that the probe never ran.
+            const dislikeBlockedCatalog = (): PlanRecipeCandidate[] =>
+                feasibleCatalog().map((recipe) =>
+                    recipe.slug.startsWith('d')
+                        ? makeRecipe({
+                              slug: recipe.slug,
+                              slots: ['dinner'],
+                              calories: 800,
+                              ingredientIds: ['blocked-food'],
+                          })
+                        : recipe,
+                );
+
+            /** Aborts the first probe only, leaving later ones free to run. */
+            const abortOnce = (): (() => boolean) => {
+                let fired = false;
+
+                return () => {
+                    if (fired) {
+                        return false;
+                    }
+
+                    fired = true;
+
+                    return true;
+                };
+            };
+
+            it('earns the dislikes row when no deadline interferes', () => {
+                const verdict = analyzeLimitingConstraints({
+                    seedInputs: makeSeedInputs(),
+                    preferences: twoProbePreferences,
+                    targets: TARGETS,
+                    recipes: dislikeBlockedCatalog(),
+                });
+
+                expect(verdict.constraints.map((constraint) => constraint.constraintKey)).toContain(
+                    'dislikes',
+                );
+                expect(verdict.probeOutcome).toBe('complete');
+            });
+
+            it('reports the abort and stops, rather than reporting a relaxation as tested', () => {
+                const verdict = analyzeLimitingConstraints({
+                    seedInputs: makeSeedInputs(),
+                    preferences: twoProbePreferences,
+                    targets: TARGETS,
+                    recipes: dislikeBlockedCatalog(),
+                    shouldAbort: abortOnce(),
+                });
+
+                expect(verdict.probeOutcome).toBe('aborted');
+
+                // The cooking-time probe took the abort; the dislikes probe that
+                // would have earned its row never ran, so neither row is
+                // claimed — and the status is what says the absence is
+                // ignorance rather than a finding.
+                expect(verdict.constraints.map((constraint) => constraint.constraintKey)).not.toContain(
+                    'cooking_time',
+                );
+                expect(verdict.constraints.map((constraint) => constraint.constraintKey)).not.toContain(
+                    'dislikes',
+                );
+                expect(verdict.constraints.length).toBeGreaterThan(0);
+            });
+
+            it('turns a deadline that first fires inside a probe into the 502, not a 422', () => {
+                // THE REQUEST BOUNDARY, not just the verdict. §0.7.3 and this
+                // module's header put the rule plainly: only an ABORTED search
+                // is a 5xx, and a probe IS a search. So a deadline that expires
+                // after the primary search has honestly concluded "no week",
+                // while the analysis is still deciding WHICH constraint to
+                // blame, has to reach the user as "we couldn't finish your
+                // plan" — never as a `no_matching_meals` naming whichever
+                // constraints happened to be measured before the clock ran out.
+                // Recording the abort in the verdict is not enough if
+                // `generateWeeklyPlan` then drops it.
+                //
+                // WHERE THE PRIMARY SEARCH ENDS IS MEASURED, NEVER ASSUMED. How
+                // often either phase consults `shouldAbort` is an internal
+                // cadence this test must not encode, so it is derived in three
+                // steps below and a deadline is armed exactly one poll after
+                // the primary's last one. That is what makes "fires inside the
+                // first probe" a fact here rather than a hope.
+                const recipes = dislikeBlockedCatalog();
+                const counter = (): { polls: () => number; shouldAbort: () => boolean } => {
+                    let polls = 0;
+
+                    return {
+                        polls: () => polls,
+                        shouldAbort: () => {
+                            polls += 1;
+
+                            return false;
+                        },
+                    };
+                };
+
+                // 1. The primary search on its own: it must finish, and find
+                //    nothing. Its diagnostics are also what bounds the probes,
+                //    so passing them on in step 2 reproduces the real pool.
+                const primary = searchFor(recipes, undefined, twoProbePreferences);
+
+                expect(primary.aborted).toBe(false);
+                expect(primary.days).toBeNull();
+
+                const diagnostics = {
+                    exhausted: primary.exhausted,
+                    exhaustedBy: primary.exhaustedBy,
+                    frontierDayIndex: primary.frontierDayIndex,
+                    evaluations: primary.evaluations,
+                };
+
+                // 2. The analysis alone, polled but never aborting.
+                const probeOnly = counter();
+
+                analyzeLimitingConstraints({
+                    seedInputs: makeSeedInputs(),
+                    preferences: twoProbePreferences,
+                    targets: TARGETS,
+                    recipes,
+                    diagnostics,
+                    shouldAbort: probeOnly.shouldAbort,
+                });
+
+                // 3. The whole call, polled the same way. The difference is the
+                //    primary search's share.
+                const whole = counter();
+
+                expect(() =>
+                    plan(recipes, twoProbePreferences, makeSeedInputs(), whole.shouldAbort),
+                ).toThrow(NoMatchingMealsError);
+
+                const primaryPolls = whole.polls() - probeOnly.polls();
+
+                // Guards, so a future change of shape fails here loudly instead
+                // of leaving the assertion below passing for the wrong reason:
+                // the probes must actually poll, and the primary's share cannot
+                // be negative.
+                expect(probeOnly.polls()).toBeGreaterThan(0);
+                expect(primaryPolls).toBeGreaterThanOrEqual(0);
+
+                // The deadline fires on the poll straight after the primary's
+                // last — the first poll any probe makes.
+                let polls = 0;
+                const deadlineInFirstProbe = (): boolean => {
+                    polls += 1;
+
+                    return polls > primaryPolls;
+                };
+
+                expect(() =>
+                    plan(recipes, twoProbePreferences, makeSeedInputs(), deadlineInFirstProbe),
+                ).toThrow(PlanGenerationError);
+            });
+        });
     });
 });
 
@@ -4348,7 +5011,7 @@ describe('the committed catalog and recipe graph', () => {
                     preferences: makePreferences(),
                     targets: TARGETS,
                     recipes: fixtureCatalog(),
-                }),
+                }).constraints,
             ).toEqual([
                 {
                     constraintKey: 'catalog_coverage',

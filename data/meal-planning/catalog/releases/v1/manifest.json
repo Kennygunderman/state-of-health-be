@@ -2,13 +2,13 @@
   "release_id": "v1",
   "manifest_version": "v1",
   "coverage_plan_version": "v1",
-  "generated_at": "2026-09-13T11:37:28.970Z",
+  "generated_at": "2026-09-17T07:14:19.745Z",
   "produced_by": "pipeline",
   "files": [
     {
       "path": "foods.jsonl",
       "name": "foods.jsonl",
-      "sha256": "f0d733c139f647d94ebf6912ee8862599cf2842c90774b1e38ac2cfdae8180e1",
+      "sha256": "bf4d94c8263f59144ffa2df15bd844f590c5f8152820196413d1a6e2af0565b5",
       "row_count": 11046,
       "bytes": 13389696
     },
@@ -36,9 +36,9 @@
     {
       "path": "validation-records.jsonl",
       "name": "validation-records.jsonl",
-      "sha256": "2251674dba5dacd7c5b02518110cf6e73545127af4f49ea12bba0016f72e0db4",
+      "sha256": "35c4e245b5c56d04e5ee50d43d5782962df73bc46a9e0cced2ed662a390ba2d2",
       "row_count": 11046,
-      "bytes": 50787067
+      "bytes": 56641447
     }
   ],
   "counts": {
@@ -70,7 +70,7 @@
         "Foundation 2025-12",
         "Foundation 2026-04"
       ],
-      "retrieved_at": "2026-09-13T11:35:18.625Z",
+      "retrieved_at": "2026-09-17T05:10:41.151Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     },
@@ -80,7 +80,7 @@
       "versions_present": [
         "SR Legacy 2019-04"
       ],
-      "retrieved_at": "2026-09-13T11:36:16.185Z",
+      "retrieved_at": "2026-09-17T05:11:35.893Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     },
@@ -90,7 +90,7 @@
       "versions_present": [
         "Survey (FNDDS) 2024-10"
       ],
-      "retrieved_at": "2026-09-13T11:36:49.111Z",
+      "retrieved_at": "2026-09-17T05:12:11.163Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     }
@@ -100,7 +100,13 @@
     "review_model": null,
     "prompt_version": null,
     "generation_prompt_version": null,
-    "review_prompt_version": null
+    "review_prompt_version": null,
+    "generation_models": [],
+    "review_models": [],
+    "generation_prompt_versions": [],
+    "review_prompt_versions": [],
+    "ai_generated_foods": 0,
+    "reviewed_foods": 0
   },
   "coverage": {
     "coverage_plan_version": "v1",

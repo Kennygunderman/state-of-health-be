@@ -816,10 +816,6 @@ export type MakePreferencesOptions = Omit<
  * default a FRESH confirmed estimate: staleness is the inequality of those two
  * (AAP §0.5.2), so a suite that saves any preference and then reads the targets
  * sees `stale: true` because every save advances `revision`.
- *
- * `estimate_inputs_revision` is set in step with them for coherence only. No
- * query reads it (see `prisma/schema.prisma`), so a suite never needs to state
- * it and no assertion should depend on it.
  */
 export const makePreferences = async (
     userId: string,
@@ -863,7 +859,6 @@ export const makePreferences = async (
             targets_revision: 1,
             confirmed_targets: asJsonColumnValue(FIXTURE_TARGETS),
             targets_input_revision: 1,
-            estimate_inputs_revision: 1,
             revision: 1,
             ...options,
         },

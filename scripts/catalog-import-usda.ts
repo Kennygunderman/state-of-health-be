@@ -44,6 +44,7 @@ import './lib/dbGuard';
 
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
@@ -55,7 +56,10 @@ import {
     USDA_MANIFEST_FILE,
     loadCoveragePlan,
     loadUsdaManifest,
+    mergeStageReport,
     reportPath,
+    withArtifactPublicationLockSync,
+    writeJsonFile,
 } from './lib/manifest';
 import type {
     CatalogFoodState,
@@ -73,15 +77,31 @@ import type {
     UsdaSweepPortionPolicy,
 } from './lib/manifest';
 import { ModelBudgetError } from './lib/budget';
-import { RateLimitConfigError, createUsdaRateLimiter, getUsdaImportRateLimitPerHour } from './lib/rateLimiter';
+// The four derivations both writers of `catalog_foods` must agree on, and the
+// version counters `recipe_ingredients` snapshots are checked against. They
+// live in `lib/` rather than here so that `catalog-generate-ai.ts` can share
+// them without importing this CLI — see the note at the top of that module.
+import {
+    buildSearchText,
+    canonicalJsonString,
+    dedupeSortedAliases,
+    nextCatalogFoodVersions,
+    sha256Hex,
+} from './lib/catalogFoodFacts';
+import type { StoredVersionedFacts } from './lib/catalogFoodFacts';
+import {
+    RateLimitConfigError,
+    USDA_IMPORT_POLICY_CAP_PER_HOUR,
+    createUsdaRateLimiter,
+    getUsdaImportRateLimitPerHour,
+} from './lib/rateLimiter';
 import type { UsdaRateLimiter, UsdaRequestStats } from './lib/rateLimiter';
 import {
     CheckpointError,
     appendRunLog,
     finishRun,
     openOrResumeRun,
-    recordCounts,
-    saveCursor,
+    saveCheckpoint,
     withCatalogStageLock,
 } from './lib/checkpoint';
 import type { CatalogRunDb } from './lib/checkpoint';
@@ -113,6 +133,7 @@ import { toBaseQuantity, unitFamily } from '../src/utils/units';
 // Type-only: the value side of usda.service constructs a Prisma client for its
 // response cache, so it is imported inside main() and these stay erased.
 import type {
+    UsdaBatchRetrievalFacts,
     UsdaFoodDetail,
     UsdaFoodNutrient,
     UsdaFoodPortion,
@@ -142,7 +163,37 @@ export type CatalogImportErrorCode =
     /** A USDA request did not answer usably — the vendor boundary's failure, wrapped. */
     | 'usda_request_failed'
     /** `--manifest` named a version the loaded manifest does not declare. */
-    | 'manifest_version_mismatch';
+    | 'manifest_version_mismatch'
+    /**
+     * The manifest and the coverage plan disagree about a category, a food
+     * group or a food group's category. Refused before the limiter and the
+     * first request, which is what the manifest's own `coveragePlanContract`
+     * requires: the disagreement is in the documents, so no amount of the
+     * import running makes it resolvable, and half an import is worse to
+     * recover from than none.
+     */
+    | 'manifest_coverage_mismatch'
+    /**
+     * A key in `sweepAllergenDietRules.byFoodGroup` or
+     * `sweepCostClassRules.foodGroupOverrides` names a food group the coverage
+     * plan does not declare, so no record can carry it and the allergen set or
+     * cost class under it can never be applied.
+     *
+     * Its own code rather than a shade of `manifest_coverage_mismatch`, because
+     * the remedy differs: nothing is mis-filed, so the fix is to re-key the
+     * entry onto a food group the plan declares — or to drop it where the live
+     * rules already cover its intent — rather than to correct a filing.
+     */
+    | 'manifest_inert_policy_keys'
+    /**
+     * A `foods` entry reached the planner without a verified FDC id.
+     * `loadUsdaManifest` refuses that document outright (see
+     * `assertUsdaManifestShape`), so this is reachable only from a caller that
+     * built a manifest object itself. It is a throw rather than a skip because
+     * a curated entry silently dropped is a reviewed decision that never
+     * reaches the catalog.
+     */
+    | 'manifest_entry_unresolved';
 
 /**
  * The stage's own failure, and the only shape callers of this file are asked
@@ -445,8 +496,12 @@ export const describeUsage = (): string =>
         '  --limit <n>         Stop after n manifest records. Positive integer.',
         '                      Default: no limit.',
         '  --resume            Continue this stage\'s newest unfinished run from its',
-        '                      stored cursor instead of starting a new one.',
-        '                      Default: off (a new run).',
+        '                      stored cursor. Required to continue one: without it an',
+        '                      unfinished run for this manifest version is refused and',
+        '                      nothing is written, because a second run alongside it',
+        '                      cannot be opened. A run that already succeeded is',
+        '                      recognised and does no work either way.',
+        '                      Default: off (refuse rather than continue).',
         '  --dry-run           Report what the import would write without writing it.',
         '                      Default: off.',
         `  --manifest <ver>    Refuse unless the manifest declares this version (${EXPECTED_USDA_MANIFEST_VERSION}).`,
@@ -555,8 +610,18 @@ export const preflight = (deps: ImportPreflightDeps): readonly PrerequisiteGap[]
             gaps.push({
                 code: 'usda_rate_limit_misconfigured',
                 requirement:
-                    'USDA_IMPORT_RATE_LIMIT_PER_HOUR must resolve to an integer within the vendor cap so every fetch is paced',
-                remedy: 'Set USDA_IMPORT_RATE_LIMIT_PER_HOUR to an integer between 1 and 1000, or unset it to take the default of 900.',
+                    `USDA_IMPORT_RATE_LIMIT_PER_HOUR must resolve to an integer within the import ceiling of ` +
+                    `${USDA_IMPORT_POLICY_CAP_PER_HOUR} requests/hour so every fetch is paced and the running API keeps its ` +
+                    'share of the same key',
+                // The ceiling, not the vendor cap: 901-1,000 is legal for USDA
+                // and illegal for this import, because the top 100 per hour are
+                // the live API's share of the key (AAP §0.7.1 Group 1). Naming
+                // 1,000 here is what sent an operator to a value the limiter
+                // refuses.
+                remedy:
+                    `Set USDA_IMPORT_RATE_LIMIT_PER_HOUR to an integer between 1 and ` +
+                    `${USDA_IMPORT_POLICY_CAP_PER_HOUR}, or unset it to take that ceiling as the default. Nothing can ` +
+                    'raise it; a lower value only paces the import more gently.',
                 detail: error.message,
             });
         } else {
@@ -816,38 +881,6 @@ export const deriveSweepAliases = (description: string, canonicalName: string): 
         kept.push(trimmed);
     }
     return kept;
-};
-
-/**
- * `search_text` feeds the STORED `search_vector`, so it carries the terms that
- * should match and no punctuation: `to_tsvector` owns stemming and weighting,
- * and this file's job is to hand it plain words (Rule backend-architecture §7).
- */
-export const buildSearchText = (
-    canonicalName: string,
-    aliases: readonly string[],
-    foodState: CatalogFoodState,
-    foodGroup: string,
-): string => {
-    const words: string[] = [];
-    const seen = new Set<string>();
-    const push = (value: string): void => {
-        for (const word of normalizeCanonicalName(value).split(' ')) {
-            if (word.length > 0 && !seen.has(word)) {
-                seen.add(word);
-                words.push(word);
-            }
-        }
-    };
-
-    push(canonicalName);
-    for (const alias of aliases) {
-        push(alias);
-    }
-    push(foodState.replace(/_/g, ' '));
-    push(foodGroup.replace(/_/g, ' '));
-
-    return words.join(' ');
 };
 
 /** `1` when the category has no row, so a missing policy is visible, not silent. */
@@ -1438,6 +1471,25 @@ export interface PreparedCatalogFood {
      */
     readonly curatorReviewRequired: boolean;
     /**
+     * True when the retrieval this record rests on carries no observed HTTP
+     * status, so `identity_evidence[0].http_status` is null.
+     *
+     * The status is a MANDATORY field of a retrieval record (Agent Action Plan
+     * §0.3.2), and a record missing a mandatory evidence field must not be
+     * published — `importPublicationStatus` quarantines it, exactly as §0.7.3
+     * classes missing identity evidence. Publishing it instead is the defect
+     * OBSEV-F12 reports at release scale: 11,046 published records whose
+     * mandatory status is null.
+     *
+     * It should never be true. `usda.service.ts` re-fetches a cached batch
+     * whose `http_status` is null rather than replaying it, so every retrieval
+     * reaching here carries a number. That is precisely why the flag exists:
+     * the guarantee is then enforced at the point of publication rather than
+     * inferred from the vendor boundary's current behaviour, and a later change
+     * there cannot quietly publish a mandatory field nobody observed.
+     */
+    readonly retrievalStatusMissing: boolean;
+    /**
      * The sentence `catalog_validation_records.nutrition_method` carries, which
      * has to agree with {@link assumptions}: a record whose assumptions say
      * energy was derived cannot have a method that says nothing was derived.
@@ -1458,11 +1510,18 @@ export interface PreparedCatalogFood {
      * per-food `GET /food/{id}` — nothing in this pipeline makes one), and
      * `source_cache_key` is the key that response is recorded under in
      * `usda_api_cache`, so a reader can look the payload up and recompute
-     * `body_sha256` from it. `http_status` is `null` when
-     * `retrieval_source` is `usda_api_cache`, because in that case this run
-     * read a recorded response and made no HTTP exchange at all; it is 200
-     * only when this run's own request returned the records, which
-     * `fetchFromUsda` only does on a 2xx.
+     * `body_sha256` from it.
+     *
+     * `http_status` is the upstream status the vendor exchange answered with,
+     * taken from the retrieval the client reported and never derived from
+     * anything else. It used to be computed as "null if the response came from
+     * cache, otherwise 200", which stated a status nobody had observed and — for
+     * the great majority of records, because the origin was misread — no status
+     * at all. It is now: this run's observed status when this run fetched, the
+     * status recorded on the cache row when this run replayed one, and `null`
+     * only for a row cached before `usda_api_cache.http_status` existed.
+     * `http_status_source` says which of those three it is, so the value is
+     * never left to be guessed at from `retrieval_source`.
      */
     readonly evidence: {
         readonly url: string;
@@ -1470,9 +1529,11 @@ export interface PreparedCatalogFood {
         readonly request_body: { readonly fdcIds: readonly number[]; readonly format: string };
         readonly final_host: string;
         readonly http_status: number | null;
+        readonly http_status_source: string;
         readonly source_cache_key: string;
+        readonly source_cache_key_scheme: string;
         readonly retrieval_source: UsdaRetrievalSource;
-        readonly body_sha256: string | null;
+        readonly body_sha256: string;
         readonly body_sha256_subject: string;
         readonly record_sha256: string;
         readonly record_sha256_subject: string;
@@ -1509,21 +1570,137 @@ export const USDA_BATCH_ENDPOINT = `https://${USDA_API_HOST}/fdc/v1${USDA_BATCH_
 export const USDA_BATCH_FORMAT = 'full';
 
 /**
+ * The cache-key scheme every imported row's `source_cache_key` follows, stated
+ * as data so the manifest's own declaration can be compared against it.
+ *
+ * The manifest used to describe this key as `/food/<fdcId>?format=full`, a
+ * per-food detail path that nothing in this pipeline ever requests — so no
+ * `usda_api_cache` row has ever existed under it and the documented provenance
+ * could not be checked against anything. The key rows actually carry is the
+ * batch key below, shared by the (up to twenty) foods one `POST /foods`
+ * response carried, which is exactly what makes it checkable: a reader takes
+ * the key off the row, reads the cache row it names, and recomputes the
+ * evidence digests from the payload.
+ *
+ * Derived from this file's own endpoint constants rather than written out, so
+ * the declaration cannot drift from the request the import makes; `main()`
+ * refuses to run when the manifest's declaration disagrees with it, and the
+ * suite pins it against a real `cacheKeyForRequest` call.
+ */
+export interface UsdaSourceCacheKeyScheme {
+    readonly method: string;
+    readonly path: string;
+    /** Empty: the batch request carries no query parameter, so none is in the key. */
+    readonly queryParams: readonly string[];
+    readonly requestBodyKeys: readonly string[];
+    readonly format: string;
+    readonly shape: string;
+    /** True: one key names one response, and a response carries many foods. */
+    readonly sharedAcrossBatch: boolean;
+    readonly maxFoodsPerKey: number;
+}
+
+export const USDA_SOURCE_CACHE_KEY_SCHEME: UsdaSourceCacheKeyScheme = {
+    method: 'POST',
+    path: USDA_BATCH_PATH,
+    queryParams: [],
+    requestBodyKeys: ['fdcIds', 'format'],
+    format: USDA_BATCH_FORMAT,
+    shape: `POST ${USDA_BATCH_PATH}?#{"fdcIds":[<ascending de-duplicated fdc ids>],"format":"${USDA_BATCH_FORMAT}"}`,
+    sharedAcrossBatch: true,
+    maxFoodsPerKey: MAX_BATCH_FDC_IDS,
+};
+
+/** Where the manifest states the scheme, for the message a disagreement prints. */
+export const SOURCE_CACHE_KEY_SCHEME_MANIFEST_PATH = 'sweepNamingPolicy.sourceCacheKeyScheme';
+
+/**
+ * Field-by-field disagreement between the manifest's declared scheme and the
+ * one above; empty when they agree.
+ *
+ * Pure and total: it takes `unknown` because `UsdaManifest` does not type this
+ * documentary block, and it reports an absent or malformed declaration as a
+ * disagreement rather than treating it as agreement. Silence on an absent
+ * declaration is how the old `/food/<fdcId>` claim survived unnoticed — nothing
+ * read it, so nothing could contradict it.
+ */
+export const sourceCacheKeySchemeDisagreements = (
+    declared: unknown,
+    expected: UsdaSourceCacheKeyScheme = USDA_SOURCE_CACHE_KEY_SCHEME,
+): readonly string[] => {
+    if (declared === null || typeof declared !== 'object' || Array.isArray(declared)) {
+        return [
+            `${SOURCE_CACHE_KEY_SCHEME_MANIFEST_PATH} is absent or is not an object, so the source_cache_key the ` +
+                `import writes ("${expected.shape}") is stated nowhere a reader can check it`,
+        ];
+    }
+
+    const record = declared as Record<string, unknown>;
+    const disagreements: string[] = [];
+
+    type ScalarField = 'method' | 'path' | 'format' | 'shape' | 'sharedAcrossBatch' | 'maxFoodsPerKey';
+
+    const compareScalar = (field: ScalarField): void => {
+        const value = record[field];
+        if (value !== expected[field]) {
+            disagreements.push(
+                `${SOURCE_CACHE_KEY_SCHEME_MANIFEST_PATH}.${field} declares ${JSON.stringify(value)} but the import ` +
+                    `writes ${JSON.stringify(expected[field])}`,
+            );
+        }
+    };
+
+    const compareList = (field: 'queryParams' | 'requestBodyKeys'): void => {
+        const value = record[field];
+        const declaredList = Array.isArray(value) ? value.map((entry) => String(entry)) : null;
+        if (declaredList === null || declaredList.join(',') !== expected[field].join(',')) {
+            disagreements.push(
+                `${SOURCE_CACHE_KEY_SCHEME_MANIFEST_PATH}.${field} declares ${JSON.stringify(value)} but the import ` +
+                    `sends ${JSON.stringify(expected[field])}`,
+            );
+        }
+    };
+
+    compareScalar('method');
+    compareScalar('path');
+    compareList('queryParams');
+    compareList('requestBodyKeys');
+    compareScalar('format');
+    compareScalar('shape');
+    compareScalar('sharedAcrossBatch');
+    compareScalar('maxFoodsPerKey');
+
+    return disagreements;
+};
+
+/**
  * Where a batch response came from on this run.
  *
  * `usda_api_cache` means the response was already on record when this run
  * looked, so the run read it and issued no request — and the recorded
  * `fetched_at` is the vendor retrieval time, which is the honest answer to
- * "when was this obtained from USDA". `import_run` means it was not on record,
- * so the only retrieval time this run can state is its own clock.
+ * "when was this obtained from USDA". `import_run` means this run fetched it,
+ * so the retrieval time is this run's own clock.
+ *
+ * These two values are the vocabulary already published in
+ * `catalog_validation_records.identity_evidence`, so the client's `'cache'` /
+ * `'network'` origin is mapped onto them rather than replacing them.
  */
 export type UsdaRetrievalSource = 'usda_api_cache' | 'import_run';
 
 /**
  * The observed facts about one batch request, produced by the client that makes
- * it (see {@link ImportUsdaClient.describeBatchRetrieval}) rather than inferred
- * here, because only the client knows how it reaches the vendor and what its
- * cache recorded.
+ * it (see {@link ImportUsdaClient.fetchBatch}) rather than inferred here,
+ * because only the client knows how it reaches the vendor and what its cache
+ * recorded.
+ *
+ * Every member is observed BY the call that returned the records, not re-read
+ * afterwards. That ordering is the fix for a defect worth stating: the retrieval
+ * used to be described by a second `usda_api_cache` lookup made after the fetch,
+ * which raced the fetch's own best-effort cache write — so a response this run
+ * had just fetched was usually reported as having been read from cache, and the
+ * HTTP status on its evidence record was decided by that mistaken origin rather
+ * than by anything USDA answered.
  */
 export interface UsdaBatchRetrieval {
     /** The ids that addressed the response, normalised the way the cache key is. */
@@ -1531,36 +1708,48 @@ export interface UsdaBatchRetrieval {
     /** `usda_api_cache.cache_key` for this request — the row that holds the payload. */
     readonly cacheKey: string;
     /**
-     * sha256 of the canonical JSON of the whole recorded response payload, or
-     * `null` when nothing was recorded under {@link cacheKey} for this run to
-     * digest. Null rather than an empty string: there is no digest, and a
-     * fixed-shape placeholder in a hash field reads as one.
+     * sha256 of the canonical JSON of the whole response payload the records
+     * were read out of — the same payload recorded under {@link cacheKey}.
+     *
+     * Never null: the client hands the payload back with the records, so there
+     * is always something to digest. It used to be nullable because the digest
+     * was taken from a separate cache read that could find no row.
      */
-    readonly responseSha256: string | null;
+    readonly responseSha256: string;
     readonly source: UsdaRetrievalSource;
-    /** `usda_api_cache.fetched_at`; `null` when the response was not on record. */
+    /**
+     * The upstream HTTP status of the exchange that produced the payload: this
+     * run's observed status when it fetched, and the status recorded on the
+     * cache row when it replayed one.
+     *
+     * `null` means the recorded response predates `usda_api_cache.http_status`,
+     * so no status was ever observed for it. It never means "unknown, probably
+     * 200" — an evidence record quotes this value, and a status nobody saw is
+     * the claim this field exists to stop.
+     */
+    readonly httpStatus: number | null;
+    /** `usda_api_cache.fetched_at`; `null` when this run fetched the response itself. */
     readonly cachedAt: Date | null;
 }
 
 /**
- * Key-sorted JSON, so a digest of a vendor record does not depend on the order
- * the payload's keys happened to arrive in. `undefined` cannot appear in parsed
- * JSON, so it needs no case.
+ * The retrieval facts as the vendor client states them, in the vocabulary the
+ * evidence records publish. Pure, so the mapping is asserted without a fetch.
+ *
+ * `origin` is the client's observation, and it is the only thing that decides
+ * `source`: `cachedAt` carries the row's own retrieval time for a replay and is
+ * left null for a live fetch, so the evidence record falls back to the run clock
+ * exactly when there is no vendor retrieval time to state. The digest is taken
+ * from the payload the records came out of, which is why it is always present.
  */
-export const canonicalJsonString = (value: unknown): string => {
-    if (value === null || typeof value !== 'object') {
-        return JSON.stringify(value ?? null);
-    }
-    if (Array.isArray(value)) {
-        return `[${value.map(canonicalJsonString).join(',')}]`;
-    }
-    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
-        left < right ? -1 : left > right ? 1 : 0,
-    );
-    return `{${entries.map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJsonString(nested)}`).join(',')}}`;
-};
-
-export const sha256Hex = (text: string): string => crypto.createHash('sha256').update(text).digest('hex');
+export const toBatchRetrieval = (facts: UsdaBatchRetrievalFacts): UsdaBatchRetrieval => ({
+    requestedFdcIds: facts.requestedFdcIds,
+    cacheKey: facts.cacheKey,
+    responseSha256: sha256Hex(canonicalJsonString(facts.payload)),
+    source: facts.origin === 'cache' ? 'usda_api_cache' : 'import_run',
+    httpStatus: facts.httpStatus,
+    cachedAt: facts.origin === 'cache' ? facts.fetchedAt : null,
+});
 
 /**
  * Assembles one candidate from one USDA detail record.
@@ -1755,7 +1944,8 @@ export const prepareCatalogFood = (
             source_version: buildSourceVersion(dataType, detail.publicationDate),
             // The key of the batch response this row was read out of, so the
             // payload behind it can be looked up. Shared by the (up to twenty)
-            // foods of that batch, which is what it means.
+            // foods of that batch, which is what it means — and what
+            // USDA_SOURCE_CACHE_KEY_SCHEME states and the manifest now declares.
             source_cache_key: retrieval.cacheKey,
             food_group: foodGroup,
             // Only the reviewed entries seed the dislike suggestions: a swept
@@ -1774,48 +1964,40 @@ export const prepareCatalogFood = (
             ? `protein, fat, carbohydrate and fibre read per 100 g from the record's own foodNutrients (203 protein, 204 fat, 205 carbohydrate, 291 fibre); the record stated no energy value (208), so energy was derived from those same macros by the manifest's documented fallback (${manifest.caloriesFallback}). No value came from another food.`
             : "every value read per 100 g from the record's own foodNutrients (203 protein, 204 fat, 205 carbohydrate, 208 energy, 291 fibre); nothing was scaled, derived or estimated",
         curatorReviewRequired: !curated && !assignment.classified,
+        // The mandatory retrieval field this record cannot be published
+        // without. `usda.service.ts` re-fetches a pre-ledger cache row rather
+        // than replaying it, so a null should be unreachable — this flag is
+        // what makes that a checked property of the run instead of an
+        // assumption, and it is read by `importPublicationStatus`.
+        retrievalStatusMissing: retrieval.httpStatus === null,
         evidence: {
             url: USDA_BATCH_ENDPOINT,
-            method: 'POST',
+            method: USDA_SOURCE_CACHE_KEY_SCHEME.method,
             request_body: { fdcIds: retrieval.requestedFdcIds, format: USDA_BATCH_FORMAT },
             final_host: USDA_API_HOST,
-            http_status: retrieval.source === 'usda_api_cache' ? null : 200,
+            http_status: retrieval.httpStatus,
+            http_status_source:
+                retrieval.httpStatus === null
+                    ? 'null: the response was already recorded in usda_api_cache before that table carried http_status, so no upstream status was ever observed for it. Not a substituted 200 — re-importing this batch records the status of the exchange that answers.'
+                    : retrieval.source === 'usda_api_cache'
+                      ? 'usda_api_cache.http_status: the status recorded when this response was retrieved from USDA, replayed by this run'
+                      : "this run's own POST /foods exchange, as src/services/usda.service.ts observed it on the attempt that returned the records",
             source_cache_key: retrieval.cacheKey,
+            source_cache_key_scheme: USDA_SOURCE_CACHE_KEY_SCHEME.shape,
             retrieval_source: retrieval.source,
             body_sha256: retrieval.responseSha256,
-            body_sha256_subject:
-                retrieval.responseSha256 === null
-                    ? `null: no ${USDA_BATCH_PATH} response was recorded in usda_api_cache under source_cache_key when this run read it, so there was nothing to digest`
-                    : `sha256 of the key-sorted JSON of the whole ${USDA_BATCH_PATH} response payload recorded in usda_api_cache under source_cache_key`,
+            body_sha256_subject: `sha256 of the key-sorted JSON of the whole ${USDA_BATCH_PATH} response payload this food's record was read out of, as recorded in usda_api_cache under source_cache_key`,
             record_sha256: sha256Hex(canonicalJsonString(detail)),
             record_sha256_subject: "sha256 of the key-sorted JSON of this food's own record within that response",
             matched_snippet: description.slice(0, 500),
             fetched_at: (retrieval.cachedAt ?? fetchedAt).toISOString(),
             fetched_at_source:
                 retrieval.cachedAt === null
-                    ? 'import run clock: the response was not on record in usda_api_cache when this run read it, so no vendor retrieval time is available'
+                    ? 'import run clock: this run fetched the response itself, so the retrieval time is its own'
                     : 'usda_api_cache.fetched_at: the time the response was retrieved from USDA',
         },
         curated,
     };
-};
-
-/** Lower-case, de-duplicated, sorted, and never the canonical name itself. */
-export const dedupeSortedAliases = (aliases: readonly string[], canonicalName: string): string[] => {
-    const normalizedCanonical = normalizeCanonicalName(canonicalName);
-    const seen = new Set<string>();
-    const kept: string[] = [];
-
-    for (const alias of aliases) {
-        const trimmed = alias.trim().toLowerCase().replace(/\s+/g, ' ');
-        if (trimmed.length === 0 || seen.has(trimmed) || normalizeCanonicalName(trimmed) === normalizedCanonical) {
-            continue;
-        }
-        seen.add(trimmed);
-        kept.push(trimmed);
-    }
-
-    return kept.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
 };
 
 // ---------------------------------------------------------------------------
@@ -1876,61 +2058,29 @@ export interface ImportDb {
     $transaction<T>(work: (tx: ImportDb) => Promise<T>, options?: { timeout?: number }): Promise<T>;
 }
 
+/**
+ * The batch transaction's client, viewed as the run ledger's.
+ *
+ * `ImportDb` and `CatalogRunDb` are two narrow structural views of ONE real
+ * Prisma client: `main()` casts the singleton to the first and hands the same
+ * object to `runDb` as the second, and the client `deps.db.$transaction` yields
+ * is that same object mid-transaction. Declaring the intersection instead is not
+ * available — `CatalogRunDb` is a union of two generated Prisma types, so an
+ * intersection with it would demand a full `PrismaClient` where a transaction
+ * client (which has no `$transaction` of its own) is what exists.
+ *
+ * So the conversion is a cast, and it lives here alone rather than at the call
+ * site, with the contract it asserts written down: the object must carry
+ * `catalog_import_runs` and the raw-query escape hatch the run row's lock is
+ * taken with. `src/__tests__/scripts/catalog-import.test.ts` is what holds it to
+ * that — it drives the batch loop against a client whose transactions really do
+ * carry the run ledger, so a fake that did not would fail there rather than in
+ * production.
+ */
+const asRunLedger = (tx: ImportDb): CatalogRunDb => tx as unknown as CatalogRunDb;
+
 /** What persisting one record did, so the report counts real outcomes. */
 export type PersistOutcome = 'inserted' | 'updated';
-
-/**
- * Everything the two version counters on `catalog_foods` answer for, plus the
- * counters themselves.
- *
- * Every field is optional and nullable on purpose. The columns Prisma reads
- * back are nullable where prisma/schema.prisma says so — the five nutrients
- * and `density_g_per_ml` are `DOUBLE PRECISION NULL`, where NULL means unknown
- * and never zero — and a field the caller has no value for arrives as
- * `undefined`. {@link nextCatalogFoodVersions} normalises the two into one
- * "no value" so neither reads as a change against the other.
- */
-export interface StoredVersionedFacts {
-    /**
-     * The counters as stored. Read from the existing row only — the incoming
-     * facts do not carry a version, because what the next version IS is this
-     * module's decision rather than the vendor payload's.
-     */
-    nutrition_version?: number | null;
-    metadata_version?: number | null;
-
-    // THE NUTRITION SET: the five values `recipe_ingredients.snapshot_per_100g`
-    // freezes, the three that fix what "per 100" means (a per_100ml basis, a
-    // basis amount of 50 or a density each change what the same five numbers
-    // describe), the provenance `snapshot_provenance` freezes, and the vendor
-    // facts the numbers were read from — a different fdc id, data type or
-    // publication month means a different source record produced them, which a
-    // recipe holding the old snapshot has to be told about.
-    calories?: number | null;
-    protein_g?: number | null;
-    carbs_g?: number | null;
-    fat_g?: number | null;
-    fiber_g?: number | null;
-    nutrition_basis?: string | null;
-    basis_amount?: number | null;
-    density_g_per_ml?: number | null;
-    nutrition_provenance?: string | null;
-    usda_fdc_id?: number | null;
-    usda_data_type?: string | null;
-    source_version?: string | null;
-
-    // THE METADATA SET: identity and safety. `snapshot_name` freezes the name a
-    // recipe displays, `snapshot_allergen_tags` and `snapshot_diet_tags` freeze
-    // what it may claim, and `food_group` is what a user's dislike selection
-    // excludes by. `allergen_status` is here because 'known' → 'unknown' is a
-    // change of safety standing even when the tag list is untouched.
-    canonical_name?: string | null;
-    display_name?: string | null;
-    food_group?: string | null;
-    allergen_status?: string | null;
-    allergen_tags?: readonly string[] | null;
-    diet_tags?: readonly string[] | null;
-}
 
 // TWO FIELDS THIS STAGE WRITES ARE DELIBERATELY IN NEITHER SET, because the
 // next reader's first instinct is to add them and a spurious bump is not free:
@@ -1946,15 +2096,6 @@ export interface StoredVersionedFacts {
 //     recategorised food is already reported correctly without a new version.
 // Both remain fully written by the upsert below; they are simply not evidence
 // that a frozen snapshot has stopped describing this food.
-
-/** The two counters to write, and which set moved to get them there. */
-export interface CatalogFoodVersions {
-    readonly nutritionVersion: number;
-    readonly metadataVersion: number;
-    /** False on an insert: a new row's counters start at 1, they do not move. */
-    readonly nutritionChanged: boolean;
-    readonly metadataChanged: boolean;
-}
 
 /**
  * The Prisma `select` the version decision needs, typed as a total record over
@@ -1983,114 +2124,6 @@ const VERSIONED_FACT_SELECT: Record<keyof StoredVersionedFacts, true> = {
     allergen_status: true,
     allergen_tags: true,
     diet_tags: true,
-};
-
-/**
- * Order-insensitive set comparison for the two tag arrays: a food whose diet
- * tags came back in a different order has not changed, and versioning it would
- * be versioning the vendor's array ordering.
- */
-const sameStringSet = (
-    left: readonly string[] | null | undefined,
-    right: readonly string[] | null | undefined,
-): boolean => {
-    const a = [...(left ?? [])].sort();
-    const b = [...(right ?? [])].sort();
-    return a.length === b.length && a.every((value, index) => value === b[index]);
-};
-
-/**
- * One fact compared, with absent and NULL treated as the same "no value".
- *
- * Strict equality is the right test for the numbers here: they are read per
- * 100 g out of the same vendor payload by the same deterministic code, so a
- * rerun that changes nothing produces bit-identical doubles, and a tolerance
- * would only hide a real vendor revision. What DOES need normalising is
- * `undefined` vs `null` — `fiber_g` is written as `?? null` and a fact the
- * caller omits arrives as `undefined` — which without this would read as a
- * change on every single rerun.
- */
-const sameFact = (
-    left: string | number | null | undefined,
-    right: string | number | null | undefined,
-): boolean => (left ?? null) === (right ?? null);
-
-/**
- * Both version counters for the row about to be written.
- *
- * WHY THIS EXISTS AT ALL. `recipe_ingredients` freezes `snapshot_per_100g`,
- * `snapshot_name`, `snapshot_provenance`, `snapshot_allergen_tags` and
- * `snapshot_diet_tags` beside the two counters they were taken at, and
- * `src/services/recipe.logic.ts::isIngredientSnapshotStale` detects a stale
- * snapshot by comparing BOTH counters for INEQUALITY — nothing compares the
- * values themselves. A counter that is reset to 1, or that fails to move when
- * its facts did, therefore means a published recipe goes on claiming nutrition
- * or safety metadata the catalog no longer states: with the allergen set that
- * is a safety bug, not a cosmetic one (AAP §0.5.1, §0.7.3, and the counter
- * contract "nutrition_version bumped on any nutrient change, metadata_version
- * bumped on any allergen/diet/name/food-group change").
- *
- * Each counter answers for its own set and only its own: a renamed food does
- * not reversion its nutrition, and a changed nutrient does not reversion its
- * safety metadata, because either spurious bump forces a needless new recipe
- * version across every recipe using the food. An unchanged set PRESERVES the
- * stored counter rather than recomputing it, which is what keeps a no-op rerun
- * byte-identical and an exported release stable.
- *
- * `next` may carry more than the compared facts — the caller passes the whole
- * scalar set it is about to write — and everything outside the two sets above
- * is ignored.
- *
- * @param existing the stored row, or `null` when this `source_key` is new
- * @param next the facts about to be written
- *
- * @example
- * // A rerun that changed nothing keeps both counters where they were.
- * nextCatalogFoodVersions({ nutrition_version: 3, metadata_version: 2, calories: 165 }, { calories: 165 });
- * // → { nutritionVersion: 3, metadataVersion: 2, nutritionChanged: false, metadataChanged: false }
- */
-export const nextCatalogFoodVersions = (
-    existing: StoredVersionedFacts | null,
-    next: StoredVersionedFacts,
-): CatalogFoodVersions => {
-    // A new row is at version 1 on both counters. There is no stored snapshot
-    // of it anywhere yet, so nothing has moved and nothing can be stale.
-    if (existing === null) {
-        return { nutritionVersion: 1, metadataVersion: 1, nutritionChanged: false, metadataChanged: false };
-    }
-
-    const nutritionChanged =
-        !sameFact(existing.calories, next.calories) ||
-        !sameFact(existing.protein_g, next.protein_g) ||
-        !sameFact(existing.carbs_g, next.carbs_g) ||
-        !sameFact(existing.fat_g, next.fat_g) ||
-        !sameFact(existing.fiber_g, next.fiber_g) ||
-        !sameFact(existing.nutrition_basis, next.nutrition_basis) ||
-        !sameFact(existing.basis_amount, next.basis_amount) ||
-        !sameFact(existing.density_g_per_ml, next.density_g_per_ml) ||
-        !sameFact(existing.nutrition_provenance, next.nutrition_provenance) ||
-        !sameFact(existing.usda_fdc_id, next.usda_fdc_id) ||
-        !sameFact(existing.usda_data_type, next.usda_data_type) ||
-        !sameFact(existing.source_version, next.source_version);
-
-    const metadataChanged =
-        !sameFact(existing.canonical_name, next.canonical_name) ||
-        !sameFact(existing.display_name, next.display_name) ||
-        !sameFact(existing.food_group, next.food_group) ||
-        !sameFact(existing.allergen_status, next.allergen_status) ||
-        !sameStringSet(existing.allergen_tags, next.allergen_tags) ||
-        !sameStringSet(existing.diet_tags, next.diet_tags);
-
-    // A stored counter this stage never wrote (a hand-loaded row, a release
-    // predating the column) is read as 1 rather than as "no version": the
-    // column is NOT NULL in the schema, and treating a missing counter as 0
-    // would silently renumber a snapshot that already cites 1.
-    return {
-        nutritionVersion: (existing.nutrition_version ?? 1) + (nutritionChanged ? 1 : 0),
-        metadataVersion: (existing.metadata_version ?? 1) + (metadataChanged ? 1 : 0),
-        nutritionChanged,
-        metadataChanged,
-    };
 };
 
 /**
@@ -2263,7 +2296,13 @@ export const buildValidationRecordData = (
     // Null on purpose, and meaningfully so: no model was consulted about this
     // food. A model name here would imply a review that never happened.
     llm_review: null,
-    outcome: prepared.curatorReviewRequired ? 'quarantined' : verdict.outcome,
+    // Either import-stage refusal holds the record, whatever the checks said:
+    // an unclassified category (curator review) or a retrieval with no observed
+    // status (a mandatory evidence field, AAP §0.3.2). The reason is readable
+    // off the record itself — `identity_evidence[0].http_status_source` says
+    // which case a null status is — so the outcome never has to be explained
+    // from outside the row.
+    outcome: prepared.curatorReviewRequired || prepared.retrievalStatusMissing ? 'quarantined' : verdict.outcome,
     reviewed_at: now,
     publication_status: publicationStatus,
     source_versions: {
@@ -2273,6 +2312,244 @@ export const buildValidationRecordData = (
         coverage_plan_version: 'v1',
     },
 });
+
+// ---------------------------------------------------------------------------
+// The cross-document check the manifest's own `coveragePlanContract` assigns to
+// this stage.
+//
+// `loadUsdaManifest` verifies the manifest against its declared shape and its
+// own vocabularies (`assertUsdaManifestShape`), and deliberately loads no
+// second document — so the half of the contract that spans two files has
+// nowhere else to live. What it spans is worth stating precisely: the manifest
+// files every food under a `category` and a `foodGroup`, and the coverage plan
+// is where those two are defined and where the food group's OWN category is
+// declared. An entry naming a category the plan does not target contributes to
+// no target; one naming an unknown food group is invisible to the dislike
+// exclusions built from food groups; and one whose category disagrees with its
+// food group's category in the plan is counted against one category while it
+// behaves as another. None of the three fails at runtime.
+//
+// It runs before the rate limiter is installed and before the first vendor
+// request, because a disagreement between two committed documents is not
+// something the import can work through: no number of records fetched makes it
+// resolvable, and stopping halfway is strictly worse to recover from than
+// stopping at the start.
+// ---------------------------------------------------------------------------
+
+/** Cap on the entries one refusal or warning lists, so a wholesale disagreement is still readable. */
+const COVERAGE_MISMATCH_LIST_LIMIT = 10;
+
+/**
+ * What the manifest and the coverage plan agree and disagree about, split by
+ * what the disagreement costs.
+ */
+export interface CoveragePlanAgreement {
+    /**
+     * A record would be FILED under a category or food group the plan does not
+     * declare, or under a category that is not its food group's own. Every one
+     * of these mis-files a row: it is counted against a category nothing
+     * targets, or behaves as one category while being counted as another. This
+     * is the agreement the manifest's `coveragePlanContract` states, and a
+     * non-empty list stops the run before its first vendor request.
+     */
+    readonly filingMismatches: readonly string[];
+    /**
+     * A KEY in one of the manifest's derivation tables names a food group no
+     * record can carry, so the cost class or allergen set under it can never be
+     * applied. Nothing is mis-filed, but a policy a curator wrote is not in
+     * force — and for the allergen table that means a record the curator
+     * intended to mark as containing milk carries no such tag.
+     *
+     * Kept as its own list because the two disagreements are different facts
+     * and each deserves its own message, but it is **as fatal as a
+     * filing mismatch**: the manifest's `coveragePlanContract` promises that
+     * every food group below exists in the named plan and that a mismatch stops
+     * the run before a USDA request, and a promise enforced only by a log line
+     * is not one. Reporting without refusing is what let 30 such keys accumulate
+     * across a taxonomy rename while every import kept succeeding.
+     */
+    readonly inertPolicyKeys: readonly string[];
+}
+
+/**
+ * Compares the manifest with the coverage plan. Pure (§1.2/§7): both documents
+ * are arguments, nothing is read from the environment and nothing is logged, so
+ * the whole comparison is unit-testable and the caller decides what each half
+ * of the result means.
+ */
+export const checkManifestAgainstCoveragePlan = (
+    manifest: UsdaManifest,
+    coveragePlan: CoveragePlan,
+): CoveragePlanAgreement => {
+    const planCategories = new Set<string>(coveragePlan.categories.map((row) => row.category));
+    const categoryOfFoodGroup = new Map<string, string>(
+        coveragePlan.foodGroups.map((row) => [row.foodGroup, row.category]),
+    );
+
+    const filingMismatches: string[] = [];
+    const inertPolicyKeys: string[] = [];
+
+    // Before any heading is compared: every check below reads this plan as the
+    // authority on what a category and a food group mean, so comparing against
+    // a plan the manifest was not written for proves nothing. Headings the two
+    // versions happen to share would pass, and headings only the intended plan
+    // declares would be reported as unknown — or worse, accepted.
+    if (manifest.coveragePlanVersion !== coveragePlan.coveragePlanVersion) {
+        filingMismatches.push(
+            `the manifest is written against coverage plan ${manifest.coveragePlanVersion}, but the loaded plan ` +
+                `declares coveragePlanVersion ${coveragePlan.coveragePlanVersion}`,
+        );
+    }
+
+    /** One filing — a curated entry, a sweep rule, the fallback — checked all three ways. */
+    const checkFiling = (where: string, category: string, foodGroup: string): void => {
+        if (!planCategories.has(category)) {
+            filingMismatches.push(`${where} files under category ${category}, which coverage-plan does not declare`);
+            return;
+        }
+        const declared = categoryOfFoodGroup.get(foodGroup);
+        if (declared === undefined) {
+            filingMismatches.push(`${where} files under foodGroup ${foodGroup}, which coverage-plan does not declare`);
+            return;
+        }
+        if (declared !== category) {
+            filingMismatches.push(
+                `${where} files ${foodGroup} under ${category}, but coverage-plan declares that foodGroup under ${declared}`,
+            );
+        }
+    };
+
+    manifest.foods.forEach((entry, index) => {
+        checkFiling(`foods[${index}] (${entry.canonicalName}, ${entry.foodState})`, entry.category, entry.foodGroup);
+    });
+
+    // The sweeps file swept records under these same two fields, so a rule
+    // naming an unknown pair mis-files every record it matches — thousands of
+    // them, from one line nobody re-read.
+    manifest.sweepClassificationRules.rules.forEach((rule, index) => {
+        checkFiling(`sweepClassificationRules.rules[${index}]`, rule.category, rule.foodGroup);
+    });
+    checkFiling(
+        'sweepClassificationRules.fallback',
+        manifest.sweepClassificationRules.fallback.category,
+        manifest.sweepClassificationRules.fallback.foodGroup,
+    );
+
+    manifest.datasetSweeps.forEach((sweep, index) => {
+        if (sweep.category !== undefined && !planCategories.has(sweep.category)) {
+            filingMismatches.push(
+                `datasetSweeps[${index}] (${sweep.sweepKey}) declares category ${sweep.category}, which coverage-plan does not declare`,
+            );
+        }
+    });
+
+    // A category key is load-bearing the same way a filing is: the cost class it
+    // carries is the one every record of that category takes.
+    Object.keys(manifest.sweepCostClassRules.byCategory).forEach((category) => {
+        if (!planCategories.has(category)) {
+            filingMismatches.push(
+                `sweepCostClassRules.byCategory names category ${category}, which coverage-plan does not declare`,
+            );
+        }
+    });
+    manifest.sweepAllergenDietRules.dietDerivation.animalCategories.forEach((category, index) => {
+        if (!planCategories.has(category)) {
+            filingMismatches.push(
+                `sweepAllergenDietRules.dietDerivation.animalCategories[${index}] is ${category}, which coverage-plan does not declare`,
+            );
+        }
+    });
+
+    // The two food-group-keyed tables. A key outside the plan matches no record,
+    // so what it carries is simply never applied.
+    Object.keys(manifest.sweepCostClassRules.foodGroupOverrides).forEach((foodGroup) => {
+        if (!categoryOfFoodGroup.has(foodGroup)) {
+            inertPolicyKeys.push(
+                `sweepCostClassRules.foodGroupOverrides.${foodGroup} applies to no record: coverage-plan declares no such foodGroup`,
+            );
+        }
+    });
+    Object.keys(manifest.sweepAllergenDietRules.byFoodGroup).forEach((foodGroup) => {
+        if (!categoryOfFoodGroup.has(foodGroup)) {
+            inertPolicyKeys.push(
+                `sweepAllergenDietRules.byFoodGroup.${foodGroup} tags no record: coverage-plan declares no such foodGroup`,
+            );
+        }
+    });
+
+    return { filingMismatches, inertPolicyKeys };
+};
+
+/** `a; b; c; and 20 more` — a list an operator can read, whatever its length. */
+const describeMismatchList = (entries: readonly string[]): string => {
+    const listed = entries.slice(0, COVERAGE_MISMATCH_LIST_LIMIT);
+    const remainder = entries.length - listed.length;
+    return `${listed.join('; ')}${remainder > 0 ? `; and ${remainder} more` : ''}`;
+};
+
+/**
+ * Refuses the manifest/coverage-plan pair on ANY disagreement the manifest's
+ * `coveragePlanContract` covers — a mis-filed record, a plan version the
+ * manifest was not written against, or a derivation key naming a food group the
+ * plan does not declare.
+ *
+ * Called before the rate limiter is installed and before the first vendor
+ * request, because a disagreement between two committed documents is not
+ * something the import can work through: no number of records fetched makes it
+ * resolvable, and stopping halfway is strictly worse to recover from than
+ * stopping at the start.
+ *
+ * Both halves are fatal. An inert key costs no mis-filed row, so reporting it
+ * was tempting — but the contract in `usda-manifest.v1.json` promises the
+ * agreement holds, and an unenforced promise is how a taxonomy rename left 30
+ * such keys behind while every import kept reporting success. A curation gap
+ * that no run refuses is a curation gap nobody fixes.
+ */
+export const assertManifestMatchesCoveragePlan = (
+    manifest: UsdaManifest,
+    coveragePlan: CoveragePlan,
+    logger: ScriptLogger,
+): CoveragePlanAgreement => {
+    const agreement = checkManifestAgainstCoveragePlan(manifest, coveragePlan);
+
+    if (agreement.filingMismatches.length > 0) {
+        throw new CatalogImportError(
+            'manifest_coverage_mismatch',
+            `data/meal-planning/${USDA_MANIFEST_FILE} (usdaManifestVersion ${manifest.usdaManifestVersion}) and the ` +
+                `coverage plan (coveragePlanVersion ${coveragePlan.coveragePlanVersion}) disagree on ` +
+                `${agreement.filingMismatches.length} ` +
+                `${agreement.filingMismatches.length === 1 ? 'heading' : 'headings'}: ` +
+                `${describeMismatchList(agreement.filingMismatches)}. The two documents must be reconciled before ` +
+                'this import runs — it is refused here rather than halfway through, because no amount of importing ' +
+                'resolves a disagreement between two committed files.',
+            { manifestVersion: manifest.usdaManifestVersion },
+        );
+    }
+
+    if (agreement.inertPolicyKeys.length > 0) {
+        throw new CatalogImportError(
+            'manifest_inert_policy_keys',
+            `data/meal-planning/${USDA_MANIFEST_FILE} (usdaManifestVersion ${manifest.usdaManifestVersion}) carries ` +
+                `${agreement.inertPolicyKeys.length} derivation ` +
+                `${agreement.inertPolicyKeys.length === 1 ? 'key' : 'keys'} naming a foodGroup coverage plan ` +
+                `${coveragePlan.coveragePlanVersion} does not declare, so the cost class or allergen set under each ` +
+                `can never be applied to any record: ${describeMismatchList(agreement.inertPolicyKeys)}. ` +
+                'Re-key each onto a foodGroup the plan declares, or remove it where the live rules already cover ' +
+                'the intent — an allergen a curator wrote and the importer never applies reads as "contains none of ' +
+                'it" rather than "not determined".',
+            { manifestVersion: manifest.usdaManifestVersion },
+        );
+    }
+
+    logger.info('manifest_coverage_plan_agreed', {
+        stage: STAGE,
+        usdaManifestVersion: manifest.usdaManifestVersion,
+        coveragePlanVersion: coveragePlan.coveragePlanVersion,
+        foodGroups: coveragePlan.foodGroups.length,
+    });
+
+    return agreement;
+};
 
 // ---------------------------------------------------------------------------
 // The work plan.
@@ -2314,6 +2591,7 @@ const chunk = <T>(items: readonly T[], size: number): T[][] => {
  */
 export const buildImportPlan = async (
     manifest: UsdaManifest,
+    coveragePlan: CoveragePlan,
     listFoodsForDataType: (dataType: string, pageSize: number, pageNumber: number) => Promise<UsdaFoodSummary[]>,
     options: ImportOptions,
     logger: ScriptLogger,
@@ -2324,13 +2602,66 @@ export const buildImportPlan = async (
         skippedBrandPattern: 0,
         skippedCuratedFdcId: 0,
         skippedCuratedIdentity: 0,
+        // Permanently zero, and kept for exactly that reason. An entry without a
+        // verified FDC id used to be counted here and dropped; it is now refused
+        // — by `assertUsdaManifestShape` when the document is loaded, and by the
+        // throw below for a caller that built a manifest object itself — so the
+        // field states the guarantee ("none was skipped, because none can be")
+        // to every reader of the report that carries it, rather than
+        // disappearing from a shape the committed artefact declares.
         skippedUnresolvedEntry: 0,
         skippedDuplicateInPlan: 0,
         skippedCategoryFilter: 0,
+        /** A sweep record whose category had already reached its candidate volume. */
+        skippedCategoryVolumeReached: 0,
     };
 
     const wantedCategories = new Set(options.categories);
     const inScope = (category: string): boolean => wantedCategories.size === 0 || wantedCategories.has(category);
+
+    // THE CANDIDATE-VOLUME BUDGET. The coverage plan states a `candidateVolume`
+    // per category — `ceil(1.25 × publishedTarget)`, the number import and
+    // generation aim for — and a sweep that declares
+    // `stopWhenCategoryCandidateVolumeReached` is asking to be held to it. Two
+    // costs come from ignoring it, and the manifest's own `sweepPageBounds` note
+    // names it as one of the two real stopping conditions: records beyond the
+    // volume are fetched with requests from a 900/hour budget that the other
+    // categories need, and they overfill the category, which then publishes more
+    // than the plan targets and reports a shortfall computed against a number it
+    // has already passed.
+    //
+    // Curated entries count toward a category's volume but are never refused by
+    // it: they are reviewed curation, pinned by name in the search benchmark,
+    // and the flag is declared per sweep. Only swept records are skipped.
+    const categoryCandidateVolume = new Map<string, number>(
+        coveragePlan.categories.map((row) => [row.category, row.candidateVolume]),
+    );
+    const plannedByCategory = new Map<string, number>();
+    const countPlanned = (category: string): void => {
+        plannedByCategory.set(category, (plannedByCategory.get(category) ?? 0) + 1);
+    };
+    const hasCategoryCapacity = (category: string): boolean => {
+        const volume = categoryCandidateVolume.get(category);
+        // A category the plan states no volume for is unbudgeted rather than
+        // full: refusing it would make this a cap the coverage plan never set.
+        return volume === undefined || (plannedByCategory.get(category) ?? 0) < volume;
+    };
+    /**
+     * Every category this run could still file a record under is full.
+     *
+     * `budgeted.length > 0` is load-bearing, not defensive: `[].every(...)` is
+     * TRUE, so a coverage plan that states no volume for any category in scope
+     * would make this answer "all full" before the first page and end the sweep
+     * having imported nothing. An unbudgeted scope has no budget to reach,
+     * which is also what `hasCategoryCapacity` says one category at a time —
+     * the two have to agree or the page-level stop contradicts the per-record
+     * one.
+     */
+    const everyInScopeCategoryFull = (): boolean => {
+        const budgeted = [...categoryCandidateVolume.keys()].filter((category) => inScope(category));
+
+        return budgeted.length > 0 && budgeted.every((category) => !hasCategoryCapacity(category));
+    };
 
     // `--limit` is documented as "stop after n manifest records", so it is one
     // budget over the whole work list in workListOrder — the curated entries
@@ -2343,13 +2674,29 @@ export const buildImportPlan = async (
     const curatedIdentities = new Set<string>();
     const curatedFdcIds: number[] = [];
 
-    for (const entry of manifest.foods) {
-        if (entry.fdcId === undefined) {
-            // `resolveBy` entries name a food without a verified id. Resolving
-            // one needs a search call whose answer a human has to confirm, so
-            // the import reports it rather than guessing which hit was meant.
-            skipped.skippedUnresolvedEntry += 1;
-            continue;
+    for (const [entryIndex, entry] of manifest.foods.entries()) {
+        // Every curated entry names its food by an FDC id read from a live USDA
+        // response, and `loadUsdaManifest` refuses a document that does not (see
+        // `assertUsdaManifestShape`, which rejects the old `resolveBy` form by
+        // name). Reaching here without one therefore means a caller built the
+        // manifest object itself, and the honest answer is to refuse rather than
+        // to count it: the previous revision incremented
+        // `skippedUnresolvedEntry` and moved on, so a reviewed curation was
+        // dropped from the catalog and said so only in a counter.
+        //
+        // Written as an integer test rather than `=== undefined` because
+        // `fdcId` is a required `number` in the declared shape — the comparison
+        // would not compile — and this still catches the absent, null and
+        // non-integer cases a hand-built object can carry.
+        if (!Number.isInteger(entry.fdcId) || entry.fdcId < 1) {
+            throw new CatalogImportError(
+                'manifest_entry_unresolved',
+                `foods[${entryIndex}] (${entry.canonicalName}, ${entry.foodState}) carries no verified fdcId ` +
+                    `(received ${JSON.stringify(entry.fdcId)}). This importer resolves no entry: verify the id ` +
+                    `against a live USDA response and write it into data/meal-planning/${USDA_MANIFEST_FILE}, or ` +
+                    'remove the entry. A curated food is never imported under a guessed id and never silently skipped.',
+                { fdcId: entry.fdcId },
+            );
         }
         curatedIdentities.add(`${normalizeCanonicalName(entry.canonicalName)}\u0000${entry.foodState}`);
         if (!inScope(entry.category)) {
@@ -2370,6 +2717,7 @@ export const buildImportPlan = async (
         }
         curatedFdcIds.push(entry.fdcId);
         assignments.set(entry.fdcId, { kind: 'curated', entry });
+        countPlanned(entry.category);
     }
 
     const batches: ImportBatch[] = [];
@@ -2381,10 +2729,44 @@ export const buildImportPlan = async (
 
     for (const sweep of manifest.datasetSweeps) {
         const sweepIds: number[] = [];
-        const lastPage = Math.min(sweep.maxPages, sweep.observedLastNonEmptyPage ?? sweep.maxPages);
+        // THE SWEEP'S PAGE BOUND IS `maxPages`, AND NOTHING ELSE.
+        //
+        // `observedLastNonEmptyPage` is a MEASUREMENT taken on `observedOn` by
+        // binary-searching the last page that still returned records. The
+        // previous revision took `min(maxPages, observedLastNonEmptyPage)` as
+        // the bound, which turns that dated measurement into a permanent
+        // ceiling: USDA adds records to these datasets, and every record past
+        // the page count someone measured once would never be imported — with
+        // nothing in the run's output to say so, because the sweep ends
+        // normally.
+        //
+        // The document's own `sweepPageBounds` note states the design directly:
+        // `maxPages` "sits above the observed count so a dataset that grows
+        // between authoring and import is not silently truncated", and "the real
+        // stopping conditions are an empty page and
+        // stopWhenCategoryCandidateVolumeReached; maxPages only caps a runaway".
+        // So the measurement is used as an EXPECTATION — exceeding it is logged
+        // as growth, because that is the signal to re-measure and raise
+        // `maxPages` — and `assertUsdaManifestShape` refuses a document whose
+        // `maxPages` sits below its own observed page, which is what keeps the
+        // remaining bound from truncating anything.
+        const observedLastPage = sweep.observedLastNonEmptyPage;
+        // Opt-in, per sweep: the flag is an explicit request in the document,
+        // and reading its absence as "on" would hold a future sweep to a budget
+        // its author never asked for.
+        const honoursCategoryVolume = sweep.stopWhenCategoryCandidateVolumeReached === true;
+        let volumeStoppedAtPage: number | null = null;
+        let grewBeyondObserved = false;
 
-        for (let page = 1; page <= lastPage; page += 1) {
+        for (let page = 1; page <= sweep.maxPages; page += 1) {
             if (atLimit()) {
+                break;
+            }
+            // Checked BEFORE the request, which is the point: once every
+            // category this run can file under is full, each further page costs
+            // a token from the same 900/hour budget and yields nothing.
+            if (honoursCategoryVolume && everyInScopeCategoryFull()) {
+                volumeStoppedAtPage = page - 1;
                 break;
             }
             // Wrapped at the boundary (§9): a sweep that dies on page 43 of a
@@ -2398,6 +2780,13 @@ export const buildImportPlan = async (
             }
             if (rows.length === 0) {
                 break;
+            }
+            if (observedLastPage !== undefined && page > observedLastPage) {
+                // Not a warning about a problem: it is the evidence that the
+                // dataset has grown past its last measurement, which is what
+                // tells a curator to re-measure and confirm `maxPages` still
+                // sits above the data. Recorded once per sweep.
+                grewBeyondObserved = true;
             }
 
             for (const row of rows) {
@@ -2432,6 +2821,15 @@ export const buildImportPlan = async (
                     skipped.skippedCategoryFilter += 1;
                     continue;
                 }
+                // The per-record half of the volume budget: this category has
+                // the candidates the coverage plan asks for, so one more would
+                // overfill it. Other categories on this same page are still
+                // accepted, which is why this is a `continue` and the page loop
+                // above stops only when every one of them is full.
+                if (honoursCategoryVolume && !hasCategoryCapacity(classification.category)) {
+                    skipped.skippedCategoryVolumeReached += 1;
+                    continue;
+                }
 
                 const foodState = resolveFoodState(description, sweep.dataType, manifest.sweepFoodStateRules);
                 const identity = `${normalizeCanonicalName(description)}\u0000${foodState}`;
@@ -2452,6 +2850,7 @@ export const buildImportPlan = async (
                     foodGroup: classification.foodGroup,
                     classified: classification.matched,
                 });
+                countPlanned(classification.category);
                 sweepIds.push(row.fdcId);
             }
         }
@@ -2461,6 +2860,14 @@ export const buildImportPlan = async (
             sweepKey: sweep.sweepKey,
             dataType: sweep.dataType,
             planned: sweepIds.length,
+            maxPages: sweep.maxPages,
+            // Both are stated so the sweep's own output answers why it stopped:
+            // a page number here means the candidate volumes ended it, and
+            // `grewBeyondObserved` means the dataset now holds more pages than
+            // the document's measurement records.
+            volumeStoppedAtPage,
+            observedLastNonEmptyPage: observedLastPage ?? null,
+            grewBeyondObserved,
         });
 
         for (const ids of chunk(sweepIds, batchSize)) {
@@ -2481,25 +2888,91 @@ export const buildImportPlan = async (
 // ---------------------------------------------------------------------------
 
 /** The checkpoint this stage resumes from. */
+/**
+ * What a resumed run has to carry forward, and why it lives in the cursor.
+ *
+ * THE DEFECT THIS EXISTS FOR. Every report dimension — the outcome counters,
+ * the per-category and per-check tallies, the identity and nutrition-method
+ * splits, the refusal list — used to be process-local and to start at zero.
+ * A run interrupted after 9,000 records and resumed therefore wrote a final
+ * report describing the resumed ATTEMPT: the 9,000 records the first attempt
+ * imported appeared nowhere, and the artefact a reviewer reads as the record of
+ * the import understated it by most of the catalog. `batchesProcessed` was the
+ * only figure that survived, because it alone was recorded durably.
+ *
+ * WHY THE CURSOR AND NOT THE RUN'S COUNTS. `recordCounts` and `finishRun` merge
+ * ADDITIVELY into `catalog_import_runs.counts`, which is exactly right for the
+ * run row: each attempt contributes its own delta and the row totals the work.
+ * The report needs the opposite — a single cumulative statement of the whole
+ * run — and computing it by re-merging the row would double count. The cursor
+ * is the one piece of run state that is REPLACED rather than merged, and it is
+ * written at the same instant as the batch index, so a snapshot taken with it
+ * describes exactly the batches the index has passed: nothing is ever persisted
+ * for work beyond the durable cursor, and a resumed attempt re-processes from
+ * the index and re-measures those batches itself (its upserts make the repeat a
+ * no-op in the catalog, and the outcome it records — `updated` rather than
+ * `inserted` — is what actually happened).
+ *
+ * PLAN-TIME FIGURES ARE NOT CARRIED. `planned` and the `skipped*` counters are
+ * recomputed identically by every attempt from the same manifest, so carrying
+ * them would double them on resume. They are applied once, at report time.
+ */
+export interface ImportReportSnapshot {
+    /** Attempts that have contributed to the figures below, including the one that saved them. */
+    readonly attempts: number;
+    /** The batch index the figures cover — always the cursor's own index. */
+    readonly throughBatchIndex: number;
+    readonly processedBatches: number;
+    /** Outcome counters only: inserted, updated, candidates, quarantined, rejected, missingFromVendor. */
+    readonly counts: Readonly<Record<string, number>>;
+    readonly byCategory: Readonly<Record<string, number>>;
+    readonly byCheck: Readonly<Record<string, number>>;
+    readonly byIdentityStatus: Readonly<Record<string, number>>;
+    readonly byNutritionMethod: Readonly<Record<string, number>>;
+    readonly byCategoryOutcome: Readonly<Record<string, CategoryOutcomeCounts>>;
+    /**
+     * The refusal worklist as far as its bound. Truncation is not recorded
+     * here: the report derives it per tier from `total > listed`, which stays
+     * correct however the list was capped.
+     */
+    readonly refused: readonly QuarantinedRecord[];
+}
+
 export interface ImportCursor {
     /** Identifies the plan the indices belong to. */
     readonly fingerprint: string;
     readonly nextBatchIndex: number;
+    /**
+     * The report figures as of `nextBatchIndex`. Optional because a cursor
+     * written by an earlier revision of this stage carries none: such a resume
+     * reports the attempt it can measure and says so through
+     * `runAggregation.carriedFromEarlierAttempts`, rather than failing a run
+     * whose work is already committed.
+     */
+    readonly report?: ImportReportSnapshot;
+}
+
+/** One batch response: the records, and the observed facts about the request. */
+export interface ImportBatchFetch {
+    readonly details: UsdaFoodDetail[];
+    readonly retrieval: UsdaBatchRetrieval;
 }
 
 export interface ImportUsdaClient {
     readonly listFoods: (dataType: string, pageSize: number, pageNumber: number) => Promise<UsdaFoodSummary[]>;
-    readonly getFoodsBatch: (fdcIds: readonly number[]) => Promise<UsdaFoodDetail[]>;
     /**
-     * The retrieval facts for the request `getFoodsBatch` just made, read from
-     * the client's own cache rather than assumed here. Called after the fetch,
-     * so a response served from `usda_api_cache` reports the vendor retrieval
-     * time it was recorded with, and one this run fetched live reports
-     * `import_run` if the best-effort cache write has not landed yet — either
-     * way the evidence record states which it is instead of presenting the
-     * run's clock as a vendor timestamp.
+     * The records AND the retrieval facts of the request that served them, in
+     * one call.
+     *
+     * One call rather than two on purpose. This used to be a `getFoodsBatch`
+     * followed by a `describeBatchRetrieval` that re-read `usda_api_cache` —
+     * which cannot establish where a response came from: the fetch's cache write
+     * races the read, so a freshly fetched response was reported as a replay,
+     * and the evidence record's HTTP status was then decided by that mistaken
+     * origin. Only the call that reached the vendor knows whether it did, so the
+     * client reports it and nothing here infers it.
      */
-    readonly describeBatchRetrieval: (fdcIds: readonly number[]) => Promise<UsdaBatchRetrieval>;
+    readonly fetchBatch: (fdcIds: readonly number[]) => Promise<ImportBatchFetch>;
 }
 
 export interface RunImportDeps {
@@ -2523,17 +2996,130 @@ export interface RunImportDeps {
      * avoid. `main()` always supplies it, so every real run measures.
      */
     readonly rateLimiterStats?: () => UsdaRequestStats;
-    readonly writeReport: (report: unknown) => void;
+    /**
+     * Publishes one report, to the destination the run names.
+     *
+     * The destination is part of the contract rather than a decision the writer
+     * infers, because the two destinations are not the same artefact: only a
+     * real run may touch `import-report.json`, and a dry run's figures are
+     * hypotheses (see {@link IMPORT_REPORT_DESTINATIONS}).
+     */
+    readonly writeReport: (report: unknown, destination: ImportReportDestination) => void;
 }
+
+/**
+ * WHERE A REPORT MAY LAND, AND WHY A DRY RUN MAY NOT LAND IN THE EVIDENCE.
+ *
+ * `canonical` is `data/meal-planning/reports/latest/import-report.json` — a
+ * committed artefact a reviewer reads as the record of what the import
+ * measured, and the file `catalog-report.ts` aggregates into.
+ *
+ * `dry_run_preview` exists because a dry run reports what an import WOULD do:
+ * every outcome counter in it is zero by construction, nothing was written to
+ * the catalog, and no run row or cursor was touched. Publishing that into the
+ * canonical artefact replaced a real run's measurements with hypothetical
+ * zeros, and it did so while holding no lock of any kind — `main()`
+ * deliberately takes no catalog stage lock for a dry run, precisely so an
+ * operator can ask what an import would cost while one is running, which means
+ * a dry run could overwrite the report of the import running beside it.
+ *
+ * So a dry run publishes to a distinct, non-canonical preview file outside the
+ * data tree, and the run logs its absolute path. The preview is disposable
+ * output for the operator who asked, never evidence, and it can never be
+ * mistaken for — or committed as — the artefact.
+ */
+export const IMPORT_REPORT_DESTINATIONS = ['canonical', 'dry_run_preview'] as const;
+export type ImportReportDestination = (typeof IMPORT_REPORT_DESTINATIONS)[number];
+
+/** The canonical evidence artefact this stage writes its half of. */
+export const IMPORT_REPORT_FILE = 'import-report.json';
+
+/**
+ * The destination a set of options may publish to: a dry run gets the preview,
+ * everything else the artefact.
+ *
+ * Exported and argument-driven so the rule — rather than its consequence — is
+ * what the suite pins (Rule backend-architecture §11).
+ */
+export const importReportDestination = (options: ImportOptions): ImportReportDestination =>
+    options.dryRun ? 'dry_run_preview' : 'canonical';
+
+/**
+ * The absolute path a destination resolves to.
+ *
+ * The preview path carries the process id so two operators previewing at once
+ * do not overwrite each other's file, and it sits under the OS temporary
+ * directory so it is outside the repository and outside every path
+ * `scripts/lib/manifest.ts` will build inside the data tree.
+ */
+export const importReportTarget = (destination: ImportReportDestination): string =>
+    destination === 'canonical'
+        ? reportPath(IMPORT_REPORT_FILE)
+        : path.join(os.tmpdir(), `soh-catalog-import-dry-run-${process.pid}.json`);
 
 export interface ImportOutcome {
     /** `null` for a dry run, which deliberately opens no run — see runImport. */
     readonly runId: string | null;
     readonly resumed: boolean;
+    /**
+     * WHAT THIS INVOCATION DID, never what some earlier one did.
+     *
+     * A second run of a scope that already succeeded writes nothing and fetches
+     * nothing, so every write counter here is 0 and `processedBatches` is 0 —
+     * the no-op counts AAP §0.7.1 Group 3 requires of an identical rerun. It
+     * used to return the stored counts of the run that did the work, which made
+     * a no-op invocation report thousands of inserts it had not performed; a
+     * caller comparing runs, or a report built from this, could not tell the two
+     * apart. The durable totals are still available, under
+     * {@link historicalCounts}, where they cannot be mistaken for this run's.
+     *
+     * `planned` and the plan-time `skipped*` keys are this invocation's own:
+     * the plan is built before the run is claimed, so those are facts about
+     * work this invocation really did.
+     */
     readonly counts: Readonly<Record<string, number>>;
     readonly plannedBatches: number;
     readonly processedBatches: number;
+    /**
+     * True when the (kind, manifestVersion) scope had already succeeded, so this
+     * invocation stopped at the claim. `resumed` alone cannot say this — it is
+     * also true of a run that resumed a cursor and then imported the rest.
+     */
+    readonly alreadyCompleted: boolean;
+    /**
+     * The durable totals recorded by the run that did the work, when this
+     * invocation did none; `null` otherwise. Separate from {@link counts} so
+     * "this scope holds 11,983 records" and "this invocation wrote 0" are two
+     * readable facts rather than one ambiguous number.
+     */
+    readonly historicalCounts: Readonly<Record<string, number>> | null;
 }
+
+/**
+ * The count set an invocation starts from: its own plan size, its own plan-time
+ * skips, and a zero for everything only a write can raise.
+ *
+ * One function for both the working path and the already-completed path, so the
+ * no-op counts cannot drift from the real ones into a different set of keys — a
+ * consumer reading `counts.inserted` must find the key whether or not this
+ * invocation did any work.
+ */
+export const initialImportCounts = (plan: ImportPlan): Record<string, number> => ({
+    planned: plan.assignments.size,
+    inserted: 0,
+    updated: 0,
+    candidates: 0,
+    quarantined: 0,
+    rejected: 0,
+    missingFromVendor: 0,
+    // The durable batch counter belongs in the zero shape too. It is the one
+    // additive key recorded as the run goes rather than at the end, so a no-op
+    // invocation that omitted it reported a counts object one key SHORT of the
+    // working path's — and a consumer reading `counts.batchesProcessed` on an
+    // already-completed scope found `undefined` where every other figure was 0.
+    batchesProcessed: 0,
+    ...plan.skipped,
+});
 
 /**
  * One record this stage refused to publish, as the report lists it.
@@ -2560,7 +3146,56 @@ interface CategoryOutcomeCounts {
     rejected: number;
 }
 
-const CURSOR_SAVE_EVERY_BATCHES = 5;
+/**
+ * What ONE batch's transaction did, and the reason the report's totals are
+ * assembled from these rather than mutated in place.
+ *
+ * Every field here is produced inside the batch's transaction and merged into
+ * the run's in-memory totals only after that transaction has COMMITTED. The
+ * previous revision added to the totals inside the transaction, so a batch that
+ * rolled back — a statement timeout, a serialisation failure, a vendor-shaped
+ * record the persist step refused — left its rows absent from the database and
+ * its counts present in the report for the rest of the run: an import that
+ * reported 12,000 records written where 11,980 existed, with nothing to say
+ * which reading was wrong. A delta the commit gates is what makes the totals a
+ * statement about the database rather than about the attempt.
+ */
+interface BatchDelta {
+    /** The additive ledger keys: inserted, updated, candidates, quarantined, rejected, missingFromVendor, batchesProcessed. */
+    readonly counts: Record<string, number>;
+    readonly byCategory: Record<string, number>;
+    readonly byCheck: Record<string, number>;
+    readonly byIdentityStatus: Record<string, number>;
+    readonly byNutritionMethod: Record<string, number>;
+    readonly categoryOutcomes: Map<string, CategoryOutcomeCounts>;
+    /**
+     * Every record this batch refused, uncapped — a batch is at most
+     * `detailBatchSize` records, so the list is bounded by construction. The
+     * report's cap is applied when the delta is merged, not here: a rolled-back
+     * batch must not consume slots in a list it never contributed to.
+     */
+    readonly quarantined: QuarantinedRecord[];
+}
+
+const emptyBatchDelta = (): BatchDelta => ({
+    counts: {},
+    byCategory: {},
+    byCheck: {},
+    byIdentityStatus: {},
+    byNutritionMethod: {},
+    categoryOutcomes: new Map<string, CategoryOutcomeCounts>(),
+    quarantined: [],
+});
+
+const bumpCount = (target: Record<string, number>, key: string, by = 1): void => {
+    target[key] = (target[key] ?? 0) + by;
+};
+
+const mergeCountMap = (target: Record<string, number>, delta: Readonly<Record<string, number>>): void => {
+    for (const [key, value] of Object.entries(delta)) {
+        bumpCount(target, key, value);
+    }
+};
 
 /**
  * Runs the import: plan, then fetch and persist batch by batch, checkpointing
@@ -2597,6 +3232,215 @@ export const importRunScope = (manifestVersion: string, options: ImportOptions):
     return `${manifestVersion}+partial:${crypto.createHash('sha256').update(scope).digest('hex').slice(0, 16)}`;
 };
 
+// ---------------------------------------------------------------------------
+// The durable report snapshot (see ImportReportSnapshot).
+//
+// Three pure functions, all argument-driven so the resume arithmetic is pinned
+// by the suite rather than inferred from a run (Rule backend-architecture §11):
+// what may be carried, how a stored snapshot is read back, and how the carried
+// figures and the live ones are added up.
+// ---------------------------------------------------------------------------
+
+/**
+ * The counters a resumed run carries forward: measured outcomes only.
+ *
+ * `planned` and every `skipped*` counter are recomputed identically from the
+ * manifest by each attempt, so carrying them would double them.
+ */
+export const CARRIED_IMPORT_COUNT_KEYS: readonly string[] = [
+    'inserted',
+    'updated',
+    'candidates',
+    'quarantined',
+    'rejected',
+    'missingFromVendor',
+];
+
+const numericRecordOf = (value: unknown): Record<string, number> => {
+    const result: Record<string, number> = {};
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return result;
+    }
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof entry === 'number' && Number.isFinite(entry)) {
+            result[key] = entry;
+        }
+    }
+    return result;
+};
+
+const addNumericRecords = (
+    left: Readonly<Record<string, number>>,
+    right: Readonly<Record<string, number>>,
+): Record<string, number> => {
+    const sum: Record<string, number> = { ...left };
+    for (const [key, value] of Object.entries(right)) {
+        sum[key] = (sum[key] ?? 0) + value;
+    }
+    return sum;
+};
+
+const categoryOutcomeRecordOf = (value: unknown): Record<string, CategoryOutcomeCounts> => {
+    const result: Record<string, CategoryOutcomeCounts> = {};
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return result;
+    }
+    for (const [category, entry] of Object.entries(value as Record<string, unknown>)) {
+        const counts = numericRecordOf(entry);
+        result[category] = {
+            written: counts.written ?? 0,
+            candidates: counts.candidates ?? 0,
+            quarantined: counts.quarantined ?? 0,
+            rejected: counts.rejected ?? 0,
+        };
+    }
+    return result;
+};
+
+const addCategoryOutcomes = (
+    carried: Readonly<Record<string, CategoryOutcomeCounts>>,
+    live: ReadonlyMap<string, CategoryOutcomeCounts>,
+): Record<string, CategoryOutcomeCounts> => {
+    const sum: Record<string, CategoryOutcomeCounts> = {};
+    for (const [category, counts] of Object.entries(carried)) {
+        sum[category] = { ...counts };
+    }
+    for (const [category, counts] of live) {
+        const existing = sum[category];
+        sum[category] =
+            existing === undefined
+                ? { ...counts }
+                : {
+                      written: existing.written + counts.written,
+                      candidates: existing.candidates + counts.candidates,
+                      quarantined: existing.quarantined + counts.quarantined,
+                      rejected: existing.rejected + counts.rejected,
+                  };
+    }
+    return sum;
+};
+
+/**
+ * A refusal record as the snapshot stores it, or `null` when the stored value
+ * is not one — a cursor is JSONB and this stage reads back what some earlier
+ * revision of it wrote, so every field is checked rather than asserted.
+ */
+const refusalRecordOf = (value: unknown): QuarantinedRecord | null => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+    }
+    const record = value as Partial<QuarantinedRecord>;
+    if (
+        typeof record.sourceKey !== 'string' ||
+        typeof record.fdcId !== 'number' ||
+        typeof record.category !== 'string' ||
+        typeof record.foodState !== 'string' ||
+        typeof record.publicationStatus !== 'string'
+    ) {
+        return null;
+    }
+    return {
+        sourceKey: record.sourceKey,
+        fdcId: record.fdcId,
+        category: record.category,
+        foodState: record.foodState,
+        publicationStatus: record.publicationStatus,
+        failedChecks: Array.isArray(record.failedChecks)
+            ? record.failedChecks.filter((check): check is string => typeof check === 'string')
+            : [],
+    };
+};
+
+/**
+ * Reads a stored snapshot back off a cursor, or `null` when the cursor carries
+ * none or carries something unusable.
+ *
+ * A cursor whose snapshot cannot be read is treated as an absent one rather
+ * than as a failure: the batch index beside it is still valid, the work it
+ * names is already committed to the catalog, and refusing to resume would
+ * abandon it. The report says which case it is.
+ */
+export const readImportReportSnapshot = (cursor: unknown): ImportReportSnapshot | null => {
+    if (cursor === null || typeof cursor !== 'object' || Array.isArray(cursor)) {
+        return null;
+    }
+    const stored = (cursor as Partial<ImportCursor>).report;
+    if (stored === null || stored === undefined || typeof stored !== 'object' || Array.isArray(stored)) {
+        return null;
+    }
+    const snapshot = stored as Partial<ImportReportSnapshot>;
+    const refused = Array.isArray(snapshot.refused)
+        ? snapshot.refused.map(refusalRecordOf).filter((record): record is QuarantinedRecord => record !== null)
+        : [];
+
+    return {
+        attempts: typeof snapshot.attempts === 'number' && snapshot.attempts > 0 ? Math.floor(snapshot.attempts) : 1,
+        throughBatchIndex: typeof snapshot.throughBatchIndex === 'number' ? Math.max(0, snapshot.throughBatchIndex) : 0,
+        processedBatches: typeof snapshot.processedBatches === 'number' ? Math.max(0, snapshot.processedBatches) : 0,
+        counts: numericRecordOf(snapshot.counts),
+        byCategory: numericRecordOf(snapshot.byCategory),
+        byCheck: numericRecordOf(snapshot.byCheck),
+        byIdentityStatus: numericRecordOf(snapshot.byIdentityStatus),
+        byNutritionMethod: numericRecordOf(snapshot.byNutritionMethod),
+        byCategoryOutcome: categoryOutcomeRecordOf(snapshot.byCategoryOutcome),
+        refused,
+    };
+};
+
+/**
+ * The live figures added to the carried ones — the whole run as of one batch
+ * index, which is what both the checkpoint and the final report state.
+ *
+ * The refusal list is carried in order (earlier attempts first) and deduplicated
+ * by source key, because a resumed attempt re-processes the batches between the
+ * cursor and wherever the previous attempt stopped and would otherwise list the
+ * same record twice; it is then bounded by the same limit the live list uses, and
+ * the report derives truncation from `total > listed`.
+ */
+export const combineImportReportFigures = (input: {
+    readonly carried: ImportReportSnapshot | null;
+    readonly attempts: number;
+    readonly throughBatchIndex: number;
+    readonly processedBatches: number;
+    readonly counts: Readonly<Record<string, number>>;
+    readonly byCategory: Readonly<Record<string, number>>;
+    readonly byCheck: Readonly<Record<string, number>>;
+    readonly byIdentityStatus: Readonly<Record<string, number>>;
+    readonly byNutritionMethod: Readonly<Record<string, number>>;
+    readonly byCategoryOutcome: ReadonlyMap<string, CategoryOutcomeCounts>;
+    readonly refused: readonly QuarantinedRecord[];
+    readonly refusalListLimit: number;
+}): ImportReportSnapshot => {
+    const carried = input.carried;
+    const liveCounts: Record<string, number> = {};
+    for (const key of CARRIED_IMPORT_COUNT_KEYS) {
+        liveCounts[key] = input.counts[key] ?? 0;
+    }
+
+    const seen = new Set<string>();
+    const refused: QuarantinedRecord[] = [];
+    for (const record of [...(carried?.refused ?? []), ...input.refused]) {
+        if (seen.has(record.sourceKey) || refused.length >= input.refusalListLimit) {
+            continue;
+        }
+        seen.add(record.sourceKey);
+        refused.push(record);
+    }
+
+    return {
+        attempts: input.attempts,
+        throughBatchIndex: input.throughBatchIndex,
+        processedBatches: (carried?.processedBatches ?? 0) + input.processedBatches,
+        counts: addNumericRecords(carried?.counts ?? {}, liveCounts),
+        byCategory: addNumericRecords(carried?.byCategory ?? {}, input.byCategory),
+        byCheck: addNumericRecords(carried?.byCheck ?? {}, input.byCheck),
+        byIdentityStatus: addNumericRecords(carried?.byIdentityStatus ?? {}, input.byIdentityStatus),
+        byNutritionMethod: addNumericRecords(carried?.byNutritionMethod ?? {}, input.byNutritionMethod),
+        byCategoryOutcome: addCategoryOutcomes(carried?.byCategoryOutcome ?? {}, input.byCategoryOutcome),
+        refused,
+    };
+};
+
 /**
  * Reports what a dry run would write, without a run row, a cursor or a
  * completion — see the note at the call site.
@@ -2623,41 +3467,51 @@ const reportDryRun = async (
         records: plan.assignments.size,
         planFingerprint: plan.fingerprint.slice(0, 16),
         note: 'no run row, cursor or completion was written, so the canonical import is unaffected',
+        previewReport: importReportTarget('dry_run_preview'),
     });
 
-    deps.writeReport({
-        stage: STAGE,
-        generatedAt: deps.now().toISOString(),
-        runId: null,
-        usdaManifestVersion: deps.manifest.usdaManifestVersion,
-        coveragePlanVersion: coveragePlan.coveragePlanVersion,
-        planFingerprint: plan.fingerprint,
-        options: {
-            categories: deps.options.categories,
-            limit: deps.options.limit,
-            resume: deps.options.resume,
-            dryRun: true,
-            manifestVersion: deps.options.manifestVersion,
+    // The PREVIEW destination, never the canonical artefact: these counters are
+    // hypotheses about an import that has not happened, and this invocation
+    // holds no stage lock (see IMPORT_REPORT_DESTINATIONS).
+    deps.writeReport(
+        {
+            stage: STAGE,
+            reportKind: 'dry_run_preview',
+            reportKindBasis:
+                'A preview of the plan, not evidence of an import: every outcome counter below is zero because nothing was fetched, written or validated, and this invocation held no catalog stage lock. The canonical import-report.json was not touched.',
+            generatedAt: deps.now().toISOString(),
+            runId: null,
+            usdaManifestVersion: deps.manifest.usdaManifestVersion,
+            coveragePlanVersion: coveragePlan.coveragePlanVersion,
+            planFingerprint: plan.fingerprint,
+            options: {
+                categories: deps.options.categories,
+                limit: deps.options.limit,
+                resume: deps.options.resume,
+                dryRun: true,
+                manifestVersion: deps.options.manifestVersion,
+            },
+            plannedBatches: plan.batches.length,
+            processedBatches: 0,
+            counts,
+            byCategory: {},
+            failedChecks: {},
+            // A plan-time fact, so a dry run can state it: both mechanisms are
+            // applied while the work list is built, before any fetch. The measured
+            // blocks (categories, failuresByCheck, quarantined) are deliberately
+            // NOT here — nothing was validated or written, and an empty block
+            // would read as "none found" rather than "never looked".
+            duplicatesRemoved: buildDuplicatesRemovedBlock(plan),
+            // Reported for a dry run too, because a dry run really does spend
+            // vendor requests: buildImportPlan walks the dataset sweeps through
+            // /foods/list to decide the batches. Omitting the block would make the
+            // one command an operator runs to find out what an import costs the
+            // only one that does not say what it cost.
+            usdaRequests: buildUsdaRequestsBlock(deps.manifest, deps.rateLimiterStats),
+            note: 'dry run: the plan only. Any dataset-sweep enumeration pages the plan needed were fetched and are counted in usdaRequests (attempts states how many), but no detail record was fetched, nothing was written, and no run or checkpoint state was touched, so the canonical import still has its work to do.',
         },
-        plannedBatches: plan.batches.length,
-        processedBatches: 0,
-        counts,
-        byCategory: {},
-        failedChecks: {},
-        // A plan-time fact, so a dry run can state it: both mechanisms are
-        // applied while the work list is built, before any fetch. The measured
-        // blocks (categories, failuresByCheck, quarantined) are deliberately
-        // NOT here — nothing was validated or written, and an empty block
-        // would read as "none found" rather than "never looked".
-        duplicatesRemoved: buildDuplicatesRemovedBlock(plan),
-        // Reported for a dry run too, because a dry run really does spend
-        // vendor requests: buildImportPlan walks the dataset sweeps through
-        // /foods/list to decide the batches. Omitting the block would make the
-        // one command an operator runs to find out what an import costs the
-        // only one that does not say what it cost.
-        usdaRequests: buildUsdaRequestsBlock(deps.manifest, deps.rateLimiterStats),
-        note: 'dry run: the plan only. Any dataset-sweep enumeration pages the plan needed were fetched and are counted in usdaRequests (attempts states how many), but no detail record was fetched, nothing was written, and no run or checkpoint state was touched, so the canonical import still has its work to do.',
-    });
+        'dry_run_preview',
+    );
 
     return {
         runId: null,
@@ -2665,6 +3519,11 @@ const reportDryRun = async (
         counts,
         plannedBatches: plan.batches.length,
         processedBatches: 0,
+        // A dry run claims no run row, so it can neither complete a scope nor
+        // find one completed: it has no history to report and is not a no-op
+        // invocation of an imported scope, it is a plan.
+        alreadyCompleted: false,
+        historicalCounts: null,
     };
 };
 
@@ -2694,6 +3553,21 @@ const countCategoryOutcome = (
         row.rejected += 1;
     }
     byCategory.set(category, row);
+};
+
+/** Adds one batch's per-category outcome rows into the run's totals, after its commit. */
+const mergeCategoryOutcomes = (
+    target: Map<string, CategoryOutcomeCounts>,
+    delta: ReadonlyMap<string, CategoryOutcomeCounts>,
+): void => {
+    for (const [category, row] of delta) {
+        const total = target.get(category) ?? { written: 0, candidates: 0, quarantined: 0, rejected: 0 };
+        total.written += row.written;
+        total.candidates += row.candidates;
+        total.quarantined += row.quarantined;
+        total.rejected += row.rejected;
+        target.set(category, total);
+    }
 };
 
 /**
@@ -2846,50 +3720,69 @@ export const IMPORT_REPORT_NOTE_KEY = 'importStageWrite';
  * unreadable content forward under this run's name, and failing the import
  * over a stale report file would throw away work that is already committed to
  * the database. Neither is silent.
+ *
+ * HOW THE MERGE IS DONE, AND WHY NOT WITH A TOP-LEVEL SPREAD. Two kinds of key
+ * live in this document. A stage-private key (`counts`, `usdaRequests`,
+ * `aiGenerationCounts`) belongs to one stage and is replaced by it. A
+ * CO-WRITTEN block — `duplicatesRemoved`, `failuresByCheck` — carries one
+ * sub-key per stage (`skippedCuratedIdentityAtImport`, `importStage`,
+ * `generationStage`, `validateStage`) because the three stages answer the same
+ * question from three vantage points and a reader wants them side by side. A
+ * top-level spread replaces the whole block, so an import used to delete
+ * generation's `generationStage` sub-key and a generation run used to delete
+ * the import's. `mergeStageReport` in scripts/lib/manifest.ts is the one place
+ * that knows the difference, and it is shared with the generation stage's
+ * writer so the two cannot drift apart.
+ *
+ * HOW IT IS PUBLISHED. The merge is a read-modify-write of a committed evidence
+ * artefact, so it runs under the artefact directory's publication lock — two
+ * stages interleaving would lose one of them entirely, even though each write
+ * is atomic on its own — and the document replaces the file through
+ * `writeJsonFile`'s staged-then-renamed write, so an interrupted run leaves the
+ * previous complete report rather than a truncated one.
  */
 export const writeImportReport = (target: string, report: unknown, log: ScriptLogger): void => {
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-
-    let existing: Record<string, unknown> = {};
-    if (fs.existsSync(target)) {
-        try {
-            const parsed: unknown = JSON.parse(fs.readFileSync(target, 'utf-8'));
-            // Objects only. A JSON array or scalar is a valid document and a
-            // useless base to merge into, so it is treated as unusable rather
-            // than spread into an object shape it does not have.
-            if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-                existing = parsed as Record<string, unknown>;
-            } else {
+    withArtifactPublicationLockSync(path.dirname(target), `${STAGE}:report`, () => {
+        let existing: Record<string, unknown> = {};
+        if (fs.existsSync(target)) {
+            try {
+                const parsed: unknown = JSON.parse(fs.readFileSync(target, 'utf-8'));
+                // Objects only. A JSON array or scalar is a valid document and a
+                // useless base to merge into, so it is treated as unusable rather
+                // than spread into an object shape it does not have.
+                if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    existing = parsed as Record<string, unknown>;
+                } else {
+                    log.warn('report_replaced', {
+                        stage: STAGE,
+                        file: path.basename(target),
+                        reason: 'the existing report is not a JSON object, so there is nothing to merge into',
+                    });
+                }
+            } catch (error) {
                 log.warn('report_replaced', {
                     stage: STAGE,
                     file: path.basename(target),
-                    reason: 'the existing report is not a JSON object, so there is nothing to merge into',
+                    reason: 'the existing report could not be parsed as JSON',
+                    error: safeError(error),
                 });
             }
-        } catch (error) {
-            log.warn('report_replaced', {
-                stage: STAGE,
-                file: path.basename(target),
-                reason: 'the existing report could not be parsed as JSON',
-                error: safeError(error),
-            });
         }
-    }
 
-    const merged = {
-        ...existing,
-        ...(report as Record<string, unknown>),
-        [IMPORT_REPORT_NOTE_KEY]: {
-            mergedIntoExisting: Object.keys(existing).length > 0,
-            preservedKeys: Object.keys(existing)
-                .filter((key) => !Object.prototype.hasOwnProperty.call(report as Record<string, unknown>, key))
-                .sort(),
-            basis:
-                'The import stage replaces the keys it measures and preserves every other key in the document, because catalog-report.ts aggregates into the same file. preservedKeys names what this write left alone, so a reader can tell which half of the artefact this run produced.',
-        },
-    };
+        const merged = mergeStageReport(existing, report as Record<string, unknown>, {
+            noteKey: IMPORT_REPORT_NOTE_KEY,
+            stage: STAGE,
+        });
 
-    fs.writeFileSync(target, `${JSON.stringify(merged, null, 2)}\n`, 'utf-8');
+        writeJsonFile(target, merged.document);
+
+        log.info('report_written', {
+            stage: STAGE,
+            file: path.basename(target),
+            preservedKeys: merged.preservedKeys.length,
+            preservedSubKeys: Object.keys(merged.preservedSubKeys).length,
+        });
+    });
 };
 
 /**
@@ -2902,9 +3795,47 @@ export const writeImportReport = (target: string, report: unknown, log: ScriptLo
 const buildDuplicatesRemovedBlock = (plan: ImportPlan): Record<string, unknown> => ({
     skippedCuratedIdentityAtImport: plan.skipped.skippedCuratedIdentity ?? 0,
     skippedDuplicateInPlanAtImport: plan.skipped.skippedDuplicateInPlan ?? 0,
-    basis:
+    // `basisAtImport`, not `basis`: this block is co-written — the generation
+    // stage contributes `generationStage` and its own prose, and the report
+    // stage contributes the catalog-wide figures — so a shared `basis` key
+    // meant whichever stage ran last described only its own sub-keys while
+    // appearing to describe the block. Stage-suffixed, like the two counters
+    // above it (scripts/lib/manifest.ts, CROSS-STAGE REPORT MERGING).
+    basisAtImport:
         'Two import-stage mechanisms, both applied while the plan is built and before any fetch: a swept record whose normalised identity collides with a reviewed curated entry is never assigned, and an FDC id already in the plan is never assigned twice. The cross-table duplicate decision is deliberately NOT made here - it needs a view of the whole non-rejected table that a batch-at-a-time import cannot have - so dedupeIdentity runs in catalog:validate and its duplicate_identity counts appear in the validation report.',
 });
+
+/**
+ * One refusal tier as the report states it: its own total, its own bounded
+ * worklist, and truncation derived from the two.
+ *
+ * `tier` is the `publication_status` the block counts, so the figure is
+ * self-describing rather than needing the reader to know which statuses this
+ * stage can write.
+ */
+export const buildRefusalBlock = (
+    tier: 'quarantined' | 'rejected',
+    figures: ImportReportSnapshot,
+): Record<string, unknown> => {
+    const records = figures.refused.filter((record) => record.publicationStatus === tier);
+    const total = figures.counts[tier] ?? 0;
+
+    return {
+        tier,
+        total,
+        listed: records.length,
+        // `total > listed`, never `listed >= limit`: the worklist is capped, so
+        // the only honest statement of truncation is that the run refused more
+        // records than the list names.
+        truncated: total > records.length,
+        listLimit: QUARANTINE_LIST_LIMIT,
+        records,
+        basis:
+            tier === 'quarantined'
+                ? 'Records this run wrote with publication_status quarantined: held because a check could not be satisfied with the data available, re-validated by catalog:validate, and publishable once it can be.'
+                : 'Records this run wrote with publication_status rejected: refused outright by a reject-tier check (physically impossible nutrition, a brand-pattern name, a conversion that does not reconcile) and never publishable. Counted separately from quarantined because the two are different outcomes and summing them overstates what a later pass can recover.',
+    };
+};
 
 /**
  * The `usdaRequests` block, written from the limiter's own counters.
@@ -2940,12 +3871,24 @@ const buildUsdaRequestsBlock = (
         headroomReason:
             "Left on the same key for the running API's estimate, label-scan and branded-search traffic, which share the credential with this import.",
         limiterCountsPhysicalAttempts: true,
+        // The ceiling is the code's, not this document's: a value above it is
+        // refused at startup by getUsdaImportRateLimitPerHour and again by
+        // createUsdaRateLimiter, so `configuredPerHour` can never exceed it and
+        // the headroom above is a guarantee rather than a convention.
+        importCeilingPerHour: USDA_IMPORT_POLICY_CAP_PER_HOUR,
+        importCeilingBasis:
+            'scripts/lib/rateLimiter.ts USDA_IMPORT_POLICY_CAP_PER_HOUR. USDA allows 1,000 requests/hour per key; the import is capped at 900 and refuses any higher configuration at startup, because the remaining 100/hour are the running API\'s share of the same key. 901-1,000 is legal for the vendor and illegal for this import, and a lower value only paces the import more gently.',
         pausesNote:
             'An exhausted bucket or a spent hour makes the import WAIT, never fail, so a non-zero pause count is the ceiling working rather than an error. The limiter fails the run only when its durable ledger cannot be trusted.',
-        // Declared, not omitted: a reader looking for "how many 429s" must find
-        // out that nobody counted them, rather than infer a zero.
-        statusClassCountsUnavailable:
-            'The limiter gates every physical attempt but does not see the response, so attempts are not broken down by status class. A 429/5xx split would have to be counted inside src/services/usda.service.ts, where the response is read. Not estimated here.',
+        // The split IS counted, in the one place that can count it: the limiter
+        // wraps the transport, so it holds each physical response and reads its
+        // status, while usda.service.ts's retry ladder resolves several physical
+        // answers into one logical outcome and can no longer say how many were
+        // 429s. This block used to carry a sentence saying nobody counted them.
+        statusClassCountsBasis:
+            'Measured by scripts/lib/rateLimiter.ts at the transport, one bucket per physical attempt: 400, 408 and 429 exactly, the rest of 4xx as otherClientError, 5xx as serverError, 2xx as ok2xx, anything unreadable as otherStatus. A request that never produced a response is counted under transportFailures instead.',
+        statusClassCountsIdentity:
+            'attempts === ok2xx + retryable400 + timeout408 + throttled429 + otherClientError + serverError + otherStatus + transportFailures. Every admitted attempt is charged to the hour and to exactly one bucket, so this identity is how the block is checked from the artefact alone.',
     };
 
     if (readStats === undefined) {
@@ -2953,7 +3896,7 @@ const buildUsdaRequestsBlock = (
             ...accounting,
             unmeasured: true,
             unmeasuredReason:
-                'This invocation installed no rate limiter, so there are no attempt or pause counters to report. The fields are absent rather than zero: zero would claim the run issued no vendor request.',
+                'This invocation installed no rate limiter, so there are no attempt, pause or status counters to report — attempts, pauses, totalPausedMs, longestPauseMs, firstAttemptAt, lastAttemptAt, attemptsInWindow, ledgerKind, ledgerScope, policyCapPerHour, statusClassCounts and transportFailures are all absent rather than zero, because zero would claim the run issued no vendor request and answered none.',
         };
     }
 
@@ -2964,10 +3907,21 @@ const buildUsdaRequestsBlock = (
  * Settles a run row an attempt is abandoning, and never replaces the failure
  * an operator has to act on.
  *
- * The cursor is left exactly as the last checkpoint wrote it: the row records
- * that the attempt stopped, while the saved batch index is what `--resume`
- * continues from. A failure to record the failure is reported BESIDE the
- * original, never instead of it — the caller rethrows what it caught.
+ * The cursor is left exactly as the last committed batch wrote it: the row
+ * records that the attempt stopped, while the saved batch index is what
+ * `--resume` continues from. A failure to record the failure is reported BESIDE
+ * the original, never instead of it — the caller rethrows what it caught.
+ *
+ * IT MERGES NO COUNTS, AND THAT IS THE FIX FOR A DOUBLE COUNT. Each batch now
+ * records its own counts inside its own transaction, so by the time this runs
+ * the ledger already holds exactly the work that committed. The previous
+ * revision passed this attempt's absolute totals to `finishRun`, which merges
+ * additively: with the cursor saved only every fifth batch, up to four batches'
+ * worth of committed rows sat beyond it, a retry reprocessed them, and their
+ * counts were merged a second time — so a run that imported N records could
+ * report more than N, and the overstatement grew with every retry. The totals
+ * are still LOGGED here, because what this attempt did is what the operator is
+ * reading; they are simply not written again.
  */
 const closeFailedRun = async (
     deps: RunImportDeps,
@@ -2981,12 +3935,12 @@ const closeFailedRun = async (
         runId,
         code: failure.code,
         error: failure.error,
-        counts: JSON.stringify(counts),
-        note: 'the checkpoint cursor is untouched, so `npm run catalog:import -- --resume` continues from the last saved batch',
+        attemptCounts: JSON.stringify(counts),
+        note: 'each batch recorded its own counts and cursor in its own transaction, so `npm run catalog:import -- --resume` continues from the last committed batch and nothing is counted twice',
     });
 
     try {
-        await finishRun(deps.runDb, runId, 'failed', { counts: { ...counts }, error, logger: deps.logger });
+        await finishRun(deps.runDb, runId, 'failed', { error, logger: deps.logger });
     } catch (closeError) {
         deps.logger.error('run_close_failed', { stage: STAGE, runId, error: safeError(closeError) });
     }
@@ -3008,6 +3962,14 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
         );
     }
 
+    // ALSO BEFORE THE LIMITER, THE PLAN AND THE FIRST REQUEST. The manifest's
+    // own `coveragePlanContract` assigns this cross-file check to the importer
+    // and requires it to stop the run before the first USDA request: a category
+    // or food group the two documents disagree about mis-files every record it
+    // touches, and no part of the import resolves a disagreement between two
+    // committed files.
+    assertManifestMatchesCoveragePlan(manifest, coveragePlan, logger);
+
     const policy: CatalogValidationPolicy = {
         categories: coveragePlan.categories,
         validationBounds: coveragePlan.validationBounds,
@@ -3015,7 +3977,7 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
 
     const restoreFetch = deps.installRateLimiter();
     try {
-        const plan = await buildImportPlan(manifest, deps.usda.listFoods, options, logger);
+        const plan = await buildImportPlan(manifest, coveragePlan, deps.usda.listFoods, options, logger);
         logger.info('plan_built', {
             stage: STAGE,
             batches: plan.batches.length,
@@ -3047,20 +4009,37 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             initialCursor: { fingerprint: plan.fingerprint, nextBatchIndex: 0 },
             logger,
             now: deps.now,
+            // What makes `--resume` mean something. The flag was parsed and then
+            // never reached the claim, so an unfinished run was continued
+            // whether or not the operator asked for it — and the usage line
+            // saying otherwise described no code. Passing it here makes
+            // continuing explicit: without the flag an unfinished run under this
+            // key is refused (`run_resume_not_requested`) and nothing is
+            // written, and a run that already SUCCEEDED is still recognised and
+            // still does no work, because that is not a resume.
+            resume: options.resume,
         });
 
         if (claim.alreadyCompleted) {
+            const historicalCounts = (claim.run.counts ?? {}) as Record<string, number>;
             logger.info('run_already_completed', {
                 stage: STAGE,
                 runId: claim.run.id,
-                counts: JSON.stringify(claim.run.counts ?? {}),
+                // Both, labelled: what this invocation did (nothing) and what
+                // the scope holds. One `counts` field carrying the stored
+                // totals is what made a no-op look like an import.
+                counts: JSON.stringify(initialImportCounts(plan)),
+                historicalCounts: JSON.stringify(historicalCounts),
+                note: 'this invocation fetched nothing and wrote nothing; the counts above are its own and the historical ones belong to the run that imported the scope',
             });
             return {
                 runId: claim.run.id,
                 resumed: true,
-                counts: (claim.run.counts ?? {}) as Record<string, number>,
+                counts: initialImportCounts(plan),
                 plannedBatches: plan.batches.length,
                 processedBatches: 0,
+                alreadyCompleted: true,
+                historicalCounts,
             };
         }
 
@@ -3068,16 +4047,7 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
         // partial work: only `batchesProcessed` is recorded durably as the run
         // goes, and a run closed 'failed' with nothing else would say a run
         // that imported 9,000 records imported none.
-        const counts: Record<string, number> = {
-            planned: plan.assignments.size,
-            inserted: 0,
-            updated: 0,
-            candidates: 0,
-            quarantined: 0,
-            rejected: 0,
-            missingFromVendor: 0,
-            ...plan.skipped,
-        };
+        const counts: Record<string, number> = initialImportCounts(plan);
         const byCategory: Record<string, number> = {};
         const byCheck: Record<string, number> = {};
         const byIdentityStatus: Record<string, number> = {};
@@ -3098,10 +4068,27 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
         try {
         const savedCursor = claim.run.cursor;
         let startIndex = 0;
+        // The figures earlier attempts of THIS run measured, as of the batch
+        // index the cursor names. Restored only when the cursor belongs to this
+        // plan: a changed work list restarts at zero, so its figures describe
+        // batches this attempt is about to redo (see ImportReportSnapshot).
+        let carriedReport: ImportReportSnapshot | null = null;
         if (claim.resumed && savedCursor !== null && typeof savedCursor === 'object') {
             const cursor = savedCursor as Partial<ImportCursor>;
             if (cursor.fingerprint === plan.fingerprint && typeof cursor.nextBatchIndex === 'number') {
                 startIndex = Math.max(0, Math.min(cursor.nextBatchIndex, plan.batches.length));
+                carriedReport = readImportReportSnapshot(savedCursor);
+                logger.info('report_state_restored', {
+                    stage: STAGE,
+                    runId: claim.run.id,
+                    throughBatchIndex: carriedReport?.throughBatchIndex ?? 0,
+                    carriedAttempts: carriedReport?.attempts ?? 0,
+                    carriedInserted: carriedReport?.counts.inserted ?? 0,
+                    basis:
+                        carriedReport === null
+                            ? 'the cursor carries no report snapshot (written by an earlier revision of this stage), so the final report states this attempt only and says so'
+                            : 'the final report states the whole run: these figures plus what this attempt measures',
+                });
             } else {
                 // The work list changed between runs, so the saved index names
                 // a different batch than it did. Restarting is the only correct
@@ -3120,12 +4107,55 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             }
         }
 
-        // The batch index the durable `batchesProcessed` total was last brought
-        // up to. It starts at the RESUME index, not at 0: recordCounts merges
-        // additively into the run row, the earlier invocation already recorded
-        // the batches it did, and starting from 0 would record them a second
-        // time. On a fresh run startIndex is 0, so the two readings agree.
-        let lastCheckpointBatchIndex = startIndex;
+        // THE PLAN'S OWN TOTALS, RECORDED ONCE PER RUN ROW.
+        //
+        // `planned` and the `skipped*` keys describe the WORK LIST, not any
+        // batch, and the run ledger merges additively — so recording them on
+        // every attempt would multiply them by the number of times the run was
+        // resumed. A fresh run row records them here, before its first batch, so
+        // an interrupted run's row already says how much work the attempt set
+        // out to do; a resumed row already carries them from the attempt that
+        // opened it.
+        //
+        // The additive keys are written at zero in the same statement, so the
+        // row carries its whole shape from the moment it opens. Adding zero is
+        // arithmetically nothing — the batches below still supply every real
+        // increment — but it is the difference between a reader seeing
+        // `inserted: 0` on a run that inserted nothing and seeing no `inserted`
+        // key at all, which reads as a ledger that does not track inserts.
+        if (!claim.resumed) {
+            await saveCheckpoint<ImportCursor>(deps.runDb, claim.run.id, {
+                cursor: { fingerprint: plan.fingerprint, nextBatchIndex: startIndex },
+                // The same zero shape the outcome reports, from the one helper
+                // that states it: two copies of this list drifted apart once
+                // already, and the row's shape and the outcome's shape are the
+                // same promise made to two readers.
+                counts: initialImportCounts(plan),
+            });
+        }
+
+        // This attempt's number within the run, fixed before the first batch so
+        // every checkpoint of it records the same value.
+        const attemptNumber = (carriedReport?.attempts ?? 0) + 1;
+
+        // The whole run's figures as of a batch index: the carried snapshot plus
+        // whatever this attempt has measured. Used both for the checkpoint and
+        // for the final report, so the two can never disagree.
+        const figuresThrough = (throughBatchIndex: number): ImportReportSnapshot =>
+            combineImportReportFigures({
+                carried: carriedReport,
+                attempts: attemptNumber,
+                throughBatchIndex,
+                processedBatches,
+                counts,
+                byCategory,
+                byCheck,
+                byIdentityStatus,
+                byNutritionMethod,
+                byCategoryOutcome,
+                refused: quarantined,
+                refusalListLimit: QUARANTINE_LIST_LIMIT,
+            });
 
         for (let index = startIndex; index < plan.batches.length; index += 1) {
             const batch = plan.batches[index];
@@ -3138,8 +4168,11 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             let details: UsdaFoodDetail[];
             let retrieval: UsdaBatchRetrieval | null;
             try {
-                details = options.dryRun ? [] : await deps.usda.getFoodsBatch(batch.fdcIds);
-                retrieval = options.dryRun ? null : await deps.usda.describeBatchRetrieval(batch.fdcIds);
+                // One call, so the records and the facts describing how they
+                // were obtained cannot come from two different requests.
+                const fetched = options.dryRun ? null : await deps.usda.fetchBatch(batch.fdcIds);
+                details = fetched === null ? [] : fetched.details;
+                retrieval = fetched === null ? null : fetched.retrieval;
             } catch (error) {
                 throw asImportFailure(error, {
                     batchIndex: batch.index,
@@ -3147,13 +4180,39 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                     sweepKey: batch.source,
                 });
             }
-            const returned = new Set<number>();
+            // Derived from what the vendor answered, before the transaction, so
+            // the whole delta below — including the records USDA did not return
+            // — is computed from data the transaction does not depend on.
+            const returned = new Set<number>(details.map((detail) => detail.fdcId));
+            const missing = batch.fdcIds.filter((fdcId) => !returned.has(fdcId));
 
             if (!options.dryRun && retrieval !== null) {
-                await deps.db.$transaction(
-                    async (tx) => {
+                // ONE TRANSACTION PER BATCH, CARRYING THE ROWS, THE CURSOR AND
+                // THE COUNTS.
+                //
+                // The three used to be three commits: the rows here, then
+                // `saveCursor` and `recordCounts` afterwards on `runDb`, and
+                // only every fifth batch. Two things followed, and both were
+                // silent. A crash between them left a run whose cursor named an
+                // earlier batch than its counts described, so the resume redid
+                // work the ledger had already claimed; and with the cursor
+                // written every fifth batch, up to four batches of committed
+                // rows were invisible to it, so a retry reprocessed them and
+                // (because the closure merged this attempt's absolute totals)
+                // counted them twice.
+                //
+                // `deps.db` and `deps.runDb` are two structural views of ONE
+                // Prisma client — `main()` casts the singleton for the first and
+                // passes the same object as the second — so the batch's
+                // transaction client can carry the ledger write too, and
+                // `saveCheckpoint` run inside a caller's transaction holds its
+                // row lock until that transaction commits. The batch is
+                // therefore atomic in the only sense that matters to a resume:
+                // its rows exist if and only if its cursor and counts say so.
+                const delta = await deps.db.$transaction(
+                    async (tx): Promise<BatchDelta> => {
+                        const batchDelta = emptyBatchDelta();
                         for (const detail of details) {
-                            returned.add(detail.fdcId);
                             const assignment = plan.assignments.get(detail.fdcId);
                             if (assignment === undefined) {
                                 continue;
@@ -3170,35 +4229,46 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                                 publicationStatus,
                                 fetchedAt,
                             );
-                            counts[outcome] += 1;
-                            counts[publicationStatusCountKey(publicationStatus)] += 1;
-                            byCategory[prepared.row.category] = (byCategory[prepared.row.category] ?? 0) + 1;
+                            bumpCount(batchDelta.counts, outcome);
+                            bumpCount(batchDelta.counts, publicationStatusCountKey(publicationStatus));
+                            bumpCount(batchDelta.byCategory, prepared.row.category);
 
                             // Measured from the row that was just written, not
                             // asserted from what this stage "always" writes: a
                             // report that states its own policy back to itself
                             // cannot show the policy being broken.
-                            byIdentityStatus[prepared.row.identity_status] =
-                                (byIdentityStatus[prepared.row.identity_status] ?? 0) + 1;
-                            byNutritionMethod[prepared.nutritionMethod] =
-                                (byNutritionMethod[prepared.nutritionMethod] ?? 0) + 1;
-                            countCategoryOutcome(byCategoryOutcome, prepared.row.category, publicationStatus);
+                            bumpCount(batchDelta.byIdentityStatus, prepared.row.identity_status);
+                            bumpCount(batchDelta.byNutritionMethod, prepared.nutritionMethod);
+                            countCategoryOutcome(
+                                batchDelta.categoryOutcomes,
+                                prepared.row.category,
+                                publicationStatus,
+                            );
 
                             const failedChecks: string[] = [];
                             for (const check of verdict.checks) {
                                 if (!check.pass) {
-                                    byCheck[check.name] = (byCheck[check.name] ?? 0) + 1;
+                                    bumpCount(batchDelta.byCheck, check.name);
                                     failedChecks.push(check.name);
                                 }
                             }
+                            // The import-stage refusal, counted and named the
+                            // same way so a quarantined record is never
+                            // unexplained in the report. It is not a member of
+                            // catalog.logic.ts's CATALOG_CHECK_NAMES because
+                            // that registry judges the FOOD, and this judges
+                            // the retrieval — see IMPORT_CHECK_MISSING_RETRIEVAL_STATUS.
+                            if (prepared.retrievalStatusMissing) {
+                                byCheck[IMPORT_CHECK_MISSING_RETRIEVAL_STATUS] =
+                                    (byCheck[IMPORT_CHECK_MISSING_RETRIEVAL_STATUS] ?? 0) + 1;
+                                failedChecks.push(IMPORT_CHECK_MISSING_RETRIEVAL_STATUS);
+                            }
 
-                            // Listed individually, capped, because the list is
-                            // a worklist an operator acts on rather than a
-                            // metric: a 12,000-record refusal must not produce
-                            // a report too large to open, and the per-check and
-                            // per-category totals above stay complete either way.
-                            if (publicationStatus !== 'candidate' && quarantined.length < QUARANTINE_LIST_LIMIT) {
-                                quarantined.push({
+                            // Collected in full for this batch; the report's cap
+                            // is applied when the delta is merged, so a batch
+                            // that rolls back consumes none of the list.
+                            if (publicationStatus !== 'candidate') {
+                                batchDelta.quarantined.push({
                                     sourceKey: prepared.sourceKey,
                                     fdcId: prepared.fdcId,
                                     category: prepared.row.category,
@@ -3208,45 +4278,93 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                                 });
                             }
                         }
+
+                        bumpCount(batchDelta.counts, 'missingFromVendor', missing.length);
+                        bumpCount(batchDelta.counts, 'batchesProcessed');
+
+                        // LAST STATEMENT IN THE TRANSACTION, AND THE REASON IT
+                        // IS A TRANSACTION. The cursor names the NEXT batch, so
+                        // writing it here means "everything up to and including
+                        // this batch is durable" — a claim that is true because
+                        // the rows above it are in the same commit. It also
+                        // takes the run row's lock, which a concurrent writer of
+                        // the same run then queues on rather than racing.
+                        await saveCheckpoint<ImportCursor>(asRunLedger(tx), claim.run.id, {
+                            cursor: { fingerprint: plan.fingerprint, nextBatchIndex: index + 1 },
+                            counts: batchDelta.counts,
+                        });
+
+                        return batchDelta;
                     },
                     { timeout: TRANSACTION_TIMEOUT_MS },
                 );
+
+                // AFTER THE COMMIT, NEVER INSIDE IT. Everything below describes
+                // rows that now exist.
+                mergeCountMap(counts, delta.counts);
+                mergeCountMap(byCategory, delta.byCategory);
+                mergeCountMap(byCheck, delta.byCheck);
+                mergeCountMap(byIdentityStatus, delta.byIdentityStatus);
+                mergeCountMap(byNutritionMethod, delta.byNutritionMethod);
+                mergeCategoryOutcomes(byCategoryOutcome, delta.categoryOutcomes);
+                // Listed individually, capped, because the list is a worklist an
+                // operator acts on rather than a metric: a 12,000-record refusal
+                // must not produce a report too large to open, and the per-check
+                // and per-category totals above stay complete either way.
+                for (const record of delta.quarantined) {
+                    if (quarantined.length >= QUARANTINE_LIST_LIMIT) {
+                        break;
+                    }
+                    quarantined.push(record);
+                }
+                processedBatches += 1;
+
+                // THE FIGURES A RESUME INHERITS, CARRIED WITH THE INDEX. The
+                // transaction above made this batch's rows, cursor and counts
+                // durable together; this write adds the report snapshot for
+                // exactly the batches that are committed, taken after the delta
+                // was merged, so a resumed attempt inherits the run's totals
+                // without inheriting a claim about work it will redo itself. It
+                // names the same index the transaction wrote and carries no
+                // counts, so it can neither move the cursor nor double-count.
+                await saveCheckpoint<ImportCursor>(deps.runDb, claim.run.id, {
+                    cursor: {
+                        fingerprint: plan.fingerprint,
+                        nextBatchIndex: index + 1,
+                        report: figuresThrough(index + 1),
+                    },
+                });
             }
 
-            const missing = batch.fdcIds.filter((fdcId) => !returned.has(fdcId));
-            counts.missingFromVendor += options.dryRun ? 0 : missing.length;
-            processedBatches += 1;
-
-            const done = index + 1;
-            if (done % CURSOR_SAVE_EVERY_BATCHES === 0 || done === plan.batches.length) {
-                await saveCursor<ImportCursor>(deps.runDb, claim.run.id, {
-                    fingerprint: plan.fingerprint,
-                    nextBatchIndex: done,
-                });
-                // The batches THIS checkpoint covers, never the save interval:
-                // the final partial checkpoint of a 7-batch run covers 2, and
-                // recording 5 would overstate the durable total by 3 for the
-                // rest of the run's life. The delta needs no lower guard — this
-                // block is reached only when `done` advanced past the previous
-                // checkpoint, so it is always at least 1.
-                await recordCounts(deps.runDb, claim.run.id, {
-                    batchesProcessed: done - lastCheckpointBatchIndex,
-                });
-                lastCheckpointBatchIndex = done;
-                logger.info('batch_progress', {
-                    stage: STAGE,
-                    batch: done,
-                    ofBatches: plan.batches.length,
-                    inserted: counts.inserted,
-                    updated: counts.updated,
-                    candidates: counts.candidates,
-                    quarantined: counts.quarantined,
-                });
-            }
+            // One line per batch, after its commit, so what it reports is what
+            // the database holds. There is no save interval to report against
+            // any more: the checkpoint is part of the batch.
+            logger.info('batch_progress', {
+                stage: STAGE,
+                batch: index + 1,
+                ofBatches: plan.batches.length,
+                inserted: counts.inserted,
+                updated: counts.updated,
+                candidates: counts.candidates,
+                quarantined: counts.quarantined,
+            });
         }
+
+        // THE WHOLE RUN, NOT THIS ATTEMPT. Every figure below comes from the
+        // carried snapshot plus what this attempt measured, so a run that was
+        // interrupted and resumed reports the records it actually imported
+        // rather than the tail of them (see ImportReportSnapshot). The last
+        // batch always checkpoints, so these figures equal the final cursor's.
+        const runFigures = figuresThrough(plan.batches.length);
+        const runOutcomeCounts: Record<string, number> = {
+            planned: plan.assignments.size,
+            ...plan.skipped,
+            ...runFigures.counts,
+        };
 
         const report = {
             stage: STAGE,
+            reportKind: 'canonical' as ImportReportDestination,
             generatedAt: deps.now().toISOString(),
             runId: claim.run.id,
             usdaManifestVersion: manifest.usdaManifestVersion,
@@ -3260,45 +4378,97 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                 manifestVersion: options.manifestVersion,
             },
             plannedBatches: plan.batches.length,
-            processedBatches,
-            counts,
-            byCategory,
-            failedChecks: byCheck,
-            ...buildImportReportCoverage(coveragePlan, policy, byCategoryOutcome),
+            processedBatches: runFigures.processedBatches,
+            counts: runOutcomeCounts,
+            byCategory: runFigures.byCategory,
+            failedChecks: runFigures.byCheck,
+            ...buildImportReportCoverage(
+                coveragePlan,
+                policy,
+                new Map(Object.entries(runFigures.byCategoryOutcome)),
+            ),
+            // How the figures above were arrived at, so a reader can tell a
+            // single-attempt run from a resumed one instead of inferring it
+            // from a batch count that does not add up.
+            runAggregation: {
+                attempts: runFigures.attempts,
+                resumedFromBatchIndex: startIndex,
+                batchesThisAttempt: processedBatches,
+                carriedFromEarlierAttempts: carriedReport !== null,
+                carriedThroughBatchIndex: carriedReport?.throughBatchIndex ?? null,
+                carriedProcessedBatches: carriedReport?.processedBatches ?? 0,
+                // The one field that answers "can I read these totals as the
+                // run's?" without parsing prose. It is FALSE in exactly one
+                // case: the cursor pointed past the first batch but carried no
+                // figures, so the batches before it were measured by an
+                // attempt whose numbers are gone and are not re-processed
+                // here. A resume that restarts at batch 0 re-processes every
+                // batch, so its figures do cover the run - rows an earlier
+                // attempt already wrote are counted as updated, which is what
+                // actually happened.
+                figuresCoverWholeRun: carriedReport !== null || startIndex === 0,
+                basis:
+                    carriedReport !== null
+                        ? 'A resumed run: the figures are the snapshot the cursor carried (measured by earlier attempts, through carriedThroughBatchIndex) plus what this attempt measured. Batches between the cursor and wherever the previous attempt stopped are re-processed and re-measured by this attempt, so they are counted once - as updated rather than inserted, which is what actually happened.'
+                        : startIndex > 0
+                          ? `A resumed attempt starting at batch ${startIndex} whose cursor carried no report snapshot (it was written by an earlier revision of this stage), so the figures cover THIS attempt only and understate the run by the batches before that index. Re-run the stage from a fresh run key if a whole-run report is required.`
+                          : 'A single pass over the whole work list: every figure in this report was measured by it. A run resumed at batch 0 reads the same way, because it re-processes every batch.',
+                countsExcludedFromCarry: [
+                    'planned',
+                    ...Object.keys(plan.skipped).sort(),
+                ],
+                countsExcludedFromCarryReason:
+                    'Plan-time figures, recomputed identically from the manifest by every attempt. They are applied once here; carrying them would double them on resume.',
+            },
             countsByIdentitySource: {
-                usda: Object.values(byIdentityStatus).reduce((total, count) => total + count, 0),
+                usda: Object.values(runFigures.byIdentityStatus).reduce((total, count) => total + count, 0),
                 ai_generated: 0,
-                byIdentityStatus,
+                byIdentityStatus: runFigures.byIdentityStatus,
                 measuredFrom: 'the identity_source and identity_status written on each catalog_foods row by this run',
                 aiGeneratedZeroReason:
                     'This stage imports FoodData Central records only. An AI-estimated food can be created by catalog:generate and never here, which is what makes every row this stage writes source_backed.',
             },
             countsByNutritionProvenance: {
-                source_backed: Object.values(byNutritionMethod).reduce((total, count) => total + count, 0),
+                source_backed: Object.values(runFigures.byNutritionMethod).reduce((total, count) => total + count, 0),
                 ingredient_derived: 0,
                 ai_estimated: 0,
-                byNutritionMethod,
+                byNutritionMethod: runFigures.byNutritionMethod,
                 measuredFrom: 'the nutrition_provenance written on each catalog_foods row and the nutrition_method on its validation record',
             },
             duplicatesRemoved: buildDuplicatesRemovedBlock(plan),
             failuresByCheck: {
                 checkNameVocabulary:
                     'src/services/catalog.logic.ts CATALOG_CHECK_NAMES, with the tier per name from catalogCheckTier',
-                importStage: groupChecksByTier(byCheck),
+                importStage: groupChecksByTier(runFigures.byCheck),
             },
-            quarantined: {
-                total: counts.quarantined + counts.rejected,
-                listed: quarantined.length,
-                truncated: quarantined.length >= QUARANTINE_LIST_LIMIT,
-                listLimit: QUARANTINE_LIST_LIMIT,
-                records: quarantined,
-            },
+            // TWO TIERS, TWO BLOCKS. `quarantined` and `rejected` are distinct
+            // publication_status values with distinct meanings — a quarantined
+            // record is held because a check could not be satisfied with the
+            // data available and is re-validated by a later pass, a rejected
+            // one is refused outright and is never publishable. A single block
+            // whose total was `quarantined + rejected` therefore reported every
+            // refusal as recoverable: the committed evidence for this catalog
+            // holds 74 quarantined records and 195 rejected ones, and the old
+            // block called all 269 quarantined. Each block now counts its own
+            // status and lists its own records, and truncation is
+            // `total > listed`: a run whose refusals happen to number exactly
+            // the list bound is not truncated, and the previous
+            // `listed >= limit` reading called it so.
+            quarantined: buildRefusalBlock('quarantined', runFigures),
+            rejected: buildRefusalBlock('rejected', runFigures),
             usdaRequests: buildUsdaRequestsBlock(manifest, deps.rateLimiterStats),
-            note: 'publication_status is candidate or quarantined here by design: catalog:validate is the stage that publishes.',
+            note: 'publication_status is candidate, quarantined or rejected here by design: this stage publishes nothing, catalog:validate is the stage that publishes, and the two refusal tiers are reported in their own blocks above.',
         };
-        deps.writeReport(report);
+        deps.writeReport(report, 'canonical');
 
-        await finishRun(deps.runDb, claim.run.id, 'succeeded', { counts, logger });
+        // No counts, for the same reason `closeFailedRun` passes none: every
+        // batch recorded its own inside its own transaction and the plan's
+        // totals were recorded once when the row was opened, so the ledger is
+        // already exactly what committed. Merging this attempt's absolute totals
+        // here would double every batch a resumed run did not perform itself.
+        // `finishRun` logs the row's counts as it reads them back, so the
+        // run_finished line still states the whole run's totals.
+        await finishRun(deps.runDb, claim.run.id, 'succeeded', { logger });
 
         return {
             runId: claim.run.id,
@@ -3306,6 +4476,11 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             counts,
             plannedBatches: plan.batches.length,
             processedBatches,
+            // This invocation did the work, whether it started the scope or
+            // resumed it, so its counts ARE the invocation's own and there is no
+            // separate history to keep apart from them.
+            alreadyCompleted: false,
+            historicalCounts: null,
         };
         } catch (error) {
             await closeFailedRun(deps, claim.run.id, counts, error);
@@ -3326,17 +4501,48 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
 const TRANSACTION_TIMEOUT_MS = 30_000;
 
 /**
+ * The one refusal this stage names itself, reported beside the validation
+ * checks: the retrieval behind a record carried no observed HTTP status, so a
+ * mandatory field of its retrieval record (Agent Action Plan §0.3.2) is
+ * missing and the record is held as `quarantined` rather than published.
+ *
+ * Deliberately NOT a member of `catalog.logic.ts`'s `CATALOG_CHECK_NAMES`.
+ * That registry — and the tier map beside it — judges the candidate FOOD: its
+ * nutrients, its identity, its portions. This judges how the response was
+ * obtained, which that module neither sees nor should see, and its `name` field
+ * is typed to the registry's closed union, so a retrieval fault cannot be
+ * expressed there without widening a vocabulary that belongs to validation.
+ * The report's `failuresByCheck` map is keyed by plain strings, so the two
+ * appear side by side without either owning the other's names.
+ */
+export const IMPORT_CHECK_MISSING_RETRIEVAL_STATUS = 'missing_retrieval_status';
+
+/**
  * What the import writes to `publication_status`.
  *
  * The import never publishes. A record the checks would accept is written as a
  * `candidate`, because publication needs the cross-table duplicate check that
  * only a pass over the whole table can make — that is `catalog:validate`'s
  * job, and keeping the two apart is what makes the import safe to re-run.
+ *
+ * ONE IMPORT-STAGE REFUSAL SITS ABOVE THE VERDICT. A record whose retrieval
+ * carries no observed HTTP status is held as `quarantined` however clean its
+ * nutrient checks are, because the status is a mandatory field of the retrieval
+ * record (AAP §0.3.2) and §0.7.3 classes missing identity evidence as
+ * quarantine-tier. It is decided here rather than in the validation checks
+ * because the fault is a property of THIS STAGE'S retrieval rather than of the
+ * candidate's stated values: `catalog.logic.ts` judges the food, and it neither
+ * sees nor should see how the response was obtained.
  */
 export const importPublicationStatus = (
     prepared: PreparedCatalogFood,
     verdict: CatalogValidationVerdict,
-): string => (verdict.publicationStatus === 'published' ? 'candidate' : verdict.publicationStatus);
+): string =>
+    prepared.retrievalStatusMissing
+        ? 'quarantined'
+        : verdict.publicationStatus === 'published'
+          ? 'candidate'
+          : verdict.publicationStatus;
 
 const publicationStatusCountKey = (publicationStatus: string): string =>
     publicationStatus === 'candidate'
@@ -3351,18 +4557,38 @@ const publicationStatusCountKey = (publicationStatus: string): string =>
 // Reporting.
 // ---------------------------------------------------------------------------
 
-// One field per gap, keyed by the gap's stable code, so a refusal is greppable
-// by code and readable in one line per prerequisite.
-const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
-    const fields: LogFields = { stage: STAGE, gapCount: gaps.length };
-    for (const gap of gaps) {
-        fields[`gap_${gap.code}`] =
-            gap.detail === undefined
-                ? `${gap.requirement}. ${gap.remedy}`
-                : `${gap.requirement}. ${gap.remedy} [${gap.detail}]`;
-    }
-    return fields;
-};
+// One structured entry per gap under a single neutral key, so a refusal is
+// greppable by code and still carries the sentence that says what to do.
+//
+// NOT one field per gap code, which is what this did and why it is written out:
+// a field NAME must be a fixed identifier, never derived from data
+// (scripts/lib/logger.ts states the contract beside the vocabulary that
+// enforces it). The logger redacts the value of any key whose name reads as a
+// credential, matching credential phrases anywhere in the name — deliberately,
+// so `serviceAccountJson` and `apiKeyHeader` cannot slip past — and
+// `gap_usda_api_key_missing` reads as exactly such a name. The most important
+// gap this stage can report, a missing USDA_API_KEY, therefore reached the
+// operator as `"gap_usda_api_key_missing":"***"`: the requirement and the
+// remedy gone, and nothing secret protected, because a requirement sentence is
+// not a credential.
+//
+// With the code in a `code` VALUE the prose survives intact, while the value
+// rules still scrub a real credential that appears inside it — an env
+// assignment keeps its name and loses its value, a DSN loses its userinfo — so
+// this is strictly safer than a field name that happens to avoid the
+// vocabulary.
+const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => ({
+    stage: STAGE,
+    gapCount: gaps.length,
+    gaps: gaps.map((gap) => ({
+        code: gap.code,
+        requirement: gap.requirement,
+        remedy: gap.remedy,
+        // Present as `null` rather than omitted, so every entry has the same
+        // shape for a report reader that indexes these events by key.
+        detail: gap.detail ?? null,
+    })),
+});
 
 // Every error class this file can observe gets its own reported code, so an
 // operator never has to read a stack trace to know which layer refused.
@@ -3477,6 +4703,63 @@ const main = async (): Promise<number> => {
     const coveragePlan = loadCoveragePlan();
     const requestsPerHour = getUsdaImportRateLimitPerHour(process.env);
 
+    // THE MANIFEST'S RATE MUST SIT UNDER THE CODE'S CEILING. The document
+    // declares the rate the import is meant to run at and the vendor cap it
+    // leaves headroom against; the ceiling that is actually enforced lives in
+    // rateLimiter.ts. A manifest asking for more than the code will allow is a
+    // disagreement an operator has to see as itself, not as a rate limit
+    // silently lower than the one the document promises — the same treatment
+    // the batch ceiling gets above.
+    if (manifest.importLimits.configuredRequestsPerHour > USDA_IMPORT_POLICY_CAP_PER_HOUR) {
+        logger.error('rate_ceiling_disagrees', {
+            stage: STAGE,
+            manifestConfiguredPerHour: manifest.importLimits.configuredRequestsPerHour,
+            importCeilingPerHour: USDA_IMPORT_POLICY_CAP_PER_HOUR,
+            vendorCapPerHour: manifest.importLimits.vendorRequestsPerHour,
+            remedy: `lower importLimits.configuredRequestsPerHour in data/meal-planning/${USDA_MANIFEST_FILE} to at most ${USDA_IMPORT_POLICY_CAP_PER_HOUR}: the top ${manifest.importLimits.vendorRequestsPerHour - USDA_IMPORT_POLICY_CAP_PER_HOUR} requests/hour of the vendor cap are the running API's share of the same key`,
+        });
+        return 1;
+    }
+
+    // THE DOCUMENTED CACHE-KEY SCHEME MUST BE THE ONE THE IMPORT WRITES. Every
+    // imported row carries a `source_cache_key`, and every validation record
+    // publishes it as retrieval evidence, so a manifest describing a different
+    // key than the client builds documents provenance a reader cannot check —
+    // which is exactly what the earlier `/food/<fdcId>?format=full` claim did,
+    // unnoticed, because nothing compared it with anything.
+    const declaredScheme = (manifest as unknown as { sweepNamingPolicy?: { sourceCacheKeyScheme?: unknown } })
+        .sweepNamingPolicy?.sourceCacheKeyScheme;
+    const schemeDisagreements = sourceCacheKeySchemeDisagreements(declaredScheme);
+    if (schemeDisagreements.length > 0) {
+        logger.error('source_cache_key_scheme_disagrees', {
+            stage: STAGE,
+            manifestPath: `data/meal-planning/${USDA_MANIFEST_FILE} ${SOURCE_CACHE_KEY_SCHEME_MANIFEST_PATH}`,
+            disagreements: schemeDisagreements.join('; '),
+            importWrites: USDA_SOURCE_CACHE_KEY_SCHEME.shape,
+        });
+        return 1;
+    }
+
+    // And the key the client actually builds must match the declared shape, not
+    // merely agree with a constant in this file. Built from a deliberately
+    // unsorted, duplicated sample, which also pins the "ascending de-duplicated
+    // fdc ids" the shape claims — cacheKeyForRequest normalises the id list
+    // itself, so the whole scheme is checked and the check costs no request.
+    const sampleKey = usdaService.cacheKeyForRequest('POST', USDA_BATCH_PATH, {}, {
+        fdcIds: [2, 1, 2],
+        format: USDA_BATCH_FORMAT,
+    });
+    const expectedSampleKey = `POST ${USDA_BATCH_PATH}?#{"fdcIds":[1,2],"format":"${USDA_BATCH_FORMAT}"}`;
+    if (sampleKey !== expectedSampleKey) {
+        logger.error('source_cache_key_builder_disagrees', {
+            stage: STAGE,
+            clientBuilds: sampleKey,
+            schemeDeclares: expectedSampleKey,
+            note: 'src/services/usda.service.ts cacheKeyForRequest no longer produces the shape USDA_SOURCE_CACHE_KEY_SCHEME and the manifest state, so every source_cache_key this run would write is documented wrongly',
+        });
+        return 1;
+    }
+
     // Assigned by installRateLimiter below and read by rateLimiterStats, so
     // the report states what the pacing measured rather than what it intended.
     let limiter: UsdaRateLimiter | null = null;
@@ -3486,32 +4769,20 @@ const main = async (): Promise<number> => {
         runDb: prisma as unknown as CatalogRunDb,
         usda: {
             listFoods: (dataType, pageSize, pageNumber) => usdaService.listFoods(dataType, pageSize, pageNumber),
-            getFoodsBatch: (fdcIds) => usdaService.getFoodsBatch(fdcIds),
-            // The key is rebuilt with the client's own exported builders rather
-            // than spelled out here, so it cannot drift from the one
-            // `usdaPost` writes: `getFoodsBatch` sends
-            // `{fdcIds: normalizeFdcIds(ids), format: 'full'}` to `/foods` with
-            // no query parameters, and `cacheKeyForRequest` canonicalises the
-            // body the same way for both of us.
-            describeBatchRetrieval: async (fdcIds) => {
-                const requestedFdcIds = usdaService.normalizeFdcIds(fdcIds);
-                const cacheKey = usdaService.cacheKeyForRequest('POST', USDA_BATCH_PATH, {}, {
-                    fdcIds: requestedFdcIds,
-                    format: USDA_BATCH_FORMAT,
-                });
-                const cached = await prisma.usda_api_cache.findUnique({
-                    where: { cache_key: cacheKey },
-                    select: { payload: true, fetched_at: true },
-                });
-                return {
-                    requestedFdcIds,
-                    cacheKey,
-                    // Digesting the recorded payload is what makes the claim
-                    // checkable: a reader can read that row and recompute this.
-                    responseSha256: cached === null ? null : sha256Hex(canonicalJsonString(cached.payload)),
-                    source: cached === null ? 'import_run' : 'usda_api_cache',
-                    cachedAt: cached?.fetched_at ?? null,
-                };
+            // The records and their provenance come out of ONE call, and every
+            // fact on the retrieval is the client's own observation: the cache
+            // key it filed the response under, whether it reached the vendor,
+            // the status that exchange answered with, and when the payload was
+            // obtained. Nothing is re-derived here — the previous wiring read
+            // `usda_api_cache` back after the fetch, which could not tell a live
+            // fetch from a replay (the fetch's own cache write races the read)
+            // and therefore put an unobserved HTTP status on every evidence
+            // record. `toBatchRetrieval` only renames the client's vocabulary
+            // into the one the evidence records publish, and digests the payload
+            // the records were read out of.
+            fetchBatch: async (fdcIds) => {
+                const { details, retrieval } = await usdaService.getFoodsBatchWithRetrieval(fdcIds);
+                return { details, retrieval: toBatchRetrieval(retrieval) };
             },
         },
         manifest,
@@ -3528,6 +4799,13 @@ const main = async (): Promise<number> => {
             limiter = createUsdaRateLimiter({
                 requestsPerHour,
                 vendorCapPerHour: manifest.importLimits.vendorRequestsPerHour,
+                // Passed explicitly although it is also the default: the
+                // import's ceiling is a promise this stage makes about a shared
+                // key, and a promise a reader has to infer from a default is one
+                // a later edit can drop without anyone noticing. `requestsPerHour`
+                // has already been bounded by getUsdaImportRateLimitPerHour, so
+                // this is the second gate rather than the first.
+                policyCapPerHour: USDA_IMPORT_POLICY_CAP_PER_HOUR,
                 logger,
             });
             return limiter.install();
@@ -3545,8 +4823,25 @@ const main = async (): Promise<number> => {
             }
             return limiter.stats();
         },
-        writeReport: (report) => {
-            writeImportReport(reportPath('import-report.json'), report, logger);
+        writeReport: (report, destination) => {
+            const target = importReportTarget(destination);
+            if (destination === 'canonical') {
+                writeImportReport(target, report, logger);
+                return;
+            }
+
+            // A PREVIEW IS NOT MERGED AND NOT LOCKED, because it shares nothing
+            // with the evidence artefact: it is this invocation's own file,
+            // written whole (atomically, like every artefact this pipeline
+            // writes) and named in the line below so the operator who asked for
+            // it can read it.
+            writeJsonFile(target, report);
+            logger.info('dry_run_preview_written', {
+                stage: STAGE,
+                file: target,
+                canonicalReportUntouched: reportPath(IMPORT_REPORT_FILE),
+                basis: 'a dry run reports the plan only, so it never writes the committed evidence artefact',
+            });
         },
     };
 
@@ -3575,9 +4870,19 @@ const main = async (): Promise<number> => {
         stage: STAGE,
         runId: outcome.runId,
         resumed: outcome.resumed,
+        alreadyCompleted: outcome.alreadyCompleted,
         plannedBatches: outcome.plannedBatches,
         processedBatches: outcome.processedBatches,
+        // This invocation's own counts, always. The scope's durable totals are
+        // reported beside them and only when this invocation did no work, so a
+        // no-op rerun reads as one instead of as a second import.
         counts: JSON.stringify(outcome.counts),
+        ...(outcome.historicalCounts === null
+            ? {}
+            : {
+                  historicalCounts: JSON.stringify(outcome.historicalCounts),
+                  note: 'this scope had already succeeded, so this invocation fetched nothing and wrote nothing; historicalCounts belongs to the run that imported it',
+              }),
     });
 
     await prisma.$disconnect();

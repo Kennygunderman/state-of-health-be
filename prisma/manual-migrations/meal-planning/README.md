@@ -101,18 +101,80 @@ development environment, the production URL unless the shell overrides it —
 therefore removes nothing:
 
 ```bash
-# From backend/. Both the name and the URL are yours to type; the script raises
-# if they are not the same database, and raises if the SET is missing entirely.
+# From backend/. Save this block to a file and run it with `bash -euo pipefail`,
+# as the script's own header advises: every check here is meant to END the run,
+# not print a warning that scrolls past into the backup and then the DROPs.
+set -euo pipefail
+
+# Type the name once. Only a plain PostgreSQL identifier is accepted.
 REMOVAL_TARGET_DB='<the disposable database you intend to strip>'
+if [[ ! $REMOVAL_TARGET_DB =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  echo "STOP: '$REMOVAL_TARGET_DB' is not a plain database identifier" >&2
+  exit 1
+fi
+
 REMOVAL_TARGET_URL="postgresql://<user>@<host>:<port>/$REMOVAL_TARGET_DB"
-psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 \
-  -c "SET meal_planning.removal_target = '$REMOVAL_TARGET_DB'" \
-  -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
+
+# Prove that URL is that database before anything else touches it.
+ACTUAL_DB=$(psql "$REMOVAL_TARGET_URL" -tAc 'SELECT current_database()')
+if [ "$ACTUAL_DB" != "$REMOVAL_TARGET_DB" ]; then
+  echo "STOP: that URL is $ACTUAL_DB, not $REMOVAL_TARGET_DB" >&2
+  exit 1
+fi
+
+# Read this line yourself: only a database you can lose belongs here.
+psql "$REMOVAL_TARGET_URL" -tAc \
+  'SELECT current_database(), current_user, inet_server_addr(), inet_server_port()'
+
+# The only way back. Confirm it restores before going on.
+pg_dump --format=custom "$REMOVAL_TARGET_URL" \
+  > "./$REMOVAL_TARGET_DB-pre-removal.dump"
+
+# The declaration arrives on stdin (-f -) rather than through -c, because psql
+# expands its variables only in the input it lexes: `-c "… :'target' …"` is sent
+# to the server untouched and fails with `syntax error at or near ":"`.
+echo "SELECT set_config('meal_planning.removal_target', :'target', false);" \
+  | psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 -v target="$REMOVAL_TARGET_DB" \
+      -f - \
+      -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
 ```
 
-The script's own header carries the full procedure — the read-back that proves
-the URL is that database, the backup, the maintenance window — and the complete
-inventory of what is destroyed. Read it before running any of this.
+The first check is about the name rather than the removal, because the name
+reaches three places at once: a SQL literal, the path component of the URL, and
+the dump filename. Requiring a plain identifier closes all three with one test:
+a name of that shape needs no percent-encoding to sit in a URL's path and cannot
+carry a path separator or a leading dash into a filename, so the absence of
+encoding below is that check's consequence rather than an omission. A name
+holding a quote, a slash or a space would otherwise break or redirect the command
+long before the guard in section 0 could refuse anything. The `./` on the dump
+path restates the point: the file lands where you are standing, and cannot be
+read as a path or an option. If a database's real name cannot satisfy the
+pattern — a quoted name, or one carrying a dash, a dot or a space — its removal
+needs an invocation reviewed for that name rather than one improvised here.
+
+The target is then handed to psql as a variable and quoted by psql, instead of
+being spliced into SQL by the shell: `-v target="$REMOVAL_TARGET_DB"` binds the
+value, and `:'target'` expands it as a properly quoted SQL literal with any
+quote inside it doubled. That is the whole of the difference, and it is why the
+statement is piped in rather than passed with `-c`: psql interpolates its
+variables only into input it lexes, so a `-c` string reaches the server with the
+`:'target'` still in it and errors out. What the statement sets is what the
+script documents: a `set_config` whose third argument is `false` is
+session-scoped exactly as `SET` is, and psql runs every `-f` — `-f -` for stdin
+included — in one session in the order given, so the setting is in force when
+the removal script runs. It is also exactly what section 0's guard reads: that
+block takes `current_setting('meal_planning.removal_target', true)` and raises
+unless it equals `current_database()`, so a session that declares nothing still
+drops nothing.
+
+The script's own header carries this same procedure — the identifier check, the
+read-back, the backup, the psql variable — with the reasoning for each step, the
+complete inventory of what is destroyed, and why the run belongs in a reviewed
+maintenance window with the API stopped. Read it before running any of this. The
+two agree — the same checks in the same order, the same commands — so either
+copy can be used: the header's step 4 binds the name with
+`-v target="$REMOVAL_TARGET_DB"` and lets psql quote it exactly as the block
+above does, and neither splices it into the `SET` statement.
 
 Everything the dropped tables hold goes with them: plans, grocery state,
 preferences, recipes and the whole catalog, including the retained USDA-derived
@@ -121,22 +183,55 @@ to `meal_entries` are nullable, so dropping them **detaches** planned and
 catalog-logged entries rather than deleting them, each row keeping its name,
 servings and macro snapshot and losing only its provenance caption.
 
-Re-populating afterwards is not the same as restoring. A `catalog:load` of a
-reviewed release plus `recipes:seed` rebuilds the shared catalog and recipe
-content with **new identifiers** — never the rows that were dropped, and never
-the user data beside them, since plans, grocery check state, preferences and the
-action ledger appear in no release. Only the backup you took first returns
-those. Whether that load path can run in the tree you are holding is tracked in
-one place, `docs/meal-planning/release-and-recovery.md` — as this is written the
-stages stop before any database write, so today the backup is the only way back
-to either, as well as the only way back to the exact rows.
+Re-populating afterwards is not the same as restoring, and both halves of a
+fresh load do write. `catalog:load` reconciles a reviewed, checksummed release
+into `catalog_foods` and its aliases, portions, compositions and validation
+records — verifying every manifest digest before it writes anything, and
+retiring rather than deleting a published food a newer release no longer
+carries. `recipes:seed` then publishes the 42 committed recipe files as
+`recipe_versions` rows with their frozen ingredient snapshots, idempotent by
+slug. Between them they rebuild the shared catalog and recipe content, with
+**new identifiers** — so nothing that referenced the dropped rows finds them
+again, and the diary entries the column drops detached stay detached.
+
+They rebuild that shared content and nothing beside it. Plans, grocery state and
+the check marks on it, preferences, the confirmed-target bookkeeping and the
+`meal_plan_actions` ledger are user data: they appear in no release, so no load
+brings them back. Only the backup returns those exact rows — the same ids, the
+same plan and shopping history, the same stored responses — which is why the
+`pg_dump` this section opens with is a precondition of the removal and not a
+precaution around it. The release-side procedure for the load itself — which
+release, from where, and what each writer does to the database it is pointed at
+— is settled under **What a release loads** in
+[`docs/meal-planning/release-and-recovery.md`](../../../docs/meal-planning/release-and-recovery.md#what-a-release-loads),
+and not repeated here.
 
 The Prisma ledger then needs reconciling, because `_prisma_migrations` still
 records the migration as applied: `migrate deploy` would report nothing pending
 while the schema is gone. Delete that one row, and re-apply normally whenever the
-feature is wanted back — same `REMOVAL_TARGET_URL`, same `backend/` directory:
+feature is wanted back — same `REMOVAL_TARGET_URL`, same `backend/` directory,
+and the same checks in front of it, because a `DELETE` and a `migrate deploy` are
+no safer than the URL they are handed. The migration name is a fixed literal and
+needs no quoting of its own:
 
 ```bash
+set -euo pipefail
+
+# The same shell as the block above, or its checks again: an unset
+# $REMOVAL_TARGET_URL is not "no target", it is whatever ambient connection
+# libpq and Prisma would each fall back to.
+: "${REMOVAL_TARGET_DB:?run the validated block above first, in this same shell}"
+: "${REMOVAL_TARGET_URL:?run the validated block above first, in this same shell}"
+if [[ ! $REMOVAL_TARGET_DB =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  echo "STOP: '$REMOVAL_TARGET_DB' is not a plain database identifier" >&2
+  exit 1
+fi
+ACTUAL_DB=$(psql "$REMOVAL_TARGET_URL" -tAc 'SELECT current_database()')
+if [ "$ACTUAL_DB" != "$REMOVAL_TARGET_DB" ]; then
+  echo "STOP: that URL is $ACTUAL_DB, not $REMOVAL_TARGET_DB" >&2
+  exit 1
+fi
+
 psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 \
   -c "DELETE FROM _prisma_migrations WHERE migration_name = '20260908000000_meal_planning';"
 DATABASE_URL="$REMOVAL_TARGET_URL" npx prisma migrate deploy

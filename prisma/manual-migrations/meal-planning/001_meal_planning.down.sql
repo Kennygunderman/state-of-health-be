@@ -30,21 +30,40 @@
 -- warning is this long.
 --
 -- BEFORE RUNNING IT
+--   Steps 1 to 4 are one shell script: save them to a file and run it with
+--   `bash -euo pipefail` rather than pasting them loose, because every check in
+--   them is meant to END the run rather than print a warning that scrolls past
+--   into the backup and then into the DROPs. README.md in this folder publishes
+--   the same block; the two are one procedure, and either copy can be used.
 --   1. Name the target yourself, and do not let any command below read an
 --      ambient DATABASE_URL. In this project's development environment that
 --      variable arrives holding the PRODUCTION URL unless the shell overrides
 --      it, so a destructive command that defaults to it is one forgotten export
 --      away from the wrong database. Type the database name out - it is the
 --      affirmation that both this procedure and the guard in section 0 check -
---      and build the URL beside it:
+--      and accept it only if it is a plain PostgreSQL identifier:
 --        REMOVAL_TARGET_DB='<the disposable database you intend to strip>'
+--        if [[ ! $REMOVAL_TARGET_DB =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+--          echo "STOP: '$REMOVAL_TARGET_DB' is not a plain database identifier" >&2
+--          exit 1
+--        fi
+--      That test comes before anything else because the name reaches three
+--      places at once: a SQL literal, the path component of the URL built in
+--      step 2, and the dump filename in step 3. Requiring a plain identifier
+--      closes all three with one test, since a name of that shape needs no
+--      percent-encoding to sit in a URL path and cannot carry a path separator
+--      or a leading dash into a filename - so the absence of encoding below is
+--      that check's consequence rather than an omission, and a name holding a
+--      quote, a slash or a space stops here instead of breaking or redirecting
+--      a command long before the guard in section 0 could refuse anything. A
+--      database whose real name cannot satisfy the pattern - a quoted name, or
+--      one carrying a dash, a dot or a space - needs an invocation reviewed for
+--      that name rather than this one.
+--   2. Build the URL from the validated name, and prove that URL is that
+--      database before anything else touches it. Under errexit, an unreachable
+--      host or a refused login aborts here too, because the failing psql takes
+--      the script down with it.
 --        REMOVAL_TARGET_URL="postgresql://<user>@<host>:<port>/$REMOVAL_TARGET_DB"
---   2. Prove that URL is that database, before anything else touches it. Put
---      steps 2 to 4 in a file and run it with `bash -euo pipefail` rather than
---      pasting them loose: the check below has to END the run, not print a
---      warning that scrolls past into the backup and the removal. Under
---      errexit, an unreachable host or a refused login aborts here too, because
---      the failing psql takes the script down with it.
 --        ACTUAL_DB=$(psql "$REMOVAL_TARGET_URL" -tAc 'SELECT current_database()')
 --        if [ "$ACTUAL_DB" != "$REMOVAL_TARGET_DB" ]; then
 --          echo "STOP: that URL is $ACTUAL_DB, not $REMOVAL_TARGET_DB" >&2
@@ -57,17 +76,28 @@
 --      you have not just backed up. Nothing in this file can tell those apart
 --      for you - see section 0.
 --   3. Take a fresh backup of that same database and confirm it restores. It is
---      the only way back:
+--      the only way back. The `./` is deliberate: the dump lands where you are
+--      standing, and the name step 1 validated cannot be read as a path of its
+--      own or as an option.
 --        pg_dump --format=custom "$REMOVAL_TARGET_URL" \
---          > "$REMOVAL_TARGET_DB-pre-removal.dump"
+--          > "./$REMOVAL_TARGET_DB-pre-removal.dump"
 --   4. Run it from the backend/ directory - the path below is relative to it -
 --      in a reviewed maintenance window, with the API stopped or both feature
---      gates closed, so nothing is mid-write. The SET is not optional: section 0
---      refuses to drop anything without it, and refuses again if the name and
---      the connection disagree.
---        psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 \
---          -c "SET meal_planning.removal_target = '$REMOVAL_TARGET_DB'" \
---          -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
+--      gates closed, so nothing is mid-write. The declaration is not optional:
+--      section 0 refuses to drop anything without it, and refuses again if the
+--      name and the connection disagree. The name is handed to psql as a
+--      VARIABLE and quoted by psql - `-v target=<name>` binds the value and
+--      `:'target'` expands it as a properly quoted SQL literal - never spliced
+--      into the statement by the shell. That statement arrives on stdin (`-f -`)
+--      because psql expands its variables only in input it lexes: the same text
+--      passed with `-c` reaches the server with `:'target'` still in it and
+--      fails with `syntax error at or near ":"`. psql runs every -f, stdin
+--      included, in one session in the order given, so the setting is in force
+--      when the removal script runs.
+--        echo "SELECT set_config('meal_planning.removal_target', :'target', false);" \
+--          | psql "$REMOVAL_TARGET_URL" -v ON_ERROR_STOP=1 -v target="$REMOVAL_TARGET_DB" \
+--              -f - \
+--              -f prisma/manual-migrations/meal-planning/001_meal_planning.down.sql
 --   5. Reconcile the Prisma migration history afterwards, against that same
 --      $REMOVAL_TARGET_URL. That step is an operator decision rather than DDL,
 --      so it is documented in README.md in this folder and in
@@ -98,30 +128,34 @@
 -- WHAT A LOAD CAN PUT BACK, AND WHAT ONLY THE BACKUP CAN
 --   These are two different recoveries, and only one of them returns the rows
 --   this file destroyed.
---   - A fresh load - `npm run catalog:load -- --release <v>` of a reviewed,
---     checksummed release, then `npm run recipes:seed` - rebuilds the shared
---     catalog and recipe content from the artefact committed in this repository
---     (data/meal-planning/catalog/releases/), by the same route step 4 of the
---     release order uses. It is never a restore of the dropped rows: the
---     identifiers are new ones, so nothing that referenced the old rows finds
---     them again, and the detached diary entries described below stay detached.
---     It also rebuilds that shared content ONLY. Plans, grocery lists and their
---     check marks, preferences, the confirmed-target bookkeeping and the
+--   - A fresh load - `catalog:load` of a reviewed, checksummed release, then
+--     `recipes:seed` - rebuilds the shared catalog and recipe content from the
+--     artefact committed in this repository
+--     (data/meal-planning/catalog/releases/). Both writers DO write: the load
+--     verifies every manifest digest before it writes anything and reconciles
+--     the release into "catalog_foods" with its aliases, portions, components
+--     and validation records, and the seed then publishes the committed recipe
+--     files as "recipe_versions" rows with their frozen ingredient snapshots.
+--     It is never a restore of the dropped rows: the identifiers are new ones,
+--     so nothing that referenced the old rows finds them again, and the
+--     detached diary entries described below stay detached. It also rebuilds
+--     that shared content ONLY. Plans, grocery lists and their check marks,
+--     preferences, the confirmed-target bookkeeping and the
 --     "meal_plan_actions" ledger are user data that no release contains, so no
 --     load brings them back.
 --   - The backup from step 3 is the only thing that returns those exact rows -
 --     the same ids, the same plan and shopping history, the same stored
---     responses. That is why step 3 is a precondition of this file and not a
+--     responses - and the only thing that repopulates the user-owned tables at
+--     all. That is why step 3 is a precondition of this file and not a
 --     precaution around it.
---   Whether the load path can run at all in the tree you are holding is tracked
---   in one place, the status table in
---   docs/meal-planning/release-and-recovery.md, and every stage reports its own
---   unmet inputs on stderr and exits non-zero rather than half-loading, so
---   `npm run catalog:load -- --release v1` answers the question directly. As
---   this file is committed the answer is no - the stages verify their inputs,
---   including the release manifest, and stop before any database write - which
---   makes the backup the only way back to either kind of data today, as well as
---   the only way back to the exact rows.
+--   What each writer does to the database it is pointed at, and the exact
+--   invocation each one takes - including the `--confirm-target` both of them
+--   demand unless the database's own name says development - is settled under
+--   "What a release loads" in docs/meal-planning/release-and-recovery.md and
+--   not repeated here. Every stage names its own unmet inputs on stderr and
+--   exits non-zero rather than half-loading, so whether a given checkout and
+--   database can load is answered by running the command, never by reading
+--   this file.
 --
 -- WHAT SURVIVES
 --   Diary history is left intact, which is the point of the ordering below. The
@@ -167,12 +201,17 @@
 --
 --   SET meal_planning.removal_target = '<the name typed in step 1 above>';
 --
--- Pass it with `-c` before `-f`, as step 4 does, or run it as the first
--- statement of the same session in a SQL console. The setting is session
--- scoped: it is never written to the database and cannot be left behind as a
--- standing permission. Run the file with -v ON_ERROR_STOP=1 (or inside a single
--- transaction) so the raise stops the script rather than being logged and
--- stepped over.
+-- Step 4 above declares it without typing the name into a statement at all: it
+-- pipes `SELECT set_config('meal_planning.removal_target', :'target', false);`
+-- into the same psql session that then reads this file, with the name bound as
+-- `-v target=<name>` for psql to quote. A SQL console can equally run the SET
+-- above as the first statement of the same session. Either form satisfies the
+-- block below - it reads the value with current_setting, not the syntax that
+-- set it - and either way the setting is session scoped: a set_config whose
+-- third argument is false is exactly as session scoped as SET, so it is never
+-- written to the database and cannot be left behind as a standing permission.
+-- Run the file with -v ON_ERROR_STOP=1 (or inside a single transaction) so the
+-- raise stops the script rather than being logged and stepped over.
 -- ---------------------------------------------------------------------------
 
 DO $$

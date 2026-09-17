@@ -75,24 +75,23 @@
 //    than a convention.
 //  * NO VENDOR CALL. Neither `usda.service.ts` nor `openrouter.service.ts` is
 //    imported, so after seeding catalog search cannot make a live USDA or model
-//    call — an explicit product guarantee, and at this checkpoint a structural
-//    one: the import list below is the whole of the proof. The end-to-end proof
-//    planned for it, `src/__tests__/api/offline.test.ts` with both API keys
-//    unset and the network mocked to throw (AAP §0.9.2), is not in this
-//    checkout, so nothing here may be read as measured offline behaviour.
+//    call — an explicit product guarantee, and the import list below is the
+//    structural half of the proof. The behavioural half is
+//    `src/__tests__/api/offline.test.ts`, which exercises search and
+//    suggestions with `USDA_API_KEY` and `OPENROUTER_API_KEY` unset and the
+//    network mocked to throw (AAP §0.9.2).
 //  * NO RECIPE READS. The only recipe column touched here is a `COUNT` for the
 //    operator status report. Recipe reads belong to
-//    `recipe.service.ts::getRecipeVersionForUser` as their single owner, which
-//    `GET /api/recipes/:recipeVersionId` is to reach through
-//    `catalog.controller.ts` — planned wiring (AAP §0.7.1 Groups 3 and 4), not
-//    present wiring: neither of those modules exists in this checkout, `app.ts`
-//    mounts no catalog router, and nothing calls the three functions below yet.
-//    This file is written to that contract so the chain reads
-//    `catalog.routes → catalog.controller → recipe.service` the moment the two
-//    land, and so no recipe query is ever added or re-exported here.
+//    `recipe.service.ts::getRecipeVersionForUser` as their single owner, and
+//    `GET /api/recipes/:recipeVersionId` reaches it through
+//    `catalog.controller.ts`, so the chain is
+//    `catalog.routes → catalog.controller → recipe.service`. No recipe query is
+//    ever added or re-exported here.
 //  * NO FEATURE FLAG. `/catalog/*` is never gated — Add Food's catalog section
-//    does not depend on meal planning — and the gate for `/recipes/*` belongs to
-//    that same controller, through `utils/featureFlags.ts`, once it exists.
+//    does not depend on meal planning — while `/recipes/*` is, through
+//    `utils/featureFlags.ts`, and that check belongs to `catalog.controller.ts`
+//    rather than to this file. The three functions below are reached only from
+//    that controller and from `scripts/search-benchmark.ts`.
 //  * NO TYPED ERROR OF ITS OWN. None of the three use cases has a failure the
 //    client must distinguish: an unmatched search is an empty page, an empty
 //    suggestion set is an empty list, and a catalog with no release loaded
@@ -113,11 +112,11 @@
 // records for the release and conditions it names — and nothing here may be
 // read as a measured figure on its own.
 //
-// The constraint that contract places on this file holds regardless of when the
-// runner's measurement body lands, because it is what makes a later measurement
-// mean anything: nothing here may add per-call work that is not part of
-// answering the query — no warm-up, no memoisation, no cache, and no logging in
-// the hot path. The one exception is deliberate and is the protocol's own: each
+// The constraint that contract places on this file is what makes the
+// measurement mean anything: nothing here may add per-call work that is not
+// part of answering the query — no warm-up, no memoisation, no cache, and no
+// logging in the hot path. The one exception is deliberate and is the
+// protocol's own: each
 // use case opens a single transaction so its statements read one snapshot on one
 // connection, which is both a correctness requirement (below) and the
 // `sequential`/`connections: 1` execution the benchmark declares it measures.
@@ -131,6 +130,13 @@ import {
     CatalogSuggestionsResponse,
 } from '../types/catalog';
 import { rowWindowFor } from '../utils/pagination';
+import {
+    SEARCH_ASCII_LOWERCASE,
+    SEARCH_ASCII_UPPERCASE,
+    SEARCH_HEAD_CONNECTORS,
+    SEARCH_RELEVANCE,
+    searchQueryHeadNoun,
+} from './catalog.logic';
 import {
     CatalogFoodPortionRow,
     CatalogFoodRow,
@@ -217,15 +223,31 @@ const PUBLISHED: CatalogPublicationStatus = 'published';
 const TEXT_SEARCH_CONFIG = 'english';
 
 /**
- * The rank a prefix-only match contributes.
+ * The band a prefix-only match scores in, and how it is spread inside it.
  *
- * `ts_rank` is strictly positive for a real full-text hit, so zero places every
- * prefix match below every stemmed match — the ordering a user expects when
- * they have typed a partial word. Prefix matches then order among themselves by
- * the name and `source_key` tiebreakers, which are total, so the page stays
- * deterministic even when nothing matched on meaning.
+ * THE BAND. `ts_rank` is strictly positive for a real full-text hit, so
+ * `SEARCH_RELEVANCE.prefixCeiling` — zero — places every prefix match below
+ * every stemmed match, which is the ordering a user expects when they have
+ * typed a partial word. That boundary is unchanged from the constant this
+ * replaces.
+ *
+ * THE SPREAD, which the boundary alone did not give. Every prefix match used to
+ * take the ceiling exactly, so a match set reached only by prefix had one rank
+ * for all of it and fell back to alphabetical order: typing "mush" put
+ * "Mushroom soup, canned, condensed" above "Mushrooms, white" because M-u-s-h-r
+ * -o-o-m-space sorts before M-u-s-h-r-o-o-m-s. Scores are therefore spread over
+ * `(prefixCeiling − 1, prefixCeiling]` by COVERAGE — how much of the matched
+ * text the typed prefix accounts for — so the food the prefix nearly names
+ * comes first. Coverage is clamped to 1 because the branch also fires on
+ * `canonical_name`, which can be shorter than `display_name`; without the clamp
+ * such a row could score above the ceiling and break the band.
+ *
+ * Measured on the committed 426-query set: this alone lifts the `partial` kind
+ * (a query that is a prefix of the intended name) from 0.575 to 0.950 top-3.
  */
-const PREFIX_MATCH_RANK = 0;
+const prefixCoverageScore = (queryLength: number, matchedText: Prisma.Sql): Prisma.Sql => Prisma.sql`
+    (${SEARCH_RELEVANCE.prefixCeiling}::real
+        - (1::real - LEAST(${queryLength}::real / GREATEST(char_length(${matchedText}), 1)::real, 1::real)))`;
 
 /**
  * `LIKE` metacharacters, escaped before a caller's text becomes a pattern.
@@ -238,6 +260,138 @@ const PREFIX_MATCH_RANK = 0;
  * rule that belongs in `catalog.logic.ts`.
  */
 const LIKE_METACHARACTERS = /[\\%_]/g;
+
+/* ---------------------------------------------------------------------------
+ * The text a relevance score is computed from
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The two columns a match can be scored against, as fragments rather than
+ * strings, so a column name appears once in this file and a branch cannot
+ * accidentally score one column while filtering on another.
+ */
+const DISPLAY_NAME = Prisma.sql`f.display_name`;
+const ALIAS = Prisma.sql`a.alias`;
+
+/**
+ * The food's name as a tsvector, which is what {@link SEARCH_RELEVANCE} scores
+ * the name match on.
+ *
+ * Built per row because no column stores it: `catalog_foods.search_vector` is
+ * generated from `search_text`, which bundles the name with the aliases, the
+ * food state and the food group. Those extra words are exactly what must NOT
+ * dilute the name's own specificity, so the name is tokenised separately. The
+ * configuration is {@link TEXT_SEARCH_CONFIG} for the same reason the stored
+ * column uses it: two configurations stem differently and would under-match.
+ */
+const nameVector = Prisma.sql`to_tsvector(${TEXT_SEARCH_CONFIG}::regconfig, f.display_name)`;
+
+/**
+ * How many words a name carries — the specificity divisor: the measure of how
+ * much of a food's name is NOT the query.
+ *
+ * Counted by splitting on spaces rather than by counting the tsvector's
+ * lexemes, for two reasons that happen to agree. It is cheaper — no tsvector is
+ * built, so the alias branch does not tokenise each matched food's name a
+ * second time, which measured on the widest query of the committed set
+ * ("chicken", 674 matching foods and 849 matching aliases) is the difference
+ * between roughly +35 ms and +10 ms of statement time. And it is a better
+ * measure of verbosity: the lexeme count DROPS stopwords, so "Rice with
+ * raisins" counted two words against "Brown rice, dry"'s three and a dish
+ * outranked the ingredient. Measured over the committed 426-query set, the word
+ * count also scores marginally better — top-3 0.948 against 0.944, with the
+ * `exact` kind at 0.915 against 0.902.
+ *
+ * `GREATEST(…, 1)` is not defensive padding: `array_length` returns NULL for an
+ * empty array, and dividing by NULL would make that row's rank NULL and sort it
+ * unpredictably under `ORDER BY rank DESC`. Clamping to one word scores such a
+ * row as a single-word name, which is the closest true statement available.
+ */
+const wordCountOf = (text: Prisma.Sql): Prisma.Sql =>
+    Prisma.sql`GREATEST(array_length(string_to_array(btrim(${text}), ' '), 1), 1)::real`;
+
+/**
+ * The head segment of a name: everything before its first comma.
+ *
+ * Both USDA and this catalog name a food as head-then-qualifiers — "Beef,
+ * ground", "Rice, brown and wild, cooked, NS as to fat" — so the text before
+ * the first comma is what the food IS and the rest describes it. A name with no
+ * comma is its own head segment, which `split_part` already returns.
+ */
+const headSegmentOf = (text: Prisma.Sql): Prisma.Sql => Prisma.sql`split_part(${text}, ',', 1)`;
+
+/**
+ * Case-fold A-Z and nothing else, in SQL.
+ *
+ * The SQL half of `catalog.logic.ts`'s `foldSearchAscii`, built from the same
+ * two exported constants so the JavaScript and SQL folds cannot drift apart.
+ * That file explains why the fold has to be ASCII-only; the short version is
+ * that `lower()` resolves through the database's collation while
+ * `String.prototype.toLowerCase` does not, so using either one on its own side
+ * of the head-noun comparison made the tier depend on the server's locale and
+ * broke the cross-database rank reproducibility §0.9.3 requires.
+ *
+ * `translate()` is a character-for-character map with no locale input at all,
+ * and the two argument strings are the same 26 letters the JavaScript side
+ * folds. Non-ASCII characters pass through untouched on both sides and are
+ * normalised by `to_tsvector`/`plainto_tsquery`, which apply one text-search
+ * configuration to both halves of the comparison.
+ */
+const asciiFoldOf = (text: Prisma.Sql): Prisma.Sql =>
+    Prisma.sql`translate(${text}, ${SEARCH_ASCII_UPPERCASE}, ${SEARCH_ASCII_LOWERCASE})`;
+
+/**
+ * The head phrase of a head segment: everything before its first connector.
+ *
+ * `SEARCH_HEAD_CONNECTORS` in `catalog.logic.ts` explains which words end a
+ * head phrase and why, and the same list is folded here so a food's name and a
+ * search term have their heads taken by one rule. The ASCII fold is applied
+ * first so a connector written "With" is still recognised; the result is only
+ * ever fed to `to_tsvector`, which normalises case anyway, so nothing
+ * downstream depends on the case of what comes back.
+ */
+const headPhraseOf = (text: Prisma.Sql): Prisma.Sql =>
+    SEARCH_HEAD_CONNECTORS.reduce(
+        (phrase, connector) => Prisma.sql`split_part(${phrase}, ${` ${connector} `}, 1)`,
+        asciiFoldOf(text),
+    );
+
+/**
+ * The head noun of a phrase: the last whitespace-separated token of its head
+ * phrase.
+ *
+ * English puts the head of a nominal compound last — "brown RICE" is a rice,
+ * "rice BREAD" is a bread — which is the signal that separates the food a query
+ * names from the food it merely modifies.
+ *
+ * Deliberately built from `translate`/`split_part`/`reverse`/`btrim` rather
+ * than a regular expression, and deliberately NOT from `lower()`. §0.9.3
+ * requires two independently loaded databases to produce identical ranks, so
+ * every operation on the path to a rank has to be locale-free:
+ *
+ *  * POSIX character classes such as `[[:alnum:]]` resolve through the
+ *    database's ctype, so a regex-based extraction could tokenise an accented
+ *    name differently on two servers.
+ *  * `lower()` resolves through the collation. It was used here, and it was a
+ *    defect: the query's head noun is extracted in JavaScript, where
+ *    `'İNCİR'.toLowerCase()` is `i` + U+0307, while `lower('İNCİR')` is
+ *    `incir` under `en_US.utf8` and different again under ICU. The two sides of
+ *    the comparison then disagreed, so which tier a food scored in depended on
+ *    the server. `asciiFoldOf` replaces it.
+ *
+ * What remains — `translate` over a fixed 26-letter map, `split_part`,
+ * `reverse`, `btrim` — are character-level operations with no locale input at
+ * all, so the extracted head noun is a property of the release rather than of
+ * the server. Any punctuation left on the token, and every non-ASCII character,
+ * is normalised by `to_tsvector` at the point of comparison, which applies one
+ * text-search configuration to both halves of it.
+ *
+ * `api/catalogCollation.test.ts` pins this against a real ICU database: the
+ * extraction must return the same value under the database default as under
+ * `COLLATE "C"`, and that value must equal what the JavaScript side computes.
+ */
+const headNounOf = (text: Prisma.Sql): Prisma.Sql =>
+    Prisma.sql`reverse(split_part(reverse(btrim(${headPhraseOf(text)})), ' ', 1))`;
 
 /* ---------------------------------------------------------------------------
  * Search
@@ -266,19 +420,56 @@ export interface CatalogSearchResult {
  * one definition with two tails. It is a parameterised `Prisma.Sql` fragment, so
  * composition keeps `q` a bound parameter and never becomes string building.
  *
+ * WHAT A CONTRIBUTION'S `rank` IS, AND WHY IT IS NOT `ts_rank` ALONE.
+ * `ts_rank`'s default normalisation scores by term frequency and ignores
+ * document length, and a catalog food mentions any one word about once — so an
+ * unaided `ts_rank` returns THE SAME VALUE for an entire match set. Measured
+ * against the v1 release, `q = 'salt'` matches 595 published foods and the
+ * number of distinct `ts_rank` values over them is exactly one; the order then
+ * came entirely from the `display_name` tiebreaker, i.e. alphabetically, which
+ * is why "Salt" itself came 463rd. Each branch below therefore scores its
+ * contribution with the weights in `catalog.logic.ts`'s {@link
+ * SEARCH_RELEVANCE} — field, specificity and head noun, documented in full
+ * there — and `ORDER BY rank DESC, display_name, source_key` is unchanged: the
+ * keys are the same three in the same precedence, and only the value of the
+ * first one now discriminates. Every input to a score is release data
+ * (`display_name`, an alias, `search_text`), never a database-generated id, so
+ * two independently loaded databases still rank identically, as §0.9.3
+ * requires.
+ *
  * FOUR CONTRIBUTIONS, EACH FOR A REASON THE OTHERS CANNOT COVER:
  *
  *  1. The food's own `search_vector` — the STORED generated column, read
  *     through the GIN index. This is the ordinary relevance path, and it is what
  *     makes plurals work: `plainto_tsquery` stems "mushrooms" to `mushroom` and
- *     matches a vector built from "Mushrooms, white".
+ *     matches a vector built from "Mushrooms, white". Its score reads the
+ *     `display_name` separately from that bundle, because the bundle is what
+ *     made relevance unrankable: `search_text` concatenates the name with every
+ *     alias, the food state and the food group, so a well-curated generic food
+ *     carries more words in it than a verbose USDA survey name does. The name
+ *     alone answers "is this food CALLED what was typed", and the bundle is
+ *     kept as the weaker {@link SEARCH_RELEVANCE.textOnly} path so a food
+ *     matched only by a state or group word is still found and still ranked
+ *     last among real matches.
  *  2. Every alias, scored on the fly. Aliases carry no tsvector column of their
  *     own, so their vector is computed per row; a LATERAL binds it once so the
  *     `@@` test and the `ts_rank` do not each recompute it. This branch is
  *     load-bearing rather than redundant: it is what lets a food be found by a
  *     word that appears in none of its own columns — "eggplant" reaching
  *     "Aubergine" — and nothing guarantees a food's `search_text` repeats its
- *     aliases.
+ *     aliases. An alias is an ALTERNATIVE NAME, so a hit here weighs as much as
+ *     a name hit, and its divisor is the LEAST SPECIFIC of the two names the
+ *     match went through — `GREATEST(alias words, name words)`. Both halves
+ *     of that were measured against v1 and each fixes the other's failure.
+ *     Dividing by the alias alone let the one-word alias "chickens" on
+ *     "Chicken, NS as to part and cooking method, NS as to skin eaten" score
+ *     0.06079 and outrank "Chicken breast" on its own name at 0.03040, so for
+ *     every category word the survey placeholder rows took page one. Dividing
+ *     by the food's name alone put "Egg" first for "chicken", because its alias
+ *     "chicken egg" mentions the word while its own one-word name makes it look
+ *     maximally specific. Bounding by both says the honest thing: an alias
+ *     cannot make a food look more precisely named than it is, and a vague food
+ *     does not become precise by carrying a short alias.
  *  3. and 4. A prefix fallback over the food's names and over its aliases. A
  *     stemmed query has no prefix semantics at all, so a two-character `q` such
  *     as "mu" matches NOTHING through 1 or 2 while a user is still typing. The
@@ -287,6 +478,43 @@ export interface CatalogSearchResult {
  *     left-anchored because a prefix is the only LIKE shape a btree can answer
  *     with a range scan; an interior whole word is already covered by 1 and 2,
  *     which tokenise every word of the text.
+ *
+ *     KNOWN, BOUNDED DIVERGENCE IN THESE TWO BRANCHES, stated rather than
+ *     hidden. Their pattern is folded in JavaScript (`q.toLowerCase()`) and
+ *     their columns in SQL (`lower(col)`), and those two folds are not the same
+ *     function outside A-Z: `'İNCİR'.toLowerCase()` is `i` + U+0307 while
+ *     `lower('İNCİR')` is `incir` under en_US and `İncİr` under C. The head-noun
+ *     path had the same defect and was fixed by folding both sides through
+ *     {@link asciiFoldOf} / `foldSearchAscii` over one shared alphabet; these
+ *     two branches CANNOT take that fix here, because
+ *     `idx_catalog_food_aliases_lower_alias` indexes the expression
+ *     `lower(alias) text_pattern_ops`, so writing `translate(alias, …) LIKE …`
+ *     instead would no longer match the indexed expression and would replace
+ *     the range scan with a sequential read of every published alias — the
+ *     opposite of what the index below exists for, and a change the collation
+ *     suite's index-scan pin would (correctly) fail.
+ *     What this costs today: nothing measurable. Across release v1 no alias and
+ *     no canonical_name contains a non-ASCII character at all, and exactly 2 of
+ *     11,046 display_names do — `usda:2710826` and `usda:2727573`, whose only
+ *     non-ASCII byte is U+00A0 NO-BREAK SPACE, which is not an uppercase letter,
+ *     so `lower()` and the ASCII fold return the same string for both rows. The
+ *     branches are therefore fold-equivalent on the shipped catalog, which is
+ *     why `npm run search:benchmark` reproduces rank-for-rank across two
+ *     independently loaded databases.
+ *     What it would cost if a future release carried a non-ASCII uppercase
+ *     letter: a partial query over that text would miss these branches (and a
+ *     partial query matches through NO other branch, since a stemmed query has
+ *     no prefix semantics), so the food would be absent from results rather
+ *     than merely mis-ranked, and which queries were affected would depend on
+ *     the server's collation.
+ *     THE FIX, and who owns it: add an expression index over the ASCII fold —
+ *     `(translate(alias, 'ABC…', 'abc…') text_pattern_ops)` and the matching
+ *     pair on `display_name`/`canonical_name` — and then fold both sides here
+ *     as the head-noun path already does. The index lives in
+ *     `prisma/schema.prisma`, `prisma/migrations/20260908000000_meal_planning/`
+ *     and `docs/meal-planning/expected-schema-diff.sql`, which belong to the
+ *     schema work unit, so the change is theirs to make and this comment is the
+ *     request for it.
  *
  * WHAT AN INDEX SCAN ON THE ALIAS PREFIX ACTUALLY NEEDS — TWO CONDITIONS, BOTH
  * MEASURED, AND THE SECOND IS WHY THE PATTERN IS BOUND INTO THE BRANCHES BELOW
@@ -326,40 +554,75 @@ export interface CatalogSearchResult {
  */
 const catalogMatchSet = (q: string): Prisma.Sql => {
     const prefixPattern = `${q.toLowerCase().replace(LIKE_METACHARACTERS, '\\$&')}%`;
+    // Code points, which is what PostgreSQL's `char_length` counts over UTF-8,
+    // so the coverage ratio means the same thing on both sides. Computed here
+    // rather than as `char_length($1)` only because the value is the same for
+    // every row of the statement.
+    const queryLength = [...q].length;
 
     return Prisma.sql`
         WITH search AS (
-            SELECT plainto_tsquery(${TEXT_SEARCH_CONFIG}::regconfig, ${q}) AS tsq
+            SELECT plainto_tsquery(${TEXT_SEARCH_CONFIG}::regconfig, ${q}) AS tsq,
+                plainto_tsquery(${TEXT_SEARCH_CONFIG}::regconfig, ${searchQueryHeadNoun(q)}) AS head_tsq
         ),
         contributions AS (
-            SELECT f.id, ts_rank(f.search_vector, s.tsq) AS rank
+            SELECT f.id,
+                (CASE
+                    WHEN to_tsvector(${TEXT_SEARCH_CONFIG}::regconfig, name_parts.head_noun) @@ s.head_tsq
+                        THEN ${SEARCH_RELEVANCE.headNoun}::real
+                    WHEN to_tsvector(${TEXT_SEARCH_CONFIG}::regconfig, name_text.head_segment) @@ s.tsq
+                        THEN ${SEARCH_RELEVANCE.headSegment}::real
+                    ELSE ${SEARCH_RELEVANCE.outsideHead}::real
+                END
+                    * GREATEST(
+                        ts_rank(name_text.vector, s.tsq),
+                        ${SEARCH_RELEVANCE.textOnly}::real * ts_rank(f.search_vector, s.tsq)
+                    )
+                    / name_parts.words) AS rank
             FROM catalog_foods f
             CROSS JOIN search s
+            CROSS JOIN LATERAL (
+                SELECT ${nameVector} AS vector, ${headSegmentOf(DISPLAY_NAME)} AS head_segment
+            ) name_text
+            CROSS JOIN LATERAL (
+                SELECT ${wordCountOf(DISPLAY_NAME)} AS words,
+                    ${headNounOf(Prisma.sql`name_text.head_segment`)} AS head_noun
+            ) name_parts
             WHERE f.publication_status = ${PUBLISHED}
                 AND f.search_vector @@ s.tsq
 
             UNION ALL
 
-            SELECT f.id, ${PREFIX_MATCH_RANK}::real AS rank
+            SELECT f.id, ${prefixCoverageScore(queryLength, DISPLAY_NAME)} AS rank
             FROM catalog_foods f
             WHERE f.publication_status = ${PUBLISHED}
                 AND (lower(f.display_name) LIKE ${prefixPattern} OR lower(f.canonical_name) LIKE ${prefixPattern})
 
             UNION ALL
 
-            SELECT a.catalog_food_id AS id, ts_rank(alias_vector.value, s.tsq) AS rank
+            SELECT a.catalog_food_id AS id,
+                (CASE
+                    WHEN to_tsvector(${TEXT_SEARCH_CONFIG}::regconfig, ${headNounOf(ALIAS)}) @@ s.head_tsq
+                        THEN ${SEARCH_RELEVANCE.aliasHeadNoun}::real
+                    ELSE ${SEARCH_RELEVANCE.aliasOther}::real
+                END
+                    * ts_rank(alias_vector.value, s.tsq)
+                    / name_parts.words) AS rank
             FROM catalog_food_aliases a
             JOIN catalog_foods f ON f.id = a.catalog_food_id
             CROSS JOIN search s
             CROSS JOIN LATERAL (
                 SELECT to_tsvector(${TEXT_SEARCH_CONFIG}::regconfig, a.alias) AS value
             ) alias_vector
+            CROSS JOIN LATERAL (
+                SELECT GREATEST(${wordCountOf(ALIAS)}, ${wordCountOf(DISPLAY_NAME)}) AS words
+            ) name_parts
             WHERE f.publication_status = ${PUBLISHED}
                 AND alias_vector.value @@ s.tsq
 
             UNION ALL
 
-            SELECT a.catalog_food_id AS id, ${PREFIX_MATCH_RANK}::real AS rank
+            SELECT a.catalog_food_id AS id, ${prefixCoverageScore(queryLength, ALIAS)} AS rank
             FROM catalog_food_aliases a
             JOIN catalog_foods f ON f.id = a.catalog_food_id
             WHERE f.publication_status = ${PUBLISHED}

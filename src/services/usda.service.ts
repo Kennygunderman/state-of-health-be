@@ -137,11 +137,28 @@ interface UsdaRequestOptions {
     body?: unknown;
 }
 
+/**
+ * One completed USDA exchange: the decoded body and the status the vendor
+ * answered it with.
+ *
+ * The status is carried out of the retry loop rather than dropped because it is
+ * a mandatory field of a retrieval record (Agent Action Plan §0.3.2) and the
+ * catalog import copies it onto every
+ * `catalog_validation_records.identity_evidence` record. It is always the
+ * status of the attempt that produced `payload` — the successful one — never an
+ * earlier retried `400`/`429`, because only a `response.ok` attempt returns
+ * from the loop at all.
+ */
+interface UsdaFetchResult {
+    readonly payload: any;
+    readonly httpStatus: number;
+}
+
 const fetchFromUsda = async (
     path: string,
     params: Record<string, string>,
     options?: UsdaRequestOptions,
-): Promise<any> => {
+): Promise<UsdaFetchResult> => {
     const baseUrl = process.env.USDA_BASE_URL || DEFAULT_BASE_URL;
     // Spaces must be %20, not URLSearchParams' "+" — USDA 400s on "+" inside
     // dataType values (e.g. "Survey (FNDDS)").
@@ -197,7 +214,12 @@ const fetchFromUsda = async (
                     ? await fetch(url, { signal: controller.signal })
                     : await fetch(url, { ...init, signal: controller.signal });
             if (response.ok) {
-                return await response.json();
+                // Read the status before the body: an unreadable body throws
+                // below and is retried, and the status of a retried attempt is
+                // not the status of this call.
+                const httpStatus = response.status;
+
+                return { payload: await response.json(), httpStatus };
             }
             lastError = new UsdaError(`USDA returned ${response.status}`);
             terminal = !isRetryableUsdaStatus(response.status);
@@ -329,11 +351,15 @@ export const cacheKeyForRequest = (
     return `${normalizedMethod} ${baseKey}#${canonicalBody(body)}`;
 };
 
-const upsertCache = async (cacheKey: string, payload: any): Promise<void> => {
+// `http_status` is written on every path that writes a payload, including the
+// background refresh: the column records the status of the exchange that
+// produced the row it sits on, so a refreshed row carries the refresh's status
+// rather than the one the replaced payload arrived with.
+const upsertCache = async (cacheKey: string, payload: any, httpStatus: number): Promise<void> => {
     await prisma.usda_api_cache.upsert({
         where: { cache_key: cacheKey },
-        create: { cache_key: cacheKey, payload },
-        update: { payload, fetched_at: new Date() },
+        create: { cache_key: cacheKey, payload, http_status: httpStatus },
+        update: { payload, http_status: httpStatus, fetched_at: new Date() },
     });
 };
 
@@ -343,7 +369,7 @@ const refreshInBackground = (cacheKey: string, path: string, params: Record<stri
     if (refreshing.has(cacheKey)) return;
     refreshing.add(cacheKey);
     fetchFromUsda(path, params)
-        .then((payload) => upsertCache(cacheKey, payload))
+        .then(({ payload, httpStatus }) => upsertCache(cacheKey, payload, httpStatus))
         .catch(() => {
             // Stale row keeps being served; the next request past TTL retries.
         })
@@ -371,39 +397,105 @@ const usdaGet = async (path: string, params: Record<string, string>): Promise<an
         return cached.payload;
     }
 
-    const payload = await fetchFromUsda(path, params);
-    upsertCache(cacheKey, payload).catch(() => {
+    const { payload, httpStatus } = await fetchFromUsda(path, params);
+    // Deliberately not awaited, unlike the batch path below: a client is
+    // waiting on this call, the response is already in hand, and nothing on the
+    // request path asks where the payload came from — so the write stays off
+    // the latency path exactly as it has been.
+    upsertCache(cacheKey, payload, httpStatus).catch(() => {
         // Caching is best-effort; the response is already in hand.
     });
     return payload;
 };
 
+/**
+ * What one batch call observed about its own retrieval.
+ *
+ * Every member is a fact the call itself saw, which is the point: once the
+ * cache write is awaited (below), the presence of a row no longer tells a
+ * caller whether this call fetched or replayed, so the answer has to travel out
+ * of the call rather than be re-derived from the table afterwards.
+ */
+interface UsdaPostResult {
+    readonly payload: unknown;
+    /** `usda_api_cache.cache_key` this response is filed under. */
+    readonly cacheKey: string;
+    readonly origin: 'cache' | 'network';
+    /** See {@link UsdaBatchRetrievalFacts.httpStatus} for what `null` means. */
+    readonly httpStatus: number | null;
+    readonly fetchedAt: Date;
+}
+
 // The batch POST cannot go through usdaGet — that path is GET-only and its key
 // is not body-aware — so it reads and writes the same cache table through
 // cacheKeyForRequest, with usdaGet's error posture: cache/DB failures fall
-// through to a live call. A cached batch is served whatever its age and is
+// through to a live call. A cached batch is served whatever its AGE and is
 // never refreshed in the background: detail records are near-immutable, and a
 // background request would spend one of the hour's requests outside the
 // caller's rate accounting.
-const usdaPost = async (path: string, params: Record<string, string>, body: unknown): Promise<unknown> => {
+//
+// Age is the only thing that does not invalidate a row. A row with no recorded
+// `http_status` is a different matter and is re-fetched — see below.
+const usdaPost = async (path: string, params: Record<string, string>, body: unknown): Promise<UsdaPostResult> => {
     const cacheKey = cacheKeyForRequest('POST', path, params, body);
 
-    let cached: { payload: unknown } | null = null;
+    let cached: { payload: unknown; http_status: number | null; fetched_at: Date } | null = null;
     try {
         cached = await prisma.usda_api_cache.findUnique({ where: { cache_key: cacheKey } });
     } catch {
         cached = null;
     }
 
-    if (cached) {
-        return cached.payload;
+    // A ROW WITH NO RECORDED STATUS IS NOT A USABLE REPLAY, and that is the
+    // one condition besides absence that sends this call to the vendor.
+    //
+    // `http_status` is a mandatory field of the retrieval record this response
+    // becomes (Agent Action Plan §0.3.2), and a row cached before the column
+    // existed carries none. Serving such a row would make it an ABSORBING
+    // STATE: every future call would replay it, so the status could never be
+    // observed for that batch on any later run, and the evidence would stay
+    // null forever while the code that fills it in looked correct. Re-fetching
+    // is the only way the field can ever be obtained.
+    //
+    // NOTHING IS BACKFILLED OR GUESSED. The status written is the one the new
+    // exchange answers with, the payload written is that exchange's payload,
+    // and `fetched_at` moves to that exchange's time — the upsert below
+    // replaces all three together, so the row stops being a pre-ledger row the
+    // first time it is read after the migration rather than being annotated
+    // with a status that belongs to a different response. The re-fetch goes
+    // through the same `globalThis.fetch` the import's limiter wraps, so it is
+    // paced and counted like any other attempt.
+    //
+    // This costs one request per pre-ledger batch, once. Rows this release
+    // writes all carry a status, so the condition is self-clearing and no
+    // steady-state traffic is added.
+    if (cached !== null && cached.http_status !== null) {
+        return {
+            payload: cached.payload,
+            cacheKey,
+            origin: 'cache',
+            // The status recorded with the row, never a substituted 200.
+            httpStatus: cached.http_status,
+            // The row's own retrieval time, which is when this payload was
+            // obtained from USDA — this call obtained nothing.
+            fetchedAt: cached.fetched_at,
+        };
     }
 
-    const payload = await fetchFromUsda(path, params, { method: 'POST', body });
-    upsertCache(cacheKey, payload).catch(() => {
-        // Caching is best-effort; the response is already in hand.
-    });
-    return payload;
+    const { payload, httpStatus } = await fetchFromUsda(path, params, { method: 'POST', body });
+    const fetchedAt = new Date();
+    // Awaited, unlike the request path above: no client is waiting on a batch,
+    // and a caller that asks where this response came from must not be able to
+    // observe the row arriving after the answer. The guard keeps the write
+    // best-effort all the same — a read-only or unreachable database still
+    // cannot fail a vendor call whose response is already in hand.
+    try {
+        await upsertCache(cacheKey, payload, httpStatus);
+    } catch (error) {
+        console.error('Failed to cache USDA batch response:', (error as Error).message);
+    }
+
+    return { payload, cacheKey, origin: 'network', httpStatus, fetchedAt };
 };
 
 const titleCase = (value: string): string =>
@@ -678,20 +770,104 @@ export const getFoodDetail = async (fdcId: string | number): Promise<UsdaFoodDet
     return record;
 };
 
-export const getFoodsBatch = async (fdcIds: ReadonlyArray<string | number>): Promise<UsdaFoodDetail[]> => {
-    if (fdcIds.length === 0) {
-        return [];
+/**
+ * How one `POST /foods` batch was actually obtained.
+ *
+ * This exists because the status of a USDA exchange is a mandatory field of a
+ * retrieval record (Agent Action Plan §0.3.2) and
+ * `catalog_validation_records.identity_evidence` IS such a record (§0.5.1): the
+ * catalog import has to state the upstream status of the response each food
+ * record came from, and it can only state what this boundary observed.
+ *
+ * Every member is observed by the call that returns it, never re-derived
+ * afterwards. In particular {@link origin} is not "is there a row under
+ * {@link cacheKey}" — the live path awaits its own cache write, so by the time
+ * a caller looks there is always a row.
+ */
+export interface UsdaBatchRetrievalFacts {
+    /** `normalizeFdcIds` output: canonical, de-duplicated and ascending. */
+    readonly requestedFdcIds: readonly number[];
+    /**
+     * `usda_api_cache.cache_key` for this request — the single-column primary
+     * key of the row holding {@link payload}, so a reader can look the response
+     * up and recompute a digest of it.
+     */
+    readonly cacheKey: string;
+    /** `'network'` when this call reached USDA, `'cache'` when it replayed a recorded response. */
+    readonly origin: 'cache' | 'network';
+    /**
+     * The upstream HTTP status of the exchange that produced {@link payload}:
+     * this call's observed status on a live fetch, and the status recorded on
+     * the row on a replay.
+     *
+     * `null` means **the recorded response predates the status ledger** — it
+     * was cached before `usda_api_cache.http_status` existed, so no status was
+     * ever observed for it. It never means "unknown, probably 200": a
+     * downstream artefact quotes this value as retrieval evidence, and
+     * substituting a status nobody saw is the defect the column was added to
+     * end.
+     *
+     * In practice this function no longer returns `null`. A live fetch always
+     * carries a number because only a `response.ok` attempt returns a payload,
+     * and a cached row without a status is re-fetched rather than replayed
+     * (see `usdaPost`) precisely so the field can be obtained. The `null` stays
+     * REPRESENTABLE rather than being typed away, because a consumer that
+     * publishes this value must refuse the case explicitly instead of relying
+     * on a type to prove it cannot happen — `catalog-import-usda.ts` quarantines
+     * such a record rather than publishing a mandatory field it never observed.
+     */
+    readonly httpStatus: number | null;
+    /**
+     * When {@link payload} was obtained from USDA: the row's `fetched_at` on a
+     * replay (the vendor retrieval time), this call's clock on a live fetch.
+     */
+    readonly fetchedAt: Date;
+    /**
+     * The whole response payload the details were read from — the same value
+     * recorded under {@link cacheKey} — so a caller can digest it rather than
+     * re-reading the row and hoping it still holds this response.
+     */
+    readonly payload: unknown;
+}
+
+/**
+ * Rejects an over-length batch instead of truncating it: silently dropping ids
+ * would make the import under-count and its coverage report lie.
+ */
+const assertBatchWithinCap = (count: number): void => {
+    if (count > MAX_BATCH_FDC_IDS) {
+        throw new UsdaError(`USDA accepts at most ${MAX_BATCH_FDC_IDS} FDC ids per batch request, received ${count}`);
     }
-    // Silently truncating to the cap would make the import under-count and its
-    // coverage report lie, so an over-length batch is rejected instead.
-    if (fdcIds.length > MAX_BATCH_FDC_IDS) {
+};
+
+/**
+ * `getFoodsBatch` plus the retrieval facts of the call that served it.
+ *
+ * The records are identical to what `getFoodsBatch` returns for the same ids —
+ * it delegates here — so a caller needing the provenance pays nothing extra and
+ * cannot end up describing a different request than the one it read.
+ *
+ * An empty id list throws rather than answering: `getFoodsBatch([])` makes no
+ * request and reads no row, so there are no retrieval facts to state, and
+ * inventing a shape for them is what this whole interface exists to stop.
+ */
+export const getFoodsBatchWithRetrieval = async (
+    fdcIds: ReadonlyArray<string | number>,
+): Promise<{ details: UsdaFoodDetail[]; retrieval: UsdaBatchRetrievalFacts }> => {
+    if (fdcIds.length === 0) {
         throw new UsdaError(
-            `USDA accepts at most ${MAX_BATCH_FDC_IDS} FDC ids per batch request, received ${fdcIds.length}`,
+            'USDA batch retrieval requires at least one FDC id: an empty batch makes no request, so there is ' +
+                'nothing to describe',
         );
     }
+    assertBatchWithinCap(fdcIds.length);
 
     const ids = normalizeFdcIds(fdcIds);
-    const payload: unknown = await usdaPost('/foods', {}, { fdcIds: ids, format: 'full' });
+    const { payload, cacheKey, origin, httpStatus, fetchedAt } = await usdaPost(
+        '/foods',
+        {},
+        { fdcIds: ids, format: 'full' },
+    );
     const requested = new Set(ids);
     const records = toIdentifiedRecords<UsdaFoodDetail>(payload, 'batch');
     for (const record of records) {
@@ -702,7 +878,25 @@ export const getFoodsBatch = async (fdcIds: ReadonlyArray<string | number>): Pro
             throw new UsdaError(`USDA batch returned an unrequested fdcId: ${record.fdcId}`);
         }
     }
-    return records;
+
+    return {
+        details: records,
+        retrieval: { requestedFdcIds: ids, cacheKey, origin, httpStatus, fetchedAt, payload },
+    };
+};
+
+export const getFoodsBatch = async (fdcIds: ReadonlyArray<string | number>): Promise<UsdaFoodDetail[]> => {
+    // The empty case is answered here rather than delegated: it issues no
+    // request, so the delegate has no retrieval to describe and refuses it.
+    // Everything else — the twenty-id cap, id canonicalisation, the cache, the
+    // identity checks — is the delegate's, so the two cannot diverge.
+    if (fdcIds.length === 0) {
+        return [];
+    }
+
+    const { details } = await getFoodsBatchWithRetrieval(fdcIds);
+
+    return details;
 };
 
 // dataType takes the same values searchGenericFoods passes ('Foundation',

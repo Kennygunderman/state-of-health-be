@@ -5,7 +5,7 @@
   "iconKey": "dome",
   "instructions": [
     "Heat the oven to 400°F and halve the bell peppers lengthwise, hollowing out each half.",
-    "Warm the olive oil in a skillet over medium heat, then soften the chopped onion and diced zucchini for about 5 minutes.",
+    "Warm the olive oil in a skillet over medium heat, then soften the chopped onion and diced zucchini for about 3 minutes.",
     "Stir in the black beans, cooked brown rice, diced tomato, ground cumin, and chili powder, and cook 2 minutes more to draw out the aroma.",
     "Spoon the filling into the bell pepper halves and arrange them snugly in a baking dish.",
     "Bake for 25 minutes, until the bell peppers are tender and the filling is heated through."
@@ -13,7 +13,7 @@
   "yieldServings": 4,
   "servingDescription": "1 stuffed bell pepper (2 halves)",
   "prepMinutes": 15,
-  "cookMinutes": 32,
+  "cookMinutes": 30,
   "mealSlots": [
     "dinner"
   ],

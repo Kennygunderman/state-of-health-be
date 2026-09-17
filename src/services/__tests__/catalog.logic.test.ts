@@ -47,7 +47,10 @@ import { join } from 'path';
 
 import {
     CATALOG_ALLERGEN_STATUSES,
+    CATALOG_ALLERGEN_TAGS,
     CATALOG_CHECK_NAMES,
+    CATALOG_DIET_TAG_EXCLUSIONS,
+    CATALOG_DIET_TAGS,
     CATALOG_FOOD_STATES,
     CATALOG_IDENTITY_SOURCES,
     CATALOG_IDENTITY_STATUSES,
@@ -61,9 +64,12 @@ import {
     CATALOG_SUGGESTIONS_MAX_LIMIT,
     CatalogCategoryBounds,
     CatalogComponentCoverageFacts,
+    CatalogDispositionInput,
     CatalogFoodCandidate,
     CatalogFoodPortionCandidate,
     CatalogGlobalValidationBounds,
+    CatalogAllergenTag,
+    CatalogDietTag,
     CatalogIdentityCandidate,
     CatalogIdentityError,
     CatalogNutrientInput,
@@ -85,12 +91,15 @@ import {
     assessComponentCoverage,
     buildSourceKey,
     catalogCheckTier,
+    classifyCatalogTagSets,
     computeCoverageShortfall,
     dedupeIdentity,
     deriveComponentNutrition,
     findBrandPatternMatch,
     groceryCategorySortIndex,
     isCatalogAllergenStatus,
+    isCatalogAllergenTag,
+    isCatalogDietTag,
     isCatalogFoodState,
     isCatalogIdentitySource,
     isCatalogIdentityStatus,
@@ -109,6 +118,12 @@ import {
     parseCatalogSuggestionsQuery,
     resolveCatalogDisposition,
     resolveCategoryBounds,
+    foldSearchAscii,
+    SEARCH_ASCII_LOWERCASE,
+    SEARCH_ASCII_UPPERCASE,
+    SEARCH_HEAD_CONNECTORS,
+    SEARCH_RELEVANCE,
+    searchQueryHeadNoun,
     validateCatalogCandidate,
 } from '../catalog.logic';
 import {
@@ -130,6 +145,11 @@ import {
     CatalogValidationOutcome,
 } from '../../types/catalog';
 import { CatalogEntryFood, resolveCatalogEntrySnapshot } from '../nutrition.logic';
+// The allergen codes the USER's selection stores, imported rather than copied:
+// the two lists are compared to each other at planning time, so the parity
+// assertion below has to read the real one (F20). `preferences.logic.ts` is a
+// pure module — no Prisma, no clock — so importing it costs this suite nothing.
+import { NAMED_ALLERGENS } from '../preferences.logic';
 
 /* ---------------------------------------------------------------------------
  * Fixtures — a deliberately synthetic policy, kept beside the shipped one
@@ -259,6 +279,12 @@ describe('closed value set guards', () => {
         ['allergen status', isCatalogAllergenStatus, CATALOG_ALLERGEN_STATUSES],
         ['publication status', isCatalogPublicationStatus, CATALOG_PUBLICATION_STATUSES],
         ['grocery category', isGroceryCategory, GROCERY_CATEGORY_ORDER],
+        // Both tag vocabularies are enforced here or nowhere for the same reason
+        // as the statuses above: `allergen_tags` and `diet_tags` are `TEXT[]`
+        // with no enum and no CHECK, and an off-vocabulary code matches nothing
+        // downstream rather than failing (F20).
+        ['allergen tag', isCatalogAllergenTag, CATALOG_ALLERGEN_TAGS],
+        ['diet tag', isCatalogDietTag, CATALOG_DIET_TAGS],
     ];
 
     it.each(guards)('%s admits every declared member', (_label, guard, values) => {
@@ -364,6 +390,52 @@ describe('check tiers', () => {
     it('files non_finite_computed_value as reject', () => {
         expect(catalogCheckTier(CATALOG_CHECK_NAMES.NON_FINITE_COMPUTED_VALUE)).toBe('reject');
         expect(catalogCheckTier(CATALOG_CHECK_NAMES.DEFAULT_PORTION_COUNT)).toBe('quarantine');
+    });
+
+    // Reject, and not review or quarantine (F20). A record claiming `vegan`
+    // while carrying `milk` cannot be true as written, and an off-vocabulary
+    // code matches nothing in the planner's exclusion — so neither is a fact
+    // waiting for more data, and a reject-tier failure returns before the
+    // review branch, where no curator allowlist can lift it. It is also what
+    // keeps `CATALOG_QUARANTINE_CHECK_NAMES` byte-equal to the coverage plan's
+    // `quarantineChecks`, which `catalog-report.ts` asserts against the data.
+    it('files the two tag checks as reject', () => {
+        expect(catalogCheckTier(CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE)).toBe('reject');
+        expect(catalogCheckTier(CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET)).toBe('reject');
+        expect([...CATALOG_REJECT_CHECK_NAMES]).toEqual(
+            expect.arrayContaining([
+                CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE,
+                CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET,
+            ]),
+        );
+        expect([...CATALOG_QUARANTINE_CHECK_NAMES]).not.toEqual(
+            expect.arrayContaining([
+                CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE,
+                CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET,
+            ]),
+        );
+    });
+
+    // The whole reject tier, listed: the quarantine and review lists above are
+    // pinned against the coverage plan, and this is the third list, so a new
+    // check name cannot be added to any tier without a test saying which.
+    it('files the fourteen reject-tier checks', () => {
+        expect([...CATALOG_REJECT_CHECK_NAMES]).toEqual([
+            'brand_pattern_name',
+            'empty_component_set',
+            'energy_macro_mismatch',
+            'inconsistent_tag_set',
+            'invalid_basis_amount',
+            'invalid_component_quantity',
+            'kcal_ceiling',
+            'macro_mass_ceiling',
+            'non_finite_computed_value',
+            'nutrient_negative',
+            'nutrient_not_finite',
+            'portion_conversion_drift',
+            'unknown_category',
+            'unknown_tag_code',
+        ]);
     });
 
     // The tier describes the check's own severity; the disposition rule is what
@@ -1130,6 +1202,250 @@ describe('parseCatalogSearchRequest', () => {
         expect(parseCatalogSearchRequest({ q: 'rice' })).toMatchObject({ limit: DEFAULT_SEARCH_LIMIT });
         expect(parseCatalogSearchRequest({ q: 'rice', limit: '50' })).toMatchObject({ limit: 50 });
         expect(parseCatalogSearchRequest({ q: 'rice', limit: '51' })).toMatchObject({ kind: 'error' });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The search relevance policy
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The weights `catalog.service.ts` binds into the search statement, and the
+ * query-side head-noun rule they are applied against.
+ *
+ * WHY A UNIT TEST OF NUMBERS IS WORTH HAVING HERE. These are not arbitrary
+ * settings: the ORDER of the bands is the search contract. `ts_rank` is
+ * strictly positive for a real full-text hit, so a `prefixCeiling` above zero
+ * would let a half-typed word outrank a food that matched on meaning, and a
+ * `textOnly` weight at or above the name weights would let a food matched only
+ * by its food-group word outrank a food actually called what the user typed.
+ * Either mistake is a one-character edit that no type checks and that the
+ * relevance thresholds would only reveal on the next operator benchmark run —
+ * which is exactly the "realistic future bug" Rule backend-architecture §7.1
+ * asks a pure test to catch. The relation assertions below therefore matter
+ * more than the literal values, and both are pinned.
+ *
+ * The behavioural half of this policy — that the weights actually order a page
+ * that way — is `src/__tests__/api/catalog.test.ts`, which needs PostgreSQL and
+ * so cannot live here.
+ */
+describe('the search relevance policy', () => {
+    describe('SEARCH_RELEVANCE', () => {
+        it('carries the weights the search statement binds', () => {
+            expect(SEARCH_RELEVANCE).toEqual({
+                headNoun: 1,
+                headSegment: 0.6,
+                outsideHead: 0.3,
+                aliasHeadNoun: 1,
+                aliasOther: 0.6,
+                textOnly: 0.1,
+                prefixCeiling: 0,
+            });
+        });
+
+        it('keeps the prefix band strictly below every full-text band', () => {
+            // `ts_rank` is strictly positive for a hit, so a ceiling of zero is
+            // what makes "a prefix match never outranks a stemmed match" true.
+            // Any positive ceiling silently inverts that.
+            expect(SEARCH_RELEVANCE.prefixCeiling).toBeLessThanOrEqual(0);
+
+            for (const weight of [
+                SEARCH_RELEVANCE.headNoun,
+                SEARCH_RELEVANCE.headSegment,
+                SEARCH_RELEVANCE.outsideHead,
+                SEARCH_RELEVANCE.aliasHeadNoun,
+                SEARCH_RELEVANCE.aliasOther,
+                SEARCH_RELEVANCE.textOnly,
+            ]) {
+                expect(weight).toBeGreaterThan(SEARCH_RELEVANCE.prefixCeiling);
+            }
+        });
+
+        it('ranks a head-noun match over a modifier match over a match outside the head', () => {
+            expect(SEARCH_RELEVANCE.headNoun).toBeGreaterThan(SEARCH_RELEVANCE.headSegment);
+            expect(SEARCH_RELEVANCE.headSegment).toBeGreaterThan(SEARCH_RELEVANCE.outsideHead);
+            expect(SEARCH_RELEVANCE.aliasHeadNoun).toBeGreaterThan(SEARCH_RELEVANCE.aliasOther);
+        });
+
+        it('treats an alias as an alternative name, weighing it with the name itself', () => {
+            expect(SEARCH_RELEVANCE.aliasHeadNoun).toBe(SEARCH_RELEVANCE.headNoun);
+        });
+
+        it('weighs a match found only in the bundled search text below every name match', () => {
+            // The weakest positive band: a food reached only through a state,
+            // food-group or descriptor word is still found, and still ranks
+            // behind every food the query actually names.
+            expect(SEARCH_RELEVANCE.textOnly).toBeLessThan(SEARCH_RELEVANCE.outsideHead);
+            expect(SEARCH_RELEVANCE.textOnly).toBeLessThan(SEARCH_RELEVANCE.aliasOther);
+            expect(SEARCH_RELEVANCE.textOnly).toBeGreaterThan(SEARCH_RELEVANCE.prefixCeiling);
+        });
+
+        it('keeps every weight a fraction of the full-weight reference', () => {
+            // The reference is 1, so a score is always a fraction of the
+            // specificity-divided `ts_rank` and no weight can amplify a match
+            // past what the full-text rank itself says.
+            for (const weight of Object.values(SEARCH_RELEVANCE)) {
+                expect(weight).toBeLessThanOrEqual(1);
+            }
+        });
+
+        it('cannot be retuned in place by a caller on the request path', () => {
+            // Frozen: shared policy read per search, so a mutation would
+            // silently retune every later search in the process.
+            expect(Object.isFrozen(SEARCH_RELEVANCE)).toBe(true);
+        });
+    });
+
+    describe('searchQueryHeadNoun', () => {
+        it('takes the last word of a compound, which is its head', () => {
+            expect(searchQueryHeadNoun('brown rice')).toBe('rice');
+            expect(searchQueryHeadNoun('whole wheat bread')).toBe('bread');
+        });
+
+        it('is its own head noun when the term is a single word', () => {
+            expect(searchQueryHeadNoun('rice')).toBe('rice');
+        });
+
+        it('stops at a connector, because what follows postmodifies the head', () => {
+            // "gumbo with rice" is a gumbo, not a rice — the failure this rule
+            // exists for, measured on the v1 release.
+            expect(searchQueryHeadNoun('gumbo with rice')).toBe('gumbo');
+            expect(searchQueryHeadNoun('macaroni and cheese')).toBe('macaroni');
+            expect(searchQueryHeadNoun('chicken in sauce')).toBe('chicken');
+        });
+
+        it('stops at the first comma, as the catalog names its foods', () => {
+            expect(searchQueryHeadNoun('beans, black')).toBe('beans');
+        });
+
+        it('takes the comma before the connector, in that order', () => {
+            // Both delimiters present: the comma wins because it is applied
+            // first, which is the same order the SQL applies them in.
+            expect(searchQueryHeadNoun('rice, cooked with butter')).toBe('rice');
+        });
+
+        it('recognises a connector however it is capitalised', () => {
+            expect(searchQueryHeadNoun('Gumbo With Rice')).toBe('gumbo');
+        });
+
+        it('ignores surrounding and repeated whitespace', () => {
+            expect(searchQueryHeadNoun('  brown rice  ')).toBe('rice');
+            expect(searchQueryHeadNoun('beans  and  rice')).toBe('beans');
+        });
+
+        it('yields the empty string for a term with no word in it', () => {
+            // Whose `plainto_tsquery` is an empty query that matches nothing, so
+            // the head-noun weight simply does not apply. `parseCatalogSearchQuery`
+            // has already refused such a term at the request boundary.
+            expect(searchQueryHeadNoun('')).toBe('');
+            expect(searchQueryHeadNoun('   ')).toBe('');
+        });
+
+        it('keeps punctuation for plainto_tsquery to discard', () => {
+            // Deliberately not stripped here: the result is tokenised by
+            // PostgreSQL with the same configuration the stored vectors used, so
+            // stripping it twice could only disagree with that tokeniser.
+            expect(searchQueryHeadNoun('rice.')).toBe('rice.');
+        });
+    });
+
+    describe('SEARCH_HEAD_CONNECTORS', () => {
+        it('lists the function words that end a head phrase', () => {
+            expect(SEARCH_HEAD_CONNECTORS).toEqual(['with', 'and', 'in', 'on', 'from', 'for', 'of']);
+        });
+
+        it('ends a head phrase at every one of them', () => {
+            // The list and the behaviour asserted together, so an entry added
+            // without the SQL side following it shows up as a failure here.
+            for (const connector of SEARCH_HEAD_CONNECTORS) {
+                expect(searchQueryHeadNoun(`gumbo ${connector} rice`)).toBe('gumbo');
+            }
+        });
+
+        it('holds only words the English stemmer treats as stopwords', () => {
+            // What makes truncation safe: none of these can be the word a user
+            // is searching for, so no query loses its head noun to the rule.
+            // Lower-case and single-word by construction, which is what the
+            // ` word `-delimited split the SQL performs requires.
+            for (const connector of SEARCH_HEAD_CONNECTORS) {
+                expect(connector).toBe(connector.toLowerCase());
+                expect(connector).not.toContain(' ');
+            }
+        });
+
+        it('holds only ASCII words, which is what makes an ASCII-only fold sufficient', () => {
+            // `foldSearchAscii` deliberately folds nothing outside A-Z, so a
+            // connector carrying a non-ASCII capital would stop being
+            // recognised. This asserts no such connector exists.
+            for (const connector of SEARCH_HEAD_CONNECTORS) {
+                expect(connector).toMatch(/^[a-z]+$/);
+            }
+        });
+    });
+
+    describe('foldSearchAscii', () => {
+        it('folds every ASCII capital and nothing else', () => {
+            expect(foldSearchAscii(SEARCH_ASCII_UPPERCASE)).toBe(SEARCH_ASCII_LOWERCASE);
+        });
+
+        it('leaves text that has no ASCII capital exactly as it was', () => {
+            expect(foldSearchAscii('brown rice, dry')).toBe('brown rice, dry');
+            expect(foldSearchAscii('')).toBe('');
+        });
+
+        it('keeps punctuation, digits and spacing untouched', () => {
+            expect(foldSearchAscii('Beef, 80% Lean  (Ground)')).toBe('beef, 80% lean  (ground)');
+        });
+
+        it('leaves a non-ASCII capital alone rather than case-folding it', () => {
+            // THE DEFECT THIS FUNCTION EXISTS FOR. `toLowerCase()` applies
+            // Unicode default case folding and turns 'İ' into 'i' + U+0307
+            // COMBINING DOT ABOVE, while PostgreSQL's `lower()` goes through
+            // the database collation and yields a plain 'i' under en_US.utf8 —
+            // two different strings on the two sides of the head-noun
+            // comparison, so the tier a food scored in depended on the server
+            // and ranks stopped being reproducible across independent loads
+            // (AAP §§0.5.2, 0.9.3). Folding only A-Z is identical in every
+            // collation and in every JS engine, so both sides agree by
+            // construction and `to_tsvector` does the Unicode work.
+            expect('İNCİR'.toLowerCase()).toBe('i\u0307nci\u0307r');
+            expect(foldSearchAscii('İNCİR')).toBe('İncİr');
+            expect(foldSearchAscii('ÉCLAIR')).toBe('Éclair');
+            // Every non-ASCII capital is left standing, including one in the
+            // middle of an otherwise ASCII word: 'Ä' is outside A-Z, so it
+            // survives the fold exactly as 'İ' does. Case is then normalised by
+            // `to_tsvector`/`plainto_tsquery`, identically on both sides of the
+            // comparison, which is the whole point of not folding it here.
+            expect(foldSearchAscii('ÅKERBÄR')).toBe('ÅkerbÄr');
+        });
+
+        it('is idempotent, so folding an already-folded term changes nothing', () => {
+            const once = foldSearchAscii('Rice With İNCİR');
+
+            expect(foldSearchAscii(once)).toBe(once);
+        });
+    });
+
+    describe('searchQueryHeadNoun on non-ASCII input', () => {
+        it('never emits a Unicode case fold', () => {
+            // The head noun goes straight into `plainto_tsquery`, and the SQL
+            // side builds its half with the same ASCII-only map, so the two
+            // must produce byte-identical text. `api/catalogCollation.test.ts`
+            // pins that equality against a real ICU database; this pins the
+            // JavaScript half on its own.
+            expect(searchQueryHeadNoun('İNCİR')).toBe('İncİr');
+            expect(searchQueryHeadNoun('İNCİR')).not.toContain('\u0307');
+        });
+
+        it('takes the head noun of a non-ASCII compound by the same rules', () => {
+            expect(searchQueryHeadNoun('DRIED İNCİR')).toBe('İncİr');
+            expect(searchQueryHeadNoun('İNCİR with honey')).toBe('İncİr');
+            expect(searchQueryHeadNoun('İNCİR, dried')).toBe('İncİr');
+        });
+
+        it('still recognises a connector written with ASCII capitals', () => {
+            expect(searchQueryHeadNoun('Gumbo WITH Rice')).toBe('gumbo');
+        });
     });
 });
 
@@ -1959,6 +2275,296 @@ describe('mapCategoryToGroceryCategory', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The tag vocabularies and the classifier over them
+ *
+ * `allergen_tags` and `diet_tags` are the two safety lists a planner acts on —
+ * the allergen list against the user's own selection, the diet list through
+ * `recipe.logic.ts`'s ingredient derivation — and both were free strings
+ * persisted verbatim before this module declared a vocabulary for them (F20).
+ * What follows pins the vocabulary, the contradiction rules, and the fact that
+ * the classifier is usable at PARSE time: it takes `unknown[]`, because a model
+ * payload and a `TEXT[]` column can each hand it a non-string.
+ * ------------------------------------------------------------------------- */
+
+describe('classifyCatalogTagSets', () => {
+    // The shape the shipped release actually carries on a cheese row: one
+    // allergen, and the three diet claims the derivation leaves after removing
+    // vegan for a dairy marker.
+    it('accepts the shipped shape and returns the canonical codes', () => {
+        expect(
+            classifyCatalogTagSets({
+                allergenTags: ['milk'],
+                dietTags: ['vegetarian', 'pescatarian', 'gluten_free'],
+            }),
+        ).toEqual({
+            kind: 'ok',
+            allergenTags: ['milk'],
+            dietTags: ['vegetarian', 'pescatarian', 'gluten_free'],
+        });
+    });
+
+    // An empty list is an ANSWER — "no allergens" — and not an absence.
+    it('accepts two empty lists', () => {
+        expect(classifyCatalogTagSets({ allergenTags: [], dietTags: [] })).toEqual({
+            kind: 'ok',
+            allergenTags: [],
+            dietTags: [],
+        });
+    });
+
+    it('treats an unsupplied or null list as contributing nothing', () => {
+        expect(classifyCatalogTagSets({})).toEqual({ kind: 'ok', allergenTags: [], dietTags: [] });
+        expect(classifyCatalogTagSets({ allergenTags: null, dietTags: null })).toEqual({
+            kind: 'ok',
+            allergenTags: [],
+            dietTags: [],
+        });
+        // A diet claim cannot be contradicted by a list nobody supplied.
+        expect(classifyCatalogTagSets({ dietTags: ['vegan'] })).toEqual({
+            kind: 'ok',
+            allergenTags: [],
+            dietTags: ['vegan'],
+        });
+    });
+
+    // Keyed on `normalizeCanonicalName`, which is what `recipe.logic.ts` and
+    // `isDietCompatible` compare with: a spelling those functions WOULD match
+    // must not be reported as unmatchable here.
+    it('normalises case, surrounding whitespace and punctuation to the canonical code', () => {
+        expect(
+            classifyCatalogTagSets({
+                allergenTags: ['  MILK ', 'Tree Nuts'],
+                dietTags: ['Gluten-Free'],
+            }),
+        ).toEqual({ kind: 'ok', allergenTags: ['milk', 'tree_nuts'], dietTags: ['gluten_free'] });
+    });
+
+    // De-duplication is by key, not by text: the consumers read `['Milk',
+    // 'milk']` as one allergen, so a record claiming two would misdescribe the
+    // food.
+    it('de-duplicates by normalised key', () => {
+        expect(
+            classifyCatalogTagSets({ allergenTags: ['wheat', 'Wheat', ' wheat '], dietTags: ['vegan', 'VEGAN'] }),
+        ).toEqual({ kind: 'ok', allergenTags: ['wheat'], dietTags: ['vegan'] });
+    });
+
+    // Vocabulary order, not arrival order: a persisted array whose order
+    // depended on a model's output would read as a metadata change next run.
+    it('returns the codes in vocabulary order whatever order they arrived in', () => {
+        const forwards = classifyCatalogTagSets({ allergenTags: ['sesame', 'milk', 'wheat'] });
+        const backwards = classifyCatalogTagSets({ allergenTags: ['wheat', 'sesame', 'milk'] });
+
+        expect(forwards).toEqual(backwards);
+        expect(forwards.allergenTags).toEqual(['milk', 'wheat', 'sesame']);
+    });
+
+    it('reports an unknown code in either list, naming the list it came from', () => {
+        expect(classifyCatalogTagSets({ allergenTags: ['milk', 'gluten'], dietTags: ['vegetarian'] })).toEqual({
+            kind: 'violation',
+            allergenTags: ['milk'],
+            dietTags: ['vegetarian'],
+            unknownAllergenTags: ['gluten'],
+            unknownDietTags: [],
+            contradictions: [],
+        });
+        expect(classifyCatalogTagSets({ allergenTags: [], dietTags: ['keto', 'paleo'] })).toEqual({
+            kind: 'violation',
+            allergenTags: [],
+            dietTags: [],
+            unknownAllergenTags: [],
+            unknownDietTags: ['keto', 'paleo'],
+            contradictions: [],
+        });
+    });
+
+    // The vocabularies are disjoint, so a code put in the wrong list is
+    // unmatchable in the list it is in — which is exactly the fault.
+    it('reports a code filed under the wrong list', () => {
+        const result = classifyCatalogTagSets({ allergenTags: ['vegan'], dietTags: ['milk'] });
+
+        expect(result).toEqual({
+            kind: 'violation',
+            allergenTags: [],
+            dietTags: [],
+            unknownAllergenTags: ['vegan'],
+            unknownDietTags: ['milk'],
+            contradictions: [],
+        });
+    });
+
+    // Reported rather than dropped: a producer emitting `null` into a tag array
+    // is the bug this check exists to surface, and an entry with no
+    // alphanumeric content is an unmatchable key.
+    it('reports a blank, whitespace-only, punctuation-only or non-string entry', () => {
+        const result = classifyCatalogTagSets({
+            allergenTags: ['', '   ', '--', null, 7, {}, ['milk'], undefined],
+        });
+
+        expect(result.kind).toBe('violation');
+        expect(result).toMatchObject({
+            allergenTags: [],
+            unknownAllergenTags: ['(blank)', '(null)', '(number)', '(object)', '(undefined)', '--'],
+        });
+    });
+
+    it.each([
+        ['vegan', 'milk'],
+        ['vegan', 'eggs'],
+        ['vegan', 'fish'],
+        ['vegan', 'shellfish'],
+        ['vegetarian', 'fish'],
+        ['vegetarian', 'shellfish'],
+        ['gluten_free', 'wheat'],
+    ])('reports %s carrying %s as a contradiction', (dietTag, allergenTag) => {
+        const result = classifyCatalogTagSets({ allergenTags: [allergenTag], dietTags: [dietTag] });
+
+        expect(result.kind).toBe('violation');
+        expect(result).toMatchObject({
+            unknownAllergenTags: [],
+            unknownDietTags: [],
+            contradictions: [{ dietTag, allergenTag }],
+        });
+    });
+
+    // Every exclusion the module declares gets a case above; this is the guard
+    // that the list above is the whole of it.
+    it('declares exactly the exclusions the cases above cover', () => {
+        expect(CATALOG_DIET_TAG_EXCLUSIONS).toEqual([
+            { dietTag: 'vegan', excludedAllergenTags: ['milk', 'eggs', 'fish', 'shellfish'] },
+            { dietTag: 'vegetarian', excludedAllergenTags: ['fish', 'shellfish'] },
+            { dietTag: 'gluten_free', excludedAllergenTags: ['wheat'] },
+        ]);
+    });
+
+    // Peanuts, tree nuts, soy and sesame are plants: a vegan food may carry any
+    // of them, and rejecting that would reject most of the nut_seed category.
+    it.each(['peanuts', 'tree_nuts', 'soy', 'sesame', 'wheat'])(
+        'accepts a vegan food carrying %s',
+        (allergenTag) => {
+            expect(
+                classifyCatalogTagSets({
+                    allergenTags: [allergenTag],
+                    dietTags: ['vegan', 'vegetarian', 'pescatarian'],
+                }),
+            ).toMatchObject({ kind: 'ok' });
+        },
+    );
+
+    // The pescatarian set IS the vegetarian set plus fish and seafood, so fish
+    // on a pescatarian-only food is the normal case, not a contradiction.
+    it.each(['fish', 'shellfish'])('accepts a pescatarian food carrying %s', (allergenTag) => {
+        expect(
+            classifyCatalogTagSets({ allergenTags: [allergenTag], dietTags: ['pescatarian'] }),
+        ).toMatchObject({ kind: 'ok' });
+    });
+
+    // Dairy and eggs are vegetarian; only the vegan claim they refute.
+    it.each(['milk', 'eggs'])('accepts a vegetarian food carrying %s', (allergenTag) => {
+        expect(
+            classifyCatalogTagSets({
+                allergenTags: [allergenTag],
+                dietTags: ['vegetarian', 'pescatarian'],
+            }),
+        ).toMatchObject({ kind: 'ok' });
+    });
+
+    // Not an implication closure: `vegan` without `vegetarian` is INCOMPLETE,
+    // and `recipe.logic.ts` closes a derived tag set under
+    // `DIET_TAG_IMPLICATIONS` — so rejecting it would reject correct data.
+    it('does not require a diet claim to carry the tags it implies', () => {
+        expect(classifyCatalogTagSets({ allergenTags: [], dietTags: ['vegan'] })).toEqual({
+            kind: 'ok',
+            allergenTags: [],
+            dietTags: ['vegan'],
+        });
+        expect(classifyCatalogTagSets({ allergenTags: [], dietTags: ['vegetarian'] })).toMatchObject({
+            kind: 'ok',
+        });
+    });
+
+    // One violation of each kind at once, reported separately, because the two
+    // faults have different fixes: a vocabulary the producer does not know, and
+    // a claim it got wrong.
+    it('reports unknown codes and contradictions separately in one answer', () => {
+        expect(
+            classifyCatalogTagSets({
+                allergenTags: ['milk', 'gluten'],
+                dietTags: ['vegan', 'keto'],
+            }),
+        ).toEqual({
+            kind: 'violation',
+            allergenTags: ['milk'],
+            dietTags: ['vegan'],
+            unknownAllergenTags: ['gluten'],
+            unknownDietTags: ['keto'],
+            contradictions: [{ dietTag: 'vegan', allergenTag: 'milk' }],
+        });
+    });
+
+    // All four contradictions a single vegan claim can draw, in vocabulary
+    // order, so a record names every value an operator has to reconcile.
+    it('reports every contradiction a claim draws, not just the first', () => {
+        const result = classifyCatalogTagSets({
+            allergenTags: ['shellfish', 'milk', 'fish', 'eggs'],
+            dietTags: ['vegan', 'vegetarian'],
+        });
+
+        expect(result).toMatchObject({
+            kind: 'violation',
+            contradictions: [
+                { dietTag: 'vegan', allergenTag: 'milk' },
+                { dietTag: 'vegan', allergenTag: 'eggs' },
+                { dietTag: 'vegan', allergenTag: 'fish' },
+                { dietTag: 'vegan', allergenTag: 'shellfish' },
+                { dietTag: 'vegetarian', allergenTag: 'fish' },
+                { dietTag: 'vegetarian', allergenTag: 'shellfish' },
+            ],
+        });
+    });
+
+    it('declares nine allergen codes and four diet codes', () => {
+        expect([...CATALOG_ALLERGEN_TAGS]).toEqual([
+            'milk',
+            'eggs',
+            'peanuts',
+            'tree_nuts',
+            'soy',
+            'wheat',
+            'fish',
+            'shellfish',
+            'sesame',
+        ]);
+        expect([...CATALOG_DIET_TAGS]).toEqual(['vegan', 'vegetarian', 'pescatarian', 'gluten_free']);
+    });
+
+    // `pescatarian`, never `pescatarian_ok`: that spelling is the only one
+    // `recipe.logic.ts` emits and the only one `isDietCompatible` matches, and
+    // the manifest records that its own earlier revision spelled it
+    // `pescatarian_ok` — which silently excluded every seafood food from every
+    // pescatarian user's plan.
+    it('knows pescatarian and not pescatarian_ok', () => {
+        expect(isCatalogDietTag('pescatarian')).toBe(true);
+        expect(isCatalogDietTag('pescatarian_ok')).toBe(false);
+        expect(classifyCatalogTagSets({ dietTags: ['pescatarian_ok'] })).toMatchObject({
+            kind: 'violation',
+            unknownDietTags: ['pescatarian_ok'],
+        });
+    });
+
+    // The exported arrays are what a JSON-schema `enum` is built from at the
+    // generation boundary, so they have to be plain string arrays a spread can
+    // copy — not a Set, and not a frozen object a serialiser would choke on.
+    it('exports both vocabularies as spreadable string arrays', () => {
+        const allergenEnum: string[] = [...CATALOG_ALLERGEN_TAGS];
+        const dietEnum: string[] = [...CATALOG_DIET_TAGS];
+
+        expect(JSON.parse(JSON.stringify({ enum: allergenEnum }))).toEqual({ enum: allergenEnum });
+        expect(allergenEnum.every((code) => isCatalogAllergenTag(code))).toBe(true);
+        expect(dietEnum.every((code) => isCatalogDietTag(code))).toBe(true);
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * resolveCatalogDisposition
  * ------------------------------------------------------------------------- */
 
@@ -2031,19 +2637,6 @@ describe('resolveCatalogDisposition', () => {
         expect(disposition.reviewFlags).toEqual(['out_of_category_range']);
     });
 
-    it('lifts a held review flag when the advisory review confirmed it', () => {
-        const disposition = resolveCatalogDisposition(
-            [failingCheck('out_of_category_range', 'review')],
-            {
-                identitySource: 'ai_generated',
-                advisoryReview: { confirmedCheckNames: ['out_of_category_range'] },
-            },
-        );
-
-        expect(disposition.publicationStatus).toBe('published');
-        expect(disposition.reviewFlags).toEqual(['out_of_category_range']);
-    });
-
     it('lifts a held review flag when a curator allowlisted it', () => {
         const disposition = resolveCatalogDisposition(
             [failingCheck('allergens_unknown', 'review')],
@@ -2056,7 +2649,43 @@ describe('resolveCatalogDisposition', () => {
         expect(disposition.publicationStatus).toBe('published');
     });
 
-    it('keeps holding a generated record when only some review flags were lifted', () => {
+    // THE ADVISORY REVIEW IS NOT AN INPUT HERE, and this is the assertion that
+    // says so from the outside: the only channel a model answer ever travelled
+    // is gone from the input type, so a stage that tried to pass one would not
+    // compile, and a caller that smuggles the field past the compiler is
+    // ignored. A generated candidate held by a review-tier flag therefore stays
+    // held whatever a model said about it — Agent Action Plan §0.1.2 ("NEVER
+    // present AI-generated values or an AI plausibility review as verified
+    // nutrition") and §0.7.3's provenance model ("never promotes values").
+    it('holds a generated record however a model answered, because no advisory channel exists', () => {
+        const smuggled = {
+            identitySource: 'ai_generated' as const,
+            advisoryReview: { confirmedCheckNames: ['out_of_category_range'] },
+        } as CatalogDispositionInput;
+
+        const disposition = resolveCatalogDisposition(
+            [failingCheck('out_of_category_range', 'review')],
+            smuggled,
+        );
+
+        expect(disposition.publicationStatus).toBe('quarantined');
+        expect(disposition.decidingCheckNames).toEqual(['out_of_category_range']);
+        expect(disposition.reviewFlags).toEqual(['out_of_category_range']);
+
+        // The compile-time half of the same assertion. `advisoryChannelAbsent`
+        // is typed `true` only while NEITHER input carries an advisory field, so
+        // re-adding one makes this assignment a type error and this file stops
+        // compiling — the channel cannot come back unnoticed.
+        type AdvisoryChannelKeys = Extract<
+            keyof CatalogDispositionInput | keyof CatalogValidationContext,
+            'advisoryReview'
+        >;
+        const advisoryChannelAbsent: [AdvisoryChannelKeys] extends [never] ? true : false = true;
+
+        expect(advisoryChannelAbsent).toBe(true);
+    });
+
+    it('keeps holding a generated record when only some review flags were allowlisted', () => {
         const disposition = resolveCatalogDisposition(
             [
                 failingCheck('out_of_category_range', 'review'),
@@ -2064,7 +2693,7 @@ describe('resolveCatalogDisposition', () => {
             ],
             {
                 identitySource: 'ai_generated',
-                advisoryReview: { confirmedCheckNames: ['out_of_category_range'] },
+                curatorAllowlistedCheckNames: ['out_of_category_range'],
             },
         );
 
@@ -2072,11 +2701,11 @@ describe('resolveCatalogDisposition', () => {
         expect(disposition.decidingCheckNames).toEqual(['allergens_unknown']);
     });
 
-    it('tolerates an absent, null or empty advisory review', () => {
-        for (const advisoryReview of [undefined, null, {}, { confirmedCheckNames: [] }]) {
+    it('tolerates an absent or empty curator allowlist', () => {
+        for (const curatorAllowlistedCheckNames of [undefined, [], ['some_other_check']]) {
             const disposition = resolveCatalogDisposition(
                 [failingCheck('out_of_category_range', 'review')],
-                { identitySource: 'ai_generated', advisoryReview },
+                { identitySource: 'ai_generated', curatorAllowlistedCheckNames },
             );
 
             expect(disposition.publicationStatus).toBe('quarantined');
@@ -2084,13 +2713,11 @@ describe('resolveCatalogDisposition', () => {
     });
 
     // Structural rather than a promise: a reject- or quarantine-tier failure
-    // returns before the review branch is reached.
-    it('never lets an advisory review overturn a rejection or a quarantine', () => {
+    // returns before the review branch — and therefore before the allowlist —
+    // is reached.
+    it('never lets a curator allowlist overturn a rejection or a quarantine', () => {
         const context = {
             identitySource: 'ai_generated' as const,
-            advisoryReview: {
-                confirmedCheckNames: ['kcal_ceiling', 'missing_core_nutrient', 'out_of_category_range'],
-            },
             curatorAllowlistedCheckNames: ['kcal_ceiling', 'missing_core_nutrient'],
         };
 
@@ -2907,7 +3534,7 @@ describe('validateCatalogCandidate', () => {
         expect(verdict.countsTowardPublishedTarget).toBe(true);
     });
 
-    it('holds a generated record outside its category band until it is confirmed', () => {
+    it('holds a generated record outside its category band until a curator allowlists it', () => {
         const candidate = publishableCandidate({
             source_key: 'ai:produce_vegetable:mystery mash:prepared',
             canonical_name: 'mystery mash',
@@ -2923,11 +3550,13 @@ describe('validateCatalogCandidate', () => {
         });
 
         expect(validateCatalogCandidate(candidate, POLICY).publicationStatus).toBe('quarantined');
+        // An advisory model answer has no route in and changes nothing: the row
+        // is held identically whether a review ran or not.
         expect(
             validateCatalogCandidate(candidate, POLICY, {
                 advisoryReview: { confirmedCheckNames: [CATALOG_CHECK_NAMES.OUT_OF_CATEGORY_RANGE] },
-            }).publicationStatus,
-        ).toBe('published');
+            } as CatalogValidationContext).publicationStatus,
+        ).toBe('quarantined');
         expect(
             validateCatalogCandidate(candidate, POLICY, {
                 curatorAllowlistedCheckNames: [CATALOG_CHECK_NAMES.OUT_OF_CATEGORY_RANGE],
@@ -3000,6 +3629,207 @@ describe('validateCatalogCandidate', () => {
 
         expect(verdict.publicationStatus).toBe('published');
         expect(verdict.reviewFlags).toEqual([CATALOG_CHECK_NAMES.ALLERGENS_UNKNOWN]);
+    });
+
+    /* -----------------------------------------------------------------------
+     * The tag vocabularies (F20)
+     *
+     * Both lists are matched by CODE downstream, so the cases below are about
+     * what reaches a plate: an off-vocabulary code excludes nothing, and a diet
+     * claim the allergen list refutes is a false claim about the food. The
+     * three release shapes are named because the shipped v1 release really
+     * carries them.
+     * --------------------------------------------------------------------- */
+
+    it('publishes a candidate whose tag lists are in vocabulary and agree', () => {
+        const verdict = validateCatalogCandidate(
+            publishableCandidate({
+                allergen_tags: ['milk'],
+                diet_tags: ['vegetarian', 'pescatarian', 'gluten_free'],
+            }),
+            POLICY,
+        );
+
+        expect(verdict.publicationStatus).toBe('published');
+        expect(verdict.decidingCheckNames).toEqual([]);
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE)?.pass).toBe(true);
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET)?.pass).toBe(true);
+    });
+
+    it('publishes a candidate whose tag lists are both empty', () => {
+        const verdict = validateCatalogCandidate(
+            publishableCandidate({ allergen_tags: [], diet_tags: [] }),
+            POLICY,
+        );
+
+        expect(verdict.publicationStatus).toBe('published');
+        expect(verdict.checks.every((check) => check.pass)).toBe(true);
+    });
+
+    it.each([
+        ['vegan', 'milk'],
+        ['vegan', 'eggs'],
+        ['vegan', 'fish'],
+        ['vegan', 'shellfish'],
+        ['vegetarian', 'fish'],
+        ['vegetarian', 'shellfish'],
+        ['gluten_free', 'wheat'],
+    ])('rejects a candidate claiming %s while carrying %s', (dietTag, allergenTag) => {
+        const verdict = validateCatalogCandidate(
+            publishableCandidate({ allergen_tags: [allergenTag], diet_tags: [dietTag] }),
+            POLICY,
+        );
+
+        expect(verdict.publicationStatus).toBe('rejected');
+        expect(verdict.decidingCheckNames).toEqual([CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET]);
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET)).toEqual({
+            name: CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET,
+            pass: false,
+            observed: `${dietTag} with ${allergenTag}`,
+            bound: 'vegan excludes milk, eggs, fish, shellfish; vegetarian excludes fish, shellfish; gluten_free excludes wheat',
+            tier: 'reject',
+        });
+    });
+
+    // The three shapes the shipped v1 release really holds — 19 rows claim
+    // vegan while carrying milk, 4 claim it while carrying eggs ("pie, lemon
+    // meringue, commercially prepared") and 3 while carrying fish ("sauce,
+    // worcestershire") — every one of them produced by the manifest's sweep,
+    // whose allergen markers ("dairy", "whey", "worcestershire") have no
+    // counterpart in its diet-derivation markers. A reject-tier verdict is
+    // what makes those rows visible on the next validation run instead of
+    // leaving them published as vegan.
+    it.each([
+        ['pie, lemon meringue, commercially prepared', ['eggs'], 'vegan with eggs'],
+        ['beverages, malted drink mix, natural, powder, dairy based.', ['milk', 'wheat'], 'vegan with milk'],
+        ['sauce, worcestershire', ['fish'], 'vegan with fish, vegetarian with fish'],
+    ])('rejects the released row "%s"', (canonicalName, allergenTags, observed) => {
+        const verdict = validateCatalogCandidate(
+            publishableCandidate({
+                canonical_name: canonicalName,
+                display_name: canonicalName,
+                allergen_tags: allergenTags,
+                // As released: the derivation starts from all four tags and
+                // removes what it can prove, and `gluten_free` survives unless
+                // a wheat allergen was derived.
+                diet_tags:
+                    allergenTags.includes('wheat')
+                        ? ['pescatarian', 'vegan', 'vegetarian']
+                        : ['gluten_free', 'pescatarian', 'vegan', 'vegetarian'],
+            }),
+            POLICY,
+        );
+
+        expect(verdict.publicationStatus).toBe('rejected');
+        expect(verdict.decidingCheckNames).toEqual([CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET]);
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET)?.observed).toBe(observed);
+    });
+
+    it.each([
+        ['an allergen code', { allergen_tags: ['milk', 'gluten'], diet_tags: [] }, 'allergen_tags: gluten'],
+        ['a diet code', { allergen_tags: [], diet_tags: ['keto'] }, 'diet_tags: keto'],
+        ['a blank entry', { allergen_tags: [''], diet_tags: [] }, 'allergen_tags: (blank)'],
+        [
+            'a code in the wrong list',
+            { allergen_tags: ['vegan'], diet_tags: ['milk'] },
+            'allergen_tags: vegan; diet_tags: milk',
+        ],
+    ])('rejects a candidate carrying %s outside the vocabulary', (_label, overrides, observed) => {
+        const verdict = validateCatalogCandidate(publishableCandidate(overrides), POLICY);
+
+        expect(verdict.publicationStatus).toBe('rejected');
+        expect(verdict.decidingCheckNames).toEqual([CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE]);
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE)?.observed).toBe(observed);
+    });
+
+    // A reject-tier failure returns before the review branch, so the one input
+    // that can lift a review hold cannot reach a false tag claim (AAP §0.1.2:
+    // an advisory model review never promotes a value, and a curator decision
+    // is scoped to review-tier flags).
+    it('keeps a contradictory tag set rejected for a curator and for a generated row', () => {
+        const contradictory = {
+            allergen_tags: ['milk'],
+            diet_tags: ['vegan'],
+        };
+
+        for (const context of [
+            {},
+            { curatorAllowlistedCheckNames: [CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET] },
+            { curatorAllowlistedCheckNames: [CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE] },
+        ]) {
+            expect(
+                validateCatalogCandidate(publishableCandidate(contradictory), POLICY, context)
+                    .publicationStatus,
+            ).toBe('rejected');
+        }
+    });
+
+    // A check whose input is unavailable is ABSENT from the record rather than
+    // recorded as a pass: a candidate carrying diet claims whose allergen list
+    // was never read has not been shown to be consistent.
+    it('omits the consistency check when only one list was supplied', () => {
+        const allergensOnly = validateCatalogCandidate(
+            publishableCandidate({ allergen_tags: ['milk'] }),
+            POLICY,
+        );
+        const dietOnly = validateCatalogCandidate(
+            publishableCandidate({ allergen_tags: undefined, diet_tags: ['vegan'] }),
+            POLICY,
+        );
+
+        expect(checkNamed(allergensOnly.checks, CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET)).toBeUndefined();
+        expect(checkNamed(allergensOnly.checks, CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE)?.bound).toBe(
+            'allergen_tags in (milk, eggs, peanuts, tree_nuts, soy, wheat, fish, shellfish, sesame)',
+        );
+        expect(allergensOnly.publicationStatus).toBe('published');
+
+        expect(checkNamed(dietOnly.checks, CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET)).toBeUndefined();
+        expect(checkNamed(dietOnly.checks, CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE)?.bound).toBe(
+            'diet_tags in (vegan, vegetarian, pescatarian, gluten_free)',
+        );
+        expect(dietOnly.publicationStatus).toBe('published');
+    });
+
+    it('omits both tag checks when neither list was supplied', () => {
+        const verdict = validateCatalogCandidate(
+            publishableCandidate({ allergen_tags: undefined }),
+            POLICY,
+        );
+
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE)).toBeUndefined();
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET)).toBeUndefined();
+        expect(verdict.publicationStatus).toBe('published');
+    });
+
+    // Rejection is terminal and the review tier is where an atypical value is
+    // held, so a tag fault must not be reported as a review flag.
+    it('records a tag fault as a deciding check and never as a review flag', () => {
+        const verdict = validateCatalogCandidate(
+            publishableCandidate({ allergen_tags: ['milk', 'gluten'], diet_tags: ['vegan'] }),
+            POLICY,
+        );
+
+        expect(verdict.outcome).toBe('rejected');
+        expect(verdict.reviewFlags).toEqual([]);
+        expect([...verdict.decidingCheckNames].sort()).toEqual([
+            CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET,
+            CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE,
+        ]);
+        expect(verdict.countsTowardPublishedTarget).toBe(false);
+    });
+
+    // The spelling the consumers would match is the spelling this module
+    // accepts: `recipe.logic.ts` compares every tag through
+    // `normalizeCanonicalName`, so a stored `Gluten Free` is `gluten_free` to
+    // the planner and must not be judged unmatchable here.
+    it('publishes a candidate whose tags differ only in case or punctuation', () => {
+        const verdict = validateCatalogCandidate(
+            publishableCandidate({ allergen_tags: ['Milk', ' milk '], diet_tags: ['Gluten-Free'] }),
+            POLICY,
+        );
+
+        expect(verdict.publicationStatus).toBe('published');
+        expect(checkNamed(verdict.checks, CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE)?.pass).toBe(true);
     });
 
     it('rejects a per-serving label set that disagrees with the per-100 g values', () => {
@@ -3490,6 +4320,50 @@ const COVERAGE_PLAN_CANDIDATE_VOLUME_TOTAL = 13765;
 
 const CATEGORY_CODES: readonly string[] = SHIPPED_PLAN.categories.map((entry) => entry.category);
 
+/* ---------------------------------------------------------------------------
+ * usda-manifest.v1.json — the OTHER declaration of the tag vocabularies
+ *
+ * Read from disk the same way the coverage plan is, because the import's sweep
+ * derives `allergen_tags` and `diet_tags` from the rules in this document while
+ * the validator judges them against the vocabularies in `catalog.logic.ts`. Two
+ * declarations of one vocabulary is a drift waiting to happen, and the drift is
+ * silent: a code only one side knows matches nothing in the planner's exclusion
+ * instead of failing. So the two are compared here, in both directions.
+ * ------------------------------------------------------------------------- */
+
+/** The parts of the USDA manifest this suite reads. */
+interface UsdaManifestVocabularies {
+    readonly allergenVocabulary: readonly string[];
+    readonly dietTagVocabulary: readonly string[];
+}
+
+const MANIFEST_VOCABULARIES: UsdaManifestVocabularies = (() => {
+    const document = readCommittedJson('usda-manifest.v1.json');
+    const rules = isJsonRecord(document) ? document.sweepAllergenDietRules : undefined;
+    const problems: string[] = [];
+
+    if (!isJsonRecord(rules)) {
+        problems.push('sweepAllergenDietRules is not an object');
+    } else {
+        for (const field of ['allergenVocabulary', 'dietTagVocabulary'] as const) {
+            const value = rules[field];
+
+            if (!isJsonStringArray(value) || value.length === 0) {
+                problems.push(`sweepAllergenDietRules.${field} is not a non-empty array of strings`);
+            }
+        }
+    }
+
+    if (problems.length > 0) {
+        throw new Error(
+            `catalog.logic.test.ts cannot run: usda-manifest.v1.json does not declare the tag vocabularies ` +
+                `this suite compares the module against — ${problems.join('; ')}`,
+        );
+    }
+
+    return rules as unknown as UsdaManifestVocabularies;
+})();
+
 const planCategory = (category: string): CoveragePlanCategory => {
     const entry = SHIPPED_PLAN.categories.find((candidate) => candidate.category === category);
 
@@ -3616,6 +4490,11 @@ interface CatalogFixtureFood {
     readonly publication_status: CatalogPublicationStatus;
     readonly allergen_status: CatalogAllergenStatus;
     readonly allergen_tags: readonly string[];
+    /**
+     * The stored diet claims, read here because the validator now judges them
+     * against the allergen list (F20). Every fixture row carries the column.
+     */
+    readonly diet_tags: readonly string[];
     readonly nutrition_basis: CatalogNutritionBasis;
     readonly basis_amount: number;
     readonly nutrition_version: number;
@@ -3700,6 +4579,9 @@ const catalogFixtureFoodProblems = (row: unknown, index: number): string[] => {
     }
     if (!isJsonStringArray(row.allergen_tags)) {
         problems.push(`${key}.allergen_tags is not an array of strings`);
+    }
+    if (!isJsonStringArray(row.diet_tags)) {
+        problems.push(`${key}.diet_tags is not an array of strings`);
     }
 
     // The closed sets are enforced by the module's own guards, so a fixture
@@ -3871,6 +4753,10 @@ const fixtureCandidate = (
         nutrition_provenance: food.nutrition_provenance,
         allergen_status: food.allergen_status,
         allergen_tags: food.allergen_tags,
+        // Passed through so the tag checks are EVALUATED over real rows: the
+        // release join `catalog-validate.ts` performs selects both columns, and
+        // a suite that withheld one would exercise the omission branch only.
+        diet_tags: food.diet_tags,
         nutrition_basis: food.nutrition_basis,
         basis_amount: food.basis_amount,
         calories: food.calories,
@@ -3888,17 +4774,33 @@ const fixtureCandidate = (
 
 /**
  * The context the fixture's stored records were produced with: duplicate
- * detection ran and found none, and each generated row carries its advisory
- * review. The review is passed BECAUSE it is advisory — every row below whose
- * flag it declines to confirm stays held, which is the assertion that proves it.
+ * detection ran and found none, and NOTHING ELSE.
+ *
+ * A generated row's stored `llm_review` is deliberately not passed here,
+ * because there is nowhere to pass it: the advisory review is recorded beside
+ * the verdict and is not an input to it. Re-judging a fixture row from its own
+ * columns therefore reproduces its stored `publication_status` without any
+ * model answer being consulted — which is the property the whole fixture
+ * section rests on.
  */
-const fixtureContext = (sourceKey: string): CatalogValidationContext => ({
+const fixtureContext = (): CatalogValidationContext => ({
     duplicateOfSourceKey: null,
-    advisoryReview: fixtureRecord(sourceKey)?.llm_review ?? null,
 });
 
 const validateFixtureRow = (sourceKey: string, overrides: Partial<CatalogFoodCandidate> = {}) =>
-    validateCatalogCandidate(fixtureCandidate(sourceKey, overrides), SHIPPED_POLICY, fixtureContext(sourceKey));
+    validateCatalogCandidate(fixtureCandidate(sourceKey, overrides), SHIPPED_POLICY, fixtureContext());
+
+/**
+ * The two checks the committed fixture's stored records predate (F20).
+ *
+ * Named once, here, so the two halves of the stored-verdict comparison below
+ * cannot drift apart: whatever this set excludes from the byte-equal half is
+ * exactly what the separate exact assertion covers.
+ */
+const TAG_CHECK_NAMES: ReadonlySet<string> = new Set<string>([
+    CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE,
+    CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET,
+]);
 
 /**
  * `retired` is not a validation outcome: `validateCatalogCandidate` can only
@@ -4217,6 +5119,85 @@ describe('the shipped coverage plan, loaded as the validation policy', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The shipped USDA manifest's tag vocabularies, against the module's
+ *
+ * The import's sweep DERIVES `allergen_tags` and `diet_tags` from
+ * `usda-manifest.v1.json`'s `sweepAllergenDietRules`, and the validator JUDGES
+ * them against the vocabularies in `catalog.logic.ts`. One vocabulary declared
+ * twice drifts silently — a code only one side knows is not rejected
+ * downstream, it simply matches nothing in the planner's allergen exclusion and
+ * diet derivation — so the two are compared here, in both directions and in
+ * order (F20).
+ * ------------------------------------------------------------------------- */
+
+describe('the tag vocabularies the shipped data declares', () => {
+    it('declares the same allergen vocabulary as the manifest, in the same order', () => {
+        const declared: readonly string[] = CATALOG_ALLERGEN_TAGS;
+
+        expect(declared).toEqual(MANIFEST_VOCABULARIES.allergenVocabulary);
+    });
+
+    it('declares the same diet vocabulary as the manifest, in the same order', () => {
+        const declared: readonly string[] = CATALOG_DIET_TAGS;
+
+        expect(declared).toEqual(MANIFEST_VOCABULARIES.dietTagVocabulary);
+    });
+
+    // Both directions, stated as membership as well as as equality: an ordering
+    // change alone is harmless, a MISSING or EXTRA code is not, and a failure
+    // that names the code is worth more than one that prints two arrays.
+    it('admits every manifest code and claims none the manifest does not', () => {
+        for (const code of MANIFEST_VOCABULARIES.allergenVocabulary) {
+            expect({ code, known: isCatalogAllergenTag(code) }).toEqual({ code, known: true });
+        }
+        for (const code of CATALOG_ALLERGEN_TAGS) {
+            expect({ code, declaredByManifest: MANIFEST_VOCABULARIES.allergenVocabulary.includes(code) }).toEqual(
+                { code, declaredByManifest: true },
+            );
+        }
+        for (const code of MANIFEST_VOCABULARIES.dietTagVocabulary) {
+            expect({ code, known: isCatalogDietTag(code) }).toEqual({ code, known: true });
+        }
+        for (const code of CATALOG_DIET_TAGS) {
+            expect({ code, declaredByManifest: MANIFEST_VOCABULARIES.dietTagVocabulary.includes(code) }).toEqual({
+                code,
+                declaredByManifest: true,
+            });
+        }
+    });
+
+    // The user's own selection is matched against these codes at planning time
+    // (AAP §0.7.3 eligibility), so a difference of spelling between the two
+    // lists would be a silent failure to exclude an allergen someone declared.
+    it('spells the allergens exactly as the user selection stores them', () => {
+        const selectable: readonly string[] = NAMED_ALLERGENS;
+        const declared: readonly string[] = CATALOG_ALLERGEN_TAGS;
+
+        expect(declared).toEqual(selectable);
+    });
+
+    // The manifest's derivation may only ever narrow — add an allergen, remove
+    // a diet tag — so every code it can emit must be one this module accepts.
+    it('accepts every tag set the manifest rules can derive', () => {
+        const allergenTags: readonly CatalogAllergenTag[] = CATALOG_ALLERGEN_TAGS;
+        const dietTags: readonly CatalogDietTag[] = CATALOG_DIET_TAGS;
+
+        expect(
+            classifyCatalogTagSets({
+                allergenTags: MANIFEST_VOCABULARIES.allergenVocabulary,
+                dietTags: [],
+            }),
+        ).toEqual({ kind: 'ok', allergenTags, dietTags: [] });
+        expect(
+            classifyCatalogTagSets({
+                allergenTags: [],
+                dietTags: MANIFEST_VOCABULARIES.dietTagVocabulary,
+            }),
+        ).toEqual({ kind: 'ok', allergenTags: [], dietTags });
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * Every category of the shipped plan, at the edges of its own bands
  *
  * Table-driven from `coverage-plan.v1.json` itself, which is what makes the
@@ -4302,14 +5283,15 @@ describe('every coverage-plan category, at the edges of its own bands', () => {
                 SHIPPED_POLICY,
                 DEDUPED_CONTEXT,
             );
-            const confirmed = validateCatalogCandidate(
+            // The generated row's one route out of the hold, exercised per band:
+            // an explicit CURATOR allowlist. A model answer has no route at all,
+            // which the disposition suite asserts directly.
+            const allowlisted = validateCatalogCandidate(
                 bandProbe(category, band.foodState, calories, 'ai_generated'),
                 SHIPPED_POLICY,
                 {
                     ...DEDUPED_CONTEXT,
-                    advisoryReview: {
-                        confirmedCheckNames: [CATALOG_CHECK_NAMES.OUT_OF_CATEGORY_RANGE],
-                    },
+                    curatorAllowlistedCheckNames: [CATALOG_CHECK_NAMES.OUT_OF_CATEGORY_RANGE],
                 },
             );
 
@@ -4320,7 +5302,7 @@ describe('every coverage-plan category, at the edges of its own bands', () => {
                 sourcedFlags: sourced.reviewFlags,
                 generated: generated.publicationStatus,
                 generatedDeciding: generated.decidingCheckNames,
-                confirmed: confirmed.publicationStatus,
+                allowlisted: allowlisted.publicationStatus,
             }).toEqual({
                 band: `${category}/${band.foodState}`,
                 calories,
@@ -4328,7 +5310,7 @@ describe('every coverage-plan category, at the edges of its own bands', () => {
                 sourcedFlags: [CATALOG_CHECK_NAMES.OUT_OF_CATEGORY_RANGE],
                 generated: 'quarantined',
                 generatedDeciding: [CATALOG_CHECK_NAMES.OUT_OF_CATEGORY_RANGE],
-                confirmed: 'published',
+                allowlisted: 'published',
             });
         }
     });
@@ -4627,13 +5609,53 @@ describe('the committed catalog fixture', () => {
     // it — the same checks, in the same order, with the same observed values
     // and bounds, and the same outcome. A retuned constant, a reordered check
     // or a changed observation all surface here.
+    //
+    // The two tag checks (F20) are asserted separately, in the test below,
+    // because the stored records PREDATE them: `catalog-foods.fixture.json` is
+    // committed data this suite does not own, and its records will carry the
+    // entries once the run that owns the fixture re-emits them. Splitting the
+    // comparison keeps this assertion at full strength for everything else
+    // instead of loosening it to `arrayContaining`, and the separated half is
+    // an exact assertion rather than a weaker one.
     it.each(FIXTURE_VALIDATED_ROWS)('reproduces the stored verdict for $sourceKey', ({ sourceKey, expectedStatus }) => {
         const record = requireFixtureRecord(sourceKey);
         const verdict = validateFixtureRow(sourceKey);
 
         expect(verdict.publicationStatus).toBe(expectedStatus);
         expect(verdict.outcome).toBe(record.outcome);
-        expect(verdict.checks).toEqual(record.checks);
+        expect(verdict.checks.filter((check) => !TAG_CHECK_NAMES.has(check.name))).toEqual(record.checks);
+    });
+
+    // Every fixture row's real tag lists, judged: both checks evaluated, both
+    // passing, with the observation and bound a record stores. This is what
+    // makes the tag vocabulary a property of the committed data and not only of
+    // hand-built candidates — and if a stored row ever did contradict itself,
+    // this is where it would say so rather than being quietly absorbed.
+    it.each(FIXTURE_VALIDATED_ROWS)('judges the stored tag lists of $sourceKey', ({ sourceKey }) => {
+        const food = fixtureFood(sourceKey);
+        const verdict = validateFixtureRow(sourceKey);
+
+        expect(verdict.checks.filter((check) => TAG_CHECK_NAMES.has(check.name))).toEqual([
+            {
+                name: CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE,
+                pass: true,
+                observed: null,
+                bound:
+                    `allergen_tags in (${CATALOG_ALLERGEN_TAGS.join(', ')}); ` +
+                    `diet_tags in (${CATALOG_DIET_TAGS.join(', ')})`,
+                tier: 'reject',
+            },
+            {
+                name: CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET,
+                pass: true,
+                observed: null,
+                bound: 'vegan excludes milk, eggs, fish, shellfish; vegetarian excludes fish, shellfish; gluten_free excludes wheat',
+                tier: 'reject',
+            },
+        ]);
+        expect(
+            classifyCatalogTagSets({ allergenTags: food.allergen_tags, dietTags: food.diet_tags }),
+        ).toMatchObject({ kind: 'ok' });
     });
 
     // `candidate` is what a generated row arrives as and `retired` is the
@@ -4880,9 +5902,10 @@ describe('the boundary rows of the committed fixture', () => {
             flags: [CATALOG_CHECK_NAMES.ALLERGENS_UNKNOWN],
         });
 
-        // Its stored advisory review declined to confirm the flag, which is why
-        // it is held; a review that confirms it lifts the hold and can do
-        // nothing else.
+        // Its stored advisory review is recorded beside the verdict and had no
+        // part in it: the row is held by the deterministic flag, and a model
+        // answer — this row's stored one, or one that confirms the flag outright
+        // — leaves the hold exactly where it is.
         expect(requireFixtureRecord(ROW.ALLERGENS_UNKNOWN_GENERATED).llm_review?.confirmedCheckNames).toEqual(
             [],
         );
@@ -4893,6 +5916,19 @@ describe('the boundary rows of the committed fixture', () => {
                 {
                     duplicateOfSourceKey: null,
                     advisoryReview: { confirmedCheckNames: [CATALOG_CHECK_NAMES.ALLERGENS_UNKNOWN] },
+                } as CatalogValidationContext,
+            ).publicationStatus,
+        ).toBe('quarantined');
+
+        // The one thing that does release it: a curator's decision, recorded as
+        // an allowlisted check name.
+        expect(
+            validateCatalogCandidate(
+                fixtureCandidate(ROW.ALLERGENS_UNKNOWN_GENERATED),
+                SHIPPED_POLICY,
+                {
+                    duplicateOfSourceKey: null,
+                    curatorAllowlistedCheckNames: [CATALOG_CHECK_NAMES.ALLERGENS_UNKNOWN],
                 },
             ).publicationStatus,
         ).toBe('published');
@@ -5118,7 +6154,7 @@ describe('bounds are parameters, not constants', () => {
     });
 
     const verdictUnder = (sourceKey: string, policy: CatalogValidationPolicy) =>
-        validateCatalogCandidate(fixtureCandidate(sourceKey), policy, fixtureContext(sourceKey));
+        validateCatalogCandidate(fixtureCandidate(sourceKey), policy, fixtureContext());
 
     it('rejects under a tightened macro-mass factor the row the shipped plan publishes', () => {
         expect(verdictUnder(ROW.MACRO_MASS_ON_ALLOWANCE, SHIPPED_POLICY).publicationStatus).toBe('published');

@@ -26,9 +26,6 @@
 //    save — a diet or schedule edit as much as an activity one — can make a
 //    confirmed estimate stale. That is the contract, not a defect: the user is
 //    asked to recalculate, and the figure only changes if they do.
-//    `estimateInputsChanged` is asserted separately, over the equation's own
-//    columns, purely as the write-side diagnostic it is; no part of the stale
-//    derivation reads it or the column it maintains.
 //
 // No database, no mocks, no clock: every function under test is pure, and the
 // determinism group asserts that directly.
@@ -47,11 +44,9 @@ import {
     computeTargetEstimate,
     deriveMacroTargets,
     deriveTargetsResponse,
-    ESTIMATE_INPUT_COLUMNS,
     ESTIMATED_SAVE_KEYS,
     EstimateAvailabilityRow,
     EstimateInputsRow,
-    estimateInputsChanged,
     KCAL_PER_POUND_PER_WEEK_PER_DAY,
     MANUAL_CALORIE_RANGE,
     MANUAL_MACRO_RANGE,
@@ -62,6 +57,7 @@ import {
     parseRequiredRevision,
     parseSaveTargetsRequest,
     resolveEstimateInputs,
+    resolveManualTargetSetupAdvance,
     TARGET_SOURCES,
     TargetsPreferencesRow,
     TargetsUserRow,
@@ -69,8 +65,15 @@ import {
 // The save envelope reports an unrecognised `source` with the code the
 // preferences parsers publish for a value outside a closed set, and bounds
 // every revision by the one `MAX_REVISION` this layer shares. Both are
-// imported from the module that owns them rather than restated here.
-import { MAX_REVISION, PREFERENCE_FIELD_CODES } from '../preferences.logic';
+// imported from the module that owns them rather than restated here — as is
+// `nextSetupState`, which the setup-advance group asserts against rather than
+// restating the route order it owns.
+import {
+    MAX_REVISION,
+    PREFERENCE_FIELD_CODES,
+    SetupStateSnapshot,
+    nextSetupState,
+} from '../preferences.logic';
 import { ActivityLevel, TargetsResponse } from '../../types/mealPlanning';
 
 /* ---------------------------------------------------------------------------
@@ -1901,6 +1904,138 @@ describe('assessFeasibility', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * resolveManualTargetSetupAdvance
+ *
+ * The manual route's target screen is the one wizard stop that saves through
+ * `PUT /meal-planning/targets` rather than as a setup step (AAP §0.7.4), so
+ * this is the only thing that can move the resume marker off `targets_manual`.
+ * Both directions matter: a manual confirmation standing on that stop must
+ * advance, and every other way the save route is reached must write nothing —
+ * an Account-only target edit, an edit-mode re-save from plan settings and a
+ * completed user all arrive at the same function.
+ * ------------------------------------------------------------------------- */
+
+describe('resolveManualTargetSetupAdvance', () => {
+    /**
+     * A user standing on the manual route's target stop: goal and body
+     * answered (which is how the marker got there), diet onwards not.
+     */
+    const onTargetStop = (overrides: Partial<SetupStateSnapshot> = {}): SetupStateSnapshot => ({
+        setupStatus: 'in_progress',
+        setupStep: 'targets_manual',
+        targetRoute: 'manual',
+        answers: {
+            goal: 'lose',
+            activityLevel: null,
+            diet: null,
+            mealSchedule: null,
+            cookingTimeLimitMin: null,
+        },
+        ...overrides,
+    });
+
+    describe('the one save that earns the advance', () => {
+        it('moves the marker to the next stop of the manual route', () => {
+            expect(resolveManualTargetSetupAdvance(onTargetStop(), 'manual')).toEqual({
+                setup_step: 'diet',
+                setup_status: 'in_progress',
+            });
+        });
+
+        it('takes both columns from the state machine rather than naming them itself', () => {
+            // The assertion that keeps the decision in one place: `diet` above
+            // is what `nextSetupState` says the stop after `targets_manual` is,
+            // so reordering MANUAL_ROUTE_ORDER moves this helper with it. A
+            // literal here would have to be found and changed by hand.
+            const snapshot = onTargetStop();
+            const transition = nextSetupState(snapshot, 'targets_manual', 'manual');
+
+            expect(resolveManualTargetSetupAdvance(snapshot, 'manual')).toEqual({
+                setup_step: transition.setupStep,
+                setup_status: transition.setupStatus,
+            });
+        });
+
+        it('does not promote the user to ready_for_review, because six stops remain', () => {
+            expect(resolveManualTargetSetupAdvance(onTargetStop(), 'manual')?.setup_status).toBe(
+                'in_progress',
+            );
+        });
+    });
+
+    describe('the saves that write nothing', () => {
+        it('writes nothing for an estimated confirmation', () => {
+            // The estimated route has no target stop at all — its figure is
+            // confirmed on Review as the first step of generating — so an
+            // estimated save answers no wizard screen.
+            expect(resolveManualTargetSetupAdvance(onTargetStop(), 'estimated')).toBeNull();
+        });
+
+        it('writes nothing when there is no preferences row', () => {
+            // The Account-only target edit: the row this save creates is
+            // `not_started` with no marker, and advancing it would invent
+            // onboarding progress the user never made.
+            expect(resolveManualTargetSetupAdvance(null, 'manual')).toBeNull();
+        });
+
+        it('writes nothing for a not_started row', () => {
+            expect(
+                resolveManualTargetSetupAdvance(
+                    onTargetStop({ setupStatus: 'not_started', setupStep: null, targetRoute: null }),
+                    'manual',
+                ),
+            ).toBeNull();
+        });
+
+        it('writes nothing for a ready_for_review row', () => {
+            // The wizard is finished and the user is on Review; a target edit
+            // there is not progress through the wizard.
+            expect(
+                resolveManualTargetSetupAdvance(
+                    onTargetStop({ setupStatus: 'ready_for_review', setupStep: 'review' }),
+                    'manual',
+                ),
+            ).toBeNull();
+        });
+
+        it('writes nothing for a completed row', () => {
+            // The plan-settings target editor. A completed user has a
+            // published week, and putting them back into onboarding is the
+            // regression the monotonic status rule exists to prevent.
+            expect(
+                resolveManualTargetSetupAdvance(
+                    onTargetStop({ setupStatus: 'completed', setupStep: 'review' }),
+                    'manual',
+                ),
+            ).toBeNull();
+        });
+
+        it('writes nothing when the row is on the estimated route', () => {
+            // A marker left behind by a route change: the estimated route's
+            // stops are not this one's.
+            expect(
+                resolveManualTargetSetupAdvance(onTargetStop({ targetRoute: 'estimated' }), 'manual'),
+            ).toBeNull();
+        });
+
+        it.each(['goal', 'body', 'diet', 'dislikes', 'schedule', 'cooking', 'review'] as const)(
+            'writes nothing when the marker reads %s rather than targets_manual',
+            (marker) => {
+                // Before the stop it is a jump ahead; after it the stop has
+                // already been answered and progress is not earned twice.
+                expect(
+                    resolveManualTargetSetupAdvance(onTargetStop({ setupStep: marker }), 'manual'),
+                ).toBeNull();
+            },
+        );
+
+        it('writes nothing when the row carries no marker at all', () => {
+            expect(resolveManualTargetSetupAdvance(onTargetStop({ setupStep: null }), 'manual')).toBeNull();
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * deriveTargetsResponse
  * ------------------------------------------------------------------------- */
 
@@ -2224,145 +2359,6 @@ describe('deriveTargetsResponse', () => {
 });
 
 /* ---------------------------------------------------------------------------
- * estimateInputsChanged
- *
- * The rule behind `meal_plan_preferences.estimate_inputs_revision`, the
- * write-side counter that records when a user's CALCULABLE details last moved.
- * It is not `TargetsResponse.stale` — that is the ancestry check on
- * `revision` asserted above and below — so these cases pin the rule's own
- * question and nothing else. Asserted from both sides: every column the
- * equation reads must count, and every column it does not read must not.
- * ------------------------------------------------------------------------- */
-
-describe('estimateInputsChanged', () => {
-    /** A stored row whose every estimate input is set. */
-    const stored: EstimateInputsRow = { ...REFERENCE_ROW };
-
-    /** One changed value per estimate input, all genuinely different from `stored`. */
-    const changes: Partial<EstimateInputsRow>[] = [
-        { goal: 'gain' },
-        { pace_lb_per_week: 1.5 },
-        { age: 35 },
-        { height_cm: 180 },
-        { weight_kg: 83 },
-        { sex_for_estimate: 'male' },
-        { activity_level: 'very_active' },
-    ];
-
-    it('covers every column the equation reads, and only those', () => {
-        // Keyed off the exported list rather than a second hand-written one, so
-        // adding an input to the equation without classifying it here fails.
-        expect([...ESTIMATE_INPUT_COLUMNS].sort()).toEqual(
-            [
-                'activity_level',
-                'age',
-                'goal',
-                'height_cm',
-                'pace_lb_per_week',
-                'sex_for_estimate',
-                'weight_kg',
-            ].sort(),
-        );
-        expect(changes.map((change) => Object.keys(change)[0]).sort()).toEqual(
-            [...ESTIMATE_INPUT_COLUMNS].sort(),
-        );
-    });
-
-    it('reports a change for each of the seven inputs', () => {
-        for (const change of changes) {
-            expect(estimateInputsChanged(stored, change)).toBe(true);
-        }
-    });
-
-    it('reports no change when a save rewrites the same values', () => {
-        // Revisiting the body step and pressing Continue is not a change: the
-        // user's details still produce the confirmed figure, so nothing needs
-        // recalculating. A rule keyed off which step was saved would say
-        // otherwise.
-        expect(estimateInputsChanged(stored, { ...stored })).toBe(false);
-
-        for (const column of ESTIMATE_INPUT_COLUMNS) {
-            expect(estimateInputsChanged(stored, { [column]: stored[column] })).toBe(false);
-        }
-    });
-
-    it('reports a change when a stored input is cleared', () => {
-        expect(estimateInputsChanged(stored, { activity_level: null })).toBe(true);
-        expect(estimateInputsChanged(stored, { weight_kg: null })).toBe(true);
-    });
-
-    it('ignores a column the write does not mention', () => {
-        // `undefined` is Prisma's "do not write this column", so it must read as
-        // absent here or the rule would disagree with the statement it guards.
-        expect(estimateInputsChanged(stored, {})).toBe(false);
-        expect(estimateInputsChanged(stored, { activity_level: undefined })).toBe(false);
-    });
-
-    it('ignores every preference that is not an input to the equation', () => {
-        // THIS IS THE FINDING. Each of these advances the all-purpose
-        // `revision`, and none of them can move a calculated target, so none
-        // may make a confirmed estimate stale. `goal_weight_kg` is in the list
-        // deliberately: it is a destination the user typed, and no term of the
-        // equation reads it.
-        const unrelatedWrites: Record<string, unknown>[] = [
-            { goal_weight_kg: 70 },
-            { goal_weight_kg: null },
-            { diet: 'vegan' },
-            { allergens: ['milk', 'peanuts'] },
-            { disliked_food_groups: ['mushroom'] },
-            { disliked_food_ids: [] },
-            { meal_schedule: 'three_plus_snack' },
-            { meal_times: [{ slot: 'breakfast', time: '09:00' }] },
-            { cooking_time_limit_min: 15 },
-            { budget_amount: 120 },
-            { budget_currency: 'USD' },
-            { no_budget_preference: false },
-            { budget_tier: 2 },
-            { review_start_date: new Date('2026-07-05T00:00:00.000Z') },
-            { height_unit_pref: 'cm' },
-            { weight_unit_pref: 'kg' },
-        ];
-
-        for (const write of unrelatedWrites) {
-            expect(estimateInputsChanged(stored, write as Partial<EstimateInputsRow>)).toBe(false);
-        }
-    });
-
-    it('reports a change only for the input half of a mixed write', () => {
-        const unrelatedOnly = { diet: 'vegan', cooking_time_limit_min: 45 } as Partial<EstimateInputsRow>;
-        const withAnInput = { diet: 'vegan', activity_level: 'active' } as Partial<EstimateInputsRow>;
-
-        expect(estimateInputsChanged(stored, unrelatedOnly)).toBe(false);
-        expect(estimateInputsChanged(stored, withAnInput)).toBe(true);
-    });
-
-    describe('on the row that does not exist yet', () => {
-        it('counts writing an input as a change, because there was no answer before it', () => {
-            expect(estimateInputsChanged(null, { goal: 'lose' })).toBe(true);
-            expect(estimateInputsChanged(null, { age: 34 })).toBe(true);
-        });
-
-        it('does not count an explicit null, or a write with no input in it', () => {
-            expect(estimateInputsChanged(null, {})).toBe(false);
-            expect(estimateInputsChanged(null, { pace_lb_per_week: null })).toBe(false);
-            expect(estimateInputsChanged(null, { diet: 'none' } as Partial<EstimateInputsRow>)).toBe(false);
-        });
-    });
-
-    it('is pure: it mutates neither argument', () => {
-        const current = { ...stored };
-        const writes: Partial<EstimateInputsRow> = { activity_level: 'active' };
-        const currentSnapshot = { ...current };
-        const writesSnapshot = { ...writes };
-
-        estimateInputsChanged(current, writes);
-
-        expect(current).toEqual(currentSnapshot);
-        expect(writes).toEqual(writesSnapshot);
-    });
-});
-
-/* ---------------------------------------------------------------------------
  * The staleness rule, composed with the saves that drive it
  *
  * `deriveTargetsResponse` compares two revisions; `preferences.service.ts`
@@ -2371,20 +2367,11 @@ describe('estimateInputsChanged', () => {
  * exactly as those two writers evolve it — every preference save advances
  * `revision`, and confirming an estimate records the `revision` it was
  * confirmed at — and then reads the verdict off the result.
- *
- * The write-side `estimate_inputs_revision` is carried along so the two
- * QUESTIONS stay distinguishable in one place: "has anything changed since this
- * figure was confirmed?" (the AAP's staleness rule, §0.5.2) and "have the
- * user's calculable details changed?" (`estimateInputsChanged`). Only the first
- * one is `stale`.
  * ------------------------------------------------------------------------- */
 
 describe('a confirmed estimate through a sequence of preference saves', () => {
     /** The stored row, as the writers and the read together see it. */
-    interface StoredRow extends EstimateInputsRow, TargetsPreferencesRow {
-        /** The write-side diagnostic counter; no read consults it. */
-        estimate_inputs_revision: number;
-    }
+    type StoredRow = EstimateInputsRow & TargetsPreferencesRow;
 
     /**
      * A freshly confirmed estimate: `targets_input_revision` equals `revision`,
@@ -2397,23 +2384,19 @@ describe('a confirmed estimate through a sequence of preference saves', () => {
         targets_revision: 4,
         confirmed_targets: { ...CONFIRMED },
         targets_input_revision: 12,
-        estimate_inputs_revision: 7,
         revision: 12,
     });
 
     /**
      * One preference save, applying exactly what `preferences.service.ts`
      * applies: `revision` ALWAYS advances — that is what a client pins to
-     * detect a lost update, so every save has to move it — and the write-side
-     * diagnostic advances only when the pure rule says an equation input moved.
+     * detect a lost update, so every save has to move it — and nothing else
+     * about the confirmed estimate is touched.
      */
     const save = (row: StoredRow, writes: Partial<EstimateInputsRow>): StoredRow => ({
         ...row,
         ...writes,
         revision: row.revision + 1,
-        estimate_inputs_revision: estimateInputsChanged(row, writes)
-            ? row.estimate_inputs_revision + 1
-            : row.estimate_inputs_revision,
     });
 
     /**
@@ -2463,7 +2446,7 @@ describe('a confirmed estimate through a sequence of preference saves', () => {
         expect(staleAfter({ cooking_time_limit_min: 15 } as Partial<EstimateInputsRow>)).toBe(true);
     });
 
-    it('distinguishes the two questions: unrelated saves move the revision but not the diagnostic', () => {
+    it('advances the revision once per save, whatever the save edited', () => {
         const afterUnrelated = [
             { diet: 'vegan' } as Partial<EstimateInputsRow>,
             { allergens: ['milk'] } as Partial<EstimateInputsRow>,
@@ -2473,11 +2456,10 @@ describe('a confirmed estimate through a sequence of preference saves', () => {
         ].reduce(save, confirmedRow());
         const afterAnInput = save(confirmedRow(), { activity_level: 'active' });
 
-        // Five saves, five revisions, and the user's calculable details never
-        // moved — which is what the diagnostic records and `stale` does not.
+        // Five saves, five revisions — none of them an answer the equation
+        // reads, and the counter advances all the same.
         expect(afterUnrelated.revision).toBe(17);
-        expect(afterUnrelated.estimate_inputs_revision).toBe(7);
-        expect(afterAnInput.estimate_inputs_revision).toBe(8);
+        expect(afterAnInput.revision).toBe(13);
 
         // Both are stale, because both are figures confirmed at revision 12
         // against rows that have moved past it.
@@ -2494,9 +2476,9 @@ describe('a confirmed estimate through a sequence of preference saves', () => {
             sex_for_estimate: row.sex_for_estimate,
         });
 
-        // Nothing the equation reads moved, so the diagnostic stands still —
-        // and the revision still advanced, so the ancestry no longer matches.
-        expect(rewritten.estimate_inputs_revision).toBe(7);
+        // Nothing the equation reads moved, and the revision still advanced,
+        // so the ancestry no longer matches.
+        expect(rewritten.revision).toBe(13);
         expect(deriveTargetsResponse(userRow(), rewritten).stale).toBe(true);
     });
 

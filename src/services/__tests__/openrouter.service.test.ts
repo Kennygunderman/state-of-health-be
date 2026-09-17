@@ -792,6 +792,96 @@ describe('OpenRouterError', () => {
         });
     });
 
+    /**
+     * THE HALF OF THE FAILURE A LOG MAY CARRY.
+     *
+     * `message` is the client-visible text asserted throughout this file, and
+     * for the `http` and `network` kinds it quotes the vendor: up to 300
+     * characters of the failed response body, or the transport's own words.
+     * That is right for a 502 returned to the caller who made the request and
+     * wrong for anything that outlives it — a log line, a run ledger, a
+     * committed report — because `scripts/lib/logger.ts` can scrub credential
+     * patterns and cannot scrub arbitrary prose.
+     *
+     * `safeMessage` is the form those paths take, and the assertions below are
+     * the reason it can be trusted: it is assembled from the closed kind set
+     * and the numeric status only, so there is no input a vendor controls that
+     * can reach it. Both catalog stages
+     * (`scripts/catalog-generate-ai.ts::asGenerationFailure`,
+     * `scripts/catalog-validate.ts::asReviewFailure`) read this property.
+     */
+    describe('safeMessage', () => {
+        /** A body that is unmistakable if any part of it survives into a log. */
+        const SENSITIVE_BODY =
+            'internal trace: user bob@example.com asked about mushrooms; upstream said quota for org_42 exhausted';
+
+        it('carries the kind and the status, and no byte of the response body', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(failureResponse(429, SENSITIVE_BODY));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.safeMessage).toBe('OpenRouter call failed (http, status 429)');
+            // The message still quotes the vendor — that is the shipped 502
+            // text — which is exactly why the two properties are separate.
+            expect(error.message).toContain(SENSITIVE_BODY);
+            expect(error.safeMessage).not.toContain('bob@example.com');
+            expect(error.safeMessage).not.toContain('org_42');
+        });
+
+        it('carries no byte of a 300-character body either, so truncation is not the protection', async () => {
+            const openRouter = loadConfigured();
+            const body = 'q'.repeat(HTTP_BODY_LIMIT);
+            const stub = respondWith(failureResponse(503, body));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.safeMessage).toBe('OpenRouter call failed (http, status 503)');
+            expect(error.safeMessage).not.toContain('q');
+        });
+
+        it('omits the status segment when the failure has no HTTP status', async () => {
+            const openRouter = loadConfigured();
+            const stub = jest.fn(() => Promise.reject(new Error('ECONNRESET while talking to 10.1.2.3'))) as unknown as FetchStub;
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.safeMessage).toBe('OpenRouter call failed (network)');
+            expect(error.safeMessage).not.toContain('ECONNRESET');
+            expect(error.safeMessage).not.toContain('10.1.2.3');
+        });
+
+        it.each<OpenRouterErrorKind>(['not_configured', 'http', 'empty', 'timeout', 'network', 'unparseable'])(
+            'names %s without repeating the constructor message',
+            (kind) => {
+                const openRouter = loadConfigured();
+
+                const error = new openRouter.OpenRouterError(kind, 'a message a vendor wrote');
+
+                expect(error.safeMessage).toBe(`OpenRouter call failed (${kind})`);
+                expect(error.safeMessage).not.toContain('a vendor wrote');
+                expect(error.message).toBe('a message a vendor wrote');
+            },
+        );
+
+        it('refuses to echo a kind outside the closed set, so the text stays this module\'s own', () => {
+            const openRouter = loadConfigured();
+
+            const error = new openRouter.OpenRouterError('<script>alert(1)</script>' as OpenRouterErrorKind, 'boom', 418);
+
+            expect(error.safeMessage).toBe('OpenRouter call failed (unknown_kind, status 418)');
+            expect(error.safeMessage).not.toContain('script');
+        });
+
+        it('omits a status that is not an integer rather than rendering it', () => {
+            const openRouter = loadConfigured();
+
+            expect(new openRouter.OpenRouterError('http', 'boom', Number.NaN).safeMessage).toBe('OpenRouter call failed (http)');
+            expect(new openRouter.OpenRouterError('http', 'boom', 503.5).safeMessage).toBe('OpenRouter call failed (http)');
+        });
+    });
+
     describe('not_configured', () => {
         it('reports a missing key with the shipped message', async () => {
             const openRouter = loadOpenRouter();

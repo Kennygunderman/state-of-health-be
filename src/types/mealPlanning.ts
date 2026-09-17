@@ -714,6 +714,23 @@ export interface MealPlanResponse {
     // varies the generator's seed so a regeneration differs from the plan it
     // replaces.
     generationAttempt: number;
+    // The idempotency key of the keyed write that published this plan, which is
+    // what lets a client prove a plan it just read is the one its own pending
+    // request produced.
+    //
+    // A client whose generate or regenerate response was lost cannot otherwise
+    // tell: refetching the current plan may return the plan its request
+    // committed, a plan another device made, or the untouched plan it was
+    // replacing, and all three look alike. Matching this against the key the
+    // client still holds is the only exact answer, so an unresolved intent is
+    // retired on a match and kept — with the refetch left display-only — on
+    // anything else (§0.2.5, §0.7.2).
+    //
+    // Safe to expose: it is a value this user's own client minted and sent, it
+    // is unique per user (meal_plans.@@unique([user_id, generation_key])), and
+    // it grants nothing — a keyed write is authenticated and owner-scoped
+    // regardless of the key it carries.
+    generationKey: string;
     startDate: string; // 'YYYY-MM-DD'
     endDate: string; // 'YYYY-MM-DD', six days after startDate
     status: PlanStatus;

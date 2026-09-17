@@ -34,6 +34,7 @@
 
 import type {
     EstimateUnavailableErrorData,
+    InvalidRequestDetail,
     LimitingConstraint,
     NoMatchingMealsErrorData,
     PlanNotActiveErrorData,
@@ -71,13 +72,22 @@ export class StaleRevisionError extends Error {
     }
 }
 
-// A preferences body carried a server-owned or unknown key. The field name is
-// client-supplied, so it travels as data and never as message text; the
-// controller renders it as the InvalidRequestDetail whose code is
+// A preferences body carried server-owned or unknown keys. The field names are
+// client-supplied, so they travel as data and never as message text; the
+// controller renders them as the InvalidRequestDetail entries whose code is
 // 'read_only_field'.
+//
+// IT CARRIES THE WHOLE LIST, not one field, because the parser that finds these
+// keys reports EVERY offending one in a single verdict and the 400 must keep
+// naming all of them: a client sending three server-owned keys learns about
+// three in one round trip, not one per attempt. That is why the payload is
+// `details` rather than a `field` — a single-field class could only ever carry
+// the first, so raising it would have narrowed the response, which is the
+// reason the preference service used to return the verdict instead of throwing
+// and left this class with no raise path at all.
 export class ReadOnlyFieldError extends Error {
-    constructor(public readonly field: string) {
-        super('Request contains a read-only field');
+    constructor(public readonly details: readonly InvalidRequestDetail[]) {
+        super('Request contains read-only fields');
         this.name = 'ReadOnlyFieldError';
     }
 }

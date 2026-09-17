@@ -1,7 +1,7 @@
 {
   "usdaManifestVersion": "v1",
   "coveragePlanVersion": "v1",
-  "coveragePlanContract": "Every category and foodGroup below exists in coverage-plan.<coveragePlanVersion>.json, and each entry's category equals that foodGroup's own category there. That agreement holds by construction: the entries were emitted by a generator that refused to write the file on any mismatch, unknown category, unknown foodGroup or unknown foodState. scripts/lib/manifest.ts enforces only the version field at load time (loadUsdaManifest checks usdaManifestVersion against EXPECTED_USDA_MANIFEST_VERSION and throws ManifestError, which catalog-import-usda.ts preflight reports as the usda_manifest_unavailable gap); it passes no structural check for this document. Re-asserting the cross-file agreement against the loaded coverage plan therefore belongs to the importer, and a mismatch must stop the run before the first USDA request rather than halfway through an import.",
+  "coveragePlanContract": "Every category and foodGroup below exists in coverage-plan.<coveragePlanVersion>.json, and each entry's category equals that foodGroup's own category there. For the filing fields - each foods[] entry, each sweepClassificationRules rule and its fallback - that agreement holds by construction: the entries were emitted by a generator that refused to write the file on any mismatch, unknown category, unknown foodGroup or unknown foodState. The derivation tables keyed BY foodGroup - sweepAllergenDietRules.byFoodGroup and sweepCostClassRules.foodGroupOverrides - are hand-curated and were NOT covered by that generator, which is how a taxonomy rename once left 30 keys naming food groups no record could carry: every import kept succeeding while the allergen seeds and cost classes under those keys were never applied to anything. They are now checked and the check is fatal. scripts/lib/manifest.ts checks this document's own structure at load time - loadUsdaManifest passes assertUsdaManifestShape, which verifies every field the declared UsdaManifest shape promises, that every closed-vocabulary value (category, foodState, usdaDataType, costClass, allergen tag and diet tag) is drawn from its vocabulary, and that allergenVocabulary and the descriptionAllergenMarkers key set are each EXACTLY the nine allergen classes the product supports - compared against ALLERGEN_CLASSES in scripts/lib/manifest.ts rather than against this document, so a coherent truncation that drops a class from the vocabulary, the marker table and every reviewed entry at once is refused instead of silently never tagging it - and throws ManifestError, which catalog-import-usda.ts preflight reports as the usda_manifest_unavailable gap. What that check deliberately does not do is load a second document, so the cross-file agreement with the coverage plan is not its to make. Re-asserting that agreement against the loaded coverage plan therefore belongs to the importer: assertManifestMatchesCoveragePlan compares coveragePlanVersion for equality, every filing, every category key and every foodGroup-keyed derivation key, and refuses the run on any disagreement before the rate limiter is installed and before the first USDA request rather than halfway through an import.",
   "apiKeyEnvVar": "USDA_API_KEY",
   "usdaDataTypes": [
     "Foundation",
@@ -13,7 +13,7 @@
   "brandedDataTypePolicy": "'Branded' is listed because the USDA API accepts it and the running API's branded search uses it, but no datasetSweep enumerates it and no entry below selects it: manufacturer records enter the catalog only through a curated entry, never through a bulk import. USDA FoodData Central is public domain with no retention restrictions (recorded in src/services/usda.service.ts and on the usda_api_cache model), which is what makes committing the identity data in this file and snapshotting per-100 g values into a release legal; no other provider's data appears here.",
   "sourceKeyFormat": "usda:<fdcId>",
   "sourceKeyContract": "catalog_foods.source_key is UNIQUE and is the key every import upserts on, so rerunning this manifest updates in place instead of inserting duplicates; catalog_foods.usda_fdc_id is UNIQUE too, so two entries may never name the same fdcId. Recipe seeds and search-benchmark expectations reference foods by this string and never by a database id, which is what lets a release load into any database.",
-  "entryIdentityContract": "Each foods entry carries exactly one of fdcId (an integer read from a live USDA response) or resolveBy, the shape scripts/lib/manifest.ts declares as UsdaFoodResolveBy {query, dataTypes?, requireDescription?}: a lookup the importer performs once, pins and reports, where requireDescription is the exact description the resolved record must carry. Never both fields, and never a guessed id, because a fabricated FDC id imports the wrong food under a name that looks right. Every entry in this version carries a verified fdcId, so resolveBy is unused here; the importer must still support it, because a later append may name a food whose id cannot be verified at authoring time.",
+  "entryIdentityContract": "Each foods entry names its food by fdcId - an integer read from a live USDA response - and that is the only form it may take. There is no resolveBy lookup: scripts/lib/manifest.ts declares fdcId as required and assertUsdaManifestShape refuses, naming the entry, any document that carries resolveBy. Verifying an id is a curation step that happens before this document is written, because both alternatives are unsafe. An unattended search picks among plausible hits and can import the wrong record under a name that looks right - the fabricated identity this policy forbids, which would then carry that record's nutrition into recipes as source-backed - and skipping the entry instead is a curation a reviewer approved that never reaches the catalog, visible only as a counter nobody reads. An append naming a food whose id cannot be verified yet therefore waits for that verification, never for the importer.",
   "expectedUsdaDescriptionContract": "expectedUsdaDescription is the description the record carried when its id was verified. The importer compares it with the live record and, on a mismatch, records identity_status \"ambiguous\" and reports the entry instead of trusting the id, so an upstream re-identification surfaces as a review item rather than a silently wrong food.",
   "importLimits": {
     "vendorRequestsPerHour": 1000,
@@ -7005,7 +7005,7 @@
     "fallbackReason": "Survey (FNDDS) descriptions are as-eaten, so an unmatched FNDDS record is prepared; the reference datasets describe the food as bought, so an unmatched record there is as_purchased. The state is never guessed from nutrition, and raw, dry and cooked forms stay separate rows because grocery aggregation keys on (catalog_food_id, food_state) and must never merge them."
   },
   "sweepAliasPolicy": "A swept record's aliases are derived from its own description only: the comma-separated qualifiers reordered into natural order (\"Rice, brown, long-grain, raw\" yields \"brown rice\"), plus the plural of the head noun. The sweep invents no synonym, regional name or misspelling \u2014 those are curation decisions and exist only on the foods entries above.",
-  "sweepPageBounds": "Each sweep's observedLastNonEmptyPage and observedApproximateRecordCount were measured against GET /foods/list at pageSize 200 on observedOn, by binary-searching the last page that still returned a non-empty array. maxPages is a backstop bound and not that measurement: it sits above the observed count so a dataset that grows between authoring and import is not silently truncated, while an enumeration that never returns an empty page still terminates. The real stopping conditions are an empty page and stopWhenCategoryCandidateVolumeReached; maxPages only caps a runaway.",
+  "sweepPageBounds": "Each sweep's observedLastNonEmptyPage and observedApproximateRecordCount were measured against GET /foods/list at pageSize 200 on observedOn, by binary-searching the last page that still returned a non-empty array. maxPages is a backstop bound and not that measurement: it sits above the observed count so a dataset that grows between authoring and import is not silently truncated, while an enumeration that never returns an empty page still terminates. The real stopping conditions are an empty page and stopWhenCategoryCandidateVolumeReached; maxPages only caps a runaway. maxPages is therefore the only page bound the importer applies, and assertUsdaManifestShape refuses a sweep whose maxPages sits below its own observedLastNonEmptyPage - a bound below the data already measured would truncate the dataset this document describes.",
   "genericDatasetVolume": {
     "measuredOn": "2026-09-12",
     "foundation": 394,
@@ -7335,13 +7335,11 @@
     },
     "foodGroupOverrides": {
       "game_meat": 3,
-      "shellfish": 3,
-      "finfish": 3,
       "cheese": 3,
-      "nut": 3,
-      "seed": 2,
-      "spice": 2,
-      "fresh_herb": 3,
+      "sesame": 2,
+      "sunflower_seed": 2,
+      "chili_spice": 2,
+      "spice_other": 2,
       "rice": 1,
       "pasta": 1,
       "potato": 1,
@@ -7350,10 +7348,8 @@
       "cabbage": 1,
       "banana": 1,
       "apple": 1,
-      "wheat_flour": 1,
       "vegetable_oil": 1,
-      "sugar": 1,
-      "water": 1,
+      "sweetener": 1,
       "coffee": 1,
       "tea": 1
     }
@@ -7376,6 +7372,9 @@
       "cheese": [
         "milk"
       ],
+      "blue_cheese": [
+        "milk"
+      ],
       "milk": [
         "milk"
       ],
@@ -7388,31 +7387,28 @@
       "cream": [
         "milk"
       ],
-      "dairy_other": [
-        "milk"
-      ],
-      "ice_cream": [
-        "milk"
-      ],
-      "egg": [
+      "chicken_egg": [
         "eggs"
       ],
-      "egg_other": [
+      "egg_product": [
         "eggs"
       ],
       "peanut": [
         "peanuts"
       ],
-      "peanut_butter": [
-        "peanuts"
-      ],
-      "nut": [
+      "almond": [
         "tree_nuts"
       ],
-      "nut_butter": [
+      "cashew": [
         "tree_nuts"
       ],
-      "soy_product": [
+      "walnut": [
+        "tree_nuts"
+      ],
+      "nut_other": [
+        "tree_nuts"
+      ],
+      "soybean": [
         "soy"
       ],
       "tofu": [
@@ -7424,16 +7420,13 @@
       "soy_milk": [
         "soy"
       ],
-      "wheat_flour": [
+      "wheat_grain": [
         "wheat"
       ],
       "pasta": [
         "wheat"
       ],
-      "bread": [
-        "wheat"
-      ],
-      "roll_bun": [
+      "bread_leavened": [
         "wheat"
       ],
       "tortilla": [
@@ -7442,19 +7435,7 @@
       "cracker": [
         "wheat"
       ],
-      "cereal": [
-        "wheat"
-      ],
       "pastry": [
-        "wheat"
-      ],
-      "cookie": [
-        "wheat"
-      ],
-      "cake": [
-        "wheat"
-      ],
-      "pie": [
         "wheat"
       ],
       "pizza": [
@@ -7466,22 +7447,25 @@
       "wrap": [
         "wheat"
       ],
-      "pancake_waffle": [
-        "wheat"
-      ],
-      "finfish": [
+      "salmon": [
         "fish"
       ],
-      "canned_fish": [
+      "tuna": [
         "fish"
       ],
-      "shellfish": [
+      "white_fish": [
+        "fish"
+      ],
+      "anchovy": [
+        "fish"
+      ],
+      "crustacean": [
         "shellfish"
       ],
-      "sesame_seed": [
-        "sesame"
+      "mollusk": [
+        "shellfish"
       ],
-      "tahini": [
+      "sesame": [
         "sesame"
       ]
     },
@@ -7705,7 +7689,22 @@
     "canonicalName": "The USDA description, lower-cased and whitespace-normalised, verbatim otherwise. USDA descriptions are comma-inverted and highly specific, which is exactly what the partial unique index on (canonical_name, food_state) WHERE published needs: 7,793 SR Legacy descriptions stay distinct without any invented disambiguator. Curated entries keep their hand-authored canonicalName.",
     "displayName": "The USDA description verbatim. USDA already writes sentence case (\"Mushrooms, white, raw\"), which matches the curated entries' own displayName convention, so re-casing it would lose fidelity and risk mangling abbreviations. Distinct display names also keep the search ordering contract (ts_rank DESC, display_name ASC, source_key ASC) deterministic.",
     "sourceVersion": "\"<usdaDataType> <publicationDate as YYYY-MM>\", reproducing the reviewed rows' \"SR Legacy 2019-04\" and \"Survey (FNDDS) 2024-10\". publicationDate is M/D/YYYY on a detail record and ISO on a list record, so both forms are parsed.",
-    "sourceCacheKey": "\"/food/<fdcId>?format=full\" - the canonical detail path, which is the key the reviewed rows carry, whether the record was fetched singly or in a POST /foods batch.",
+    "sourceCacheKey": "The key of the batch response the row was read out of: \"POST /foods?#{\\\"fdcIds\\\":[...],\\\"format\\\":\\\"full\\\"}\", shared by the up-to-twenty foods that response carried. It is the primary key of the usda_api_cache row holding that payload, so a reader can fetch the row and recompute the identity_evidence digests from it. The earlier text here named \"/food/<fdcId>?format=full\", a per-food detail path this pipeline never requests - twenty ids per request is what keeps a 13,000-food sweep inside the vendor's hourly cap - so no cache row has ever existed under that key and the claim was unverifiable. Corrected to what the import writes; the machine-checkable form is sourceCacheKeyScheme below, which catalog-import-usda.ts refuses to run against if it disagrees with the key the client actually builds.",
+    "sourceCacheKeyScheme": {
+      "method": "POST",
+      "path": "/foods",
+      "queryParams": [],
+      "requestBodyKeys": [
+        "fdcIds",
+        "format"
+      ],
+      "format": "full",
+      "shape": "POST /foods?#{\"fdcIds\":[<ascending de-duplicated fdc ids>],\"format\":\"full\"}",
+      "builtBy": "src/services/usda.service.ts cacheKeyForRequest",
+      "sharedAcrossBatch": true,
+      "maxFoodsPerKey": 20,
+      "checkedBy": "scripts/catalog-import-usda.ts USDA_SOURCE_CACHE_KEY_SCHEME, compared field by field at startup and pinned against a real cacheKeyForRequest call by src/__tests__/scripts/catalog-import.test.ts"
+    },
     "identityCollisionWithCuratedEntries": "A sweep skips any record whose normalised (canonical_name, food_state) matches a curated entry's, on top of skipFdcIdsPresentInFoods, counted under skippedCuratedIdentity. dedupeIdentity's survivor tiebreak is the lexicographically smaller source_key and knows nothing about curation, so without this skip a swept record could unseat a curated identity that search-benchmark.v1.json pins by sourceKey. Swept-versus-swept collisions are left to dedupeIdentity as designed."
   },
   "sweepPortionPolicy": {

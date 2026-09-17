@@ -918,18 +918,40 @@ const findMatchedSnippet = (body: Buffer, expectedName: string, maxChars: number
     return haystack.slice(start, start + maxChars);
 };
 
+/**
+ * The one way this module reports a refusal: a typed result carrying the
+ * machine-readable `reason`, a fixed explanatory `detail`, and the host when one
+ * was established — host granularity and nothing else, never the full URL (its
+ * query string is model-supplied), never a header, never a byte of the body
+ * (AAP §0.3.2).
+ *
+ * THIS FUNCTION DOES NOT LOG, AND THAT IS THE CONTRACT.
+ *
+ * It used to `console.warn` every refusal unconditionally, which was wrong three
+ * times over. A refusal is the NORMAL outcome here — the model proposes up to
+ * three URLs per candidate and most are refused before a socket exists — so at
+ * catalog scale that produced tens of thousands of lines. They were
+ * unstructured, so nothing downstream could aggregate them. And the caller
+ * already reports the same fact properly: the one consumer in the repository,
+ * `scripts/catalog-generate-ai.ts::collectIdentityEvidence`, emits a bounded
+ * structured `evidence_refused` event at debug level with the host and reason
+ * taken from this result, and tallies `evidenceRefusals` into the run report's
+ * `refusalsByReason` — so the refusal was being told twice, once badly.
+ *
+ * The refusal is still reported rather than swallowed (the rejection is
+ * returned, and the caller quarantines the candidate on it); the decision about
+ * where it is written belongs to the stage that owns the run. Injecting
+ * `scripts/lib/logger.ts`'s ScriptLogger is not the alternative: this file is in
+ * the production program (`tsconfig.json` roots it at `src/`) and must not
+ * import from `backend/scripts/`, and a second `console` sink here would be the
+ * same defect with different spelling.
+ */
 const refuse = (
     reason: EvidenceRejectionReason,
     detail: string,
     host: string | null,
     error: EvidenceError | null = null,
-): EvidenceFetchResult => {
-    // Host granularity, and nothing else: never the full URL (its query string is
-    // model-supplied), never a header, never a byte of the body.
-    console.warn(`Evidence retrieval refused (${reason}) for host ${host ?? 'unknown'}`);
-
-    return { ok: false, reason, detail, host, error };
-};
+): EvidenceFetchResult => ({ ok: false, reason, detail, host, error });
 
 /**
  * Retrieves one identity-evidence page, or refuses to.

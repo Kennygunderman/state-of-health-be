@@ -90,6 +90,7 @@ import { RateLimitConfigError } from './lib/rateLimiter';
 import {
     CheckpointError,
     GRAPH_MUTATING_RUN_KINDS,
+    VALIDATION_SCOPE_SEPARATOR,
     canonicalValidationRunKey,
     catalogInputIdentity,
     isRestrictedValidationRunKey,
@@ -542,7 +543,11 @@ export interface ReleaseFoodRow {
         readonly yield_factor: number;
         readonly component_nutrition_version: number;
         readonly sort_order: number;
-        readonly component_catalog_foods: { readonly source_key: string } | null;
+        readonly component_catalog_foods: {
+            readonly source_key: string;
+            /** Whether the release carries this target at all — see the walk. */
+            readonly publication_status: string;
+        } | null;
     }[];
     readonly catalog_validation_records: {
         readonly canonical_identity: unknown;
@@ -589,6 +594,13 @@ export interface ReleaseDb {
     catalog_import_runs: {
         create(args: unknown): Promise<{ id: string }>;
         /**
+         * The release ledger row's outcome, written once publication has either
+         * happened or failed — see `runReleaseStage`. A row that says
+         * 'succeeded' before the rename is a row that can outlive the release
+         * it describes.
+         */
+        update(args: unknown): Promise<{ id: string }>;
+        /**
          * Read to prove the published set is a validated set and not a
          * mid-pipeline one, and to refuse while a mutating run is still open.
          */
@@ -612,6 +624,18 @@ export interface ReleaseRunRow {
     readonly manifest_version: string;
     readonly status: string;
     readonly finished_at: Date | null;
+    /**
+     * What the run RECORDED that it did. Read for validation rows only, and for
+     * one question: did a pass that ran after the canonical one change any
+     * food's publication status (`judged` minus `unchanged`)? Without it a
+     * restricted pass is invisible to the readiness rules — see WHICH
+     * VALIDATION ROW COUNTS.
+     *
+     * Optional because it is `Json?` in the schema and because a caller holding
+     * older rows (a test, an older select) still satisfies the two rules that
+     * do not read it.
+     */
+    readonly counts?: unknown;
 }
 
 /**
@@ -628,6 +652,37 @@ export interface ReleaseRunRow {
 export interface ReleaseFileWriter {
     write(chunk: string): void;
     close(): void;
+}
+
+/**
+ * Every filesystem effect this stage has, in one injected place.
+ *
+ * The export's four file operations were already deps; publication's were not —
+ * `fs.renameSync`, `fs.rmSync` and `process.pid` were reached for directly in
+ * module scope and in `main()`, so the half of the stage that decides whether a
+ * reviewed release is replaced was the half no test could drive (Rule
+ * backend-architecture §4). They are all here now, which is what lets
+ * `runReleaseStage` be exercised end to end — export, publication, ledger — on
+ * in-memory doubles.
+ */
+export interface ReleaseFileSystem {
+    readonly writeFile: (absolutePath: string, contents: string) => void;
+    readonly readFileBytes: (absolutePath: string) => Buffer;
+    readonly ensureDir: (absolutePath: string) => void;
+    /** Recursive, and absent is not an error: it is what discards staging. */
+    readonly removeDir: (absolutePath: string) => void;
+    readonly directoryExists: (absolutePath: string) => boolean;
+    readonly rename: (from: string, to: string) => void;
+    /**
+     * Creates the file with these contents ONLY if it does not exist, and
+     * answers whether it did. The atomic claim publication serialises on; a
+     * `exists ? no : create` pair could not do it, because two runs can both
+     * observe "no".
+     */
+    readonly createFileExclusive: (absolutePath: string, contents: string) => boolean;
+    /** Absent is not an error: it is what releases a lock that was never taken. */
+    readonly removeFile: (absolutePath: string) => void;
+    readonly openWriter?: (absolutePath: string) => ReleaseFileWriter;
 }
 
 export interface RunReleaseDeps {
@@ -955,7 +1010,12 @@ const RELEASE_FOOD_SELECT = {
             yield_factor: true,
             component_nutrition_version: true,
             sort_order: true,
-            component_catalog_foods: { select: { source_key: true } },
+            // `publication_status` beside the key, because the key alone cannot
+            // answer whether the release CARRIES that food: foods.jsonl holds
+            // published rows only, so a component pointing at a candidate,
+            // quarantined or retired food would name a key absent from it. See
+            // A RELEASE'S COMPONENTS CLOSE OVER ITS OWN FOODS in the walk.
+            component_catalog_foods: { select: { source_key: true, publication_status: true } },
         },
         orderBy: { sort_order: 'asc' },
     },
@@ -993,11 +1053,21 @@ const RELEASE_FOOD_SELECT = {
  * what makes the walk resumable AND makes the emitted order the release's
  * stated order, so paging is invisible in the bytes.
  */
+/**
+ * The one status a release exports.
+ *
+ * Named because two rules have to agree on it: the page query selects parents
+ * by it, and the component-closure check asks whether a component's TARGET
+ * carries it. Written twice, they could drift; read from here, the release's
+ * membership rule and its closure rule are the same statement.
+ */
+const PUBLISHED_STATUS = 'published';
+
 const releaseFoodPageQuery = (cursor: string | null, pageSize: number): unknown => ({
     where:
         cursor === null
-            ? { publication_status: 'published' }
-            : { publication_status: 'published', source_key: { gt: cursor } },
+            ? { publication_status: PUBLISHED_STATUS }
+            : { publication_status: PUBLISHED_STATUS, source_key: { gt: cursor } },
     orderBy: { source_key: 'asc' },
     take: pageSize,
     select: RELEASE_FOOD_SELECT,
@@ -1049,6 +1119,17 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
 
     const withoutValidationRecord = new OffenderTally();
     const withoutUsableDefaultPortion = new OffenderTally();
+    /** Compositions naming a food this release does not export — see the walk. */
+    const componentTargetOutsideRelease = new OffenderTally();
+    /** Published AI-generated foods with no batch to attribute them to. */
+    const withoutGenerationBatch = new OffenderTally();
+    /**
+     * Every target `components.jsonl` actually names, deduplicated. Bounded by
+     * the number of DISTINCT components in the release — the smallest member by
+     * design — and used once, after the walk, to assert the emitted references
+     * resolve against the foods the release carries.
+     */
+    const referencedComponentKeys = new Set<string>();
     const componentFacts: {
         source_key: string;
         nutrition_provenance: string;
@@ -1070,13 +1151,19 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     const retrievedAt = new Map<string, Date>();
     /**
      * Which model and prompt produced the AI-generated rows this release
-     * carries, read from their batches. Sets, because a release spanning two
-     * generation runs carries two, and `model_versions` must be measured from
-     * the rows rather than restated from the plan.
+     * carries, read from their batches, and which model and prompt reviewed any
+     * of them, read from their validation records' `llm_review`. Sets, because a
+     * release spanning two generation or review runs carries two, and
+     * `model_versions` must be measured from the rows rather than restated from
+     * the plan — a plan states which environment variable SELECTS a model, which
+     * is not evidence that a call was made.
      */
     const generationModels = new Set<string>();
     const generationPromptVersions = new Set<string>();
+    const reviewModels = new Set<string>();
+    const reviewPromptVersions = new Set<string>();
     let aiGeneratedFoods = 0;
+    let reviewedFoods = 0;
 
     // Sorted by (parent, child) so a member is byte-reproducible whatever order
     // the database returned one parent's children in. Comparison is by code
@@ -1170,12 +1257,40 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                         emit('foods.jsonl', toReleaseFoodLine(row));
                         publishedByCategory[row.category] = (publishedByCategory[row.category] ?? 0) + 1;
 
+                        // PROVENANCE IS MEASURED HERE OR IT IS NOT MEASURED.
+                        //
+                        // Each of these four facts comes from the row itself:
+                        // the batch that generated it names the model and prompt
+                        // that produced it, and its validation record's
+                        // `llm_review` names the model and prompt that reviewed
+                        // it. Nothing is taken from the coverage plan, which
+                        // says which env var SELECTS a model and is not evidence
+                        // that a call happened.
                         if (row.identity_source === 'ai_generated') {
                             aiGeneratedFoods += 1;
+                            if (row.catalog_generation_batches === null) {
+                                // An AI-generated food with no batch cannot be
+                                // attributed to a model at all, and the catalog
+                                // policy requires an AI-generated record to be
+                                // attributable. The old fallback filled the gap
+                                // from configuration, which named a model that
+                                // may never have run.
+                                withoutGenerationBatch.add(row.source_key);
+                            }
                         }
                         if (row.catalog_generation_batches !== null) {
                             generationModels.add(row.catalog_generation_batches.model);
                             generationPromptVersions.add(row.catalog_generation_batches.prompt_version);
+                        }
+                        const review = advisoryReviewProvenance(row.catalog_validation_records?.llm_review);
+                        if (review !== null) {
+                            reviewedFoods += 1;
+                            if (review.model !== null) {
+                                reviewModels.add(review.model);
+                            }
+                            if (review.promptVersion !== null) {
+                                reviewPromptVersions.add(review.promptVersion);
+                            }
                         }
 
                         if (row.usda_data_type !== null && row.source_version !== null) {
@@ -1227,9 +1342,52 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                             withoutUsableDefaultPortion.add(row.source_key);
                         }
 
-                        const componentLines = row.catalog_food_components
-                            .filter((component) => component.component_catalog_foods !== null)
-                            .map((component) => ({
+                        // A RELEASE'S COMPONENTS CLOSE OVER ITS OWN FOODS.
+                        //
+                        // `components.jsonl` names its target by `source_key`
+                        // because a local uuid means nothing in another
+                        // database — and catalog-load.ts resolves that key
+                        // against the release's own foods and the foods already
+                        // loaded, refusing with `component_reference_unresolved`
+                        // when neither carries it. So a target this release does
+                        // not export is not a cosmetic gap: it is either a load
+                        // that fails partway through a reviewed artefact, or —
+                        // in a database that happens to hold a food under the
+                        // same key — a composition whose meaning depends on the
+                        // destination rather than on the release.
+                        //
+                        // Publication status is what decides membership, since
+                        // foods.jsonl carries published rows and nothing else,
+                        // and it is read from the SAME snapshot as the parents
+                        // (see ONE SNAPSHOT, TWO READS) so the two cannot
+                        // disagree. A non-published target is therefore not
+                        // filtered away quietly the way a null one used to be:
+                        // dropping it would leave an ingredient-derived food
+                        // whose exported composition is a subset of the one its
+                        // nutrient totals were computed from, which is a
+                        // misstatement of where those totals came from. It is
+                        // collected and the release is refused below.
+                        const componentLines: Record<string, unknown>[] = [];
+                        for (const component of row.catalog_food_components) {
+                            const target = component.component_catalog_foods;
+                            if (target === null) {
+                                // Unreachable through the schema — the component
+                                // FK is required and RESTRICT — and kept as a
+                                // refusal rather than a filter for exactly that
+                                // reason: if it ever happens, the composition
+                                // has lost a component and the release must say
+                                // so.
+                                componentTargetOutsideRelease.add(`${row.source_key} → (unlinked component)`);
+                                continue;
+                            }
+                            if (target.publication_status !== PUBLISHED_STATUS) {
+                                componentTargetOutsideRelease.add(
+                                    `${row.source_key} → ${target.source_key} (${target.publication_status})`,
+                                );
+                                continue;
+                            }
+                            referencedComponentKeys.add(target.source_key);
+                            componentLines.push({
                                 food_source_key: row.source_key,
                                 // The portable reference, never the local uuid:
                                 // a component id means nothing in another
@@ -1237,15 +1395,14 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                                 // `component_food_source_key` because that is
                                 // what catalog-load.ts reads, and the loader's
                                 // reader is the release's format contract.
-                                component_food_source_key: (
-                                    component.component_catalog_foods as { readonly source_key: string }
-                                ).source_key,
+                                component_food_source_key: target.source_key,
                                 quantity_grams: component.quantity_grams,
                                 yield_factor: component.yield_factor,
                                 component_nutrition_version: component.component_nutrition_version,
                                 sort_order: component.sort_order,
-                            }))
-                            .sort(byChildKey('component_food_source_key'));
+                            });
+                        }
+                        componentLines.sort(byChildKey('component_food_source_key'));
                         for (const line of componentLines) {
                             emit('components.jsonl', line);
                         }
@@ -1253,10 +1410,13 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                         componentFacts.push({
                             source_key: row.source_key,
                             nutrition_provenance: row.nutrition_provenance,
-                            // Only components that RESOLVE to a food count: a
-                            // row pointing at a food this release does not
-                            // carry is not something a nutrient total could
-                            // have been derived from.
+                            // Only components the release CARRIES count: a row
+                            // pointing at a food this release does not export is
+                            // not something a nutrient total could have been
+                            // derived from here, so it must not make a derived
+                            // food look composed. The refusal below fires first
+                            // in practice; this keeps the count honest either
+                            // way.
                             resolvable_component_count: componentLines.length,
                         });
 
@@ -1329,6 +1489,43 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         );
     }
 
+    // THE RELEASE IS A CLOSED GRAPH, OR IT IS NOT A RELEASE.
+    //
+    // Refused before the emptiness rule below, because this is the more
+    // specific cause: a derived food whose components all point outside the
+    // published set would otherwise be reported as "carries no component rows",
+    // which is true of the artefact and says nothing about why.
+    if (componentTargetOutsideRelease.total > 0) {
+        throw new ReleaseIntegrityError(
+            `${componentTargetOutsideRelease.total} composition row(s) name a food this release does not carry, so components.jsonl would reference keys absent from foods.jsonl and catalog:load would refuse the release with component_reference_unresolved: ${componentTargetOutsideRelease.describe()}. Publish those foods, or remove the composition, before cutting a release.`,
+            { file: 'components.jsonl', sourceKey: componentTargetOutsideRelease.first },
+        );
+    }
+
+    // AND EVERY REFERENCE ACTUALLY EMITTED RESOLVES.
+    //
+    // The filter above already admits published targets only, and the parents
+    // were selected on that same status inside one snapshot, so this set is a
+    // subset of the exported keys by construction — which is precisely why it
+    // is worth asserting: the claim the loader depends on is cheap to state
+    // here, and a future change to either the page query or the component
+    // filter that broke it would otherwise be invisible until a load failed.
+    // The exported keys are read back off `componentFacts`, which the walk has
+    // already retained one entry per food for, so no second index of the
+    // catalog is built to check it.
+    const exportedFoodKeys = new Set(componentFacts.map((fact) => fact.source_key));
+    const unresolvedComponentKeys = Array.from(referencedComponentKeys)
+        .filter((sourceKey) => !exportedFoodKeys.has(sourceKey))
+        .sort();
+    if (unresolvedComponentKeys.length > 0) {
+        throw new ReleaseIntegrityError(
+            `components.jsonl names ${unresolvedComponentKeys.length} food source key(s) that foods.jsonl does not carry, so the release is not a self-contained graph: ${unresolvedComponentKeys
+                .slice(0, NAMED_OFFENDERS)
+                .join(', ')}${unresolvedComponentKeys.length > NAMED_OFFENDERS ? ', …' : ''}.`,
+            { file: 'components.jsonl', sourceKey: unresolvedComponentKeys[0] },
+        );
+    }
+
     // WHAT MAKES AN EMPTY components.jsonl AN ASSERTED FACT RATHER THAN A BLANK.
     // A component row is the composition of an INGREDIENT-DERIVED food, so the
     // member is empty exactly when no published food derives its nutrition from
@@ -1369,6 +1566,46 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     logger.info('components_asserted', {
         components: rowCounts['components.jsonl'],
         published_ingredient_derived: componentCoverage.derivedCount,
+    });
+
+    // AN AI-GENERATED ROW THIS RELEASE CANNOT ATTRIBUTE IS NOT SHIPPED.
+    //
+    // The generation batch is the only record of which model and prompt produced
+    // a generated food, so a published `ai_generated` row without one leaves the
+    // manifest with nothing truthful to say about it. The previous behaviour
+    // filled that silence from the coverage plan — a model name read from
+    // configuration, for a call nobody can show happened — which is exactly the
+    // fabricated provenance the feature's nutrition-integrity requirement rules
+    // out. Refused instead, naming the rows, because the repair is to record the
+    // batch (or to unpublish the row), not to guess.
+    if (withoutGenerationBatch.total > 0) {
+        throw new ReleaseIntegrityError(
+            `${withoutGenerationBatch.total} published AI-generated food(s) carry no generation batch, so the release cannot attribute the model and prompt that produced them: ${withoutGenerationBatch.describe()}. Re-run catalog:generate for those rows, or unpublish them, before cutting a release.`,
+            { file: 'foods.jsonl', sourceKey: withoutGenerationBatch.first },
+        );
+    }
+
+    const modelVersions = modelVersionsFor({
+        aiGeneratedFoods,
+        reviewedFoods,
+        generationModels,
+        generationPromptVersions,
+        reviewModels,
+        reviewPromptVersions,
+    });
+    assertMeasuredModelVersions(modelVersions);
+    // The COMPLETE sets, logged as well as written, so a release produced across
+    // more than one model or prompt states that fact in the run's output too —
+    // the singular manifest fields are null in that case by design, and a
+    // reader of the log should not have to open the manifest to see why.
+    logger.info('release_model_provenance_measured', {
+        stage: STAGE,
+        aiGeneratedFoods,
+        reviewedFoods,
+        generationModels: sortedValues(generationModels).join(', '),
+        generationPromptVersions: sortedValues(generationPromptVersions).join(', '),
+        reviewModels: sortedValues(reviewModels).join(', '),
+        reviewPromptVersions: sortedValues(reviewPromptVersions).join(', '),
     });
 
     // Every member has been written and closed by now, including
@@ -1484,25 +1721,19 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
             }),
         // MEASURED, AND NULL WHEN THAT IS THE MEASUREMENT.
         //
-        // Every field is derived from whether this release actually carries an
-        // AI-generated published food. A release built entirely from sourced
-        // USDA records made no model call, so every field is null — and that
-        // null is a measurement of the rows, not a constant: naming a model a
+        // Derived above from the exported rows alone — the batches that produced
+        // the AI-generated foods and the `llm_review` records their validation
+        // records carry — and asserted to be strings before it is written. A
+        // release built entirely from sourced USDA records made no model call,
+        // so every singular field is null and every set empty, and that null is
+        // a measurement of the rows rather than a default: naming a model a
         // release did not use would misattribute every food in it, and naming
         // none for a release that did use one would hide the attribution the
-        // catalog policy requires.
-        //
-        // The model and generation prompt come from the batches that produced
-        // the rows, which is the only record of what really ran; the plan's
-        // declared names are the fallback for a batch that recorded none, and
-        // the review prompt version is the plan's because no per-row review
-        // record carries it.
-        model_versions: modelVersionsFor({
-            aiGeneratedFoods,
-            generationModels,
-            generationPromptVersions,
-            coveragePlan,
-        }),
+        // catalog policy requires. Several values make the singular field null
+        // and are stated in full in the set beside it; the coverage plan is not
+        // consulted at all, because it declares which environment variable
+        // selects a model and not that a call was ever made.
+        model_versions: modelVersions,
         coverage: {
             coverage_plan_version: coveragePlan.coveragePlanVersion,
             published_target_total: coveragePlan.publishedTargetTotal,
@@ -1537,37 +1768,24 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         shortfallTotal,
     });
 
-    // THE ONLY ROW THIS STAGE WRITES, AND IT IS NOT CATALOG DATA.
+    // THIS FUNCTION WRITES NO ROW AT ALL.
     //
     // The export is read-only over the catalog graph: not one
     // catalog_foods / catalog_food_aliases / catalog_food_portions /
     // catalog_food_components / catalog_validation_records row is inserted,
     // updated or deleted anywhere in this file, which is what makes cutting a
-    // release a safe thing to do twice. What is appended is one row in the
-    // pipeline run LEDGER, under the kind prisma/schema.prisma:340 documents
-    // for exactly this stage, so an operator reading that ledger can see when a
-    // release was cut and from what. It is written directly rather than through
-    // checkpoint.ts, whose kind union covers the four stages that RESUME; this
-    // one does not resume — it re-cuts.
-    await deps.db.catalog_import_runs.create({
-        data: {
-            kind: 'release',
-            manifest_version: deps.release,
-            started_at: generatedAt,
-            finished_at: deps.now(),
-            status: 'succeeded',
-            cursor: { release: deps.release },
-            counts: {
-                foods: foodCount,
-                aliases: rowCounts['aliases.jsonl'],
-                portions: rowCounts['portions.jsonl'],
-                components: rowCounts['components.jsonl'],
-                validation_records: rowCounts['validation-records.jsonl'],
-            },
-            log: [{ event: 'release_written', at: generatedAt.toISOString(), release: deps.release }],
-        },
-    });
-
+    // release a safe thing to do twice.
+    //
+    // The pipeline run LEDGER row — kind 'release', which
+    // prisma/schema.prisma:340 documents for exactly this stage — belongs to
+    // `runReleaseStage`, which opens it BEFORE the export and closes it
+    // 'succeeded' only after the staging directory has been moved into its
+    // reviewed path. It used to be written here, as 'succeeded', while the
+    // rename was still ahead: a failed rename then left a ledger claiming a
+    // release that was not at its path, and a failed export left no row at all.
+    // A row's status is a statement about a published artefact, so it is the
+    // orchestrator — the one function that knows whether publication happened —
+    // that makes it.
     return {
         release: deps.release,
         publishedFoods: foodCount,
@@ -1592,53 +1810,126 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
 const isUsableGramWeight = (gramWeight: number): boolean => Number.isFinite(gramWeight) && gramWeight > 0;
 
 /**
- * The single value a `model_versions` field can carry, from what the rows say.
+ * The model and prompt an advisory review recorded on a validation record, or
+ * `null` when no review is recorded there.
  *
- * One distinct value is the answer. Several is a release produced across more
- * than one model or prompt, and the manifest field holds one string — so the
- * greatest is recorded (deterministic, and for a versioned identifier the
- * latest) and the caller logs the full set, because discarding the fact
- * silently is the one option that is not acceptable.
+ * `catalog_validation_records.llm_review` is written by catalog-validate's
+ * `advisoryReviewRecord` (and by `failedAdvisoryReviewRecord` for a review that
+ * was attempted and did not answer), both of which carry `model` and
+ * `prompt_version`. A failed review counts as a review that RAN — the call was
+ * made and it is attributable — which is what this field documents; whether it
+ * lifted anything is the record's own business and never the release's.
+ *
+ * Read defensively rather than cast, because this column is JSON written by
+ * another stage and possibly by an older version of it: an object that carries
+ * neither string is still a review record (the row is not null), and it
+ * contributes to `reviewed_foods` without inventing a model name.
  */
-const singleOrGreatest = (values: ReadonlySet<string>): string | null =>
-    values.size === 0 ? null : Array.from(values).sort()[values.size - 1];
+const advisoryReviewProvenance = (
+    llmReview: unknown,
+): { readonly model: string | null; readonly promptVersion: string | null } | null => {
+    if (llmReview === null || llmReview === undefined || typeof llmReview !== 'object' || Array.isArray(llmReview)) {
+        return null;
+    }
+    const record = llmReview as { readonly model?: unknown; readonly prompt_version?: unknown };
+    return {
+        model: typeof record.model === 'string' && record.model.length > 0 ? record.model : null,
+        promptVersion:
+            typeof record.prompt_version === 'string' && record.prompt_version.length > 0
+                ? record.prompt_version
+                : null,
+    };
+};
+
+/** A measured set as the manifest states it: sorted by code point, so the bytes are reproducible. */
+const sortedValues = (values: ReadonlySet<string>): readonly string[] => Array.from(values).sort();
 
 /**
- * `model_versions`, measured from the published rows this release carries.
+ * The singular `model_versions` field for a measured set: the value when the
+ * release carries exactly ONE, and `null` otherwise.
  *
- * Gated on there being an AI-generated food at all: a release of sourced
- * records made no model call, and every field is null for it.
+ * `null` for several is the point, and it replaces taking the greatest. A
+ * release produced across two models has no single model, and naming the later
+ * of the two attributed every row in it to a model some of them did not come
+ * from — a misstatement a reader of the manifest could not detect. The complete
+ * set is written beside this field, so nothing is discarded by declining to
+ * collapse it.
+ */
+const onlyValue = (values: readonly string[]): string | null => (values.length === 1 ? values[0] : null);
+
+/**
+ * `model_versions`, measured from the published rows this release carries and
+ * from nothing else.
+ *
+ * Every field is derived from the rows: the generation model and prompt from
+ * the batches that produced the AI-generated foods, the review model and prompt
+ * from the `llm_review` records those foods' validation records carry. A release
+ * built entirely from sourced USDA records has empty sets, and therefore nulls
+ * and empty arrays — and that null is a MEASUREMENT of the rows rather than a
+ * default: naming a model a release did not use would misattribute every food
+ * in it, and the coverage plan cannot supply one, because it declares which
+ * environment variable selects a model and not that a call was ever made.
  */
 const modelVersionsFor = (input: {
     readonly aiGeneratedFoods: number;
+    readonly reviewedFoods: number;
     readonly generationModels: ReadonlySet<string>;
     readonly generationPromptVersions: ReadonlySet<string>;
-    readonly coveragePlan: CoveragePlan;
+    readonly reviewModels: ReadonlySet<string>;
+    readonly reviewPromptVersions: ReadonlySet<string>;
 }): CatalogReleaseModelVersions => {
-    if (input.aiGeneratedFoods === 0) {
-        return {
-            generation_model: null,
-            review_model: null,
-            prompt_version: null,
-            generation_prompt_version: null,
-            review_prompt_version: null,
-        };
-    }
-
-    const generationModel = singleOrGreatest(input.generationModels) ?? input.coveragePlan.generationModel ?? null;
-    const generationPromptVersion =
-        singleOrGreatest(input.generationPromptVersions) ?? input.coveragePlan.promptVersion;
+    const generationModels = sortedValues(input.generationModels);
+    const generationPromptVersions = sortedValues(input.generationPromptVersions);
+    const reviewModels = sortedValues(input.reviewModels);
+    const reviewPromptVersions = sortedValues(input.reviewPromptVersions);
+    const generationPromptVersion = onlyValue(generationPromptVersions);
 
     return {
-        generation_model: generationModel,
-        review_model: input.coveragePlan.reviewModel ?? null,
+        generation_model: onlyValue(generationModels),
+        review_model: onlyValue(reviewModels),
         prompt_version: generationPromptVersion,
         // `prompt_version` under the release format contract's spelling, which
         // names it for the generation prompt it records and pairs it with the
         // review prompt beside it.
         generation_prompt_version: generationPromptVersion,
-        review_prompt_version: input.coveragePlan.reviewPromptVersion,
+        review_prompt_version: onlyValue(reviewPromptVersions),
+        generation_models: generationModels,
+        review_models: reviewModels,
+        generation_prompt_versions: generationPromptVersions,
+        review_prompt_versions: reviewPromptVersions,
+        ai_generated_foods: input.aiGeneratedFoods,
+        reviewed_foods: input.reviewedFoods,
     };
+};
+
+/**
+ * Refuses a `model_versions` block that is not made of strings.
+ *
+ * The cheap structural check that the collapsed-and-fabricated version would
+ * have failed: the coverage plan's `generationModel` is a configuration OBJECT,
+ * it was assigned straight into a field typed `string | null`, and TypeScript
+ * accepted it because the plan's declared type said `string`. A manifest is
+ * evidence, so the last thing done before writing one is to assert that every
+ * provenance value is a string, a null, or an array of strings — the shape the
+ * release format contract states and the shape catalog-load.ts and any reviewer
+ * will read.
+ */
+const assertMeasuredModelVersions = (versions: CatalogReleaseModelVersions): void => {
+    for (const [field, value] of Object.entries(versions)) {
+        const ok =
+            value === null ||
+            typeof value === 'string' ||
+            typeof value === 'number' ||
+            (Array.isArray(value) && value.every((entry) => typeof entry === 'string'));
+        if (!ok) {
+            throw new ReleaseIntegrityError(
+                `model_versions.${field} is not a string, a null or a list of strings, so the release manifest would record provenance that no reader can interpret: ${JSON.stringify(
+                    value,
+                )}. model_versions is measured from the exported rows' generation batches and llm_review records; configuration is never written there.`,
+                { file: RELEASE_MANIFEST_FILE_NAME },
+            );
+        }
+    }
 };
 
 /**
@@ -1670,6 +1961,61 @@ const SETTLING_COMMANDS: Readonly<Record<string, string>> = {
 };
 
 /**
+ * What an operator can actually do about a restricted pass that moved the
+ * published set, stated as it is rather than as one would wish it.
+ *
+ * "Re-run catalog:validate" is NOT the remedy here, and saying so would be
+ * advice that cannot work: the canonical run key names the coverage plan and the
+ * last completed ingest, neither of which a validation pass changes, so the
+ * canonical row is already succeeded and re-running the stage is answered by
+ * the completed-run no-op (catalog-validate's `run_already_completed`, which
+ * writes nothing at all). The two things that DO create a new canonical run are
+ * the two that message itself names, and they are named here for the same
+ * reason: an operator reading a refusal needs the action that clears it.
+ *
+ * The narrower repair — having a restricted pass that changes dispositions
+ * invalidate the canonical judgement, so an ordinary re-validation becomes
+ * available — belongs to catalog-validate.ts and lib/checkpoint.ts, which own
+ * the run key. This stage's job is to refuse to certify a set its canonical
+ * evidence does not cover.
+ */
+const RESTRICTED_VALIDATION_REMEDY =
+    'Cut the release from a catalog whose canonical pass is the last word on it: a newer catalog:import or ' +
+    'catalog:load, or a new coveragePlanVersion, each creates a new canonical validation run, and re-running ' +
+    'catalog:validate against this same input and plan is the completed-run no-op. Until one of those has judged ' +
+    'the whole plan again, this database has no canonical judgement of the set it now holds.';
+
+/**
+ * How many food publication statuses a validation run's ledger says it CHANGED,
+ * or `null` when its counts do not say.
+ *
+ * Pure over the column so the rule that reads it is testable without a
+ * database. `judged` is tallied once per row the pass judged and `unchanged`
+ * once per judged row whose status did not move (catalog-validate.ts), and both
+ * reach the row through the periodic flush and the close, whatever the outcome —
+ * so the difference is the number of dispositions the pass moved. Absent
+ * `judged` yields `null` rather than `0`: "the counts do not state it" and "it
+ * changed nothing" are different facts, and the caller treats them differently.
+ */
+export const validationDispositionChanges = (counts: unknown): number | null => {
+    if (counts === null || typeof counts !== 'object' || Array.isArray(counts)) {
+        return null;
+    }
+    const readCount = (key: string): number | null => {
+        const value = (counts as Record<string, unknown>)[key];
+        return typeof value === 'number' && Number.isFinite(value) ? value : null;
+    };
+    const judged = readCount('judged');
+    if (judged === null) {
+        return null;
+    }
+    // A negative difference is not a fact about the catalog — it is a row whose
+    // two counters disagree — so it is reported as "changed nothing" rather
+    // than as a negative number the message would print.
+    return Math.max(0, judged - (readCount('unchanged') ?? 0));
+};
+
+/**
  * Every pipeline run that bears on whether this database may be released:
  * succeeded runs, for the prerequisite order, and runs still marked 'running',
  * because the graph they are writing is the graph this export would freeze.
@@ -1687,14 +2033,18 @@ export const loadPipelineRuns = async (db: ReleaseDb): Promise<ReleaseRunRow[]> 
         // Whether a failure blocks is decided in releaseStalenessReason, which it
         // cannot do for a row it never sees.
         where: { kind: { in: MUTATING_RUN_KINDS }, status: { in: ['succeeded', 'running', 'failed'] } },
-        select: { kind: true, manifest_version: true, status: true, finished_at: true },
+        // `counts` is selected because one rule needs a run's own statement of
+        // what it CHANGED rather than only when it ran: a restricted validation
+        // pass that republished rows after the canonical pass moved the
+        // published set, and the only durable record of that is this column.
+        select: { kind: true, manifest_version: true, status: true, finished_at: true, counts: true },
         orderBy: { finished_at: 'asc' },
     });
 
 /**
  * Why this database is not ready to be released, or `null` when it is.
  *
- * Pure over the run rows so every rule is testable without a database. Four
+ * Pure over the run rows so every rule is testable without a database. Five
  * refusals live here, in this order:
  *
  *   1. a mutating run still marked 'running' — the graph is moving;
@@ -1705,11 +2055,15 @@ export const loadPipelineRuns = async (db: ReleaseDb): Promise<ReleaseRunRow[]> 
  *   3. a later FAILED attempt of that same canonical run — validation closes
  *      itself failed when it could not judge every row it considered, and an
  *      older success must not hide it;
- *   4. an ingest that finished after that validation — the rows it touched are
+ *   4. a later RESTRICTED pass of this same catalog that changed publication
+ *      statuses, or whose ledger cannot show that it did not — either way the
+ *      canonical verdicts can no longer be shown to be the published set, so
+ *      the canonical success cannot vouch for what this release would ship;
+ *   5. an ingest that finished after that validation — the rows it touched are
  *      unpublished right now.
  *
  * A run whose `finished_at` is null never finished and says nothing about
- * ORDER, so rules 3 and 4 ignore it — which is exactly why the open-run rule
+ * ORDER, so rules 3, 4 and 5 ignore it — which is exactly why the open-run rule
  * has to be stated separately rather than folded into them.
  *
  * @param expectedKey the canonical validation run key for the coverage plan and
@@ -1867,6 +2221,106 @@ export const releaseStalenessReason = (
         );
     }
 
+    // WHAT THE CANONICAL PASS JUDGED MUST STILL BE WHAT THIS RELEASE SHIPS.
+    //
+    // The rule above establishes that a full pass of this catalog under this
+    // plan succeeded. It does not establish that its verdicts are still the
+    // published set, because validation itself can move that set afterwards: a
+    // restricted pass — `--category`, `--revalidate-quarantined`, `--review`,
+    // each of which claims `<canonicalKey>+scope:<hash>` — publishes,
+    // quarantines and rejects rows exactly as the full pass does, over a
+    // FRACTION of the plan. Run after the canonical pass, it leaves a database
+    // whose published set is partly the canonical pass's judgement and partly
+    // its own, while the ledger still shows the canonical success as the last
+    // word. catalog-validate states the consequence outright where it keeps
+    // `--review` out of the canonical key: a release is meant to "rest on a
+    // validation that consulted no model", and a `--review` pass that published
+    // a row defeats that silently.
+    //
+    // Only passes over THIS catalog under THIS plan are considered — keys of the
+    // form `<expectedKey>+scope:…`. A row naming another input or another plan
+    // is judged by the rule above, and that prefix is also what keeps
+    // housekeeping out of this rule entirely:
+    // `settleUnresumableValidationRuns` closes runs whose parsed input DIFFERS
+    // from the current one and leaves a run for the current input untouched
+    // whatever its state (catalog-validate.ts), so a settled row never carries
+    // this prefix and never reaches the loop below. No exemption is owed to it.
+    //
+    // WHAT COUNTS AS EVIDENCE, AND WHY ABSENT EVIDENCE IS A REFUSAL. A pass
+    // records what it did in `counts`: `judged` per row it judged and
+    // `unchanged` for each of those whose status did not move. `judged −
+    // unchanged` is therefore the number of dispositions it CHANGED, and it is
+    // the one question asked here:
+    //
+    //   * more than zero — the published set is not the canonically judged set,
+    //     and the release is refused;
+    //   * zero — the pass judged rows and moved none, so the canonical verdicts
+    //     still describe the set; allowed, and logged;
+    //   * unreadable — refused, whatever the row's status.
+    //
+    // That last branch is a refusal and not a warning because of the order
+    // catalog-validate.ts writes in: each judged food's new publication status
+    // is COMMITTED in its own transaction and only then tallied in memory
+    // (catalog-validate.ts, EVERY TALLY HAPPENS HERE), with the tallies reaching
+    // the ledger on a periodic flush. A pass that stopped between a commit and
+    // the next flush has therefore left status changes in the database that its
+    // `counts` do not mention at all — so a row that states nothing cannot be
+    // read as "it changed nothing", in either direction, and `failed` is not an
+    // excuse: it is the status such a pass would most likely carry. A release is
+    // an artefact other environments load, so the unreadable case resolves
+    // against publishing rather than for it, and the remedy is the same one a
+    // changed set gets.
+    const restrictedPrefix = `${expectedKey}${VALIDATION_SCOPE_SEPARATOR}`;
+    const laterRestricted = runs
+        .filter(
+            (run) =>
+                run.kind === 'validation' &&
+                run.manifest_version.startsWith(restrictedPrefix) &&
+                run.finished_at !== null &&
+                (run.finished_at as Date).getTime() > (canonicalSuccess.finished_at as Date).getTime(),
+        )
+        // Deterministic: the same ledger always names the same run.
+        .sort((left, right) => {
+            const byTime = (left.finished_at as Date).getTime() - (right.finished_at as Date).getTime();
+            return byTime !== 0 ? byTime : left.manifest_version < right.manifest_version ? -1 : 1;
+        });
+
+    for (const run of laterRestricted) {
+        const changes = validationDispositionChanges(run.counts);
+        if (changes === null) {
+            return (
+                `a restricted catalog:validate run (${run.manifest_version}) ` +
+                `${run.status === 'succeeded' ? 'finished' : run.status.toUpperCase()} at ` +
+                `${(run.finished_at as Date).toISOString()}, after the canonical pass at ` +
+                `${(canonicalSuccess.finished_at as Date).toISOString()}, and its ledger records no judged/unchanged ` +
+                'counts — so it cannot be shown to have left the canonically judged set intact. A pass commits each ' +
+                "food's new publication status before it tallies it, so one that stopped before its counts reached the " +
+                'ledger may have changed statuses this ledger says nothing about; its outcome does not excuse it from ' +
+                'this rule. ' +
+                RESTRICTED_VALIDATION_REMEDY
+            );
+        }
+        if (changes > 0) {
+            return (
+                `a restricted catalog:validate run (${run.manifest_version}) finished at ` +
+                `${(run.finished_at as Date).toISOString()}, after the canonical pass at ` +
+                `${(canonicalSuccess.finished_at as Date).toISOString()}, and changed ${changes} food publication ` +
+                `status(es)${laterRestricted.length > 1 ? ` (${laterRestricted.length} restricted runs ran since)` : ''}. ` +
+                'That pass judged only part of the plan, so the published set this release would ship is no longer the ' +
+                'set the canonical pass judged, and the canonical success cannot vouch for it. ' +
+                RESTRICTED_VALIDATION_REMEDY
+            );
+        }
+        // The one allowance this rule makes, and it is evidenced: the pass
+        // stated how many rows it judged and that none of their statuses moved.
+        logger.info('restricted_validation_changed_nothing', {
+            stage: STAGE,
+            runScope: run.manifest_version,
+            status: run.status,
+            finishedAt: (run.finished_at as Date).toISOString(),
+        });
+    }
+
     const validation = canonicalSuccess;
 
     // The ordering rule, kept as a SECOND line of defence rather than the first.
@@ -1979,6 +2433,30 @@ export class ReleaseIntegrityError extends CatalogReleaseError {
     }
 }
 
+/**
+ * The finished export was not allowed to take its reviewed path — the
+ * destination already holds a release and `--force` was not given, or another
+ * publication holds the lock on that path.
+ *
+ * Its own class, and its own code per refusal, because these two are the only
+ * failures of this stage that are about the DESTINATION rather than about the
+ * catalog: nothing is wrong with the bytes that were exported, and an operator
+ * reading `release_directory_exists` has a different next action from one
+ * reading `release_integrity_failed`. The code is a constructor argument rather
+ * than a per-class constant so the two refusals stay one concept with one
+ * recovery path (the staging directory is discarded either way) while still
+ * reporting distinguishably.
+ */
+export class ReleasePublicationError extends CatalogReleaseError {
+    public readonly code: string;
+
+    public constructor(code: string, message: string, context: CatalogReleaseErrorContext = {}) {
+        super(message, context);
+        this.name = 'ReleasePublicationError';
+        this.code = code;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Publication — a release directory never exists half-written.
 //
@@ -2005,49 +2483,390 @@ export const stagingDirFor = (finalDirectory: string, pid: number = process.pid)
     path.join(path.dirname(finalDirectory), `.${path.basename(finalDirectory)}.staging-${pid}`);
 
 /**
+ * The lock a publication holds over ONE final release path.
+ *
+ * A sibling of the directory it protects, so it is on the same filesystem and
+ * one operator can see both; dot-prefixed so it is never mistaken for a release
+ * id.
+ */
+export const publicationLockFor = (finalDirectory: string): string =>
+    path.join(path.dirname(finalDirectory), `.${path.basename(finalDirectory)}.publish.lock`);
+
+export interface PublishReleaseInput {
+    readonly stagingDirectory: string;
+    readonly finalDirectory: string;
+    /** The operator's `--force`. Publication enforces it; preflight only warns early. */
+    readonly force: boolean;
+    readonly pid: number;
+    readonly now: () => Date;
+    readonly fileSystem: ReleaseFileSystem;
+    readonly logger: ScriptLogger;
+}
+
+/**
  * Moves the finished staging directory into its reviewed path.
+ *
+ * WHY THE OVERWRITE RULE IS DECIDED HERE AND NOT ONLY IN PREFLIGHT. Preflight
+ * runs before the export — minutes before, on a full catalog — so what it
+ * observed is not what publication faces: two runs can both pass it while
+ * neither directory exists, and the second to finish would then replace a
+ * reviewed, checksummed release the first had just published, with no `--force`
+ * anywhere on its command line. That is what this function used to do: it
+ * re-derived "am I replacing something" from disk and took the move-aside path
+ * unconditionally, because `force` was never passed to it at all. Preflight
+ * remains, because failing in a second beats failing after a ten-minute export,
+ * but the authoritative check is the one taken here, under the lock, on the
+ * state that is actually about to be overwritten.
+ *
+ * SERIALISED BY FINAL PATH. The stage lock this run holds is SHARED — two
+ * exports of one database are harmless and are meant to be able to run at once
+ * — so it cannot order two publications. An atomic create-exclusive lock file
+ * beside the destination can, and it is the same idiom lib/rateLimiter.ts uses
+ * for its cross-process ledger. It is refused rather than waited on: a
+ * publication is milliseconds of renames, so a lock that is held means either a
+ * concurrent run (whose release should not be replaced from under it) or a
+ * crashed one (whose lock an operator should look at), and both are better
+ * stated than queued behind.
  *
  * With nothing at the destination this is one `rename`, and a release therefore
  * appears complete or not at all.
  *
- * Replacing an existing release (only reachable with `--force`, since preflight
- * refuses otherwise) takes three steps, because `rename` onto a non-empty
- * directory fails with `ENOTEMPTY`. The OLD release is moved aside FIRST and
- * deleted LAST, which is the ordering that cannot lose it: a run interrupted
- * between the steps leaves the old release under its `.superseded-` name, where
- * an operator can see it and move it back, whereas deleting first would destroy
- * a reviewed artefact to make room for one that might never arrive.
+ * Replacing an existing release (only with `--force`) takes three steps,
+ * because `rename` onto a non-empty directory fails with `ENOTEMPTY`. The OLD
+ * release is moved aside FIRST and deleted LAST, which is the ordering that
+ * cannot lose it: a run interrupted between the steps leaves the old release
+ * under its `.superseded-` name, where an operator can see it and move it back,
+ * whereas deleting first would destroy a reviewed artefact to make room for one
+ * that might never arrive.
  */
-export const publishRelease = (input: {
-    readonly stagingDirectory: string;
+export const publishRelease = (input: PublishReleaseInput): void => {
+    const { stagingDirectory, finalDirectory, force, pid, fileSystem, logger } = input;
+
+    // The lock is a sibling of the destination, so its parent has to exist
+    // before it can be taken. With --out that parent may be a directory only
+    // this run has any reason to create.
+    fileSystem.ensureDir(path.dirname(finalDirectory));
+
+    const lockPath = publicationLockFor(finalDirectory);
+    const owner = `${JSON.stringify({ pid, at: input.now().toISOString(), staging: stagingDirectory })}\n`;
+    if (!fileSystem.createFileExclusive(lockPath, owner)) {
+        throw new ReleasePublicationError(
+            'release_publication_locked',
+            `another release publication holds ${lockPath}, so this run will not touch ${finalDirectory}. Wait for that run to finish; if no release is running, that lock file is left over from one that was killed — read it to see which process held it, then delete it.`,
+        );
+    }
+
+    try {
+        // RECHECKED HERE, inside the lock and immediately before the rename, so
+        // the decision is made on the state being overwritten rather than on
+        // the state preflight saw.
+        const replacing = fileSystem.directoryExists(finalDirectory);
+
+        if (replacing && !force) {
+            throw new ReleasePublicationError(
+                'release_directory_exists',
+                `${finalDirectory} already holds a release, and a release directory is a reviewed, checksummed artefact other environments load. It appeared after this run's preflight — another run published it, or it was restored — so this run will not replace it. Choose the next release id, or re-run with --force to overwrite ${finalDirectory}.`,
+            );
+        }
+
+        if (!replacing) {
+            fileSystem.rename(stagingDirectory, finalDirectory);
+            logger.info('release_published', { stage: STAGE, directory: finalDirectory, replaced: false });
+            return;
+        }
+
+        const supersededDirectory = path.join(
+            path.dirname(finalDirectory),
+            `.${path.basename(finalDirectory)}.superseded-${pid}`,
+        );
+        fileSystem.removeDir(supersededDirectory);
+        fileSystem.rename(finalDirectory, supersededDirectory);
+        try {
+            fileSystem.rename(stagingDirectory, finalDirectory);
+        } catch (error) {
+            // The new release could not take the path, so the old one is put back
+            // rather than left aside under a name nothing loads.
+            fileSystem.rename(supersededDirectory, finalDirectory);
+            throw error;
+        }
+        fileSystem.removeDir(supersededDirectory);
+        logger.info('release_published', { stage: STAGE, directory: finalDirectory, replaced: true });
+    } finally {
+        // Released whatever happened, and only by the run that took it: the
+        // acquisition above returned false for anybody else, so reaching here
+        // means this process owns the file.
+        fileSystem.removeFile(lockPath);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// The stage, end to end.
+//
+// One exported function owns the whole of it — discard a stale staging
+// directory, open the ledger row, export, publish, close the ledger row — and
+// takes every effect it has through its deps (Rule backend-architecture §4).
+// Before, `main()` owned the half of the stage that decides whether a reviewed
+// release is replaced and what the ledger ends up saying about it, reaching for
+// `fs` and `process.pid` directly, so that half was unreachable from any test:
+// `main()` is guarded behind `require.main === module`, which is exactly why
+// the run* seam exists for the other four stages.
+// ---------------------------------------------------------------------------
+
+export interface RunReleaseStageDeps {
+    readonly db: ReleaseDb;
+    readonly coveragePlan: CoveragePlan;
+    readonly release: string;
+    /** The operator's `--force`, enforced at publication. */
+    readonly force: boolean;
+    /** The reviewed path this release is published to. */
     readonly finalDirectory: string;
     readonly logger: ScriptLogger;
-}): void => {
-    const { stagingDirectory, finalDirectory, logger } = input;
-    const replacing = directoryExistsOnDisk(finalDirectory);
+    readonly now: () => Date;
+    /** Names the staging directory and the superseded one; injected, never read from `process`. */
+    readonly pid: number;
+    readonly fileSystem: ReleaseFileSystem;
+    readonly pageSize?: number;
+    /**
+     * The export step. Optional, defaulting to `runRelease`: the orchestration
+     * is what this function owns, and a caller proving the ledger and
+     * publication behaviour should not have to build a catalog to do it.
+     */
+    readonly runExport?: (deps: RunReleaseDeps) => Promise<ReleaseOutcome>;
+    /** The publication step, seamed for the same reason. */
+    readonly publish?: (input: PublishReleaseInput) => void;
+}
 
-    if (!replacing) {
-        fs.renameSync(stagingDirectory, finalDirectory);
-        logger.info('release_published', { stage: STAGE, directory: finalDirectory, replaced: false });
-        return;
-    }
+/** What the ledger row records while the export is still running. */
+const RELEASE_LEDGER_KIND = 'release';
 
-    const supersededDirectory = path.join(
-        path.dirname(finalDirectory),
-        `.${path.basename(finalDirectory)}.superseded-${process.pid}`,
-    );
-    fs.rmSync(supersededDirectory, { recursive: true, force: true });
-    fs.renameSync(finalDirectory, supersededDirectory);
+/**
+ * Cuts a release: the export, its publication, and the ledger row that says
+ * whether both happened.
+ *
+ * THE LEDGER ROW IS OPENED FIRST AND CLOSED LAST, which is the ordering the
+ * row's meaning requires. 'running' from before the export means a killed run
+ * leaves a row that says what it was: an attempt that did not finish. The
+ * outcome is written once publication has either succeeded or failed — so
+ * 'succeeded' in this ledger is a statement that the six members are at the
+ * reviewed path, and never, as it was, a statement made while the rename was
+ * still ahead of it. A failure records 'failed' with its code and discards the
+ * staging directory, so a refused run leaves no release and no silence.
+ *
+ * The kind is written directly rather than through checkpoint.ts, whose kind
+ * union covers the four stages that RESUME; this one does not resume — it
+ * re-cuts. No rule reads a 'release' row (MUTATING_RUN_KINDS and
+ * GRAPH_MUTATING_RUN_KINDS both exclude it), so an open or failed row here
+ * blocks nothing and is purely the audit trail an operator reads.
+ */
+export const runReleaseStage = async (deps: RunReleaseStageDeps): Promise<ReleaseOutcome> => {
+    const { logger, fileSystem } = deps;
+    const stagingDirectory = stagingDirFor(deps.finalDirectory, deps.pid);
+
+    // A staging directory left by a run that was killed before it could clean
+    // up. Its contents describe nothing — the manifest that would make them a
+    // release was never written — so it is discarded rather than resumed.
+    fileSystem.removeDir(stagingDirectory);
+
+    const startedAt = deps.now();
+    const ledgerRunId = await openReleaseLedgerRow(deps, startedAt, stagingDirectory);
+
+    const runExport = deps.runExport ?? runRelease;
+    const publish = deps.publish ?? publishRelease;
+
+    let outcome: ReleaseOutcome;
     try {
-        fs.renameSync(stagingDirectory, finalDirectory);
+        outcome = await runExport({
+            db: deps.db,
+            coveragePlan: deps.coveragePlan,
+            release: deps.release,
+            logger,
+            now: deps.now,
+            // The STAGING directory, not the final one: nothing writes to the
+            // reviewed path until every member and the manifest exist.
+            releaseDir: () => stagingDirectory,
+            writeFile: fileSystem.writeFile,
+            readFileBytes: fileSystem.readFileBytes,
+            ensureDir: fileSystem.ensureDir,
+            openWriter: fileSystem.openWriter,
+            pageSize: deps.pageSize,
+        });
+
+        publish({
+            stagingDirectory,
+            finalDirectory: deps.finalDirectory,
+            force: deps.force,
+            pid: deps.pid,
+            now: deps.now,
+            fileSystem,
+            logger,
+        });
     } catch (error) {
-        // The new release could not take the path, so the old one is put back
-        // rather than left aside under a name nothing loads.
-        fs.renameSync(supersededDirectory, finalDirectory);
+        // A REFUSAL LEAVES NO RELEASE, NOT A PARTIAL ONE. Whatever members the
+        // walk had written go with the staging directory, so the failure cannot
+        // be mistaken for a release later — and the previously reviewed release,
+        // if there is one, is still exactly where it was.
+        fileSystem.removeDir(stagingDirectory);
+        await closeReleaseLedgerRow(deps, ledgerRunId, {
+            status: 'failed',
+            startedAt,
+            event: 'release_discarded',
+            detail: describeFailure(error),
+        });
+        logger.error('release_discarded', {
+            stage: STAGE,
+            release: deps.release,
+            staging: stagingDirectory,
+            error: safeError(error),
+        });
         throw error;
     }
-    fs.rmSync(supersededDirectory, { recursive: true, force: true });
-    logger.info('release_published', { stage: STAGE, directory: finalDirectory, replaced: true });
+
+    await closeReleaseLedgerRow(deps, ledgerRunId, {
+        status: 'succeeded',
+        startedAt,
+        event: 'release_published',
+        counts: outcome.counts,
+    });
+
+    return outcome;
+};
+
+/**
+ * Opens the release's ledger row as 'running'.
+ *
+ * Written before the export rather than after it, so the row exists for the
+ * whole time the stage is doing work and a killed run is visible as one.
+ */
+const openReleaseLedgerRow = async (
+    deps: RunReleaseStageDeps,
+    startedAt: Date,
+    stagingDirectory: string,
+): Promise<string> => {
+    const row = await deps.db.catalog_import_runs.create({
+        data: {
+            kind: RELEASE_LEDGER_KIND,
+            manifest_version: deps.release,
+            started_at: startedAt,
+            finished_at: null,
+            status: 'running',
+            cursor: { release: deps.release, staging: stagingDirectory, final: deps.finalDirectory },
+            counts: {},
+            log: [{ event: 'release_started', at: startedAt.toISOString(), release: deps.release }],
+        },
+    });
+    return row.id;
+};
+
+/**
+ * Records the outcome on the release's ledger row.
+ *
+ * A failure to write it does not mask the failure that got here: the caller's
+ * error is rethrown either way and the run exits non-zero, so the worst case is
+ * an unsettled row an operator can see, rather than a swallowed refusal. On the
+ * success path the inability to record the outcome IS the failure — the release
+ * is at its path and the ledger does not say so — and it is raised as one.
+ */
+const closeReleaseLedgerRow = async (
+    deps: RunReleaseStageDeps,
+    runId: string,
+    outcome: {
+        readonly status: 'succeeded' | 'failed';
+        readonly startedAt: Date;
+        readonly event: string;
+        readonly counts?: Readonly<Record<string, number>>;
+        readonly detail?: { readonly code: string; readonly error: { name: string; message: string } };
+    },
+): Promise<void> => {
+    const finishedAt = deps.now();
+    const entry: Record<string, unknown> = {
+        event: outcome.event,
+        at: finishedAt.toISOString(),
+        release: deps.release,
+        directory: deps.finalDirectory,
+    };
+    if (outcome.detail !== undefined) {
+        entry.code = outcome.detail.code;
+        entry.error = outcome.detail.error;
+    }
+
+    try {
+        await deps.db.catalog_import_runs.update({
+            where: { id: runId },
+            data: {
+                status: outcome.status,
+                finished_at: finishedAt,
+                counts: outcome.counts ?? {},
+                log: [
+                    { event: 'release_started', at: outcome.startedAt.toISOString(), release: deps.release },
+                    entry,
+                ],
+            },
+        });
+    } catch (error) {
+        deps.logger.error('release_ledger_unrecorded', {
+            stage: STAGE,
+            runId,
+            release: deps.release,
+            intendedStatus: outcome.status,
+            error: safeError(error),
+        });
+        if (outcome.status === 'succeeded') {
+            throw new CatalogReleaseError(
+                `the release was published to ${deps.finalDirectory} but its ledger row ${runId} could not be closed, so the run ledger still shows it as running. Re-run catalog:release --force once the database is reachable, or settle the row by hand.`,
+                { file: RELEASE_MANIFEST_FILE_NAME },
+            );
+        }
+    }
+};
+
+/**
+ * The stage's filesystem, on this machine.
+ *
+ * The one place `fs` is reached for outside the export's own writers, and it
+ * holds no policy: each member is the smallest faithful wrapper, so what a test
+ * substitutes is a filesystem and not a different set of rules.
+ *
+ * `createFileExclusive` is `openSync(path, 'wx')` because that is the atomic
+ * primitive — the same one lib/rateLimiter.ts takes its cross-process ledger
+ * lock with — and an `existsSync` check followed by a write is not: two runs
+ * can both see nothing and both write.
+ */
+export const nodeReleaseFileSystem: ReleaseFileSystem = {
+    writeFile: (absolutePath, contents) => {
+        fs.writeFileSync(absolutePath, contents, 'utf-8');
+    },
+    readFileBytes: (absolutePath) => fs.readFileSync(absolutePath),
+    ensureDir: (absolutePath) => {
+        fs.mkdirSync(absolutePath, { recursive: true });
+    },
+    removeDir: (absolutePath) => {
+        fs.rmSync(absolutePath, { recursive: true, force: true });
+    },
+    directoryExists: directoryExistsOnDisk,
+    rename: (from, to) => {
+        fs.renameSync(from, to);
+    },
+    createFileExclusive: (absolutePath, contents) => {
+        let descriptor: number;
+        try {
+            descriptor = fs.openSync(absolutePath, 'wx');
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+                return false;
+            }
+            throw error;
+        }
+        try {
+            fs.writeFileSync(descriptor, contents, 'utf-8');
+        } finally {
+            fs.closeSync(descriptor);
+        }
+        return true;
+    },
+    removeFile: (absolutePath) => {
+        fs.rmSync(absolutePath, { force: true });
+    },
+    openWriter: descriptorWriter,
 };
 
 // ---------------------------------------------------------------------------
@@ -2139,59 +2958,35 @@ const main = async (): Promise<number> => {
 
     const release = assertReleaseVersion(parsed.options.release);
     const finalDirectory = releaseDirFor(release);
-    const stagingDirectory = stagingDirFor(finalDirectory);
 
-    // A staging directory left by a run that was killed before it could clean
-    // up. Its contents describe nothing — the manifest that would make them a
-    // release was never written — so it is discarded rather than resumed.
-    fs.rmSync(stagingDirectory, { recursive: true, force: true });
-
-    let outcome: ReleaseOutcome;
-    try {
-        // THE STAGE CLAIM, TAKEN SHARED. This stage only READS the catalog graph,
-        // so two exports of one database are harmless and both may hold the lock;
-        // what must not happen is an export running while an import, a generation
-        // pass, a validation pass or a load is writing, and a shared lock is
-        // refused exactly then (lib/checkpoint.ts's THE STAGE LOCK). It is the
-        // outer half of the guarantee the Repeatable Read snapshot makes inside
-        // runRelease: the lock keeps a mutator out for the whole export, the
-        // snapshot makes every read describe one state even so.
-        outcome = await withCatalogStageLock({ stage: 'release', logger }, () =>
-            runRelease({
-                db: prisma as unknown as ReleaseDb,
-                coveragePlan: loadCoveragePlan(),
-                release,
-                logger,
-                now: () => new Date(),
-                // The STAGING directory, not the final one: nothing writes to
-                // the reviewed path until every member and the manifest exist.
-                releaseDir: () => stagingDirectory,
-                writeFile: (absolutePath, contents) => {
-                    fs.writeFileSync(absolutePath, contents, 'utf-8');
-                },
-                readFileBytes: (absolutePath) => fs.readFileSync(absolutePath),
-                ensureDir: (absolutePath) => {
-                    fs.mkdirSync(absolutePath, { recursive: true });
-                },
-                openWriter: descriptorWriter,
-            }),
-        );
-    } catch (error) {
-        // A REFUSAL LEAVES NO RELEASE, NOT A PARTIAL ONE. Whatever members the
-        // walk had written go with the staging directory, so the failure cannot
-        // be mistaken for a release later — and the previously reviewed release,
-        // if there is one, is still exactly where it was.
-        fs.rmSync(stagingDirectory, { recursive: true, force: true });
-        logger.error('release_discarded', {
-            stage: STAGE,
+    // THE STAGE CLAIM, TAKEN SHARED. This stage only READS the catalog graph,
+    // so two exports of one database are harmless and both may hold the lock;
+    // what must not happen is an export running while an import, a generation
+    // pass, a validation pass or a load is writing, and a shared lock is
+    // refused exactly then (lib/checkpoint.ts's THE STAGE LOCK). It is the
+    // outer half of the guarantee the Repeatable Read snapshot makes inside
+    // runRelease: the lock keeps a mutator out for the whole export, the
+    // snapshot makes every read describe one state even so. What it cannot do
+    // is order two publications of one release id — being shared is the point —
+    // which is why `publishRelease` takes its own exclusive claim on the final
+    // path.
+    //
+    // Everything the stage then does belongs to `runReleaseStage`: this function
+    // supplies the real database, clock, pid and filesystem and reads the
+    // outcome.
+    const outcome = await withCatalogStageLock({ stage: 'release', logger }, () =>
+        runReleaseStage({
+            db: prisma as unknown as ReleaseDb,
+            coveragePlan: loadCoveragePlan(),
             release,
-            staging: stagingDirectory,
-            error: safeError(error),
-        });
-        throw error;
-    }
-
-    publishRelease({ stagingDirectory, finalDirectory, logger });
+            force: parsed.options.force,
+            finalDirectory,
+            logger,
+            now: () => new Date(),
+            pid: process.pid,
+            fileSystem: nodeReleaseFileSystem,
+        }),
+    );
 
     logger.info('stage_completed', {
         stage: STAGE,

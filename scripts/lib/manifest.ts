@@ -26,10 +26,24 @@
 // §1.6/§9 puts that decision here, at the single boundary where the
 // configuration is read, behind accessors that throw rather than coerce (§8).
 //
-// Scope (§1.1, §7.1): this module resolves paths, reads and writes JSON,
-// compares versions, and verifies that the one policy document whose missing
-// fields would silently remove a security limit — the evidence allowlist —
-// carries the fields its declared shape promises. Checksum verification belongs
+// THIRD, and for the same reason the first two exist at this boundary rather
+// than in nine call sites: an artefact this module writes is PUBLISHED
+// atomically, and a document written by several stages is merged without losing
+// another stage's measurements. The files under `data/meal-planning/` are the
+// pipeline's evidence — a reviewer reads them and `catalog-load.ts` checksums a
+// release against its bytes — so a truncated file at a canonical path, a
+// half-published report pair, or a stage's block silently replaced by the next
+// stage's write are all failures of the same kind: evidence that looks
+// authoritative and is wrong. See ARTEFACT PUBLICATION and CROSS-STAGE REPORT
+// MERGING below for the mechanisms and why each is here.
+//
+// Scope (§1.1, §7.1): this module resolves paths, reads and writes JSON
+// (including staging, locking and promoting the artefacts the stages publish),
+// compares versions, and verifies that the two policy documents whose missing
+// fields would fail silently rather than loudly — the evidence allowlist, where
+// an absent field removes a security limit, and the USDA manifest, where an
+// absent or mistyped field imports the wrong food under a name that looks right
+// — carry the fields their declared shapes promise. Checksum verification belongs
 // to `catalog-load.ts`, JSONL streaming to the release and load scripts,
 // shortfall arithmetic to `catalog-report.ts`, the evidence policy's meaning to
 // `src/services/evidence.logic.ts`, and model-call budgeting to `budget.ts`. It imports two
@@ -39,7 +53,9 @@
 // parts are unit-testable from `src/__tests__/scripts/` (§11: Jest's `roots` is
 // `<rootDir>/src`, so no test file can live in this folder).
 
+import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { createLogger } from './logger';
@@ -73,7 +89,20 @@ export type ManifestErrorCode =
     | 'version_mismatch'
     | 'invalid_path_segment'
     | 'path_outside_data_root'
-    | 'invalid_manifest_shape';
+    | 'invalid_manifest_shape'
+    // The four publication codes (see ARTEFACT PUBLICATION). An operator acts
+    // on each differently: `artifact_publication_locked` means another stage is
+    // publishing into the same directory and this run should be repeated once it
+    // finishes; `incomplete_staged_artifact` means a staged document was
+    // truncated and the previous artefact was therefore kept;
+    // `artifact_publication_failed` means a rename failed, and the message names
+    // which artefacts were promoted and which kept their previous content; and
+    // `invalid_merged_report` means a stage's report could not be represented as
+    // JSON, so nothing was written at all.
+    | 'artifact_publication_locked'
+    | 'incomplete_staged_artifact'
+    | 'artifact_publication_failed'
+    | 'invalid_merged_report';
 
 export class ManifestError extends Error {
     constructor(
@@ -436,11 +465,1052 @@ export const readJsonFile = <T>(absolutePath: string): T => {
 // four-space rule governs TypeScript source, which this constant is not about.
 const JSON_INDENT = 2;
 
-export const writeJsonFile = (absolutePath: string, value: unknown): void => {
+// ---------------------------------------------------------------------------
+// ARTEFACT PUBLICATION — why every writer in this pipeline goes through here.
+//
+// The files under `data/meal-planning/reports/latest/` and
+// `data/meal-planning/catalog/releases/` are the pipeline's EVIDENCE: a
+// reviewer reads them to decide whether the catalog meets the requirement, and
+// `catalog-load.ts` checksums a release against its own bytes. Writing one of
+// them in place — `fs.writeFileSync(finalPath, …)` — makes two failures
+// possible that no amount of care at the call site removes:
+//
+//   TRUNCATION. `writeFileSync` truncates the file before it writes, so an
+//   interruption (a killed run, a full disk, an I/O error mid-write) leaves a
+//   half-written document at the canonical path. The previous, complete
+//   artefact is already gone, and what is left parses as nothing.
+//
+//   A HALF-PUBLISHED SET. `catalog-report.ts` writes TWO files whose quarantine
+//   figures are reconciled against each other. Writing them one after the other
+//   in place means a failure between the two leaves a mismatched pair — the one
+//   outcome that file's header calls worse than no evidence at all, because it
+//   is wrong and it looks authoritative.
+//
+// So publication here is: write a sibling temporary file in the SAME directory
+// (a rename is only atomic within a filesystem), flush it to disk, check the
+// document is complete, then `rename` it over the target — an atomic
+// replacement on POSIX, so a reader sees either the previous artefact or the
+// new one and never a partial document. A set of files is staged in full,
+// checked, and then promoted back to back with nothing in between.
+//
+// The LOCK is the other half. Three stages (`catalog:import`,
+// `catalog:generate`, `catalog:report`) merge into `import-report.json`, and a
+// merge is a read-modify-write: two of them interleaved lose one stage's
+// measurements even though each individual write is atomic. The advisory stage
+// lock in `lib/checkpoint.ts` serialises the CATALOG GRAPH's mutators and
+// cannot serve here — a dry run and the report stage take no graph lock by
+// design, and both publish artefacts — so mutual exclusion over the artefact
+// directory is its own, file-based lock.
+//
+// The lock file lives in the OS temporary directory, keyed by a hash of the
+// directory it guards, NOT beside the artefacts: `reports/latest/` is committed
+// to the repository, and a lock left behind by a killed run would show up as an
+// untracked file in every `git status` after it. A stale lock is taken over
+// rather than waited on (see ARTIFACT_LOCK_STALE_MS), because these are
+// operator-run CLI stages: telling the operator which holder is publishing, or
+// that a dead one was cleared, is more useful than blocking.
+// ---------------------------------------------------------------------------
+
+/** The suffix every staged artefact carries while it is incomplete. */
+const STAGING_SUFFIX = '.tmp';
+
+/**
+ * Removes a staging or lock file, treating "already gone" as success.
+ *
+ * A failure is warned about rather than thrown: every caller is either on the
+ * failure path of a write that has already failed — where replacing the cause
+ * with a cleanup error hides what the operator needs — or releasing a lock in a
+ * `finally`, where throwing would mask the outcome of the publication itself.
+ */
+const removeIfPresent = (absolutePath: string): void => {
+    try {
+        fs.unlinkSync(absolutePath);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== undefined && MISSING_FILE_CODES.has(code)) {
+            return;
+        }
+        logger.warn('staged_artifact_not_removed', {
+            file: describePath(absolutePath),
+            error: (error as Error).message,
+            remedy: 'Delete the leftover file by hand; no stage ever reads it.',
+        });
+    }
+};
+
+/**
+ * A staged artefact: the complete document at `stagingPath`, and the canonical
+ * path it becomes when the set it belongs to is promoted.
+ */
+export interface StagedArtifact {
+    readonly finalPath: string;
+    readonly stagingPath: string;
+}
+
+/**
+ * The staging path for `absolutePath` — a hidden sibling in the same directory,
+ * so the `rename` that promotes it stays within one filesystem.
+ *
+ * The process id and a counter are in the name because two publishers can be
+ * staging the same artefact at the same moment (a killed run's leftover, an
+ * operator running two stages); each writes its own file and only the promotion
+ * touches the canonical path. Argument-driven and exported so the naming is
+ * pinned by `src/__tests__/scripts/` (Rule backend-architecture §11).
+ */
+let stagingCounter = 0;
+export const stagingPathFor = (absolutePath: string): string => {
+    stagingCounter += 1;
+    const directory = path.dirname(absolutePath);
+    const name = path.basename(absolutePath);
+    // The random component is what makes the name unguessable, and that matters
+    // for more than collisions: `--out` accepts any directory, so on a shared
+    // or world-writable one a predictable staging name can be pre-placed as a
+    // symlink by another local principal, and a create that follows it would
+    // truncate whatever it points at with this process's privileges (CWE-59).
+    // Every creator of this path opens it `wx`/`'wx'`, which refuses an existing
+    // entry of any kind including a symlink, so the guess would have to win a
+    // race it cannot see; the random suffix removes the guess as well.
+    const nonce = crypto.randomBytes(8).toString('hex');
+    return path.join(directory, `.${name}.${process.pid}.${stagingCounter}.${nonce}${STAGING_SUFFIX}`);
+};
+
+/**
+ * Flushes a directory entry so a promoted rename survives a power loss.
+ *
+ * Best effort by design: `fsync` on a directory descriptor is refused on some
+ * platforms and filesystems (EPERM, EINVAL, EISDIR, ENOTSUP), and the rename
+ * itself is already atomic with respect to any reader — the directory flush
+ * only shortens the window in which a crash could lose it. Failing the
+ * publication over a refused optimisation would turn a complete artefact into
+ * a failed run.
+ */
+const IGNORED_DIRECTORY_FSYNC_CODES = new Set(['EPERM', 'EINVAL', 'EISDIR', 'ENOTSUP', 'EACCES', 'EBADF']);
+
+const flushDirectory = (directory: string): void => {
+    let descriptor: number | null = null;
+    try {
+        descriptor = fs.openSync(directory, 'r');
+        fs.fsyncSync(descriptor);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === undefined || !IGNORED_DIRECTORY_FSYNC_CODES.has(code)) {
+            throw error;
+        }
+    } finally {
+        if (descriptor !== null) {
+            try {
+                fs.closeSync(descriptor);
+            } catch {
+                // A close failure after a successful fsync has nothing left to
+                // report: the data is already on disk and the descriptor dies
+                // with the process.
+            }
+        }
+    }
+};
+
+/**
+ * Writes `text` to `absolutePath` atomically: a staged sibling, flushed to
+ * disk, then renamed over the target.
+ *
+ * `wx` rather than `w` on the staging file, so a name collision is an error
+ * rather than a silent overwrite of another publisher's staging document. The
+ * staging file is removed if anything after its creation fails, so a failed
+ * write leaves the previous artefact intact and no debris behind.
+ */
+const writeFileAtomicSync = (absolutePath: string, text: string): void => {
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    const stagingPath = stagingPathFor(absolutePath);
+
+    let descriptor: number | null = null;
+    try {
+        descriptor = fs.openSync(stagingPath, 'wx');
+        fs.writeFileSync(descriptor, text, 'utf8');
+        fs.fsyncSync(descriptor);
+    } catch (error) {
+        if (descriptor !== null) {
+            try {
+                fs.closeSync(descriptor);
+            } catch {
+                // Reported through the original failure below.
+            }
+            descriptor = null;
+        }
+        removeIfPresent(stagingPath);
+        throw error;
+    }
+
+    try {
+        fs.closeSync(descriptor);
+    } catch (error) {
+        removeIfPresent(stagingPath);
+        throw error;
+    }
+
+    try {
+        fs.renameSync(stagingPath, absolutePath);
+    } catch (error) {
+        // The target still holds its previous content: `rename` either replaced
+        // it or did nothing.
+        removeIfPresent(stagingPath);
+        throw error;
+    }
+
+    flushDirectory(path.dirname(absolutePath));
+};
+
+/**
+ * Writes one JSON artefact to its canonical path, atomically.
+ *
+ * Every report and manifest writer in `scripts/` goes through this function
+ * (`search-benchmark.ts`, `recipes-seed.ts`, `catalog-validate.ts`,
+ * `catalog-report.ts` and `catalog-import-usda.ts` reach it directly or through
+ * the staging helpers below), so the atomicity is a property of the pipeline
+ * rather than of each call site.
+ */
+export const writeJsonFile = (absolutePath: string, value: unknown): void => {
     // `JSON.stringify` never ends with a line break, so appending one produces
     // exactly one — the POSIX convention every other tracked file here follows.
-    fs.writeFileSync(absolutePath, `${JSON.stringify(value, null, JSON_INDENT)}\n`, 'utf8');
+    writeFileAtomicSync(absolutePath, `${JSON.stringify(value, null, JSON_INDENT)}\n`);
+};
+
+/**
+ * Stages one JSON artefact without publishing it: the complete document is
+ * written and flushed to a sibling file, and `promoteStagedArtifacts` is what
+ * makes it the artefact at `absolutePath`.
+ *
+ * Used when several artefacts must appear together — `catalog-report.ts`'s
+ * reconciled report pair — or when a document has to be checked after it is
+ * written and before it replaces the previous one.
+ */
+export const stageJsonArtifact = (absolutePath: string, value: unknown): StagedArtifact => {
+    const staged: StagedArtifact = { finalPath: absolutePath, stagingPath: stagingPathFor(absolutePath) };
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    writeFileAtomicSync(staged.stagingPath, `${JSON.stringify(value, null, JSON_INDENT)}\n`);
+    return staged;
+};
+
+/**
+ * The completeness check a staged document passes before it is promoted.
+ *
+ * It reads the file's SIZE and its LAST BYTES rather than parsing it: the
+ * validation report is tens of megabytes, and parsing it to prove it parses
+ * would cost a second and several hundred megabytes of heap on every run. What
+ * a truncated document actually looks like is a file that stops mid-way, so a
+ * document whose tail is the terminator its writer ends with is complete —
+ * every JSON artefact here ends `}\n`.
+ */
+export const assertStagedDocumentComplete = (staged: StagedArtifact, expectedTail = '}\n'): void => {
+    let size: number;
+    try {
+        size = fs.statSync(staged.stagingPath).size;
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== undefined && MISSING_FILE_CODES.has(code)) {
+            throw new ManifestError(
+                'incomplete_staged_artifact',
+                `the staged document for ${describePath(staged.finalPath)} does not exist, so nothing was published.`,
+            );
+        }
+        throw error;
+    }
+
+    const tail = Buffer.from(expectedTail, 'utf8');
+    if (size < tail.length) {
+        throw new ManifestError(
+            'incomplete_staged_artifact',
+            `the staged document for ${describePath(staged.finalPath)} is ${size} bytes, which is shorter than the ` +
+                'terminator a complete document ends with, so it was not published and the previous artefact is intact.',
+        );
+    }
+
+    const buffer = Buffer.alloc(tail.length);
+    const descriptor = fs.openSync(staged.stagingPath, 'r');
+    try {
+        fs.readSync(descriptor, buffer, 0, tail.length, size - tail.length);
+    } finally {
+        fs.closeSync(descriptor);
+    }
+
+    if (!buffer.equals(tail)) {
+        throw new ManifestError(
+            'incomplete_staged_artifact',
+            `the staged document for ${describePath(staged.finalPath)} does not end with the terminator a complete ` +
+                'document ends with, so it was truncated; it was not published and the previous artefact is intact.',
+        );
+    }
+};
+
+// The journal that makes a multi-file publication a transaction. POSIX has no
+// atomic rename of two paths, so promoting a reconciled pair with two renames
+// leaves a window — and, if the second one fails or the process dies between
+// them, leaves that mixed pair on disk permanently. The journal closes the
+// permanent case: it is written and flushed BEFORE anything moves, it names
+// every final path, its staged replacement and the backup its previous content
+// was moved to, and its presence on disk means "a publication was interrupted
+// here". `recoverInterruptedPublication` reverts such a set to its previous
+// generation, and every publisher calls it before staging, so an interrupted
+// publication is undone by the next run rather than inherited by it.
+//
+// One journal per directory, with a fixed name, is what makes it discoverable
+// by a later process. Publishers are already serialised per directory by
+// `withArtifactPublicationLock`, so two live journals in one directory cannot
+// exist.
+const PUBLICATION_JOURNAL_NAME = '.artefact-publication.journal';
+const BACKUP_SUFFIX = '.previous';
+
+interface JournalEntry {
+    readonly finalPath: string;
+    readonly stagingPath: string;
+    readonly backupPath: string;
+}
+
+interface PublicationJournal {
+    readonly holderPid: number;
+    readonly startedAt: string;
+    readonly entries: readonly JournalEntry[];
+}
+
+const journalPathFor = (directory: string): string => path.join(directory, PUBLICATION_JOURNAL_NAME);
+
+const backupPathFor = (absolutePath: string): string => {
+    const nonce = crypto.randomBytes(8).toString('hex');
+    return path.join(
+        path.dirname(absolutePath),
+        `.${path.basename(absolutePath)}.${process.pid}.${nonce}${BACKUP_SUFFIX}`,
+    );
+};
+
+const readJournal = (journalPath: string): PublicationJournal | null => {
+    let text: string;
+    try {
+        text = fs.readFileSync(journalPath, 'utf8');
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== undefined && MISSING_FILE_CODES.has(code)) {
+            return null;
+        }
+        throw error;
+    }
+
+    try {
+        const parsed = JSON.parse(text) as PublicationJournal;
+        return Array.isArray(parsed?.entries) ? parsed : null;
+    } catch {
+        // An unparsable journal still means a publication was interrupted here,
+        // but it cannot say which paths to revert. Treated as a journal with no
+        // entries so it is cleared rather than blocking every future run: the
+        // artefacts themselves are then whatever the interrupted run left, which
+        // the reconciliation in the next run is what catches.
+        return { holderPid: 0, startedAt: '', entries: [] };
+    }
+};
+
+/**
+ * Reverts an interrupted publication in `directory`, if one was left behind.
+ *
+ * Called by every publisher before it stages anything, and safe to call when
+ * there is nothing to do. Reverting rather than completing is deliberate: a
+ * crashed run's staged documents were never reconciled against each other by a
+ * live process, so rolling forward could publish a pair no run ever agreed on,
+ * while rolling back restores a generation that was published as a set.
+ *
+ * Returns the final paths it reverted, so the caller can log that it happened —
+ * an interrupted publication is an operational event, not a detail.
+ */
+export const recoverInterruptedPublication = (directory: string): readonly string[] => {
+    const journalPath = journalPathFor(directory);
+    const journal = readJournal(journalPath);
+    if (journal === null) {
+        return [];
+    }
+
+    const reverted: string[] = [];
+    for (const entry of journal.entries) {
+        // A backup exists exactly when this entry's previous content was moved
+        // aside, whether or not the staged replacement made it in. Moving the
+        // backup back therefore restores the previous generation in both cases.
+        if (fs.existsSync(entry.backupPath)) {
+            fs.renameSync(entry.backupPath, entry.finalPath);
+            reverted.push(describePath(entry.finalPath));
+        }
+        removeIfPresent(entry.stagingPath);
+    }
+
+    removeIfPresent(journalPath);
+    flushDirectory(directory);
+    return reverted;
+};
+
+/**
+ * Promotes a staged set to its canonical paths — the publication itself.
+ *
+ * This is the set's single commit point. The sequence is a write-ahead
+ * transaction: verify every staged document, record the intent in a flushed
+ * journal, move each previous artefact aside to a backup, rename the staged
+ * documents in, then clear the journal and the backups. Any failure after the
+ * journal exists restores every final path from its backup, so when this
+ * function returns — successfully or not — the canonical paths hold either all
+ * of the new generation or all of the previous one, never a mix of the two.
+ * A process killed mid-sequence leaves the journal, and the next publisher's
+ * `recoverInterruptedPublication` reverts the set.
+ *
+ * What this does NOT do, stated so no caller assumes it: a reader that does not
+ * take the publication lock can still observe the instant between two renames.
+ * Making that impossible would mean moving the artefacts behind a pointer the
+ * readers follow, and their paths are fixed by the repository and referenced by
+ * the docs and the tests. The guarantee here is over failures and crashes,
+ * which is what leaves a mixed pair addressable afterwards.
+ */
+export const promoteStagedArtifacts = (staged: readonly StagedArtifact[]): void => {
+    if (staged.length === 0) {
+        return;
+    }
+
+    for (const artifact of staged) {
+        assertStagedDocumentCompleteIfPresent(artifact);
+    }
+
+    const directories = new Set(staged.map((artifact) => path.dirname(artifact.finalPath)));
+    if (directories.size > 1) {
+        // The journal is per directory, so a set spanning two of them would need
+        // two commit points and could not be one transaction. No caller does
+        // this; refusing says so rather than silently degrading the guarantee.
+        throw new ManifestError(
+            'artifact_publication_failed',
+            'an artefact set is published as one transaction through a journal in its own directory, so every ' +
+                `artefact in the set must share one directory; this set spans ${directories.size}.`,
+        );
+    }
+    const directory = [...directories][0];
+    const journalPath = journalPathFor(directory);
+
+    const entries: JournalEntry[] = staged.map((artifact) => ({
+        finalPath: artifact.finalPath,
+        stagingPath: artifact.stagingPath,
+        backupPath: backupPathFor(artifact.finalPath),
+    }));
+
+    // The journal is written and flushed first, so every state the sequence can
+    // be interrupted in is one the recovery above can read and undo.
+    writeFileAtomicSync(
+        journalPath,
+        `${JSON.stringify(
+            { holderPid: process.pid, startedAt: new Date().toISOString(), entries } satisfies PublicationJournal,
+            null,
+            JSON_INDENT,
+        )}\n`,
+    );
+
+    const backedUp: JournalEntry[] = [];
+    const promoted: JournalEntry[] = [];
+    try {
+        for (const entry of entries) {
+            if (fs.existsSync(entry.finalPath)) {
+                fs.renameSync(entry.finalPath, entry.backupPath);
+                backedUp.push(entry);
+            }
+        }
+        for (const entry of entries) {
+            fs.renameSync(entry.stagingPath, entry.finalPath);
+            promoted.push(entry);
+        }
+    } catch (error) {
+        // Roll the whole set back to the generation it had on entry: a promoted
+        // final is overwritten by its backup, a final that was only moved aside
+        // is moved back, and anything still staged is discarded.
+        for (const entry of backedUp) {
+            try {
+                fs.renameSync(entry.backupPath, entry.finalPath);
+            } catch {
+                // The journal is deliberately left in place when a rollback step
+                // fails: it is the only record of which backup belongs to which
+                // artefact, and the next run's recovery retries from it.
+            }
+        }
+        discardStagedArtifacts(staged);
+        const failed = entries
+            .filter((entry) => !promoted.includes(entry))
+            .map((entry) => describePath(entry.finalPath));
+        const rolledBack = backedUp.every((entry) => fs.existsSync(entry.finalPath));
+        if (rolledBack) {
+            removeIfPresent(journalPath);
+            for (const entry of backedUp) {
+                removeIfPresent(entry.backupPath);
+            }
+        }
+        flushDirectory(directory);
+        throw new ManifestError(
+            'artifact_publication_failed',
+            `publishing the artefact set failed at ${failed.join(', ')}, so the set was rolled back and every ` +
+                `artefact holds the generation it had before this run` +
+                (rolledBack
+                    ? '. '
+                    : `; the rollback could not finish, so ${describePath(journalPath)} was kept and the next run ` +
+                      'reverts the set from it. ') +
+                (error as Error).message,
+        );
+    }
+
+    // Past this point the new generation is in place. Clearing the journal is
+    // what ends the transaction; the backups are then dead weight.
+    removeIfPresent(journalPath);
+    for (const entry of backedUp) {
+        removeIfPresent(entry.backupPath);
+    }
+    flushDirectory(directory);
+};
+
+// A staged file already promoted by an earlier iteration is gone; the check is
+// skipped for it rather than failing the publication it just completed.
+const assertStagedDocumentCompleteIfPresent = (staged: StagedArtifact): void => {
+    if (!fs.existsSync(staged.stagingPath)) {
+        throw new ManifestError(
+            'incomplete_staged_artifact',
+            `the staged document for ${describePath(staged.finalPath)} does not exist, so nothing was published.`,
+        );
+    }
+    assertStagedDocumentComplete(staged);
+};
+
+/**
+ * Removes a staged set without publishing it — the failure path, and the reason
+ * a failed run leaves neither debris nor a half-published pair.
+ */
+export const discardStagedArtifacts = (staged: readonly StagedArtifact[]): void => {
+    for (const artifact of staged) {
+        removeIfPresent(artifact.stagingPath);
+    }
+};
+
+/**
+ * How long a lock file may sit before a new publisher treats it as abandoned.
+ *
+ * Generous against the longest legitimate publication (the validation report is
+ * tens of megabytes streamed row by row out of the database) and short enough
+ * that a killed run does not block the next operator for an afternoon. A
+ * holder whose process is gone is stale immediately, whatever its age.
+ */
+export const ARTIFACT_LOCK_STALE_MS = 30 * 60 * 1000;
+
+interface ArtifactLockRecord {
+    readonly holder: string;
+    readonly pid: number;
+    readonly startedAt: string;
+    readonly directory: string;
+}
+
+export interface ArtifactPublicationLock {
+    readonly lockPath: string;
+    readonly release: () => void;
+}
+
+/**
+ * The physical identity of an artefact directory — what the lock is keyed on.
+ *
+ * `path.resolve` is not enough: it collapses `..` and makes the path absolute
+ * but leaves symlinks alone, so `--out /tmp/link-to-reports` and the committed
+ * `data/meal-planning/reports/latest` resolve to different strings while naming
+ * the same directory and the same `import-report.json`. Keying the lock on the
+ * spelling would let two publishers each hold "their" lock and overwrite each
+ * other's merged fields. `realpath` collapses the aliases to one identity.
+ *
+ * The directory is created first because every publisher creates it anyway, and
+ * `realpath` needs it to exist. If it cannot be resolved (a permission wall on
+ * an ancestor), the resolved spelling is used and the reason is logged: a lock
+ * keyed on the spelling still excludes the common case, and refusing to publish
+ * over an unresolvable path would be worse than a narrower guarantee.
+ */
+const physicalDirectoryIdentity = (directory: string): string => {
+    try {
+        fs.mkdirSync(directory, { recursive: true });
+        return fs.realpathSync(directory);
+    } catch (error) {
+        logger.warn('artifact_lock_directory_unresolved', {
+            directory: describePath(directory),
+            error: (error as Error).message,
+            consequence:
+                'The publication lock is keyed on the resolved path instead of the physical directory, so a ' +
+                'publisher reaching this directory through a symlink would not contend for the same lock.',
+        });
+        return path.resolve(directory);
+    }
+};
+
+const artifactLockPathFor = (physicalIdentity: string): string =>
+    path.join(
+        os.tmpdir(),
+        `soh-artifact-publication-${crypto
+            .createHash('sha256')
+            .update(physicalIdentity)
+            .digest('hex')
+            .slice(0, 16)}.lock`,
+    );
+
+const readArtifactLockRecord = (lockPath: string): ArtifactLockRecord | null => {
+    let raw: string;
+    try {
+        raw = fs.readFileSync(lockPath, 'utf8');
+    } catch {
+        return null;
+    }
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return null;
+        }
+        const record = parsed as Partial<ArtifactLockRecord>;
+        if (typeof record.pid !== 'number' || typeof record.startedAt !== 'string') {
+            return null;
+        }
+        return {
+            holder: typeof record.holder === 'string' ? record.holder : 'unknown',
+            pid: record.pid,
+            startedAt: record.startedAt,
+            directory: typeof record.directory === 'string' ? record.directory : '',
+        };
+    } catch {
+        // A lock file that does not parse carries no holder to name, so it is
+        // treated as abandoned rather than as a reason to stop publishing.
+        return null;
+    }
+};
+
+const holderProcessIsAlive = (pid: number): boolean => {
+    if (!Number.isInteger(pid) || pid <= 0) {
+        return false;
+    }
+    if (pid === process.pid) {
+        return true;
+    }
+    try {
+        // Signal 0 checks for the process without touching it.
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        // EPERM means the process exists and belongs to someone else.
+        return code === 'EPERM';
+    }
+};
+
+/**
+ * How long an unreadable lock record is assumed to belong to a live holder
+ * still writing it, rather than to a dead one.
+ *
+ * A lock whose record cannot be parsed used to be treated as abandoned outright,
+ * which is unsafe for the one case that matters: a holder that has just created
+ * the file. Claiming is atomic-with-content now (see below), so this window only
+ * has to cover a record written by an older build or truncated by a crash mid
+ * write — and for those, waiting a minute and reporting the lock is strictly
+ * better than two publishers believing they own it.
+ */
+const ARTIFACT_LOCK_RECORD_SETTLING_MS = 60 * 1000;
+
+const artifactLockIsStale = (record: ArtifactLockRecord | null, now: number, lockPath: string): boolean => {
+    if (record === null) {
+        // No readable record. Fail towards "held" while the file is fresh: an
+        // unreadable record is indistinguishable from one being written, and
+        // stealing it is the failure mode that lets two publishers run.
+        let modifiedAt: number;
+        try {
+            modifiedAt = fs.statSync(lockPath).mtimeMs;
+        } catch {
+            // The file vanished between the read and the stat, so whoever held
+            // it released it.
+            return true;
+        }
+        return now - modifiedAt > ARTIFACT_LOCK_RECORD_SETTLING_MS;
+    }
+    if (!holderProcessIsAlive(record.pid)) {
+        return true;
+    }
+    const startedAt = Date.parse(record.startedAt);
+    return !Number.isFinite(startedAt) || now - startedAt > ARTIFACT_LOCK_STALE_MS;
+};
+
+/**
+ * Claims `lockPath` exclusively, with its record already in it.
+ *
+ * `open(wx)` cannot do this: it creates an empty file and the record lands in a
+ * second call, so a contender reading in between sees no record and — under any
+ * rule that treats an unreadable record as abandoned — steals a live lock. The
+ * record is therefore written to a private temporary file first and `link`ed
+ * into place: `link` fails with EEXIST if the name is taken, so the claim is
+ * atomic, and the file is never observable without its content.
+ *
+ * Returns false when the name is already taken; throws for any other failure.
+ */
+const claimArtifactLockFile = (lockPath: string, payload: string): boolean => {
+    const pending = `${lockPath}.${process.pid}.${crypto.randomBytes(8).toString('hex')}${STAGING_SUFFIX}`;
+    let descriptor: number | null = null;
+    try {
+        descriptor = fs.openSync(pending, 'wx');
+        fs.writeFileSync(descriptor, payload, 'utf8');
+        fs.fsyncSync(descriptor);
+    } catch (error) {
+        if (descriptor !== null) {
+            try {
+                fs.closeSync(descriptor);
+            } catch {
+                // Reported through the original failure.
+            }
+        }
+        removeIfPresent(pending);
+        throw error;
+    }
+    fs.closeSync(descriptor);
+
+    try {
+        fs.linkSync(pending, lockPath);
+        return true;
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'EEXIST') {
+            return false;
+        }
+        throw error;
+    } finally {
+        // The temporary name is always dropped: on success the lock path is a
+        // second link to the same inode, which is what the holder releases.
+        removeIfPresent(pending);
+    }
+};
+
+const LOCK_ACQUIRE_ATTEMPTS = 3;
+
+/**
+ * Takes the publication lock for one artefact directory, or throws
+ * `ManifestError('artifact_publication_locked')` naming the holder.
+ *
+ * Exported with its own release so a caller that publishes across an await
+ * boundary can hold it for the whole sequence; prefer the two wrappers below,
+ * which cannot forget to release it.
+ */
+export const acquireArtifactPublicationLock = (directory: string, holder: string): ArtifactPublicationLock => {
+    const physicalIdentity = physicalDirectoryIdentity(directory);
+    const lockPath = artifactLockPathFor(physicalIdentity);
+    const record: ArtifactLockRecord = {
+        holder,
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        directory: physicalIdentity,
+    };
+    const payload = `${JSON.stringify(record, null, JSON_INDENT)}\n`;
+
+    for (let attempt = 1; attempt <= LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
+        if (!claimArtifactLockFile(lockPath, payload)) {
+            const existing = readArtifactLockRecord(lockPath);
+            if (!artifactLockIsStale(existing, Date.now(), lockPath)) {
+                throw new ManifestError(
+                    'artifact_publication_locked',
+                    `${describePath(directory)} is being published by ${existing?.holder ?? 'another stage'} ` +
+                        `(pid ${existing?.pid ?? 0}, since ${existing?.startedAt ?? 'an unknown time'}), so this run ` +
+                        'stopped rather than interleaving two writes into the same evidence artefacts. Wait for that ' +
+                        'stage to finish, or clear the lock once you have confirmed it is gone.',
+                );
+            }
+
+            logger.warn('artifact_publication_lock_taken_over', {
+                directory: describePath(directory),
+                previousHolder: existing?.holder ?? 'unparsable lock file',
+                previousPid: existing?.pid ?? 0,
+                previousStartedAt: existing?.startedAt ?? 'unknown',
+                reason: 'the recorded holder is gone or older than the stale bound, so its lock was cleared',
+            });
+            removeIfPresent(lockPath);
+            continue;
+        }
+
+        return {
+            lockPath,
+            release: (): void => {
+                // Only OUR record is removed: a lock another publisher took
+                // over after ours went stale belongs to that publisher, and
+                // deleting it would hand the directory to a third writer.
+                const current = readArtifactLockRecord(lockPath);
+                if (current !== null && (current.pid !== record.pid || current.startedAt !== record.startedAt)) {
+                    logger.warn('artifact_publication_lock_not_ours', {
+                        directory: describePath(directory),
+                        holder: current.holder,
+                        pid: current.pid,
+                        reason: 'the lock was taken over while this stage held it, so it was left in place',
+                    });
+                    return;
+                }
+                removeIfPresent(lockPath);
+            },
+        };
+    }
+
+    throw new ManifestError(
+        'artifact_publication_locked',
+        `${describePath(directory)} could not be locked for publication after ${LOCK_ACQUIRE_ATTEMPTS} attempts: ` +
+            'another publisher is clearing and retaking the lock. Run the stage again once no other stage is running.',
+    );
+};
+
+/** Synchronous publication under the directory lock, released on every path. */
+export const withArtifactPublicationLockSync = <T>(directory: string, holder: string, publish: () => T): T => {
+    const lock = acquireArtifactPublicationLock(directory, holder);
+    try {
+        revertInterruptedPublicationUnderLock(directory, holder);
+        return publish();
+    } finally {
+        lock.release();
+    }
+};
+
+/** Asynchronous publication under the directory lock, released on every path. */
+export const withArtifactPublicationLock = async <T>(
+    directory: string,
+    holder: string,
+    publish: () => Promise<T>,
+): Promise<T> => {
+    const lock = acquireArtifactPublicationLock(directory, holder);
+    try {
+        revertInterruptedPublicationUnderLock(directory, holder);
+        return await publish();
+    } finally {
+        lock.release();
+    }
+};
+
+/**
+ * Reverts a publication a previous process was killed in the middle of.
+ *
+ * Runs inside the lock, before the new publication stages anything, so it is
+ * serialised against every other publisher and cannot race the run it is
+ * cleaning up after. Placed here rather than in the four call sites for the
+ * same reason the marker clearing lives in the merge: a producer that forgets
+ * it would silently inherit a half-published set, and there is no signal that
+ * would tell it to.
+ */
+const revertInterruptedPublicationUnderLock = (directory: string, holder: string): void => {
+    const reverted = recoverInterruptedPublication(directory);
+    if (reverted.length > 0) {
+        logger.warn('interrupted_publication_reverted', {
+            directory: describePath(directory),
+            holder,
+            reverted: reverted.join(', '),
+            reason:
+                'a previous publication was interrupted after it began promoting, so the artefacts it had already ' +
+                'replaced were restored from their backups. The set is the generation published before that run.',
+            remedy: 'Re-run the stage that was interrupted; nothing from the interrupted run was kept.',
+        });
+    }
+};
+
+// ---------------------------------------------------------------------------
+// CROSS-STAGE REPORT MERGING — one document, three stages, no lost block.
+//
+// `import-report.json` is written by `catalog:import`, `catalog:generate` and
+// `catalog:report`, and each of them owns part of it. Two kinds of key live in
+// that document and they merge differently:
+//
+//   STAGE-PRIVATE keys — `counts`, `aiGenerationCounts`, `usdaRequests`,
+//   `modelSpend`, `categories` — belong to one stage, which replaces its own
+//   and never touches another's.
+//
+//   SHARED COMPOUND blocks — `duplicatesRemoved` and `failuresByCheck` — are
+//   co-written: each stage contributes its own SUB-KEYS (`…AtImport`,
+//   `importStage`, `generationStage`, `measuredFromCatalog`) to one block,
+//   because the three measurements answer the same question from three
+//   vantage points and a reader wants them side by side.
+//
+// A top-level spread (`{...existing, ...written}`) is correct for the first
+// kind and silently destructive for the second: it replaces the whole block,
+// so an import erased generation's `generationStage` sub-key and a generation
+// run erased the import's. `mergeStageReport` is the one place that knows the
+// difference, and `MERGED_REPORT_COMPOUND_BLOCKS` is the reviewed list — adding
+// a fourth shared block is a change to that constant, not to three call sites.
+// ---------------------------------------------------------------------------
+
+export const MERGED_REPORT_COMPOUND_BLOCKS: readonly string[] = ['duplicatesRemoved', 'failuresByCheck'];
+
+// Keys that mark an artefact as NOT the output of these producers. A committed
+// report that predates a producer carries one so a reader cannot mistake it for
+// evidence of the reviewed implementation; it names what is absent and the
+// command that regenerates the artefact.
+export const PROVISIONAL_REPORT_MARKER_KEYS: readonly string[] = ['staleness'];
+
+// The field inside the marker that makes freshness a PER-STAGE obligation
+// rather than one flag. This distinction is the whole point: these artefacts
+// are co-written by several stages, each owning different sections, so "is this
+// artefact current?" has one answer per stage and not one answer overall. A
+// marker cleared by whichever stage happened to write last would let a
+// generation-only run — which measures no import telemetry, no resume
+// aggregation and no final aggregates — declare the sections it never touched
+// current again, which is the same untruth the marker exists to prevent.
+//
+// So the marker lists the stages whose sections are stale, each measured write
+// removes only its OWN stage from that list, and the marker disappears only
+// when the list empties. A stage absent from the list discharges nothing: it
+// has no outstanding obligation to discharge, and it must not clear anyone
+// else's.
+export const FRESHNESS_OBLIGATIONS_FIELD = 'outstandingStages';
+
+export interface StageReportMergePolicy {
+    /** The key under which the merge records what it preserved. */
+    readonly noteKey: string;
+    /** The stage's own name, as the note states it. */
+    readonly stage: string;
+    /** Top-level keys whose sub-keys belong to several stages. */
+    readonly compoundBlocks?: readonly string[];
+}
+
+export interface StageReportMerge {
+    readonly document: Record<string, unknown>;
+    /** Top-level keys this write left exactly as it found them. */
+    readonly preservedKeys: readonly string[];
+    /** Sub-keys another stage owns that survived inside a shared block. */
+    readonly preservedSubKeys: Readonly<Record<string, readonly string[]>>;
+}
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * Merges one stage's report into the document already on disk.
+ *
+ * Key POSITION is preserved as well as key value: the existing document is
+ * spread first, so a rerun of one stage produces a diff of the fields that
+ * changed rather than a reordering of the whole artefact.
+ *
+ * The merged document is serialised here, before any caller writes it, so a
+ * value that cannot be represented as JSON (a cycle, a BigInt) fails as a
+ * merge error naming the report rather than halfway through a write that has
+ * already truncated the previous artefact.
+ */
+export const mergeStageReport = (
+    existing: Readonly<Record<string, unknown>> | null,
+    written: Readonly<Record<string, unknown>>,
+    policy: StageReportMergePolicy,
+): StageReportMerge => {
+    const compound = new Set(policy.compoundBlocks ?? MERGED_REPORT_COMPOUND_BLOCKS);
+    const base = existing ?? {};
+    const document: Record<string, unknown> = { ...base };
+    const preservedSubKeys: Record<string, readonly string[]> = {};
+
+    for (const key of Object.keys(written)) {
+        const incoming = written[key];
+        const current = base[key];
+
+        if (compound.has(key) && isPlainObject(current) && isPlainObject(incoming)) {
+            const carried = Object.keys(current).filter(
+                (subKey) => !Object.prototype.hasOwnProperty.call(incoming, subKey),
+            );
+            if (carried.length > 0) {
+                preservedSubKeys[key] = carried.sort();
+            }
+            document[key] = { ...current, ...incoming };
+            continue;
+        }
+
+        document[key] = incoming;
+    }
+
+    // Discharge this stage's own freshness obligation, and only its own. See
+    // FRESHNESS_OBLIGATIONS_FIELD for why this is per stage: a measured write is
+    // evidence for the sections THIS stage owns and says nothing about the
+    // others', so it may cross itself off the marker's list and no one else.
+    // The marker is removed only when the list empties, i.e. when every stage
+    // that owes this artefact a measurement has delivered one.
+    const clearedProvisionalMarkers: string[] = [];
+    let dischargedFreshnessObligation: string | null = null;
+    let outstandingFreshnessObligations: readonly string[] | null = null;
+
+    for (const key of PROVISIONAL_REPORT_MARKER_KEYS) {
+        if (
+            !Object.prototype.hasOwnProperty.call(base, key) ||
+            Object.prototype.hasOwnProperty.call(written, key)
+        ) {
+            continue;
+        }
+
+        const marker = base[key];
+        if (!isPlainObject(marker)) {
+            // Not an object, so it carries no obligation list; left alone for
+            // the same conservative reason as a malformed list below.
+            outstandingFreshnessObligations = null;
+            continue;
+        }
+        const obligations = marker[FRESHNESS_OBLIGATIONS_FIELD];
+        if (!Array.isArray(obligations) || obligations.some((entry) => typeof entry !== 'string')) {
+            // A marker with no usable obligation list cannot say whose sections
+            // are stale, so this write leaves it alone. Failing towards "still
+            // stale" is the conservative direction: the alternative is clearing
+            // a warning about sections this stage never measured.
+            outstandingFreshnessObligations = null;
+            continue;
+        }
+
+        const remaining = (obligations as readonly string[]).filter((entry) => entry !== policy.stage);
+        if (remaining.length === obligations.length) {
+            // This stage owes this artefact nothing, so it discharges nothing —
+            // and, critically, clears nothing.
+            outstandingFreshnessObligations = remaining;
+            continue;
+        }
+
+        dischargedFreshnessObligation = policy.stage;
+        if (remaining.length === 0) {
+            delete document[key];
+            clearedProvisionalMarkers.push(key);
+            outstandingFreshnessObligations = remaining;
+        } else {
+            document[key] = { ...marker, [FRESHNESS_OBLIGATIONS_FIELD]: remaining };
+            outstandingFreshnessObligations = remaining;
+        }
+    }
+    clearedProvisionalMarkers.sort();
+
+    // The note key is excluded because it is THIS write's own bookkeeping: a
+    // previous run of the same stage left it behind, and listing it as a key
+    // preserved from another stage would be a false statement in the artefact.
+    // Another stage's note key is not excluded — that one really is a field
+    // this write left alone. Cleared provisional markers are excluded too: they
+    // were removed, not carried forward.
+    const preservedKeys = Object.keys(base)
+        .filter(
+            (key) =>
+                key !== policy.noteKey &&
+                !clearedProvisionalMarkers.includes(key) &&
+                !Object.prototype.hasOwnProperty.call(written, key),
+        )
+        .sort();
+
+    document[policy.noteKey] = {
+        stage: policy.stage,
+        mergedIntoExisting: Object.keys(base).length > 0,
+        preservedKeys,
+        preservedSubKeys,
+        clearedProvisionalMarkers,
+        // Which freshness obligation this write discharged, and which remain.
+        // Written on every merge so the marker's lifecycle is legible from the
+        // artefact alone: a reader can see that import measured its sections
+        // while the report stage still owes its aggregates.
+        dischargedFreshnessObligation,
+        outstandingFreshnessObligations,
+        compoundBlocks: [...compound].sort(),
+        basis:
+            'This stage replaced the keys it measured and preserved every other key in the document, because the ' +
+            'import, generation and report stages all write into this file. The blocks named in compoundBlocks are ' +
+            'co-written, so their sub-keys were merged instead of replaced and preservedSubKeys names the ones this ' +
+            'write carried forward from another stage.',
+    };
+
+    try {
+        JSON.stringify(document);
+    } catch (error) {
+        throw new ManifestError(
+            'invalid_merged_report',
+            `the ${policy.stage} report cannot be represented as JSON, so nothing was written and the previous ` +
+                `artefact is intact: ${(error as Error).message}`,
+        );
+    }
+
+    return { document, preservedKeys, preservedSubKeys };
 };
 
 /**
@@ -547,6 +1617,148 @@ export type CostClass = 1 | 2 | 3;
 
 export type UsdaDataType = 'Foundation' | 'SR Legacy' | 'Survey (FNDDS)' | 'Branded' | 'Experimental';
 
+// ---------------------------------------------------------------------------
+// The four closed vocabularies above, as values a structural check can test a
+// document against.
+//
+// Each is written as a `Record<Union, true>` and its member list is read back
+// off that object, so the two cannot drift: a member added to the union without
+// a key here does not compile, and a key here that is not a union member does
+// not compile either. The alternative — a hand-maintained
+// `readonly CoverageCategory[]` literal — accepts a list with a member missing,
+// and a vocabulary silently short one value is a validator that waves the
+// corresponding document entry through. That is the failure this shape rules
+// out, and it is the same reason `assertEvidenceAllowlistShape` checks the
+// document rather than trusting it.
+//
+// Declared here rather than imported from `src/services/catalog.logic.ts`,
+// whose `CATALOG_FOOD_STATES` covers the same ground: `scripts/` may read
+// `src/`, but this module is the one every script loads its inputs through and
+// it deliberately imports two Node built-ins and its sibling logger and nothing
+// else (see the scope note at the top). The compile-time exhaustiveness above
+// is what makes the restatement safe.
+// ---------------------------------------------------------------------------
+
+const COVERAGE_CATEGORY_MEMBERS: Readonly<Record<CoverageCategory, true>> = {
+    produce_vegetable: true,
+    produce_fruit: true,
+    protein_meat: true,
+    protein_poultry: true,
+    protein_seafood: true,
+    protein_egg: true,
+    protein_plant: true,
+    dairy: true,
+    dairy_alternative: true,
+    grain: true,
+    bread_bakery: true,
+    legume: true,
+    nut_seed: true,
+    oil_fat: true,
+    condiment_sauce: true,
+    spice_herb: true,
+    beverage: true,
+    snack: true,
+    sweet: true,
+    prepared_meal: true,
+    other: true,
+};
+
+/** The 21 category codes, in declaration order. */
+export const COVERAGE_CATEGORIES: readonly CoverageCategory[] = Object.keys(
+    COVERAGE_CATEGORY_MEMBERS,
+) as readonly CoverageCategory[];
+
+const CATALOG_FOOD_STATE_MEMBERS: Readonly<Record<CatalogFoodState, true>> = {
+    raw: true,
+    cooked: true,
+    prepared: true,
+    dry: true,
+    as_purchased: true,
+};
+
+export const MANIFEST_FOOD_STATES: readonly CatalogFoodState[] = Object.keys(
+    CATALOG_FOOD_STATE_MEMBERS,
+) as readonly CatalogFoodState[];
+
+const USDA_DATA_TYPE_MEMBERS: Readonly<Record<UsdaDataType, true>> = {
+    Foundation: true,
+    'SR Legacy': true,
+    'Survey (FNDDS)': true,
+    Branded: true,
+    Experimental: true,
+};
+
+export const USDA_DATA_TYPES: readonly UsdaDataType[] = Object.keys(
+    USDA_DATA_TYPE_MEMBERS,
+) as readonly UsdaDataType[];
+
+const COST_CLASS_MEMBERS: Readonly<Record<CostClass, true>> = { 1: true, 2: true, 3: true };
+
+/**
+ * `Object.keys` stringifies numeric keys, so the values are read back through
+ * `Number` — a cost class is `1 | 2 | 3` and comparing a document's number
+ * against the string `'1'` would reject every valid entry.
+ */
+export const COST_CLASSES: readonly CostClass[] = Object.keys(COST_CLASS_MEMBERS).map((key) =>
+    Number(key),
+) as readonly CostClass[];
+
+/**
+ * The nine allergen classes this product supports, as the onboarding's
+ * multi-select offers them.
+ *
+ * Declared here rather than read from the manifest because the manifest is the
+ * document being validated: checking its `allergenVocabulary` against a list
+ * the same document declares accepts a *coherent* truncation — one that drops
+ * `milk` from the vocabulary, from the description-marker table, and from every
+ * curated entry's `reviewedSafety` in a single edit. Such a document is
+ * internally consistent and would import cleanly while silently never tagging
+ * that allergen again, which is the failure mode that matters: an allergen
+ * class the catalog cannot express is one no exclusion can act on.
+ *
+ * `NAMED_ALLERGENS` in `src/services/preferences.logic.ts` is the
+ * request-validation expression of the same nine classes; the duplication is
+ * deliberate, because a manifest check that runs inside a CLI script must not
+ * depend on a service module.
+ *
+ * This constant is not self-certifying either: the import suite asserts it
+ * equals a nine-class list written independently of it, and asserts the
+ * manifest's vocabulary and marker keys against that same list — so the
+ * document, this validator and the requirement all have to agree, and no single
+ * edit can move all three.
+ */
+export type AllergenClass =
+    | 'milk'
+    | 'eggs'
+    | 'peanuts'
+    | 'tree_nuts'
+    | 'soy'
+    | 'wheat'
+    | 'fish'
+    | 'shellfish'
+    | 'sesame';
+
+/**
+ * Exhaustive by construction: adding a member to {@link AllergenClass} without
+ * listing it here is a compile error, so the supported set cannot drift
+ * silently away from the classes the product offers.
+ */
+const ALLERGEN_CLASS_MEMBERS: Readonly<Record<AllergenClass, true>> = {
+    milk: true,
+    eggs: true,
+    peanuts: true,
+    tree_nuts: true,
+    soy: true,
+    wheat: true,
+    fish: true,
+    shellfish: true,
+    sesame: true,
+};
+
+export const ALLERGEN_CLASSES: readonly AllergenClass[] = Object.keys(
+    ALLERGEN_CLASS_MEMBERS,
+) as readonly AllergenClass[];
+
 export interface KcalRange {
     readonly min: number;
     readonly max: number;
@@ -589,6 +1801,33 @@ export interface CoveragePlanCostClassScale {
     readonly label: string;
 }
 
+/**
+ * How the coverage plan names a model: the environment variable that selects
+ * it, the variable consulted when that one is unset, and the model used when
+ * neither is set.
+ *
+ * It is a CONFIGURATION BLOCK and not a model name, which is the whole point of
+ * declaring it. The document has always held an object here
+ * (`{"envVar": "CATALOG_GENERATION_MODEL", "fallbackEnvVar": "OPENROUTER_MODEL",
+ * "fallbackModel": "google/gemini-2.5-flash"}`) while the type said `string`,
+ * and the declarative cast in `loadVersionedManifest` let the two disagree in
+ * silence — so `catalog-release.ts` could put this object into a manifest field
+ * typed `string | null` and ship it as the model that produced a release's rows.
+ * Two things follow from the shape being written down, and both are enforced:
+ * `assertCoveragePlanModelShape` refuses a document that does not carry it, and
+ * a consumer that reads it can no longer mistake it for evidence of a call —
+ * what a run actually invoked is recorded on the batch and review rows it
+ * wrote, never here.
+ */
+export interface CoveragePlanModelConfig {
+    /** The variable an operator sets to choose the model. */
+    readonly envVar: string;
+    /** Consulted when `envVar` is unset; absent where the plan names no second variable. */
+    readonly fallbackEnvVar?: string;
+    /** Used when neither variable is set. */
+    readonly fallbackModel: string;
+}
+
 export interface CoveragePlan {
     readonly coveragePlanVersion: string;
     readonly promptVersion: string;
@@ -601,9 +1840,16 @@ export interface CoveragePlan {
      */
     readonly modelCallsPerBatch: number;
     readonly defaultBatchSize: number;
-    /** The model names generation and review would use; recorded, not invoked here. */
-    readonly generationModel?: string;
-    readonly reviewModel?: string;
+    /**
+     * How generation and review SELECT a model — an env-var name, its fallback
+     * variable and the model used when neither is set. Configuration, and
+     * therefore never evidence that a call happened: a release's
+     * `model_versions` is measured from the generation batches and `llm_review`
+     * records the rows actually carry (see `catalog-release.ts`), and this block
+     * is not consulted there at all.
+     */
+    readonly generationModel?: CoveragePlanModelConfig;
+    readonly reviewModel?: CoveragePlanModelConfig;
     /**
      * The sum of every category's `publishedTarget` — 11,010, which carries
      * 1,010 of slack over the 10,000 the feature requires, so late
@@ -644,16 +1890,26 @@ export interface UsdaDefaultPortionSelector {
     readonly modifier?: string;
 }
 
-/** Used where a curated entry names the food to import but not its FDC id. */
-export interface UsdaFoodResolveBy {
-    readonly query: string;
-    readonly dataTypes?: readonly UsdaDataType[];
-    readonly requireDescription?: string;
-}
-
 export interface UsdaManifestFood {
-    readonly fdcId?: number;
-    readonly resolveBy?: UsdaFoodResolveBy;
+    /**
+     * The FDC id read from a live USDA response, and the only way a curated
+     * entry names its food. REQUIRED, and there is deliberately no second form.
+     *
+     * An earlier revision declared this optional beside a `resolveBy` lookup
+     * specification for an entry whose id could not be verified at authoring
+     * time. Nothing ever performed that lookup: `buildImportPlan` counted such
+     * an entry under `skippedUnresolvedEntry` and moved on, so a curation a
+     * reviewer had approved silently never reached the catalog. The two
+     * alternatives are worse — resolving it needs a vendor search whose chosen
+     * hit a human has to confirm, and an unattended choice among plausible hits
+     * is the fabricated identity the catalog policy forbids, carried into
+     * recipes as source-backed nutrition.
+     *
+     * So verifying the id is a curation step that happens before the document is
+     * written, `assertUsdaManifestShape` refuses an entry carrying `resolveBy`
+     * by name, and the importer resolves nothing.
+     */
+    readonly fdcId: number;
     readonly usdaDataType: UsdaDataType;
     /**
      * The description the record carried when its id was verified. The importer
@@ -848,6 +2104,16 @@ export interface UsdaImportLimits {
 
 export interface UsdaManifest {
     readonly usdaManifestVersion: string;
+    /**
+     * The coverage plan this manifest's categories, food groups and food states
+     * are filed against. Declared — and compared for equality with the loaded
+     * plan's own `coveragePlanVersion` before any vendor request — because
+     * every taxonomy check the importer runs is only as meaningful as the plan
+     * it runs against: validating this manifest against a *different* plan
+     * version would pass on headings that version happens to share and file
+     * records under headings the intended plan never declared.
+     */
+    readonly coveragePlanVersion: string;
     /** `usda:<fdcId>` — the stable identity every rerun upserts against. */
     readonly sourceKeyFormat: string;
     readonly nutrientNumbers: UsdaNutrientNumbers;
@@ -876,6 +2142,14 @@ export interface UsdaManifest {
      * see it change.
      */
     readonly curatedSafetyContract?: string;
+    /**
+     * The written rule that every category and food group below exists in the
+     * named coverage plan, and that a disagreement stops the run before a USDA
+     * request. Declared here so the promise is visible to a reader of the type,
+     * and enforced by `assertManifestMatchesCoveragePlan` in
+     * `scripts/catalog-import-usda.ts`.
+     */
+    readonly coveragePlanContract?: string;
 }
 
 export interface SearchBenchmarkThresholds {
@@ -1074,6 +2348,108 @@ const requireNonEmptyStringArray = (value: unknown, relativePath: string, field:
     );
 
 /**
+ * An array whose entries must each be a non-empty string, where the array
+ * itself may be empty. Distinct from {@link requireNonEmptyStringArray} on
+ * purpose: a curated food legitimately carries no aliases, while an alias
+ * written as `""` or as a number is a document error either way.
+ */
+const requireStringArray = (value: unknown, relativePath: string, field: string): readonly string[] => {
+    if (!Array.isArray(value)) {
+        throw shapeError(relativePath, `declares ${field} as something other than an array`);
+    }
+    return value.map((entry, index) => requireNonEmptyString(entry, relativePath, `${field}[${index}]`));
+};
+
+const requireBoolean = (value: unknown, relativePath: string, field: string): boolean => {
+    if (typeof value !== 'boolean') {
+        throw shapeError(relativePath, `declares ${field} as something other than true or false`);
+    }
+    return value;
+};
+
+/**
+ * A finite number strictly above zero, for the two fields that are measures
+ * rather than counts: a portion's `amount` and its `gramWeight`. Fractional is
+ * legitimate there (`0.5 cup`), which is why {@link requireInteger} cannot be
+ * used, but zero and negative are not — a zero gram weight is the fabricated
+ * weight the catalog policy forbids, wearing a number.
+ */
+const requirePositiveNumber = (value: unknown, relativePath: string, field: string): number => {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+        throw shapeError(relativePath, `declares ${field} as something other than a number above zero`);
+    }
+    return value;
+};
+
+/**
+ * A value drawn from one of this module's closed vocabularies. The message
+ * names the vocabulary rather than just the field, because the operator fix is
+ * always "use one of these" and a typo (`tree nuts` for `tree_nuts`) is the
+ * common case: a tag outside the vocabulary does not fail at runtime, it simply
+ * never matches, and for an allergen tag that is an exclusion that silently
+ * stops excluding.
+ */
+const requireMember = <T>(value: unknown, relativePath: string, field: string, allowed: readonly T[]): T => {
+    if (!allowed.some((candidate) => candidate === value)) {
+        throw shapeError(
+            relativePath,
+            `declares ${field} as ${JSON.stringify(value)}, which is not one of ${allowed
+                .map((candidate) => String(candidate))
+                .join(', ')}`,
+        );
+    }
+    return value as T;
+};
+
+/**
+ * Membership in both directions, plus uniqueness.
+ *
+ * {@link requireMember} answers "is this value allowed", which cannot detect an
+ * *absent* value — the check every self-declared vocabulary needs, because a
+ * document that lists fewer classes than the product supports satisfies every
+ * subset check while quietly narrowing what the importer can express.
+ */
+const requireExactSet = (
+    values: readonly string[],
+    relativePath: string,
+    field: string,
+    expected: readonly string[],
+): void => {
+    const seen = new Set<string>();
+    values.forEach((value) => {
+        if (seen.has(value)) {
+            throw shapeError(relativePath, `lists ${JSON.stringify(value)} more than once in ${field}`);
+        }
+        seen.add(value);
+    });
+
+    const allowed = new Set<string>(expected);
+    const unexpected = values.filter((value) => !allowed.has(value));
+    const missing = expected.filter((value) => !seen.has(value));
+    if (unexpected.length === 0 && missing.length === 0) {
+        return;
+    }
+
+    const parts: string[] = [];
+    if (missing.length > 0) {
+        parts.push(`omits ${missing.map((value) => JSON.stringify(value)).join(', ')}`);
+    }
+    if (unexpected.length > 0) {
+        parts.push(`adds ${unexpected.map((value) => JSON.stringify(value)).join(', ')}`);
+    }
+    throw shapeError(
+        relativePath,
+        `declares ${field} as a set that ${parts.join(' and ')}; it must be exactly ${expected
+            .map((value) => JSON.stringify(value))
+            .join(', ')}`,
+    );
+};
+
+/** An optional field: absent is fine, present is checked. `null` is not absent. */
+const optional = <T>(value: unknown, check: (present: unknown) => T): T | undefined =>
+    value === undefined ? undefined : check(value);
+
+/**
  * `false` and `'n/a'` both reject a fetch and only `true` permits one, so the
  * one thing this check must not do is accept a near-miss: the string `'false'`
  * is truthy, and a row that carried it would read as globally routable to any
@@ -1174,8 +2550,670 @@ export const assertEvidenceAllowlistShape = (value: unknown, relativePath: strin
 
     // Every member the declared type promises has now been checked against the
     // document itself, which is what makes this a verified narrowing rather than
-    // the declarative cast the other four loaders make.
+    // the declarative cast the remaining three loaders make.
     return value as EvidenceAllowlist;
+};
+
+// ---------------------------------------------------------------------------
+// `usda-manifest.v1.json`'s structural check — the second verified narrowing in
+// this module, and for the same reason as the first.
+//
+// This document is the import's whole policy: which vendor records are fetched,
+// which category and food state each one is filed under, which allergen and
+// diet determination a curated food carries, and the vendor limits the run is
+// paced against. A version check alone cannot see any of that. An entry whose
+// `category` is a typo is filed under a category nothing targets; an
+// `allergenTags` entry spelled `tree nuts` never matches the exclusion it was
+// written for; a `reviewedSafety` block missing `allergenStatus` reads as
+// `undefined`, which is not `'known'` and not `'unknown'` either. None of those
+// fails at runtime — the import completes and reports success against a catalog
+// that is wrong in a way no counter shows.
+//
+// The check is deliberately DOCUMENT-INTERNAL: every vocabulary it tests
+// against is either one of this module's four compile-time-exhaustive lists or
+// a vocabulary the document itself declares (`sweepAllergenDietRules`). The
+// cross-FILE agreement the document's own `coveragePlanContract` states — every
+// `category` and `foodGroup` existing in the coverage plan, and each entry's
+// category equalling that food group's category there — needs the coverage plan
+// loaded, so it belongs to the importer, which asserts it before its first
+// vendor request. Splitting it this way keeps this loader free of a dependency
+// on a second document's load order.
+// ---------------------------------------------------------------------------
+
+/** `foods[12] (kale, raw)` — an operator has to find the entry, not just the field. */
+const describeFoodEntry = (index: number, entry: Record<string, unknown>): string => {
+    const name = typeof entry.canonicalName === 'string' && entry.canonicalName.length > 0 ? entry.canonicalName : '?';
+    const state = typeof entry.foodState === 'string' && entry.foodState.length > 0 ? entry.foodState : '?';
+    return `foods[${index}] (${name}, ${state})`;
+};
+
+/**
+ * Exactly one of two match fields, which is what the document's own `matching`
+ * note states. Both is ambiguous — the reader cannot tell which was intended —
+ * and neither is an inert rule that matches nothing, silently shrinking the
+ * table a reviewer believes they approved.
+ */
+const requireOneMatchField = (
+    rule: Record<string, unknown>,
+    relativePath: string,
+    field: string,
+    fields: readonly string[],
+): void => {
+    const present = fields.filter((name) => rule[name] !== undefined);
+    if (present.length !== 1) {
+        throw shapeError(
+            relativePath,
+            `declares ${field} with ${present.length === 0 ? 'neither' : 'both'} of ${fields.join(
+                ' and ',
+            )}, where the document's own matching note requires exactly one`,
+        );
+    }
+    present.forEach((name) => requireNonEmptyStringArray(rule[name], relativePath, `${field}.${name}`));
+};
+
+const assertSweepAllergenDietRules = (
+    value: unknown,
+    relativePath: string,
+): { readonly allergens: readonly string[]; readonly dietTags: readonly string[] } => {
+    const rules = requireRecord(value, relativePath, 'sweepAllergenDietRules');
+
+    const allergens = requireNonEmptyStringArray(
+        rules.allergenVocabulary,
+        relativePath,
+        'sweepAllergenDietRules.allergenVocabulary',
+    );
+    // Against {@link ALLERGEN_CLASSES}, not against itself: every other check in
+    // this function reads `allergens` as the authority, so a document that
+    // dropped a class here would take its marker table and its curated entries
+    // down with it and still validate.
+    requireExactSet(
+        allergens,
+        relativePath,
+        'sweepAllergenDietRules.allergenVocabulary',
+        ALLERGEN_CLASSES,
+    );
+    const dietTags = requireNonEmptyStringArray(
+        rules.dietTagVocabulary,
+        relativePath,
+        'sweepAllergenDietRules.dietTagVocabulary',
+    );
+
+    const byFoodGroup = requireRecord(rules.byFoodGroup, relativePath, 'sweepAllergenDietRules.byFoodGroup');
+    Object.entries(byFoodGroup).forEach(([foodGroup, tags]) => {
+        requireStringArray(tags, relativePath, `sweepAllergenDietRules.byFoodGroup.${foodGroup}`).forEach(
+            (tag, index) => {
+                requireMember(
+                    tag,
+                    relativePath,
+                    `sweepAllergenDietRules.byFoodGroup.${foodGroup}[${index}]`,
+                    allergens,
+                );
+            },
+        );
+    });
+
+    // The KEYS of this map are allergen classes, and a key outside the
+    // vocabulary is the failure that matters here: the markers under it are
+    // still matched, and the tag they then write is one no exclusion reads.
+    const markers = requireRecord(
+        rules.descriptionAllergenMarkers,
+        relativePath,
+        'sweepAllergenDietRules.descriptionAllergenMarkers',
+    );
+    Object.entries(markers).forEach(([allergen, tokens]) => {
+        requireMember(
+            allergen,
+            relativePath,
+            `sweepAllergenDietRules.descriptionAllergenMarkers key ${JSON.stringify(allergen)}`,
+            allergens,
+        );
+        requireNonEmptyStringArray(
+            tokens,
+            relativePath,
+            `sweepAllergenDietRules.descriptionAllergenMarkers.${allergen}`,
+        );
+    });
+    // Every class needs at least one marker. A class present in the vocabulary
+    // but absent from this table is only reachable through `byFoodGroup`, and
+    // the sweep's food groups are coarser than its allergens — so the class
+    // would go untagged on any record whose group does not seed it, which reads
+    // as "contains no milk" rather than "not determined".
+    requireExactSet(
+        Object.keys(markers),
+        relativePath,
+        'sweepAllergenDietRules.descriptionAllergenMarkers keys',
+        ALLERGEN_CLASSES,
+    );
+
+    const derivation = requireRecord(
+        rules.dietDerivation,
+        relativePath,
+        'sweepAllergenDietRules.dietDerivation',
+    );
+    requireNonEmptyStringArray(
+        derivation.animalCategories,
+        relativePath,
+        'sweepAllergenDietRules.dietDerivation.animalCategories',
+    ).forEach((category, index) => {
+        requireMember(
+            category,
+            relativePath,
+            `sweepAllergenDietRules.dietDerivation.animalCategories[${index}]`,
+            COVERAGE_CATEGORIES,
+        );
+    });
+    requireNonEmptyStringArray(
+        derivation.animalMarkers,
+        relativePath,
+        'sweepAllergenDietRules.dietDerivation.animalMarkers',
+    );
+    requireNonEmptyStringArray(
+        derivation.seafoodMarkers,
+        relativePath,
+        'sweepAllergenDietRules.dietDerivation.seafoodMarkers',
+    );
+    requireNonEmptyStringArray(
+        derivation.dairyEggMarkers,
+        relativePath,
+        'sweepAllergenDietRules.dietDerivation.dairyEggMarkers',
+    );
+
+    const composite = requireRecord(
+        rules.compositeMarkers,
+        relativePath,
+        'sweepAllergenDietRules.compositeMarkers',
+    );
+    requireNonEmptyStringArray(
+        composite.markers,
+        relativePath,
+        'sweepAllergenDietRules.compositeMarkers.markers',
+    );
+
+    return { allergens, dietTags };
+};
+
+const assertUsdaManifestFood = (
+    entry: unknown,
+    index: number,
+    relativePath: string,
+    vocabularies: { readonly allergens: readonly string[]; readonly dietTags: readonly string[] },
+): void => {
+    const food = requireRecord(entry, relativePath, `foods[${index}]`);
+    const where = describeFoodEntry(index, food);
+
+    // THE IDENTITY RULE. A curated entry names its food by an FDC id read from a
+    // live USDA response, and this importer resolves nothing.
+    //
+    // The `resolveBy` form is refused rather than skipped. Resolving one means a
+    // vendor search whose chosen hit a human has to confirm, and there is no
+    // unattended reading of "the search returned three plausible foods" that is
+    // safe: importing the wrong record under a name that looks right is exactly
+    // the fabricated identity the catalog policy forbids, and it would then
+    // carry that record's nutrition into recipes as source-backed. Skipping the
+    // entry is no better — it is a curation a reviewer approved that never
+    // reaches the catalog, visible only as a counter nobody reads.
+    //
+    // So the document may not carry the form at all, and an append that needs a
+    // food whose id cannot be verified at authoring time is a curation task
+    // (verify the id, then append it), not an import-time lookup.
+    if (food.resolveBy !== undefined) {
+        throw shapeError(
+            relativePath,
+            `declares ${where} with resolveBy instead of a verified fdcId. This importer resolves no entry: the ` +
+                'lookup needs a vendor search whose chosen hit a human has to confirm, and importing the wrong ' +
+                'record under a name that looks right is the fabricated identity the catalog policy forbids. ' +
+                'Verify the id against a live USDA response and write it as fdcId, or remove the entry',
+        );
+    }
+
+    requireInteger(food.fdcId, relativePath, `${where} fdcId`, 1);
+    requireMember(food.usdaDataType, relativePath, `${where} usdaDataType`, USDA_DATA_TYPES);
+    optional(food.expectedUsdaDescription, (present) =>
+        requireNonEmptyString(present, relativePath, `${where} expectedUsdaDescription`),
+    );
+    requireMember(food.category, relativePath, `${where} category`, COVERAGE_CATEGORIES);
+    requireMember(food.foodState, relativePath, `${where} foodState`, MANIFEST_FOOD_STATES);
+    requireNonEmptyString(food.canonicalName, relativePath, `${where} canonicalName`);
+    requireNonEmptyString(food.displayName, relativePath, `${where} displayName`);
+    // An alias-less food is legitimate; an alias written as `""` is not.
+    requireStringArray(food.aliases, relativePath, `${where} aliases`);
+    requireNonEmptyString(food.foodGroup, relativePath, `${where} foodGroup`);
+
+    // The selector carries no gram weight BY DESIGN — the weight is USDA's to
+    // state — so there is deliberately no gramWeight field to check here.
+    const portion = requireRecord(food.defaultPortion, relativePath, `${where} defaultPortion`);
+    requireNonEmptyString(portion.description, relativePath, `${where} defaultPortion.description`);
+    optional(portion.amount, (present) =>
+        requirePositiveNumber(present, relativePath, `${where} defaultPortion.amount`),
+    );
+    optional(portion.unit, (present) => requireNonEmptyString(present, relativePath, `${where} defaultPortion.unit`));
+    optional(portion.portionDescription, (present) =>
+        requireNonEmptyString(present, relativePath, `${where} defaultPortion.portionDescription`),
+    );
+    optional(portion.modifier, (present) =>
+        requireNonEmptyString(present, relativePath, `${where} defaultPortion.modifier`),
+    );
+
+    requireMember(food.costClass, relativePath, `${where} costClass`, COST_CLASSES);
+    requireBoolean(food.isCommonDislike, relativePath, `${where} isCommonDislike`);
+
+    // The reviewed determination is the ONLY source of a curated food's safety
+    // metadata (the document's `curatedSafetyContract`), and an empty
+    // `allergenTags` list under `allergenStatus: 'known'` is itself the claim
+    // "reviewed, and this food contains none of the nine". So the block is
+    // checked field by field where it exists: a missing `allergenStatus` would
+    // read as neither 'known' nor 'unknown', and a tag outside the vocabulary
+    // would be written to the row and matched by nothing.
+    optional(food.reviewedSafety, (present) => {
+        const safety = requireRecord(present, relativePath, `${where} reviewedSafety`);
+        requireMember(safety.allergenStatus, relativePath, `${where} reviewedSafety.allergenStatus`, [
+            'known',
+            'unknown',
+        ]);
+        requireStringArray(safety.allergenTags, relativePath, `${where} reviewedSafety.allergenTags`).forEach(
+            (tag, tagIndex) => {
+                requireMember(
+                    tag,
+                    relativePath,
+                    `${where} reviewedSafety.allergenTags[${tagIndex}]`,
+                    vocabularies.allergens,
+                );
+            },
+        );
+        requireStringArray(safety.dietTags, relativePath, `${where} reviewedSafety.dietTags`).forEach(
+            (tag, tagIndex) => {
+                requireMember(
+                    tag,
+                    relativePath,
+                    `${where} reviewedSafety.dietTags[${tagIndex}]`,
+                    vocabularies.dietTags,
+                );
+            },
+        );
+        optional(safety.note, (note) => requireNonEmptyString(note, relativePath, `${where} reviewedSafety.note`));
+        return safety;
+    });
+};
+
+const assertUsdaDatasetSweep = (
+    entry: unknown,
+    index: number,
+    relativePath: string,
+    limits: { readonly maxListPageSize: number },
+    foodStateDataTypes: ReadonlySet<string>,
+): string => {
+    const sweep = requireRecord(entry, relativePath, `datasetSweeps[${index}]`);
+    const key = requireNonEmptyString(sweep.sweepKey, relativePath, `datasetSweeps[${index}].sweepKey`);
+    const where = `datasetSweeps[${index}] (${key})`;
+
+    const dataType = requireMember(sweep.dataType, relativePath, `${where} dataType`, USDA_DATA_TYPES);
+    optional(sweep.category, (present) =>
+        requireMember(present, relativePath, `${where} category`, COVERAGE_CATEGORIES),
+    );
+    requireNonEmptyString(sweep.listEndpoint, relativePath, `${where} listEndpoint`);
+
+    const pageSize = requireInteger(sweep.pageSize, relativePath, `${where} pageSize`, 1);
+    // The vendor's own ceiling on `/foods/list`. A page size above it is not a
+    // bigger page — it is a request USDA rejects, for every page of the sweep.
+    if (pageSize > limits.maxListPageSize) {
+        throw shapeError(
+            relativePath,
+            `declares ${where} pageSize ${pageSize}, above importLimits.maxListPageSize ${limits.maxListPageSize}`,
+        );
+    }
+
+    const maxPages = requireInteger(sweep.maxPages, relativePath, `${where} maxPages`, 1);
+    const observedLastPage = optional(sweep.observedLastNonEmptyPage, (present) =>
+        requireInteger(present, relativePath, `${where} observedLastNonEmptyPage`, 1),
+    );
+    // The document's own `sweepPageBounds` states that `maxPages` "sits above
+    // the observed count so a dataset that grows between authoring and import is
+    // not silently truncated". `maxPages` is the sweep's only page bound — the
+    // importer enumerates to it and stops on the first empty page — so a
+    // `maxPages` at or below the last page already measured is a document that
+    // truncates the dataset it documents.
+    if (observedLastPage !== undefined && maxPages < observedLastPage) {
+        throw shapeError(
+            relativePath,
+            `declares ${where} maxPages ${maxPages} below its own observedLastNonEmptyPage ${observedLastPage}, ` +
+                'so the sweep would stop before the data it has already been measured to hold',
+        );
+    }
+    optional(sweep.observedApproximateRecordCount, (present) =>
+        requireInteger(present, relativePath, `${where} observedApproximateRecordCount`, 0),
+    );
+    optional(sweep.observedOn, (present) => requireNonEmptyString(present, relativePath, `${where} observedOn`));
+
+    const detailFetch = requireRecord(sweep.detailFetch, relativePath, `${where} detailFetch`);
+    requireNonEmptyString(detailFetch.endpoint, relativePath, `${where} detailFetch.endpoint`);
+    requireNonEmptyString(detailFetch.method, relativePath, `${where} detailFetch.method`);
+    requireInteger(detailFetch.batchSize, relativePath, `${where} detailFetch.batchSize`, 1);
+
+    optional(sweep.skipFdcIdsPresentInFoods, (present) =>
+        requireBoolean(present, relativePath, `${where} skipFdcIdsPresentInFoods`),
+    );
+    optional(sweep.stopWhenCategoryCandidateVolumeReached, (present) =>
+        requireBoolean(present, relativePath, `${where} stopWhenCategoryCandidateVolumeReached`),
+    );
+
+    // `resolveFoodState` ends in a hard `as_purchased`, so a sweep whose dataset
+    // has no fallback entry does not fail: every unmatched record in it is filed
+    // `as_purchased`, which for FNDDS (as-eaten descriptions) is wrong for the
+    // whole sweep and shows up nowhere.
+    if (!foodStateDataTypes.has(dataType)) {
+        throw shapeError(
+            relativePath,
+            `declares ${where} over dataType ${dataType}, which sweepFoodStateRules.datasetFallback does not cover, ` +
+                'so every unmatched record in the sweep would take the module default instead of the dataset default',
+        );
+    }
+
+    return key;
+};
+
+/**
+ * Refuses `usda-manifest.v1.json` unless it carries every field the declared
+ * {@link UsdaManifest} shape promises, with every closed-vocabulary value drawn
+ * from its vocabulary, and returns it typed.
+ *
+ * Verified in place and returned as-is rather than rebuilt from the checked
+ * fields, exactly as {@link assertEvidenceAllowlistShape} is: a reviewed
+ * addition to the document still reaches the script that wants it instead of
+ * being quietly dropped here.
+ */
+export const assertUsdaManifestShape = (value: unknown, relativePath: string): UsdaManifest => {
+    const document = requireRecord(value, relativePath, 'its top level');
+
+    requireNonEmptyString(document.usdaManifestVersion, relativePath, 'usdaManifestVersion');
+    // Required, not optional: the cross-plan taxonomy check has nothing to
+    // compare against without it, and an absent field would silently downgrade
+    // that check to "whichever plan the caller happened to load".
+    requireNonEmptyString(document.coveragePlanVersion, relativePath, 'coveragePlanVersion');
+    requireNonEmptyString(document.sourceKeyFormat, relativePath, 'sourceKeyFormat');
+    requireNonEmptyString(document.caloriesFallback, relativePath, 'caloriesFallback');
+    optional(document.curatedSafetyContract, (present) =>
+        requireNonEmptyString(present, relativePath, 'curatedSafetyContract'),
+    );
+    optional(document.coveragePlanContract, (present) =>
+        requireNonEmptyString(present, relativePath, 'coveragePlanContract'),
+    );
+
+    // The four nutrient numbers are what every macro is read from. A missing one
+    // is not a missing field at runtime — it is `undefined` handed to a lookup,
+    // which finds no nutrient and reports the food as missing that macro.
+    const nutrients = requireRecord(document.nutrientNumbers, relativePath, 'nutrientNumbers');
+    requireNonEmptyString(nutrients.protein, relativePath, 'nutrientNumbers.protein');
+    requireNonEmptyString(nutrients.fat, relativePath, 'nutrientNumbers.fat');
+    requireNonEmptyString(nutrients.carbs, relativePath, 'nutrientNumbers.carbs');
+    requireNonEmptyString(nutrients.calories, relativePath, 'nutrientNumbers.calories');
+
+    const limits = requireRecord(document.importLimits, relativePath, 'importLimits');
+    const vendorRate = requireInteger(limits.vendorRequestsPerHour, relativePath, 'importLimits.vendorRequestsPerHour', 1);
+    const configuredRate = requireInteger(
+        limits.configuredRequestsPerHour,
+        relativePath,
+        'importLimits.configuredRequestsPerHour',
+        1,
+    );
+    // The headroom the document's own `rateLimitHeadroomReason` states: the
+    // running API shares this key for label scanning and branded search, so a
+    // configured rate at or above the vendor cap starves live requests rather
+    // than pacing the import.
+    if (configuredRate > vendorRate) {
+        throw shapeError(
+            relativePath,
+            `declares importLimits.configuredRequestsPerHour ${configuredRate} above ` +
+                `vendorRequestsPerHour ${vendorRate}, which leaves the running API no headroom on the shared key`,
+        );
+    }
+    requireInteger(limits.detailBatchSize, relativePath, 'importLimits.detailBatchSize', 1);
+    const maxListPageSize = requireInteger(limits.maxListPageSize, relativePath, 'importLimits.maxListPageSize', 1);
+
+    // Checked before `foods` and `datasetSweeps`, because both are validated
+    // against vocabularies this block declares.
+    const vocabularies = assertSweepAllergenDietRules(document.sweepAllergenDietRules, relativePath);
+
+    const classification = requireRecord(
+        document.sweepClassificationRules,
+        relativePath,
+        'sweepClassificationRules',
+    );
+    requireNonEmptyArray(classification.rules, relativePath, 'sweepClassificationRules.rules').forEach(
+        (entry, index) => {
+            const rule = requireRecord(entry, relativePath, `sweepClassificationRules.rules[${index}]`);
+            requireOneMatchField(rule, relativePath, `sweepClassificationRules.rules[${index}]`, [
+                'descriptionStartsWith',
+                'descriptionContains',
+            ]);
+            requireMember(
+                rule.category,
+                relativePath,
+                `sweepClassificationRules.rules[${index}].category`,
+                COVERAGE_CATEGORIES,
+            );
+            requireNonEmptyString(
+                rule.foodGroup,
+                relativePath,
+                `sweepClassificationRules.rules[${index}].foodGroup`,
+            );
+            optional(rule.excludeFromPublication, (present) =>
+                requireBoolean(
+                    present,
+                    relativePath,
+                    `sweepClassificationRules.rules[${index}].excludeFromPublication`,
+                ),
+            );
+            optional(rule.appendedBy, (present) =>
+                requireNonEmptyString(present, relativePath, `sweepClassificationRules.rules[${index}].appendedBy`),
+            );
+            return rule;
+        },
+    );
+    const fallback = requireRecord(classification.fallback, relativePath, 'sweepClassificationRules.fallback');
+    requireMember(fallback.category, relativePath, 'sweepClassificationRules.fallback.category', COVERAGE_CATEGORIES);
+    requireNonEmptyString(fallback.foodGroup, relativePath, 'sweepClassificationRules.fallback.foodGroup');
+    requireBoolean(
+        fallback.requiresCuratorReview,
+        relativePath,
+        'sweepClassificationRules.fallback.requiresCuratorReview',
+    );
+    requireNonEmptyString(fallback.reason, relativePath, 'sweepClassificationRules.fallback.reason');
+
+    const foodStates = requireRecord(document.sweepFoodStateRules, relativePath, 'sweepFoodStateRules');
+    requireNonEmptyArray(foodStates.rules, relativePath, 'sweepFoodStateRules.rules').forEach((entry, index) => {
+        const rule = requireRecord(entry, relativePath, `sweepFoodStateRules.rules[${index}]`);
+        requireOneMatchField(rule, relativePath, `sweepFoodStateRules.rules[${index}]`, [
+            'descriptionStartsWith',
+            'descriptionContains',
+        ]);
+        requireMember(
+            rule.foodState,
+            relativePath,
+            `sweepFoodStateRules.rules[${index}].foodState`,
+            MANIFEST_FOOD_STATES,
+        );
+        return rule;
+    });
+    const foodStateDataTypes = new Set<string>();
+    requireNonEmptyArray(
+        foodStates.datasetFallback,
+        relativePath,
+        'sweepFoodStateRules.datasetFallback',
+    ).forEach((entry, index) => {
+        const row = requireRecord(entry, relativePath, `sweepFoodStateRules.datasetFallback[${index}]`);
+        foodStateDataTypes.add(
+            requireMember(
+                row.dataType,
+                relativePath,
+                `sweepFoodStateRules.datasetFallback[${index}].dataType`,
+                USDA_DATA_TYPES,
+            ),
+        );
+        requireMember(
+            row.foodState,
+            relativePath,
+            `sweepFoodStateRules.datasetFallback[${index}].foodState`,
+            MANIFEST_FOOD_STATES,
+        );
+        return row;
+    });
+
+    const brand = requireRecord(document.sweepBrandExclusionRules, relativePath, 'sweepBrandExclusionRules');
+    const signals = requireRecord(brand.signals, relativePath, 'sweepBrandExclusionRules.signals');
+    requireNonEmptyStringArray(
+        signals.trademarkSymbols,
+        relativePath,
+        'sweepBrandExclusionRules.signals.trademarkSymbols',
+    );
+    requireNonEmptyStringArray(
+        signals.brandWordContains,
+        relativePath,
+        'sweepBrandExclusionRules.signals.brandWordContains',
+    );
+    const allCaps = requireRecord(signals.allCapsRun, relativePath, 'sweepBrandExclusionRules.signals.allCapsRun');
+    requireInteger(
+        allCaps.minimumLetters,
+        relativePath,
+        'sweepBrandExclusionRules.signals.allCapsRun.minimumLetters',
+        1,
+    );
+    // The allowlist may legitimately be empty (screen every all-caps run); its
+    // entries may not be empty strings, which would match nothing.
+    requireStringArray(
+        allCaps.allowedAllCaps,
+        relativePath,
+        'sweepBrandExclusionRules.signals.allCapsRun.allowedAllCaps',
+    );
+
+    const cost = requireRecord(document.sweepCostClassRules, relativePath, 'sweepCostClassRules');
+    const costByCategory = requireRecord(cost.byCategory, relativePath, 'sweepCostClassRules.byCategory');
+    Object.entries(costByCategory).forEach(([category, costClass]) => {
+        requireMember(
+            category,
+            relativePath,
+            `sweepCostClassRules.byCategory key ${JSON.stringify(category)}`,
+            COVERAGE_CATEGORIES,
+        );
+        requireMember(costClass, relativePath, `sweepCostClassRules.byCategory.${category}`, COST_CLASSES);
+    });
+    const costOverrides = requireRecord(
+        cost.foodGroupOverrides,
+        relativePath,
+        'sweepCostClassRules.foodGroupOverrides',
+    );
+    Object.entries(costOverrides).forEach(([foodGroup, costClass]) => {
+        requireMember(costClass, relativePath, `sweepCostClassRules.foodGroupOverrides.${foodGroup}`, COST_CLASSES);
+    });
+
+    const portionPolicy = requireRecord(document.sweepPortionPolicy, relativePath, 'sweepPortionPolicy');
+    const basis = requireRecord(portionPolicy.basisPortion, relativePath, 'sweepPortionPolicy.basisPortion');
+    requireNonEmptyString(basis.description, relativePath, 'sweepPortionPolicy.basisPortion.description');
+    requirePositiveNumber(basis.amount, relativePath, 'sweepPortionPolicy.basisPortion.amount');
+    requireNonEmptyString(basis.unit, relativePath, 'sweepPortionPolicy.basisPortion.unit');
+    requirePositiveNumber(basis.gramWeight, relativePath, 'sweepPortionPolicy.basisPortion.gramWeight');
+    requireNonEmptyString(basis.source, relativePath, 'sweepPortionPolicy.basisPortion.source');
+    requireBoolean(
+        basis.isDefaultWhenNoHouseholdPortion,
+        relativePath,
+        'sweepPortionPolicy.basisPortion.isDefaultWhenNoHouseholdPortion',
+    );
+
+    const sweepKeys = new Set<string>();
+    requireNonEmptyArray(document.datasetSweeps, relativePath, 'datasetSweeps').forEach((entry, index) => {
+        const key = assertUsdaDatasetSweep(entry, index, relativePath, { maxListPageSize }, foodStateDataTypes);
+        // A sweep key names a batch in the checkpoint and a row in the report,
+        // so two sweeps sharing one make a resumed run and its report ambiguous.
+        if (sweepKeys.has(key)) {
+            throw shapeError(relativePath, `declares datasetSweeps[${index}] under the sweepKey ${key} a second time`);
+        }
+        sweepKeys.add(key);
+    });
+
+    const fdcIds = new Set<number>();
+    const identities = new Set<string>();
+    requireNonEmptyArray(document.foods, relativePath, 'foods').forEach((entry, index) => {
+        assertUsdaManifestFood(entry, index, relativePath, vocabularies);
+
+        // Both duplicates below are curation mistakes the import would absorb
+        // rather than report: the plan keeps the first entry for an id and
+        // counts the rest under `skippedDuplicateInPlan`, so a second, different
+        // curation of one vendor record simply never takes effect. The identity
+        // pair is compared as written — normalising it is
+        // `catalog.logic.ts::normalizeCanonicalName`'s job and this module
+        // depends on nothing in `src/` — so this catches an exact repeat and the
+        // validator's near-miss cases are left to that function downstream.
+        const food = entry as Record<string, unknown>;
+        const fdcId = food.fdcId as number;
+        if (fdcIds.has(fdcId)) {
+            throw shapeError(
+                relativePath,
+                `declares ${describeFoodEntry(index, food)} under fdcId ${fdcId}, which an earlier entry already claims`,
+            );
+        }
+        fdcIds.add(fdcId);
+
+        const identity = `${String(food.canonicalName)}\u0000${String(food.foodState)}`;
+        if (identities.has(identity)) {
+            throw shapeError(
+                relativePath,
+                `declares ${describeFoodEntry(index, food)} a second time: canonicalName and foodState together are ` +
+                    'the published identity, so two entries sharing them cannot both publish',
+            );
+        }
+        identities.add(identity);
+    });
+
+    // Every member the declared type promises has now been checked against the
+    // document itself. The cross-file half — the coverage plan's categories and
+    // food groups — is the importer's, before its first vendor request.
+    return value as UsdaManifest;
+};
+
+/**
+ * Refuses `coverage-plan.v1.json` unless its MODEL AND PROMPT fields carry the
+ * shape the declared `CoveragePlan` promises, and returns it typed.
+ *
+ * Narrow on purpose, and the narrowness is the finding it closes rather than an
+ * omission. The plan's counts and bounds are consumed as numbers by code that
+ * computes with them, so a wrong type there fails where it is used; these five
+ * fields are consumed as METADATA — copied into a release manifest, logged,
+ * compared — and a wrong type there is written out and shipped instead of
+ * raising anything. Version-only loading is exactly what let
+ * `{"envVar": …, "fallbackModel": …}` be declared as `string` and reach a
+ * manifest field typed `string | null`.
+ *
+ * Verified in place and returned as-is, like `assertEvidenceAllowlistShape`, so
+ * a reviewed addition to the document still reaches the script that wants it.
+ *
+ * The rest of the plan's shape is not re-derived here: doing so would put a
+ * second copy of the policy in this module, and each consuming `*.logic.ts`
+ * parser already validates the slice it acts on.
+ */
+export const assertCoveragePlanModelShape = (value: unknown, relativePath: string): CoveragePlan => {
+    const document = requireRecord(value, relativePath, 'its top level');
+
+    // Both prompt versions are recorded as provenance on generated rows and on
+    // advisory review records, so an absent or non-string one is a run that
+    // would stamp `undefined` onto evidence.
+    requireNonEmptyString(document.promptVersion, relativePath, 'promptVersion');
+    requireNonEmptyString(document.reviewPromptVersion, relativePath, 'reviewPromptVersion');
+
+    // Optional in the type because a plan may leave a stage's model entirely to
+    // the environment; present-but-malformed is what must not pass.
+    for (const field of ['generationModel', 'reviewModel'] as const) {
+        const declared = document[field];
+        if (declared === undefined) {
+            continue;
+        }
+        const config = requireRecord(declared, relativePath, field);
+        requireNonEmptyString(config.envVar, relativePath, `${field}.envVar`);
+        requireNonEmptyString(config.fallbackModel, relativePath, `${field}.fallbackModel`);
+        if (config.fallbackEnvVar !== undefined) {
+            requireNonEmptyString(config.fallbackEnvVar, relativePath, `${field}.fallbackEnvVar`);
+        }
+    }
+
+    return value as CoveragePlan;
 };
 
 /**
@@ -1259,6 +3297,25 @@ export interface CatalogReleaseSourceDataset {
  * invoked. Writing a model name a release did not use would misattribute
  * every row in it.
  */
+/**
+ * What a release says about the models and prompts that produced the rows it
+ * carries.
+ *
+ * MEASURED FROM THE ROWS, NEVER RESTATED FROM CONFIGURATION, and the shape is
+ * what makes that checkable. Each singular field holds one value only when the
+ * release carries exactly ONE, and `null` otherwise — including when several
+ * are present, because "one of the two models that produced this release" is
+ * not an answer, and picking the greater of them was how a release came to
+ * attribute every row to one model it was not all produced by. The plural field
+ * beside it carries the COMPLETE sorted set, so a release spanning two
+ * generation runs states both rather than losing one, and an empty array is the
+ * measurement "no such call is recorded against any row in this release".
+ *
+ * `catalog-release.ts` derives every field from the exported rows' generation
+ * batches and `llm_review` records and asserts before writing that nothing here
+ * is an object; the coverage plan's model blocks are configuration and are not
+ * consulted.
+ */
 export interface CatalogReleaseModelVersions {
     readonly generation_model: string | null;
     readonly review_model: string | null;
@@ -1271,6 +3328,18 @@ export interface CatalogReleaseModelVersions {
      */
     readonly generation_prompt_version?: string | null;
     readonly review_prompt_version: string | null;
+    /**
+     * The complete measured sets, sorted. Optional: only a manifest written
+     * after these fields existed carries them, and a reader holding an older
+     * one still has the singular fields it always had.
+     */
+    readonly generation_models?: readonly string[];
+    readonly review_models?: readonly string[];
+    readonly generation_prompt_versions?: readonly string[];
+    readonly review_prompt_versions?: readonly string[];
+    /** How many exported rows each set was measured from. */
+    readonly ai_generated_foods?: number;
+    readonly reviewed_foods?: number;
 }
 
 export interface CatalogReleaseCoverageRow {
@@ -1367,8 +3436,8 @@ const readVersionField = (value: unknown, field: string): unknown =>
  * `v2` document is refused for its version, not for failing a `v1` shape — and
  * before the result is cached, so a refused document is never memoised.
  *
- * Only `loadEvidenceAllowlist` passes one; the reason that document is the
- * exception is written out above the shapes.
+ * `loadEvidenceAllowlist` and `loadUsdaManifest` pass one; the reason those two
+ * documents are the exceptions is written out above each check.
  */
 type ManifestShapeCheck<T> = (value: unknown, relativePath: string) => T;
 
@@ -1414,14 +3483,26 @@ const loadVersionedManifest = <T>(
 };
 
 export const loadCoveragePlan = (): CoveragePlan =>
-    loadVersionedManifest<CoveragePlan>(dataPath(COVERAGE_PLAN_FILE), [
-        { field: COVERAGE_PLAN_VERSION_FIELD, expected: EXPECTED_COVERAGE_PLAN_VERSION },
-    ]);
+    loadVersionedManifest<CoveragePlan>(
+        dataPath(COVERAGE_PLAN_FILE),
+        [{ field: COVERAGE_PLAN_VERSION_FIELD, expected: EXPECTED_COVERAGE_PLAN_VERSION }],
+        // The model and prompt fields are checked rather than declared: they are
+        // consumed as metadata, so a type the document does not honour is
+        // written out instead of raising anything (see the check).
+        assertCoveragePlanModelShape,
+    );
 
 export const loadUsdaManifest = (): UsdaManifest =>
-    loadVersionedManifest<UsdaManifest>(dataPath(USDA_MANIFEST_FILE), [
-        { field: USDA_MANIFEST_VERSION_FIELD, expected: EXPECTED_USDA_MANIFEST_VERSION },
-    ]);
+    loadVersionedManifest<UsdaManifest>(
+        dataPath(USDA_MANIFEST_FILE),
+        [{ field: USDA_MANIFEST_VERSION_FIELD, expected: EXPECTED_USDA_MANIFEST_VERSION }],
+        // The second loader that verifies its document rather than declaring
+        // it: this file is the import's whole policy, and a field missing from
+        // it — a category, a food state, an allergen determination — does not
+        // fail the run. It completes against a catalog that is wrong in a way no
+        // counter shows. See the note above the check.
+        assertUsdaManifestShape,
+    );
 
 export const loadSearchBenchmark = (): SearchBenchmark =>
     loadVersionedManifest<SearchBenchmark>(dataPath(SEARCH_BENCHMARK_FILE), [

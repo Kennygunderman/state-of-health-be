@@ -9,6 +9,16 @@
 // against real PostgreSQL, with an injected `now` that makes the fixture
 // clock-free — that is the first two thirds of this file.
 //
+// THE TWO PIPELINE STAGES A REQUEST CAN COLLIDE WITH ARE DRIVEN AS THEMSELVES,
+// through the exported `run*(deps)` entry points §0.9.2 names rather than
+// through a fixture that imitates their writes: `scripts/catalog-load.ts::runLoad`
+// over a real checksummed release in "the catalog release load beside a real
+// generation", and `scripts/recipes-seed.ts::runSeed` over a corpus on disk in
+// "the recipe seed stage promoting a version while a week is generated". Each
+// brings a transaction boundary the stage chooses and a set of writes no
+// per-user lock can exclude, which is the point: the week must still come out
+// whole, and the published one must be left exactly where it was.
+//
 // The CONTRACT the client is held to is decided one layer up, and the sections
 // that close this file prove it at the HTTP boundary: `mealPlanning.controller.ts` is the
 // only place a `StalePlanError` becomes `409 {error: 'stale_plan',
@@ -35,8 +45,8 @@
 //
 // WHY THIS SUITE NEEDS MORE THAN ONE CLIENT. A lock can only be observed from a
 // session that is not the one holding it, so {@link contendingClient} is a
-// second, independent `PrismaClient` — the same construction
-// `targets.service.test.ts` uses for its legacy writer. Races between two
+// second, independent `PrismaClient`, bounded to a small connection pool for
+// the reason given where it is constructed. Races between two
 // service calls do not need it: `prisma.$transaction` draws a separate
 // connection from the pool per call, so two concurrent `logPlannedMeal`s are
 // two genuine PostgreSQL sessions contending for one advisory lock. The second
@@ -49,11 +59,21 @@
 // other was refused as stale, and the database holds exactly one of these two
 // coherent states" — never an ordering. Where an ORDERING is the thing under
 // test, it is additionally driven sequentially in each order and the two
-// resulting states are compared. The only timing value anywhere is
-// {@link BLOCK_OBSERVATION_MS}, and it is not a race: it is how long a blocked
-// write is watched, paired with a counter-proof that the same write completes
-// in a fraction of it when nothing holds the lock — so the pair of assertions
-// carries the proof rather than the interval.
+// resulting states are compared.
+//
+// NO OUTCOME HERE IS INFERRED FROM AN INTERVAL. "This write is blocked" is read
+// from PostgreSQL's own wait state — an ungranted entry in `pg_locks` belonging
+// to a backend of THIS database ({@link blockedWaitTypes}) — so the proof is
+// the server's report rather than the absence of a result after a chosen
+// number of milliseconds, which on a loaded shared host says nothing either
+// way. Each such case is still paired with a counter-proof that the same call
+// is NEVER OBSERVED WAITING and settles on its own when nothing holds its lock
+// ({@link settleWithoutLockWait}), because a wait observed without that pair
+// could belong to something incidental to the transaction. The two intervals
+// that remain — {@link LOCK_WAIT_POLL_MS} and {@link LOCK_WAIT_HANG_GUARD_MS} —
+// decide nothing: one is how often the wait state is sampled, the other is a
+// hang guard that turns a mechanism which never blocks into a named failure
+// instead of a suite that stalls.
 //
 // WHAT IS ASSERTED IS WHAT THE DATABASE HOLDS. Every case re-reads
 // `meal_entries`, `meal_plan_actions`, `meal_plan_meals`, `meal_plan_days`,
@@ -82,12 +102,16 @@
 // advisory lock is per user, and the planning user dislikes the week's food
 // group, so neither user's recipes are ever eligible for the other.
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { runLoad } from '../../../scripts/catalog-load';
+import type { LoadDb, LoadDeps, LoadSummary } from '../../../scripts/catalog-load';
+import { getActiveReleaseLoad } from '../../../scripts/lib/checkpoint';
 import { loadCoveragePlan } from '../../../scripts/lib/manifest';
+import type { CatalogReleaseManifest } from '../../../scripts/lib/manifest';
 import { runSeed } from '../../../scripts/recipes-seed';
 import type { SeedDeps } from '../../../scripts/recipes-seed';
 import { PrismaClient, catalog_foods } from '../../generated/prisma';
@@ -152,17 +176,46 @@ const NOW = new Date(`${TODAY}T12:00:00.000Z`);
 const PLAN_START_DAY_KEY = addDaysToDayKey(TODAY, -1);
 
 /**
- * How long a blocked write is watched before the absence of a result is taken
- * as evidence that it is blocked.
+ * How often PostgreSQL's wait state is sampled while a contended write is
+ * watched.
  *
- * The write it watches is a short transaction that completes in a small
- * fraction of this when nothing holds its lock — which is exactly what the
- * counter-proof test asserts — so the pair of assertions is what carries the
- * proof, and this interval only has to be comfortably longer than the work.
- * It stays well inside Prisma's default five-second interactive-transaction
- * timeout, so a blocked call resumes rather than expiring.
+ * It bounds how soon a wait that has appeared is noticed, and nothing else: a
+ * wait shows up within tens of milliseconds of the blocking statement being
+ * issued, so a sample every {@link LOCK_WAIT_POLL_MS} costs one cheap catalog
+ * read per sample and never decides an outcome.
  */
-const BLOCK_OBSERVATION_MS = 500;
+const LOCK_WAIT_POLL_MS = 10;
+
+/**
+ * The hang guard on every wait-state observation, used ONLY to fail with a
+ * message rather than to prove anything.
+ *
+ * A mechanism that has stopped blocking, or a counter-proof that never
+ * commits, would otherwise stall until Jest's own timeout fired anonymously;
+ * with the guard it fails naming the wait that never appeared or the call that
+ * never settled. It is deliberately generous — this host is shared, and a slow
+ * sample is not a failed assertion — while staying inside the 20 s transaction
+ * the holders below keep open, so a guard that does fire fires before the
+ * holder's transaction expires and takes the diagnosis with it.
+ */
+const LOCK_WAIT_HANG_GUARD_MS = 15_000;
+
+/** The kinds of lock wait this suite observes; see {@link LOCK_WAIT_TYPES}. */
+type LockWaitKind = 'advisory' | 'row';
+
+/**
+ * The `pg_locks.locktype` values each kind of wait appears as.
+ *
+ * A session waiting for `pg_advisory_xact_lock` reports `advisory`. A statement
+ * waiting for a row another transaction has locked is queued behind that
+ * transaction's id and reports `transactionid`, and may hold a `tuple` lock on
+ * the contended row while it waits — so both spellings count as the same row
+ * wait rather than pinning one of PostgreSQL's two internal steps.
+ */
+const LOCK_WAIT_TYPES: Record<LockWaitKind, readonly string[]> = {
+    advisory: ['advisory'],
+    row: ['transactionid', 'tuple'],
+};
 
 /**
  * The three slot sizes that put a fixture day exactly on the plan's target
@@ -176,11 +229,59 @@ const SLOT_SIZES = {
 } as const;
 
 /**
- * A second session, so the per-user advisory lock can be held from OUTSIDE the
- * transaction under test. Query logging is not needed, so this client is
- * otherwise identical to the singleton.
+ * How many connections the second session below may open.
+ *
+ * Prisma sizes a client's pool at `cpus * 2 + 1` unless told otherwise — 25 on
+ * a 12-core runner — and this suite already holds one such pool through the
+ * singleton. An unbounded second client would therefore claim a second 25
+ * against a PostgreSQL whose `max_connections` is shared with every other
+ * suite and, on CI, every other job on the host; the cap is then reached by
+ * whichever suite happens to ask next, which reports it as
+ * `FATAL: sorry, too many clients already` far from the client that took the
+ * connections.
+ *
+ * This client only ever holds the lock — every assertion around it reads
+ * through the singleton — so one connection is enough; the rest is headroom.
+ * Exhausting the bound is an explicit `P2024` pool timeout rather than a hang,
+ * so a future concurrent use on this client fails loudly instead of being
+ * hidden by the bound.
  */
-const contendingClient = new PrismaClient();
+const CONTENDING_CLIENT_CONNECTION_LIMIT = 3;
+
+/** The ambient test datasource, bounded to {@link CONTENDING_CLIENT_CONNECTION_LIMIT}. */
+const boundedDatasourceUrl = (): string => {
+    const configured = process.env.DATABASE_URL;
+
+    if (configured === undefined || configured === '') {
+        // Unreachable through `npm test`: `jestSetup.ts` runs
+        // `assertTestDatabase()` before any module loads and refuses a run
+        // whose DATABASE_URL is missing or unusable.
+        throw new Error('DATABASE_URL is not set, so the contending client cannot be bounded');
+    }
+
+    const url = new URL(configured);
+    url.searchParams.set('connection_limit', String(CONTENDING_CLIENT_CONNECTION_LIMIT));
+
+    return url.toString();
+};
+
+/**
+ * A second session, so the per-user advisory lock can be held from OUTSIDE the
+ * transaction under test. Query logging is not needed, so this client differs
+ * from the singleton only in the connection bound above.
+ */
+const contendingClient = new PrismaClient({ datasourceUrl: boundedDatasourceUrl() });
+
+/**
+ * A THIRD session, which is neither party to any contention here: it only reads
+ * PostgreSQL's wait state.
+ *
+ * The reader has to be outside both sides of the contention to be trustworthy —
+ * the holder sits idle inside an open transaction and the waiter is, by
+ * definition, stuck — so the observation cannot be taken from either of their
+ * connections. Disconnected beside {@link contendingClient} in `afterAll`.
+ */
+const observerClient = new PrismaClient();
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -194,14 +295,122 @@ const deferred = (): { promise: Promise<void>; release: () => void } => {
     return { promise, release };
 };
 
+/** A watched operation: whether it has settled, and its eventual result. */
+interface Watched<T> {
+    readonly settled: () => boolean;
+    readonly done: Promise<T>;
+}
+
 /** Tracks whether a promise has settled, without awaiting it. */
-const watch = <T>(promise: Promise<T>): { settled: () => boolean; done: Promise<T> } => {
+const watch = <T>(promise: Promise<T>): Watched<T> => {
     let finished = false;
     const done = promise.finally(() => {
         finished = true;
     });
 
+    // A watched call is asserted on AFTER the holder has been released, so a
+    // case that fails one of the expectations in between leaves `done` to
+    // settle unobserved — and an unobserved refusal is reported by Node as an
+    // unhandled rejection, which fails whichever test happens to be running
+    // when it lands. Marking it handled here keeps a failure local to the case
+    // that caused it; `await done` still rejects for the cases that assert on
+    // a refusal.
+    void done.catch(() => undefined);
+
     return { settled: () => finished, done };
+};
+
+/**
+ * The `locktype` of every ungranted lock currently waited on in THIS database.
+ *
+ * Scoped to `current_database()` on purpose: this PostgreSQL server is shared
+ * by many clones of this repository, each with its own database, so an unscoped
+ * read of `pg_locks` would let another clone's blocked backend stand as
+ * evidence about a write in this one. The join to `pg_stat_activity` is what
+ * makes the scoping possible — `pg_locks` alone names the database only for the
+ * lock types that have one.
+ */
+const blockedWaitTypes = async (): Promise<string[]> => {
+    const rows = await observerClient.$queryRaw<{ locktype: string }[]>`
+        SELECT waited_lock.locktype AS locktype
+        FROM pg_locks waited_lock
+        JOIN pg_stat_activity waiter ON waiter.pid = waited_lock.pid
+        WHERE NOT waited_lock.granted
+          AND waiter.datname = current_database()
+    `;
+
+    return rows.map((row) => row.locktype);
+};
+
+/** How many backends of this database are waiting for a lock of one kind. */
+const blockedBackends = async (kind: LockWaitKind): Promise<number> =>
+    (await blockedWaitTypes()).filter((locktype) => LOCK_WAIT_TYPES[kind].includes(locktype)).length;
+
+/**
+ * Returns once PostgreSQL reports a backend of this database blocked on a lock
+ * of the given kind — the evidence that the call under test is WAITING, rather
+ * than the mere absence of a result after an interval.
+ *
+ * `what` names the wait that was expected and is what the failure message says
+ * never appeared, alongside every wait that was present instead: "the swap is
+ * not queued behind the row" and "the swap is queued behind something else" are
+ * different defects and the message has to tell them apart.
+ */
+const awaitLockWait = async (kind: LockWaitKind, what: string): Promise<void> => {
+    const deadline = Date.now() + LOCK_WAIT_HANG_GUARD_MS;
+
+    for (;;) {
+        if ((await blockedBackends(kind)) > 0) {
+            return;
+        }
+
+        if (Date.now() >= deadline) {
+            throw new Error(
+                `no ${kind} lock wait appeared within ${LOCK_WAIT_HANG_GUARD_MS} ms, so ${what} never blocked. ` +
+                    `Waits present in this database: ${JSON.stringify(await blockedWaitTypes())}`,
+            );
+        }
+
+        await sleep(LOCK_WAIT_POLL_MS);
+    }
+};
+
+/**
+ * Awaits a watched call while sampling the same wait state, and answers how
+ * many of those samples saw a wait of the given kind.
+ *
+ * This is the counter-proofs' half of each pair: an uncontended call settles on
+ * its own and is never seen waiting, so a zero here states positively that the
+ * wait the blocked case observed was caused by the holder rather than by
+ * anything the transaction does by itself. Nothing is required to finish inside
+ * a window — the call is awaited until it settles, and the interval is the hang
+ * guard that turns a call which never settles into a failure naming itself.
+ */
+const settleWithoutLockWait = async <T>(
+    watched: Watched<T>,
+    kind: LockWaitKind,
+    what: string,
+): Promise<number> => {
+    const deadline = Date.now() + LOCK_WAIT_HANG_GUARD_MS;
+    let samplesSeeingAWait = 0;
+
+    for (;;) {
+        if ((await blockedBackends(kind)) > 0) {
+            samplesSeeingAWait += 1;
+        }
+
+        if (watched.settled()) {
+            return samplesSeeingAWait;
+        }
+
+        if (Date.now() >= deadline) {
+            throw new Error(
+                `${what} had not settled within ${LOCK_WAIT_HANG_GUARD_MS} ms although nothing holds its lock`,
+            );
+        }
+
+        await sleep(LOCK_WAIT_POLL_MS);
+    }
 };
 
 /* ---------------------------------------------------------------------------
@@ -810,6 +1019,7 @@ beforeEach(async () => {
 afterAll(async () => {
     await truncateFeatureTables();
     await contendingClient.$disconnect();
+    await observerClient.$disconnect();
 });
 
 /* ---------------------------------------------------------------------------
@@ -910,16 +1120,22 @@ describe('the per-user advisory lock', () => {
             logPlannedMeal(USER_ID, week.plan.id, week.breakfastMeal.id, logBody(week.diaryMealId, 1), NOW),
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
+        try {
+            await awaitLockWait('advisory', 'the planned log waiting for the per-user advisory lock');
 
-        // Not merely unfinished: nothing of it is visible, because its
-        // transaction has not reached its first write.
-        expect(logging.settled()).toBe(false);
-        expect(await storedEntries()).toHaveLength(0);
-        expect(await ledgerRows()).toHaveLength(0);
-
-        lock.release();
-        await lock.held;
+            // Not merely unfinished: nothing of it is visible, because its
+            // transaction has not reached its first write.
+            expect(logging.settled()).toBe(false);
+            expect(await storedEntries()).toHaveLength(0);
+            expect(await ledgerRows()).toHaveLength(0);
+        } finally {
+            // Released in `finally`, and the holder's transaction awaited here:
+            // a failed expectation above would otherwise leave a 20 s
+            // transaction pinning the lock that every case after this one needs,
+            // and they would fail for a reason that is not theirs.
+            lock.release();
+            await lock.held;
+        }
 
         const result = await logging.done;
 
@@ -928,17 +1144,18 @@ describe('the per-user advisory lock', () => {
         expect(await planRevision(week.plan.id)).toBe(2);
     });
 
-    it('does not make it wait when nothing holds the lock', async () => {
+    it('does not make it wait when nothing holds the lock, and is never observed waiting', async () => {
         // The counter-proof. Without it the test above could pass because of
         // something incidental to the transaction rather than because of the
         // lock, and a build that had lost `withUserLock` would look exactly as
-        // correct.
+        // correct. What it asserts is not that the call finished inside some
+        // interval — that is a claim about this host's speed — but that the
+        // same call was never seen waiting for the lock and settled on its own.
         const logging = watch(
             logPlannedMeal(USER_ID, week.plan.id, week.breakfastMeal.id, logBody(week.diaryMealId, 1), NOW),
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
-
+        expect(await settleWithoutLockWait(logging, 'advisory', 'the uncontended planned log')).toBe(0);
         expect(logging.settled()).toBe(true);
         expect((await logging.done).kind).toBe('ok');
     });
@@ -950,15 +1167,17 @@ describe('the per-user advisory lock', () => {
             toggleGroceryItem(USER_ID, week.plan.id, week.lunchGroceryItem.id, { isChecked: true }, NOW),
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
+        try {
+            await awaitLockWait('advisory', 'the grocery toggle waiting for the per-user advisory lock');
 
-        expect(toggling.settled()).toBe(false);
-        expect(
-            await prisma.grocery_items.count({ where: { meal_plan_id: week.plan.id, is_checked: true } }),
-        ).toBe(0);
-
-        lock.release();
-        await lock.held;
+            expect(toggling.settled()).toBe(false);
+            expect(
+                await prisma.grocery_items.count({ where: { meal_plan_id: week.plan.id, is_checked: true } }),
+            ).toBe(0);
+        } finally {
+            lock.release();
+            await lock.held;
+        }
 
         expect((await toggling.done).item.isChecked).toBe(true);
         // A check mark is not a plan change, so the plan's revision did not move.
@@ -1880,40 +2099,87 @@ describe('a generation while an upcoming week already stands', () => {
             recipeVersionId: world.pool[0].version.id,
         });
 
-    it('refuses a second upcoming week as upcoming_exists and leaves the first one intact', async () => {
-        const world = await seedPlannableWorld();
-        const current = await seedCurrentWeek(world);
+    /**
+     * Both sequential permutations of the pair, as `[label, published, refused]`.
+     *
+     * The rule under test is about HOW MANY plans start after today, not about
+     * which dates they are, so it has to hold whichever of the two free weeks
+     * is asked for first: taking only the earlier-first permutation would leave
+     * a build that refused by comparing start dates — "a later week may not be
+     * asked for once an earlier one stands" — passing here, and the raced
+     * sibling case cannot close that gap because it permits either winner. The
+     * second permutation is the one that fails against such a build, since the
+     * refused week is the EARLIER of the two.
+     *
+     * Neither week overlaps the other or the current week (today + 7 through
+     * today + 13, and today + 14 through today + 20), so `plan_overlap` cannot
+     * fire in either permutation and `upcoming_exists` is the only refusal the
+     * contract allows.
+     *
+     * Each permutation is its own case rather than two halves of one, so the
+     * suite's `beforeEach` truncation and reseed gives the second a clean
+     * database — the same clean start the overlapping-generations describe
+     * reaches for with an inline `truncateFeatureTables()` mid-test — and a
+     * failure names the permutation that produced it.
+     */
+    const UPCOMING_PERMUTATIONS: ReadonlyArray<readonly [string, string, string]> = [
+        ['the earlier week first', FIRST_UPCOMING, SECOND_UPCOMING],
+        ['the later week first', SECOND_UPCOMING, FIRST_UPCOMING],
+    ];
 
-        expect((await generatePlan(PLANNING_USER_ID, generateBody(FIRST_UPCOMING), NOW)).kind).toBe('ok');
+    it.each(UPCOMING_PERMUTATIONS)(
+        'refuses a second upcoming week as upcoming_exists and leaves the first one intact, asked with %s',
+        async (_permutation, publishedWeek, refusedWeek) => {
+            const world = await seedPlannableWorld();
+            const current = await seedCurrentWeek(world);
 
-        const upcoming = (await plansOf(PLANNING_USER_ID)).find(
-            (plan) => dayKeyOf(plan.start_date) === FIRST_UPCOMING,
-        );
+            expect((await generatePlan(PLANNING_USER_ID, generateBody(publishedWeek), NOW)).kind).toBe(
+                'ok',
+            );
 
-        if (upcoming === undefined) {
-            throw new Error('the first upcoming week was not published');
-        }
+            const upcoming = (await plansOf(PLANNING_USER_ID)).find(
+                (plan) => dayKeyOf(plan.start_date) === publishedWeek,
+            );
 
-        const refusal = await outcomeOf(() =>
-            generatePlan(PLANNING_USER_ID, generateBody(SECOND_UPCOMING), NOW),
-        );
+            if (upcoming === undefined) {
+                throw new Error(`the upcoming week starting ${publishedWeek} was not published`);
+            }
 
-        // No id travels with this one: §0.5.2 has the client reach the standing
-        // upcoming plan through the current-plan response instead.
-        expect(refusal).toBeInstanceOf(UpcomingExistsError);
+            const refusal = await outcomeOf(() =>
+                generatePlan(PLANNING_USER_ID, generateBody(refusedWeek), NOW),
+            );
 
-        const plans = await plansOf(PLANNING_USER_ID);
+            // No id travels with this one: §0.5.2 has the client reach the
+            // standing upcoming plan through the current-plan response instead.
+            expect(refusal).toBeInstanceOf(UpcomingExistsError);
 
-        expect(plans.map((plan) => dayKeyOf(plan.start_date))).toEqual([TODAY, FIRST_UPCOMING]);
-        expect(plans.map((plan) => plan.id)).toEqual([current.id, upcoming.id]);
-        // The first upcoming week is exactly as it was published: same id, same
-        // revision, still active, still whole.
-        expect(upcoming.revision).toBe(1);
-        expect(upcoming.status).toBe(ACTIVE_PLAN);
-        expectWholeWeek(upcoming);
-        expect(await ledgerRows(PLANNING_USER_ID)).toHaveLength(1);
-        await expectOneActivePlanPerStartDate(PLANNING_USER_ID);
-    });
+            const plans = await plansOf(PLANNING_USER_ID);
+
+            // The FIRST-CREATED upcoming week is the one that stands, and the
+            // refused week left no row at all — including none for the week it
+            // asked for.
+            expect(plans.map((plan) => dayKeyOf(plan.start_date))).toEqual([TODAY, publishedWeek]);
+            expect(plans.map((plan) => plan.id)).toEqual([current.id, upcoming.id]);
+            // That week is exactly as it was published: same id, same start
+            // date, same revision, still active, still whole.
+            expect(dayKeyOf(upcoming.start_date)).toBe(publishedWeek);
+            expect(upcoming.revision).toBe(1);
+            expect(upcoming.status).toBe(ACTIVE_PLAN);
+            expectWholeWeek(upcoming);
+
+            const actions = await ledgerRows(PLANNING_USER_ID);
+
+            expect(actions).toHaveLength(1);
+            expect(actions[0]).toMatchObject({
+                action_type: 'generate',
+                response_status: 201,
+                plan_revision_after: 1,
+                meal_plan_id: upcoming.id,
+            });
+
+            await expectOneActivePlanPerStartDate(PLANNING_USER_ID);
+        },
+    );
 
     it('publishes exactly one of two upcoming weeks when they are raced', async () => {
         const world = await seedPlannableWorld();
@@ -2336,9 +2602,10 @@ describe('two swaps on one meal', () => {
  * PostgreSQL re-evaluates the waiting statement's qualification against the
  * committed row version, and the revision term is what decides the outcome:
  * with it the statement matches nothing, without it the swap overwrites the
- * foreign write and reports success. Nothing here depends on timing beyond
- * {@link BLOCK_OBSERVATION_MS}, which is only how long the blocked call is
- * watched — the counter-proof below settles inside the same window.
+ * foreign write and reports success. Nothing here depends on timing: that the
+ * swap is waiting is read from the row wait PostgreSQL reports for it
+ * ({@link awaitLockWait}), and the counter-proof below is never observed
+ * waiting at all.
  * ------------------------------------------------------------------------- */
 
 describe("a foreign write to the meal a swap is committing", () => {
@@ -2380,15 +2647,21 @@ describe("a foreign write to the meal a swap is committing", () => {
             commitSwap(USER_ID, week.plan.id, week.breakfastMeal.id, swapBody(week.alternative.id, 1), NOW),
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
+        try {
+            await awaitLockWait('row', 'the swap waiting for the meal row the foreign writer holds');
 
-        // Waiting on the row it means to write, with its transaction — and so
-        // its ledger reservation — still open and invisible.
-        expect(swapping.settled()).toBe(false);
-        expect((await mealRow(week.breakfastMeal.id)).recipe_version_id).toBe(week.breakfast.id);
-
-        foreignWriter.release();
-        await foreignWriter.held;
+            // Waiting on the row it means to write, with its transaction — and
+            // so its ledger reservation — still open and invisible.
+            expect(swapping.settled()).toBe(false);
+            expect((await mealRow(week.breakfastMeal.id)).recipe_version_id).toBe(week.breakfast.id);
+        } finally {
+            // Released in `finally`, and the foreign writer's transaction
+            // awaited here: a failed expectation above would otherwise leave a
+            // 20 s transaction holding this meal's row, and every later case
+            // that writes it would fail for a reason that is not theirs.
+            foreignWriter.release();
+            await foreignWriter.held;
+        }
 
         await expect(swapping.done).rejects.toThrow(SwapDataError);
 
@@ -2407,17 +2680,18 @@ describe("a foreign write to the meal a swap is committing", () => {
         expect(await ledgerRows()).toHaveLength(0);
     });
 
-    it('commits inside the same window when nothing reaches the meal', async () => {
+    it('commits without ever waiting for the row when nothing reaches the meal', async () => {
         // The counter-proof. Without it the case above could pass because of
         // something incidental to a blocked transaction rather than because of
         // the revision term, and a build that had dropped the term would look
-        // exactly as correct.
+        // exactly as correct. It asserts what the case above measured in the
+        // other direction: with no foreign writer, the same commit is never
+        // queued behind the row and settles on its own.
         const swapping = watch(
             commitSwap(USER_ID, week.plan.id, week.breakfastMeal.id, swapBody(week.alternative.id, 1), NOW),
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
-
+        expect(await settleWithoutLockWait(swapping, 'row', 'the uncontended swap commit')).toBe(0);
         expect(swapping.settled()).toBe(true);
         expect((await swapping.done).kind).toBe('ok');
 
@@ -2464,6 +2738,59 @@ describe('the current week and the upcoming week regenerated', () => {
     /** The week after the current one, published as a second active plan. */
     const UPCOMING_WEEK = addDaysToDayKey(TODAY, 7);
 
+    /**
+     * A week beyond the upcoming one, whose seven days overlap NO standing plan.
+     *
+     * It is what separates the second pair below from the first: the dates are
+     * free, so `plan_overlap` cannot fire and the at-most-one-upcoming rule is
+     * the only thing left that can refuse the generation — §0.9.2's "raced with
+     * `POST /plans` for a free future week → `upcoming_exists`". The upcoming
+     * plan occupies {@link UPCOMING_WEEK} (today + 7 through today + 13), so
+     * today + 14 is the first free start date.
+     */
+    const FREE_FUTURE_WEEK = addDaysToDayKey(TODAY, 14);
+
+    /** Which of the two writes is driven first in a sequential permutation. */
+    type SequentialFirst = 'regeneration' | 'generation';
+
+    /**
+     * Both sequential permutations of a regeneration-and-generation pair.
+     *
+     * A raced pair can only assert the outcome SET, so on its own it cannot
+     * show that the outcome is the contract rather than the winner of a coin
+     * toss: the assertion would hold just as well if one ordering produced a
+     * different result and the race happened never to take it. Driving the same
+     * pair each way round is what closes that gap, which is why §0.9.2 asks for
+     * the orderings as well as the race.
+     */
+    const SEQUENTIAL_ORDERINGS: ReadonlyArray<readonly [string, SequentialFirst]> = [
+        ['the regeneration first', 'regeneration'],
+        ['the generation first', 'generation'],
+    ];
+
+    /** The two writes driven one after the other, in the named order. */
+    const driveSequentially = async (
+        first: SequentialFirst,
+        regenerate: () => Promise<unknown>,
+        generate: () => Promise<unknown>,
+    ): Promise<{ regeneration: unknown; generation: unknown }> => {
+        if (first === 'regeneration') {
+            const regeneration = await outcomeOf(regenerate);
+
+            return { regeneration, generation: await outcomeOf(generate) };
+        }
+
+        const generation = await outcomeOf(generate);
+
+        return { regeneration: await outcomeOf(regenerate), generation };
+    };
+
+    /** An outcome that has to be the `ok` the contract promises, not a refusal. */
+    const expectCommitted = (outcome: unknown): void => {
+        expect(outcome).not.toBeInstanceOf(Error);
+        expect(outcome).toMatchObject({ kind: 'ok' });
+    };
+
     const seedCurrentAndUpcoming = async (world: PlannableWorld) => ({
         current: await makePlan(PLANNING_USER_ID, {
             startDate: TODAY,
@@ -2494,6 +2821,59 @@ describe('the current week and the upcoming week regenerated', () => {
         expect(plans.find((plan) => plan.id === replacedPlanId)?.status).toBe(SUPERSEDED_PLAN);
         await expectOneActivePlanPerStartDate(PLANNING_USER_ID);
         await expectIntactReplacementChains(PLANNING_USER_ID);
+
+        return replacement;
+    };
+
+    /**
+     * The ONE end state both pairs below are allowed to leave, whichever way
+     * round the two writes ran and whether they were raced or driven: the
+     * current week replaced by a whole successor, the upcoming week exactly as
+     * it was published, no third active plan, and one regeneration on record.
+     *
+     * The refused generation leaves nothing at all — it reserved its ledger row
+     * inside the transaction that then rolled back — so the single row is the
+     * regeneration's, asserted by type and by the plan it names rather than by
+     * count alone: a count of one would also be satisfied by the generation
+     * having committed and the regeneration having been refused, which is the
+     * opposite outcome.
+     */
+    const expectRegeneratedBesideUntouchedUpcoming = async (
+        current: FixtureMealPlan,
+        upcoming: FixtureMealPlan,
+    ): Promise<PlanWithMeals> => {
+        const replacement = await expectReplacementOf(current.id, TODAY);
+        const plans = await plansOf(PLANNING_USER_ID);
+        const standing = plans.find((plan) => plan.id === upcoming.id);
+
+        if (standing === undefined) {
+            throw new Error(`the upcoming plan ${upcoming.id} is no longer among the user's plans`);
+        }
+
+        // Three rows and two of them active: the replaced week, its successor
+        // and the upcoming week. A third active plan would mean the refused
+        // generation published something.
+        expect(plans).toHaveLength(3);
+        expect(plans.filter((plan) => plan.status === ACTIVE_PLAN).map((plan) => plan.id).sort()).toEqual(
+            [replacement.id, upcoming.id].sort(),
+        );
+        // The upcoming week is untouched — same id, same start date, same
+        // revision, still active, still whole — so a refusal that named it named
+        // a plan the client can still open.
+        expect(dayKeyOf(standing.start_date)).toBe(UPCOMING_WEEK);
+        expect(standing.revision).toBe(1);
+        expect(standing.status).toBe(ACTIVE_PLAN);
+        expectWholeWeek(standing);
+
+        const actions = await ledgerRows(PLANNING_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            action_type: 'regenerate',
+            response_status: 201,
+            plan_revision_after: 1,
+            meal_plan_id: replacement.id,
+        });
 
         return replacement;
     };
@@ -2543,28 +2923,96 @@ describe('the current week and the upcoming week regenerated', () => {
 
         const { fulfilled, rejected } = splitRace<unknown>(results);
 
-        // ONE documented outcome, and it is the same in both orderings rather
-        // than a coin toss: the requested week overlaps the upcoming plan,
-        // which this pair never touches, so the generation is refused against
-        // it whenever it runs — and the regeneration of a DIFFERENT week is
-        // refused by nothing.
+        // ONE documented outcome, and the case below drives the same pair each
+        // way round to show it is the contract rather than the winner of a coin
+        // toss: the requested week overlaps the upcoming plan, which this pair
+        // never touches, so the generation is refused against it whenever it
+        // runs — and the regeneration of a DIFFERENT week is refused by nothing.
         expect(fulfilled).toHaveLength(1);
         expect(rejected).toHaveLength(1);
         expect(rejected[0].reason).toBeInstanceOf(PlanOverlapError);
         expect((rejected[0].reason as PlanOverlapError).conflictingPlanId).toBe(upcoming.id);
 
-        const replacement = await expectReplacementOf(current.id, TODAY);
-        const plans = await plansOf(PLANNING_USER_ID);
-
-        expect(plans).toHaveLength(3);
-        expect(plans.filter((plan) => plan.status === ACTIVE_PLAN).map((plan) => plan.id).sort()).toEqual(
-            [replacement.id, upcoming.id].sort(),
-        );
-        // The upcoming week is untouched — same revision, still whole — so the
-        // refusal named a plan the client can still open.
-        expect(await planRevision(upcoming.id)).toBe(1);
-        expect(await ledgerRows(PLANNING_USER_ID)).toHaveLength(1);
+        await expectRegeneratedBesideUntouchedUpcoming(current, upcoming);
     });
+
+    it.each(SEQUENTIAL_ORDERINGS)(
+        'refuses that generation as plan_overlap and commits the regeneration when the two are driven with %s',
+        async (_ordering, first) => {
+            // The race above permits one outcome set; these two runs are what
+            // show it is not a coin toss. The generation asks for the upcoming
+            // week's own dates, so it collides with a plan neither write
+            // replaces, and it is refused against that plan whether it runs
+            // before or after the regeneration of the current week.
+            const world = await seedPlannableWorld();
+            const { current, upcoming } = await seedCurrentAndUpcoming(world);
+
+            const { regeneration, generation } = await driveSequentially(
+                first,
+                () => regeneratePlan(PLANNING_USER_ID, current.id, regenerateBody(1), NOW),
+                () => generatePlan(PLANNING_USER_ID, generateBody(UPCOMING_WEEK), NOW),
+            );
+
+            expectCommitted(regeneration);
+            expect(generation).toBeInstanceOf(PlanOverlapError);
+            expect((generation as PlanOverlapError).conflictingPlanId).toBe(upcoming.id);
+
+            await expectRegeneratedBesideUntouchedUpcoming(current, upcoming);
+        },
+    );
+
+    it('commits the current week’s regeneration and refuses a generation for a FREE future week as upcoming_exists', async () => {
+        const world = await seedPlannableWorld();
+        const { current, upcoming } = await seedCurrentAndUpcoming(world);
+
+        const results = await Promise.allSettled([
+            regeneratePlan(PLANNING_USER_ID, current.id, regenerateBody(1), NOW),
+            generatePlan(PLANNING_USER_ID, generateBody(FREE_FUTURE_WEEK), NOW),
+        ]);
+
+        const { fulfilled, rejected } = splitRace<unknown>(results);
+
+        // The requested week collides with nothing, so `plan_overlap` cannot
+        // be the refusal: the upcoming plan already stands as the one plan
+        // starting after today, and that is what refuses the generation —
+        // whichever order the two reached the lock in. The regeneration of the
+        // CURRENT week is refused by neither rule, because both checks exclude
+        // the plan being replaced and its own start date is not after today.
+        expect(fulfilled).toHaveLength(1);
+        expect(rejected).toHaveLength(1);
+        expect(rejected[0].reason).toBeInstanceOf(UpcomingExistsError);
+
+        await expectRegeneratedBesideUntouchedUpcoming(current, upcoming);
+        // No week was published for the free dates, so the refusal left the
+        // calendar exactly as the regeneration found it.
+        expect(
+            (await plansOf(PLANNING_USER_ID)).map((plan) => dayKeyOf(plan.start_date)),
+        ).not.toContain(FREE_FUTURE_WEEK);
+    });
+
+    it.each(SEQUENTIAL_ORDERINGS)(
+        'refuses the free future week as upcoming_exists with the same state when the two are driven with %s',
+        async (_ordering, first) => {
+            const world = await seedPlannableWorld();
+            const { current, upcoming } = await seedCurrentAndUpcoming(world);
+
+            const { regeneration, generation } = await driveSequentially(
+                first,
+                () => regeneratePlan(PLANNING_USER_ID, current.id, regenerateBody(1), NOW),
+                () => generatePlan(PLANNING_USER_ID, generateBody(FREE_FUTURE_WEEK), NOW),
+            );
+
+            expectCommitted(regeneration);
+            // No id travels with this refusal: §0.5.2 has the client reach the
+            // standing upcoming plan through the current-plan response instead.
+            expect(generation).toBeInstanceOf(UpcomingExistsError);
+
+            await expectRegeneratedBesideUntouchedUpcoming(current, upcoming);
+            expect(
+                (await plansOf(PLANNING_USER_ID)).map((plan) => dayKeyOf(plan.start_date)),
+            ).not.toContain(FREE_FUTURE_WEEK);
+        },
+    );
 });
 
 /* ---------------------------------------------------------------------------
@@ -2841,6 +3289,16 @@ describe('a recipe publication and a food retirement', () => {
      * while a week is generated" at the end of this file, which is where
      * `runSeed`'s own transaction boundary is the subject; these two rows are
      * about what a generation and a published week survive.
+     *
+     * The FOOD retirement has the same split, and for the same reason. Both
+     * rows below need a named food withdrawn at a moment they choose, so they
+     * flip `publication_status` themselves — the state a load leaves behind —
+     * while "the catalog release load beside a real generation", further down
+     * this file, races `scripts/catalog-load.ts::runLoad` over a real
+     * checksummed release and lets the STAGE decide what to retire. That block
+     * is where the reconciliation, the run ledger and the active-release
+     * pointer are the subject; these two rows are about what a generation and a
+     * published week survive once a food is gone.
      */
     const promoteVersion = async (
         standing: { id: string; recipe_id: string },
@@ -2862,7 +3320,16 @@ describe('a recipe publication and a food retirement', () => {
         });
     };
 
-    /** What a catalog load does to a food a newer release no longer contains. */
+    /**
+     * What a catalog load does to a food a newer release no longer contains,
+     * written as the single statement the stage ends up issuing.
+     *
+     * The STAGE ITSELF is raced in "the catalog release load beside a real
+     * generation" below; here the column is moved directly because both rows
+     * need a NAMED food withdrawn at a moment they choose (see this block's
+     * note above), and a release load chooses for itself from the difference
+     * between two releases.
+     */
     const retireFood = async (catalogFoodId: string): Promise<void> => {
         await prisma.catalog_foods.update({
             where: { id: catalogFoodId },
@@ -3065,6 +3532,535 @@ describe('a recipe publication and a food retirement', () => {
                 .map((alternative) => alternative.recipeVersionId)
                 .sort(),
         ).toEqual([week.alternative.id, week.secondAlternative.id].sort());
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The real catalog release load, beside a real generation
+ * ------------------------------------------------------------------------- */
+
+/**
+ * WHY THIS BLOCK EXISTS BESIDE THE DIRECT RETIREMENT ABOVE. That block flips
+ * `publication_status` itself, which is enough to prove what a generation and a
+ * published week survive once a food is gone — but it proves nothing about the
+ * STAGE that withdraws it. A release load is not one UPDATE: it verifies five
+ * members against their digests, claims a `catalog_import_runs` row, retires
+ * every published food the release no longer carries, reconciles each remaining
+ * food with its children in a transaction of its own, verifies the loaded counts
+ * against the manifest and only then closes the run `succeeded` — which is what
+ * makes it the active release. AAP §0.9.2 names this file for the catalog side of
+ * the publication race "driven through their exported `run*(deps)` entry points",
+ * and only the real `runLoad` exercises any of that.
+ *
+ * WHY `runLoad` AND NOT THE COMMAND. `scripts/catalog-load.ts` takes the graph's
+ * EXCLUSIVE `release_load` stage lock in `main`, outside `runLoad`, exactly as
+ * `src/__tests__/scripts/catalog-load.test.ts` drives it — so the call below is
+ * the stage's whole body and nothing here contends for that lock. It matters
+ * that it stays that way: `scripts/recipes-seed.ts::runSeed` now holds the same
+ * graph lock SHARED for a whole-corpus run, so wrapping this call in the
+ * exclusive lock would make the seed-stage block at the end of this file refuse
+ * with `catalog_locked` for a reason that has nothing to do with either race.
+ *
+ * WHY THE RELEASE IS DERIVED FROM THE DATABASE. A release carries the published
+ * set and nothing else, so the fixture reads the published foods this test has
+ * just seeded and writes every one of them EXCEPT the staple — which is exactly
+ * what "the newer release dropped that food" means, and it keeps the manifest's
+ * counts true of the database by construction, so every post-load count check
+ * can be asserted `ok` rather than merely reported. The digests are MEASURED
+ * from the bytes written, never asserted from a constant, so the release is only
+ * ever loaded against its own real checksums. Aliases and compositions are
+ * empty because `makeCatalogFood` writes none; the validation records are
+ * authored here, so the load's child reconciliation has real rows to INSERT and
+ * the release is not a no-op wearing a retirement.
+ *
+ * WHAT IS DELIBERATELY NOT HERE. The loader's own scenarios — a v1 load, a
+ * no-op rerun, a failure after partial progress, a tampered member, the
+ * committed 11,046-food artefact — belong to `scripts/catalog-load.test.ts` and
+ * are not repeated. The subject here is the RACE: one generation and one real
+ * load, in flight together, and what the database holds afterwards.
+ */
+describe('the catalog release load beside a real generation', () => {
+    /** The release id every case below loads. One release, one directory, one manifest. */
+    const RELEASE_ID = 'v1';
+
+    const RELEASE_MEMBER_FILES = {
+        foods: 'foods.jsonl',
+        aliases: 'aliases.jsonl',
+        portions: 'portions.jsonl',
+        components: 'components.jsonl',
+        validationRecords: 'validation-records.jsonl',
+    } as const;
+
+    /**
+     * The columns a `foods.jsonl` line states, in the order `catalog-release.ts`
+     * writes them. Restated here rather than imported because the release format
+     * is a file format: a test that read it from the loader's own constants
+     * could not fail when the two drifted apart.
+     */
+    const FOOD_LINE_COLUMNS: readonly (keyof catalog_foods)[] = [
+        'source_key',
+        'canonical_name',
+        'display_name',
+        'category',
+        'food_state',
+        'food_group',
+        'identity_source',
+        'identity_status',
+        'nutrition_provenance',
+        'publication_status',
+        'nutrition_basis',
+        'basis_amount',
+        'calories',
+        'protein_g',
+        'carbs_g',
+        'fat_g',
+        'fiber_g',
+        'density_g_per_ml',
+        'allergen_tags',
+        'allergen_status',
+        'diet_tags',
+        'is_common_dislike',
+        'cost_class',
+        'nutrition_version',
+        'metadata_version',
+        'usda_fdc_id',
+        'usda_data_type',
+        'usda_description',
+        'source_version',
+        'source_cache_key',
+        'search_text',
+        'imported_at',
+    ];
+
+    /** Directories to remove in `afterAll`, so a failing case still cleans up. */
+    const releaseRoots: string[] = [];
+
+    afterAll(() => {
+        for (const root of releaseRoots) {
+            fs.rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    /**
+     * The stage logs structurally; a test has nothing to read it with.
+     *
+     * Typed through `LoadDeps` rather than by importing the logger's own
+     * interface, for the reason the seed block states about `SeedDeps`: the only
+     * contract this fixture owes is the stage's, so taking it from the stage's
+     * own type means a method added there fails to compile here.
+     */
+    const silentStageLogger: LoadDeps['logger'] = {
+        debug: () => undefined,
+        info: () => undefined,
+        warn: () => undefined,
+        error: () => undefined,
+        child: () => silentStageLogger,
+    };
+
+    /** JSONL as the exporter writes it: one compact object per line, LF-terminated. */
+    const toJsonl = (rows: readonly Record<string, unknown>[]): string =>
+        rows.length === 0 ? '' : `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`;
+
+    const digestOf = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
+
+    /**
+     * A validation record for one food, as the release states it.
+     *
+     * Every published food in a release has one — `catalog-release.ts` refuses
+     * to export a food without it, and `manifestConsistencyGaps` refuses a
+     * manifest whose `counts.validation_records` disagrees with `counts.foods` —
+     * so the fixture authors one per exported food and the load inserts them.
+     */
+    const validationLine = (food: catalog_foods): Record<string, unknown> => ({
+        food_source_key: food.source_key,
+        canonical_identity: { canonical_name: food.canonical_name, food_state: food.food_state },
+        aliases: [],
+        category: food.category,
+        food_state: food.food_state,
+        identity_source: food.identity_source,
+        identity_status: food.identity_status,
+        nutrition_provenance: food.nutrition_provenance,
+        nutrition_method: 'usda_sr_legacy_per_100g',
+        nutrition_assumptions: [],
+        portion_units: [],
+        identity_evidence: [],
+        checks: [{ name: 'energy_vs_macros', pass: true, observed: 0, bound: 30 }],
+        llm_review: null,
+        outcome: 'accepted',
+        reviewed_at: NOW.toISOString(),
+        publication_status: 'published',
+        source_versions: { usda: 'SR Legacy 2019-04' },
+        history: [],
+    });
+
+    /**
+     * Writes a release holding every currently published food EXCEPT the ones
+     * named, with its manifest's digests measured from the bytes on disk.
+     *
+     * Read from the database rather than composed from a fixture so the
+     * manifest's counts describe the graph the load will reconcile against: a
+     * release that omitted a food nobody asked to drop would retire it too, and
+     * the count checks would then be about the fixture rather than about the
+     * load.
+     */
+    const writeReleaseDroppingFoods = async (
+        droppedFoodIds: readonly string[],
+    ): Promise<{ readonly root: string; readonly manifest: CatalogReleaseManifest }> => {
+        const dropped = new Set(droppedFoodIds);
+        const published = (
+            await prisma.catalog_foods.findMany({
+                where: { publication_status: 'published' },
+                orderBy: { source_key: 'asc' },
+                include: { catalog_food_portions: true },
+            })
+        ).filter((food) => !dropped.has(food.id));
+
+        const foodLines = published.map((food) => {
+            const line: Record<string, unknown> = {};
+            for (const column of FOOD_LINE_COLUMNS) {
+                const value = food[column];
+                line[column] = value instanceof Date ? value.toISOString() : (value ?? null);
+            }
+            // The release names a food's generation batch by its portable key and
+            // never by a local id; these fixture foods were imported, not
+            // generated, so there is no batch to name.
+            line.generation_batch_key = null;
+
+            return line;
+        });
+        const portionLines = published.flatMap((food) =>
+            [...food.catalog_food_portions]
+                .sort((left, right) => left.description.localeCompare(right.description))
+                .map((portion) => ({
+                    food_source_key: food.source_key,
+                    description: portion.description,
+                    amount: portion.amount,
+                    unit: portion.unit,
+                    gram_weight: portion.gram_weight,
+                    is_default: portion.is_default,
+                    source: portion.source,
+                })),
+        );
+        const validationLines = published.map(validationLine);
+
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), `concurrency-release-${RELEASE_ID}-`));
+        releaseRoots.push(root);
+
+        const contents: Readonly<Record<string, string>> = {
+            [RELEASE_MEMBER_FILES.foods]: toJsonl(foodLines),
+            [RELEASE_MEMBER_FILES.aliases]: '',
+            [RELEASE_MEMBER_FILES.portions]: toJsonl(portionLines),
+            [RELEASE_MEMBER_FILES.components]: '',
+            [RELEASE_MEMBER_FILES.validationRecords]: toJsonl(validationLines),
+        };
+        const rowCounts: Readonly<Record<string, number>> = {
+            [RELEASE_MEMBER_FILES.foods]: foodLines.length,
+            [RELEASE_MEMBER_FILES.aliases]: 0,
+            [RELEASE_MEMBER_FILES.portions]: portionLines.length,
+            [RELEASE_MEMBER_FILES.components]: 0,
+            [RELEASE_MEMBER_FILES.validationRecords]: validationLines.length,
+        };
+
+        for (const member of Object.values(RELEASE_MEMBER_FILES)) {
+            fs.writeFileSync(path.join(root, member), contents[member], 'utf-8');
+        }
+
+        const manifest: CatalogReleaseManifest = {
+            release_id: RELEASE_ID,
+            manifest_version: 'v1',
+            coverage_plan_version: 'v1',
+            generated_at: NOW.toISOString(),
+            produced_by: 'concurrency-suite',
+            // Measured from the bytes on disk, exactly as catalog-release.ts
+            // measures them: a digest taken from the string in memory would not
+            // describe the file the loader reads.
+            files: Object.values(RELEASE_MEMBER_FILES).map((member) => {
+                const bytes = fs.readFileSync(path.join(root, member));
+
+                return {
+                    path: member,
+                    name: member,
+                    sha256: digestOf(bytes),
+                    row_count: rowCounts[member],
+                    bytes: bytes.length,
+                };
+            }),
+            counts: {
+                foods: foodLines.length,
+                published_foods: foodLines.length,
+                aliases: 0,
+                portions: portionLines.length,
+                components: 0,
+                published_ingredient_derived: 0,
+                validation_records: validationLines.length,
+            },
+            source_datasets: [
+                {
+                    name: 'SR Legacy',
+                    version: 'SR Legacy 2019-04',
+                    retrieved_at: NOW.toISOString(),
+                    public_domain: true,
+                },
+            ],
+            model_versions: {
+                generation_model: null,
+                review_model: null,
+                prompt_version: null,
+                generation_prompt_version: null,
+                review_prompt_version: null,
+            },
+            coverage: {
+                coverage_plan_version: 'v1',
+                published_total: foodLines.length,
+                shortfall_total: 0,
+                categories: [],
+            },
+        };
+
+        fs.writeFileSync(
+            path.join(root, 'manifest.json'),
+            `${JSON.stringify(manifest, null, 2)}\n`,
+            'utf-8',
+        );
+
+        return { root, manifest };
+    };
+
+    /**
+     * The stage's dependencies, with the real Prisma client on both seams.
+     *
+     * `runDb` is the run ledger's client and `db` the graph's; production passes
+     * one client for both, and so does this, because the run row recording the
+     * load has to be there afterwards for the pointer assertion to mean
+     * anything.
+     */
+    const loadDeps = (built: {
+        readonly root: string;
+        readonly manifest: CatalogReleaseManifest;
+    }): LoadDeps => ({
+        db: prisma as unknown as LoadDb,
+        runDb: prisma,
+        release: RELEASE_ID,
+        manifest: built.manifest,
+        releaseRoot: built.root,
+        logger: silentStageLogger,
+        now: () => NOW,
+        dryRun: false,
+    });
+
+    const publicationStatusOf = async (catalogFoodId: string): Promise<string> =>
+        (
+            await prisma.catalog_foods.findUniqueOrThrow({
+                where: { id: catalogFoodId },
+                select: { publication_status: true },
+            })
+        ).publication_status;
+
+    it('reconciles the release and publishes the whole week, raced against each other', async () => {
+        const world = await seedPlannableWorld();
+        // The release the load will apply: everything published right now except
+        // the staple every pool recipe shops for, so the stage's own retirement
+        // pass is what withdraws it.
+        const built = await writeReleaseDroppingFoods([world.staple.id]);
+
+        expect(await publicationStatusOf(world.staple.id)).toBe('published');
+
+        const results = await Promise.allSettled([
+            generatePlan(PLANNING_USER_ID, generateBody(TODAY), NOW),
+            runLoad(loadDeps(built)),
+        ]);
+
+        const { fulfilled, rejected } = splitRace<unknown>(results);
+
+        // Neither side fails. The load reconciles tenant-less reference tables
+        // and takes no per-user lock; the generation reads the plannable set in
+        // one statement before its transaction opens and inserts version ids it
+        // has already read. They contend for rows, not for a lock, and
+        // PostgreSQL's row locks are enough.
+        expect(rejected).toEqual([]);
+        expect(fulfilled).toHaveLength(2);
+
+        const summary = results[1].status === 'fulfilled' ? (results[1].value as LoadSummary) : null;
+
+        if (summary === null) {
+            throw new Error('the release load was refused');
+        }
+
+        /* The load did its whole job, not just the retirement. */
+
+        // Every member verified against its own measured digest.
+        expect(summary.verification.map((member) => member.file).sort()).toEqual(
+            [...Object.values(RELEASE_MEMBER_FILES)].sort(),
+        );
+        // The stage decided what to withdraw, from the difference between the
+        // release and the graph — and the staple is the only difference there is.
+        expect(summary.retiredSourceKeys).toEqual([world.staple.source_key]);
+        expect(await publicationStatusOf(world.staple.id)).toBe(RETIRED_FOOD);
+        // The children the release declares were INSERTED, so this is a real
+        // reconciliation rather than a retirement wearing a load.
+        expect(summary.counts.validationRecordsWritten).toBe(
+            summary.counts.foodsInserted + summary.counts.foodsUpdated + summary.counts.foodsUnchanged,
+        );
+        expect(summary.counts.foodsRetired).toBe(1);
+        // Every post-load count agrees with the manifest, which is what says the
+        // graph now IS the release.
+        expect(summary.countChecks.filter((check) => !check.ok)).toEqual([]);
+        // And the run is the active release: read back through the same query
+        // GET /api/catalog/status answers with, never assumed from the close.
+        expect(summary.activated).toBe(true);
+        expect(await getActiveReleaseLoad(prisma)).toMatchObject({
+            releaseId: RELEASE_ID,
+            runId: summary.runId,
+        });
+        expect(summary.runId).not.toBeNull();
+        expect(
+            await prisma.catalog_import_runs.findUniqueOrThrow({
+                where: { id: summary.runId ?? '' },
+                select: { kind: true, manifest_version: true, status: true },
+            }),
+        ).toEqual({ kind: 'release_load', manifest_version: RELEASE_ID, status: 'succeeded' });
+
+        /* And the week came out whole, against the versions the search read. */
+
+        const published = await theOnlyPlanOf(PLANNING_USER_ID);
+
+        expectWholeWeek(published);
+        expect(published.status).toBe(ACTIVE_PLAN);
+        expect(published.revision).toBe(1);
+
+        const referenced = [...new Set(mealsOf(published).map((meal) => meal.recipe_version_id))];
+        const poolVersionIds = world.pool.map((entry) => entry.version.id);
+
+        expect(referenced.filter((versionId) => !poolVersionIds.includes(versionId))).toEqual([]);
+
+        // FK integrity across the seam: every ingredient of every planned
+        // version still resolves to a catalog food, including the one the load
+        // has just retired — retirement is a status, and `recipe_ingredients`
+        // holds a RESTRICT reference that a load may never break.
+        const ingredientFoodIds = [
+            ...new Set(
+                (
+                    await prisma.recipe_ingredients.findMany({
+                        where: { recipe_version_id: { in: referenced } },
+                        select: { catalog_food_id: true },
+                    })
+                ).map((row) => row.catalog_food_id),
+            ),
+        ];
+
+        expect(ingredientFoodIds).toContain(world.staple.id);
+        expect(
+            await prisma.catalog_foods.count({ where: { id: { in: ingredientFoodIds } } }),
+        ).toBe(ingredientFoodIds.length);
+
+        // The list is derived from exactly those versions — including a line for
+        // the withdrawn staple, which the shopper still needs this week.
+        const groceryFoodIds = (
+            await prisma.grocery_items.findMany({
+                where: { meal_plan_id: published.id, user_id: PLANNING_USER_ID },
+                select: { catalog_food_id: true },
+            })
+        ).map((row) => row.catalog_food_id);
+
+        expect([...groceryFoodIds].sort()).toEqual([...ingredientFoodIds].sort());
+        expect(groceryFoodIds).toContain(world.staple.id);
+
+        // Every planned version reads back for its owner, and the alternatives
+        // sheet still offers current versions only.
+        for (const versionId of referenced) {
+            expect((await getRecipeVersionForUser(PLANNING_USER_ID, versionId))?.versionId).toBe(
+                versionId,
+            );
+        }
+
+        const currentVersionIds = new Set(
+            (
+                await prisma.recipe_versions.findMany({
+                    where: { status: CURRENT_VERSION },
+                    select: { id: true },
+                })
+            ).map((version) => version.id),
+        );
+
+        for (const meal of published.meal_plan_days[0].meal_plan_meals) {
+            for (const alternative of await listedAlternatives(
+                PLANNING_USER_ID,
+                published.id,
+                meal.id,
+            )) {
+                expect(currentVersionIds.has(alternative.recipeVersionId)).toBe(true);
+            }
+        }
+
+        const actions = await ledgerRows(PLANNING_USER_ID);
+
+        expect(actions).toHaveLength(1);
+        expect(actions[0]).toMatchObject({
+            action_type: 'generate',
+            response_status: 201,
+            plan_revision_after: 1,
+            meal_plan_id: published.id,
+        });
+    });
+
+    it('leaves a week published before the load untouched by it', async () => {
+        const world = await seedPlannableWorld();
+        const built = await writeReleaseDroppingFoods([world.staple.id]);
+
+        // Sequential, and in this order, because the subject is what a load does
+        // to a week that ALREADY exists: the meal rows freeze their version ids
+        // at publication, so a reconciliation that rewrote any of them would be
+        // visible here and nowhere else.
+        const generated = await generatePlan(PLANNING_USER_ID, generateBody(TODAY), NOW);
+
+        if (generated.kind !== 'ok') {
+            throw new Error(`the generation was refused: ${JSON.stringify(generated)}`);
+        }
+
+        const before = await theOnlyPlanOf(PLANNING_USER_ID);
+        const mealsBefore = mealsOf(before).map((meal) => ({
+            id: meal.id,
+            recipe_version_id: meal.recipe_version_id,
+            revision: meal.revision,
+        }));
+        const groceriesBefore = await getGroceryList(PLANNING_USER_ID, before.id, NOW);
+
+        const summary = await runLoad(loadDeps(built));
+
+        expect(summary.retiredSourceKeys).toEqual([world.staple.source_key]);
+        expect(summary.activated).toBe(true);
+
+        const after = await theOnlyPlanOf(PLANNING_USER_ID);
+
+        // Not one row of the plan moved: a catalog release is not a plan write,
+        // so it bumps no revision and re-points no meal.
+        expect(after.revision).toBe(before.revision);
+        expect(
+            mealsOf(after).map((meal) => ({
+                id: meal.id,
+                recipe_version_id: meal.recipe_version_id,
+                revision: meal.revision,
+            })),
+        ).toEqual(mealsBefore);
+
+        // The list still renders, still holds its line for the withdrawn staple,
+        // and holds exactly the items it held before.
+        const groceriesAfter = await getGroceryList(PLANNING_USER_ID, after.id, NOW);
+
+        expect(groceriesAfter.totalCount).toBe(groceriesBefore.totalCount);
+        expect(
+            groceriesAfter.sections.flatMap((section) => section.items).map((item) => item.catalogFoodId),
+        ).toContain(world.staple.id);
+
+        // And the day still reads, with its planned recipe on the card.
+        const day = await getMealPlanDay(PLANNING_USER_ID, after.id, TODAY, NOW);
+
+        if (day.kind !== 'ok') {
+            throw new Error(`the day read was refused: ${JSON.stringify(day)}`);
+        }
+
+        expect(day.envelope.day.meals.length).toBeGreaterThan(0);
+        expect(day.envelope.day.meals.every((meal) => meal.recipe.versionId.length > 0)).toBe(true);
     });
 });
 
@@ -4477,16 +5473,17 @@ describe('two clients saving the same revisioned state at the boundary', () => {
  * contends with a writer its own lock cannot exclude, and this case is the proof
  * the week still comes out whole.
  *
- * WHY THE FOOD RETIREMENT IS NOT DRIVEN THROUGH `catalog-load.ts`. That stage
- * retires a food only as the DIFFERENCE BETWEEN TWO SUCCESSIVE RELEASES — two
- * directories, each with a manifest, five JSONL members and a digest per member
- * — and `src/__tests__/scripts/catalog-load.test.ts` already owns exactly that
- * scenario (a v1 → v2 upgrade retiring a food a newer release no longer
- * contains, with search and `/catalog/status` asserted against v2's manifest).
- * Reproducing its release-writing fixture here would duplicate that suite to
- * reach the one column this suite cares about, so the race above flips
- * `publication_status` directly — the state a load leaves behind — and this
- * block races the promotion, which no other suite races.
+ * WHERE THE FOOD RETIREMENT IS DRIVEN THROUGH `catalog-load.ts`. In "the
+ * catalog release load beside a real generation", earlier in this file: that
+ * block writes a real checksummed release holding every published food except
+ * the staple and races `runLoad(deps)` against a generation, so the STAGE
+ * decides what to withdraw and its verification, its child reconciliation, its
+ * run row and the active-release pointer are all asserted. The two rows in the
+ * promotion block above additionally flip `publication_status` themselves,
+ * because each needs a NAMED food withdrawn at a moment it chooses and a load
+ * chooses for itself from the difference between two releases. The loader's own
+ * scenarios — the v1 → v2 upgrade, the tampered member, the no-op rerun — stay
+ * with `src/__tests__/scripts/catalog-load.test.ts`, which owns them.
  *
  * WHY THE CORPUS IS SYNTHETIC AND TEMPORARY. The committed corpus is 42 recipes
  * against the committed release, and seeding it is `api/seed-rerun.test.ts`'s

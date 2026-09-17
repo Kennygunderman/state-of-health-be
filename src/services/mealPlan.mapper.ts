@@ -658,6 +658,11 @@ export interface PlanRow {
     id: string;
     revision: number;
     generation_attempt: number;
+    /**
+     * The idempotency key the publishing write carried, reported so a client can
+     * recognise a plan as the product of its own unresolved request.
+     */
+    generation_key: string;
     /** `@db.Date`. */
     start_date: Date;
     /** `@db.Date`. */
@@ -1068,6 +1073,7 @@ export const toMealPlanResponse = (
         id: plan.id,
         revision: plan.revision,
         generationAttempt: plan.generation_attempt,
+        generationKey: plan.generation_key,
         startDate: toDayKey(plan.start_date, 'meal_plans.start_date', plan.id),
         endDate,
         status: readPlanStatus(plan.status, plan.id),

@@ -391,9 +391,9 @@ interface RepetitionWindow {
  * the removal, the dish currently in the slot would also appear in the same-day
  * set and block its own republished version.
  *
- * BOTH NEIGHBOURS ARE PASSED AS `previousDayRecipeIds`, and the asymmetry in
- * that parameter's name is worth the sentence it takes to explain. The generator
- * walks days forward, so when it fills day *n* only day *n − 1* exists and
+ * BOTH NEIGHBOURS TRAVEL IN THE RULE'S `adjacentDayRecipeIds` ARGUMENT, and
+ * which days that is differs by caller. The generator walks days forward, so
+ * when it fills day *n* only day *n − 1* exists and
  * "never on consecutive days" needs one neighbour. A mid-week swap has TWO
  * neighbours, and the rule is symmetric — a recipe on Thursday is just as much
  * "consecutive" with Wednesday as Wednesday's is with Thursday. Passing the

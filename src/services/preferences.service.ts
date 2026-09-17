@@ -48,7 +48,7 @@ import {
     TargetRoute,
     WeightUnitPref,
 } from '../types/mealPlanning';
-import { StaleRevisionError } from './mealPlanning.errors';
+import { ReadOnlyFieldError, StaleRevisionError } from './mealPlanning.errors';
 import {
     MealPlanningTransactionClient,
     withMealPlanningTransaction,
@@ -72,6 +72,7 @@ import {
     parsePreferencesUpdateRequest,
     parseSetupStep,
     parseSetupStepRequest,
+    readOnlyFieldRefusal,
     reconcileSetupStateForRoute,
     resolveTargetRouteForBodyStep,
     resolveTargetRouteForUpdate,
@@ -82,14 +83,6 @@ import {
 import { startDateWindow } from './mealPlan.logic';
 import { PlanningPreferences, PREFERENCE_FLAG_CODES, isMealSlot } from './recipe.logic';
 import { getPlanningRecipeVersionsByIds } from './recipe.service';
-// The pure rule that decides whether a write moves the energy equation's own
-// inputs. It lives in the targets domain because the seven answers it inspects
-// are the equation's terms, and this service is the only thing that advances
-// the counter it guards — `meal_plan_preferences.estimate_inputs_revision`, a
-// write-side diagnostic. It is NOT what `TargetsResponse.stale` is derived
-// from: that is the ancestry check on `revision` (AAP §0.5.2), and
-// `targets.logic.ts::deriveTargetsResponse` is never even given this counter.
-import { estimateInputsChanged } from './targets.logic';
 
 /**
  * The IANA zone assumed when a user has no preferences row yet, or has one that
@@ -205,19 +198,6 @@ export interface PreferencesRow {
     targets_revision: number;
     confirmed_targets: unknown;
     targets_input_revision: number | null;
-    /**
-     * A WRITE-SIDE DIAGNOSTIC ONLY, and NOT the counter behind
-     * `TargetsResponse.stale` — `revision`, below, is. This one is advanced by
-     * this service alone, and only when one of the seven answers the energy
-     * equation actually reads changes value (`targets.logic.ts`'s
-     * `ESTIMATE_INPUT_COLUMNS`, via `estimateInputsChanged`), so it records when
-     * a user's calculable details last moved. That is a different question from
-     * whether a confirmed figure still matches the answers on file, which is
-     * what staleness asks. No query reads it:
-     * `targets.logic.ts::TargetsPreferencesRow` does not carry the column, so
-     * `deriveTargetsResponse` cannot reach it even by accident.
-     */
-    estimate_inputs_revision: number;
     /**
      * THE SINGLE INPUT-ANCESTRY COUNTER, advanced by every preference save of
      * any kind — diet, allergens, dislikes, schedule, budget, review date, unit
@@ -762,15 +742,100 @@ interface PlanFlagRecomputation {
     changed: boolean;
 }
 
+/** One meal whose recomputed verdict differs from the one stored on it. */
+interface MealFlagWrite {
+    id: string;
+    flags: readonly MealFlag[];
+}
+
+/**
+ * Writes every changed verdict of ONE plan in ONE statement.
+ *
+ * `UPDATE … FROM (VALUES …)` rather than a statement per meal: a preference
+ * save recomputes the current and upcoming weeks under the per-user advisory
+ * lock, so the per-meal form cost up to 56 sequential round trips while every
+ * other write of that user waited behind them. The set is known before the
+ * first write — `recomputePlanFlags` computes all the verdicts in memory — so
+ * there is nothing to learn from doing them one at a time.
+ *
+ * NOTHING IS INTERPOLATED. Each id and each flag document is a bound parameter
+ * carried by `Prisma.sql`, which matters beyond hygiene here: a flag's details
+ * include catalog display names that reached the row through the user's own
+ * dislike selection, so this statement handles user-influenced text.
+ *
+ * THE OWNER AND PARENT PREDICATES STAY IN THE STATEMENT (Rule
+ * backend-architecture §5.1, AAP §0.5.1). The ids come from a read that was
+ * already scoped to `{meal_plan_id, user_id}`, and that is precisely why they
+ * are repeated: a write predicated on ids alone would be correct only for as
+ * long as the read above it stays correct, which is the coupling the rule
+ * exists to forbid.
+ *
+ * THE AFFECTED COUNT IS VERIFIED. `$executeRaw` reports how many rows the
+ * predicate matched; anything but one per change means a meal the read
+ * returned was excluded by the owner or parent column, which would leave the
+ * plan half-recomputed and its audit record describing meals that were never
+ * written. That is a broken invariant rather than a recoverable condition, so
+ * it throws and takes the whole transaction — the preference write included —
+ * down with it.
+ */
+const writeMealFlags = async (
+    tx: MealPlanningTransactionClient,
+    userId: string,
+    planId: string,
+    writes: readonly MealFlagWrite[],
+): Promise<void> => {
+    if (writes.length === 0) {
+        // The caller owns the "did anything move" decision. An empty set would
+        // emit `VALUES ()`, which is a syntax error rather than a no-op, so the
+        // rule is stated here instead of being left to the SQL.
+        throw new Error('flag recomputation was asked to write an empty change set');
+    }
+
+    const rows = writes.map(
+        (write) => Prisma.sql`(${write.id}::uuid, ${JSON.stringify(write.flags)}::jsonb)`,
+    );
+
+    const affected = await tx.$executeRaw(Prisma.sql`
+        UPDATE meal_plan_meals AS m
+        SET flags = v.flags
+        FROM (VALUES ${Prisma.join(rows)}) AS v(id, flags)
+        WHERE m.id = v.id
+            AND m.user_id = ${userId}
+            AND m.meal_plan_id = ${planId}::uuid
+    `);
+
+    if (affected !== writes.length) {
+        throw new Error(
+            `flag recomputation matched ${affected} of ${writes.length} changed meals on plan ${planId}`,
+        );
+    }
+};
+
 /**
  * Recomputes one active plan's meal flags.
  *
  * Every predicate carries `user_id` AND the parent id — `{meal_plan_id,
- * user_id}` for the read, `{id, user_id, meal_plan_id}` for each write
- * (Rule §5.1, AAP §0.5.1). `updateMany` rather than `update` precisely so the
- * full predicate can be expressed: `update` would need a unique key and would
- * become an id-only write after a separate ownership read, which is the pattern
- * the rule forbids.
+ * user_id}` for the read, and `m.id = v.id AND m.user_id = … AND
+ * m.meal_plan_id = …` for the write (Rule §5.1, AAP §0.5.1). There is no
+ * id-only write here and no ownership read standing in for one: the owner and
+ * parent columns are part of the same statement that changes the rows.
+ *
+ * THE CHANGED MEALS ARE WRITTEN IN ONE STATEMENT PER PLAN, not one per meal.
+ * A save recomputes the current and the upcoming week — up to 56 four-slot
+ * meals — while holding the per-user advisory lock, so a statement per changed
+ * meal meant up to 56 sequential round trips inside the lock, serialising every
+ * other write of that user behind the network time of all of them. The verdicts
+ * are computed in memory first and applied as a single
+ * `UPDATE … FROM (VALUES …)`, which is one round trip whatever the plan's size.
+ *
+ * It is built with `Prisma.sql`/`Prisma.join`, so every id and every flag
+ * document travels as a BOUND PARAMETER — nothing is interpolated into SQL
+ * text, including the values that originate in the user's own preference
+ * answers (a dislike detail carries a catalog food's display name).
+ * `$executeRaw` returns the affected row count, which must equal the number of
+ * changed meals: a smaller count means the owner or parent predicate excluded a
+ * row the read had returned, which would leave a plan half-recomputed, so it
+ * fails the transaction rather than commits it.
  *
  * The recipe versions come from `recipe.service.ts` — the single owner of recipe
  * reads — as the eligibility input, so the snapshot rule and the closed-set
@@ -804,7 +869,7 @@ const recomputePlanFlags = async (
 
     const flaggedMealIds: string[] = [];
     const codes = new Set<MealFlagCode>();
-    let changed = false;
+    const movedFlags: MealFlagWrite[] = [];
 
     for (const meal of meals) {
         const recipe = versions.get(meal.recipe_version_id);
@@ -816,11 +881,10 @@ const recomputePlanFlags = async (
         const flags = evaluateMealAgainstPreferences({ slot: meal.slot, recipe }, preferences);
 
         if (!sameFlags(readStoredFlags(meal.flags), flags)) {
-            await tx.meal_plan_meals.updateMany({
-                where: { id: meal.id, user_id: userId, meal_plan_id: planId },
-                data: { flags: asJsonValue(flags) },
-            });
-            changed = true;
+            // Collected rather than written here: one statement for the whole
+            // plan, below. The meals' own `revision` is deliberately untouched
+            // — flags are derived state, not a change to what was planned.
+            movedFlags.push({ id: meal.id, flags });
         }
 
         if (flags.length > 0) {
@@ -832,7 +896,11 @@ const recomputePlanFlags = async (
         }
     }
 
+    const changed = movedFlags.length > 0;
+
     if (changed) {
+        await writeMealFlags(tx, userId, planId, movedFlags);
+
         // `meal_plans.incompatibility_flags` IS AN AUDIT RECORD AND NEVER THE
         // SOURCE OF TRUTH. `MealPlanResponse.hasIncompatibilities` is derived
         // from the MEALS' flags, and the affected-meals response lists the meals
@@ -921,10 +989,11 @@ const recomputeActivePlanFlags = async (
 /* ---------------------------------------------------------------------------
  * The write side — one transaction, lock first
  *
- * A REFUSAL LEAVES THIS FILE IN ONE OF TWO WAYS, and the split is the
- * difference between "fix these fields" and "you are writing against a row that
- * has moved". Neither way picks a status code: each carries the data the client
- * acts on and the controller maps it (Rule backend-architecture §8).
+ * A REFUSAL LEAVES THIS FILE IN ONE OF THREE WAYS, and the split is the
+ * difference between "fix these fields", "these keys are not yours to write"
+ * and "you are writing against a row that has moved". None of them picks a
+ * status code: each carries the data the client acts on and the controller maps
+ * it (Rule backend-architecture §8).
  *
  *  * A FIELD-LEVEL REFUSAL IS RETURNED, carrying every offending field.
  *    `parseSetupStep` and `parsePreferencesUpdate` accumulate one
@@ -932,11 +1001,14 @@ const recomputeActivePlanFlags = async (
  *    per server-owned or unknown key — and answer with the whole list, which is
  *    precisely the `400 invalid_request` body with `details: [{field, code}]`
  *    the contract declares and the wizard needs in order to mark every bad
- *    input at once. An exception can carry one field, so throwing would discard
- *    the rest and cost a client three round trips to learn what it sent wrong;
- *    `mealPlanning.errors.ts` states the same conclusion from the other side
- *    ("Field-level validation has no class at all"), and `ReadOnlyFieldError`
- *    remains available to a caller that genuinely has a single field to report.
+ *    input at once. A mixed body therefore keeps travelling as a value: the
+ *    read-only key and the out-of-range age come back together.
+ *  * A BODY WHOSE ONLY PROBLEM IS SERVER-OWNED OR UNKNOWN KEYS IS THROWN as
+ *    `ReadOnlyFieldError` by {@link refuseRequestStage}, which is the raise path
+ *    the AAP's error inventory pairs with the controller's existing
+ *    `read_only_field` mapping. The class carries the whole detail list, so the
+ *    body on the wire is the same one the returned verdict produces — nothing
+ *    is narrowed by throwing, which is what makes the class usable here at all.
  *  * A STALE REVISION IS THROWN as `StaleRevisionError`, in the one-counter
  *    form the preference routes own (`StaleRevisionCounterErrorData`); the
  *    two-counter form belongs to the plan routes, which pin two inputs at once.
@@ -952,9 +1024,10 @@ const recomputeActivePlanFlags = async (
 /**
  * The outcome of either save: the response, or the field-level refusal verbatim.
  *
- * A stale revision is deliberately absent from this union — it leaves as an
- * exception — so a caller that has an `ok` or an `error` in hand has already
- * been told everything a 200 or a 400 needs.
+ * The two thrown refusals above — a stale revision, and a body whose only
+ * problem is keys the client may not write — are deliberately absent from this
+ * union, so a caller holding an `ok` or an `error` has already been told
+ * everything a 200 or a 400 needs.
  */
 export type SavePreferencesResult =
     | { kind: 'ok'; response: PreferencesSaveResponse }
@@ -973,6 +1046,41 @@ const refuse = (refusal: PreferenceRefusal): PreferenceErrorVerdict => {
     }
 
     return refusal;
+};
+
+/**
+ * The request stage's refusal, delivered as the error contract declares it.
+ *
+ * A verdict whose details are EXCLUSIVELY `read_only_field` is precisely the
+ * condition {@link ReadOnlyFieldError} names — a body that tried to write
+ * server-owned or unknown keys (AAP §0.5.2) — so it leaves as that class rather
+ * than as a value. That is what gives the planned class a raise path to match
+ * the status mapping the controller already holds; before this, nothing
+ * constructed it. The class carries the WHOLE list, so the wire body is
+ * identical to the returned verdict's: a client sending three server-owned keys
+ * still learns about three in one round trip.
+ *
+ * A MIXED verdict is RETURNED — a read-only key beside an out-of-range age
+ * stays one 400 naming both (AAP §0.7.4). Throwing for the read-only half would
+ * either drop the field details or need a second class for "read-only and other
+ * things", and the returned verdict already answers exactly what the screen
+ * must show at once.
+ *
+ * Which refusals qualify is `readOnlyFieldRefusal`'s call, in the pure layer,
+ * because the HTTP boundary asks the same question of the same request-stage
+ * verdict before this service is reached: one predicate, so the route and every
+ * other caller of these saves cannot classify the same body differently.
+ *
+ * Shared by both saves, so the two cannot drift on which refusal throws.
+ */
+const refuseRequestStage = (verdict: PreferenceErrorVerdict): PreferenceErrorVerdict => {
+    const readOnlyDetails = readOnlyFieldRefusal(verdict);
+
+    if (readOnlyDetails !== null) {
+        throw new ReadOnlyFieldError(readOnlyDetails);
+    }
+
+    return verdict;
 };
 
 /** The revision a freshly created row carries, so the client's next write can pin it. */
@@ -1349,8 +1457,16 @@ const stepContext = (row: PreferencesRow | null): SetupStepContext => ({
  * A row that exists but whose status is unreadable is treated as `in_progress`,
  * the same cautious reading the DTO applies — and `nextSetupState` is monotonic,
  * so it can only move forward from there.
+ *
+ * EXPORTED for `targets.service.ts`, which advances the manual route's resume
+ * marker when a manual target is confirmed (AAP §0.7.4): the manual target
+ * screen saves through the targets endpoint rather than as a setup step, so
+ * that transition is computed there and it must be computed from the SAME
+ * snapshot this module builds. A second mapping of the row's columns would be a
+ * second answer to "where does setup stand", and the two would drift the first
+ * time a column's vocabulary changed.
  */
-const setupStateOf = (row: PreferencesRow | null): SetupStateSnapshot => ({
+export const setupStateOf = (row: PreferencesRow | null): SetupStateSnapshot => ({
     setupStatus:
         row === null ? 'not_started' : (asMember(SETUP_STATUSES, row.setup_status) ?? 'in_progress'),
     setupStep: row === null ? null : asMember(SETUP_STEPS, row.setup_step),
@@ -1369,45 +1485,6 @@ const setupStateOf = (row: PreferencesRow | null): SetupStateSnapshot => ({
             row === null ? null : asNumericMember(COOKING_TIME_LIMITS, row.cooking_time_limit_min),
     },
 });
-
-/**
- * The `estimate_inputs_revision` this write leaves behind, or `undefined` when
- * it moves none of the estimate's inputs.
- *
- * `undefined` is Prisma's "do not write this column", so an unrelated save
- * leaves the counter exactly where it stood — and that is the whole point. The
- * column is a WRITE-SIDE DIAGNOSTIC whose only job is to stay truthful about the
- * equation's own inputs: it must answer "when did this user's calculable details
- * last move?", so a diet, allergy, dislike, schedule, budget, review-date,
- * unit-preference or time-zone edit has to leave it alone, none of those answers
- * being a term the equation reads. On creation `undefined` falls through to the
- * column's own `DEFAULT 0`.
- *
- * STALENESS IS NOT DECIDED HERE, and moving this counter cannot affect it.
- * `TargetsResponse.stale` is the ancestry check AAP §0.5.2 defines —
- * `targets_input_revision` against the preferences `revision` — so it is the
- * `revision` bump that every save carries, on the same statement as this write,
- * that makes a confirmed estimate stale, whatever the save touched.
- * `deriveTargetsResponse` is not given this counter at all.
- *
- * The decision is `targets.logic.ts::estimateInputsChanged` — a pure, tested
- * rule read in Prisma's own write semantics (absent or `undefined` is not a
- * write; an explicit `null` is a clear; an identical value is not a change), so
- * this service only turns its verdict into the next value. Nothing here writes
- * `targets_input_revision`: that column belongs to `targets.service.ts`, which
- * is the single canonical target writer, and each counter keeping exactly one
- * writer is what stops the two drifting.
- */
-const nextEstimateInputsRevision = (
-    current: PreferencesRow | null,
-    writes: PreferenceColumnWrites,
-): number | undefined => {
-    if (!estimateInputsChanged(current, writes)) {
-        return undefined;
-    }
-
-    return current === null ? FIRST_REVISION : current.estimate_inputs_revision + 1;
-};
 
 /**
  * The freshly stored revision, read for the one purpose of telling a client
@@ -1444,9 +1521,15 @@ const staleRevisionAfterLostWrite = async (
  *     malformed meal time — are answered as one `400 invalid_request` before
  *     Prisma is touched, which is what AAP §0.5.2's "validation applied before
  *     any Prisma or planning work" requires. Previously all of it reached the
- *     database first. Where a rule that needs the row was also applicable, this
- *     stage yields rather than answer with fewer details than the screen must
- *     show at once — see `parseSetupStepRequest`.
+ *     database first. A REFUSAL HERE ENDS THE REQUEST: `loadPreferencesRow` is
+ *     below this guard and never runs for a body the request stage has already
+ *     refused. It used to run even then, whenever a row-dependent coherence
+ *     rule was also applicable, so that the 400 could carry that rule's detail
+ *     too — an authenticated read per malformed attempt, for a body no stored
+ *     row could make valid. The deferred detail arrives on the client's next
+ *     attempt instead, once the request-only errors are fixed. `needs_context`
+ *     marks the clean requests one of those rules still applies to, and reads
+ *     the row exactly as `ok` does — see `parseSetupStepRequest`.
  *  2. THE UNLOCKED PARSE, against the row as it stands. This is what keeps a
  *     client sending nonsense from taking the user's advisory lock and
  *     serialising their real writes behind it, and it reports every field-level
@@ -1482,10 +1565,13 @@ export const saveSetupStep = async (
 ): Promise<SavePreferencesResult> => {
     const requestOnly: PreferenceRequestVerdict = parseSetupStepRequest(step, body);
 
-    if (requestOnly.kind !== 'ok') {
-        return requestOnly;
+    if (requestOnly.kind === 'error') {
+        return refuseRequestStage(requestOnly);
     }
 
+    // `ok` and `needs_context` both continue: the revision comparison needs the
+    // row in either case, and `needs_context` only adds that a coherence rule
+    // has a verdict to contribute once it is read.
     const preflight = parseSetupStep(step, body, stepContext(await loadPreferencesRow(userId)));
 
     if (preflight.kind !== 'ok') {
@@ -1535,7 +1621,6 @@ export const saveSetupStep = async (
                         setup_step: transition.setupStep,
                         target_route: transition.targetRoute,
                         revision: FIRST_REVISION,
-                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
                         ...columns.writes,
                     },
                 });
@@ -1561,10 +1646,6 @@ export const saveSetupStep = async (
                         setup_step: transition.setupStep,
                         target_route: transition.targetRoute,
                         revision: current.revision + 1,
-                        // Advanced only by a real change to goal, pace, age,
-                        // height, weight, sex or activity — see
-                        // `nextEstimateInputsRevision`.
-                        estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
                         ...columns.writes,
                     },
                 });
@@ -1721,12 +1802,15 @@ const updateContext = (row: PreferencesRow | null): PreferencesUpdateContext => 
  * is reconciled ({@link reconcileSetupStateForRoute}) when — and only when —
  * that route changed, because the two routes require different steps.
  *
- * SERVER-OWNED KEYS COME BACK AS `read_only_field` DETAILS, and this file does
- * not throw `ReadOnlyFieldError` for them. `parsePreferencesUpdate` reports
- * EVERY offending key in one verdict, and an exception could only carry the
- * first — so a client sending three server-owned keys would need three round
- * trips to learn what it sent wrong. The class stays available for a caller that
- * has a single field to report; this path has a list.
+ * SERVER-OWNED KEYS LEAVE AS `ReadOnlyFieldError`, thrown by
+ * {@link refuseRequestStage} the moment the request stage has judged the body —
+ * before any Prisma work, exactly where the refusal is decided. The class
+ * carries the whole `read_only_field` detail list, so throwing narrows nothing:
+ * the controller maps it to the same `400 {error: 'invalid_request', details}`
+ * the returned verdict produces, and a client sending three offending keys
+ * learns about three at once. A body that gets a read-only key AND a field rule
+ * wrong keeps travelling as the verdict, because that single 400 must name
+ * every offending control (AAP §0.7.4).
  *
  * THE SETUP STATE MACHINE IS NEVER ADVANCED, AND NO ROW IS CREATED. A full save
  * is a settings edit rather than a wizard step: it never moves `setupStep`
@@ -1752,10 +1836,13 @@ export const savePreferences = async (
 ): Promise<SavePreferencesResult> => {
     const requestOnly: PreferenceRequestVerdict = parsePreferencesUpdateRequest(body);
 
-    if (requestOnly.kind !== 'ok') {
-        return requestOnly;
+    if (requestOnly.kind === 'error') {
+        return refuseRequestStage(requestOnly);
     }
 
+    // As in `saveSetupStep`: the row read sits BELOW the refusal, so a partial
+    // already known to be unstorable costs no query, while `needs_context` —
+    // one of the four pair rules is applicable — proceeds exactly as `ok` does.
     const preflight = parsePreferencesUpdate(body, updateContext(await loadPreferencesRow(userId)));
 
     if (preflight.kind !== 'ok') {
@@ -1829,15 +1916,11 @@ export const savePreferences = async (
                 where: { user_id: userId, revision: current.revision },
                 data: {
                     time_zone: timeZone,
-                    revision: current.revision + 1,
                     // What flips `TargetsResponse.stale` for a confirmed
-                    // estimate is the `revision` bump on the line above, which
-                    // this save carries whatever it edited (AAP §0.5.2 compares
-                    // `targets_input_revision` against it). This counter is a
-                    // write-side diagnostic: it advances only where a settings
-                    // edit moves an estimate input, and no query reads it — see
-                    // `nextEstimateInputsRevision`.
-                    estimate_inputs_revision: nextEstimateInputsRevision(current, columns.writes),
+                    // estimate is this `revision` bump, which the save carries
+                    // whatever it edited (AAP §0.5.2 compares
+                    // `targets_input_revision` against it).
+                    revision: current.revision + 1,
                     ...(targetRoute === undefined ? {} : { target_route: targetRoute }),
                     ...(reconciliation === undefined
                         ? {}

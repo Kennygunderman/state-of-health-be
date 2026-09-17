@@ -24,11 +24,15 @@
 //
 //  * THE CLOSED VALUE SETS ARE ENFORCED HERE OR NOWHERE. `publication_status`,
 //    `identity_source`, `identity_status`, `nutrition_provenance`,
-//    `food_state`, `nutrition_basis`, `allergen_status` and the grocery
-//    `category` are plain TEXT columns with no Prisma enum and no CHECK
-//    constraint, precisely so that validation lives in this file. A value this
-//    module admits reaches the database unchallenged, which is why the guards
-//    below are exported and why the tiering introduces no new status.
+//    `food_state`, `nutrition_basis`, `allergen_status`, the members of
+//    `allergen_tags` and `diet_tags`, and the grocery `category` are plain TEXT
+//    (or `TEXT[]`) columns with no Prisma enum and no CHECK constraint,
+//    precisely so that validation lives in this file. A value this module
+//    admits reaches the database unchallenged, which is why the guards below
+//    are exported and why the tiering introduces no new status. The two tag
+//    vocabularies are the sharpest case: they are SAFETY metadata the planner
+//    matches by code, so a value outside them excludes nothing rather than
+//    failing anywhere.
 //
 //  * VERDICTS ARE RETURNED, NOT THROWN. A validation answer is a `checks[]`
 //    record — one `{name, pass, observed, bound, tier}` entry per rule — and an
@@ -434,6 +438,31 @@ export const CATALOG_CHECK_NAMES = {
      * audit record would claim the check observed nothing.
      */
     NON_FINITE_COMPUTED_VALUE: 'non_finite_computed_value',
+    /**
+     * An `allergen_tags` or `diet_tags` entry outside
+     * {@link CATALOG_ALLERGEN_TAGS} / {@link CATALOG_DIET_TAGS} — including a
+     * blank string and an entry that is not a string at all.
+     *
+     * Reject tier, because an off-vocabulary code is not a fact waiting for
+     * more data: both lists are SAFETY metadata matched by code (the planner
+     * excludes on the user's selected allergens, `recipe.logic.ts` derives diet
+     * compatibility from the ingredient tags), so a code no consumer can match
+     * is silently equivalent to claiming no allergen and no diet at all. That
+     * is the unsafe direction, and it is the direction a stored value would
+     * keep failing in on every re-validation.
+     */
+    UNKNOWN_TAG_CODE: 'unknown_tag_code',
+    /**
+     * A diet claim the food's own allergen list contradicts, under
+     * {@link CATALOG_DIET_TAG_EXCLUSIONS}.
+     *
+     * Reject tier for the same reason as `macro_mass_ceiling`: the record
+     * cannot be true as written. A food carrying `milk` is not vegan, whichever
+     * of the two lists is wrong, and no later data makes both right — so it is
+     * rejected rather than held, and rejection returns before the review branch
+     * so no curator allowlist and no advisory model answer can publish it.
+     */
+    INCONSISTENT_TAG_SET: 'inconsistent_tag_set',
 
     /** A per-serving record whose serving has no sourced gram weight. */
     MISSING_GRAM_WEIGHT: 'missing_gram_weight',
@@ -485,6 +514,8 @@ const CHECK_TIERS: Readonly<Record<CatalogCheckName, CatalogCheckTier>> = {
     empty_component_set: 'reject',
     invalid_component_quantity: 'reject',
     non_finite_computed_value: 'reject',
+    unknown_tag_code: 'reject',
+    inconsistent_tag_set: 'reject',
 
     missing_gram_weight: 'quarantine',
     missing_density: 'quarantine',
@@ -1038,6 +1069,290 @@ export const parseCatalogSearchRequest = (query: unknown): ParsedCatalogSearchRe
     }
 
     return { kind: 'ok', q: parsedQuery.q, page: parsedPage.page, limit: parsedPage.limit };
+};
+
+/* ---------------------------------------------------------------------------
+ * The search relevance policy
+ * ------------------------------------------------------------------------- */
+
+/**
+ * How much each kind of match contributes to a food's relevance score, and the
+ * ceiling of the prefix band.
+ *
+ * WHY THIS POLICY EXISTS AT ALL. `ts_rank` alone does not rank this catalog.
+ * Its default normalisation scores a document by term frequency and ignores
+ * document length, and a catalog food mentions any given word about once — so
+ * an entire match set collapses onto ONE rank value. Measured against the v1
+ * release: `q = 'salt'` matches 595 published foods and
+ * `count(DISTINCT ts_rank(search_vector, plainto_tsquery('english','salt')))`
+ * over them is exactly **1**. With every rank equal, the order is decided
+ * entirely by the tiebreakers below it — `display_name`, i.e. alphabetical byte
+ * order, which is uncorrelated with relevance. That is why "Salt" ranked 463rd
+ * of 602 for "salt" and "Chicken breast" 265th of 674 for "chicken", and why
+ * the §0.7.3 relevance bar (top-3 ≥ 90 %, top-10 ≥ 97 %) was missed at
+ * 62.2 % / 80.3 %.
+ *
+ * WHAT THE POLICY CHANGES, AND WHAT IT DELIBERATELY DOES NOT. It changes only
+ * the VALUE of `rank`. `catalog.service.ts` still ranks a food by
+ * `MAX(rank) … GROUP BY id` over the same four contribution branches and still
+ * orders by `rank DESC, display_name COLLATE "C" ASC, source_key COLLATE "C"
+ * ASC` (§0.5.2, §0.7.1, and the `ordering` contract in
+ * `data/meal-planning/search-benchmark.v1.json`). No key is added, removed or
+ * reordered; the score simply discriminates, which is the only way both of
+ * those AAP statements can hold at once.
+ *
+ * THE THREE SIGNALS, each of which fixes a measured failure:
+ *
+ *  1. SPECIFICITY — a food's score is divided by the number of
+ *     whitespace-separated WORDS in its own `display_name`. Among foods that
+ *     all match, the one whose NAME is most nearly the query wins: "Spinach"
+ *     (1 word) outranks "Spinach, NS as to form, cooked" (6). The divisor
+ *     counts words and not tsvector lexemes on purpose — a lexeme count drops
+ *     English stopwords, so "Rice with raisins" would count 2 against "Brown
+ *     rice, dry"'s 3 and the vaguer name would win `q = 'rice'`; see
+ *     `wordCountOf` in `catalog.service.ts`, which also records what the
+ *     lexeme-count variant measured. The divisor is the name and not
+ *     `search_text` precisely because `search_text` bundles aliases, state and
+ *     food group, so a well-curated generic food carries MORE words there than
+ *     a verbose USDA survey name does — normalising on the bundle rewards the
+ *     verbose row, which is the opposite of what a user wants.
+ *  2. FIELD — a match in the food's own name counts fully; a match only in the
+ *     bundled `search_text` (a state word, a food-group word, a descriptor)
+ *     counts at {@link SearchRelevanceWeights.textOnly}. An alias is an
+ *     ALTERNATIVE NAME and so counts fully too, which is what keeps
+ *     "eggplant" → "Aubergine" reachable — but its divisor is the LONGER of the
+ *     alias and the food's display name, `GREATEST(alias words, name words)`,
+ *     rather than either one alone. Both halves of that are load-bearing, and
+ *     each was measured:
+ *       * not the alias's own length, because the one-word alias "chickens" on
+ *         "Chicken, NS as to part and cooking method, NS as to skin eaten"
+ *         then scored 0.06079 and beat "Chicken breast" on its own name at
+ *         0.03040 — short aliases hijacked every category query;
+ *       * not the food's name alone either, because a one-word name with a
+ *         longer alias then inherited the short divisor: "Egg", carrying the
+ *         alias "chicken egg", took first place for `q = 'chicken'`.
+ *     Taking the maximum makes a food's alias contribution no more specific
+ *     than the longer of the two strings it is claimed on.
+ *  3. HEAD NOUN — in English a nominal compound's head is its last noun, and it
+ *     is what the food IS; everything before it modifies. A query matching the
+ *     head noun of the name ("Brown rice, dry" for "rice") therefore counts
+ *     fully, a query that only modifies ("Bread, rice" — a bread) counts at
+ *     {@link SearchRelevanceWeights.headSegment} when it at least appears in
+ *     the head segment, and at {@link SearchRelevanceWeights.outsideHead} when
+ *     it appears only in a trailing qualifier. The head segment is the text
+ *     before the first comma, which is how both USDA and this catalog name
+ *     foods ("Beef, ground" / "Ground beef, 93% lean").
+ *
+ * WHY EVERY WEIGHT IS A NAMED CONSTANT HERE RATHER THAN A LITERAL IN THE SQL.
+ * These are ranking rules, not statement mechanics: they decide which food a
+ * user sees first, they are the thing a future retune would touch, and an
+ * inverted band would silently push every stemmed match below every prefix
+ * match. `catalog.service.ts` binds them as query parameters, so this object is
+ * their single source of truth. They are NOT in
+ * `data/meal-planning/coverage-plan.v1.json` — unlike the validation bounds,
+ * which arrive as arguments — because that document describes the catalog's
+ * content and carries no search key; nothing loads a manifest to answer a
+ * search, and adding one would put file I/O on the measured request path.
+ *
+ * THE VALUES ARE NOT ARBITRARY. Each was adopted from a full measurement of
+ * the committed 426-query set against the loaded v1 release, adding one signal
+ * at a time: 0.622/0.803 as found → 0.878/0.944 with specificity on the name →
+ * 0.913/0.958 adding the prefix band → 0.920/0.962 normalising aliases by the
+ * food's name → 0.932/0.977 with the head-segment factor → 0.944/0.991 with
+ * the head-noun factor → **0.948/0.991 once the specificity divisor became the
+ * name's WORD count** rather than its lexeme count, against bounds of 0.90 and
+ * 0.97. That last step is the one worth reading twice, because it was adopted
+ * for correctness and not only for the 0.004: a lexeme count drops English
+ * stopwords, so "Rice with raisins" counted two against "Brown rice, dry"'s
+ * three and the vaguer name won `q = 'rice'`. Counting words treats a
+ * postmodified phrase as the longer, less specific name it is — and costs a
+ * second `to_tsvector` per alias row less, which is where roughly 25 ms of the
+ * widest query's latency went.
+ *
+ * THE DELIVERED FIGURES, for anyone auditing this comment against evidence:
+ * top-3 0.948 (404 of 426), top-10 0.991 (422 of 426), zero-result 0, p95
+ * 94.666 ms over 1,278 timed samples — the full §0.9.3 protocol against the v1
+ * release, reproduced rank-for-rank with zero differences on a second,
+ * independently loaded database. Four queries remain outside the top ten
+ * ('crackers', 'mushrooms', 'mushroom', 'chicken'): each is a bare category
+ * word whose leading results are legitimate members of that category, and
+ * moving them would need a signal this policy does not have — which is stated
+ * here rather than closed, because the alternative is fitting weights to the
+ * benchmark's query list instead of to how names are built.
+ */
+export interface SearchRelevanceWeights {
+    /**
+     * The query's head noun is the name's head noun: the query names what the
+     * food is. Full weight, and the reference the other factors are fractions
+     * of, so it is 1 by construction rather than by preference.
+     */
+    readonly headNoun: number;
+
+    /**
+     * Every query lexeme appears in the name's head segment, but the head nouns
+     * differ — the query modifies the food rather than naming it ("apple" in
+     * "Apple cider"). Below {@link headNoun} and above {@link outsideHead}.
+     */
+    readonly headSegment: number;
+
+    /**
+     * The query matched the name only outside its head segment, i.e. in a
+     * trailing qualifier ("rice" in "Bread, rice"). The weakest name match.
+     */
+    readonly outsideHead: number;
+
+    /** An alias whose head noun is the query's head noun: an alternative name, full weight. */
+    readonly aliasHeadNoun: number;
+
+    /** An alias that matches without its head noun being the query's. */
+    readonly aliasOther: number;
+
+    /**
+     * The query matched neither the name nor an alias, only the bundled
+     * `search_text` — a state, food-group or descriptor word. Still a real
+     * match, so still positive and still returned; it simply cannot outrank a
+     * food that is actually called what the user typed.
+     */
+    readonly textOnly: number;
+
+    /**
+     * The highest score a prefix-only match may take.
+     *
+     * Zero, so the prefix band stays strictly BELOW every full-text band —
+     * `ts_rank` is strictly positive for a real hit, so any positive score
+     * outranks any prefix score. That is the same band boundary the previous
+     * constant `PREFIX_MATCH_RANK = 0` drew, and it is kept deliberately: a
+     * partially typed word should not outrank a food that matched on meaning.
+     * Inside the band, `catalog.service.ts` spreads prefix matches over
+     * `(ceiling − 1, ceiling]` by how much of the matched text the typed prefix
+     * covers, so "mush" reaches "Mushrooms, white" before "Mushroom soup,
+     * canned, condensed" instead of the two tying at the ceiling and falling
+     * back to alphabetical order.
+     */
+    readonly prefixCeiling: number;
+}
+
+/**
+ * The one instance of {@link SearchRelevanceWeights} the search statement binds.
+ *
+ * Frozen because it is shared policy read on the request path: a caller that
+ * mutated a weight would silently retune every subsequent search in the
+ * process, with no statement in the code saying so.
+ */
+export const SEARCH_RELEVANCE: SearchRelevanceWeights = Object.freeze({
+    headNoun: 1,
+    headSegment: 0.6,
+    outsideHead: 0.3,
+    aliasHeadNoun: 1,
+    aliasOther: 0.6,
+    textOnly: 0.1,
+    prefixCeiling: 0,
+});
+
+/**
+ * The function words that end a head phrase, in the order they are stripped.
+ *
+ * English puts the head of a COMPOUND noun last — "brown RICE" is a rice — but
+ * a phrase that postmodifies with a preposition or a conjunction puts its head
+ * BEFORE the connector: "GUMBO with rice" is a gumbo, "MACARONI and cheese" is
+ * a macaroni dish. Taking the last word of the whole phrase would call both of
+ * those a rice and a cheese, which measured against the v1 release is exactly
+ * what happened: "Gumbo with rice", "Beans and rice, with meat" and "Beef curry
+ * with rice" took the first page for the query "rice", ahead of "Brown rice,
+ * dry".
+ *
+ * Every entry is a PostgreSQL `english` stopword, so none of them can ever be
+ * the word a user is searching for — which is what makes truncating at them
+ * safe. The list is short and closed on purpose: it is the set that appears in
+ * this catalog's own naming, not an attempt at English grammar.
+ *
+ * Exported so `catalog.service.ts` builds the SQL side from the same list the
+ * query side uses; the two must agree or a food and a search term would have
+ * their heads taken by different rules.
+ */
+export const SEARCH_HEAD_CONNECTORS: readonly string[] = ['with', 'and', 'in', 'on', 'from', 'for', 'of'];
+
+/**
+ * The head noun of a search term: the last word of its head phrase.
+ *
+ * The query side of the head-noun rule {@link SEARCH_RELEVANCE} describes, and
+ * it applies the same three steps the SQL applies to a food's name, in the same
+ * order: take everything before the first comma, then everything before the
+ * first {@link SEARCH_HEAD_CONNECTORS} entry, then the last
+ * whitespace-separated word of what remains. "brown rice" gives `rice`,
+ * "chicken with rice" gives `chicken`, "beans, black" gives `beans`.
+ *
+ * It lives here, and not as one more SQL expression in `catalog.service.ts`,
+ * for two reasons. It is a rule about language rather than a statement
+ * mechanic, so a unit test of it is worth having (Rule backend-architecture
+ * §7.1); and it is evaluated ONCE per search rather than once per candidate
+ * row, so computing it before the statement keeps it off the per-row path that
+ * §0.9.3's latency budget is measured on.
+ *
+ * Case is folded and punctuation is left alone: the result is handed to
+ * `plainto_tsquery`, which lower-cases, discards punctuation and applies the
+ * same stemming the stored vectors were built with, so doing either here would
+ * be redundant — the fold is only so a connector written "With" is still
+ * recognised. A term of one word is its own head noun, and a term that reduces
+ * to nothing yields the empty string, whose `plainto_tsquery` is an empty query
+ * that matches nothing — so the head-noun weight simply does not apply. That is
+ * the correct outcome rather than a special case: `parseCatalogSearchQuery` has
+ * already refused an empty term at the boundary, and `searchPublishedFoods`
+ * returns an empty page for one without issuing a statement.
+ */
+export const SEARCH_ASCII_UPPERCASE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+export const SEARCH_ASCII_LOWERCASE = 'abcdefghijklmnopqrstuvwxyz';
+
+/**
+ * Case-fold A-Z and nothing else.
+ *
+ * THE ONE FOLD BOTH SIDES OF THE HEAD-NOUN COMPARISON USE, and the reason it is
+ * not `toLowerCase()`. That comparison is made in SQL, between a `to_tsvector`
+ * of the food's head noun and a `plainto_tsquery` of the query's — so the head
+ * noun is extracted twice, once here in JavaScript for the query and once in
+ * `catalog.service.ts` for the name. If the two extractions fold case by
+ * different rules they can disagree, and the tier the scorer picks then depends
+ * on which side of the comparison a character sat.
+ *
+ * They did disagree. `'İNCİR'.toLowerCase()` is Unicode's default full
+ * case-folding and yields `i` + U+0307 COMBINING DOT ABOVE, while PostgreSQL's
+ * `lower()` goes through the database's collation and yields a plain `incir`
+ * under `en_US.utf8` — a different string, so the head-noun tier silently
+ * failed to fire, and it fired differently again under an ICU collation. Ranks
+ * are therefore not reproducible across two independently created databases,
+ * which AAP §§0.5.2 and 0.9.3 require them to be. A `COLLATE "C"` on the final
+ * text tiebreakers does not help: by then the RANK already differs, and rank is
+ * the first key.
+ *
+ * Folding only A-Z removes the divergence at its source rather than patching
+ * one side to imitate the other. The map is 26 characters wide, identical in
+ * every collation and in every JavaScript engine, and `catalog.service.ts`
+ * builds its SQL `translate()` from these same two exported constants so the
+ * two cannot drift apart. Everything beyond A-Z is left exactly as stored and
+ * normalised by `to_tsvector`/`plainto_tsquery` at the point of comparison —
+ * which applies the SAME text-search configuration to both sides within one
+ * database, so `İNCİR` matches `İNCİR` and `INCIR` alike, and does so
+ * identically wherever the release is loaded.
+ *
+ * The narrow cost is deliberate: a connector written with a non-ASCII capital
+ * would not be recognised. Every member of {@link SEARCH_HEAD_CONNECTORS} is an
+ * ASCII English function word, so no such connector exists.
+ */
+export const foldSearchAscii = (text: string): string =>
+    text.replace(
+        /[A-Z]/g,
+        (letter) => SEARCH_ASCII_LOWERCASE[SEARCH_ASCII_UPPERCASE.indexOf(letter)],
+    );
+
+export const searchQueryHeadNoun = (term: string): string => {
+    const headPhrase = SEARCH_HEAD_CONNECTORS.reduce(
+        (phrase, connector) => phrase.split(` ${connector} `)[0],
+        foldSearchAscii(term).split(',')[0],
+    ).trim();
+    const lastSpace = headPhrase.lastIndexOf(' ');
+
+    return lastSpace === -1 ? headPhrase : headPhrase.slice(lastSpace + 1);
 };
 
 /* ---------------------------------------------------------------------------
@@ -1980,6 +2295,335 @@ export const mapCategoryToGroceryCategory = (category: string): GroceryCategory 
 
 
 /* ---------------------------------------------------------------------------
+ * The tag vocabularies — allergen codes, diet codes, and their consistency
+ *
+ * `catalog_foods.allergen_tags` and `catalog_foods.diet_tags` are `TEXT[]` with
+ * no Prisma enum and no CHECK constraint, and both are SAFETY metadata rather
+ * than description: the planner excludes a recipe whose ingredient tags
+ * intersect the user's selected allergens, and `recipe.logic.ts` derives a
+ * dish's diet compatibility from its ingredients' diet tags (AAP §0.7.3
+ * eligibility). Two consequences follow, and they are why this vocabulary is
+ * code and not prose:
+ *
+ *  * A code outside the vocabulary MATCHES NOTHING. It does not fail loudly
+ *    downstream — it reads as "this food declares no such allergen", which is
+ *    the one direction of error that reaches a plate.
+ *  * A diet claim that contradicts the food's own allergen list is false
+ *    whichever half is wrong, so it cannot be repaired by publishing it and
+ *    hoping.
+ *
+ * The two vocabularies are DECLARED here and asserted against the data that
+ * also declares them (`catalog.logic.test.ts` compares both, in both
+ * directions, with `data/meal-planning/usda-manifest.v1.json`'s
+ * `sweepAllergenDietRules.allergenVocabulary` and `dietTagVocabulary`), so a
+ * drift between the import's derivation rules and the validator's judgement
+ * fails a test instead of shipping an unmatchable tag. The allergen spellings
+ * are additionally the ones `preferences.logic.ts::NAMED_ALLERGENS` stores
+ * from the user's own selection: the two lists are compared to each other at
+ * planning time, so a difference of spelling between them would be a silent
+ * failure to exclude.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The nine allergen codes a catalog food may carry, in the order the manifest
+ * and `preferences.logic.ts` declare them (the FDA/FALCPA major allergens as
+ * this product tracks them, sesame included).
+ */
+export type CatalogAllergenTag =
+    | 'milk'
+    | 'eggs'
+    | 'peanuts'
+    | 'tree_nuts'
+    | 'soy'
+    | 'wheat'
+    | 'fish'
+    | 'shellfish'
+    | 'sesame';
+
+const allergenTagSet = closedSet<CatalogAllergenTag>({
+    milk: true,
+    eggs: true,
+    peanuts: true,
+    tree_nuts: true,
+    soy: true,
+    wheat: true,
+    fish: true,
+    shellfish: true,
+    sesame: true,
+});
+
+/**
+ * The allergen vocabulary, and the array a JSON-schema `enum` is built from at
+ * the generation boundary — an exported list rather than a literal repeated in
+ * a prompt schema, so the model is constrained by the same nine values this
+ * module judges against.
+ */
+export const CATALOG_ALLERGEN_TAGS: readonly CatalogAllergenTag[] = allergenTagSet.values;
+
+/**
+ * Exact-spelling membership, like every other guard in this module: it answers
+ * "is this string the canonical code?" and nothing else.
+ * {@link classifyCatalogTagSets} is what resolves a STORED spelling to a code,
+ * because a stored value has to be judged the way its consumers read it.
+ */
+export const isCatalogAllergenTag: (value: unknown) => value is CatalogAllergenTag =
+    allergenTagSet.includes;
+
+/**
+ * The four diet codes a catalog food may carry.
+ *
+ * `pescatarian`, and never `pescatarian_ok`: that spelling is the only one
+ * `recipe.logic.ts` emits from `DIET_TAG_IMPLICATIONS` and the only one
+ * `isDietCompatible('pescatarian', …)` matches, and the manifest records that
+ * an earlier revision of its own rules spelled it `pescatarian_ok` — which
+ * silently excluded every fish and seafood food, and therefore every seafood
+ * recipe, from every pescatarian user's plan, because such a food carries no
+ * `vegetarian` tag for the implication closure to rescue.
+ */
+export type CatalogDietTag = 'vegan' | 'vegetarian' | 'pescatarian' | 'gluten_free';
+
+const dietTagSet = closedSet<CatalogDietTag>({
+    vegan: true,
+    vegetarian: true,
+    pescatarian: true,
+    gluten_free: true,
+});
+
+/** The diet vocabulary, and the other JSON-schema `enum` source. */
+export const CATALOG_DIET_TAGS: readonly CatalogDietTag[] = dietTagSet.values;
+
+/** Exact-spelling membership; see {@link isCatalogAllergenTag}. */
+export const isCatalogDietTag: (value: unknown) => value is CatalogDietTag = dietTagSet.includes;
+
+/**
+ * The one tag normalisation, and it is deliberately the SAME one every consumer
+ * compares with: `recipe.logic.ts::tagKey`, `isDietCompatible` and the
+ * ingredient allergen union all key on `normalizeCanonicalName`, so
+ * `Gluten Free` and `gluten_free` are one tag to them.
+ *
+ * Judging membership on the same key is what makes this check honest in both
+ * directions: a spelling those functions would match is not reported as
+ * unmatchable, and a spelling they would not match is.
+ */
+const tagKey = (tag: string): string => normalizeCanonicalName(tag);
+
+const allergenTagByKey: ReadonlyMap<string, CatalogAllergenTag> = new Map(
+    CATALOG_ALLERGEN_TAGS.map((tag) => [tagKey(tag), tag] as const),
+);
+
+const dietTagByKey: ReadonlyMap<string, CatalogDietTag> = new Map(
+    CATALOG_DIET_TAGS.map((tag) => [tagKey(tag), tag] as const),
+);
+
+/** One diet claim and the allergen codes that make it untrue. */
+export interface CatalogDietTagExclusion {
+    readonly dietTag: CatalogDietTag;
+    readonly excludedAllergenTags: readonly CatalogAllergenTag[];
+}
+
+/**
+ * The contradictions, and ONLY these.
+ *
+ * Each row is an exclusion the allergen vocabulary can actually express:
+ * a vegan food contains no dairy, egg, fish or shellfish; a vegetarian food
+ * contains no fish or shellfish (dairy and eggs are vegetarian); a gluten-free
+ * food contains no wheat.
+ *
+ * Deliberately NOT an implication closure. `vegan` without `vegetarian` is
+ * INCOMPLETE, not false — `recipe.logic.ts` closes a tag set under
+ * `DIET_TAG_IMPLICATIONS` when it derives one, so the missing member is added
+ * where it matters and rejecting the row would reject correct data. This module
+ * judges what a list ASSERTS, never what it omits.
+ */
+export const CATALOG_DIET_TAG_EXCLUSIONS: readonly CatalogDietTagExclusion[] = [
+    { dietTag: 'vegan', excludedAllergenTags: ['milk', 'eggs', 'fish', 'shellfish'] },
+    { dietTag: 'vegetarian', excludedAllergenTags: ['fish', 'shellfish'] },
+    { dietTag: 'gluten_free', excludedAllergenTags: ['wheat'] },
+];
+
+/** One contradiction found: the claim, and the allergen code that refutes it. */
+export interface CatalogTagContradiction {
+    readonly dietTag: CatalogDietTag;
+    readonly allergenTag: CatalogAllergenTag;
+}
+
+/**
+ * The two lists as a caller holds them BEFORE they are trusted: `unknown[]`,
+ * because a model payload and a `TEXT[]` column can both carry a non-string,
+ * and an absent member means the list was not supplied at all.
+ */
+export interface CatalogTagSetInput {
+    readonly allergenTags?: readonly unknown[] | null;
+    readonly dietTags?: readonly unknown[] | null;
+}
+
+/**
+ * The codes a tag list resolved to, in VOCABULARY order rather than the order
+ * they arrived in: a persisted array whose order depended on a model's output
+ * would read as a metadata change on the next run.
+ */
+export interface CatalogResolvedTagSets {
+    readonly allergenTags: readonly CatalogAllergenTag[];
+    readonly dietTags: readonly CatalogDietTag[];
+}
+
+/**
+ * The classifier's answer. `ok` means every supplied entry named a code and the
+ * two lists agree, so `allergenTags`/`dietTags` are the canonical values a
+ * caller may persist; `violation` names what was wrong, with unknown codes and
+ * contradictions reported SEPARATELY because they are different faults with
+ * different fixes — one is a vocabulary the producer does not know, the other
+ * is a claim it got wrong.
+ */
+export type CatalogTagClassification =
+    | ({ readonly kind: 'ok' } & CatalogResolvedTagSets)
+    | ({
+          readonly kind: 'violation';
+          /** The offending `allergen_tags` entries, as text, de-duplicated and sorted. */
+          readonly unknownAllergenTags: readonly string[];
+          /** The offending `diet_tags` entries, same treatment. */
+          readonly unknownDietTags: readonly string[];
+          readonly contradictions: readonly CatalogTagContradiction[];
+      } & CatalogResolvedTagSets);
+
+/**
+ * How an off-vocabulary entry is NAMED in a validation record: its own trimmed
+ * text, or its type when it is not text at all.
+ *
+ * A record has to identify the value an operator must fix, and `observed:
+ * "[object Object]"` identifies nothing. Blank and non-string entries get a
+ * parenthesised label because they have no text to quote — and they are
+ * reported rather than dropped, since a producer emitting `null` into a tag
+ * array is exactly the bug this check exists to surface.
+ */
+const renderTagEntry = (value: unknown): string => {
+    if (typeof value !== 'string') {
+        return `(${value === null ? 'null' : typeof value})`;
+    }
+
+    const trimmed = value.trim();
+
+    return trimmed.length === 0 ? '(blank)' : trimmed;
+};
+
+interface ClassifiedTagList<T extends string> {
+    readonly resolved: readonly T[];
+    readonly unknown: readonly string[];
+}
+
+/**
+ * One list, resolved against one vocabulary.
+ *
+ * De-duplication is by KEY, not by text, so `['Milk', 'milk']` is one allergen
+ * rather than two — the consumers would read it as one, and a validation record
+ * claiming two would misdescribe the food. An entry whose key is empty (`'--'`,
+ * `'   '`) is unknown rather than skipped: it is unmatchable, which is the
+ * fault being reported, and `recipe.logic.ts::collectTags` drops such a tag for
+ * the same reason.
+ */
+const classifyTagList = <T extends string>(
+    entries: readonly unknown[] | null | undefined,
+    byKey: ReadonlyMap<string, T>,
+    vocabulary: readonly T[],
+): ClassifiedTagList<T> => {
+    const resolvedKeys = new Set<string>();
+    const unknown = new Set<string>();
+
+    for (const entry of entries ?? []) {
+        const key = typeof entry === 'string' ? tagKey(entry) : '';
+        const code = key.length === 0 ? undefined : byKey.get(key);
+
+        if (code === undefined) {
+            unknown.add(renderTagEntry(entry));
+            continue;
+        }
+
+        resolvedKeys.add(key);
+    }
+
+    return {
+        resolved: vocabulary.filter((tag) => resolvedKeys.has(tagKey(tag))),
+        unknown: [...unknown].sort(),
+    };
+};
+
+/**
+ * Judges one food's two tag lists: every entry must name a code in its
+ * vocabulary, and the diet claims must not contradict the allergen list.
+ *
+ * PURE and exported so the producing stage can call it AT PARSE TIME and refuse
+ * a candidate before it is persisted — which is the only place the fault can be
+ * fixed cheaply. `catalog-generate-ai.ts` reads model-supplied `allergenTags`
+ * and `dietTags` as free strings and writes them verbatim; a refusal there
+ * costs one candidate, while the same value stored costs a re-validation, a
+ * re-release and, until then, a food whose safety metadata cannot be matched.
+ * `validateCatalogCandidate` applies the same rules again for the validation
+ * record, which is the audit trail rather than the gate — the same division
+ * `findBrandPatternMatch` already has with the brand refusal.
+ *
+ * A list that was not supplied (`undefined`, or `null` for a JSON record whose
+ * column was absent) contributes nothing: it is not an empty list, and no
+ * contradiction can be drawn from a list nobody provided. The caller decides
+ * what an unavailable input means for its own verdict — this function only ever
+ * reports what the values it was given say.
+ */
+export const classifyCatalogTagSets = (input: CatalogTagSetInput): CatalogTagClassification => {
+    const allergens = classifyTagList(input.allergenTags, allergenTagByKey, CATALOG_ALLERGEN_TAGS);
+    const diets = classifyTagList(input.dietTags, dietTagByKey, CATALOG_DIET_TAGS);
+
+    const carried = new Set<CatalogAllergenTag>(allergens.resolved);
+    const claimed = new Set<CatalogDietTag>(diets.resolved);
+    const contradictions: CatalogTagContradiction[] = [];
+
+    for (const exclusion of CATALOG_DIET_TAG_EXCLUSIONS) {
+        if (!claimed.has(exclusion.dietTag)) {
+            continue;
+        }
+
+        for (const allergenTag of exclusion.excludedAllergenTags) {
+            if (carried.has(allergenTag)) {
+                contradictions.push({ dietTag: exclusion.dietTag, allergenTag });
+            }
+        }
+    }
+
+    const resolved: CatalogResolvedTagSets = {
+        allergenTags: allergens.resolved,
+        dietTags: diets.resolved,
+    };
+
+    if (allergens.unknown.length === 0 && diets.unknown.length === 0 && contradictions.length === 0) {
+        return { kind: 'ok', ...resolved };
+    }
+
+    return {
+        kind: 'violation',
+        ...resolved,
+        unknownAllergenTags: allergens.unknown,
+        unknownDietTags: diets.unknown,
+        contradictions,
+    };
+};
+
+/**
+ * One contradiction as a validation record states it — the claim first, because
+ * the claim is the part that is refuted.
+ */
+export const describeCatalogTagContradiction = (contradiction: CatalogTagContradiction): string =>
+    `${contradiction.dietTag} with ${contradiction.allergenTag}`;
+
+/**
+ * The consistency rule as the `bound` of a recorded check, derived from
+ * {@link CATALOG_DIET_TAG_EXCLUSIONS} rather than written out, so an added
+ * exclusion cannot leave records describing the rule they were judged against
+ * wrongly.
+ */
+const CATALOG_TAG_CONSISTENCY_RULE: string = CATALOG_DIET_TAG_EXCLUSIONS.map(
+    (exclusion) => `${exclusion.dietTag} excludes ${exclusion.excludedAllergenTags.join(', ')}`,
+).join('; ');
+
+
+/* ---------------------------------------------------------------------------
  * The three-tier validation checker
  * ------------------------------------------------------------------------- */
 
@@ -2015,6 +2659,19 @@ export interface CatalogFoodCandidate extends CatalogNutritionSource {
     nutrition_provenance: CatalogNutritionProvenance;
     allergen_status: CatalogAllergenStatus;
     allergen_tags?: readonly string[];
+    /**
+     * The diet claims stored for this food (`catalog_foods.diet_tags`).
+     *
+     * Judged rather than trusted: both tag lists are SAFETY METADATA the
+     * planner filters on — the allergens through the user's selection and the
+     * diet through `recipe.logic.ts`'s ingredient derivation — so a code
+     * outside the vocabulary cannot be matched by either, and a list that
+     * contradicts the allergen list is a claim about the food that cannot be
+     * true. Optional because a caller that reads no diet column has nothing to
+     * judge, and a check whose input is unavailable is omitted rather than
+     * recorded as a pass.
+     */
+    diet_tags?: readonly string[];
     portions?: readonly CatalogFoodPortionCandidate[];
     /**
      * The nutrition stated for ONE serving, when the source states both a
@@ -2026,17 +2683,31 @@ export interface CatalogFoodCandidate extends CatalogNutritionSource {
 }
 
 /**
- * The advisory second-model review, as this module consumes it.
+ * The advisory second-model review, as it is RECORDED.
  *
- * ADVISORY, without exception. It is consulted only in the review branch of
- * {@link resolveCatalogDisposition}, which is a structural guarantee rather
- * than a promise: a reject-tier or quarantine-tier failure returns before the
- * review branch is reached, so no advisory input can overturn one. It also
- * never supplies a value — nothing here is a nutrient — because an AI
- * plausibility review must never be presented as verified nutrition.
+ * ADVISORY, without exception, and the exception is closed structurally rather
+ * than promised: NO function in this module accepts one. There is no parameter
+ * to pass it to, so no model answer can reach a check, a tier, a nutrient or a
+ * disposition — which is what "an AI plausibility review is never presented as
+ * verified nutrition" means when it is enforced by the type system instead of
+ * by a convention (Agent Action Plan §0.1.2, and §0.7.3's provenance model:
+ * "an advisory second-model review writes `llm_review` flags and never
+ * promotes values").
+ *
+ * The shape lives here because `catalog_validation_records.llm_review` is a
+ * field of the record this module's verdict fills in, and one home for it
+ * keeps `catalog-validate.ts` from declaring a second. The only thing that may
+ * move a REVIEW-tier hold is an explicit curator decision
+ * ({@link CatalogValidationContext.curatorAllowlistedCheckNames}).
  */
 export interface CatalogAdvisoryReview {
-    /** Review-tier check names a second model examined and found plausible. */
+    /**
+     * Review-tier check names a second model examined and found plausible.
+     *
+     * Recorded for a CURATOR to read. It lifts nothing on its own: a candidate
+     * held by a review-tier flag stays held until a curator allowlists the
+     * value, whatever a model answered about it.
+     */
     readonly confirmedCheckNames?: readonly string[];
 }
 
@@ -2048,8 +2719,13 @@ export interface CatalogValidationContext {
      * found none, which is a genuine pass.
      */
     readonly duplicateOfSourceKey?: string | null;
-    readonly advisoryReview?: CatalogAdvisoryReview | null;
-    /** Review-tier check names a curator has allowlisted for this candidate. */
+    /**
+     * Review-tier check names a curator has allowlisted for this candidate.
+     *
+     * THE ONLY INPUT THAT CAN MOVE A REVIEW-TIER HOLD. There is deliberately no
+     * sibling field for the advisory model review: see
+     * {@link CatalogAdvisoryReview} for why the absence is the guarantee.
+     */
     readonly curatorAllowlistedCheckNames?: readonly string[];
 }
 
@@ -2081,7 +2757,7 @@ export interface CatalogDisposition {
 
 export interface CatalogDispositionInput {
     readonly identitySource: CatalogIdentitySource;
-    readonly advisoryReview?: CatalogAdvisoryReview | null;
+    /** See {@link CatalogValidationContext.curatorAllowlistedCheckNames}. */
     readonly curatorAllowlistedCheckNames?: readonly string[];
 }
 
@@ -2125,8 +2801,17 @@ const failedNamesInTier = (checks: readonly CatalogValidationCheck[], tier: Cata
  *  * a USDA-sourced record PUBLISHES with its review flags recorded — the
  *    source is authoritative and the flag is informational;
  *  * a generated record is HELD in quarantine against the flag (typically
- *    `out_of_category_range`) until the advisory review confirms it or a
- *    curator allowlists the value.
+ *    `out_of_category_range`) until a CURATOR allowlists the value.
+ *
+ * A CURATOR, AND NOTHING ELSE. The advisory second-model review is recorded in
+ * `catalog_validation_records.llm_review` and cannot appear here: this function
+ * takes no advisory parameter, so there is no path by which a model's
+ * plausibility answer becomes a publication decision (Agent Action Plan §0.1.2
+ * — "NEVER present AI-generated values or an AI plausibility review as
+ * verified nutrition" — and §0.7.3, where the advisory review "never promotes
+ * values"). A generated candidate whose nutrition sits outside its category
+ * band is an AI-derived value, and publishing it on a model's own word would
+ * make the review the source of the very claim it was asked to assess.
  *
  * Exported separately from {@link validateCatalogCandidate} so the rule can be
  * tested against hand-built check lists, independently of how the checks are
@@ -2152,10 +2837,9 @@ export const resolveCatalogDisposition = (
         return disposition('published', [], reviewFlags);
     }
 
-    const lifted = new Set([
-        ...(input.advisoryReview?.confirmedCheckNames ?? []),
-        ...(input.curatorAllowlistedCheckNames ?? []),
-    ]);
+    // One source of lifts, and it is a human decision. An advisory review is
+    // not in this set because it is not an input to this function at all.
+    const lifted = new Set(input.curatorAllowlistedCheckNames ?? []);
     const held = reviewFlags.filter((name) => !lifted.has(name));
 
     return held.length > 0
@@ -2224,6 +2908,84 @@ const nutrientSignChecks = (candidate: CatalogFoodCandidate): CatalogValidationC
             'greater than or equal to 0',
         ),
     ];
+};
+
+/**
+ * The two tag judgements, over {@link classifyCatalogTagSets}.
+ *
+ * Which of them is EVALUABLE depends on which lists the caller supplied, and
+ * the module's convention decides the rest: a check whose input is unavailable
+ * is absent from the record rather than recorded as a pass.
+ *
+ *  * `unknown_tag_code` needs at least one list — every entry of a supplied
+ *    list is judged, and a list nobody supplied contributes no entries.
+ *  * `inconsistent_tag_set` needs BOTH, because it is a statement about their
+ *    agreement. A candidate carrying diet claims whose allergen list was never
+ *    read has not been shown to be consistent, and recording that as a pass
+ *    would be the strongest claim in the record resting on the least evidence.
+ *
+ * An empty supplied list is an ANSWER, not an absence: `allergen_tags: []` says
+ * "no allergens", which is a claim the checks judge (and which nothing here
+ * contradicts). That distinction is why the guard tests `undefined`/`null`
+ * rather than length, exactly as `duplicateOfSourceKey` distinguishes "did not
+ * run" from "ran and found none".
+ */
+const tagVocabularyChecks = (candidate: CatalogFoodCandidate): CatalogValidationCheck[] => {
+    const allergenTagsSupplied = candidate.allergen_tags !== undefined && candidate.allergen_tags !== null;
+    const dietTagsSupplied = candidate.diet_tags !== undefined && candidate.diet_tags !== null;
+
+    if (!allergenTagsSupplied && !dietTagsSupplied) {
+        return [];
+    }
+
+    const classification = classifyCatalogTagSets({
+        allergenTags: allergenTagsSupplied ? candidate.allergen_tags : undefined,
+        dietTags: dietTagsSupplied ? candidate.diet_tags : undefined,
+    });
+
+    // Each offending value is prefixed with the column it came from: the two
+    // vocabularies are disjoint, so an operator reading `vegan` in an
+    // `allergen_tags` list needs to be told which list to go and fix.
+    const unknown =
+        classification.kind === 'violation'
+            ? [
+                  ...classification.unknownAllergenTags.map((entry) => `allergen_tags: ${entry}`),
+                  ...classification.unknownDietTags.map((entry) => `diet_tags: ${entry}`),
+              ]
+            : [];
+
+    // The bound names only the vocabularies that were actually judged, so the
+    // record does not imply a list was checked when it was never supplied.
+    const judgedVocabularies = [
+        allergenTagsSupplied ? `allergen_tags in (${CATALOG_ALLERGEN_TAGS.join(', ')})` : null,
+        dietTagsSupplied ? `diet_tags in (${CATALOG_DIET_TAGS.join(', ')})` : null,
+    ].filter((part): part is string => part !== null);
+
+    const checks: CatalogValidationCheck[] = [
+        buildCheck(
+            CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE,
+            unknown.length === 0,
+            unknown.length === 0 ? null : unknown.join('; '),
+            judgedVocabularies.join('; '),
+        ),
+    ];
+
+    if (allergenTagsSupplied && dietTagsSupplied) {
+        const contradictions = classification.kind === 'violation' ? classification.contradictions : [];
+
+        checks.push(
+            buildCheck(
+                CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET,
+                contradictions.length === 0,
+                contradictions.length === 0
+                    ? null
+                    : contradictions.map(describeCatalogTagContradiction).join(', '),
+                CATALOG_TAG_CONSISTENCY_RULE,
+            ),
+        );
+    }
+
+    return checks;
 };
 
 const energyChecks = (
@@ -2694,6 +3456,12 @@ export const validateCatalogCandidate = (
 
     checks.push(...nutrientSignChecks(candidate));
 
+    // Beside the other judgements of STATED values, and before the nutrition
+    // conversion: the tag lists are metadata the conversion neither reads nor
+    // affects, and a candidate whose basis cannot be converted still has a tag
+    // set that is either matchable or not.
+    checks.push(...tagVocabularyChecks(candidate));
+
     const portions = candidate.portions ?? [];
     const defaultPortion = portions.find((portion) => portion.is_default) ?? null;
     const servingGrams = candidate.serving_gram_weight ?? defaultPortion?.gram_weight ?? null;
@@ -2731,7 +3499,6 @@ export const validateCatalogCandidate = (
     return {
         ...resolveCatalogDisposition(checks, {
             identitySource: candidate.identity_source,
-            advisoryReview: context.advisoryReview,
             curatorAllowlistedCheckNames: context.curatorAllowlistedCheckNames,
         }),
         checks,

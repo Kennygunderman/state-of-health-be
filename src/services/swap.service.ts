@@ -4,15 +4,15 @@
 //
 // ONE RULE SET, THREE ENTRY POINTS, and that is the whole design (Agent Action
 // Plan §0.7.3). All three functions below build the SAME
-// `SwapSelectionContext` through {@link loadSwapContext} and reach their
+// `SwapSelectionContext` through {@link loadSwapSelection} and reach their
 // candidate through `swap.logic.ts::selectSwapCandidates` /
 // `selectSwapCandidate`. Nothing here decides which recipes fit a slot, at what
 // portion, or in what order; three independent implementations of that is how a
 // preview eventually shows a portion the commit refuses — or, worse, how a
 // commit writes a meal the list would never have offered.
 //
-// WHAT THE THREE DO NOT SHARE IS WRITE ELIGIBILITY. `loadSwapContext` resolves
-// the caller's OWN plan and meal and builds the selection; whether the plan may
+// WHAT THE THREE DO NOT SHARE IS WRITE ELIGIBILITY. `loadSwapSelection` resolves
+// the caller's OWN meal and builds the selection; whether the plan may
 // still be written to is `commitSwap`'s question alone, because §0.5.2 declares
 // `200` for the two GETs and lists `plan_not_active` only on the mutation
 // routes, and §0.5.1 keeps reads available for history. A superseded or ended
@@ -54,7 +54,9 @@
 //    alternatives list. This module issues no `recipe_versions` query of its
 //    own.
 //  * `targets.service.ts` owns the canonical target read (`getTargets`), which
-//    the plan card reads through as well.
+//    the plan card reads through as well. Each of the three use cases calls it
+//    ONCE, where its context is assembled, and threads the value down —
+//    `loadCurrentTargets` states why it must stay one statement.
 //
 // `mealPlan.service.ts` IS DELIBERATELY ABSENT FROM THAT LIST. Nothing here
 // imports it: a swap needs the plan's shape, its rules, its grocery projection
@@ -101,7 +103,8 @@
 //
 //    THE PARSE PRECEDES EVERY `await`, and two separate failures are what
 //    makes that position load-bearing rather than tidy. A malformed id must not
-//    reach Prisma through {@link loadSwapContext}, nor a malformed portion
+//    reach Prisma through {@link loadSwapContext} or
+//    {@link loadSwapCommitContext}, nor a malformed portion
 //    reach `swap.logic.ts::requireBoundPortion` — which refuses every value
 //    that is not the recomputed portion, so `'half'` would be answered
 //    `409 preview_stale` ("your preview went stale, re-preview it") for a
@@ -139,6 +142,7 @@ import {
     SwapAlternativesResponse,
     SwapMealPayload,
     SwapPreviewResponse,
+    TargetsResponse,
 } from '../types/mealPlanning';
 import { MealSlot } from '../types/recipe';
 import { mealPlanningFault } from '../utils/featureFlags';
@@ -172,7 +176,7 @@ import {
 import { buildRequestFingerprint } from './mealPlanningAction.logic';
 import { KeyedActionResult, runKeyedAction } from './mealPlanningAction.service';
 import { dayKeyInTimeZone, loadPreferencesRow } from './preferences.service';
-import { isMealSlot, roundNutritionForDisplay } from './recipe.logic';
+import { PlanningPreferences, isMealSlot, roundNutritionForDisplay } from './recipe.logic';
 import { RecipeVersionRow, mapSwapAlternative } from './recipe.mapper';
 import { getRecipeVersionDetail, getRecipeVersionRowsByIds, getRecipeVersionsForPlanning } from './recipe.service';
 import {
@@ -404,48 +408,43 @@ const asJsonValue = (value: unknown): Prisma.InputJsonValue => value as Prisma.I
  * ------------------------------------------------------------------------- */
 
 /**
- * The plan's lifecycle state, with its replacement resolved — the input
- * `requireWritablePlan` judges, and read by the COMMIT alone.
+ * The caller's current targets, read through the product's canonical target
+ * read — AND THE ONLY `getTargets` CALL THIS MODULE MAKES.
  *
- * THIS MODULE'S OWN READ (§5.1: `{id, user_id}`, never an id alone), because a
- * service does not borrow another service's I/O. What it does NOT own is the two
- * decisions inside the answer: `mealPlan.mapper.ts::toPlanLifecycleState` reads
- * the `@db.Date` columns into day keys and flattens the successor, and
- * `mealPlan.logic.ts::requireWritablePlan` decides which status may be written
- * to. Those live in one place each, so a plan replaced and then replaced again
- * sends a stale screen to the CURRENT week here exactly as it does everywhere
- * else — "newest successor wins" is a decision, not a join.
+ * Each of the three entry points calls it EXACTLY ONCE, at the point its
+ * context is assembled ({@link loadSwapContext} for the two reads,
+ * {@link loadSwapCommitContext} under the commit's lock), and the value is then
+ * threaded to {@link resolveSwapTargets} rather than re-resolved downstream. A
+ * second call inside the commit would be a second round trip — and a second
+ * `meal_plan_preferences` read — inside an interactive transaction holding one
+ * connection and the per-user advisory lock, which is time every other writer of
+ * this user's plan spends queued behind it.
  *
- * One plan rather than the user's whole list: the successor is resolved by the
- * ordered relation take, so nothing here needs the other weeks.
+ * WHY THIS IS A CALL AND NOT AN INLINE READ, AND WHY THE STATEMENT BEHIND IT
+ * MUST STAY ONE STATEMENT. `getTargets` is one `users ⋈ meal_plan_preferences`
+ * join (`targets.service.ts::readStoredTargets`), so it does read the
+ * preferences row a second time on the commit path — {@link
+ * loadSwapCommitContext} has already read it for the time zone and the
+ * restrictions. That is deliberate and must not be "optimised" by handing the
+ * already-loaded row in and splitting the join into two reads: the verdict
+ * `targets.logic.ts::deriveTargetsResponse` reaches is a COMPARISON between
+ * `users.target_*` and `meal_plan_preferences.confirmed_targets`, and the legacy
+ * `PUT /api/user/targets` route is untouched by this feature and holds NO
+ * meal-planning lock (AAP §0.5.1). Two statements are two READ COMMITTED
+ * snapshots, so a legacy target write could commit between them and the pair
+ * would look self-consistent while the canonical numbers had already moved —
+ * `source: 'estimated'` on figures that no longer match, i.e. a week scored and
+ * published against stale targets while presenting as confirmed, which is
+ * exactly the `legacy` signal §0.5.2 requires the planner to refuse on. One
+ * statement is one snapshot, so that reading cannot be assembled. Reconstructing
+ * the join's projection here instead would duplicate a schema-coupled read that
+ * `targets.service.ts` owns.
+ *
+ * The transaction's client is passed through, so a commit scores against the
+ * targets as they stand inside its own lock.
  */
-const loadSwapPlanState = async (
-    db: Prisma.TransactionClient,
-    userId: string,
-    planId: string,
-): Promise<PlanLifecycleState> => {
-    const plan = await db.meal_plans.findFirst({
-        where: { id: planId, user_id: userId },
-        select: {
-            id: true,
-            status: true,
-            start_date: true,
-            end_date: true,
-            replaced_by_plans: {
-                where: { user_id: userId },
-                orderBy: [{ published_at: 'desc' }, { id: 'desc' }],
-                take: 1,
-                select: { id: true },
-            },
-        },
-    });
-
-    if (plan === null) {
-        throw new PlanNotFoundError();
-    }
-
-    return toPlanLifecycleState(plan);
-};
+const loadCurrentTargets = async (db: Prisma.TransactionClient, userId: string): Promise<TargetsResponse> =>
+    getTargets(userId, db);
 
 /**
  * The targets this plan is judged against: the caller's current confirmed
@@ -461,24 +460,26 @@ const loadSwapPlanState = async (
  * against the snapshot while the card showed the current targets would offer a
  * meal that visibly misses the number printed beside it.
  *
- * `targets.service.ts::getTargets` is the product's canonical target read and is
- * called here directly, with this transaction's client, so a commit scores
- * against the targets as they stand inside its own lock.
+ * PURE, AND THAT POSITION IS LOAD-BEARING RATHER THAN TIDY. `current` is the
+ * value {@link loadCurrentTargets} already resolved for this request, so no
+ * target read happens here; what remains is the snapshot narrowing, which
+ * FAULTS (`MealPlanMappingError`, a 500) on a plan whose `targets_snapshot`
+ * does not carry four finite macros. Leaving that fault inside
+ * {@link loadSwapSelection} — i.e. after `commitSwap`'s `requireWritablePlan` —
+ * is what keeps §0.5.1's order intact: a superseded plan carrying a bad
+ * snapshot is still answered `409 plan_not_active` rather than a 500 about a
+ * column the client cannot act on.
  *
- * The plan row is the one {@link loadSwapContext} has already read — the column
- * rides along on that statement rather than taking a second round trip for it,
- * which matters inside an interactive transaction holding one connection.
+ * The plan row is the one the caller has already read ({@link loadSwapContext}
+ * on a read path, {@link loadSwapCommitContext} under the commit's lock) — the
+ * column rides along on that statement rather than taking a second round trip
+ * for it, which matters inside an interactive transaction holding one
+ * connection.
  */
-const resolveSwapTargets = async (
-    db: Prisma.TransactionClient,
-    userId: string,
+const resolveSwapTargets = (
+    current: TargetsResponse,
     plan: { id: string; targets_snapshot: unknown },
-): Promise<MealPlanMacroTotals> =>
-    resolveReportedTargets(await getTargets(userId, db), readTargetsSnapshot(plan.targets_snapshot, plan.id));
-
-/** The user's own calendar day, from the zone their last save stored. */
-const resolveToday = async (userId: string, now: Date, db: Prisma.TransactionClient): Promise<string> =>
-    dayKeyInTimeZone(now, (await loadPreferencesRow(userId, db))?.time_zone ?? null);
+): MealPlanMacroTotals => resolveReportedTargets(current, readTargetsSnapshot(plan.targets_snapshot, plan.id));
 
 /** A resolved swap request: the plan, the meal, and the selection context. */
 interface SwapContext {
@@ -491,36 +492,60 @@ interface SwapContext {
 }
 
 /**
- * Resolves one swap request into the context the rules read, or throws the
- * answer the client gets.
+ * The plan columns a selection is computed against, however the caller read
+ * them.
  *
- * OWNER-SCOPED READ RESOLUTION ONLY — it establishes WHOSE plan and meal these
- * are and what the rules must be applied to, and it says nothing about whether
- * the plan may still be written to. That division is the contract §0.5.2 states
- * in its endpoint rows: the alternatives list and the preview answer `200` (the
- * preview also `422 recipe_ineligible`) and neither lists `plan_not_active`,
- * which appears only on the mutation routes, because §0.5.1 keeps reads
- * available for history — an owned plan that has been superseded or has ended is
- * a legitimate thing to look at, and a user opening last week's plan is entitled
- * to see what could have replaced a meal without being told the plan is gone.
- * Write eligibility is therefore `commitSwap`'s and `commitSwap`'s alone; a read
- * path cannot become writable by sharing this loader, because this loader grants
+ * Structural rather than a Prisma payload type, so both readers below satisfy it
+ * with their own projection: the read paths select these three columns, and the
+ * commit selects them on the same statement that carries the lifecycle columns.
+ */
+interface SwapPlanFacts {
+    readonly id: string;
+    readonly revision: number;
+    readonly targets_snapshot: unknown;
+}
+
+/**
+ * Builds the selection context for one meal of an ALREADY-READ plan, or throws
+ * the answer the client gets.
+ *
+ * THE ONE SELECTION LOADER ALL THREE ENTRY POINTS REACH, which is what makes it
+ * impossible for the list, the preview and the commit to judge different facts:
+ * they differ only in how the plan, the preferences and the current targets
+ * arrived ({@link loadSwapContext} for the two reads,
+ * {@link loadSwapCommitContext} under the lock for the commit), never in what a
+ * candidate is measured against.
+ *
+ * THE THREE FACTS ARE HANDED IN, NEVER RE-READ HERE, and the targets are the
+ * one that used to be: this function called `getTargets` itself, so a commit
+ * resolved them AFTER its own context loader had already read the preferences
+ * row — a second `meal_plan_preferences` read inside the transaction holding
+ * the per-user advisory lock. Each caller now resolves them ONCE through
+ * {@link loadCurrentTargets} and passes the value down, and what is left here is
+ * the pure reconciliation with the plan's snapshot
+ * ({@link resolveSwapTargets}).
+ *
+ * OWNER-SCOPED READ RESOLUTION ONLY — it establishes what the rules must be
+ * applied to, and it says nothing about whether the plan may still be written
+ * to. That division is the contract §0.5.2 states in its endpoint rows: the
+ * alternatives list and the preview answer `200` (the preview also
+ * `422 recipe_ineligible`) and neither lists `plan_not_active`, which appears
+ * only on the mutation routes, because §0.5.1 keeps reads available for
+ * history — an owned plan that has been superseded or has ended is a legitimate
+ * thing to look at, and a user opening last week's plan is entitled to see what
+ * could have replaced a meal without being told the plan is gone. Write
+ * eligibility is therefore `commitSwap`'s and `commitSwap`'s alone; a read path
+ * cannot become writable by sharing this loader, because this loader grants
  * nothing.
  *
  * The order here is the contract:
  *
- *  1. THE PLAN, by `{id, user_id}`. A miss is `PlanNotFoundError` — "no such
- *     plan" and "not your plan" are one answer (§8), so a foreign or invented id
- *     is a `404` on every one of the three routes and existence never leaks. Its
- *     `targets_snapshot` is selected on this statement because step 3 needs it;
- *     a separate read for one column would be a second round trip on the single
- *     connection a transaction holds.
- *  2. THE MEAL, matched on `{id, meal_plan_id, user_id}` — the plan's own
+ *  1. THE MEAL, matched on `{id, meal_plan_id, user_id}` — the plan's own
  *     owner-scoped meal set, filtered by id, so the predicate is the same one a
  *     direct lookup would use without a second round trip (§5.1). An absent id
- *     is again `PlanNotFoundError`, so a caller cannot probe another user's meal
- *     ids.
- *  3. THE SELECTION CONTEXT: the day's meals INCLUDING the one being replaced
+ *     is `PlanNotFoundError` — "no such meal" and "not your meal" are one
+ *     answer (§8) — so a caller cannot probe another user's meal ids.
+ *  2. THE SELECTION CONTEXT: the day's meals INCLUDING the one being replaced
  *     (its nutrition has to be replaced, not added to), every meal of the week
  *     for the spacing rule, the plannable catalog, the user's eligibility
  *     preferences, and the plan's targets.
@@ -529,23 +554,16 @@ interface SwapContext {
  * this context INSIDE its transaction, under the lock: a context read outside
  * would be judged against state the write could no longer rely on.
  */
-const loadSwapContext = async (
+const loadSwapSelection = async (
     db: Prisma.TransactionClient,
     userId: string,
-    planId: string,
+    plan: SwapPlanFacts,
+    preferences: PlanningPreferences,
+    currentTargets: TargetsResponse,
     mealId: string,
 ): Promise<SwapContext> => {
-    const plan = await db.meal_plans.findFirst({
-        where: { id: planId, user_id: userId },
-        select: { id: true, revision: true, targets_snapshot: true },
-    });
-
-    if (plan === null) {
-        throw new PlanNotFoundError();
-    }
-
     const rows = await db.meal_plan_meals.findMany({
-        where: { meal_plan_id: planId, user_id: userId },
+        where: { meal_plan_id: plan.id, user_id: userId },
         select: SWAP_MEAL_SELECT,
         orderBy: SWAP_MEAL_ORDER,
     });
@@ -559,10 +577,7 @@ const loadSwapContext = async (
     const dayRows = rows.filter((row) => row.meal_plan_day_id === current.meal_plan_day_id);
     const date = toSwapDayKey(current.meal_plan_days.date, current.id);
 
-    // Sequential rather than concurrent: `db` may be an interactive transaction
-    // client, which is one connection.
-    const targets = await resolveSwapTargets(db, userId, plan);
-    const preferences = toPlanningPreferences(await loadPreferencesRow(userId, db));
+    const targets = resolveSwapTargets(currentTargets, plan);
     const recipes = await getRecipeVersionsForPlanning(db);
 
     return {
@@ -580,6 +595,168 @@ const loadSwapContext = async (
             preferences,
             recipes,
         },
+    };
+};
+
+/**
+ * Resolves one READ's swap request into the context the rules read — the plan,
+ * the meal and the selection — or throws the answer the client gets.
+ *
+ * The loader the alternatives list and the preview share. Both are open to a
+ * superseded or ended plan by design (see {@link loadSwapSelection}), so this
+ * reads no lifecycle column and asks no calendar question: it issues the plan
+ * read, by `{id, user_id}` (a miss is `PlanNotFoundError`, so existence never
+ * leaks), the preferences read the eligibility narrowing needs, and the one
+ * canonical target read ({@link loadCurrentTargets}) — one statement each, all
+ * three resolved here at the entry so nothing below resolves them again. The
+ * target statement is itself a `users ⋈ meal_plan_preferences` join, so the
+ * preferences row is read inside it a second time; {@link loadCurrentTargets}
+ * records why that join must stay one statement. The commit does not use this
+ * loader, because it needs the plan row to answer more than this; the reads it
+ * does instead are {@link loadSwapCommitContext}'s.
+ */
+const loadSwapContext = async (
+    db: Prisma.TransactionClient,
+    userId: string,
+    planId: string,
+    mealId: string,
+): Promise<SwapContext> => {
+    const plan = await db.meal_plans.findFirst({
+        where: { id: planId, user_id: userId },
+        select: { id: true, revision: true, targets_snapshot: true },
+    });
+
+    if (plan === null) {
+        throw new PlanNotFoundError();
+    }
+
+    // Sequential rather than concurrent: `db` may be an interactive transaction
+    // client, which is one connection.
+    const preferences = toPlanningPreferences(await loadPreferencesRow(userId, db));
+    const currentTargets = await loadCurrentTargets(db, userId);
+
+    return loadSwapSelection(db, userId, plan, preferences, currentTargets, mealId);
+};
+
+/**
+ * What a commit judges and selects from: the plan row, the preferences row and
+ * the caller's current targets, each resolved once for the whole commit.
+ */
+interface SwapCommitContext {
+    /**
+     * The caller's own calendar day, in the IANA zone their last preference save
+     * stored — the value `requireWritablePlan` compares a plan's `end_date`
+     * with. `preferences.service.ts::dayKeyInTimeZone` is the ONE definition of
+     * it, so a plan cannot be writable on one code path and ended on another.
+     */
+    readonly today: string;
+    /** The lifecycle facts `mealPlan.logic.ts::requireWritablePlan` judges. */
+    readonly lifecycle: PlanLifecycleState;
+    /** The same plan row's selection columns, for {@link loadSwapSelection}. */
+    readonly plan: SwapPlanFacts;
+    /** The same preferences row, narrowed to the restrictions eligibility reads. */
+    readonly preferences: PlanningPreferences;
+    /**
+     * The caller's current targets as `targets.service.ts::getTargets` reports
+     * them, resolved once here and threaded to {@link loadSwapSelection} —
+     * which used to resolve them for itself, a second target resolution inside
+     * the lock. {@link resolveSwapTargets} reconciles them with the plan's
+     * snapshot.
+     */
+    readonly currentTargets: TargetsResponse;
+}
+
+/**
+ * Reads everything a commit is judged on, while the per-user advisory lock is
+ * held, in as few statements as the reads can honestly be expressed in.
+ *
+ * THREE STATEMENTS, AND WHAT EACH IS FOR. A commit needs five things: the
+ * plan's lifecycle (to refuse a superseded or ended week), its `revision` (to
+ * refuse a stale one) and its `targets_snapshot` (to score candidates), the
+ * caller's stored time zone (to know what "today" is) together with their
+ * restrictions (to judge eligibility), and the caller's current targets (the
+ * other half of the scoring). That is ONE plan read carrying the UNION of the
+ * three plan answers, ONE `loadPreferencesRow` carrying both preference
+ * answers, and ONE canonical target resolution — because every round trip
+ * inside this transaction is time any other writer of this user's plan spends
+ * queued behind the same lock, and a read-again for a column already on the
+ * wire is lock duration spent for nothing.
+ *
+ * THE TARGET RESOLUTION READS `meal_plan_preferences` A SECOND TIME, and that
+ * is stated here rather than glossed over: `getTargets` is one
+ * `users ⋈ meal_plan_preferences` join, so the row this function has already
+ * read for the zone and the restrictions is read again inside that join's
+ * single snapshot. {@link loadCurrentTargets} records why that join must not be
+ * split or fed the row this function holds. What the commit no longer does is
+ * resolve the TARGETS twice: the value is resolved once here and threaded
+ * through, where it was previously re-resolved inside
+ * {@link loadSwapSelection} after this function had already run.
+ *
+ * IT GATHERS; IT DOES NOT DECIDE — WITH ONE EXCEPTION. The exception is
+ * ownership: a plan that is absent or not the caller's is `PlanNotFoundError`
+ * here, because the answer is a property of the read itself and must precede
+ * every other check (§8 — "no such plan" and "not your plan" are one answer).
+ * Everything else is returned as facts for `commitSwap` to judge IN §0.5.1's
+ * order, which is what keeps that order in one readable place: the status before
+ * the meal and the meal before the revision, so a superseded plan addressed with
+ * a meal id it never had is still answered `409 plan_not_active` rather than
+ * `404`.
+ *
+ * THE TARGET RESOLUTION DECIDES NOTHING EITHER, AND CANNOT, which is what makes
+ * it safe to perform HERE rather than after the checks: `targets.logic.ts`
+ * throws nowhere, so `getTargets` running ahead of `commitSwap`'s
+ * `requireWritablePlan` cannot change which refusal a client sees. The one part
+ * of target handling that CAN fault — `readTargetsSnapshot`, on a plan whose
+ * snapshot does not carry four finite macros — deliberately stays BEHIND that
+ * check, inside {@link resolveSwapTargets}, so an unreadable snapshot on a
+ * superseded week is still `409 plan_not_active` and not a 500.
+ *
+ * The two derivations are the shared ones rather than local copies:
+ * `mealPlan.mapper.ts::toPlanLifecycleState` reads the `@db.Date` columns into
+ * day keys and flattens the newest successor out of the ordered relation take,
+ * and `mealPlan.logic.ts::toPlanningPreferences` narrows the five eligibility
+ * columns — the same two every other path uses, so "newest successor wins" and
+ * "what the user restricts" are decided in one place each.
+ */
+const loadSwapCommitContext = async (
+    db: Prisma.TransactionClient,
+    userId: string,
+    planId: string,
+    now: Date,
+): Promise<SwapCommitContext> => {
+    const plan = await db.meal_plans.findFirst({
+        where: { id: planId, user_id: userId },
+        select: {
+            id: true,
+            status: true,
+            start_date: true,
+            end_date: true,
+            revision: true,
+            targets_snapshot: true,
+            replaced_by_plans: {
+                where: { user_id: userId },
+                orderBy: [{ published_at: 'desc' }, { id: 'desc' }],
+                take: 1,
+                select: { id: true },
+            },
+        },
+    });
+
+    if (plan === null) {
+        throw new PlanNotFoundError();
+    }
+
+    // Sequential rather than concurrent: `db` is the commit's interactive
+    // transaction client, which is one connection.
+    const preferences = await loadPreferencesRow(userId, db);
+    const currentTargets = await loadCurrentTargets(db, userId);
+
+    return {
+        today: dayKeyInTimeZone(now, preferences?.time_zone ?? null),
+        lifecycle: toPlanLifecycleState(plan),
+        plan,
+        preferences: toPlanningPreferences(preferences),
+        currentTargets,
     };
 };
 
@@ -755,7 +932,7 @@ export type CommitSwapResult = { kind: 'ok'; result: KeyedActionResult } | SwapR
  * plan does not have to be WRITABLE for the question "what else fits this slot"
  * to have a truthful answer, and a `409` here would break the day the client
  * composes around it. Ownership is still absolute: a foreign or invented plan or
- * meal id is `PlanNotFoundError` from `loadSwapContext`, whatever the plan's
+ * meal id is `PlanNotFoundError` from `loadSwapSelection`, whatever the plan's
  * status.
  *
  * BOTH PATH IDS ARE PARSED FIRST, before the read: an id that is not a UUID v4
@@ -975,7 +1152,7 @@ const rebuildGroceriesOrRefuse = async (
  *
  *  1. WRITE ELIGIBILITY IS ESTABLISHED HERE, AND ONLY HERE.
  *     `requireWritablePlan` is applied in this function rather than in the
- *     shared `loadSwapContext`, because this is the only one of the three swap
+ *     shared `loadSwapSelection`, because this is the only one of the three swap
  *     use cases that writes: a SUPERSEDED plan answers `409 plan_not_active`
  *     with the id of its replacement and an ENDED one with `reason: 'ended'`
  *     (§0.5.1, §0.5.2's row for this endpoint), while the two GETs stay
@@ -989,11 +1166,21 @@ const rebuildGroceriesOrRefuse = async (
  *     it may no longer write to. A plan that is absent or not the caller's is
  *     `PlanNotFoundError` from the same lookup, so ownership still answers
  *     first.
- *  2. THE CONTEXT IS REBUILT UNDER THE LOCK. `loadSwapContext` re-reads the
- *     plan, the meal and the selection from the state this transaction will
- *     commit in, so nothing the preview saw is trusted. `expectedPlanRevision`
- *     is compared next — `409 stale_plan` carrying the current value, so the
- *     client refetches at a revision that exists.
+ *
+ *     THE FACTS IT JUDGES COME FROM {@link loadSwapCommitContext}, which issues
+ *     one plan read, one preferences read and one canonical target resolution,
+ *     and decides nothing beyond ownership. The four checks stay in this
+ *     function, in this order — plan (404), status (409 `plan_not_active`), meal
+ *     (404), revision (409 `stale_plan`) — because the order IS the answer a
+ *     client sees: a superseded plan addressed with a meal id it never had must
+ *     still be told the week has moved, not that the meal does not exist.
+ *  2. THE SELECTION IS REBUILT UNDER THE LOCK. `loadSwapSelection` re-reads the
+ *     meal, the week and the plannable catalog from the state this transaction
+ *     will commit in — against the plan, preference and target facts step 1
+ *     already resolved, none of which it reads again — so nothing the preview
+ *     saw is trusted and no context row is resolved twice inside the lock.
+ *     `expectedPlanRevision` is compared next — `409 stale_plan` carrying the
+ *     current value, so the client refetches at a revision that exists.
  *  3. `selectSwapCandidate` re-selects the named recipe FROM THE LISTED ROWS —
  *     `422 recipe_ineligible` if a preference change or a catalog refresh has
  *     ruled it out since the preview, or if the freshly ranked list no longer
@@ -1098,11 +1285,21 @@ export const commitSwap = async (
                 ),
             },
             async (lockedTx) => {
-                const today = await resolveToday(userId, now, lockedTx);
+                // One plan read, one preferences read and one target resolution
+                // — judged below in §0.5.1's order, which is the order the
+                // loader deliberately leaves to this function.
+                const commitContext = await loadSwapCommitContext(lockedTx, userId, parsed.planId, now);
 
-                requireWritablePlan(await loadSwapPlanState(lockedTx, userId, parsed.planId), today);
+                requireWritablePlan(commitContext.lifecycle, commitContext.today);
 
-                const context = await loadSwapContext(lockedTx, userId, parsed.planId, parsed.mealId);
+                const context = await loadSwapSelection(
+                    lockedTx,
+                    userId,
+                    commitContext.plan,
+                    commitContext.preferences,
+                    commitContext.currentTargets,
+                    parsed.mealId,
+                );
 
                 if (context.planRevision !== payload.expectedPlanRevision) {
                     throw new StalePlanError(context.planRevision);

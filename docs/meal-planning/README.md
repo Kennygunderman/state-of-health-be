@@ -33,7 +33,12 @@ Companion documents, none of which is restated here:
 - [`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md) —
   each requirement mapped to where it is implemented and what evidence covers it.
 - [`expected-schema-diff.sql`](./expected-schema-diff.sql) — the committed
-  schema-drift evidence for the meal-planning migration.
+  schema-drift evidence for the meal-planning migration: the captured
+  `prisma migrate diff --script` output between the ledger and the datamodel,
+  compared as a whole file.
+- [`schema-catalog-evidence.sql`](./schema-catalog-evidence.sql) — the second
+  capture beside it, for the constructs that command cannot see: a read-only
+  `pg_catalog` extraction and its expected result against the applied ledger.
 
 ## Prerequisites
 
@@ -75,7 +80,26 @@ they point at and one refuses to run unless it may:
 | `soh_shadow` | `SHADOW_DATABASE_URL` | `npx prisma migrate dev --create-only`, `npx prisma migrate diff` | **Both reset it.** Nothing of value may live here, and no other command reads it |
 
 ```bash
-createdb soh_dev soh_test soh_shadow
+createdb --host=127.0.0.1 --port=5432 --maintenance-db=postgres \
+  --username='<local-postgres-user>' soh_dev
+createdb --host=127.0.0.1 --port=5432 --maintenance-db=postgres \
+  --username='<local-postgres-user>' soh_test
+createdb --host=127.0.0.1 --port=5432 --maintenance-db=postgres \
+  --username='<local-postgres-user>' soh_shadow
+```
+
+Three commands, because `createdb` takes **one** database name: a second
+positional argument is read as the new database's comment and a third is an
+error, so a single line naming all three creates at most one of them. The
+connection options are explicit for the same reason the URLs in this document
+are — without them libpq fills host, port, user and maintenance database from
+the ambient environment, and a `PGHOST` or `PGDATABASE` left over from another
+task is how a command lands on a server nobody meant. Against a containerised
+server, the same thing one database at a time:
+
+```bash
+psql "postgresql://<local-postgres-user>@127.0.0.1:5432/postgres" \
+  -c 'CREATE DATABASE soh_dev'
 ```
 
 **Never point any of these three at production.** That is not only a convention:
@@ -140,7 +164,12 @@ moved:
   `data/meal-planning/search-benchmark.v1.json` against the catalog loaded in
   `DATABASE_URL` and writes its report to
   `data/meal-planning/reports/latest/benchmark-report.json`. The report belongs
-  to the run that produced it; its numbers are recorded nowhere else.
+  to the run that produced it, and its **full** measurement — the per-query
+  ranks, the page sequences, the measurement conditions and the latencies — is
+  recorded nowhere else. The verification table in
+  [`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md)
+  records that the run happened and its headline outcome, and points here for
+  the rest.
 - `npm run typecheck` is the fast gate — run it before `build`, because it
   reports the same errors in less time. It covers the production sources only;
   the tests and the scripts are separate projects with their own compiler
@@ -248,10 +277,10 @@ entry points import, not a command.
 | `catalog:validate` | `scripts/catalog-validate.ts` | Stage 3 — resolves duplicate identities across the whole non-rejected table, runs the deterministic checks, and publishes, quarantines or rejects each row, writing one validation record per judged food | `DATABASE_URL`, `CATALOG_MODEL_CALL_BUDGET` (shared with `catalog:generate`); `OPENROUTER_API_KEY` only for the advisory review call; reads `coverage-plan.v1.json` and `evidence-allowlist.v1.json` |
 | `catalog:report` | `scripts/catalog-report.ts` | Stage 4 — the coverage and quality report: published, candidate and quarantined counts, duplicate identities, quarantine reasons and the exact per-category shortfall, written to `data/meal-planning/reports/latest/validation-report.json` (`--out` overrides) | `DATABASE_URL`; reads `coverage-plan.v1.json` |
 | `catalog:release` | `scripts/catalog-release.ts` | Stage 5 — exports the published catalog as a versioned, checksummed release under `data/meal-planning/catalog/releases/<vN>/`. `--release <vN>` is required; `--force` is needed to overwrite an existing release directory | `DATABASE_URL`; reads `coverage-plan.v1.json` |
-| `catalog:load` | `scripts/catalog-load.ts` | Loads a reviewed release into an environment, verifying every manifest digest before writing. `--release <vN>` is required | `DATABASE_URL`; `--confirm-target <dbname>` off a development origin; reads `data/meal-planning/catalog/releases/<vN>/` |
-| `recipes:seed` | `scripts/recipes-seed.ts` | Publishes the curated recipe files as versioned recipes, resolving each ingredient against the loaded catalog by `source_key`; idempotent by recipe slug. Every selected file is validated before the first write, so one bad file publishes nothing. `--only <slug>` (repeatable; `--slug` is an alias) narrows it and `--dry-run` validates without writing — neither rewrites `recipes/coverage-report.json`, which a full run derives from the seeded rows | `DATABASE_URL` with a loaded catalog; `--confirm-target <dbname>` off a development origin; reads `data/meal-planning/recipes/*.json` and `coverage-plan.v1.json`; writes `data/meal-planning/recipes/coverage-report.json` |
+| `catalog:load` | `scripts/catalog-load.ts` | Loads a reviewed release into an environment, verifying every manifest digest before writing. `--release <vN>` is required | `DATABASE_URL`; `--confirm-target <dbname>` unless the database name says development (`_dev`, with or without a clone index) on a local host; reads `data/meal-planning/catalog/releases/<vN>/` |
+| `recipes:seed` | `scripts/recipes-seed.ts` | Publishes the curated recipe files as versioned recipes, resolving each ingredient against the loaded catalog by `source_key`; idempotent by recipe slug. Every selected file is validated before the first write, so one bad file publishes nothing. `--only <slug>` (repeatable; `--slug` is an alias) narrows it and `--dry-run` validates without writing — neither rewrites `recipes/coverage-report.json`, which a full run derives from the seeded rows | `DATABASE_URL` with a loaded catalog; `--confirm-target <dbname>` unless the database name says development (`_dev`, with or without a clone index) on a local host; reads `data/meal-planning/recipes/*.json` and `coverage-plan.v1.json`; writes `data/meal-planning/recipes/coverage-report.json` |
 | `search:benchmark` | `scripts/search-benchmark.ts` | Measures the in-process catalog search against the committed query set and writes `data/meal-planning/reports/latest/benchmark-report.json` (`--out` overrides; `--passes <n>` defaults to 3, so a cold first pass can be separated from the steady state) | `DATABASE_URL` with a loaded catalog; reads `data/meal-planning/search-benchmark.v1.json` |
-| `db:seed:dev` | `scripts/seed-dev.ts` | Seeds a development database with one user, its meal-planning preferences row in the `not_started` state, and the four diary buckets for one day. Idempotent: a second run with the same flags creates nothing. `--email`, `--user-id` and `--date` override the defaults | `DATABASE_URL` that is a **development** origin — there is no confirmation flag that overrides this |
+| `db:seed:dev` | `scripts/seed-dev.ts` | Seeds a development database with **one plan-ready user** — defaults `--user-id dev-seed-user`, `--email dev-seed-user@soh.invalid` — whose meal-planning setup is **complete**, so reaching the Meal Plan screens needs no wizard run and `POST /api/meal-planning/plans` works immediately. It writes: `meal_plan_preferences` converged to `setup_status: 'completed'` with the development answers and a `confirmed_targets` snapshot matching the four `users.target_*` columns (1,709 kcal, 128 g protein / 171 g carbs / 57 g fat) **in the same transaction**, because the two disagreeing is exactly what makes the targets read report source `legacy`; one weigh-in, only where the user has none, so the About-you weight prefill has something to offer; and the four diary buckets `Breakfast`, `Lunch`, `Dinner`, `Snack` (`sort_order` 0–3) for one day — `--date`, default today in UTC. Rerunning **converges** rather than skipping: a second run with the same flags changes nothing and reports unchanged for every object, while a half-answered preferences row is completed rather than left alone. `--reset-user` deletes that one user and everything cascading from it — preferences, diary, weigh-ins, foods, plans — before seeding; it is scoped to that single user and never truncates a table. It writes no catalog, recipe, plan or grocery rows: those come from `catalog:load`, `recipes:seed` and calling the generator | `DATABASE_URL` that is a **development** origin — `development_only`, so there is no confirmation flag that overrides this |
 
 ## The database-origin guard
 
@@ -263,31 +292,53 @@ outright. Every recognised origin is on host `localhost`, `127.0.0.1` or
 one.
 
 `development` is the widest class and the one to understand before pointing a
-script anywhere: it is satisfied by **host alone** on `localhost` or
-`127.0.0.1`, or by a `_dev` name on any of the three hosts. So an arbitrarily
+script anywhere, because it is reached two ways and the two are not
+interchangeable. **By name:** a `_dev` suffix, with or without a clone index
+(`soh_dev`, `soh_dev_46`), on any of the three hosts. **By host alone:**
+`localhost` or `127.0.0.1`, whatever the database is called. So an arbitrarily
 named local database is development, while the same name on `postgres` — a
 container-network service that in CI or a compose stack need not be anyone's
-development box — is `unknown` and refused. `test` and `shadow` have no
-host-only arm: they are reached by name only, so nothing becomes a test database
-by being local.
+development box — is `unknown` and refused. Which of the two arms matched is
+what decides whether the two writers demand `--confirm-target` below. `test` and
+`shadow` have no host-only arm: they are reached by name only, so nothing
+becomes a test database by being local.
 
 | Policy | Scripts | Rule |
 | --- | --- | --- |
-| `development_or_confirmed` | `catalog:load`, `recipes:seed` | Against anything other than a development origin the run is refused at module load with code `confirmation_required` unless `--confirm-target <dbname>` names that URL's database exactly. Never needed against a development origin |
+| `development_or_confirmed` | `catalog:load`, `recipes:seed` | The run is refused at module load with code `confirmation_required` unless `--confirm-target <dbname>` names that URL's database exactly. The one case that needs no flag is a database whose own **name** says development (`_dev`, with or without a clone index) on a local host; a local database named anything else is development by its host alone and is confirmed like a test or shadow one |
 | `development_only` | `db:seed:dev` | Only a development origin is accepted; a test, shadow or unrecognised database is refused and no flag opens the door, because this is the one script that writes user-scoped rows |
 | `any_recognised` | `catalog:import`, `catalog:generate`, `catalog:validate`, `catalog:report`, `catalog:release`, `search:benchmark` | Any origin the guard can classify is accepted; an unrecognised one is still refused |
 
-Against a development origin the flag is never needed and is accepted and
-ignored. Everywhere else, the database's own name is what unlocks the run:
+The flag is never needed when the database's own name says development — `_dev`,
+with or without a clone index, on a local host — and against such an origin it
+is accepted and ignored. Everywhere else, including a local database whose name
+says anything else, the database's own name is what unlocks the run:
 
 ```bash
 npm run catalog:load -- --release v1 --confirm-target soh_test
+npm run recipes:seed -- --confirm-target soh_test
 ```
+
+Both writers carry the same policy, so both need the flag: a sequence that
+confirms only the load stops at the seed with `confirmation_required`.
 
 A name that does not match the one in `DATABASE_URL` is refused
 (`confirmation_mismatch`) just as firmly as a missing flag
 (`confirmation_required`), so the flag cannot be satisfied by habit — it has to
 be the name of the database actually being written.
+
+Two consequences are worth carrying into a deployment. A `DATABASE_URL` naming a
+remote host — a deployed environment's own database — is `unknown` whatever it
+is called, so it is refused with `unrecognised_origin` before any policy runs
+and no flag reaches it; and a database reached over loopback is `development` on
+the host alone, which is a classification and not a licence — its name says
+nothing about it, so both writers refuse it with `confirmation_required` until
+`--confirm-target` names it exactly. Loading a release into a deployed
+environment therefore has one supported shape, and
+[`release-and-recovery.md`](./release-and-recovery.md#release-order) publishes
+it as step 4 — run on the deployment host, read the target back to learn which
+name to type, and pass `--confirm-target` to both writers, which is what the
+guard will hold you to.
 
 `SHADOW_DATABASE_URL` is needed only by `npx prisma migrate dev --create-only`
 and `npx prisma migrate diff`, both of which reset the database they point at.
@@ -362,8 +413,13 @@ percent-encoded database name, or no authority at all.
 
 A second guard, `assertSchemaFreshness`, then checks that the database is the
 schema the code expects, so run `npx prisma migrate deploy` against the test
-database before the first run. `npm run check:test-db` runs both guards on their
-own and is what `pretest` runs before every `npm test`.
+database before the first run. Both guards belong to Jest: `jest.config.ts`
+registers `src/__tests__/setup/jestSetup.ts` as a `setupFiles` entry, which
+runs the identity guard as its first statement — before any application module
+or Prisma client loads — and awaits the schema guard before the first test, so
+`npm test` needs no lifecycle hook to get them. To ask the same two questions
+without running the suite, run the module directly:
+`npx ts-node --project tsconfig.test.json src/__tests__/setup/testDb.ts`.
 
 ## Environment variables
 
@@ -437,14 +493,26 @@ What was not verified, recorded here rather than left to be assumed:
   platform), so everything here was exercised against a local PostgreSQL 16
   instead. That is also why the exact patch level travels with each report
   rather than being assumed.
-- **What was exercised, and what was not.** `prisma generate`, `prisma migrate
-  deploy`, the three typechecks, `check:test-db` and its refusals, the
-  `--confirm-target` and `development_only` refusals, and `npm run dev` with its
-  `/health` response were all run as written. A full `catalog:load`,
-  `recipes:seed` and `search:benchmark` were **not** run end to end here — only
-  their guard paths — so treat their step descriptions as the contract they
-  implement rather than as a recorded measurement. `search:benchmark`'s numbers
-  only ever mean something for the environment and release that produced them.
+- **What was exercised, and where its record is.** Every command in the ordered
+  list above **from `prisma generate` onward** was run as written in that
+  environment: `prisma generate`, `prisma migrate deploy`, the three typechecks,
+  the build, `check:test-db` and its refusals, the `--confirm-target` and
+  `development_only` refusals, `npm test`, and `npm run dev` with its `/health`
+  response, together with `catalog:load` (twice, so the second run's no-op
+  counts are the idempotency evidence), `recipes:seed` and `search:benchmark`
+  **end to end** against the loaded release. The list's first step, `npm ci`,
+  prepared the environment rather than being one of those checks, so it has no
+  recorded outcome and no row. Outcomes are deliberately not restated here: the
+  run record — one row per command from `prisma generate` on, each with its real
+  result, including the one that fails — is the verification table in
+  [`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md),
+  and that table is the one source every status in this folder cites. Two
+  caveats belong here rather than there. `search:benchmark` **exits non-zero
+  when a threshold is missed**: that is the intended fail-closed behaviour of a
+  measurement, not a broken command, and the report it writes is then a record
+  of an unmet requirement. And its numbers only ever mean something for the
+  environment and the release that produced them, which is why the report
+  carries both.
 - **The mobile repository's `npm ci` fails** with a pre-existing `ERESOLVE`
   (`jest-expo`'s peer range against the installed React Native), and needs
   `npm ci --legacy-peer-deps`. That is documented, not fixed: changing either

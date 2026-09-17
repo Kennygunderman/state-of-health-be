@@ -1566,10 +1566,17 @@ describe('the order of a page', () => {
     });
 
     it('orders every same-named pair of a wide match set by source_key, not by primary key', async () => {
-        // 800 rows, 400 same-named pairs, all at rank 0 through the prefix branch:
-        // the sharpest available test of the final key. A ranking that fell back
-        // to the `gen_random_uuid()` primary key would reorder these pairs on
-        // every load, which is exactly what §0.9.3 forbids.
+        // 800 rows and 400 same-named pairs, reached only through the prefix
+        // branch: the sharpest available test of the final key. The pairs are
+        // what make it sharp. Prefix coverage is measured against the matched
+        // text, so two rows carrying the SAME `display_name` necessarily carry
+        // the same coverage, tie again on the name, and leave `source_key` as
+        // the only key that can separate them. (The 800 rows as a whole do not
+        // tie — coverage puts the shortest names first — which is why this case
+        // compares consecutive rows of equal name rather than the whole page.)
+        // A ranking that fell back to the `gen_random_uuid()` primary key would
+        // reorder these pairs on every load, which is exactly what §0.9.3
+        // forbids.
         const { items } = await searchOverHttp({ q: 'wendr', limit: ROUTE_MAX_LIMIT });
         const keys = await orderKeysFor(idsOf(items));
         const samePairs = keys.filter(
@@ -2015,11 +2022,30 @@ describe('the schema the search rests on', () => {
  * ------------------------------------------------------------------------- */
 
 describe('what the catalog read does not depend on', () => {
+    // The spy below has to be UNDONE, and nothing in the configuration does it:
+    // `jest.config.ts` sets `clearMocks` and deliberately not `restoreMocks`,
+    // because restoring before every test would strip the `jest.mock` factories
+    // `jestSetup.ts` installs for `utils/firebase` and `middleware/auth` and
+    // leave this suite unable to import `app.ts`. Clearing wipes a mock's call
+    // record and keeps its implementation, so an unrestored
+    // `mockReturnValue(false)` is not a fact about one case — it is the value
+    // every later case in this file reads for the flag, silently, while looking
+    // like the real accessor. `restoreAllMocks` here is the narrow form of what
+    // `restoreMocks` would do globally: it undoes the `jest.spyOn` above (the
+    // only spy in this file) and cannot touch those factories, which are plain
+    // functions rather than mocks. `catalog.test.ts` and `targets.test.ts` use
+    // the same hook for the same reason.
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
     it('serves a real page with meal planning switched off at the server', async () => {
         // `/catalog/*` is never gated — Add Food catalog section does not depend
         // on meal planning — and `catalog.test.ts` owns the full posture. Asserted
         // once here so a corpus-scale run cannot come to depend on the flag.
         jest.spyOn(featureFlags, 'isMealPlanningEnabled').mockReturnValue(false);
+
+        expect(featureFlags.isMealPlanningEnabled()).toBe(false);
 
         const { status, items, pagination } = await searchOverHttp({ q: queryById('q001').q });
 
@@ -2029,6 +2055,15 @@ describe('what the catalog read does not depend on', () => {
     });
 
     it('answers two different callers identically, because the catalog has no owner', async () => {
+        // The isolation pin for the case above, in the position that can observe
+        // it: this is the case its spy would have leaked into. The accessor is
+        // the module's own function again — not a mock — and it reads the `true`
+        // that `jestSetup.ts` puts in `MEAL_PLANNING_ENABLED`, so a future edit
+        // that dropped the restoring hook fails HERE with the reason, rather than
+        // quietly running the rest of the file with planning switched off.
+        expect(jest.isMockFunction(featureFlags.isMealPlanningEnabled)).toBe(false);
+        expect(featureFlags.isMealPlanningEnabled()).toBe(true);
+
         const reader = await searchOverHttp({ q: 'quibbin' }, READER);
         const other = await searchOverHttp({ q: 'quibbin' }, OTHER_READER);
 

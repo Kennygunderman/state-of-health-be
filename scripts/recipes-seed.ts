@@ -22,6 +22,88 @@
 // coverage check would answer from an incomplete set and the committed coverage
 // report would describe recipes that are not there.
 //
+// THE CATALOG MUST NOT MOVE WHILE THIS STAGE PUBLISHES, AND IT IS HELD SHUT
+// TWICE. A new `recipe_versions` row cites catalog facts — the per-100 g
+// snapshot, the name, the provenance, the allergen and diet tag arrays and both
+// version counters — that were read before the transaction it is written in. If
+// a `catalog-load` retires that food, re-judges it or moves either counter in
+// between, the row that publishes is a plannable recipe built on facts that no
+// longer hold, which §0.7.3 forbids. So:
+//
+//   1. the WHOLE run is wrapped in the catalog graph's stage lock, taken SHARED
+//      (see THE BORROWED READER STAGE below), from before the first catalog read
+//      through every promotion to the coverage read the report is derived from;
+//      and
+//   2. every publishing transaction RE-READS its recipe's ingredient rows under
+//      `SELECT … FOR SHARE` immediately before it writes, and refuses the
+//      publication if any of them is no longer publishable or has moved
+//      (`assertIngredientFactsHold`).
+//
+// Neither half is redundant. The lock keeps an exclusive mutator out for the
+// whole run, which the per-transaction check alone cannot do — it would only
+// notice drift recipe by recipe, after earlier recipes had already published
+// against the older facts. The check covers what the lock cannot: a writer that
+// does not take the lock at all, and a caller that injected its own lock seam.
+//
+// ONE RECIPE-SEED WRITER, AND WHY THE GRAPH HOLD CANNOT BE IT. The graph hold
+// above is SHARED, which is the correct mode for a stage that only READS the
+// catalog — and it is therefore compatible with itself, so two seeds both take
+// it and neither notices the other. Two seeds are not harmless: they write the
+// same `recipes`, `recipe_versions` and `recipe_ingredients` rows, they publish
+// in separate per-recipe transactions, and they race the whole-corpus coverage
+// report, so an interleaving can leave a corpus assembled from two different
+// revisions of the files and a committed report that describes neither. The
+// run ledger's lease cannot separate them either: its key carries the CORPUS
+// FINGERPRINT (see THE RUN LEDGER), so two different corpus revisions address
+// two different rows, and an `--only`-narrowed run claims no row at all.
+//
+// So the stage takes a SECOND lock of its own — the RECIPE-SEED WRITER LOCK
+// (see runUnderWriterHold) — exclusive, session-scoped, on its own connection,
+// keyed on a CONSTANT that names no corpus and no fingerprint, and held for the
+// whole lifetime of every non-dry publication INCLUDING a narrowed one. It is
+// additional to the graph hold and never a replacement for it: the graph hold
+// is what keeps a catalog MUTATOR out, and the writer lock is what keeps a
+// second RECIPE SEED out. A dry run takes neither the writer lock nor a ledger
+// row, because it publishes nothing there is anything to own.
+//
+// ONE RUN ROW, AND WHY THIS STAGE KEEPS ONE. The corpus publishes one
+// transaction per recipe, so an interruption after recipe twenty of forty-two
+// leaves a half-promoted corpus. Without a ledger row nothing records that: no
+// terminal status, no counts, no cursor, and a committed coverage report that
+// may describe a different corpus. The stage therefore claims a
+// `catalog_import_runs` row of its own (see THE RUN LEDGER) keyed on a
+// fingerprint of the corpus it selected, records what it settles as it goes, and
+// closes `succeeded` or `failed` — never silently.
+//
+// AND WHY THE ROW ALSO CARRIES A FENCE. A session lock dies with its session,
+// which is exactly the property that makes it safe — but it is also what leaves
+// one residue: a process whose LOCK SESSION died while the process itself lived
+// on (a network drop, a host suspension, a query that returned after an age)
+// still holds a live Prisma pool and can still write. The lock cannot stop that
+// process, because it no longer holds the lock; the run row is what stops it.
+// Every claim and every takeover stamps an unguessable ATTEMPT TOKEN into the
+// run's cursor, and every write this stage makes against that run — each recipe
+// publication, each cursor update, the coverage report and the terminal close —
+// re-reads the row under `SELECT … FOR UPDATE` in the SAME transaction as the
+// write and refuses (`run_attempt_superseded`) when the stored token is no
+// longer its own (see assertAttemptOwnsRun). A superseded attempt's write is
+// therefore rejected rather than merely improbable, which is what
+// lib/checkpoint.ts asks of the layer above it: its own row lock serialises two
+// live writers into last-write-wins and states, at writeCursorToRun, that
+// lifetime ownership has to be enforced here.
+//
+// WHAT THE FENCE DOES NOT COVER, STATED SO IT IS NOT MISTAKEN FOR COVERED. An
+// `--only`-narrowed run claims no ledger row (see THE CLAIM), so it has nothing
+// to be fenced BY: its exclusivity is the writer lock and only the writer lock.
+// That is the correct trade rather than a gap left open — claiming a whole-corpus
+// row for a narrowed run would let one slug's cursor and counts describe a
+// corpus nobody reconciled, and would block the real seed through the lease —
+// and it costs nothing against the two races that matter, because a narrowed
+// run publishes no coverage report and closes no run row. A narrowed writer
+// beside any other live writer is refused by the lock; only a narrowed writer
+// whose own lock session died mid-run is unfenced, and what it can then do is
+// republish the one slug it was already publishing, idempotently, by slug.
+//
 // NOTHING IS DERIVED TWICE. `total_minutes`, the four `per_serving_*` values,
 // `sourced_calories_note`, `diet_tags`, `allergen_tags`, `allergen_status`,
 // `badges`, `budget_tier` and `nutrition_provenance` are all read from
@@ -48,20 +130,68 @@
 import './lib/bootstrap';
 import './lib/dbGuard';
 
+// Node's own hashing, for the corpus fingerprint the run row is addressed by
+// (see THE RUN LEDGER), and its CSPRNG for the attempt token an attempt is
+// fenced by (see assertAttemptOwnsRun). Nothing here hashes a secret: the digest
+// is taken over the bytes of the committed recipe files, which are reviewed
+// content.
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+// THE BORROWED READER STAGE, and why it is not a sixth stage name.
+//
+// lib/checkpoint.ts holds ONE advisory lock name for the whole catalog graph;
+// the `stage` argument selects the mode and labels the holder in
+// pg_stat_activity. The four mutating stages take it exclusively and the one
+// reader stage — `release`, the export — takes it SHARED, which is refused
+// exactly while a mutator holds it. That is the guarantee this stage needs: it
+// reads the catalog graph and writes only recipe tables, so two seeds or a seed
+// beside an export are harmless, while a seed beside an import, a generation
+// pass, a validation pass or a release load is the defect. `release` is
+// therefore borrowed rather than extended, following catalog-release.ts:2159:
+// `CATALOG_STAGE_LOCK_MODES` is a `Record<CatalogStageName, …>` over
+// `CatalogRunKind | 'release'`, so adding a name is a change to that module —
+// whose exhaustive key set is asserted in
+// src/__tests__/scripts/catalog-import.test.ts — and not a change to this file.
+// The mode is passed explicitly all the same, so this stage's hold stays shared
+// even if that table were ever re-keyed.
+//
+// THE RUN LEDGER. The claim is written here rather than through
+// checkpoint.ts's `openOrResumeRun`, for the reason that module states about
+// catalog-release.ts: `CatalogRunKind` is closed over the four stages that
+// resume THROUGH it, `catalog_import_runs.kind` is TEXT with no CHECK
+// constraint, `toCatalogRun` preserves any other value it meets, and every
+// ledger reader filters by kind — so `recipe_seed` needs no migration and is
+// inert for all of them. What this file does NOT re-implement is the ledger's
+// locked read-modify-write: `saveCursor` and `finishRun` are keyed by run id and
+// are kind-agnostic, so the cursor, the terminal counts and the guarded close
+// are that module's, exactly as they are for the other stages.
+//
+// Deliberately NOT imported: lib/budget and lib/rateLimiter. This stage makes no
+// vendor call, so it meters no model budget and paces no request, and those
+// modules' error classes are unreachable here. Importing them to classify a
+// failure that cannot happen would tell a reader this stage can exhaust a model
+// budget, which it cannot.
+import {
+    appendRunLog,
+    CheckpointError,
+    finishRun,
+    RUN_STATUS_SUCCEEDED,
+    saveCursor,
+    withCatalogStageLock,
+} from './lib/checkpoint';
+import type {
+    CatalogRunDb,
+    CatalogStageLockConnection,
+    CatalogStageLockMode,
+    CatalogStageName,
+} from './lib/checkpoint';
 import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
 import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
 import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
 import { loadCoveragePlan, ManifestError, recipesDir, writeJsonFile } from './lib/manifest';
 import type { CoveragePlan } from './lib/manifest';
-// Deliberately NOT imported: lib/budget, lib/rateLimiter and lib/checkpoint.
-// This stage reads files and writes rows — it makes no vendor call, meters no
-// model budget, paces no request and keeps no resumable checkpoint — so those
-// modules' error classes are unreachable here. Importing them to classify a
-// failure that cannot happen would load three unrelated modules at startup and
-// tell a reader this stage can exhaust a model budget, which it cannot.
 // The pure derivation layer. Every rule this stage applies to an ingredient set
 // comes from here, and this file adds none of its own (see the header).
 import { normalizeCanonicalName } from '../src/services/catalog.logic';
@@ -128,6 +258,115 @@ const FIRST_VERSION = 1;
  */
 const PUBLISH_TRANSACTION_TIMEOUT_MS = 30_000;
 
+/**
+ * The stage name this run's catalog hold is labelled with, and the mode it is
+ * taken in — the graph's one reader stage, borrowed (see the header's THE
+ * BORROWED READER STAGE for why adding a name here is a checkpoint.ts change and
+ * not a change to this file).
+ */
+const CATALOG_READER_STAGE: CatalogStageName = 'release';
+const CATALOG_READER_STAGE_MODE: CatalogStageLockMode = 'shared';
+
+/**
+ * THE RECIPE-SEED WRITER LOCK'S KEYSPACE, and why it is neither of the two
+ * spaces this system already uses.
+ *
+ * PostgreSQL documents the one-argument (bigint) and two-argument (int, int)
+ * advisory spaces as DISTINCT — a lock taken as `pg_advisory_lock(k)` never
+ * conflicts with one taken as `pg_advisory_lock(c, k)` — and lib/checkpoint.ts
+ * records what already lives in each:
+ *
+ *  - the ONE-argument space over `hashtext(...)` carries the request path's
+ *    per-user meal-planning lock (`hashtext('meal-planning:' || userId)`, Agent
+ *    Action Plan §0.5.1 "Lock first") and this file's own run-claim lock
+ *    (`hashtext('catalog-run:<kind>:<version>')`). `hashtext` narrows to 32
+ *    bits, so two unrelated names CAN collide. For a transaction-scoped lock
+ *    that costs milliseconds of waiting; for a lock held on a SESSION for the
+ *    whole duration of a stage — which is what this one is — a collision would
+ *    block a user's meal-planning request for that entire duration, which is an
+ *    outage rather than a delay. That rules the one-argument space out.
+ *  - the TWO-argument space under class id `0x434154` ('CAT') carries
+ *    lib/checkpoint.ts's catalog-graph stage lock, and that module states that
+ *    every catalog stage uses it "and nothing outside this file does". Reusing
+ *    it would make this lock contend with stages it has nothing to do with: a
+ *    seed would then refuse because an import held the same key, which is
+ *    already what the SHARED graph hold expresses correctly and separately.
+ *
+ * So this lock takes the two-argument space under a class id of its OWN. The
+ * value is the ASCII bytes of 'RSD' (recipe seed) — an arbitrary but fixed and
+ * documented constant, which is all a class id has to be, chosen the same way
+ * 'CAT' was. One name lives under it, so nothing inside the class can collide
+ * either.
+ */
+const RECIPE_SEED_WRITER_LOCK_CLASS_ID = 0x525344;
+
+/**
+ * ONE NAME FOR EVERY RECIPE-SEED WRITER, carrying no corpus and no fingerprint.
+ *
+ * That is the whole point: exclusivity is a property of the RECIPE TABLES, not
+ * of a corpus revision. Keying this on the fingerprint — the way the run claim
+ * is — would let two different revisions of the files, or an `--only`-narrowed
+ * writer beside a whole-corpus one, publish overlapping slugs at the same time,
+ * which is exactly the pair this lock exists to separate.
+ */
+const RECIPE_SEED_WRITER_LOCK_NAME = 'recipe-seed-writer';
+
+/** Ten seconds: a writer lock that cannot reach the database should say so, not hang. */
+const WRITER_LOCK_CONNECT_TIMEOUT_MS = 10_000;
+
+/** The lock statements are single function calls; anything slower is a database in trouble. */
+const WRITER_LOCK_QUERY_TIMEOUT_MS = 30_000;
+
+/**
+ * Names this connection in pg_stat_activity, so an operator who finds the seed
+ * refused can attribute the hold to a recipe seed rather than to an anonymous
+ * idle session. Distinct from lib/checkpoint.ts's `soh-catalog-stage-lock` for
+ * the same reason the class id is: the two holds answer different questions.
+ */
+const WRITER_LOCK_APPLICATION_NAME = 'soh-recipe-seed-writer-lock';
+
+/**
+ * This stage's `catalog_import_runs.kind`.
+ *
+ * Outside `CatalogRunKind` by design, the way catalog-release.ts's `'release'`
+ * is: the column is TEXT with no CHECK constraint, every ledger reader filters
+ * by kind, and nothing else in the pipeline claims this value.
+ */
+export const RECIPE_SEED_RUN_KIND = 'recipe_seed';
+
+/** `catalog_import_runs.status` while a run owns the corpus. */
+const RUN_STATUS_RUNNING = 'running';
+
+/**
+ * How long a claimed run stays LIVE without a heartbeat, and — since the writer
+ * lock landed — how long an interrupted run row stays un-resumable.
+ *
+ * WHAT THIS IS NOT. It is NOT what separates two seeds; the RECIPE-SEED WRITER
+ * LOCK is (see the header's ONE RECIPE-SEED WRITER). The lease cannot be: its
+ * row is addressed by the corpus fingerprint, so two different revisions of the
+ * files never meet on it at all, and an `--only`-narrowed run claims no row for
+ * it to be stored on. A previous revision of this comment claimed the lease was
+ * "the whole of this stage's mutual exclusion between two seeds" — it was
+ * wrong, and the code above it is why the claim is not re-added.
+ *
+ * WHAT IT IS. The recovery clock for the ONE exit that leaves a row `running`:
+ * the process died, so nothing closed it. A live holder keeps the session-scoped
+ * writer lock, so while it lives no second invocation reaches the claim at all
+ * and no takeover can happen; the lease is read only by an invocation that
+ * ALREADY took the writer lock, i.e. one for which the previous holder's session
+ * is provably gone. A lease still in the future then means "that process may
+ * only just have died, and its last publications are still settling", and the
+ * run is refused (`seed_in_progress`); once it has lapsed the row is taken over,
+ * its attempt token is rotated, and the dead attempt is fenced out for good.
+ *
+ * Two minutes is four times the ceiling on one publish transaction
+ * (PUBLISH_TRANSACTION_TIMEOUT_MS), which is the longest a healthy run can go
+ * between heartbeats, and it is also how long an operator waits after a `kill
+ * -9` before the corpus can be seeded again. Both halves of that trade are why
+ * it is neither seconds nor an hour.
+ */
+export const RECIPE_SEED_RUN_LEASE_MS = 120_000;
+
 const logger = createLogger(STAGE);
 
 /* ---------------------------------------------------------------------------
@@ -150,8 +389,52 @@ const logger = createLogger(STAGE);
  *    them and not the first.
  *  - `publication_failed` — the validated set was refused by the database. The
  *    per-slug transaction means nothing partial survives it.
+ *  - `catalog_locked` — another catalog pipeline stage holds the graph
+ *    exclusively, so this run cannot read a catalog that will still be the
+ *    catalog when it publishes. Refused before any write, and retryable as soon
+ *    as the other stage finishes.
+ *  - `catalog_drifted` — an ingredient's catalog row stopped being publishable,
+ *    or moved one of its version counters, between the validation pass and the
+ *    transaction that was about to cite it. Refused rather than published,
+ *    because a plannable recipe may not rest on a retired, non-source-backed or
+ *    allergen-unknown ingredient (§0.7.3), and the recipe already published
+ *    before it keeps its own committed transaction.
+ *  - `seed_in_progress` — a live run of this same corpus already holds the
+ *    stage's run row, so publishing beside it would interleave two corpora's
+ *    decisions into one ledger.
+ *  - `seed_writer_locked` — ANOTHER RECIPE SEED is publishing right now. A
+ *    different situation from `catalog_locked` and a different remedy: nothing
+ *    is wrong with the catalog, and the operator is waiting for a seed rather
+ *    than for an import, a generation pass, a validation pass or a release load.
+ *    Refused before any read or write, and retryable the moment the other seed
+ *    finishes or its process dies (the lock is session-scoped, so death releases
+ *    it with no operator action).
+ *  - `seed_writer_lock_unavailable` — the writer lock could not be attempted at
+ *    all because no `DATABASE_URL` is resolvable. dbGuard normally refuses that
+ *    at module load, so reaching this means a caller bypassed it; refused rather
+ *    than publishing with no writer exclusion (§9 — config behind an accessor
+ *    that fails loudly).
+ *  - `run_attempt_superseded` — this attempt no longer owns its run row: the row
+ *    is gone, has been closed, or carries another attempt's token because a
+ *    later invocation took the run over after this one's lock session died. The
+ *    write is refused rather than landing on a run someone else is finishing
+ *    (see assertAttemptOwnsRun).
+ *  - `run_ledger_unavailable` — the caller injected a publication client that
+ *    cannot reach `catalog_import_runs` and no separate ledger client, so the
+ *    run could not be recorded. Refused rather than publishing unrecorded work.
  */
-export type RecipeSeedErrorCode = 'recipes_unreadable' | 'unknown_slug' | 'recipes_invalid' | 'publication_failed';
+export type RecipeSeedErrorCode =
+    | 'recipes_unreadable'
+    | 'unknown_slug'
+    | 'recipes_invalid'
+    | 'publication_failed'
+    | 'catalog_locked'
+    | 'catalog_drifted'
+    | 'seed_in_progress'
+    | 'seed_writer_locked'
+    | 'seed_writer_lock_unavailable'
+    | 'run_attempt_superseded'
+    | 'run_ledger_unavailable';
 
 /**
  * The stage's own failure class.
@@ -317,12 +600,16 @@ export const describeUsage = (): string =>
         '  --dry-run                   Parse, resolve and validate everything, then stop.',
         '                              No row and no report is written on any path.',
         '  --confirm-target <dbname>   Required by scripts/lib/dbGuard.ts, which owns',
-        '                              this flag, whenever DATABASE_URL is not a',
-        '                              development origin: it must name that URL\'s',
-        '                              database exactly. Without it the guard refuses',
-        '                              the run at module load with',
-        '                              code "confirmation_required". Never needed',
-        '                              against a development origin.',
+        '                              this flag, unless the database\'s own NAME says',
+        '                              development — a _dev suffix, with or without a',
+        '                              clone index, on a local host: it must name that',
+        '                              URL\'s database exactly. Without it the guard',
+        '                              refuses the run at module load with',
+        '                              code "confirmation_required". A local database',
+        '                              named anything else is development by its host',
+        '                              alone, and needs the flag like a test or shadow',
+        '                              one; a remote host is unrecognised and no flag',
+        '                              reaches it.',
         '  --help, -h                  Print this usage block and exit 0.',
         '',
         'Inputs read:',
@@ -339,11 +626,30 @@ export const describeUsage = (): string =>
         '                                      the diet x allergen x slot x time coverage',
         '                                      table, derived from the seeded rows. Stable',
         '                                      and byte-identical on a no-op rerun.',
+        `  catalog_import_runs (kind "${RECIPE_SEED_RUN_KIND}")`,
+        '                                      one run row per whole-corpus attempt, keyed on',
+        '                                      a fingerprint of the coverage plan version and',
+        '                                      the selected files\' bytes. It carries the slug',
+        '                                      watermark and the decisions as a cursor, the',
+        '                                      committed counts, and a terminal succeeded or',
+        '                                      failed status — so an interrupted seed is',
+        '                                      visible and resumable. A dry run and an --only',
+        '                                      run claim none.',
+        '',
+        'Concurrency:',
+        '  The whole run holds the catalog graph\'s stage lock in SHARED mode, so it is',
+        '  refused while an import, a generation pass, a validation pass or a release',
+        '  load is rewriting the catalog this corpus resolves against, and every',
+        '  publication re-reads and locks its ingredient rows before it writes. Two',
+        '  seeds of one corpus do not publish at the same time: the second is refused',
+        '  while the first\'s run lease is live, and an abandoned run becomes resumable',
+        `  ${RECIPE_SEED_RUN_LEASE_MS / 1000} seconds after its last committed recipe.`,
         '',
         'Environment:',
         '  DATABASE_URL   required; classified by scripts/lib/dbGuard.ts. Ingredients',
         '                 resolve against the catalog loaded in it, so run',
-        '                 `npm run catalog:load -- --release <vN>` first.',
+        '                 `npm run catalog:load -- --release <vN>` first. The stage lock',
+        '                 and the run ledger are held in the same database.',
     ].join('\n');
 
 const writeUsage = (level: LogLevel): void => {
@@ -648,10 +954,27 @@ export const parseRecipePayload = (file: string, value: unknown): RecipeFilePayl
     };
 };
 
+/**
+ * One selected file's identity in the corpus fingerprint: its name and a digest
+ * of the exact bytes this run read.
+ *
+ * Taken over the BYTES rather than over the parsed payload, and taken for a file
+ * that failed to parse too: the fingerprint names the corpus an attempt was
+ * asked to publish, and two runs over the same bytes are the same work whatever
+ * those bytes turn out to mean.
+ */
+export interface RecipeFileDigest {
+    readonly file: string;
+    /** SHA-256 of the file's contents, hex. */
+    readonly sha256: string;
+}
+
 export interface RecipeFileRead {
     readonly payloads: readonly RecipeFilePayload[];
     /** One entry per file that could not be parsed; the run refuses on any of them. */
     readonly problems: readonly string[];
+    /** One entry per selected file, in file-name order — the corpus fingerprint's input. */
+    readonly digests: readonly RecipeFileDigest[];
 }
 
 /**
@@ -691,6 +1014,7 @@ export const readRecipeFiles = (directory: string, only: readonly string[]): Rec
 
     const payloads: RecipeFilePayload[] = [];
     const problems: string[] = [];
+    const digests: RecipeFileDigest[] = [];
 
     for (const file of [...selected].sort()) {
         let raw: string;
@@ -702,6 +1026,11 @@ export const readRecipeFiles = (directory: string, only: readonly string[]): Rec
                 `recipes/${file} could not be read: ${safeError(error).message}`,
             );
         }
+
+        // Digested here, from the bytes just read, so the fingerprint describes
+        // what this run actually consumed rather than what a second read of the
+        // directory would find.
+        digests.push({ file, sha256: crypto.createHash('sha256').update(raw).digest('hex') });
 
         let parsed: unknown;
         try {
@@ -726,7 +1055,7 @@ export const readRecipeFiles = (directory: string, only: readonly string[]): Rec
         }
     }
 
-    return { payloads, problems };
+    return { payloads, problems, digests };
 };
 
 /* ---------------------------------------------------------------------------
@@ -1581,9 +1910,11 @@ export interface JoinedRecipeRow {
 // The compensating controls are therefore about WHICH DATABASE and WHICH ROW
 // rather than which user. scripts/lib/dbGuard.ts classifies `DATABASE_URL`
 // before any client exists and, because `recipes-seed` is registered
-// `development_or_confirmed`, demands `--confirm-target <dbname>` for any
-// non-development origin; `slug` (unique) selects the recipe and `source_key`
-// selects each ingredient's food, so no write here is found by a bare id.
+// `development_or_confirmed`, demands `--confirm-target <dbname>` unless the
+// database's own name says development — so a deployment database reached over
+// loopback is named aloud like a test or shadow one; `slug` (unique) selects the
+// recipe and `source_key` selects each ingredient's food, so no write here is
+// found by a bare id.
 export interface SeedDb {
     catalog_foods: {
         findMany<Row = SeedCatalogFoodRow>(args: unknown): Promise<Row[]>;
@@ -1598,6 +1929,15 @@ export interface SeedDb {
         create(args: unknown): Promise<{ id: string; version: number }>;
         update(args: unknown): Promise<{ id: string }>;
     };
+    /**
+     * Raw SQL, because Prisma cannot express `FOR SHARE` and the row lock is not
+     * optional in a publishing transaction (see `lockIngredientFoods`).
+     * Declared with the ROW ARRAY as the type parameter and the template form as
+     * the argument, which is how lib/checkpoint.ts's `lockRunForUpdate` and
+     * catalog-validate.ts's `ValidateDb` declare the same seam, so every raw
+     * reader in this pipeline reads the same way.
+     */
+    $queryRaw<TRows = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows>;
     $transaction<T>(work: (tx: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T>;
 }
 
@@ -1743,6 +2083,152 @@ const RECIPE_READ_INCLUDE = {
 };
 
 /**
+ * The catalog facts a publishing transaction re-reads, and the only ones it can
+ * compare: a `recipe_ingredients` row snapshots the nutrients, the name, the
+ * provenance and both counters, so those are what "unchanged" is measured
+ * against, while `publication_status` and `allergen_status` are the live
+ * eligibility clauses §0.7.3 states for a NEW version.
+ */
+const INGREDIENT_FACT_SELECT = {
+    id: true,
+    source_key: true,
+    publication_status: true,
+    nutrition_provenance: true,
+    allergen_status: true,
+    nutrition_version: true,
+    metadata_version: true,
+};
+
+interface IngredientFactRow {
+    id: string;
+    source_key: string;
+    publication_status: string;
+    nutrition_provenance: string;
+    allergen_status: string;
+    nutrition_version: number;
+    metadata_version: number;
+}
+
+/**
+ * Takes a SHARED row lock on every catalog food this publication cites.
+ *
+ * Raw SQL because Prisma cannot express `FOR SHARE`, and the in-repo pattern for
+ * "lock the row, then re-read it through the selection object" is
+ * catalog-validate.ts's per-food compare-and-set — down to binding the ids and
+ * casting them in the statement text rather than interpolating them.
+ *
+ * SHARED rather than exclusive: this stage does not write `catalog_foods`, and
+ * two seeds (or a seed and a release export) holding the same food are
+ * harmless. What the lock buys is the half-second that matters — a catalog
+ * mutator wanting to retire or re-version one of these rows must now wait for
+ * this transaction to commit, so the facts verified on the next line cannot
+ * change between the verification and the insert that cites them.
+ *
+ * `ORDER BY id` makes the locking order deterministic rather than plan-dependent,
+ * which is the cheap half of deadlock avoidance; the expensive half is the
+ * graph-wide stage lock the whole run is held under, which keeps the exclusive
+ * mutators out entirely.
+ *
+ * An id absent from the result is a food that is no longer in the table at all,
+ * and the re-read below reports it as such — retirement is a status change, so a
+ * genuinely absent row means someone deleted it by hand.
+ */
+const lockIngredientFoods = async (tx: SeedDb, foodIds: readonly string[]): Promise<void> => {
+    await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM catalog_foods WHERE id = ANY(${[...foodIds]}::uuid[]) ORDER BY id FOR SHARE
+    `;
+};
+
+/**
+ * Refuses a publication whose ingredient facts moved since validation.
+ *
+ * WHY THIS EXISTS EVEN THOUGH THE RUN HOLDS THE GRAPH LOCK. The validation pass
+ * reads the catalog once, for the whole corpus, and the publications then happen
+ * one transaction at a time. Between the two, a writer that did not take the
+ * stage lock — or a caller that injected its own lock seam — can retire a food,
+ * flip it to `ai_estimated`, drop its allergen review or bump either counter,
+ * and the snapshot this stage was about to write would then describe a row that
+ * no longer exists in that shape. §0.7.3 forbids exactly that: a plannable
+ * recipe may not rest on a retired, non-source-backed or allergen-unknown
+ * ingredient, and a `current` version citing a stale counter is what
+ * `findStaleIngredients` exists to catch rather than to create.
+ *
+ * Every offending ingredient is reported, not the first, because an operator
+ * who ran a load beside a seed wants the whole list; each entry names the
+ * recipe, the ingredient's `source_key` and what moved.
+ *
+ * Called immediately before the first write of each publishing path and NEVER
+ * on the `unchanged` path: a rerun that publishes nothing must stay a read, and
+ * a retired food may legitimately keep backing the version it was already
+ * published into.
+ */
+const assertIngredientFactsHold = async (tx: SeedDb, plan: RecipePublicationPlan): Promise<void> => {
+    const foodIds = [...new Set(plan.ingredients.map((ingredient) => ingredient.catalog_food_id))].sort();
+    if (foodIds.length === 0) {
+        return;
+    }
+
+    await lockIngredientFoods(tx, foodIds);
+
+    const rows = await tx.catalog_foods.findMany<IngredientFactRow>({
+        where: { id: { in: foodIds } },
+        select: INGREDIENT_FACT_SELECT,
+        orderBy: { source_key: 'asc' },
+    });
+    const factsById = new Map(rows.map((row) => [row.id, row]));
+
+    const problems: string[] = [];
+    for (const ingredient of plan.ingredients) {
+        const facts = factsById.get(ingredient.catalog_food_id);
+        const named = `${plan.slug}: ingredient "${ingredient.snapshot_name}"`;
+
+        if (facts === undefined) {
+            problems.push(`${named} is no longer in the catalog at all`);
+            continue;
+        }
+        if (facts.publication_status !== PUBLISHED_STATUS) {
+            problems.push(
+                `${named} (${facts.source_key}) is now publication_status "${facts.publication_status}", ` +
+                    `not "${PUBLISHED_STATUS}"`,
+            );
+        }
+        if (facts.nutrition_provenance !== SOURCE_BACKED_PROVENANCE) {
+            problems.push(
+                `${named} (${facts.source_key}) is now nutrition_provenance "${facts.nutrition_provenance}", ` +
+                    `not "${SOURCE_BACKED_PROVENANCE}"`,
+            );
+        }
+        if (facts.allergen_status !== KNOWN_ALLERGEN_STATUS) {
+            problems.push(
+                `${named} (${facts.source_key}) is now allergen_status "${facts.allergen_status}", ` +
+                    `not "${KNOWN_ALLERGEN_STATUS}"`,
+            );
+        }
+        if (facts.nutrition_version !== ingredient.catalog_nutrition_version) {
+            problems.push(
+                `${named} (${facts.source_key}) moved nutrition_version ` +
+                    `${ingredient.catalog_nutrition_version} -> ${facts.nutrition_version} since it was resolved`,
+            );
+        }
+        if (facts.metadata_version !== ingredient.catalog_metadata_version) {
+            problems.push(
+                `${named} (${facts.source_key}) moved metadata_version ` +
+                    `${ingredient.catalog_metadata_version} -> ${facts.metadata_version} since it was resolved`,
+            );
+        }
+    }
+
+    if (problems.length > 0) {
+        throw new RecipeSeedError(
+            'catalog_drifted',
+            `${plan.slug} was not published: the catalog moved under it between validation and publication. ` +
+                'Run the seed again once the catalog stage that changed these rows has finished',
+            problems,
+        );
+    }
+};
+
+/**
  * Publishes one validated recipe, or leaves it alone.
  *
  * ONE TRANSACTION, and inside it the order is load-bearing:
@@ -1760,21 +2246,52 @@ const RECIPE_READ_INCLUDE = {
  * The decision is taken INSIDE the transaction, from the rows it reads there:
  * deciding outside it would let a concurrent run publish between the read and
  * the write, and the loser would insert a second `current` row.
+ *
+ * The CATALOG FACTS are verified inside it too, immediately before either
+ * writing path's first statement and under a shared row lock
+ * (`assertIngredientFactsHold`). `plan` carries facts the validation pass read
+ * for the whole corpus; a food retired, re-judged or re-versioned since then
+ * refuses this recipe rather than publishing a `current` version that cites
+ * facts which no longer hold. The no-op path never reaches the check, so a
+ * rerun over an unchanged corpus still writes nothing at all.
+ *
+ * THE ATTEMPT'S OWNERSHIP is verified inside it as the FIRST statement, when a
+ * run was claimed (`assertAttemptOwnsRun`). Two reasons it is first rather than
+ * beside the catalog check: the row lock it takes must be held for the whole
+ * transaction for the verification to be atomic with the publication, and a
+ * fenced-out attempt must not even take the shared ingredient locks a real
+ * publication takes. It runs on the no-op path too — an attempt that no longer
+ * owns the run may not report a slug as reconciled either, and the fence's own
+ * `SELECT … FOR UPDATE` leaves the recipe tables exactly as it found them, so
+ * "an unchanged rerun writes nothing" still holds.
+ *
+ * `owner` is `null` for the two paths that claim no run — a dry run, which never
+ * reaches here, and an `--only`-narrowed run, whose exclusivity comes from the
+ * writer lock alone because there is no row for a second attempt to take over.
  */
 export const publishRecipe = async (
     db: SeedDb,
     plan: RecipePublicationPlan,
     now: Date,
     currentCatalogVersions: ReadonlyMap<string, CatalogIngredientVersions>,
+    owner: SeedRunOwner | null,
 ): Promise<PublishResult> =>
     db.$transaction(
         async (tx) => {
+            if (owner !== null) {
+                await assertAttemptOwnsRun(tx, owner);
+            }
+
             const stored = await tx.recipes.findUnique<StoredRecipeRow>({
                 where: { slug: plan.slug },
                 include: RECIPE_READ_INCLUDE,
             });
 
             if (stored === null) {
+                // The facts, re-read and held, before the first write of this
+                // path (see assertIngredientFactsHold).
+                await assertIngredientFactsHold(tx, plan);
+
                 const recipe = await tx.recipes.create({ data: { slug: plan.slug } });
                 const version = await tx.recipe_versions.create({
                     data: versionCreateData(plan, recipe.id, FIRST_VERSION, now),
@@ -1832,6 +2349,11 @@ export const publishRecipe = async (
                     reason: null,
                 };
             }
+
+            // A new version WILL be written from here on, so the facts it cites
+            // are re-read and held first — after the no-op return above, which
+            // must stay a read (see assertIngredientFactsHold).
+            await assertIngredientFactsHold(tx, plan);
 
             const highestVersion = stored.recipe_versions.reduce(
                 (highest, row) => Math.max(highest, row.version),
@@ -2348,6 +2870,72 @@ export interface SeedDeps {
      */
     readonly reportPath: string;
     readonly writeReport: (absolutePath: string, value: unknown) => void;
+    /**
+     * The client the RUN LEDGER is written through — `catalog_import_runs` and
+     * nothing else.
+     *
+     * Optional, and it defaults to `prisma`: in production `main` hands the one
+     * singleton to both, and so does every suite that drives this stage. It is
+     * separable for the one case where the two must not be the same object — a
+     * suite that faults the publication client to prove a rollback would
+     * otherwise fault the ledger write that records that failure. When it is
+     * omitted the publication client is probed for the ledger delegate, and a
+     * client that cannot reach it refuses the run (`run_ledger_unavailable`)
+     * rather than publishing work that nothing records.
+     *
+     * Typed as checkpoint.ts's own `CatalogRunDb` because the cursor and the
+     * terminal close go through that module's locked writers, which take
+     * exactly that client.
+     */
+    readonly runDb?: CatalogRunDb;
+    /**
+     * Runs the whole stage while the catalog graph is held, and releases it
+     * afterwards however the stage ended.
+     *
+     * Optional, defaulting to the real shared hold on the graph's stage lock
+     * (see the header's THE CATALOG MUST NOT MOVE WHILE THIS STAGE PUBLISHES).
+     * It is a seam rather than a fixed call for the two things a suite needs and
+     * cannot get otherwise: driving the stage with no second connection to
+     * PostgreSQL, and asserting that the hold is actually taken around the whole
+     * run rather than around part of it. Production never passes it, so the lock
+     * is not something the stage opts into.
+     */
+    readonly runUnderCatalogLock?: <T>(work: () => Promise<T>) => Promise<T>;
+    /**
+     * Runs the whole publishing stage as the one recipe-seed writer, and
+     * releases that exclusivity afterwards however the stage ended.
+     *
+     * Optional, defaulting to the real exclusive, session-scoped hold (see
+     * runUnderWriterHold), and bypassed entirely for a dry run, which publishes
+     * nothing to own. Production never passes it, so the lock is not something
+     * the stage opts into.
+     *
+     * It is a seam for the one thing a suite cannot otherwise produce: a
+     * ZOMBIE. The lock's whole value is that it dies with its session, and the
+     * case that leaves — a process whose lock session died while the process
+     * kept running and kept a usable connection pool — is unreachable from a
+     * test that can only kill whole processes. A pass-through injected here IS
+     * that process, which is how the attempt fence (`assertAttemptOwnsRun`) is
+     * driven deterministically rather than hoped for.
+     */
+    readonly runUnderWriterLock?: <T>(work: () => Promise<T>) => Promise<T>;
+}
+
+/** What this invocation recorded in `catalog_import_runs`. */
+export interface SeedRunRecord {
+    readonly runId: string;
+    /** The corpus fingerprint the run is addressed by, stored as `manifest_version`. */
+    readonly manifestVersion: string;
+    /** True when this invocation continued a run an earlier attempt left open. */
+    readonly resumed: boolean;
+    /** Which attempt at this run's corpus this invocation is; 1 for a fresh run. */
+    readonly attempt: number;
+    /**
+     * The newest run that had already SUCCEEDED for this same corpus, or `null`
+     * when there was none. Recorded rather than turned into a no-op — see
+     * `claimRecipeSeedRun`.
+     */
+    readonly previousSucceededRunId: string | null;
 }
 
 export interface SeedOutcome {
@@ -2362,7 +2950,725 @@ export interface SeedOutcome {
     readonly reportPath: string | null;
     /** Why no report was written, or `null` when one was. */
     readonly reportSkippedReason: string | null;
+    /**
+     * The ledger row this invocation owned, or `null` for a dry run and for an
+     * `--only`-narrowed run: neither is an attempt at the whole corpus, so
+     * neither claims one.
+     */
+    readonly run: SeedRunRecord | null;
+    /** Why no run was claimed, or `null` when one was. */
+    readonly runSkippedReason: string | null;
 }
+
+/* ---------------------------------------------------------------------------
+ * THE RUN LEDGER
+ *
+ * §0.7.1's interruption-and-recovery requirement, for a stage that publishes
+ * one transaction per recipe. A run row makes three questions answerable after
+ * the fact that are unanswerable without one: did the last attempt finish, how
+ * far did it get, and was it working on THIS corpus.
+ *
+ * The identity is the corpus, not the clock: `manifest_version` is a
+ * fingerprint of the coverage plan version plus every selected file's bytes, so
+ * a rerun of the same corpus addresses the same run and an edited corpus is new
+ * work by construction.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The corpus fingerprint, stored as the run's `manifest_version`.
+ *
+ * Formatted exactly like checkpoint.ts's `canonicalValidationRunKey` — the
+ * policy version, `@`, and twelve hex characters of a SHA-256 — and for the same
+ * reason: `manifest_version` is a column an operator reads in a terminal, so the
+ * readable half stays readable and the input is hashed rather than embedded.
+ * Twelve hex characters distinguish every corpus a database will ever hold.
+ *
+ * The coverage plan version is part of it because the plan supplies the
+ * food-group vocabulary the instruction-completeness check refuses files with:
+ * the same files under a new vocabulary are a different judgement and therefore
+ * different work.
+ */
+export const deriveCorpusFingerprint = (
+    coveragePlanVersion: string,
+    digests: readonly RecipeFileDigest[],
+): string => {
+    // Sorted by file name rather than trusted to arrive ordered, so the
+    // fingerprint is a function of the corpus's CONTENT and not of directory
+    // iteration order — the same rule catalogInputIdentity follows.
+    const canonical = [...digests]
+        .sort((left, right) => (left.file < right.file ? -1 : left.file > right.file ? 1 : 0))
+        .map((digest) => `${digest.file}\t${digest.sha256}`)
+        .join('\n');
+
+    return `${coveragePlanVersion}@${crypto
+        .createHash('sha256')
+        .update(`${digests.length}\n${canonical}`)
+        .digest('hex')
+        .slice(0, 12)}`;
+};
+
+/**
+ * The run's stored cursor: what this attempt has settled, and the lease that
+ * makes the attempt recognisable as live.
+ *
+ * Per ATTEMPT rather than cumulative across attempts. A resumed run's tallies
+ * would otherwise count a slug twice — once as the created row an interrupted
+ * attempt committed and once as the unchanged row the resuming attempt read —
+ * and `settledSlugs` would exceed `corpusSlugs`, which is the kind of number
+ * nobody can act on. The interrupted attempt's own watermark is not lost: the
+ * claim appends it to the run's `log` before it overwrites the cursor.
+ */
+export interface RecipeSeedCursor {
+    /** 1 for a fresh run, incremented each time an attempt takes over an open one. */
+    readonly attempt: number;
+    /** Recipes this attempt was asked to reconcile. */
+    readonly corpusSlugs: number;
+    /** Recipes whose transaction has COMMITTED in this attempt. */
+    readonly settledSlugs: number;
+    /** The slug watermark: the last recipe this attempt settled. */
+    readonly lastSlug: string | null;
+    readonly lastAction: PublishAction | null;
+    readonly created: number;
+    readonly promoted: number;
+    readonly unchanged: number;
+    readonly ingredientRows: number;
+    /**
+     * ISO instant. While it is in the future another invocation treats this run
+     * as live and refuses; once it has lapsed the run is resumable (see
+     * RECIPE_SEED_RUN_LEASE_MS).
+     */
+    readonly leaseUntil: string;
+    /**
+     * THE FENCE. An unguessable token identifying the attempt that owns this run
+     * right now, minted on the fresh claim and ROTATED on every takeover.
+     *
+     * It lives in the cursor rather than in a column of its own because
+     * `catalog_import_runs` has no such column and this stage does not get to
+     * add one — prisma/schema.prisma is a shared surface and the cursor is the
+     * JSONB shape this file already owns end to end (`cursorFrom` composes it,
+     * nothing else reads it). Every write this attempt makes against the run
+     * compares its own token with the stored one under a row lock, so a
+     * superseded attempt is refused rather than merely unlikely (see
+     * assertAttemptOwnsRun).
+     */
+    readonly attemptToken: string;
+}
+
+/** The attempt's running tally, which the cursor and the terminal counts are both written from. */
+interface SeedRunProgress {
+    attempt: number;
+    settled: number;
+    created: number;
+    promoted: number;
+    unchanged: number;
+    ingredientRows: number;
+    lastSlug: string | null;
+    lastAction: PublishAction | null;
+}
+
+const newRunProgress = (attempt: number): SeedRunProgress => ({
+    attempt,
+    settled: 0,
+    created: 0,
+    promoted: 0,
+    unchanged: 0,
+    ingredientRows: 0,
+    lastSlug: null,
+    lastAction: null,
+});
+
+/**
+ * A fresh attempt token.
+ *
+ * `randomUUID` rather than a counter, a timestamp or the attempt number,
+ * because the token's only job is to be UNGUESSABLE: a superseded attempt must
+ * not be able to reconstruct the value that would let its write through, and a
+ * value derived from anything it already knows (its run id, its attempt number,
+ * the clock) is exactly that. It is a CSPRNG value from Node's own crypto, so
+ * nothing new is depended on.
+ */
+const newAttemptToken = (): string => crypto.randomUUID();
+
+const cursorFrom = (
+    progress: SeedRunProgress,
+    corpusSlugs: number,
+    leaseUntil: Date,
+    attemptToken: string,
+): RecipeSeedCursor => ({
+    attempt: progress.attempt,
+    corpusSlugs,
+    settledSlugs: progress.settled,
+    lastSlug: progress.lastSlug,
+    lastAction: progress.lastAction,
+    created: progress.created,
+    promoted: progress.promoted,
+    unchanged: progress.unchanged,
+    ingredientRows: progress.ingredientRows,
+    leaseUntil: leaseUntil.toISOString(),
+    attemptToken,
+});
+
+/**
+ * The attempt's tallies as the ledger's `counts` map.
+ *
+ * Snake_case keys, like every other stage's counters, because they are read
+ * beside them in one column.
+ */
+const countsFrom = (progress: SeedRunProgress): Record<string, number> => ({
+    recipes_settled: progress.settled,
+    recipes_created: progress.created,
+    recipes_promoted: progress.promoted,
+    recipes_unchanged: progress.unchanged,
+    ingredient_rows: progress.ingredientRows,
+});
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+    typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * A stored cursor's lease, or `null` when the column carries no readable one.
+ *
+ * Defensive on purpose: a run row can predate this cursor shape, can have been
+ * written by hand, or can hold a malformed instant, and every one of those means
+ * the same thing — there is no evidence this run is live, so it is resumable.
+ * Treating an unreadable lease as live would be worse: it would refuse every
+ * future seed of this corpus with no way to clear it short of editing the table.
+ */
+const leaseUntilOf = (cursor: unknown): Date | null => {
+    if (!isPlainRecord(cursor)) {
+        return null;
+    }
+    const leaseUntil = cursor.leaseUntil;
+    if (typeof leaseUntil !== 'string') {
+        return null;
+    }
+    const parsed = new Date(leaseUntil);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+/** A stored cursor's attempt number, defaulting to the first attempt for any unreadable value. */
+const attemptOf = (cursor: unknown): number => {
+    if (!isPlainRecord(cursor)) {
+        return 1;
+    }
+    const attempt = cursor.attempt;
+    return typeof attempt === 'number' && Number.isInteger(attempt) && attempt > 0 ? attempt : 1;
+};
+
+/**
+ * A stored cursor's attempt token, or `null` when the column carries none.
+ *
+ * `null` is NOT treated as "any attempt may write", the way `leaseUntilOf`
+ * treats an unreadable lease as "not live". The asymmetry is deliberate and it
+ * is the safe direction for each: an unreadable lease must not lock a corpus out
+ * for ever, while a missing token means the row is not the row this attempt
+ * claimed — a hand-edited cursor, or one overwritten by something that does not
+ * speak this protocol — and letting a write through on that basis would defeat
+ * the fence entirely. Every claim and takeover writes a token before this
+ * attempt publishes anything, so a missing one at verification time is always
+ * someone else's doing.
+ */
+const attemptTokenOf = (cursor: unknown): string | null => {
+    if (!isPlainRecord(cursor)) {
+        return null;
+    }
+    const token = cursor.attemptToken;
+    return typeof token === 'string' && token.length > 0 ? token : null;
+};
+
+/**
+ * Everything one attempt needs to write to its own ledger row, including the
+ * token that proves the row is still its own.
+ *
+ * Carried as one object rather than as three correlated values so that no call
+ * site can pass the client and the run id of an attempt and forget its fence.
+ * Exported because `publishRecipe` — the stage's one exported write — names it.
+ */
+export interface SeedRunOwner {
+    /** The client the RUN LEDGER is written through (`SeedDeps.runDb`, or `prisma`). */
+    readonly db: CatalogRunDb;
+    readonly record: SeedRunRecord;
+    /**
+     * This attempt's fence. Deliberately NOT a member of `SeedRunRecord`, which
+     * travels out on `SeedOutcome.run` and into the stage's log lines: a token
+     * that appears in an operator's terminal is a token a later reader of that
+     * terminal can replay.
+     */
+    readonly attemptToken: string;
+}
+
+/** The ledger rows the claim reads. Structural, so the generated row type satisfies it. */
+interface StoredRunRow {
+    readonly id: string;
+    readonly cursor: unknown;
+}
+
+/**
+ * The one call the fence makes: a LOCKING read of the run row.
+ *
+ * Declared as its own one-method shape because the fence runs against both of
+ * this stage's clients — the publication client inside a per-recipe transaction
+ * (`SeedDb`) and the ledger client inside its own (`CatalogRunDb`) — and both
+ * satisfy exactly this. The template form matches how lib/checkpoint.ts's
+ * `lockRunForUpdate` and this file's `lockIngredientFoods` declare the same
+ * seam, so every raw reader in this pipeline reads the same way.
+ */
+interface FenceDb {
+    $queryRaw<TRows = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows>;
+}
+
+/** What the fence reads under the row lock. JSONB comes back already parsed. */
+interface FencedRunRow {
+    status: string;
+    cursor: unknown;
+}
+
+/**
+ * Refuses a write whose attempt no longer owns the run — THE FENCE.
+ *
+ * WHY IT EXISTS EVEN THOUGH THE STAGE HOLDS A SESSION LOCK. The writer lock
+ * makes two LIVE writers impossible, and while a holder lives no takeover can
+ * occur. What it cannot cover is the process whose lock SESSION died while the
+ * process kept running: a dropped connection, a suspended host, a statement
+ * that returned after an age. That process holds no lock, so a second
+ * invocation legitimately takes the writer lock, finds the row's lease lapsed
+ * and takes the run over — and the first process can then wake up with a
+ * perfectly usable Prisma pool and continue publishing, move the cursor
+ * backwards or close a row the new attempt is still working. This is the
+ * residue the finding names, and it is what this function refuses.
+ *
+ * WHY IT IS ATOMIC. `SELECT … FOR UPDATE` is taken in the SAME transaction as
+ * the write it guards — the per-recipe publication transaction, the cursor
+ * write's transaction, the report's, the close's — so the row cannot be taken
+ * over between the verification and the write. That is only possible because
+ * lib/checkpoint.ts declares `CatalogRunDb = PrismaClient |
+ * Prisma.TransactionClient`: `saveCursor` and `finishRun` accept a transaction
+ * client and run in place inside it, so verify-then-write is one transaction
+ * without changing that module.
+ *
+ * THREE WAYS TO FAIL, one code. An absent row, a row no longer `running`, and a
+ * row carrying a different token all mean the same thing to the caller — this
+ * attempt does not own this run — and all three are situations a takeover
+ * produces. The message distinguishes them for the operator.
+ */
+const assertAttemptOwnsRun = async (tx: FenceDb, owner: SeedRunOwner): Promise<void> => {
+    const runId = owner.record.runId;
+    const rows = await tx.$queryRaw<FencedRunRow[]>`
+        SELECT status, cursor FROM catalog_import_runs WHERE id = ${runId}::uuid FOR UPDATE
+    `;
+
+    if (rows.length === 0) {
+        throw new RecipeSeedError(
+            'run_attempt_superseded',
+            `${STAGE} stopped: its run row (${runId}) is no longer in catalog_import_runs, so this attempt ` +
+                'has nothing to record against and must not keep publishing. Run the seed again.',
+        );
+    }
+
+    const row = rows[0];
+
+    if (row.status !== RUN_STATUS_RUNNING) {
+        throw new RecipeSeedError(
+            'run_attempt_superseded',
+            `${STAGE} stopped: its run row (${runId}) has already been closed as "${row.status}" by another ` +
+                'attempt, so this one is no longer the writer. Run the seed again to reconcile the corpus.',
+        );
+    }
+
+    const stored = attemptTokenOf(row.cursor);
+
+    if (stored !== owner.attemptToken) {
+        throw new RecipeSeedError(
+            'run_attempt_superseded',
+            `${STAGE} stopped: its run row (${runId}) was taken over by a later attempt (now attempt ` +
+                `${attemptOf(row.cursor)}), so this attempt's writes are fenced out. This happens when a seed's ` +
+                'lock session is lost while its process keeps running; the later attempt owns the corpus, and ' +
+                'nothing this one had already committed is lost — it is reconciled by the attempt that took over.',
+        );
+    }
+};
+
+/**
+ * The one shape the claim needs beyond `CatalogRunDb`: its own transaction.
+ *
+ * Probed rather than required, exactly as checkpoint.ts's `transactionRunnerOf`
+ * probes it — a Prisma transaction client is the client with `$transaction`
+ * removed, so its absence means the caller already owns a transaction and the
+ * claim must run in place rather than nest.
+ */
+interface LedgerTransactionRunner {
+    $transaction<T>(work: (tx: CatalogRunDb) => Promise<T>, options?: { timeout?: number }): Promise<T>;
+}
+
+/**
+ * `options` is passed through for the ONE ledger transaction that wraps
+ * something slower than two statements — the coverage report's file write (see
+ * publishCoverageReport). Everything else leaves it out and takes the client's
+ * own default, which is what the claim, the cursor writes and the closes have
+ * always used.
+ */
+const inLedgerTransaction = async <T>(
+    db: CatalogRunDb,
+    work: (tx: CatalogRunDb) => Promise<T>,
+    options?: { timeout?: number },
+): Promise<T> => {
+    const runner = db as unknown as Partial<LedgerTransactionRunner>;
+    return typeof runner.$transaction === 'function' ? runner.$transaction(work, options) : work(db);
+};
+
+/** What `deps.prisma` must expose for the ledger, when no separate ledger client was injected. */
+interface LedgerDelegateProbe {
+    readonly catalog_import_runs?: unknown;
+    readonly $executeRaw?: unknown;
+}
+
+/**
+ * The client the run row is written through.
+ *
+ * Probed rather than cast blindly: `SeedDeps.prisma` is a narrow structural
+ * slice that a suite may satisfy with a wrapper, and a wrapper that cannot reach
+ * `catalog_import_runs` would otherwise fail deep inside the claim with a
+ * TypeError instead of telling the caller which dependency to inject (§9 —
+ * config resolved behind an accessor that fails loudly).
+ */
+const resolveRunLedgerDb = (deps: SeedDeps): CatalogRunDb => {
+    if (deps.runDb !== undefined) {
+        return deps.runDb;
+    }
+
+    const candidate = deps.prisma as unknown as LedgerDelegateProbe;
+    if (candidate.catalog_import_runs === undefined || typeof candidate.$executeRaw !== 'function') {
+        throw new RecipeSeedError(
+            'run_ledger_unavailable',
+            `${STAGE} cannot record its run: the injected publication client cannot reach ` +
+                'catalog_import_runs, and no separate runDb was supplied. Pass SeedDeps.runDb (the Prisma ' +
+                'singleton) so the run row, its cursor and its terminal counts are written somewhere.',
+        );
+    }
+
+    return deps.prisma as unknown as CatalogRunDb;
+};
+
+/**
+ * Claims this corpus's run: resumes the open one, or opens a new row.
+ *
+ * SERIALISED ON THE IDENTITY, because there is no row to lock before the claim —
+ * two invocations would both find nothing open and both insert, after which two
+ * processes publish the same corpus and interleave their decisions in two
+ * ledgers. The lock follows checkpoint.ts's documented one-argument convention
+ * for a claim (`pg_advisory_xact_lock(hashtext('catalog-run:<kind>:<version>'))`,
+ * the same idiom AAP §0.5.1 uses for a user's meal-planning writes), composed as
+ * ONE bound string so the whole value is a parameter, and released when this
+ * transaction ends.
+ *
+ * IT IS REACHED ONLY BY THE WRITER, which is why the lease means what it does.
+ * `runSeed` holds the exclusive, session-scoped RECIPE-SEED WRITER LOCK before
+ * this function is called on any publishing path, so a second LIVE seed never
+ * arrives here at all. Every outcome below is therefore about a run whose
+ * previous holder's session is provably gone — and the advisory lock above is
+ * still not redundant, because it serialises the read-then-insert against an
+ * invocation racing this one through the same writer lock's release.
+ *
+ * THE THREE OUTCOMES.
+ *
+ *  - An open run whose LEASE IS STILL LIVE: refused (`seed_in_progress`). The
+ *    previous holder died moments ago and its last publications may still be
+ *    settling, so the corpus is left alone until the lease lapses.
+ *  - An open run whose lease has LAPSED: taken over as the same row — a process
+ *    killed before its finalizer ran leaves exactly this, and the run it opened
+ *    is the run that should finish. Its watermark is appended to the log before
+ *    the cursor is overwritten, so the interrupted attempt's progress survives.
+ *    THE TAKEOVER ROTATES THE ATTEMPT TOKEN, and that rotation is what fences
+ *    the previous attempt out: if its process is not in fact dead — only its
+ *    lock session was — every write it still tries against this row is refused
+ *    (see assertAttemptOwnsRun).
+ *  - Nothing open: a NEW row, even when a previous run for this same corpus
+ *    already SUCCEEDED. That is deliberate and it is the one place this claim
+ *    departs from `openOrResumeRun`'s completed-run no-op: the fingerprint names
+ *    the CORPUS, and this stage's other input is the CATALOG. A catalog refresh
+ *    makes a stored ingredient snapshot stale under unchanged files, and §0.5.1
+ *    requires the seed to publish a new version then — so a no-op keyed on the
+ *    corpus alone would refuse that work for ever, which is precisely the trap
+ *    checkpoint.ts documents for a validation key that names only its policy.
+ *    Reconciling again is cheap and idempotent: an unchanged recipe is a read.
+ *    The previous succeeded run is reported on the outcome so a caller can still
+ *    tell "this corpus had already been published" from "this is the first time".
+ */
+const claimRecipeSeedRun = async (input: {
+    readonly db: CatalogRunDb;
+    readonly manifestVersion: string;
+    readonly corpusSlugs: number;
+    readonly now: () => Date;
+    readonly logger: ScriptLogger;
+}): Promise<{ readonly owner: SeedRunOwner; readonly progress: SeedRunProgress }> => {
+    const claimKey = `catalog-run:${RECIPE_SEED_RUN_KIND}:${input.manifestVersion}`;
+
+    const claimed = await inLedgerTransaction(input.db, async (tx) => {
+        // $executeRaw, not $queryRaw: pg_advisory_xact_lock returns void and
+        // Prisma's query path cannot deserialise a void column (P2010) — the
+        // same note checkpoint.ts's acquireRunClaimLock carries.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${claimKey}))`;
+
+        const open: StoredRunRow | null = await tx.catalog_import_runs.findFirst({
+            where: {
+                kind: RECIPE_SEED_RUN_KIND,
+                manifest_version: input.manifestVersion,
+                status: RUN_STATUS_RUNNING,
+            },
+            orderBy: { started_at: 'desc' },
+            select: { id: true, cursor: true },
+        });
+
+        if (open !== null) {
+            const leaseUntil = leaseUntilOf(open.cursor);
+            const at = input.now();
+
+            if (leaseUntil !== null && leaseUntil.getTime() > at.getTime()) {
+                throw new RecipeSeedError(
+                    'seed_in_progress',
+                    `another ${STAGE} run (${open.id}) is publishing this same corpus and holds it until ` +
+                        `${leaseUntil.toISOString()}. Wait for it to finish, or — if its process is gone — run ` +
+                        'the seed again once that moment has passed.',
+                );
+            }
+
+            const progress = newRunProgress(attemptOf(open.cursor) + 1);
+            // ROTATED, not carried over: the token the previous attempt was
+            // using is replaced in the same transaction that takes the row over,
+            // which is the single write that fences that attempt out of every
+            // future publication, cursor move, report and close.
+            const attemptToken = newAttemptToken();
+            // The interrupted attempt's watermark, kept before the cursor that
+            // holds it is overwritten. Appended through checkpoint.ts so it is
+            // capped and scrubbed by the same rules as every other run log
+            // entry. `interruptedCursor` carries the superseded token with it —
+            // by then it is a value nothing will accept again, and an operator
+            // reconstructing the handover needs to see which attempt was fenced.
+            await appendRunLog(
+                tx,
+                open.id,
+                {
+                    event: 'recipe_seed_attempt_taken_over',
+                    attempt: progress.attempt,
+                    interruptedCursor: JSON.stringify(open.cursor ?? null),
+                    leaseLapsedAt: leaseUntil === null ? 'none' : leaseUntil.toISOString(),
+                },
+                input.now,
+            );
+            await saveCursor(
+                tx,
+                open.id,
+                cursorFrom(
+                    progress,
+                    input.corpusSlugs,
+                    new Date(at.getTime() + RECIPE_SEED_RUN_LEASE_MS),
+                    attemptToken,
+                ),
+            );
+
+            return {
+                owner: {
+                    db: input.db,
+                    record: {
+                        runId: open.id,
+                        manifestVersion: input.manifestVersion,
+                        resumed: true,
+                        attempt: progress.attempt,
+                        previousSucceededRunId: null,
+                    },
+                    attemptToken,
+                },
+                progress,
+            };
+        }
+
+        const succeeded = await tx.catalog_import_runs.findFirst({
+            where: {
+                kind: RECIPE_SEED_RUN_KIND,
+                manifest_version: input.manifestVersion,
+                status: RUN_STATUS_SUCCEEDED,
+            },
+            orderBy: { started_at: 'desc' },
+            select: { id: true },
+        });
+
+        // started_at is left to the column default, like openRun's, so a run's
+        // clock never depends on the script host's. counts and log are written
+        // as an empty map and an empty array rather than left NULL so no reader
+        // needs a null branch.
+        const opened = await tx.catalog_import_runs.create({
+            data: {
+                kind: RECIPE_SEED_RUN_KIND,
+                manifest_version: input.manifestVersion,
+                status: RUN_STATUS_RUNNING,
+                counts: {},
+                log: [],
+            },
+            select: { id: true },
+        });
+        const progress = newRunProgress(1);
+        const attemptToken = newAttemptToken();
+        await saveCursor(
+            tx,
+            opened.id,
+            cursorFrom(
+                progress,
+                input.corpusSlugs,
+                new Date(input.now().getTime() + RECIPE_SEED_RUN_LEASE_MS),
+                attemptToken,
+            ),
+        );
+
+        return {
+            owner: {
+                db: input.db,
+                record: {
+                    runId: opened.id,
+                    manifestVersion: input.manifestVersion,
+                    resumed: false,
+                    attempt: 1,
+                    previousSucceededRunId: succeeded?.id ?? null,
+                },
+                attemptToken,
+            },
+            progress,
+        };
+    });
+
+    // After the commit, never before: a line claiming a run exists must not
+    // describe a claim that rolled back (checkpoint.ts's openOrResumeRun states
+    // the same rule for the same reason).
+    // The attempt token is NOT among these fields, and never becomes one: the
+    // fence is only worth having while the value it compares stays out of the
+    // logs an operator pastes into a ticket.
+    input.logger.info(claimed.owner.record.resumed ? 'run_resumed' : 'run_opened', {
+        stage: STAGE,
+        runId: claimed.owner.record.runId,
+        kind: RECIPE_SEED_RUN_KIND,
+        manifestVersion: claimed.owner.record.manifestVersion,
+        attempt: claimed.owner.record.attempt,
+        corpusSlugs: input.corpusSlugs,
+        previousSucceededRunId: claimed.owner.record.previousSucceededRunId,
+    });
+
+    return claimed;
+};
+
+/**
+ * Records one settled recipe: the watermark, the decision and a refreshed lease.
+ *
+ * Written AFTER the publishing transaction committed and never before it — a
+ * cursor or a count written for a transaction that then rolled back is the
+ * phantom-progress defect this ledger exists to rule out. One write per recipe
+ * rather than a cursor write and a counts write: the counters are derived from
+ * the same tally at close, so the hot path stays a single locked
+ * read-modify-write, which is what keeps an audit trail from costing more round
+ * trips than the publications it describes.
+ *
+ * FENCED IN THE SAME TRANSACTION AS THE WRITE. `saveCursor` takes a
+ * `CatalogRunDb`, which lib/checkpoint.ts declares to include a transaction
+ * client — so the ownership check and the cursor write are one transaction and a
+ * superseded attempt cannot move a cursor that now belongs to the attempt which
+ * took the run over.
+ */
+const saveRunProgress = async (input: {
+    readonly owner: SeedRunOwner | null;
+    readonly progress: SeedRunProgress;
+    readonly corpusSlugs: number;
+    readonly now: () => Date;
+}): Promise<void> => {
+    const owner = input.owner;
+    if (owner === null) {
+        return;
+    }
+
+    await inLedgerTransaction(owner.db, async (tx) => {
+        await assertAttemptOwnsRun(tx, owner);
+        await saveCursor(
+            tx,
+            owner.record.runId,
+            cursorFrom(
+                input.progress,
+                input.corpusSlugs,
+                new Date(input.now().getTime() + RECIPE_SEED_RUN_LEASE_MS),
+                owner.attemptToken,
+            ),
+        );
+    });
+};
+
+/**
+ * Closes the run as succeeded, with the attempt's committed counts.
+ *
+ * Fenced like every other ledger write: a `succeeded` row is the evidence the
+ * corpus and the committed report describe each other, so an attempt that no
+ * longer owns the run must not be the one to state it.
+ */
+const closeSucceededRun = async (
+    owner: SeedRunOwner | null,
+    progress: SeedRunProgress,
+    stageLogger: ScriptLogger,
+): Promise<void> => {
+    if (owner === null) {
+        return;
+    }
+
+    await inLedgerTransaction(owner.db, async (tx) => {
+        await assertAttemptOwnsRun(tx, owner);
+        await finishRun(tx, owner.record.runId, 'succeeded', {
+            counts: countsFrom(progress),
+            logger: stageLogger,
+        });
+    });
+};
+
+/**
+ * Closes the run as failed, and NEVER replaces the failure that got us here.
+ *
+ * Guarded because it runs on a path that is already failing: if the ledger write
+ * itself cannot land — the database is gone, the row was deleted, someone closed
+ * the run under us — reporting that instead of the original error would hide the
+ * reason the stage stopped. The ledger failure is logged with its own event so
+ * it is not lost either, and the original error propagates untouched.
+ *
+ * A FENCED-OUT CLOSE GETS ITS OWN EVENT. `run_close_refused` is not a failure of
+ * the ledger, it is the fence working: this attempt was superseded, the attempt
+ * that took the run over owns its terminal status, and overwriting it would
+ * replace a live run — or a `succeeded` one — with a stale `failed`. Reported
+ * separately from `run_close_failed` so an operator reading the line is not sent
+ * looking for a database fault that did not happen.
+ */
+const closeFailedRun = async (
+    owner: SeedRunOwner | null,
+    progress: SeedRunProgress,
+    error: unknown,
+    stageLogger: ScriptLogger,
+): Promise<void> => {
+    if (owner === null) {
+        return;
+    }
+
+    try {
+        await inLedgerTransaction(owner.db, async (tx) => {
+            await assertAttemptOwnsRun(tx, owner);
+            await finishRun(tx, owner.record.runId, 'failed', {
+                counts: countsFrom(progress),
+                error,
+                logger: stageLogger,
+            });
+        });
+    } catch (closeError) {
+        const fenced = closeError instanceof RecipeSeedError && closeError.code === 'run_attempt_superseded';
+
+        stageLogger.error(fenced ? 'run_close_refused' : 'run_close_failed', {
+            stage: STAGE,
+            runId: owner.record.runId,
+            attempt: owner.record.attempt,
+            settled: progress.settled,
+            error: safeError(closeError),
+        });
+    }
+};
 
 /**
  * Reads the two catalog facts the run needs: the full row for every ingredient
@@ -2390,19 +3696,276 @@ const readCatalogFacts = async (
     return new Map(foods.map((food) => [food.source_key, food]));
 };
 
+/** The two acquisition failures the stage lock raises, as this stage reports them. */
+const STAGE_LOCK_REFUSAL_CODES: readonly string[] = ['catalog_stage_locked', 'catalog_stage_lock_unavailable'];
+
 /**
- * Publishes the curated recipe files as versioned recipes.
+ * The production catalog hold: the graph's stage lock, taken SHARED for the
+ * whole run.
+ *
+ * `withCatalogStageLock` opens its own dedicated connection, tries the lock
+ * once, and releases it in a `finally` — so the window this covers is exactly
+ * the stage's own lifetime, and a refusal costs nothing because it happens
+ * before the stage reads or writes anything. There is no waiting branch on
+ * purpose: the other four stages take the same lock the same way, and a seed
+ * that blocked for the hours an import takes would be indistinguishable from a
+ * seed that hung.
+ */
+const defaultCatalogLockRunner =
+    (stageLogger: ScriptLogger) =>
+    <T>(work: () => Promise<T>): Promise<T> =>
+        withCatalogStageLock(
+            { stage: CATALOG_READER_STAGE, mode: CATALOG_READER_STAGE_MODE, logger: stageLogger },
+            () => work(),
+        );
+
+/* ---------------------------------------------------------------------------
+ * THE RECIPE-SEED WRITER LOCK
+ *
+ * One recipe seed at a time, for the whole lifetime of a publishing process.
+ * The graph hold above cannot be this — it is SHARED, so it is compatible with
+ * itself — and neither can the run ledger's lease, whose row is addressed by the
+ * corpus fingerprint and is not claimed at all by a narrowed run. See the
+ * header's ONE RECIPE-SEED WRITER for the races that leaves open.
+ *
+ * It is implemented HERE rather than added to lib/checkpoint.ts's stage-lock
+ * table on purpose: `CATALOG_STAGE_LOCK_MODES` is a
+ * `Record<CatalogStageName, …>` over the closed union `CatalogRunKind |
+ * 'release'`, whose exhaustive key set is asserted in
+ * src/__tests__/scripts/catalog-import.test.ts, so a sixth stage name is a
+ * change to that module and its suite rather than to this file — the same
+ * reason this stage BORROWS `release` for its graph hold. The construction
+ * below follows `acquireCatalogStageLock` step for step (dedicated `pg`
+ * connection, try-lock, release-then-close in a `finally` that never throws),
+ * because the property being bought is identical: a SESSION-scoped lock that
+ * the operating system releases for us when the process dies, which is what
+ * lets this stage hold exclusivity for its whole lifetime with no heartbeat and
+ * no background timer (excluded by AAP §0.8.2).
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The `pg` surface this file uses — three calls, declared narrowly because
+ * `@types/pg` is deliberately absent from this repo (lib/checkpoint.ts and the
+ * test-setup modules all declare their own the same way).
+ */
+interface WriterLockPgModule {
+    Client: new (config: {
+        connectionString: string;
+        application_name?: string;
+        connectionTimeoutMillis?: number;
+        query_timeout?: number;
+        keepAlive?: boolean;
+    }) => CatalogStageLockConnection;
+}
+
+const resolveWriterLockConnectionString = (): string => {
+    const candidate = process.env.DATABASE_URL;
+
+    if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+        // Typed rather than left to the driver: `new Client({connectionString:
+        // undefined})` reads the libpq environment instead and can connect
+        // somewhere nobody named (§9 — config resolved behind an accessor that
+        // fails loudly). dbGuard refuses this at module load, so reaching here
+        // means a caller bypassed it.
+        throw new RecipeSeedError(
+            'seed_writer_lock_unavailable',
+            `${STAGE} did not run: no DATABASE_URL is set, so the recipe-seed writer lock could not be taken ` +
+                'and nothing would stop a second seed publishing beside this one. Set DATABASE_URL (see ' +
+                'backend/.env.example) and run the seed again.',
+        );
+    }
+
+    return candidate;
+};
+
+const openWriterLockConnection = (connectionString: string): CatalogStageLockConnection => {
+    // Required lazily, exactly as lib/checkpoint.ts does it: importing this
+    // module must stay side-effect-free, so a suite that only reads the pure
+    // derivations never loads a database driver. `pg` is already a runtime
+    // dependency of this service (Prisma's own driver) and needs no addition.
+    const pg = require('pg') as WriterLockPgModule;
+
+    return new pg.Client({
+        connectionString,
+        application_name: WRITER_LOCK_APPLICATION_NAME,
+        connectionTimeoutMillis: WRITER_LOCK_CONNECT_TIMEOUT_MS,
+        query_timeout: WRITER_LOCK_QUERY_TIMEOUT_MS,
+        // The session sits idle for as long as the seed runs and the lock lives
+        // in that session: without keepalive probes an idle connection can be
+        // dropped by the network and the lock released with nobody informed.
+        // That case is not merely tolerated — it is what the attempt fence
+        // exists for (see assertAttemptOwnsRun).
+        keepAlive: true,
+    });
+};
+
+/**
+ * Runs `work` as the one recipe-seed writer, and releases the lock afterwards
+ * however `work` ended.
+ *
+ * REFUSES RATHER THAN BLOCKS. `pg_try_advisory_lock` is attempted exactly once
+ * and a refusal is this stage's own `seed_writer_locked`, with no waiting
+ * branch — the same philosophy the graph hold already states for the same
+ * reason: a seed that blocked for however long another seed takes would be
+ * indistinguishable, from the outside, from a seed that hung.
+ *
+ * ON ITS OWN CONNECTION. A session lock must not be taken through the injected
+ * Prisma client, which hands out POOLED connections and routes each statement to
+ * whichever is free — the lock would be held by an arbitrary connection and
+ * could never be released deterministically. This is the same reasoning
+ * lib/checkpoint.ts records for the catalog stage lock, and the same remedy.
+ */
+const runUnderWriterHold = async <T>(stageLogger: ScriptLogger, work: () => Promise<T>): Promise<T> => {
+    const connection = openWriterLockConnection(resolveWriterLockConnectionString());
+
+    // Closes without raising, on paths that are already failing: a teardown
+    // error here would replace the reason the stage stopped with a reason
+    // nobody asked about.
+    const closeQuietly = async (): Promise<void> => {
+        try {
+            await connection.end();
+        } catch (error) {
+            stageLogger.warn('seed_writer_lock_close_failed', { stage: STAGE, error: safeError(error) });
+        }
+    };
+
+    try {
+        await connection.connect();
+
+        // Two-integer keyspace under this stage's own class id, and the object
+        // id is hashtext() computed in PostgreSQL. Both values are BOUND, not
+        // interpolated, so the statement text is constant. See
+        // RECIPE_SEED_WRITER_LOCK_CLASS_ID for why this is neither the
+        // one-argument space nor checkpoint.ts's 'CAT' class.
+        const attempt = await connection.query<{ locked: boolean | null }>(
+            'SELECT pg_try_advisory_lock($1::int4, hashtext($2::text)) AS locked',
+            [RECIPE_SEED_WRITER_LOCK_CLASS_ID, RECIPE_SEED_WRITER_LOCK_NAME],
+        );
+
+        if (attempt.rows[0]?.locked !== true) {
+            throw new RecipeSeedError(
+                'seed_writer_locked',
+                `${STAGE} did not run: another recipe seed is publishing against this database and holds the ` +
+                    'recipe-seed writer lock. Wait for it to finish and run the seed again — the lock is held on ' +
+                    'that process\'s own session, so it is released the moment that process ends, with nothing ' +
+                    'for an operator to clear.',
+            );
+        }
+    } catch (error) {
+        await closeQuietly();
+        throw error;
+    }
+
+    stageLogger.info('seed_writer_lock_acquired', { stage: STAGE, lock: RECIPE_SEED_WRITER_LOCK_NAME });
+
+    try {
+        return await work();
+    } finally {
+        // Unlock first, then close. The close alone would release the lock, but
+        // an explicit unlock is what keeps a pooled or reused connection from
+        // carrying the hold past this stage, and neither statement is allowed to
+        // raise over the stage's own outcome.
+        try {
+            await connection.query('SELECT pg_advisory_unlock($1::int4, hashtext($2::text))', [
+                RECIPE_SEED_WRITER_LOCK_CLASS_ID,
+                RECIPE_SEED_WRITER_LOCK_NAME,
+            ]);
+        } catch (error) {
+            stageLogger.warn('seed_writer_unlock_failed', { stage: STAGE, error: safeError(error) });
+        }
+        await closeQuietly();
+        stageLogger.info('seed_writer_lock_released', { stage: STAGE, lock: RECIPE_SEED_WRITER_LOCK_NAME });
+    }
+};
+
+/**
+ * The production writer hold, shaped like `defaultCatalogLockRunner` so the two
+ * seams read identically at the call site.
+ */
+const defaultWriterLockRunner =
+    (stageLogger: ScriptLogger) =>
+    <T>(work: () => Promise<T>): Promise<T> =>
+        runUnderWriterHold(stageLogger, work);
+
+/** Runs `work` with no writer lock at all — the dry-run path, which publishes nothing to own. */
+const withoutWriterHold = <T>(work: () => Promise<T>): Promise<T> => work();
+
+/**
+ * Publishes the curated recipe files as versioned recipes, as the one recipe-seed
+ * writer and with the catalog graph held for the whole attempt.
+ *
+ * TWO HOLDS, AND THEY ANSWER DIFFERENT QUESTIONS. The RECIPE-SEED WRITER LOCK
+ * (exclusive, this stage's own key) is what stops a SECOND SEED; the CATALOG
+ * GRAPH HOLD (shared, borrowed from the graph's reader stage) is what stops a
+ * catalog MUTATOR. Neither substitutes for the other, and both are refusals
+ * rather than waits.
+ *
+ * Both live HERE rather than in `main` because `runSeed` is the entry point AAP
+ * §0.9.2 names — the one the API-level concurrency suite drives and the one any
+ * future caller would reach for — so a hold that only `main` took would protect
+ * the command and not the stage. A refused graph hold is translated into this
+ * stage's own error class before it reaches an operator: the message
+ * checkpoint.ts writes already names the stage, the mode and the remedy, and
+ * `describeFailure` reports it under `catalog_locked` rather than under a
+ * checkpoint code, because from the outside this is "the seed refused", not "a
+ * checkpoint failed". A refused writer hold is already this stage's own error
+ * (`seed_writer_locked`) and needs no translation — and it is deliberately NOT
+ * `catalog_locked`, because "another seed is publishing" and "a catalog stage
+ * owns the graph" send an operator to different places.
+ */
+export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
+    const runUnderCatalogLock = deps.runUnderCatalogLock ?? defaultCatalogLockRunner(deps.logger);
+    // THE WRITER LOCK IS OUTERMOST, and a dry run takes none.
+    //
+    // Outermost because a second seed should be refused before it contends for
+    // anything else: it then reports "another recipe seed is publishing" rather
+    // than queueing behind a graph hold it was never going to be allowed to use,
+    // and the refusal costs one connection and one statement.
+    //
+    // Taken for EVERY non-dry run, `--only` included. A narrowed writer publishes
+    // real `recipe_versions` rows for the slugs it names, so a narrowed run
+    // beside a whole-corpus one is two writers on overlapping rows — exactly the
+    // pair the lock exists to separate — even though the narrowed one claims no
+    // ledger row and writes no coverage report. A dry run, by contrast, writes
+    // nothing at all on any path, so it owns nothing and waits for nobody; the
+    // seam is bypassed rather than defaulted for it, so a caller cannot opt a dry
+    // run into a hold it has no use for.
+    const runUnderWriterLock = deps.options.dryRun
+        ? withoutWriterHold
+        : (deps.runUnderWriterLock ?? defaultWriterLockRunner(deps.logger));
+
+    try {
+        return await runUnderWriterLock(() => runUnderCatalogLock(() => seedUnderCatalogHold(deps)));
+    } catch (error) {
+        if (error instanceof CheckpointError && STAGE_LOCK_REFUSAL_CODES.includes(error.code)) {
+            throw new RecipeSeedError(
+                'catalog_locked',
+                `${STAGE} did not run: ${error.message}`,
+            );
+        }
+        throw error;
+    }
+};
+
+/**
+ * The stage itself, running with the catalog graph already held.
  *
  * The stage in one function, in the order §0.7.3 requires: read, resolve,
  * validate EVERYTHING, then write, then derive the report from what was
  * written. The validation pass is complete before the first write because a
  * partially seeded corpus is worse than an unseeded one — the planner's
  * coverage check would answer from an incomplete set.
+ *
+ * Wrapped, from the claim onwards, in the run lifecycle: every path out of this
+ * function closes the run row it claimed — `succeeded` at the end, `failed` in
+ * the guarded finalizer — so there is no exit through which a run stays
+ * `running` other than the process dying, which is the one case the lease and
+ * the cursor exist for.
  */
-export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
+const seedUnderCatalogHold = async (deps: SeedDeps): Promise<SeedOutcome> => {
     const { logger, options, prisma } = deps;
 
-    const { payloads, problems: payloadProblems } = readRecipeFiles(deps.recipesDir, options.only);
+    const { payloads, problems: payloadProblems, digests } = readRecipeFiles(deps.recipesDir, options.only);
     logger.info('recipes_read', {
         stage: STAGE,
         files: payloads.length,
@@ -2410,6 +3973,131 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
         only: [...options.only],
         dryRun: options.dryRun,
     });
+
+    // THE CLAIM, AND WHAT IS DELIBERATELY NOT CLAIMED. A dry run writes nothing
+    // and an `--only`-narrowed run is one recipe's slice of the corpus, so
+    // neither is an attempt at the corpus the fingerprint names: claiming a
+    // whole-corpus run for either would let a narrowed run's cursor and counts
+    // describe work nobody asked for, and would let it block the real seed
+    // through the lease. This is the same rule the coverage report already
+    // follows, for the same reason, and the two are kept in step.
+    const wholeCorpusRun = !options.dryRun && options.only.length === 0;
+    const manifestVersion = deriveCorpusFingerprint(deps.coveragePlan.coveragePlanVersion, digests);
+    const runSkippedReason = wholeCorpusRun
+        ? null
+        : options.dryRun
+          ? 'dry run: no run was claimed, because nothing is published on this path'
+          : `run narrowed to ${options.only.length} slug${options.only.length === 1 ? '' : 's'}, so no whole-corpus run was claimed`;
+    const ledgerDb = wholeCorpusRun ? resolveRunLedgerDb(deps) : null;
+    const claim =
+        ledgerDb === null
+            ? null
+            : await claimRecipeSeedRun({
+                  db: ledgerDb,
+                  manifestVersion,
+                  corpusSlugs: payloads.length,
+                  now: deps.now,
+                  logger,
+              });
+    const owner = claim?.owner ?? null;
+    const progress = claim?.progress ?? newRunProgress(1);
+
+    if (owner === null) {
+        logger.info('run_not_claimed', { stage: STAGE, manifestVersion, note: runSkippedReason });
+    }
+
+    try {
+        return await publishClaimedCorpus({
+            deps,
+            payloads,
+            payloadProblems,
+            owner,
+            progress,
+            runSkippedReason,
+        });
+    } catch (error) {
+        // The terminal record of an interrupted attempt: the status, the counts
+        // it really committed and the scrubbed failure, written by a finalizer
+        // that cannot replace the error it is reporting — and that is itself
+        // fenced, so an attempt which has been superseded cannot close a run the
+        // attempt that took it over is still working.
+        await closeFailedRun(owner, progress, error, logger);
+        throw error;
+    }
+};
+
+/** Everything the claimed attempt does, and the arguments it needs to report itself. */
+interface PublishCorpusInput {
+    readonly deps: SeedDeps;
+    readonly payloads: readonly RecipeFilePayload[];
+    readonly payloadProblems: readonly string[];
+    /**
+     * The ledger row this attempt owns and the token that proves it, or `null`
+     * for a dry run and an `--only`-narrowed run, neither of which claims one.
+     */
+    readonly owner: SeedRunOwner | null;
+    readonly progress: SeedRunProgress;
+    readonly runSkippedReason: string | null;
+}
+
+/**
+ * Writes the whole-corpus coverage report, fenced against a takeover.
+ *
+ * WHY THE FILE WRITE IS INSIDE A TRANSACTION. The artefact is the run's promise:
+ * a `succeeded` row means the corpus and the committed report describe each
+ * other. A superseded attempt that overwrote the report would therefore replace
+ * the owning attempt's evidence with a table derived from a read it took before
+ * it lost the run — and verifying ownership and then writing outside the lock
+ * would leave exactly the window this fence exists to close. So the row lock is
+ * taken, the token is compared, and the file is written while that lock is held;
+ * a refusal aborts before `writeReport` is reached and the previous artefact
+ * survives untouched. The write is a synchronous few hundred kilobytes, so the
+ * lock is held for a moment rather than for a stage.
+ *
+ * With no claimed run there is nothing to fence: only a whole-corpus, non-dry
+ * run reaches the report, and that run always owns a row — the `null` branch is
+ * the guarantee itself rather than a case that occurs.
+ */
+const publishCoverageReport = async (input: {
+    readonly owner: SeedRunOwner | null;
+    readonly report: CoverageReport;
+    readonly reportPath: string;
+    readonly writeReport: (absolutePath: string, value: unknown) => void;
+}): Promise<void> => {
+    const owner = input.owner;
+
+    if (owner === null) {
+        input.writeReport(input.reportPath, input.report);
+        return;
+    }
+
+    await inLedgerTransaction(
+        owner.db,
+        async (tx) => {
+            await assertAttemptOwnsRun(tx, owner);
+            input.writeReport(input.reportPath, input.report);
+        },
+        // The same generous ceiling the publication transactions take, and for
+        // the same reason: the work is one synchronous write of ~130 KB, so the
+        // headroom is for a CI runner's scheduler rather than for the statement.
+        // Without it this transaction would take the client's 5 s default and a
+        // scheduling stall would report a seed failure that says nothing about
+        // the corpus.
+        { timeout: PUBLISH_TRANSACTION_TIMEOUT_MS },
+    );
+};
+
+/**
+ * Validates the read corpus and publishes it, recording progress as it goes.
+ *
+ * Separated from the claim only so the claim's finalizer can wrap EVERY exit
+ * from it — including the validation refusal, which is a real attempt that
+ * failed and belongs in the ledger as one.
+ */
+const publishClaimedCorpus = async (input: PublishCorpusInput): Promise<SeedOutcome> => {
+    const { deps, payloads, payloadProblems, owner, progress, runSkippedReason } = input;
+    const { logger, options, prisma } = deps;
+    const run = owner?.record ?? null;
 
     const sourceKeys = [...new Set(payloads.flatMap((payload) => payload.ingredients.map((i) => i.sourceKey)))].sort();
     const foodsBySourceKey = await readCatalogFacts(prisma, sourceKeys);
@@ -2484,6 +4172,8 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
             report: null,
             reportPath: null,
             reportSkippedReason: reason,
+            run: null,
+            runSkippedReason,
         };
     }
 
@@ -2501,13 +4191,25 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
     // one that is gone. A retired food is included deliberately: it may keep
     // backing the version it was published into, and only `describeUnpublishable
     // Food` refuses it for a NEW one.
+    //
+    // ONE READ FOR THE WHOLE CORPUS, not one per slug. This read exists only to
+    // discover which catalog foods the stored versions point at, and the answer
+    // is the same whether it is assembled in forty-two round trips or one — so
+    // it is one, keyed on the slugs this run selected.
+    //
+    // It does NOT replace the re-read each publishing transaction performs.
+    // That one is a CORRECTNESS requirement rather than a duplicate of this
+    // one: it happens inside the transaction, under a row lock, against the
+    // facts the transaction is about to cite (see assertIngredientFactsHold).
+    // Collapsing the two would put the verification back outside the
+    // transaction, which is the defect this stage was refused for.
+    const storedRecipes = await prisma.recipes.findMany<StoredRecipeRow>({
+        where: { slug: { in: plans.map((plan) => plan.slug) } },
+        include: RECIPE_READ_INCLUDE,
+    });
     const storedFoodIds = new Set<string>();
-    for (const plan of plans) {
-        const stored = await prisma.recipes.findUnique<StoredRecipeRow>({
-            where: { slug: plan.slug },
-            include: RECIPE_READ_INCLUDE,
-        });
-        for (const ingredient of stored?.current_version?.recipe_ingredients ?? []) {
+    for (const stored of storedRecipes) {
+        for (const ingredient of stored.current_version?.recipe_ingredients ?? []) {
             if (!currentCatalogVersions.has(ingredient.catalog_food_id)) {
                 storedFoodIds.add(ingredient.catalog_food_id);
             }
@@ -2537,22 +4239,24 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
     let ingredientRows = 0;
 
     for (const plan of plans) {
-        const result = await publishRecipe(prisma, plan, now, currentCatalogVersions);
+        const result = await publishRecipe(prisma, plan, now, currentCatalogVersions, owner);
 
         if (result.action === 'created') {
             created.push(result.slug);
             ingredientRows += result.ingredientRows;
+            progress.created += 1;
+            progress.ingredientRows += result.ingredientRows;
             logger.info('recipe_published', {
                 stage: STAGE,
                 slug: result.slug,
                 version: result.version,
                 ingredientRows: result.ingredientRows,
             });
-            continue;
-        }
-        if (result.action === 'promoted') {
+        } else if (result.action === 'promoted') {
             promoted.push(result.slug);
             ingredientRows += result.ingredientRows;
+            progress.promoted += 1;
+            progress.ingredientRows += result.ingredientRows;
             logger.info('recipe_version_promoted', {
                 stage: STAGE,
                 slug: result.slug,
@@ -2560,11 +4264,24 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
                 ingredientRows: result.ingredientRows,
                 reason: result.reason,
             });
-            continue;
+        } else {
+            unchanged.push(result.slug);
+            progress.unchanged += 1;
+            logger.debug('recipe_unchanged', { stage: STAGE, slug: result.slug, version: result.version });
         }
 
-        unchanged.push(result.slug);
-        logger.debug('recipe_unchanged', { stage: STAGE, slug: result.slug, version: result.version });
+        // The watermark moves only for a COMMITTED transaction: `publishRecipe`
+        // has returned, so whatever it decided is durable, and a cursor written
+        // here can never describe work that rolled back.
+        progress.settled += 1;
+        progress.lastSlug = result.slug;
+        progress.lastAction = result.action;
+        await saveRunProgress({
+            owner,
+            progress,
+            corpusSlugs: plans.length,
+            now: deps.now,
+        });
     }
 
     logger.info('recipes_published', {
@@ -2583,6 +4300,8 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
         const reason = `run narrowed to ${options.only.length} slug${options.only.length === 1 ? '' : 's'}, so the whole-corpus coverage report was not rewritten`;
         logger.warn('coverage_report_skipped', { stage: STAGE, note: reason, only: [...options.only] });
 
+        await closeSucceededRun(owner, progress, logger);
+
         return {
             selected: plans.map((plan) => plan.slug),
             created,
@@ -2593,6 +4312,8 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
             report: null,
             reportPath: null,
             reportSkippedReason: reason,
+            run,
+            runSkippedReason,
         };
     }
 
@@ -2601,7 +4322,7 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
         include: COVERAGE_READ_INCLUDE,
     });
     const report = deriveCoverageReport(seeded.map(toCoverageRecipe));
-    deps.writeReport(deps.reportPath, report);
+    await publishCoverageReport({ owner, report, reportPath: deps.reportPath, writeReport: deps.writeReport });
     logger.info('coverage_report_written', {
         stage: STAGE,
         recipeCount: report.recipeCount,
@@ -2610,6 +4331,11 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
         guaranteedCells: report.guaranteedCells.length,
         reducedCells: report.reducedCells.length,
     });
+
+    // Closed LAST, after the report the run promises has been written: the run
+    // row and the committed artefact describe the same corpus, so a `succeeded`
+    // row is evidence that both landed.
+    await closeSucceededRun(owner, progress, logger);
 
     return {
         selected: plans.map((plan) => plan.slug),
@@ -2621,6 +4347,8 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
         report,
         reportPath: deps.reportPath,
         reportSkippedReason: null,
+        run,
+        runSkippedReason,
     };
 };
 
@@ -2650,6 +4378,15 @@ export const describeFailure = (error: unknown): { code: string; error: { name: 
         return { code: error.code, error: safeError(error) };
     }
     if (error instanceof ManifestError) {
+        return { code: error.code, error: safeError(error) };
+    }
+    // Reachable for the ledger's own refusals — a run row that vanished or was
+    // closed under this invocation — rather than for the stage lock, which
+    // `runSeed` translates into `catalog_locked` before it gets here. Reported
+    // under checkpoint.ts's code for the same reason every other stage does: a
+    // new code in that module reaches operator terminals under its own name with
+    // no change here.
+    if (error instanceof CheckpointError) {
         return { code: error.code, error: safeError(error) };
     }
     if (error instanceof RecipeDerivationError) {
@@ -2704,6 +4441,11 @@ const main = async (): Promise<number> => {
     try {
         const outcome = await runSeed({
             prisma: prisma as unknown as SeedDb,
+            // The same singleton, named for both roles rather than left to the
+            // publication client's default: in production the recipe writes and
+            // the run row go to one database through one pool, and saying so
+            // here is what makes the seam visible to a reader.
+            runDb: prisma,
             recipesDir: recipesDir(),
             now: () => new Date(),
             options: parsed.options,
@@ -2722,6 +4464,11 @@ const main = async (): Promise<number> => {
             ingredientRows: outcome.ingredientRows,
             dryRun: outcome.dryRun,
             reportSkippedReason: outcome.reportSkippedReason,
+            runId: outcome.run?.runId ?? null,
+            manifestVersion: outcome.run?.manifestVersion ?? null,
+            runAttempt: outcome.run?.attempt ?? null,
+            runResumed: outcome.run?.resumed ?? false,
+            runSkippedReason: outcome.runSkippedReason,
         });
 
         return 0;

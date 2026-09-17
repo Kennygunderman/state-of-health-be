@@ -62,12 +62,26 @@
 //     the unlocked read must NOT block it. Without the second assertion the
 //     first could pass because of something incidental to the transaction.
 //
+// HOW AN ORDERING IS ESTABLISHED HERE. Every interleaving below is driven from a
+// signal and never from elapsed time, because a wall-clock window proves nothing
+// on a loaded host: it can close before the other session has started, and "it
+// has not answered yet" is as true of slow work as of blocked work. So a
+// BLOCKED claim waits until PostgreSQL itself reports the contending session as
+// waiting for a lock (`pg_locks.granted = false`) and only then asserts that the
+// contender has not settled; a NOT-BLOCKED claim awaits the contender to
+// COMPLETION while the transaction that must not block it is still open; and
+// entry into a transaction is signalled by the code that is inside it rather
+// than inferred from a delay. The deadlines that remain are hang guards — they
+// turn a synchronisation mistake into a named failure instead of a silent pass
+// or a suite timeout — and no assertion rests on one.
+//
 // Everything here runs against the ambient test database and truncates only the
 // feature tables through the shared guard, exactly as the other suites in this
-// directory do. The two extra Prisma clients are a genuine requirement rather
+// directory do. The three extra Prisma clients are a genuine requirement rather
 // than a convenience: a lock test needs a session that is not the one holding
-// the lock, and a statement count needs a client whose query events are
-// observable.
+// the lock, a statement count needs a client whose query events are observable,
+// and reading `pg_locks` needs a session that is neither party to the
+// contention it is reporting on.
 //
 // ---------------------------------------------------------------------------
 // THE SECOND HALF: THE HTTP BOUNDARY (from "the three target routes over HTTP"
@@ -139,6 +153,7 @@ import { randomUUID } from 'node:crypto';
 import supertest from 'supertest';
 
 import { PrismaClient } from '../../generated/prisma';
+import type { meal_plan_preferences } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
 import {
     FIXTURE_TARGETS,
@@ -160,9 +175,15 @@ import { updateTargets } from '../../services/nutrition.service';
 import { savePreferences, saveSetupStep } from '../../services/preferences.service';
 import { PlanningPreferences, evaluatePlanningEligibility } from '../../services/recipe.logic';
 import * as groceryService from '../../services/grocery.service';
+// The namespace beside the named import, and not instead of it: the legacy-writer
+// cases above call `updateTargets` directly, while the atomicity proofs below
+// have to reach the module's own exported binding — the property
+// `targets.service.ts` resolves at call time — to fail the save between its two
+// halves. Removing either import would cost one of those two things.
+import * as nutritionService from '../../services/nutrition.service';
 import * as recipeService from '../../services/recipe.service';
 import { UnitConversionError, unitFamily } from '../../utils/units';
-import type { DailyMacrosResponse } from '../../types/nutrition';
+import type { DailyMacrosResponse, MacroTargetsResponse } from '../../types/nutrition';
 import type {
     InvalidRequestDetail,
     SaveTargetsResponse,
@@ -180,17 +201,6 @@ import {
 const USER_ID = 'targets-service-suite-user';
 const TIME_ZONE = 'America/New_York';
 
-/**
- * How long a blocked write is watched before the absence of a result is taken
- * as evidence that it is blocked.
- *
- * The write it watches is a single indexed UPDATE that completes in well under a
- * millisecond when nothing holds its row, and the counter-test asserts exactly
- * that. So half a second is three orders of magnitude of headroom, and the pair
- * of assertions — blocked here, not blocked there — is what carries the proof.
- */
-const BLOCK_OBSERVATION_MS = 500;
-
 /** A second session, so a lock can be observed from outside the one holding it. */
 const legacyWriterClient = new PrismaClient();
 
@@ -201,11 +211,188 @@ const legacyWriterClient = new PrismaClient();
  */
 const observedClient = new PrismaClient({ log: [{ emit: 'event', level: 'query' }] });
 
+/**
+ * A fourth session, which is never a party to the contention it reports on.
+ *
+ * Neither side of a lock can report the lock: the blocked session is stuck
+ * inside its own statement, and a statement issued from the holder would join
+ * the contention it was meant to describe. So the `pg_locks` observation below
+ * runs on a session that holds nothing and waits for nothing. `observedClient`
+ * cannot double as it either — its query log is what the single-statement read
+ * is counted from, and a poll would fill that log with statements the read never
+ * issued.
+ */
+const lockObserverClient = new PrismaClient();
+
 /** Statements the pool issues around the ones under test, and never the read itself. */
 const isFrameworkStatement = (sql: string): boolean =>
     /^\s*(BEGIN|COMMIT|ROLLBACK|DEALLOCATE|SET|SELECT 1|-- Implicit)/i.test(sql);
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The longest any wait below is given before the suite fails with a message
+ * naming what it was waiting for.
+ *
+ * A HANG GUARD and never evidence. Every wait it bounds is one PostgreSQL
+ * satisfies within milliseconds when the code under test behaves — a lock wait
+ * appears as soon as the contending statement is parked, and an unblocked write
+ * of one indexed row returns immediately — so reaching this deadline means the
+ * ordering never happened, which is a failure to report rather than a timing
+ * margin to tune. Generous on purpose: the number is never compared against
+ * anything, and a tighter one would only trade a real failure for a flake on a
+ * loaded host. It sits inside {@link LOCK_CASE_TIMEOUT_MS}, so the guard's own
+ * message is what a stuck ordering is reported as; where the stuck party is a
+ * transaction the CODE opened (a publication runs on Prisma's 5 s default), that
+ * transaction aborts first and the guard then reports the wait that never
+ * arrived, with the holder released by its `finally` either way.
+ */
+const LOCK_WAIT_HANG_GUARD_MS = 15_000;
+
+/** How often `pg_locks` is consulted while a wait is expected to appear. */
+const LOCK_WAIT_POLL_INTERVAL_MS = 25;
+
+/**
+ * The `locktype` a session waits under while it queues for a row another
+ * transaction has locked: PostgreSQL parks the waiter on the holder's
+ * transaction id, behind a short-lived `tuple` lock when more than one writer is
+ * queued for the same row. Both spellings mean "waiting for that row".
+ */
+const ROW_LOCK_WAIT: readonly string[] = ['transactionid', 'tuple'];
+
+/**
+ * The per-case timeout for the cases below that synchronise two sessions.
+ *
+ * Jest's default is 5 s, which is SHORTER than {@link LOCK_WAIT_HANG_GUARD_MS} —
+ * so a synchronisation mistake would be reported as Jest's own generic
+ * "Exceeded timeout of 5000 ms" instead of as the named wait that never
+ * happened, and it would then CASCADE: the timeout does not abort the
+ * transaction the case is still holding, so the truncating `beforeEach` of the
+ * next case and the suite's `afterAll` both queue behind the abandoned lock and
+ * time out in turn, burying the one real failure. Sitting comfortably above the
+ * hang guard puts the guard first, which lets its `finally` release every holder
+ * and leaves the run with exactly one readable failure.
+ */
+const LOCK_CASE_TIMEOUT_MS = 30_000;
+
+/**
+ * Every session in THIS database that is waiting for a lock right now, by the
+ * kind of lock it waits for.
+ *
+ * `granted = false` is PostgreSQL's own statement that a session is blocked, and
+ * it is the only thing that turns "the promise has not settled" into evidence:
+ * unfinished work is otherwise indistinguishable from slow work. The
+ * `current_database()` predicate is load-bearing rather than tidy — this server
+ * is shared by every checkout of this repository, and without it a neighbouring
+ * database's contention would be read as this suite's.
+ */
+const observedLockWaits = async (): Promise<string[]> => {
+    const waiting = await lockObserverClient.$queryRaw<{ locktype: string }[]>`
+        SELECT l.locktype
+        FROM pg_locks l
+        JOIN pg_stat_activity a ON a.pid = l.pid
+        WHERE NOT l.granted
+          AND a.datname = current_database()
+    `;
+
+    return waiting.map((row) => row.locktype);
+};
+
+/**
+ * Blocks until PostgreSQL reports a session in this database waiting for one of
+ * `expected`, and answers with the kind of wait it found.
+ *
+ * This is what a BLOCKING claim is asserted against. `what` describes the wait
+ * in the language of the test, so a failure says which ordering never happened
+ * and which ungranted locks were seen instead, rather than leaving a timed-out
+ * suite to be re-run under a debugger.
+ */
+const awaitLockWait = async (expected: readonly string[], what: string): Promise<string> => {
+    const deadline = Date.now() + LOCK_WAIT_HANG_GUARD_MS;
+    const seen = new Set<string>();
+
+    for (;;) {
+        const waits = await observedLockWaits();
+
+        waits.forEach((locktype) => seen.add(locktype));
+
+        const found = waits.find((locktype) => expected.includes(locktype));
+
+        if (found !== undefined) {
+            return found;
+        }
+
+        if (Date.now() >= deadline) {
+            throw new Error(
+                `no ${expected.join('/')} lock wait appeared within ${LOCK_WAIT_HANG_GUARD_MS} ms: ${what}. ` +
+                    `Ungranted locks seen while waiting: ${
+                        seen.size > 0 ? [...seen].sort().join(', ') : 'none'
+                    }.`,
+            );
+        }
+
+        await sleep(LOCK_WAIT_POLL_INTERVAL_MS);
+    }
+};
+
+/**
+ * Awaits `work`, failing with a message built from `what` if it never settles.
+ *
+ * Used wherever a promise must be awaited to completion for the proof to mean
+ * anything — the unblocked counterexamples, and every contending write after its
+ * holder releases. Without the guard a synchronisation mistake would present as
+ * a bare suite timeout naming no ordering at all.
+ */
+const withHangGuard = async <T>(work: Promise<T>, what: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+        return await Promise.race([
+            work,
+            new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error(`${what} did not finish within ${LOCK_WAIT_HANG_GUARD_MS} ms`)),
+                    LOCK_WAIT_HANG_GUARD_MS,
+                );
+            }),
+        ]);
+    } finally {
+        if (timer !== undefined) {
+            clearTimeout(timer);
+        }
+    }
+};
+
+/**
+ * Runs `work` to completion while polling `pg_locks`, and reports every kind of
+ * wait that appeared while it ran.
+ *
+ * This is the shape a NOT-BLOCKED claim needs. Timing such a claim measures the
+ * host: "it finished inside half a second" is a statement about load, and the
+ * same assertion passes for a write that was never started. Finishing AT ALL
+ * while the transaction that must not block it is still open is the property
+ * itself, and an empty wait list is the same absence seen from the database's
+ * side.
+ */
+const runWatchingForLockWaits = async (work: Promise<unknown>, what: string): Promise<string[]> => {
+    const observed = new Set<string>();
+    let polling = true;
+    const watcher = (async () => {
+        while (polling) {
+            (await observedLockWaits()).forEach((locktype) => observed.add(locktype));
+            await sleep(LOCK_WAIT_POLL_INTERVAL_MS);
+        }
+    })();
+
+    try {
+        await withHangGuard(work, what);
+
+        return [...observed].sort();
+    } finally {
+        polling = false;
+        await watcher;
+    }
+};
 
 /** The confirmed-estimate starting state: four stored targets that match the snapshot. */
 const seedConfirmedEstimate = async (): Promise<void> => {
@@ -237,15 +424,14 @@ const saveFull = async (body: Record<string, unknown>): Promise<void> => {
     }
 };
 
-const storedRevisions = async (): Promise<{ revision: number; estimateInputs: number; targetsInput: number | null }> => {
+const storedRevisions = async (): Promise<{ revision: number; targetsInput: number | null }> => {
     const row = await prisma.meal_plan_preferences.findUniqueOrThrow({
         where: { user_id: USER_ID },
-        select: { revision: true, estimate_inputs_revision: true, targets_input_revision: true },
+        select: { revision: true, targets_input_revision: true },
     });
 
     return {
         revision: row.revision,
-        estimateInputs: row.estimate_inputs_revision,
         targetsInput: row.targets_input_revision,
     };
 };
@@ -259,6 +445,7 @@ afterAll(async () => {
     await truncateFeatureTables();
     await legacyWriterClient.$disconnect();
     await observedClient.$disconnect();
+    await lockObserverClient.$disconnect();
 });
 
 /* ---------------------------------------------------------------------------
@@ -302,11 +489,6 @@ describe('a confirmed estimate across real preference saves', () => {
         expect(revisions.revision).toBe(2);
         expect(revisions.targetsInput).toBe(1);
         expect(await getTargets(USER_ID)).toMatchObject({ source: 'estimated', stale: true, revision: 1 });
-
-        // The write-side diagnostic counter did NOT move, because a diet is not
-        // a term in the energy equation. It is a different question from the
-        // one `stale` answers, and nothing reads it.
-        expect(revisions.estimateInputs).toBe(1);
     });
 
     it('goes stale through schedule, cooking, dislike and time-zone edits', async () => {
@@ -352,10 +534,10 @@ describe('a confirmed estimate across real preference saves', () => {
 
         const revisions = await storedRevisions();
 
-        // Nothing the equation reads moved — the diagnostic stands still — and
-        // the revision advanced all the same, so the ancestry no longer holds.
+        // Nothing the equation reads moved, and the revision advanced all the
+        // same, so the ancestry no longer holds.
         expect(revisions.revision).toBe(2);
-        expect(revisions.estimateInputs).toBe(1);
+        expect(revisions.targetsInput).toBe(1);
         expect(await getTargets(USER_ID)).toMatchObject({ stale: true });
     });
 
@@ -365,7 +547,6 @@ describe('a confirmed estimate across real preference saves', () => {
         const revisions = await storedRevisions();
 
         expect(revisions.revision).toBe(2);
-        expect(revisions.estimateInputs).toBe(2);
         expect(revisions.targetsInput).toBe(1);
         expect(await getTargets(USER_ID)).toEqual({
             // Nothing is recomputed or rewritten: the review screen offers a
@@ -894,11 +1075,20 @@ describe('the pinned targets revision as a write predicate', () => {
             (error: unknown) => ({ error }),
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
+        // The interleaving the predicate exists for, established from
+        // PostgreSQL rather than from a delay: the save is PARKED on the row the
+        // holder is sitting on, so the bump that follows provably lands after
+        // the save read revision 1 and before its own UPDATE is re-evaluated.
+        // An elapsed window would also "pass" for a save that never got as far
+        // as its UPDATE, which is the ordering this test is not about.
+        await awaitLockWait(
+            ROW_LOCK_WAIT,
+            "the save queued behind the holder's lock on the preferences row",
+        );
         holder.release();
-        await holder.committed;
+        await withHangGuard(holder.committed, "the holder's revision bump");
 
-        expect(await outcome).toEqual({
+        expect(await withHangGuard(outcome, 'the save released by the holder')).toEqual({
             error: expect.objectContaining({ name: 'StaleTargetsError', currentRevision: 2 }),
         });
 
@@ -924,12 +1114,13 @@ describe('the pinned targets revision as a write predicate', () => {
             confirmed_targets: { ...FIXTURE_TARGETS },
             targets_revision: 2,
         });
-    });
+    }, LOCK_CASE_TIMEOUT_MS);
 
     it('completes the save when the row is merely locked and released', async () => {
-        // The counter-proof. The save waits on exactly the same row lock for
-        // the same duration; only the revision differs, so the refusal above is
-        // the predicate and nothing else.
+        // The counter-proof. The save waits on exactly the same row lock, is
+        // observed waiting the same way and is released the same way; only the
+        // revision the holder leaves behind differs, so the refusal above is the
+        // predicate and nothing else.
         const holder = holdRowLock(false);
         await holder.locked;
 
@@ -938,11 +1129,16 @@ describe('the pinned targets revision as a write predicate', () => {
             (error: unknown) => ({ error }),
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
+        await awaitLockWait(
+            ROW_LOCK_WAIT,
+            "the save queued behind the holder's lock on the preferences row",
+        );
         holder.release();
-        await holder.committed;
+        await withHangGuard(holder.committed, 'the holder that only locked and released');
 
-        expect(await outcome).toMatchObject({ response: { kind: 'ok' } });
+        expect(await withHangGuard(outcome, 'the save released by the holder')).toMatchObject({
+            response: { kind: 'ok' },
+        });
         expect(await getTargets(USER_ID)).toEqual({
             targets: { calories: 1800, protein: 140, carbs: 180, fat: 60 },
             complete: true,
@@ -950,7 +1146,7 @@ describe('the pinned targets revision as a write predicate', () => {
             stale: false,
             revision: 2,
         });
-    });
+    }, LOCK_CASE_TIMEOUT_MS);
 
     it('creates the row, rather than pinning a revision that cannot exist, for a legacy user', async () => {
         // The other arm of the same write. A user editing targets from Account
@@ -1082,7 +1278,19 @@ describe('the publication gate against the untouched legacy writer', () => {
                     const gate = await requireConfirmedTargets(locked, USER_ID);
                     const legacy = startLegacyWrite(FIXTURE_TARGETS.calories + 100);
 
-                    await sleep(BLOCK_OBSERVATION_MS);
+                    // BLOCKED IS THE DATABASE'S VERDICT, NOT A STOPWATCH'S.
+                    // PostgreSQL lists the legacy write as an ungranted wait for
+                    // this transaction's row lock, and only that makes
+                    // "unsettled" mean "blocked" — an elapsed window says the
+                    // same thing about a write that is merely slow, or that the
+                    // event loop has not started yet. The wait it matches is for
+                    // the ROW — the lock the legacy writer was always going to
+                    // have to take — and not for this feature's advisory lock,
+                    // which `PUT /api/user/targets` never asks for.
+                    await awaitLockWait(
+                        ROW_LOCK_WAIT,
+                        "the legacy write behind the gate's lock on the user row",
+                    );
 
                     // THE INVARIANT THE LOCK EXISTS FOR. A plan is inserted
                     // after this point in the same transaction, and its
@@ -1103,7 +1311,7 @@ describe('the publication gate against the untouched legacy writer', () => {
             source: 'estimated',
         });
 
-        await observed.legacy.done;
+        await withHangGuard(observed.legacy.done, 'the legacy write released at COMMIT');
 
         // Released at COMMIT, so the legacy write is not lost — it applies to a
         // plan that was built, and published, on values that were confirmed at
@@ -1113,55 +1321,82 @@ describe('the publication gate against the untouched legacy writer', () => {
             targets: { ...FIXTURE_TARGETS, calories: FIXTURE_TARGETS.calories + 100 },
             source: 'legacy',
         });
-    });
+    }, LOCK_CASE_TIMEOUT_MS);
 
     it('leaves that write unblocked when the read is the unlocked one', async () => {
         // The counter-proof. Without it, the test above could pass because of
         // something incidental to the transaction rather than because of the
         // row lock — and a gate that had lost its `FOR UPDATE` would look
         // exactly as correct.
+        //
+        // NOT BLOCKED IS PROVEN BY COMPLETION, NOT BY A DEADLINE. The legacy
+        // write is awaited to the end while the unlocked read's transaction is
+        // STILL OPEN — the strongest form of the claim, and one that cannot be
+        // satisfied by a slow host the way "unfinished after half a second"
+        // could be inverted by one. The watch over `pg_locks` is the same
+        // absence from the database's side: nothing ever queued.
         const observed = await withMealPlanningTransaction(
             (tx) =>
                 withUserLock(tx, USER_ID, async (locked) => {
                     await previewConfirmedTargets(USER_ID, locked);
+
                     const legacy = startLegacyWrite(FIXTURE_TARGETS.calories + 100);
+                    const lockWaitsObserved = await runWatchingForLockWaits(
+                        legacy.done,
+                        'the legacy write behind an unlocked read',
+                    );
 
-                    await sleep(BLOCK_OBSERVATION_MS);
-
-                    return { legacy, blockedWhileOpen: !legacy.settled() };
+                    return { settledWhileOpen: legacy.settled(), lockWaitsObserved };
                 }),
             { timeout: 20_000 },
         );
 
-        await observed.legacy.done;
-
-        expect(observed.blockedWhileOpen).toBe(false);
-    });
+        expect(observed.settledWhileOpen).toBe(true);
+        expect(observed.lockWaitsObserved).toEqual([]);
+    }, LOCK_CASE_TIMEOUT_MS);
 
     it('sees a legacy write that commits while it waits, and refuses on the next attempt', async () => {
         // The two orderings the AAP requires, driven in sequence: the write
         // that could not interleave becomes the write that precedes the next
         // attempt, and that attempt is refused rather than silently planned.
-        await withMealPlanningTransaction(
+        //
+        // The contending write is handed OUT of the transaction and awaited
+        // below rather than dropped. Dropping it left the second attempt racing
+        // a commit nobody was waiting for — the refusal then depended on which
+        // of the two won — and a rejection from an abandoned promise would
+        // surface as an unhandled rejection in whichever test happened to be
+        // running.
+        const legacy = await withMealPlanningTransaction(
             (tx) =>
                 withUserLock(tx, USER_ID, async (locked) => {
                     await requireConfirmedTargets(locked, USER_ID);
-                    const legacy = startLegacyWrite(FIXTURE_TARGETS.calories + 250);
+                    const contending = startLegacyWrite(FIXTURE_TARGETS.calories + 250);
 
-                    await sleep(BLOCK_OBSERVATION_MS);
-                    void legacy.done;
+                    // "While it waits" as a fact: the write is parked on this
+                    // transaction's row lock at the moment the gate's read has
+                    // already judged the targets.
+                    await awaitLockWait(
+                        ROW_LOCK_WAIT,
+                        "the legacy write behind the gate's lock on the user row",
+                    );
+
+                    return contending;
                 }),
             { timeout: 20_000 },
         );
 
-        await sleep(BLOCK_OBSERVATION_MS);
+        // Released at COMMIT and awaited to completion, so the next attempt
+        // begins after the legacy value is COMMITTED — which is the ordering the
+        // refusal below is about.
+        await withHangGuard(legacy.done, 'the legacy write released at COMMIT');
+        expect(legacy.settled()).toBe(true);
 
         await expect(
             withMealPlanningTransaction((tx) =>
                 withUserLock(tx, USER_ID, (locked) => requireConfirmedTargets(locked, USER_ID)),
             ),
         ).rejects.toThrow(TargetsUnconfirmedError);
-    });
+    }, LOCK_CASE_TIMEOUT_MS);
 });
 
 /* ---------------------------------------------------------------------------
@@ -1243,34 +1478,94 @@ const planningEligibility = async (): Promise<{ eligible: number; refusalCodes: 
     };
 };
 
-/**
- * How long the publication is held open, so that a write fired while it is
- * running is demonstrably fired INSIDE its transaction.
- */
-const PUBLICATION_WINDOW_MS = 1200;
+/** A publication held open at its grocery write, with the two signals that bound it. */
+interface HeldPublication {
+    /** Resolves once the request is provably inside the publication transaction. */
+    entered: Promise<void>;
+    /** Lets the held step return, so the transaction can commit. */
+    release: () => void;
+}
 
-/** Long enough for the request to have reached the grocery write past the gate. */
-const ENTER_PUBLICATION_MS = 400;
-
 /**
- * Holds the publication transaction open at a step that runs AFTER the gate.
+ * Holds the publication transaction open at a step that runs AFTER the gate, and
+ * SIGNALS the moment it gets there.
  *
- * The grocery write is the last substantial thing the callback does, so a delay
- * there sits inside the transaction with the gate's row lock already taken and
- * the plan already inserted. That window is the only way to fire the legacy
- * writer DURING a publication rather than before or after one, which is what
- * AAP §0.9.2's second ordering is about. Nothing about the gate, the lock or the
- * snapshot is stubbed — only the moment of COMMIT is postponed.
+ * Firing the legacy writer DURING a publication — rather than before or after
+ * one — is what AAP §0.9.2's second ordering is about, and it needs two facts
+ * that a delay cannot supply. The first is entry: `entered` resolves only once
+ * the REAL `writePlanGroceryRows` has returned, so when the test proceeds the
+ * request has passed the gate's `SELECT … FOR UPDATE OF u`, inserted its plan
+ * and reached the last substantial step of the same transaction. That is a fact
+ * about where the request is, whereas an elapsed few hundred milliseconds is a
+ * guess that a loaded host can make wrong in either direction — reaching the
+ * grocery write after the window has closed, or finishing the whole publication
+ * before the legacy writer has even started, which would silently test the
+ * opposite ordering. The second is the moment of COMMIT: the spy waits on
+ * `release`, so the test chooses it instead of racing a timer that may expire
+ * while the legacy write is still being set up.
+ *
+ * Nothing about the gate, the lock, the plan insert or the snapshot is stubbed —
+ * the real write runs first and its result is returned unchanged.
  */
-const holdPublicationOpen = (): void => {
+const holdPublicationOpen = (): HeldPublication => {
     const writeRows = groceryService.writePlanGroceryRows;
+    const entered = deferred();
+    const held = deferred();
 
     jest.spyOn(groceryService, 'writePlanGroceryRows').mockImplementation(async (tx, params) => {
         const written = await writeRows(tx, params);
-        await sleep(PUBLICATION_WINDOW_MS);
+
+        entered.release();
+        await held.promise;
 
         return written;
     });
+
+    return { entered: entered.promise, release: held.release };
+};
+
+/**
+ * Fires the legacy writer inside a held publication and hands back its handle,
+ * once PostgreSQL reports it queued behind the publication's row lock.
+ *
+ * Shared by the generation and the regeneration case because the choreography is
+ * the property, not the endpoint: enter the transaction, contend for the row,
+ * establish from `pg_locks` that the contender is waiting rather than merely
+ * unfinished, and only then release. The release is in `finally` — a failed
+ * expectation must not leave the transaction pinned on the user row, because
+ * every later case in this suite writes that row through the same gate and would
+ * fail as a timeout sourced nowhere near the real defect.
+ *
+ * The caller owns both promises afterwards: the publication's own result, and
+ * the legacy write that commits behind it.
+ */
+const raceLegacyWriteIntoPublication = async <T>(
+    publication: HeldPublication,
+    publishing: { settled: () => boolean; done: Promise<T> },
+): Promise<{ settled: () => boolean; done: Promise<unknown> }> => {
+    try {
+        await withHangGuard(publication.entered, 'the publication never reached its grocery write');
+
+        // Inside the transaction because the code inside the transaction said
+        // so, rather than because a chosen number of milliseconds has passed.
+        expect(publishing.settled()).toBe(false);
+
+        const legacy = watch(
+            updateTargets(USER_ID, { calories: FIXTURE_TARGETS.calories + 100 }, legacyWriterClient),
+        );
+
+        await awaitLockWait(
+            ROW_LOCK_WAIT,
+            "the legacy write queued behind the publication's lock on the user row",
+        );
+
+        // PostgreSQL has parked the write, so this is the lock and not latency.
+        expect(legacy.settled()).toBe(false);
+
+        return legacy;
+    } finally {
+        publication.release();
+    }
 };
 
 const countPersisted = async (): Promise<{ plans: number; ledger: number }> => ({
@@ -1387,17 +1682,31 @@ describe('the real generation path against the untouched legacy writer', () => {
 
         const generation = watch(generatePlan(USER_ID, generateRequest(), new Date()));
 
-        await sleep(BLOCK_OBSERVATION_MS);
-        expect(generation.settled()).toBe(false);
+        try {
+            // The wait is PostgreSQL's own: the request is listed as queued for
+            // the row this second session is holding. "Has not answered yet"
+            // would be equally true of a request still searching the catalog,
+            // and on a loaded host that is exactly what a fixed window would
+            // catch instead.
+            await awaitLockWait(
+                ROW_LOCK_WAIT,
+                "generation behind the holder's lock on the user row",
+            );
+            expect(generation.settled()).toBe(false);
+        } finally {
+            // Released whatever the expectation did: a holder left open would
+            // pin the user row for every case after this one, and the failure
+            // would be reported far away from its cause.
+            releaseHold.release();
+        }
 
-        releaseHold.release();
-        await holder;
+        await withHangGuard(holder, 'the holder that moves the legacy value');
 
         await expect(generation.done).rejects.toThrow(TargetsUnconfirmedError);
         expect(await countPersisted()).toEqual({ plans: 0, ledger: 0 });
 
         expect(await getTargets(USER_ID)).toMatchObject({ source: 'legacy' });
-    });
+    }, LOCK_CASE_TIMEOUT_MS);
 
     /**
      * §0.5.2's two outcomes for `POST /meal-planning/plans`, at the grocery
@@ -1502,21 +1811,11 @@ describe('the real generation path against the untouched legacy writer', () => {
         // and this expectation would fail. The refusal-shaped tests above cannot
         // see that, because a reader later in the same transaction raises the
         // same error once the legacy value commits.
-        holdPublicationOpen();
-
+        const publication = holdPublicationOpen();
         const generation = watch(generatePlan(USER_ID, generateRequest(), new Date()));
+        const legacy = await raceLegacyWriteIntoPublication(publication, generation);
 
-        await sleep(ENTER_PUBLICATION_MS);
-        expect(generation.settled()).toBe(false);
-
-        const legacy = watch(
-            updateTargets(USER_ID, { calories: FIXTURE_TARGETS.calories + 100 }, legacyWriterClient),
-        );
-
-        await sleep(BLOCK_OBSERVATION_MS);
-        expect(legacy.settled()).toBe(false);
-
-        const published = await generation.done;
+        const published = await withHangGuard(generation.done, 'the published week');
 
         expect(published.kind).toBe('ok');
 
@@ -1527,7 +1826,7 @@ describe('the real generation path against the untouched legacy writer', () => {
 
         expect(plan.targets_snapshot).toEqual({ ...FIXTURE_TARGETS });
 
-        await legacy.done;
+        await withHangGuard(legacy.done, 'the legacy write the published week was holding');
 
         // Released at COMMIT, so the write is not lost, the published week keeps
         // the values it was built on, and the canonical read now reports the
@@ -1542,7 +1841,7 @@ describe('the real generation path against the untouched legacy writer', () => {
                 })
             ).targets_snapshot,
         ).toEqual({ ...FIXTURE_TARGETS });
-    });
+    }, LOCK_CASE_TIMEOUT_MS);
 
     it('makes the legacy writer wait on a REGENERATION too, which shares the gate', async () => {
         // The regeneration callback runs the same gate over a plan that already
@@ -1567,7 +1866,7 @@ describe('the real generation path against the untouched legacy writer', () => {
         });
         const { revision: targetsRevision } = await getTargets(USER_ID);
 
-        holdPublicationOpen();
+        const publication = holdPublicationOpen();
 
         const regeneration = watch(
             regeneratePlan(
@@ -1583,18 +1882,10 @@ describe('the real generation path against the untouched legacy writer', () => {
             ),
         );
 
-        await sleep(ENTER_PUBLICATION_MS);
-        expect(regeneration.settled()).toBe(false);
+        const legacy = await raceLegacyWriteIntoPublication(publication, regeneration);
 
-        const legacy = watch(
-            updateTargets(USER_ID, { calories: FIXTURE_TARGETS.calories + 100 }, legacyWriterClient),
-        );
-
-        await sleep(BLOCK_OBSERVATION_MS);
-        expect(legacy.settled()).toBe(false);
-
-        expect((await regeneration.done).kind).toBe('ok');
-        await legacy.done;
+        expect((await withHangGuard(regeneration.done, 'the replacement week')).kind).toBe('ok');
+        await withHangGuard(legacy.done, 'the legacy write the replacement week was holding');
 
         // One active week, built on the confirmed pair, and the week it replaced
         // is superseded rather than rewritten.
@@ -1610,7 +1901,7 @@ describe('the real generation path against the untouched legacy writer', () => {
             { ...FIXTURE_TARGETS },
         ]);
         expect(await getTargets(USER_ID)).toMatchObject({ source: 'legacy' });
-    });
+    }, LOCK_CASE_TIMEOUT_MS);
 
     it('leaves only a safe outcome when the two are raced', async () => {
         // AAP §0.9.2's third clause. Which side wins is timing, so the assertion
@@ -2694,6 +2985,139 @@ describe('PUT /api/meal-planning/targets', () => {
     });
 
     describe('one transaction, both halves', () => {
+        /**
+         * The injected failure's message.
+         *
+         * It carries no code the controller maps, deliberately: an untyped
+         * failure is what a genuine mid-transaction fault looks like, and the
+         * 500 it becomes is the honest answer the route already gives for one
+         * (see the "no `users` row" throw in `targets.service.ts`).
+         */
+        const POST_WRITE_FAULT_MESSAGE =
+            'injected fault: the save failed after both halves had written';
+
+        /**
+         * Every column of the preferences row, for a comparison an atomicity
+         * proof cannot afford to make narrower.
+         *
+         * `storedTargetRecord` projects the seven columns the attribution is
+         * made of, which is what every other case here needs. A half-committed
+         * save is a different question: ANY column left behind is the defect,
+         * including one nobody thought to select, so this reads the row whole.
+         * The table carries no timestamps, so comparing two reads of it is
+         * stable.
+         */
+        const storedPreferencesRow = (uid: string): Promise<meal_plan_preferences> =>
+            prisma.meal_plan_preferences.findUniqueOrThrow({ where: { user_id: uid } });
+
+        /** What the injected failure saw of the two halves, from inside the transaction. */
+        interface PostWriteObservation {
+            /** The four values the `users` half was asked to write. */
+            requested: Partial<MacroTargetsResponse>;
+            /**
+             * Whether that half was handed the save's own transaction client.
+             * False would mean it wrote on the autocommit client, which no
+             * rollback can reach — the defect this describe exists to detect,
+             * and one that would otherwise be invisible.
+             */
+            transactional: boolean;
+            /** `users.target_*` as that half left them, read back before the failure. */
+            columns: MacroTargetsResponse | null;
+            /** The preferences half's row, read through the same client the save is using. */
+            record: meal_plan_preferences | null;
+        }
+
+        /**
+         * Runs `assertions` with the save rigged to fail AFTER both halves have
+         * written, reporting what each of them wrote on the way.
+         *
+         * WHY A SPY ON `updateTargets` IS THE SEAM. `saveTargets` records the
+         * preferences half first and then calls
+         * `updateTargets(userId, values, tx)` for `users.target_*`. A spy that
+         * awaits the real function and only then throws therefore raises its
+         * failure at the one instant when BOTH halves are written and neither is
+         * committed — which is the only state in which a save built as one
+         * transaction is distinguishable from one that writes twice and hopes.
+         * Nothing is stubbed out: the production writes really happen, and what
+         * is injected is the failure that has to take them back.
+         *
+         * The observation is taken through the client the save handed the
+         * writer, so `record` is the uncommitted preferences half as that
+         * transaction sees it. That is what makes the assertions after the
+         * request a ROLLBACK proof rather than another refusal: the same facts
+         * are asserted PRESENT inside the transaction and ABSENT once it has
+         * gone.
+         *
+         * The error log is silenced because the 500 is deliberate, and asserted
+         * because a failure the controller swallowed would otherwise read like a
+         * clean rollback. Both spies are restored in the `finally`:
+         * `clearMocks` clears calls and leaves implementations standing.
+         */
+        const withFailureAfterBothHalves = async (
+            assertions: (observed: PostWriteObservation[]) => Promise<void>,
+        ): Promise<void> => {
+            const write = nutritionService.updateTargets;
+            const observed: PostWriteObservation[] = [];
+            const fault = jest
+                .spyOn(nutritionService, 'updateTargets')
+                .mockImplementation(async (userId, targets, db) => {
+                    const columns = await write(userId, targets, db);
+                    const client = db ?? prisma;
+                    const record = await client.meal_plan_preferences.findUnique({
+                        where: { user_id: userId },
+                    });
+
+                    observed.push({
+                        requested: targets,
+                        transactional: db !== undefined,
+                        columns,
+                        record,
+                    });
+
+                    throw new Error(POST_WRITE_FAULT_MESSAGE);
+                });
+            const errorLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+            try {
+                await assertions(observed);
+
+                expect(fault).toHaveBeenCalledTimes(1);
+                // THE INJECTED FAILURE IS THE ONE THAT ENDED THE REQUEST, read
+                // off the single server event the residual 500 emits. Asserting
+                // only that something was logged would let an unrelated error —
+                // a typo in the request body reaching a different branch, say —
+                // stand in for the fault and make every "nothing moved"
+                // assertion below vacuous.
+                //
+                // The attribution is no longer the fault's MESSAGE, because
+                // `failRequest` describes a throw by name and machine code
+                // alone: the route it answered, the status, the one stable code
+                // and `errorName: 'Error'` — this fault is deliberately untyped,
+                // so no mapped error class answered it — are what identify it.
+                // The message's ABSENCE is asserted beside them rather than
+                // assumed, because redacting it is the point of that shape and
+                // not a side effect of it.
+                expect(errorLog).toHaveBeenCalledTimes(1);
+                // ONE argument, and a string: the second argument that used to
+                // carry the error object is exactly where a fault's message, its
+                // stack and a Prisma `meta` reached the log.
+                expect(errorLog.mock.calls[0]).toHaveLength(1);
+
+                const [failureLine] = errorLog.mock.calls[0];
+
+                expect(failureLine).toContain('[meal-planning] request_failed');
+                expect(failureLine).toContain('"action":"targets.save"');
+                expect(failureLine).toContain(`"userId":"${HTTP_USER}"`);
+                expect(failureLine).toContain('"status":500');
+                expect(failureLine).toContain('"code":"internal_error"');
+                expect(failureLine).toContain('"errorName":"Error"');
+                expect(failureLine).not.toContain(POST_WRITE_FAULT_MESSAGE);
+            } finally {
+                fault.mockRestore();
+                errorLog.mockRestore();
+            }
+        };
+
         it('writes the columns, the snapshot, the source, the revision and the ancestry together', async () => {
             await seedUnconfirmedPreferences();
 
@@ -2755,6 +3179,250 @@ describe('PUT /api/meal-planning/targets', () => {
             expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toMatchObject({
                 targets: { ...FIXTURE_TARGETS },
                 source: 'estimated',
+            });
+        });
+
+        it('takes the users columns back when the failure lands after both halves have written', async () => {
+            // THE POST-WRITE ATOMICITY PROOF, and the one the case above cannot
+            // make: a refusal raised before either half runs passes just as
+            // happily for a save that writes `users.target_*`, commits it, and
+            // only then fails while recording the snapshot. What that would cost
+            // is specific — a confirmed target the preferences row never got, so
+            // the canonical read's attribution is derived from a DISAGREEMENT
+            // and reports `legacy` for a figure this feature had just written,
+            // after which the planner refuses to build a week on the user's own
+            // targets (§0.5.2). Nothing but a failure injected between the two
+            // writes can tell the two implementations apart, so that is what is
+            // injected here, against a save with nothing refusable about it.
+            await seedHttpConfirmedEstimate();
+
+            const columnsBefore = await storedUserTargets(HTTP_USER);
+            const rowBefore = await storedPreferencesRow(HTTP_USER);
+
+            await withFailureAfterBothHalves(async (observed) => {
+                const response = await saveTargetsOverHttp(HTTP_USER, {
+                    source: 'manual',
+                    ...COHERENT_TARGETS,
+                    expectedTargetsRevision: 1,
+                }).expect(500);
+
+                expect(response.body).toEqual({ error: 'internal_error' });
+
+                // WHAT MAKES THIS A POST-WRITE CASE rather than a fourth
+                // refusal: the values the failing half had already written,
+                // observed inside the transaction and different from the
+                // fixture's in all four fields, beside the preferences half that
+                // had already recorded them at the bumped revision.
+                expect(observed).toHaveLength(1);
+                expect(observed[0].transactional).toBe(true);
+                expect(observed[0].requested).toEqual({ ...COHERENT_TARGETS });
+                expect(observed[0].columns).toEqual({ ...COHERENT_TARGETS });
+                expect(observed[0].record).toMatchObject({
+                    target_source: 'manual',
+                    confirmed_targets: { ...COHERENT_TARGETS },
+                    targets_revision: 2,
+                    targets_input_revision: null,
+                });
+            });
+
+            // Both halves, byte for byte — and the preferences half as a WHOLE
+            // ROW, so a column outside the attribution projection cannot survive
+            // the failure unnoticed either.
+            expect(await storedUserTargets(HTTP_USER)).toEqual(columnsBefore);
+            expect(await storedPreferencesRow(HTTP_USER)).toEqual(rowBefore);
+
+            // The user-visible statement of the two assertions above: the
+            // canonical read still reports the pre-call figure on every term it
+            // answers, attribution and staleness included.
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                targets: { ...FIXTURE_TARGETS },
+                complete: true,
+                source: 'estimated',
+                stale: false,
+                revision: 1,
+            });
+        });
+
+        it('takes the ancestry the estimated route writes back with it', async () => {
+            // The other arm, because it writes three things the manual arm does
+            // not: `targets_input_revision` — the number `stale` is judged
+            // against — `estimated_targets`, the only surviving account of the
+            // calculation, and `target_source: 'estimated'`. A rollback that
+            // missed any of them would leave the row claiming a calculated
+            // ancestry for a figure it does not hold, which is the same
+            // disagreement as above wearing the other route's name.
+            await seedUnconfirmedPreferences();
+
+            const estimate = (await getEstimate(HTTP_USER).expect(200))
+                .body as TargetEstimateResponse;
+            const values = {
+                calories: estimate.calories,
+                protein: estimate.protein,
+                carbs: estimate.carbs,
+                fat: estimate.fat,
+            };
+            const rowBefore = await storedPreferencesRow(HTTP_USER);
+
+            // The starting state stated rather than assumed: nothing here has
+            // been confirmed, so every column the save is about to write is
+            // unset, and the comparison after the failure has something to mean.
+            expect(rowBefore).toMatchObject({
+                target_source: null,
+                confirmed_targets: null,
+                targets_revision: 0,
+                targets_input_revision: null,
+                estimated_targets: null,
+            });
+
+            await withFailureAfterBothHalves(async (observed) => {
+                const response = await saveTargetsOverHttp(HTTP_USER, {
+                    source: 'estimated',
+                    estimateRevision: estimate.estimateRevision,
+                }).expect(500);
+
+                expect(response.body).toEqual({ error: 'internal_error' });
+
+                expect(observed).toHaveLength(1);
+                expect(observed[0].transactional).toBe(true);
+                expect(observed[0].columns).toEqual(values);
+                // Every column this arm writes, present inside the transaction —
+                // so their absence afterwards is a rollback and not a save that
+                // never reached them.
+                expect(observed[0].record).toMatchObject({
+                    target_source: 'estimated',
+                    confirmed_targets: values,
+                    targets_revision: 1,
+                    targets_input_revision: estimate.estimateRevision,
+                    estimated_targets: {
+                        inputRevision: estimate.estimateRevision,
+                        calories: estimate.calories,
+                        protein: estimate.protein,
+                        carbs: estimate.carbs,
+                        fat: estimate.fat,
+                    },
+                });
+            });
+
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: null,
+                target_protein_g: null,
+                target_carbs_g: null,
+                target_fat_g: null,
+            });
+            expect(await storedPreferencesRow(HTTP_USER)).toEqual(rowBefore);
+
+            // Still a user who has confirmed nothing, which is the honest
+            // reading of a save that failed: no values, no attribution, and the
+            // revision a first save will pin.
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                targets: null,
+                complete: false,
+                source: null,
+                stale: false,
+                revision: 0,
+            });
+        });
+
+        it('leaves no preferences row behind when the row it created cannot commit', async () => {
+            // THE CREATE ARM, which is the half an upsert committed outside the
+            // transaction would strand. A legacy user editing targets from
+            // Account has no preferences row at all, so this save creates one
+            // (§0.5.2, and the section below on what that row looks like). A
+            // create that survived the failure would leave a user who never ran
+            // the wizard holding a row claiming a confirmed target nobody holds,
+            // and a `targets_revision` their next save would have to pin against
+            // it.
+            await makeUser({ id: HTTP_USER });
+
+            await withFailureAfterBothHalves(async (observed) => {
+                const response = await saveTargetsOverHttp(HTTP_USER, {
+                    source: 'manual',
+                    ...COHERENT_TARGETS,
+                }).expect(500);
+
+                expect(response.body).toEqual({ error: 'internal_error' });
+
+                expect(observed).toHaveLength(1);
+                expect(observed[0].transactional).toBe(true);
+                expect(observed[0].columns).toEqual({ ...COHERENT_TARGETS });
+                // The row really was created, inside the transaction and in the
+                // shape the section below pins — so its absence afterwards is
+                // that create being rolled back rather than never attempted.
+                expect(observed[0].record).toMatchObject({
+                    setup_status: 'not_started',
+                    setup_step: null,
+                    target_source: 'manual',
+                    confirmed_targets: { ...COHERENT_TARGETS },
+                    targets_revision: 1,
+                    targets_input_revision: null,
+                    revision: 1,
+                });
+            });
+
+            expect(await prisma.meal_plan_preferences.count({ where: { user_id: HTTP_USER } })).toBe(
+                0,
+            );
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: null,
+                target_protein_g: null,
+                target_carbs_g: null,
+                target_fat_g: null,
+            });
+            expect((await getTargetsOverHttp(HTTP_USER).expect(200)).body).toEqual({
+                targets: null,
+                complete: false,
+                source: null,
+                stale: false,
+                revision: 0,
+            });
+        });
+
+        it('leaves the route usable: the identical save then commits and moves the revision one step', async () => {
+            // What the three cases above cannot show on their own. A rollback
+            // that wedged the user — a leaked lock, or a revision consumed by
+            // the attempt — would satisfy every "nothing moved" assertion and
+            // still have broken the route. So the same body, pinned at the same
+            // revision, is re-sent once the injected failure is gone: it must
+            // succeed, and the revision must move exactly ONE step from where
+            // the fixture stood, which is only true if the failed attempt
+            // stranded nothing. (The lock is `pg_advisory_xact_lock`, released
+            // at ROLLBACK as well as COMMIT, and this is the assertion that
+            // holds that choice in place.)
+            await seedHttpConfirmedEstimate();
+
+            const save = () =>
+                saveTargetsOverHttp(HTTP_USER, {
+                    source: 'manual',
+                    ...COHERENT_TARGETS,
+                    expectedTargetsRevision: 1,
+                });
+
+            await withFailureAfterBothHalves(async (observed) => {
+                await save().expect(500);
+
+                expect(observed).toHaveLength(1);
+            });
+
+            const saved = (await save().expect(200)).body as SaveTargetsResponse;
+
+            expect(saved.targets).toEqual({
+                targets: { ...COHERENT_TARGETS },
+                complete: true,
+                source: 'manual',
+                stale: false,
+                revision: 2,
+            });
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: COHERENT_TARGETS.calories,
+                target_protein_g: COHERENT_TARGETS.protein,
+                target_carbs_g: COHERENT_TARGETS.carbs,
+                target_fat_g: COHERENT_TARGETS.fat,
+            });
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                target_source: 'manual',
+                confirmed_targets: { ...COHERENT_TARGETS },
+                targets_revision: 2,
+                targets_input_revision: null,
             });
         });
     });
@@ -2840,6 +3508,212 @@ describe('PUT /api/meal-planning/targets', () => {
             );
 
             expect(response.body).toMatchObject({ setupStatus: 'not_started', setupStep: null });
+        });
+
+        it('still invents no progress when the same user saves targets again', async () => {
+            // The second save takes the UPDATE arm rather than the create arm,
+            // which is where the conditional setup advance lives. A row that
+            // never started the wizard has no stop to answer, so the marker
+            // must stay absent however many times targets are edited from
+            // Account.
+            await saveFromAccount();
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                expectedTargetsRevision: 1,
+            }).expect(200);
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                setup_status: 'not_started',
+                setup_step: null,
+                targets_revision: 2,
+            });
+        });
+    });
+
+    /* -----------------------------------------------------------------------
+     * The manual route's own stop
+     *
+     * `targets_manual` is a stop on the manual route's wizard that saves
+     * through THIS endpoint rather than as a setup step (AAP §0.7.4), so no
+     * `PUT /preferences/steps/:step` request can answer it and nothing but the
+     * target save can move the marker off it. Only a real walk through the
+     * wizard produces that state: the marker is written by the body step's
+     * Skip branch, and the advance is judged against the row that branch left
+     * behind.
+     * --------------------------------------------------------------------- */
+
+    describe('the manual route, resuming after its targets are confirmed', () => {
+        /** Frame 02, as the client saves it — the save that creates the row. */
+        const GOAL_STEP_BODY = {
+            goal: 'lose',
+            goalWeightKg: 70,
+            paceLbPerWeek: 1,
+            timeZone: TIME_ZONE,
+        } as const;
+
+        const saveStepOverHttp = (step: string, body: Record<string, unknown>) =>
+            asUser(request.put(`${PREFERENCES_PATH}/steps/${step}`), { uid: HTTP_USER }).send(body);
+
+        const readPreferencesOverHttp = async (): Promise<Record<string, unknown>> =>
+            (await asUser(request.get(PREFERENCES_PATH), { uid: HTTP_USER }).expect(200)).body as Record<
+                string,
+                unknown
+            >;
+
+        /**
+         * Walks the wizard to the manual target screen the way the client
+         * does: the goal step creates the row, and Skip on the body step is
+         * one of the two answers that select the manual route (it sends no
+         * measurements at all, so the stored route is the only record of the
+         * choice).
+         */
+        const walkToTheTargetStop = async (): Promise<void> => {
+            await makeUser({ id: HTTP_USER });
+            await saveStepOverHttp('goal', { ...GOAL_STEP_BODY }).expect(200);
+            await saveStepOverHttp('body', {
+                skipped: true,
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            }).expect(200);
+        };
+
+        const confirmManualTargets = () =>
+            saveTargetsOverHttp(HTTP_USER, { source: 'manual', ...COHERENT_TARGETS });
+
+        it('reaches that stop through the wizard, with no targets confirmed yet', async () => {
+            // The starting state the rest of this group depends on. Without it
+            // the advance below could pass by moving a marker that was never
+            // on the target screen.
+            await walkToTheTargetStop();
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                setup_status: 'in_progress',
+                setup_step: 'targets_manual',
+                target_source: null,
+                targets_revision: 0,
+                revision: 2,
+            });
+        });
+
+        it('advances the resume marker to Diet, so a force-quit does not reopen the editor', async () => {
+            await walkToTheTargetStop();
+            await confirmManualTargets().expect(200);
+
+            // The whole finding: before this, the marker stayed on
+            // `targets_manual` and "Continue setup" reopened the target screen
+            // the user had just completed.
+            expect(await readPreferencesOverHttp()).toMatchObject({
+                setupStatus: 'in_progress',
+                setupStep: 'diet',
+                targetRoute: 'manual',
+            });
+        });
+
+        it('leaves the preferences revision exactly where it stood', async () => {
+            await walkToTheTargetStop();
+            await confirmManualTargets().expect(200);
+
+            // `revision` is what a client pins when it writes preference
+            // ANSWERS, and this save changed no answer. The client still sees
+            // the new marker, because a target save invalidates the
+            // preferences query (AAP §0.7.2).
+            expect(await readPreferencesOverHttp()).toMatchObject({ revision: 2 });
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({ revision: 2 });
+        });
+
+        it('accepts the very next step save, which a revision bump would have refused', async () => {
+            // The consequence of the line above, stated as behaviour: Diet is
+            // the stop the marker now names, and the client pins the revision
+            // it last read. A bump here would answer that save with a
+            // spurious `409 stale_revision` on the one route where it always
+            // follows.
+            await walkToTheTargetStop();
+            await confirmManualTargets().expect(200);
+
+            await saveStepOverHttp('diet', {
+                diet: 'vegetarian',
+                allergens: ['milk'],
+                timeZone: TIME_ZONE,
+                expectedRevision: 2,
+            }).expect(200);
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                setup_status: 'in_progress',
+                setup_step: 'dislikes',
+                revision: 3,
+            });
+        });
+
+        it('stores and reports the confirmed targets exactly as it does on any other route', async () => {
+            await walkToTheTargetStop();
+
+            const response = await confirmManualTargets().expect(200);
+
+            // The advance rides along with the target write; it changes
+            // nothing about what that write stores or answers.
+            expect((response.body as SaveTargetsResponse).targets).toEqual({
+                targets: { ...COHERENT_TARGETS },
+                complete: true,
+                source: 'manual',
+                stale: false,
+                revision: 1,
+            });
+            expect(await storedUserTargets(HTTP_USER)).toEqual({
+                target_calories: COHERENT_TARGETS.calories,
+                target_protein_g: COHERENT_TARGETS.protein,
+                target_carbs_g: COHERENT_TARGETS.carbs,
+                target_fat_g: COHERENT_TARGETS.fat,
+            });
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                target_source: 'manual',
+                confirmed_targets: { ...COHERENT_TARGETS },
+                // The one counter this save does advance.
+                targets_revision: 1,
+                // Hand-entered values have no calculated ancestry.
+                targets_input_revision: null,
+            });
+        });
+
+        it('moves the marker no further when the same targets are saved again', async () => {
+            // An edit-mode re-save from later in the wizard, or a user
+            // returning to the target screen: the stop has been answered, and
+            // progress is not earned a second time.
+            await walkToTheTargetStop();
+            await confirmManualTargets().expect(200);
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                expectedTargetsRevision: 1,
+            }).expect(200);
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                setup_status: 'in_progress',
+                setup_step: 'diet',
+                targets_revision: 2,
+                revision: 2,
+            });
+        });
+
+        it('leaves setup where it stood when the save is refused', async () => {
+            // The advance is in the same statement as the values, under the
+            // same pinned-revision predicate, so a refused save cannot resume
+            // the user past a target write that never landed.
+            await walkToTheTargetStop();
+
+            await saveTargetsOverHttp(HTTP_USER, {
+                source: 'manual',
+                ...COHERENT_TARGETS,
+                expectedTargetsRevision: 4,
+            }).expect(409);
+
+            expect(await storedTargetRecord(HTTP_USER)).toMatchObject({
+                setup_status: 'in_progress',
+                setup_step: 'targets_manual',
+                target_source: null,
+                targets_revision: 0,
+                revision: 2,
+            });
         });
     });
 

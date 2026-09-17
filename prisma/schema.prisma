@@ -300,9 +300,21 @@ model meal_entries {
 // is public domain with no retention restrictions; stale rows are served
 // immediately and refreshed in the background — see usda.service.
 model usda_api_cache {
-  cache_key  String   @id(map: "usda_api_cache_pkey")
-  payload    Json
-  fetched_at DateTime @default(now()) @db.Timestamptz(6)
+  cache_key   String   @id(map: "usda_api_cache_pkey")
+  payload     Json
+  // The upstream HTTP status of the exchange that produced `payload` — the
+  // successful attempt, not an earlier retried 400/429. It is a mandatory
+  // field of a retrieval record (Agent Action Plan §0.3.2) and the catalog
+  // import copies it onto every `catalog_validation_records.identity_evidence`
+  // record, so it has to be observed and stored rather than inferred.
+  //
+  // Nullable with no default and no backfill on purpose: rows written before
+  // this column existed genuinely carry no observed status, and stamping them
+  // 200 would manufacture the evidence this column exists to record. A null
+  // therefore means "this recorded response predates the status ledger", never
+  // "unknown, probably 200".
+  http_status Int?
+  fetched_at  DateTime @default(now()) @db.Timestamptz(6)
 }
 
 // One row per user x UTC day, counting AI calls (estimate + label-scan share
@@ -386,6 +398,18 @@ model catalog_generation_batches {
   catalog_foods        catalog_foods[]
 
   @@unique([batch_key])
+  // Every run-scoped read leads with run_id: getReservedModelCalls sums
+  // model_calls_reserved over one run's rows before EVERY paid model call
+  // (scripts/lib/budget.ts) while holding that run's advisory lock, and
+  // catalog-generate-ai.ts loads the run's batch rows and their statuses to
+  // decide which batches a resumed run still has to execute
+  // (scripts/catalog-generate-ai.ts; scripts/lib/checkpoint.ts resumes the
+  // catalog_import_runs row itself, not these batches). Without this index both
+  // scan every batch ever generated — the sum inside the serialized section —
+  // and the batch ledger is never pruned. It is also the referencing side of the run
+  // foreign key above, so a cascading run delete stops scanning the table as
+  // well. Reads that also name batch_key are served by the unique index above.
+  @@index([run_id])
 }
 
 // The internal food catalog. Identity (identity_source / identity_status),
@@ -491,7 +515,7 @@ model catalog_foods {
 // served, so the class replaces `text_ops` rather than joining it.
 // Unlike idx_catalog_foods_search_vector above, no @@index can mirror this one,
 // so the schema-diff gate is blind to it by design and
-// docs/meal-planning/expected-schema-diff.sql reads the class back out of
+// docs/meal-planning/schema-catalog-evidence.sql reads the class back out of
 // pg_opclass instead.
 model catalog_food_aliases {
   id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
@@ -575,12 +599,23 @@ model catalog_validation_records {
 // matching partial unique on recipe_versions (recipe_id) WHERE status =
 // 'current' is appended in the migration SQL.
 model recipes {
-  id                 String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  slug               String
-  current_version_id String?           @db.Uuid
-  created_at         DateTime          @default(now())
-  current_version    recipe_versions?  @relation("recipes_current_version", fields: [current_version_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
-  recipe_versions    recipe_versions[] @relation("recipe_versions_recipe")
+  id                     String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug                   String
+  current_version_id     String?           @db.Uuid
+  created_at             DateTime          @default(now())
+  current_version        recipe_versions?  @relation("recipes_current_version", fields: [current_version_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  // MEMBERSHIP GUARD beside the SET NULL pointer above: the pair
+  // (current_version_id, id) must name a version whose recipe_id IS THIS
+  // RECIPE, so the pointer can never name a version of a different recipe -
+  // which the single-column reference and the partial unique on
+  // recipe_versions (recipe_id) WHERE status = 'current' both permit. The
+  // pointer stays nullable and keeps SET NULL: NO ACTION here is checked at end
+  // of statement, by which time SET NULL has already cleared the pointer, and
+  // MATCH SIMPLE leaves the pair unchecked while current_version_id IS NULL.
+  // Every writer creates the version first and moves the pointer afterwards
+  // (scripts/recipes-seed.ts), which is what this constraint holds them to.
+  member_current_version recipe_versions?  @relation("recipes_current_version_membership", fields: [current_version_id, id], references: [id, recipe_id], onDelete: NoAction, onUpdate: NoAction)
+  recipe_versions        recipe_versions[] @relation("recipe_versions_recipe")
 
   @@unique([slug])
 }
@@ -590,44 +625,50 @@ model recipes {
 // detail and diary entry keeps the numbers it was actually built from. Retired
 // versions stay readable for exactly that reason.
 model recipe_versions {
-  id                       String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  recipe_id                String               @db.Uuid
-  version                  Int
-  name                     String
-  description              String?
-  icon_key                 String // 'crosshair' | 'fork_knife' | 'bowl' | 'wrap' | 'dome' | 'salad' | 'bowl_dash' | 'pot' | 'cloche'
-  instructions             Json
-  yield_servings           Float
-  serving_description      String
-  prep_minutes             Int
-  cook_minutes             Int
-  total_minutes            Int // prep_minutes + cook_minutes — the value the user's cooking-time limit is applied to
+  id                        String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  recipe_id                 String               @db.Uuid
+  version                   Int
+  name                      String
+  description               String?
+  icon_key                  String // 'crosshair' | 'fork_knife' | 'bowl' | 'wrap' | 'dome' | 'salad' | 'bowl_dash' | 'pot' | 'cloche'
+  instructions              Json
+  yield_servings            Float
+  serving_description       String
+  prep_minutes              Int
+  cook_minutes              Int
+  total_minutes             Int // prep_minutes + cook_minutes — the value the user's cooking-time limit is applied to
   // No @default([]) on purpose: a version with no slot is never plannable, so an
   // omitted meal_slots must fail the insert rather than be stored as an empty
   // set. NOT NULL is added by hand in the migration SQL, as for every list here.
-  meal_slots               String[] // 'breakfast' | 'lunch' | 'dinner' | 'snack'
-  diet_tags                String[]             @default([])
-  allergen_tags            String[]             @default([])
-  allergen_status          String // 'known' | 'unknown' — only 'known' is ever plannable
-  budget_tier              Int                  @db.SmallInt
-  badges                   String[]             @default([]) // 'high_protein' | 'gluten_free' | 'dairy_free' | 'vegan' | 'quick'
-  nutrition_provenance     String // 'source_backed' — planning admits nothing else
-  per_serving_calories     Float
-  per_serving_protein_g    Float
-  per_serving_carbs_g      Float
-  per_serving_fat_g        Float
-  sourced_calories_note    String?
-  status                   String // 'current' | 'retired'
-  published_at             DateTime?
-  retired_at               DateTime?
-  recipes                  recipes              @relation("recipe_versions_recipe", fields: [recipe_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  current_of_recipes       recipes[]            @relation("recipes_current_version")
-  recipe_ingredients       recipe_ingredients[]
-  meal_plan_meals          meal_plan_meals[]    @relation("meal_plan_meals_recipe_version")
-  previous_meal_plan_meals meal_plan_meals[]    @relation("meal_plan_meals_previous_recipe_version")
-  meal_entries             meal_entries[]
+  meal_slots                String[] // 'breakfast' | 'lunch' | 'dinner' | 'snack'
+  diet_tags                 String[]             @default([])
+  allergen_tags             String[]             @default([])
+  allergen_status           String // 'known' | 'unknown' — only 'known' is ever plannable
+  budget_tier               Int                  @db.SmallInt
+  badges                    String[]             @default([]) // 'high_protein' | 'gluten_free' | 'dairy_free' | 'vegan' | 'quick'
+  nutrition_provenance      String // 'source_backed' — planning admits nothing else
+  per_serving_calories      Float
+  per_serving_protein_g     Float
+  per_serving_carbs_g       Float
+  per_serving_fat_g         Float
+  sourced_calories_note     String?
+  status                    String // 'current' | 'retired'
+  published_at              DateTime?
+  retired_at                DateTime?
+  recipes                   recipes              @relation("recipe_versions_recipe", fields: [recipe_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  current_of_recipes        recipes[]            @relation("recipes_current_version")
+  member_current_of_recipes recipes[]            @relation("recipes_current_version_membership")
+  recipe_ingredients        recipe_ingredients[]
+  meal_plan_meals           meal_plan_meals[]    @relation("meal_plan_meals_recipe_version")
+  previous_meal_plan_meals  meal_plan_meals[]    @relation("meal_plan_meals_previous_recipe_version")
+  meal_entries              meal_entries[]
 
   @@unique([recipe_id, version])
+  // Candidate key: the referenced side of the recipes (current_version_id, id)
+  // membership guard, which is what makes a current-version pointer into
+  // another recipe's version structurally impossible. id is already unique, so
+  // no row is newly restricted.
+  @@unique([id, recipe_id])
 }
 
 // Ingredient quantities plus a SNAPSHOT of the catalog row taken at
@@ -667,46 +708,46 @@ model recipe_ingredients {
 // values as they stood at confirmation, which is how the canonical read tells a
 // confirmed target from one a legacy PUT /user/targets changed afterwards.
 model meal_plan_preferences {
-  id                       String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id                  String    @unique
-  time_zone                String? // IANA name from the device, refreshed on every step save
-  setup_status             String // 'not_started' | 'in_progress' | 'ready_for_review' | 'completed'
-  setup_step               String? // 'goal' | 'body' | 'activity' | 'diet' | 'dislikes' | 'schedule' | 'cooking' | 'review' | 'targets_manual'
-  review_start_date        DateTime? @db.Date
-  target_route             String? // 'estimated' | 'manual'
-  goal                     String? // 'lose' | 'maintain' | 'gain'
-  goal_weight_kg           Float?
-  pace_lb_per_week         Float? // 0.5 | 1 | 1.5
-  age                      Int?
-  height_cm                Float?
-  weight_kg                Float?
-  weight_source            String?
-  sex_for_estimate         String? // 'female' | 'male' | 'prefer_not_to_say' — the last one takes the manual-target route
-  height_unit_pref         String? // 'ft_in' | 'cm'
-  weight_unit_pref         String? // 'lb' | 'kg'
-  activity_level           String? // 'not_very_active' | 'lightly_active' | 'active' | 'very_active'
-  diet                     String? // 'none' | 'vegetarian' | 'vegan' | 'pescatarian'
-  allergens                String[]  @default([]) // 'none' is mutually exclusive with the nine named allergens
+  id                     String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id                String    @unique
+  time_zone              String? // IANA name from the device, refreshed on every step save
+  setup_status           String // 'not_started' | 'in_progress' | 'ready_for_review' | 'completed'
+  setup_step             String? // 'goal' | 'body' | 'activity' | 'diet' | 'dislikes' | 'schedule' | 'cooking' | 'review' | 'targets_manual'
+  review_start_date      DateTime? @db.Date
+  target_route           String? // 'estimated' | 'manual'
+  goal                   String? // 'lose' | 'maintain' | 'gain'
+  goal_weight_kg         Float?
+  pace_lb_per_week       Float? // 0.5 | 1 | 1.5
+  age                    Int?
+  height_cm              Float?
+  weight_kg              Float?
+  weight_source          String?
+  sex_for_estimate       String? // 'female' | 'male' | 'prefer_not_to_say' — the last one takes the manual-target route
+  height_unit_pref       String? // 'ft_in' | 'cm'
+  weight_unit_pref       String? // 'lb' | 'kg'
+  activity_level         String? // 'not_very_active' | 'lightly_active' | 'active' | 'very_active'
+  diet                   String? // 'none' | 'vegetarian' | 'vegan' | 'pescatarian'
+  allergens              String[]  @default([]) // 'none' is mutually exclusive with the nine named allergens
   // catalog_foods ids held as a plain uuid[]: Postgres cannot foreign-key an
   // array, so membership is validated in preferences.logic.ts instead.
-  disliked_food_ids        String[]  @default([]) @db.Uuid
-  disliked_food_groups     String[]  @default([])
-  meal_schedule            String? // 'three' | 'three_plus_snack'
-  meal_times               Json? // one {slot, time} entry per slot of the chosen schedule, in wire order
-  cooking_time_limit_min   Int? // 15 | 30 | 45 | 60, total prep + cook per meal
-  budget_amount            Int? // whole units of budget_currency
-  budget_currency          String? // 'USD' only in this version
-  no_budget_preference     Boolean   @default(false)
-  budget_tier              Int?      @db.SmallInt
-  target_source            String? // 'estimated' | 'manual'
-  targets_revision         Int       @default(0)
-  confirmed_targets        Json?
+  disliked_food_ids      String[]  @default([]) @db.Uuid
+  disliked_food_groups   String[]  @default([])
+  meal_schedule          String? // 'three' | 'three_plus_snack'
+  meal_times             Json? // one {slot, time} entry per slot of the chosen schedule, in wire order
+  cooking_time_limit_min Int? // 15 | 30 | 45 | 60, total prep + cook per meal
+  budget_amount          Int? // whole units of budget_currency
+  budget_currency        String? // 'USD' only in this version
+  no_budget_preference   Boolean   @default(false)
+  budget_tier            Int?      @db.SmallInt
+  target_source          String? // 'estimated' | 'manual'
+  targets_revision       Int       @default(0)
+  confirmed_targets      Json?
   // The `revision` whose goal/body/activity/pace produced the confirmed
   // estimate (AAP 0.5.1). Written only by targets.service.ts, which records the
   // same number the request's estimateRevision pinned; null for manual targets,
   // which have no calculated ancestry.
-  targets_input_revision   Int?
-  estimated_targets        Json?
+  targets_input_revision Int?
+  estimated_targets      Json?
   // THE SINGLE INPUT-ANCESTRY COUNTER. `revision` advances on every preference
   // save - diet, allergens, dislikes, schedule, budget, review date, unit
   // preferences, time zone included - and does two jobs: a client pins it to
@@ -716,32 +757,24 @@ model meal_plan_preferences {
   // "confirmed against revision N" and "derived from revision N" the same
   // statement, and it is the revision GET /meal-planning/targets/estimate
   // echoes as estimateRevision.
-  revision                 Int       @default(0)
-  // A WRITE-SIDE DIAGNOSTIC ONLY, and NOT the basis of TargetsResponse.stale -
-  // see `revision` above, which is. This counter advances only when one of the
-  // seven answers the energy equation actually reads changes value (goal,
-  // pace_lb_per_week, age, height_cm, weight_kg, sex_for_estimate,
-  // activity_level - never goal_weight_kg, which the equation never reads), so
-  // it records when a user's calculable details last moved, which is a
-  // different question from whether a confirmed figure still matches the
-  // answers on file. Written by preferences.service.ts through the pure rule
-  // targets.logic.ts::estimateInputsChanged and read by no query:
-  // TargetsPreferencesRow does not carry it, so the staleness comparison cannot
-  // reach it. It is retained rather than dropped because preferences.service.ts
-  // still maintains it and the migration's recorded checksum is what the test
-  // harness verifies the database against; removing both together is a
-  // follow-up in that service, not a change this column can carry alone.
-  estimate_inputs_revision Int       @default(0)
-  users                    users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  revision               Int       @default(0)
+  users                  users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 }
 
 // One published week per user. status and revision drive the write-safety
-// model: every mutation takes the per-user advisory lock, requires status =
-// 'active', and compares the expected revision before writing. The partial
-// unique on (user_id, start_date) WHERE status = 'active' — the backstop that
-// makes two overlapping active plans impossible — is appended in the migration
-// SQL. targets_snapshot is what this plan was generated against, which is how a
-// later target change is reported as stale instead of silently regenerating.
+// model, and that model is enforced IN THE SERVICE, not by this schema: every
+// mutating path runs inside the per-user advisory lock that
+// mealPlanningAction.service.ts takes, and the rules it applies there are pure
+// — mealPlan.logic.ts's requireWritablePlan (status and end date) and
+// requireNonConflictingWeek (the date-INTERVAL overlap and the single-upcoming
+// rule), plus the expected-revision comparison. What the database contributes
+// is narrower and exact: the partial unique on (user_id, start_date) WHERE
+// status = 'active', appended in the migration SQL, rejects a second active
+// plan STARTING ON THE SAME DATE for one user — a backstop against a lost lock,
+// not a guarantee against two active plans whose weeks overlap from different
+// start dates, which only that service check prevents. targets_snapshot is what
+// this plan was generated against, which is how a later target change is
+// reported as stale instead of silently regenerating.
 model meal_plans {
   id                       String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   user_id                  String
@@ -801,16 +834,27 @@ model meal_plan_days {
   @@unique([meal_plan_id, date])
   // Referenced side of meal_plan_meals' (meal_plan_day_id, user_id) guard.
   @@unique([id, user_id])
+  // Referenced side of meal_plan_meals' (meal_plan_day_id, meal_plan_id,
+  // user_id) parent reference: it is what correlates a meal's day with the meal's
+  // own plan, so a meal cannot name a day of plan A while claiming plan B. id is
+  // already unique, so this adds no new restriction on the rows — only the key
+  // that guard needs.
+  @@unique([id, meal_plan_id, user_id])
   // Leading index for the users cascade: without it, deleting a user scans this
   // table once per row it owns elsewhere.
   @@index([user_id])
 }
 
 // One planned slot. meal_plan_id and user_id are denormalized so the composite
-// {id, user_id, meal_plan_id} write predicate needs no join and can never match
-// a meal whose plan has been superseded. previous_recipe_version_id is an audit
-// value only — the card's logged-then-swapped treatment is derived from the
-// linked meal_entries, so any number of successive swaps stays representable.
+// {id, user_id, meal_plan_id} write predicate needs no join to reject a meal of
+// another user or of another plan; whether that plan is still ACTIVE is a
+// service-side check — mealPlan.logic.ts's requireWritablePlan, applied by
+// mealPlan.service.ts, swap.service.ts and plannedMealLog.service.ts inside the
+// per-user advisory lock, which answers 409 plan_not_active — and no constraint
+// here prevents a write to a superseded plan's meal.
+// previous_recipe_version_id is an audit value only — the card's
+// logged-then-swapped treatment is derived from the linked meal_entries, so any
+// number of successive swaps stays representable.
 model meal_plan_meals {
   id                         String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   meal_plan_day_id           String              @db.Uuid
@@ -832,11 +876,15 @@ model meal_plan_meals {
   flags                      Json                @default("[]")
   previous_recipe_version_id String?             @db.Uuid
   swapped_at                 DateTime?
-  // Both parent references are tenant-preserving: (meal_plan_day_id, user_id)
-  // and (meal_plan_id, user_id) must each name a row of the SAME user, so the
-  // {id, user_id, meal_plan_id} write predicate the planning services use can
-  // never match a meal whose day or plan belongs to someone else.
-  meal_plan_days             meal_plan_days      @relation(fields: [meal_plan_day_id, user_id], references: [id, user_id], onDelete: Cascade, onUpdate: NoAction)
+  // Both parent references are tenant-preserving, and the day reference is
+  // PLAN-preserving as well: (meal_plan_day_id, meal_plan_id, user_id) must name
+  // a day that belongs to this meal's own plan and user, and (meal_plan_id,
+  // user_id) a plan of the same user. Correlating the day with meal_plan_id
+  // rather than with user_id alone is what stops a meal naming a day of plan A
+  // while claiming plan B for the same user — the hierarchy the
+  // {id, user_id, meal_plan_id} write predicate assumes. All three columns are
+  // NOT NULL, so MATCH SIMPLE never leaves this pair unchecked.
+  meal_plan_days             meal_plan_days      @relation(fields: [meal_plan_day_id, meal_plan_id, user_id], references: [id, meal_plan_id, user_id], onDelete: Cascade, onUpdate: NoAction)
   meal_plans                 meal_plans          @relation(fields: [meal_plan_id, user_id], references: [id, user_id], onDelete: Cascade, onUpdate: NoAction)
   users                      users               @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
   recipe_versions            recipe_versions     @relation("meal_plan_meals_recipe_version", fields: [recipe_version_id], references: [id], onDelete: Restrict, onUpdate: NoAction)
@@ -845,11 +893,17 @@ model meal_plan_meals {
   tenant_meal_entries        meal_entries[]      @relation("meal_entries_planned_meal_tenant")
   meal_plan_actions          meal_plan_actions[] @relation("meal_plan_actions_planned_meal")
   tenant_meal_plan_actions   meal_plan_actions[] @relation("meal_plan_actions_planned_meal_tenant")
+  member_meal_plan_actions   meal_plan_actions[] @relation("meal_plan_actions_planned_meal_membership")
 
   @@unique([meal_plan_day_id, slot])
   // Referenced side of the (meal_plan_meal_id, user_id) guards on meal_entries
   // and meal_plan_actions.
   @@unique([id, user_id])
+  // Referenced side of meal_plan_actions' (meal_plan_meal_id, meal_plan_id,
+  // user_id) guard: an idempotency-ledger row that records both a plan and a
+  // planned meal must record a meal OF THAT PLAN. id is already unique, so this
+  // adds no new restriction on the rows.
+  @@unique([id, meal_plan_id, user_id])
   // Plan-wide reads — affected meals, plan summary, flag recomputation — select
   // every meal of a plan for its owner; the day/slot unique key cannot serve
   // them. Also the referencing side of the plan tenant key above.
@@ -941,6 +995,23 @@ model meal_plan_actions {
   tenant_meal_plans      meal_plans?      @relation("meal_plan_actions_plan_tenant", fields: [meal_plan_id, user_id], references: [id, user_id], onDelete: NoAction, onUpdate: NoAction)
   tenant_meal_plan_meals meal_plan_meals? @relation("meal_plan_actions_planned_meal_tenant", fields: [meal_plan_meal_id, user_id], references: [id, user_id], onDelete: NoAction, onUpdate: NoAction)
   tenant_meal_entries    meal_entries?    @relation("meal_plan_actions_entry_tenant", fields: [meal_entry_id, user_id], references: [id, user_id], onDelete: NoAction, onUpdate: NoAction)
+  // MEMBERSHIP GUARD, on top of the tenant guards above: when a row records BOTH
+  // a plan and a planned meal — a swap or a log — the two must belong together,
+  // (meal_plan_meal_id, meal_plan_id, user_id) naming a meal of that very plan.
+  // Tenant-scoping each link on its own leaves a hole this closes: both could
+  // name rows of the right user and still describe a meal of one plan against
+  // another plan's id, which is a ledger row that misdescribes its own write.
+  // It does NOT replace the two-column guards above, because MATCH SIMPLE skips
+  // any key containing a NULL and the three cover three different rows. Both
+  // links set — a swap or a log — is the only case this guard is checked at all.
+  // A generate or regenerate row sets the plan and leaves meal_plan_meal_id
+  // NULL, which skips this guard AND the (meal_plan_meal_id, user_id) one, so it
+  // is the (meal_plan_id, user_id) guard that holds it to its owner. A row that
+  // sets only the meal skips this guard and the plan one, so there the
+  // (meal_plan_meal_id, user_id) guard is the owner check. SET NULL on the
+  // single-column links stays intact for the same reason it does there: NO ACTION
+  // is checked at end of statement, after SET NULL has cleared the link.
+  member_meal_plan_meals meal_plan_meals? @relation("meal_plan_actions_planned_meal_membership", fields: [meal_plan_meal_id, meal_plan_id, user_id], references: [id, meal_plan_id, user_id], onDelete: NoAction, onUpdate: NoAction)
 
   @@unique([user_id, idempotency_key])
   @@index([meal_plan_id])

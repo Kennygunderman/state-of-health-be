@@ -1230,35 +1230,62 @@ export const eligibleRecipeCountForSlot = (
  * ------------------------------------------------------------------------- */
 
 /**
- * Whether placing this recipe would break the week's repetition rule: at most
- * {@link MAX_RECIPE_USES_PER_WEEK} appearances, and never within a day of
- * another appearance.
+ * The "nothing to exclude" set, shared rather than allocated per call.
+ *
+ * Declared here rather than beside the search because it is both
+ * {@link violatesRepetitionRule}'s default fourth argument and day 0's
+ * non-existent previous day inside {@link searchPlanWeek}. Typed
+ * `ReadonlySet` so a holder cannot add to the set everyone shares.
+ */
+const EMPTY_RECIPE_IDS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Whether placing this recipe would break the week's repetition rule.
+ *
+ * THE RULE IS §0.7.3'S TWO CLAUSES AND NOTHING ELSE: a recipe may appear at
+ * most {@link MAX_RECIPE_USES_PER_WEEK} times in the week, and never on
+ * consecutive days. Both uses may therefore fall on the SAME day, in two
+ * different slots — a lunch and a dinner that both declare a dish are two
+ * distinct meals, and the plan permits the dish in both.
+ *
+ * A third, unwritten clause used to sit here, refusing a recipe already placed
+ * today on the reading that "never on consecutive days" means "at least one
+ * clear day between appearances". It was removed because it can refuse a week
+ * §0.7.3 allows: two different slots can share a recipe, so a tight pool can
+ * need one dish twice on one day while EVERY slot holds plenty of recipes. The
+ * argument that used to justify the clause — "needing one recipe twice in one
+ * day means a slot has fewer than two recipes" — was simply wrong for that
+ * reason, and the price of it was a feasible week answered with
+ * `422 no_matching_meals`.
  *
  * A HARD eligibility test for the slot, deliberately NOT a soft score penalty.
  * A penalty would let a sufficiently attractive recipe appear five times, and
  * the whole point is that it cannot.
  *
- * "Never on consecutive days" is spacing, so it is read as "at least one clear
- * day between appearances" — which also rules out twice on the SAME day, zero
- * days apart. The alternative reading, allowing a recipe at breakfast and again
- * at dinner while forbidding it the next day, is strictly worse for the user
- * and cannot make a week feasible that this reading refuses: needing one recipe
- * twice in one day means a slot has fewer than two recipes, which is already a
- * coverage failure.
+ * `additionalExcludedRecipeIds` is an OPTIONAL exclusion set the CALLER chooses,
+ * on top of the rule — it is not part of §0.7.3 and defaults to empty, so a
+ * caller that says nothing gets exactly the two clauses above. Its one caller is
+ * `swap.logic.ts`, which passes the other meals of the same day so the
+ * alternatives sheet never offers a dish the user is already eating that day.
+ * That narrowing is right THERE and wrong here: the swap list is eight rows with
+ * a drawn "no alternatives" state, so a shorter list is a supported outcome,
+ * whereas a refusal by the generator is a whole week the user cannot have.
+ * `searchPlanWeek` therefore leaves it absent, on purpose.
  *
- * Every argument looks BACKWARDS — uses so far, yesterday's recipes, today's
- * placements. That is what lets the depth-first search trust its completed
- * days: no later placement can retroactively invalidate an earlier one.
+ * Every argument looks BACKWARDS — uses so far, the adjacent day's recipes, and
+ * whatever extra the caller excludes. That is what lets the depth-first search
+ * trust its completed days: no later placement can retroactively invalidate an
+ * earlier one.
  */
 export const violatesRepetitionRule = (
     recipeId: string,
     usesSoFar: number,
-    previousDayRecipeIds: ReadonlySet<string>,
-    currentDayRecipeIds: ReadonlySet<string>,
+    adjacentDayRecipeIds: ReadonlySet<string>,
+    additionalExcludedRecipeIds: ReadonlySet<string> = EMPTY_RECIPE_IDS,
 ): boolean =>
     usesSoFar >= MAX_RECIPE_USES_PER_WEEK ||
-    previousDayRecipeIds.has(recipeId) ||
-    currentDayRecipeIds.has(recipeId);
+    adjacentDayRecipeIds.has(recipeId) ||
+    additionalExcludedRecipeIds.has(recipeId);
 
 /* ---------------------------------------------------------------------------
  * Scoring — move ORDER, never acceptance
@@ -1579,20 +1606,22 @@ export const sameMacroTotals = (left: MealPlanMacroTotals, right: MealPlanMacroT
  * The search — depth-first, best-first move order, first feasible, bounded
  * ------------------------------------------------------------------------- */
 
-const EMPTY_RECIPE_IDS: ReadonlySet<string> = new Set<string>();
-
 /**
  * The two evaluation budgets a run may be held to.
  *
- * Present as a parameter for ONE reason: under the shipped policy the per-plan
- * cap is exactly {@link PLAN_DAY_COUNT} × the per-day cap, so a week that trips
- * one guard would trip the other at the same moment and no fixture could tell
- * them apart. Supplying the caps separately makes each guard independently
- * observable, which is what lets a test prove the per-plan counter spans day
- * boundaries and the per-day counter accumulates across backtracking
- * re-entries. Production never passes it — the shipped policy is
- * {@link MAX_EVALUATIONS_PER_DAY} and {@link MAX_EVALUATIONS_PER_PLAN}, and
- * both {@link generateWeeklyPlan} and the analysis probes leave this absent.
+ * Present as a parameter for two reasons. The first is observability: under the
+ * shipped policy the per-plan cap is exactly {@link PLAN_DAY_COUNT} × the
+ * per-day cap, so a week that trips one guard would trip the other at the same
+ * moment and no fixture could tell them apart — supplying the caps separately
+ * is what lets a test prove the per-plan counter spans day boundaries and the
+ * per-day counter accumulates across backtracking re-entries.
+ *
+ * The second is the request-wide bound. {@link generateWeeklyPlan}'s own search
+ * leaves this absent and gets the shipped policy, but
+ * {@link analyzeLimitingConstraints}' probes run AFTER that search and must fit
+ * inside what §0.7.3 allows one plan request in total, so each probe passes the
+ * pool's remainder here. Without it four probes would each start a fresh
+ * {@link MAX_EVALUATIONS_PER_PLAN}.
  */
 export interface PlanSearchBudget {
     perDay?: number;
@@ -1745,6 +1774,11 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
     );
 
     const placed: PlannedMealAssignment[][] = dates.map(() => []);
+    // Reference counts beside the per-day sets, for the same reason the
+    // ingredient bookkeeping below has them: §0.7.3 permits a recipe in two
+    // slots of ONE day, so a day's membership is a count and not a flag. The
+    // set is what the next day reads as its adjacent-day exclusion.
+    const dayRecipeCounts: Map<string, number>[] = dates.map(() => new Map<string, number>());
     const dayRecipeIds: Set<string>[] = dates.map(() => new Set<string>());
     const usesByRecipeId = new Map<string, number>();
     // Reference counts beside the set: an ingredient stays "on the list" while
@@ -1781,6 +1815,34 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
         }
     };
 
+    /**
+     * Records one more occurrence of a recipe on a day.
+     *
+     * THE INVARIANT: `dayRecipeIds[dayIndex]` holds a recipe exactly while
+     * `dayRecipeCounts[dayIndex]` counts at least one placement of it on that
+     * day. A plain set would break the moment §0.7.3's two same-day uses are
+     * both taken — unwinding one of them would withdraw the recipe from the
+     * day, and the NEXT day's adjacent-day exclusion would then silently stop
+     * enforcing "never on consecutive days" for a dish still sitting in the
+     * earlier day's other slot.
+     */
+    const addDayRecipe = (dayIndex: number, recipeId: string): void => {
+        dayRecipeCounts[dayIndex].set(recipeId, (dayRecipeCounts[dayIndex].get(recipeId) ?? 0) + 1);
+        dayRecipeIds[dayIndex].add(recipeId);
+    };
+
+    /** Withdraws one occurrence, and the set entry only at the last of them. */
+    const removeDayRecipe = (dayIndex: number, recipeId: string): void => {
+        const remaining = (dayRecipeCounts[dayIndex].get(recipeId) ?? 1) - 1;
+
+        if (remaining <= 0) {
+            dayRecipeCounts[dayIndex].delete(recipeId);
+            dayRecipeIds[dayIndex].delete(recipeId);
+        } else {
+            dayRecipeCounts[dayIndex].set(recipeId, remaining);
+        }
+    };
+
     const place = (dayIndex: number, slot: SlotSchedule, candidate: PlanCandidate): void => {
         const recipeId = candidate.recipe.recipe_id;
 
@@ -1795,10 +1857,7 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
             portionMultiplier: candidate.portionMultiplier,
             planned: { ...candidate.nutrition },
         });
-        // A plain set is safe because `violatesRepetitionRule` forbids the same
-        // recipe twice in one day, so this add and the delete below are never
-        // unbalanced by a second placement of the same recipe.
-        dayRecipeIds[dayIndex].add(recipeId);
+        addDayRecipe(dayIndex, recipeId);
         usesByRecipeId.set(recipeId, (usesByRecipeId.get(recipeId) ?? 0) + 1);
         addFoods(candidate);
     };
@@ -1807,7 +1866,7 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
         const recipeId = candidate.recipe.recipe_id;
 
         placed[dayIndex].pop();
-        dayRecipeIds[dayIndex].delete(recipeId);
+        removeDayRecipe(dayIndex, recipeId);
 
         const remaining = (usesByRecipeId.get(recipeId) ?? 1) - 1;
         if (remaining <= 0) {
@@ -1825,20 +1884,19 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
         cumulative: MealPlanMacroTotals,
     ): ScoredCandidate[] => {
         const previousDayRecipeIds = dayIndex > 0 ? dayRecipeIds[dayIndex - 1] : EMPTY_RECIPE_IDS;
-        const currentDayRecipeIds = dayRecipeIds[dayIndex];
         const pool = candidatesBySlot.get(slot.slot) ?? [];
         const moves: ScoredCandidate[] = [];
 
         for (const candidate of pool) {
             const recipeId = candidate.recipe.recipe_id;
 
+            // Three arguments, not four: the generator holds the week to
+            // §0.7.3's two clauses and adds no same-day exclusion of its own,
+            // because a refusal here costs the user the whole week rather than
+            // a row of a list. The optional fourth argument belongs to
+            // `swap.logic.ts` — see {@link violatesRepetitionRule}.
             if (
-                violatesRepetitionRule(
-                    recipeId,
-                    usesByRecipeId.get(recipeId) ?? 0,
-                    previousDayRecipeIds,
-                    currentDayRecipeIds,
-                )
+                violatesRepetitionRule(recipeId, usesByRecipeId.get(recipeId) ?? 0, previousDayRecipeIds)
             ) {
                 continue;
             }
@@ -1998,10 +2056,89 @@ export interface LimitingConstraintInput {
      * without it reaches exactly the verdict it always did. Supplied, it adds
      * the one fact the catalog counts cannot express: the search ran out of
      * evaluations, so the numbers ARE implicated even where a slot is thin
-     * (§0.7.3).
+     * (§0.7.3) — and its `evaluations` is what the primary search already spent,
+     * which is what {@link LimitingConstraintInput.probeEvaluationBudget}
+     * subtracts from the request's allowance by default.
      */
     diagnostics?: PlanSearchDiagnostics;
+    /**
+     * How many candidate evaluations ALL the probes together may spend.
+     *
+     * Absent — the production case — means
+     * `MAX_EVALUATIONS_PER_PLAN − (diagnostics?.evaluations ?? 0)`, floored at
+     * zero: §0.7.3 bounds one plan request at {@link MAX_EVALUATIONS_PER_PLAN}
+     * evaluations, the failed primary search has already spent
+     * `diagnostics.evaluations` of them, and what is left is all the diagnosis
+     * may spend. Deriving it here rather than at the call site is deliberate —
+     * the bound must hold whether or not a caller remembers it.
+     *
+     * A caller may state the pool explicitly, which is how a test pins the
+     * skip-and-report behaviour without constructing a 14,000-evaluation search
+     * first. Zero is a legal value and means "no probe runs"; a negative or
+     * fractional pool is a programming fault and throws
+     * {@link MealPlanInputError}.
+     */
+    probeEvaluationBudget?: number;
 }
+
+/**
+ * How the diagnosis's probe pool ended, which is a fact about the VERDICT and
+ * not about the week.
+ *
+ *  - `complete` — every probe the verdict needed ran to completion.
+ *  - `aborted` — a probe hit the injected deadline. That probe established
+ *    nothing, and no later probe ran, because the deadline has already fired.
+ *  - `budget_exhausted` — the request's evaluation allowance (§0.7.3) was spent
+ *    before a probe the verdict would have run, so that probe was skipped.
+ *
+ * The last two mean the same thing to a reader of the rows: a relaxation row
+ * that is ABSENT may be absent because nothing tested it. A row is a claim that
+ * needs a witness, so an untested relaxation is reported as no row rather than
+ * as a negative claim — and this value is how a caller can tell the difference.
+ */
+export type LimitingConstraintProbeOutcome = 'complete' | 'aborted' | 'budget_exhausted';
+
+/** The verdict, plus what establishing it cost and how it ended. */
+export interface LimitingConstraintVerdict {
+    /** The rows, most-limiting first. Never empty. */
+    constraints: LimitingConstraint[];
+    /**
+     * What the probes spent, in candidate evaluations — never more than
+     * {@link LimitingConstraintInput.probeEvaluationBudget}, which is how a
+     * caller can check §0.7.3's per-request bound rather than trust it.
+     */
+    probeEvaluations: number;
+    /** Whether anything went untested, and why. */
+    probeOutcome: LimitingConstraintProbeOutcome;
+}
+
+/**
+ * Reads the probes' shared evaluation pool, or derives it from what the primary
+ * search already spent.
+ *
+ * Zero is accepted where {@link resolveEvaluationBudget} refuses it, and the
+ * difference is the point: a per-search cap of zero would report every week as
+ * exhausted before the first placement, whereas a pool of zero is a legitimate
+ * state of the world — the primary search spent the request's whole allowance —
+ * and the caller's answer to it is to run no probe at all.
+ */
+const resolveProbeEvaluationPool = (input: LimitingConstraintInput): number => {
+    const supplied = input.probeEvaluationBudget;
+
+    if (supplied === undefined) {
+        return Math.max(0, MAX_EVALUATIONS_PER_PLAN - (input.diagnostics?.evaluations ?? 0));
+    }
+
+    if (!Number.isInteger(supplied) || supplied < 0) {
+        throw new MealPlanInputError(
+            'probeEvaluationBudget must be a non-negative integer number of evaluations, received ' +
+                String(supplied),
+            'probeEvaluationBudget',
+        );
+    }
+
+    return supplied;
+};
 
 /** The next cooking-time tier above a limit, or null when there is no higher tier. */
 export const nextCookingTimeTier = (limit: number | null): number | null => {
@@ -2096,8 +2233,31 @@ const dislikeSelectionCount = (preferences: PlanGenerationPreferences): number =
  * The list is never empty. A search that failed for no reason this function can
  * name still gets the `nutrition_tolerance` row, because "no meals match" with
  * nothing to act on is not an answer.
+ *
+ * ONE EVALUATION POOL FOR THE WHOLE REQUEST. Each relaxation above is tested by
+ * a real search, and there can be four of them, so probes run against a single
+ * remaining-evaluation pool — {@link LimitingConstraintInput.probeEvaluationBudget},
+ * by default whatever §0.7.3's per-plan bound has left after the primary search
+ * — debited by each probe as it spends. Without it one 422 could run five full
+ * searches and spend five times the bound the AAP states for a plan.
+ *
+ * The pool makes later probes CHEAPER, never differently ordered: the probes run
+ * in the order written above whatever the pool holds, each still sees the
+ * baseline ranks and the baseline admitted sets, and the same inputs still reach
+ * the same verdict — a pool derived from the inputs is itself an input. The
+ * honest consequence is that with the pool spent a relaxation row may be
+ * OMITTED, and that is the correct trade: a row is a claim that needs a witness,
+ * and a probe that never ran has none. {@link LimitingConstraintVerdict.probeOutcome}
+ * is what says so out loud.
+ *
+ * An ABORTED probe is INCONCLUSIVE, never evidence. A probe cut off by the
+ * deadline has established nothing about its relaxation, so it emits no row and
+ * no further probe runs — the deadline has fired, and a second probe would only
+ * spend the remaining pool discovering that again.
  */
-export const analyzeLimitingConstraints = (input: LimitingConstraintInput): LimitingConstraint[] => {
+export const analyzeLimitingConstraints = (
+    input: LimitingConstraintInput,
+): LimitingConstraintVerdict => {
     const { seedInputs, preferences, targets, recipes, shouldAbort, diagnostics } = input;
 
     const seed = derivePlanSeed(seedInputs);
@@ -2127,11 +2287,42 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
         ]),
     );
 
-    /** The week a counterfactual admits, or null when it admits none. */
+    // The request's one evaluation pool, and what became of it. Every probe
+    // below draws from `remainingEvaluations` and debits it; `probeEvaluations`
+    // is the total drawn, which is what makes the §0.7.3 bound checkable by a
+    // caller instead of a promise in a comment.
+    let remainingEvaluations = resolveProbeEvaluationPool(input);
+    let probeEvaluations = 0;
+    let probeOutcome: LimitingConstraintProbeOutcome = 'complete';
+
+    /**
+     * Runs one counterfactual search, or declines to.
+     *
+     * Returns the search's whole outcome so nothing about it can be silently
+     * dropped — the `aborted` flag in particular, whose loss is what let a
+     * deadline expiry read as "this relaxation does not open the week". `null`
+     * means the probe did NOT establish anything and the caller must treat its
+     * relaxation as untested: the pool was empty, the deadline had already
+     * fired, or this probe itself was cut off.
+     *
+     * The per-day cap is the smaller of the policy constant and what the pool
+     * holds, because a day may not spend more than the request has left; both
+     * are positive here, since a pool at zero returns before the search.
+     */
     const probeWeek = (
         probePreferences: PlanGenerationPreferences,
         portionPolicy: PortionPolicy,
-    ): PlannedMealAssignment[][] | null => {
+    ): PlanSearchOutcome | null => {
+        if (probeOutcome === 'aborted') {
+            return null;
+        }
+
+        if (remainingEvaluations <= 0) {
+            probeOutcome = 'budget_exhausted';
+
+            return null;
+        }
+
         const probeSlots = resolveSlotSchedule(
             probePreferences.meal_schedule,
             probePreferences.meal_times,
@@ -2144,7 +2335,7 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
             baselineRanks,
         );
 
-        return searchPlanWeek({
+        const outcome = searchPlanWeek({
             dates,
             slots: probeSlots,
             candidatesBySlot: groupCandidatesBySlot(
@@ -2156,7 +2347,22 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
             targets,
             userBudgetTier,
             shouldAbort,
-        }).days;
+            budget: {
+                perPlan: remainingEvaluations,
+                perDay: Math.min(MAX_EVALUATIONS_PER_DAY, remainingEvaluations),
+            },
+        });
+
+        probeEvaluations += outcome.evaluations;
+        remainingEvaluations = Math.max(0, remainingEvaluations - outcome.evaluations);
+
+        if (outcome.aborted) {
+            probeOutcome = 'aborted';
+
+            return null;
+        }
+
+        return outcome;
     };
 
     /**
@@ -2185,11 +2391,21 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
             }),
         );
 
-    /** One relaxed preference, reported only when its week needed the relaxation. */
+    /**
+     * One relaxed preference, reported only when its week needed the relaxation.
+     *
+     * False covers three different facts, and that is sound in exactly one
+     * direction: the probe ran and found no week, the probe ran and found one it
+     * could have built without the relaxation, or the probe never ran at all.
+     * All three mean "no row", because a row asserts that THIS preference is
+     * what stands between the user and a plan, and none of the three
+     * establishes that. Which of them it was travels on
+     * {@link LimitingConstraintVerdict.probeOutcome}.
+     */
     const relaxationOpensTheWeek = (probePreferences: PlanGenerationPreferences): boolean => {
-        const week = probeWeek(probePreferences, DEFAULT_PORTION_POLICY);
+        const outcome = probeWeek(probePreferences, DEFAULT_PORTION_POLICY);
 
-        return week !== null && placesNewlyAdmittedMeal(week);
+        return outcome?.days != null && placesNewlyAdmittedMeal(outcome.days);
     };
 
     const emptySlots: MealSlot[] = [];
@@ -2303,7 +2519,7 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
     // Likewise only meaningful once every slot has recipes: with a slot at zero,
     // no portion of anything closes the week.
     if (emptySlots.length === 0) {
-        const widerWeek = probeWeek(preferences, EXTENDED_PORTION_POLICY);
+        const widerWeek = probeWeek(preferences, EXTENDED_PORTION_POLICY)?.days ?? null;
 
         // TWO witnesses, and the multiplier one is written out rather than
         // inferred from the identity set, because it is the row's actual claim:
@@ -2340,8 +2556,13 @@ export const analyzeLimitingConstraints = (input: LimitingConstraintInput): Limi
     // fallback is kept anyway because the promise it protects belongs to the
     // response and not to this function: a 422 must always hand the user
     // something to act on, and a future branch added above must not be able to
-    // return an unexplained one.
-    return constraints.length > 0 ? constraints : [nutritionToleranceRow];
+    // return an unexplained one. It holds whatever became of the probe pool: an
+    // aborted or exhausted analysis still answers with a row.
+    return {
+        constraints: constraints.length > 0 ? constraints : [nutritionToleranceRow],
+        probeEvaluations,
+        probeOutcome,
+    };
 };
 
 /* ---------------------------------------------------------------------------
@@ -2373,13 +2594,18 @@ export interface GeneratePlanRequest {
  *
  * Throws exactly two things, and the difference matters to the user:
  *  - {@link PlanGenerationError} when the injected deadline fired — the search
- *    did not finish, so nothing is known about feasibility;
+ *    did not finish, so nothing is known about feasibility. THIS COVERS THE
+ *    DEADLINE FIRING DURING THE LIMITING-CONSTRAINT ANALYSIS TOO, not only
+ *    during the primary search: the probes run on the same clock and a
+ *    part-finished analysis cannot name which constraint is limiting, so it is
+ *    the same 502 rather than a 422 built from whatever was measured first;
  *  - {@link NoMatchingMealsError} when it finished and no week exists, carrying
  *    the constraints to act on. An exhausted evaluation budget is THIS case, not
- *    the first: the search completed within the bounds it was given and the
- *    honest report is that these preferences do not admit a week. The error also
- *    carries the search's own diagnostics — which guard ran out, and the day it
- *    could not close — for the logs, never for the response body.
+ *    the first — including a diagnostic pool that ran dry, which skips the
+ *    remaining probes by design: the search completed within the bounds it was
+ *    given and the honest report is that these preferences do not admit a week.
+ *    The error also carries the search's own diagnostics — which guard ran out,
+ *    and the day it could not close — for the logs, never for the response body.
  *
  * {@link MealPlanInputError} escapes for input that could not be planned from at
  * all (a non-positive target, a malformed date, a slot with no saved time).
@@ -2428,20 +2654,52 @@ export const generateWeeklyPlan = (request: GeneratePlanRequest): GeneratedPlan 
             evaluations: outcome.evaluations,
         };
 
-        throw new NoMatchingMealsError(
-            analyzeLimitingConstraints({
-                seedInputs,
-                preferences,
-                targets,
-                recipes,
-                shouldAbort,
-                diagnostics,
-            }),
-            {
-                ...diagnostics,
-                frontierDate: addDaysToDayKey(seedInputs.startDate, diagnostics.frontierDayIndex),
-            },
-        );
+        // `diagnostics` is what bounds the probes — it carries the evaluations
+        // the search above just spent, and the analysis subtracts them from
+        // §0.7.3's per-plan allowance before running any probe.
+        const verdict = analyzeLimitingConstraints({
+            seedInputs,
+            preferences,
+            targets,
+            recipes,
+            shouldAbort,
+            diagnostics,
+        });
+
+        // THE DEADLINE IS A 502 WHEREVER IT FIRES, INCLUDING IN HERE.
+        //
+        // The primary search's own abort is handled above, but the deadline can
+        // just as easily first expire inside a diagnostic probe: the probes run
+        // after the search, on the same clock, and each one is a full week
+        // search of its own. This module's header states the rule that decides
+        // it — only an aborted search is a 5xx, and an exhausted evaluation
+        // budget is not — so an abort discovered here is the SAME event as an
+        // abort discovered above and gets the same answer.
+        //
+        // Reporting it as `no_matching_meals` instead would be the one dishonest
+        // outcome available: the probes are what establish WHICH constraint is
+        // limiting, so an abort part-way through them means the analysis never
+        // finished, and 10c would name whichever constraints happened to be
+        // measured before the clock ran out as though they were the whole story.
+        // "We couldn't finish your plan" is the truthful screen for that.
+        //
+        // `budget_exhausted` deliberately does NOT come here. That is the pool
+        // running dry, not the clock — the search completed within the bounds it
+        // was given, the remaining probes were skipped by design, and §0.7.3
+        // makes exhaustion the 422. The two outcomes are separate values for
+        // exactly this decision.
+        if (verdict.probeOutcome === 'aborted') {
+            throw new PlanGenerationError();
+        }
+
+        // `.constraints` only: the 422 body is `{limitingConstraints,
+        // allergiesKept}` (§0.5.2) and the error's diagnostics are the search's
+        // own, so the verdict's probe accounting stays on this side of the
+        // boundary.
+        throw new NoMatchingMealsError(verdict.constraints, {
+            ...diagnostics,
+            frontierDate: addDaysToDayKey(seedInputs.startDate, diagnostics.frontierDayIndex),
+        });
     }
 
     const searchedDays = outcome.days;

@@ -7,7 +7,8 @@
  *   1. `assertTestDatabase` — IDENTITY. May this run destroy this database?
  *   2. `assertSchemaFreshness` — SHAPE. Is this database the schema the code
  *      expects? See that section's own header for why identity alone is not
- *      enough, and `npm run check:test-db` for the command form.
+ *      enough, and `runSchemaFreshnessCommand` at the foot of this file for the
+ *      command form.
  *
  * Everything about the shape of this module serves one property: the guard must
  * run BEFORE anything can reach a database. That is why there is no
@@ -1291,9 +1292,16 @@ export interface CommandOutput {
 }
 
 /**
- * The command form, which `npm run check:test-db` runs and `pretest` runs
- * before Jest starts. It exists so `npm test` against a stale database says one
- * thing once, instead of saying nothing and letting every suite fail.
+ * The command form: the standalone diagnostic an operator runs to ask both
+ * questions without running the suite, invoked directly rather than through a
+ * package script, so nothing is attached to the `npm test` lifecycle:
+ *
+ *   npx ts-node --project tsconfig.test.json src/__tests__/setup/testDb.ts
+ *
+ * It answers "is this database ready for the suite" in one message. The suite
+ * itself does not depend on it — `jestSetup.ts` runs both gates as a
+ * `setupFiles` entry, before any application module loads — so this is a way to
+ * ask early, not a second owner of pre-test safety.
  *
  * Exit codes: 1 for a refusal (either gate), 0 for verified and 0 for a skip —
  * a skip is printed as a warning and carries the command that would fix it.
@@ -1361,8 +1369,9 @@ export const runSchemaFreshnessCommand = async (
 // so importing this module never starts the command.
 if (require.main === module) {
     void runSchemaFreshnessCommand().then((code) => {
-        // `exitCode` rather than `exit`: stdout is a pipe under npm, and exiting
-        // outright can truncate the one message this command exists to print.
+        // `exitCode` rather than `exit`: stdout is a pipe whenever the caller
+        // redirects or captures it, and exiting outright can truncate the one
+        // message this command exists to print.
         process.exitCode = code;
     });
 }

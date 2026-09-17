@@ -111,12 +111,13 @@ export type CatalogRunKind = 'usda_import' | 'ai_generation' | 'validation' | 'r
 export type CatalogRunStatus = 'running' | 'succeeded' | 'failed';
 
 // Every stage that contends for the catalog graph, which is the four run kinds
-// plus the read-only export. `release` is not a CatalogRunKind — that union is
-// the set of stages that OPEN a resumable run through this module, and
-// catalog-release.ts writes its audit row directly (see the note on
-// CatalogRunKind) — but it is a stage for locking purposes, because it reads the
-// whole published graph and must not read one a mutator is rewriting.
-export type CatalogStageName = CatalogRunKind | 'release';
+// plus the two read-only ones. Neither `release` nor `benchmark` is a
+// CatalogRunKind — that union is the set of stages that OPEN a resumable run
+// through this module, and catalog-release.ts writes its audit row directly
+// (see the note on CatalogRunKind) while scripts/search-benchmark.ts opens no
+// run row at all — but both are stages for locking purposes, because each reads
+// the whole published graph and must not read one a mutator is rewriting.
+export type CatalogStageName = CatalogRunKind | 'release' | 'benchmark';
 
 export type CatalogStageLockMode = 'exclusive' | 'shared';
 
@@ -131,18 +132,27 @@ export type CatalogStageLockMode = 'exclusive' | 'shared';
 //                      that is this table's contract, not a future intention;
 //   * validation     — re-judges rows and moves publication_status;
 //   * release_load   — reconciles a release into the graph and retires rows.
-// One stage only READS it and takes the lock SHARED:
+// Two stages only READ it and take the lock SHARED:
 //   * release        — exports the published graph to a versioned release. Shared
 //                      rather than exclusive because two exports of one database
 //                      are harmless, while an export concurrent with ANY mutator
 //                      would freeze a graph that is still moving — the exact
 //                      defect this table exists to prevent.
+//   * benchmark      — measures search against the published graph and writes the
+//                      acceptance-evidence report (scripts/search-benchmark.ts).
+//                      Shared for the same reason as `release`: it only reads, so
+//                      two benchmark runs against one database are harmless,
+//                      while a run concurrent with any mutator would produce one
+//                      report whose queries spanned two committed catalog states
+//                      — measurements of a corpus that never existed as a whole,
+//                      which is not evidence of anything.
 export const CATALOG_STAGE_LOCK_MODES: Readonly<Record<CatalogStageName, CatalogStageLockMode>> = {
     usda_import: 'exclusive',
     ai_generation: 'exclusive',
     validation: 'exclusive',
     release_load: 'exclusive',
     release: 'shared',
+    benchmark: 'shared',
 };
 
 // ONE LOCK NAME FOR THE WHOLE GRAPH, not one per stage.
@@ -380,6 +390,7 @@ export type CheckpointErrorCode =
     | 'run_not_found'
     | 'run_not_open'
     | 'run_already_finished'
+    | 'run_resume_not_requested'
     | 'catalog_stage_locked'
     | 'catalog_stage_lock_unavailable';
 
@@ -414,6 +425,20 @@ const checkpointErrorMessage = (
         return storedStatus
             ? `Catalog run ${runId} is already ${storedStatus}`
             : `Catalog run ${runId} is already finished`;
+    }
+    if (code === 'run_resume_not_requested') {
+        // Says what was found, what will happen to it, and what the operator
+        // types. The last part matters because the alternative an operator
+        // reaches for — "start a fresh run instead" — is not available: runs are
+        // keyed by (kind, manifestVersion) precisely so a repeat recognises
+        // completed work, so an unfinished run under that key is either resumed
+        // or left alone.
+        return (
+            `Catalog run ${runId} is unfinished (${storedStatus ?? RUN_STATUS_RUNNING}) and this stage was not asked ` +
+            'to resume it. Re-run with --resume to continue it from its stored cursor. A second run for the same ' +
+            'key cannot be opened alongside it: the runs are keyed so that a repeat recognises work already done, ' +
+            'and its checkpoint is what makes continuing cheap.'
+        );
     }
     if (code === 'catalog_stage_locked') {
         // Names the stage, the mode it asked for and how long it waited, because
@@ -1385,6 +1410,29 @@ export const openOrResumeRun = async <TCursor>(
         initialCursor?: TCursor;
         logger?: ScriptLogger;
         now?: () => Date;
+        /**
+         * Whether continuing an unfinished run under this key is permitted.
+         *
+         * Optional, and an absent value permits it — which is this function's
+         * long-standing behaviour and what the three callers that do not expose
+         * a `--resume` flag (generation, validation, release load) rely on.
+         *
+         * `false` is the opt-out a caller that DOES expose the flag passes when
+         * the operator did not use it. Without this parameter the flag could
+         * not mean anything: `catalog-import-usda.ts` parsed `--resume`, and an
+         * unfinished run was continued either way, so its usage line ("Default:
+         * off") described behaviour no code implemented. Refusing is the only
+         * coherent reading of "not asked to resume" — see THE CLAIM: runs are
+         * keyed by (kind, manifestVersion) so that a repeat recognises completed
+         * work, so a second run row for the same key is not a thing this module
+         * can create, and silently continuing is what the flag was meant to make
+         * explicit.
+         *
+         * A run that already SUCCEEDED is unaffected: recognising it and doing
+         * no work is not a resume, and it is what makes a repeat import
+         * incapable of creating duplicates.
+         */
+        resume?: boolean;
     },
 ): Promise<CatalogRunClaim<TCursor>> => {
     // Injected and defaulted like appendRunLog's, so the retry entry's timestamp
@@ -1401,6 +1449,9 @@ export const openOrResumeRun = async <TCursor>(
         });
 
         if (resumable) {
+            if (input.resume === false) {
+                throw new CheckpointError('run_resume_not_requested', resumable.id, RUN_STATUS_RUNNING);
+            }
             return { run: resumable, resumed: true, alreadyCompleted: false };
         }
 
@@ -1418,6 +1469,17 @@ export const openOrResumeRun = async <TCursor>(
             // Any terminal status other than 'succeeded' is a failed attempt, and
             // retryFailedRun refuses anything it does not recognise rather than
             // reopening it blindly.
+            //
+            // A failed run is unfinished work too — its cursor is the whole
+            // reason retrying it is cheap — so `resume: false` refuses it on the
+            // same terms as a running one rather than reopening it silently.
+            if (input.resume === false) {
+                throw new CheckpointError(
+                    'run_resume_not_requested',
+                    latest.id,
+                    (latest.status as CatalogRunStatus) ?? RUN_STATUS_FAILED,
+                );
+            }
             const retried = await retryFailedRun<TCursor>(tx, latest.id, now());
             return { run: retried, resumed: true, alreadyCompleted: false };
         }
@@ -1603,6 +1665,77 @@ export const recordCounts = async (
     // model-call totals through this same function while a stage records its own
     // progress, and an operator can run two stages against one run's row.
     return inRunTransaction(db, (tx) => mergeCountsIntoRun(tx, runId, delta));
+};
+
+const writeCheckpointToRun = async <TCursor>(
+    db: CatalogRunDb,
+    runId: string,
+    cursor: TCursor,
+    delta: Record<string, number>,
+): Promise<Readonly<Record<string, number>>> => {
+    // ONE locking read, ONE write. That is the whole point of this function: the
+    // cursor and the counts for the work it names move together or not at all.
+    const locked = await lockRunForUpdate(db, runId);
+
+    if (!locked) {
+        throw new CheckpointError('run_not_found', runId);
+    }
+    if (locked.status !== RUN_STATUS_RUNNING) {
+        throw new CheckpointError('run_not_open', runId);
+    }
+
+    const counts = mergeCounts(locked.counts, delta);
+
+    const result = await db.catalog_import_runs.updateMany({
+        where: { id: runId, status: RUN_STATUS_RUNNING },
+        data: { cursor: cursor as Prisma.InputJsonValue, counts },
+    });
+
+    // Unreachable while the row lock is held; kept as the guarantee itself
+    // rather than as a comment (see closeRunOnce).
+    if (result.count === 0) {
+        throw new CheckpointError('run_not_open', runId);
+    }
+
+    return counts;
+};
+
+/**
+ * Advances the cursor and adds this unit of work's counts in ONE statement
+ * under ONE row lock — and, when handed a transaction, inside the caller's.
+ *
+ * WHY THIS EXISTS BESIDE `saveCursor` AND `recordCounts`. Those two are each
+ * their own transaction, so a stage that called both recorded the work and the
+ * place it had reached as two separate commits. Between them a crash leaves the
+ * run saying it processed N items while its cursor names the item before them:
+ * a resume then redoes work the counts already claim, and the counts are wrong
+ * for the rest of the run's life. That is not a lost update the row lock can
+ * prevent — each write is individually correct — it is two facts about one unit
+ * of work that were never atomic.
+ *
+ * Worse, neither of them can join the CALLER's transaction usefully on its own:
+ * a stage whose real work is a batch of catalog rows wants the rows, the cursor
+ * and the counts to commit together, so that a rolled-back batch leaves a run
+ * ledger that never mentioned it. `inRunTransaction` runs in place when handed
+ * a `tx` (see the note above it), so passing the batch's transaction client
+ * here is what makes the three one commit.
+ *
+ * `saveCursor` and `recordCounts` are unchanged and still exported: a caller
+ * with only one of the two to write — the budget ledger mirroring model-call
+ * totals, a release load recording verified files — should not have to invent
+ * the other, and an empty `counts` here is a legitimate cursor-only checkpoint.
+ *
+ * Returns the merged counts, as `recordCounts` does, so a caller can log what
+ * the run now says without reading the row again.
+ */
+export const saveCheckpoint = async <TCursor>(
+    db: CatalogRunDb,
+    runId: string,
+    input: { readonly cursor: TCursor; readonly counts?: Record<string, number> },
+): Promise<Readonly<Record<string, number>>> => {
+    assertWellFormedRunId(runId);
+
+    return inRunTransaction(db, (tx) => writeCheckpointToRun(tx, runId, input.cursor, input.counts ?? {}));
 };
 
 const appendLogToRun = async (

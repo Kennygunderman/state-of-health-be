@@ -284,11 +284,25 @@ export type KeyedActionCompletion<TAction extends KeyedActionType = KeyedActionT
  * whose three completion columns are all filled — a half-completed row is
  * reported, never answered — so there is no case in which a keyed response
  * exists without the revision it is required to carry.
+ *
+ * `replayed` IS THE ONE THING THE CALLER CAN LEARN THAT THE CLIENT CANNOT. It
+ * says which of the two routes above answered, and it exists for the server
+ * event the HTTP edge emits: without it an operator reading the log cannot tell
+ * a committed write from the retry that replayed it, which is the difference
+ * between "this user generated a plan twice" and "this user's first response
+ * was lost". It is deliberately NOT part of any response — no handler puts it
+ * in a body, a header or a status — because a client that could see it would be
+ * able to distinguish a replay from the original answer, and §0.5.1 requires
+ * exactly the opposite ("a client can never distinguish a replay from the
+ * original response"). The two construction sites below are the only places it
+ * is set, and they are the same two points at which the body's route diverges,
+ * so the flag cannot drift from the thing it describes.
  */
 export interface KeyedActionResult {
     readonly status: number;
     readonly body: unknown;
     readonly planRevisionAfter: number;
+    readonly replayed: boolean;
 }
 
 /* ---------------------------------------------------------------------------
@@ -552,7 +566,14 @@ const replayReservedAction = async (
         );
     }
 
-    return { status: stored.status, body: stored.body, planRevisionAfter: stored.planRevisionAfter };
+    return {
+        status: stored.status,
+        body: stored.body,
+        planRevisionAfter: stored.planRevisionAfter,
+        // The only path that reads `response_snapshot` back, so the only path
+        // that can be a replay.
+        replayed: true,
+    };
 };
 
 /* ---------------------------------------------------------------------------
@@ -746,6 +767,9 @@ export const runKeyedAction = async <TAction extends KeyedActionType>(
             status: response.responseStatus,
             body: response.responseSnapshot,
             planRevisionAfter: response.planRevisionAfter,
+            // This transaction ran `work` and completed the reserved row, so
+            // this is the commit itself and never a retry of one.
+            replayed: false,
         };
     });
 
@@ -842,7 +866,11 @@ class KeyedActionPreflightRollback extends Error {
  *
  * The transaction is two statements long — the advisory lock and the
  * reservation attempt — so the serialisation it costs the user is negligible
- * beside the work that follows it.
+ * beside the work that follows it. BOTH OF THEM ARE UNDONE BEFORE THIS RETURNS
+ * `null`: the lock is released and the attempted reservation vanishes at the
+ * rollback, which is what lets a caller that runs later work — a five-second
+ * search, or `mealPlan.service.ts::raiseInjectedGenerationFault` — still say
+ * truthfully that no lock is held and no ledger row exists at that point.
  */
 export const replayCommittedKeyedAction = async (
     params: KeyedActionParams,

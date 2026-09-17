@@ -768,8 +768,13 @@ The rules, in the order they apply:
 2. A repeated key whose **request fingerprint matches** replays the stored first
    response — its **status and body, verbatim**. The status is persisted with the
    response, never inferred at replay time, and there is deliberately no "this
-   was a replay" flag, so a client cannot distinguish a replay from the original
-   and does not need to.
+   was a replay" flag in the response, so a client cannot distinguish a replay
+   from the original and does not need to. The distinction IS recorded
+   server-side: the `keyed_write_answered` event (and, on the abort seam,
+   `response_aborted_after_commit`) carries a `replayed` field, because an
+   operator reading two identical `201`s under one key otherwise cannot tell a
+   duplicate the ledger absorbed from a single commit whose first response was
+   lost. It is a log field only and never reaches a body, a header or a status.
 3. A repeated key with a **different** body is `409 idempotency_conflict`. That
    is a genuinely different write wearing a used key, never a retry.
 
@@ -943,7 +948,7 @@ differing from the confirmed snapshot, and
 
 **The ordering consequence: the backend must ship before the client.** Every
 change above is additive for an old client but required by the new one — a client
-that expects `mealPlanMealId`, `meal_planning` input methods or the catalog body
+that expects `mealPlanMealId`, `meal_plan` input methods or the catalog body
 against an older backend has no contract to talk to.
 
 ## Error-code index
@@ -984,19 +989,22 @@ All twenty-one meal-planning error classes, each with exactly one status:
 | `catalog_food_not_found` | `404` | `POST /api/macros/meal/:mealId/entries` (catalog body) | `CatalogFoodNotFoundError` |
 | `feature_disabled` | `503` | the sixteen gated routes | `MealPlanningDisabledError` |
 
-Four more outcomes have no error class, by design:
+Four more outcomes are absent from `mealPlanning.errors.ts`, by design. Three of
+them are produced without any error class; the fourth has one, in the diary
+domain:
 
-| Code | Status | Routes | Why no class |
+| Code | Status | Routes | Why it is not in `mealPlanning.errors.ts` |
 | --- | --- | --- | --- |
-| `invalid_request` | `400` | every route with a parser | Field validation returns a verdict rather than throwing, which is what keeps the parsers testable without exceptions. |
-| `invalid_payload` | `400` | `POST /api/macros/meal/:mealId/entries` | Same — a body matching neither shape is a parser verdict. |
-| `invalid_serving` | `400` | `POST /api/macros/meal/:mealId/entries` (catalog body) | Raised by `InvalidServingError` in `nutrition.logic.ts`, which belongs to the diary domain rather than to meal planning. |
+| `invalid_request` | `400` | every route with a parser | No class: field validation returns a verdict rather than throwing, which is what keeps the parsers testable without exceptions. The `read_only_field` variant in the table above is the one thrown case. |
+| `invalid_payload` | `400` | `POST /api/macros/meal/:mealId/entries` | No class, same reason — a body matching neither shape is a parser verdict. |
+| `invalid_serving` | `400` | `POST /api/macros/meal/:mealId/entries` (catalog body) | Has a class, but not this file's: `InvalidServingError` is declared in `nutrition.logic.ts` beside the catalog writer that raises it and mapped to this status by `nutrition.controller.ts`, because a failure belongs to the module that raises it — the same boundary that keeps `EstimateFailedError` in `estimate.service.ts`. |
 | `Recipe not found` | `404` | `GET /recipes/:recipeVersionId` | The service returns `null` and the controller maps it, so "no such version" and "not visible to you" cannot diverge. |
 
-Two of those four bodies carry a human string rather than a machine code
-(`Plan not found`, `Recipe not found`), matching the existing diary routes'
-`Meal not found` and `Entry not found`. New client code should branch on the
-status for these, not on the string.
+Two bodies across the two tables above carry a human string rather than a
+machine code (`Plan not found` from the class table, `Recipe not found` from the
+table just above), matching the existing diary routes' `Meal not found` and
+`Entry not found`. New client code should branch on the status for these, not on
+the string.
 
 The four codes the client already maps from shipped endpoints, included so the
 whole vocabulary is visible in one place — none of them is a meal-planning route:
@@ -1013,9 +1021,18 @@ here so their absence from the per-endpoint lists is not read as an omission.
 `401` is the shared auth middleware's answer for a missing or invalid bearer
 token, ahead of every handler. **`500` is each controller's residual
 unmapped-exception fallback** — it is not a contract code, and no client should
-branch on it. Internal data-integrity classes (`MealPlanDataError`,
+branch on it. On the meal-planning controller that fallback now answers one
+stable body, `{"error": "internal_error"}`, for every route it serves, rather
+than a per-handler sentence: the route that failed is recorded in the server
+event instead, where a description is useful and where it is not something a
+client can come to depend on. It is still not a contract code — `internal_error`
+means "the server faulted", carries nothing to act on, and a client that
+branches on it is branching on a bug. The other controllers (`catalog`,
+`nutrition`, `workout`, and the rest of the shipped diary surface) keep their
+existing prose fallbacks unchanged.
+
+Internal data-integrity classes (`MealPlanDataError`,
 `SwapDataError`, `GroceryDataError`, `PlannedMealLogWriteError`,
 `RecipeMappingError`) are deliberately kept out of the vocabulary and land
 there: they mean a stored row contradicts an invariant, which is an operator
 problem to read in the logs rather than a condition a client can act on.
-

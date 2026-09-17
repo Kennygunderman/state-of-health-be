@@ -261,7 +261,6 @@ CREATE TABLE "meal_plan_preferences" (
     "targets_input_revision" INTEGER,
     "estimated_targets" JSONB,
     "revision" INTEGER NOT NULL DEFAULT 0,
-    "estimate_inputs_revision" INTEGER NOT NULL DEFAULT 0,
 
     CONSTRAINT "meal_plan_preferences_pkey" PRIMARY KEY ("id")
 );
@@ -372,6 +371,9 @@ CREATE INDEX "catalog_import_runs_kind_started_at_idx" ON "catalog_import_runs"(
 CREATE UNIQUE INDEX "catalog_generation_batches_batch_key_key" ON "catalog_generation_batches"("batch_key");
 
 -- CreateIndex
+CREATE INDEX "catalog_generation_batches_run_id_idx" ON "catalog_generation_batches"("run_id");
+
+-- CreateIndex
 CREATE INDEX "catalog_foods_publication_status_category_idx" ON "catalog_foods"("publication_status", "category");
 
 -- CreateIndex
@@ -405,6 +407,9 @@ CREATE UNIQUE INDEX "recipes_slug_key" ON "recipes"("slug");
 CREATE UNIQUE INDEX "recipe_versions_recipe_id_version_key" ON "recipe_versions"("recipe_id", "version");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "recipe_versions_id_recipe_id_key" ON "recipe_versions"("id", "recipe_id");
+
+-- CreateIndex
 CREATE INDEX "recipe_ingredients_recipe_version_id_idx" ON "recipe_ingredients"("recipe_version_id");
 
 -- CreateIndex
@@ -429,6 +434,9 @@ CREATE UNIQUE INDEX "meal_plan_days_meal_plan_id_date_key" ON "meal_plan_days"("
 CREATE UNIQUE INDEX "meal_plan_days_id_user_id_key" ON "meal_plan_days"("id", "user_id");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "meal_plan_days_id_meal_plan_id_user_id_key" ON "meal_plan_days"("id", "meal_plan_id", "user_id");
+
+-- CreateIndex
 CREATE INDEX "meal_plan_meals_meal_plan_id_user_id_idx" ON "meal_plan_meals"("meal_plan_id", "user_id");
 
 -- CreateIndex
@@ -445,6 +453,9 @@ CREATE UNIQUE INDEX "meal_plan_meals_meal_plan_day_id_slot_key" ON "meal_plan_me
 
 -- CreateIndex
 CREATE UNIQUE INDEX "meal_plan_meals_id_user_id_key" ON "meal_plan_meals"("id", "user_id");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "meal_plan_meals_id_meal_plan_id_user_id_key" ON "meal_plan_meals"("id", "meal_plan_id", "user_id");
 
 -- CreateIndex
 CREATE INDEX "grocery_items_user_id_idx" ON "grocery_items"("user_id");
@@ -473,8 +484,10 @@ CREATE UNIQUE INDEX "meal_entries_id_user_id_key" ON "meal_entries"("id", "user_
 -- CreateIndex
 -- Hand-written from here to the foreign keys: constructs the Prisma datamodel
 -- cannot express. `prisma migrate diff` is blind to expression and partial
--- indexes, so docs/meal-planning/expected-schema-diff.sql reads them back out of
--- the database instead and the CI schema-evidence gate compares them.
+-- indexes, so docs/meal-planning/schema-catalog-evidence.sql reads them back out
+-- of the database instead and the CI schema-evidence gate compares them;
+-- docs/meal-planning/expected-schema-diff.sql is the captured migrate-diff
+-- output itself, which is what covers the generated column.
 CREATE INDEX "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("search_vector");
 
 -- CreateIndex
@@ -547,6 +560,9 @@ ALTER TABLE "catalog_validation_records" ADD CONSTRAINT "catalog_validation_reco
 ALTER TABLE "recipes" ADD CONSTRAINT "recipes_current_version_id_fkey" FOREIGN KEY ("current_version_id") REFERENCES "recipe_versions"("id") ON DELETE SET NULL ON UPDATE NO ACTION;
 
 -- AddForeignKey
+ALTER TABLE "recipes" ADD CONSTRAINT "recipes_current_version_id_id_fkey" FOREIGN KEY ("current_version_id", "id") REFERENCES "recipe_versions"("id", "recipe_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+
+-- AddForeignKey
 ALTER TABLE "recipe_versions" ADD CONSTRAINT "recipe_versions_recipe_id_fkey" FOREIGN KEY ("recipe_id") REFERENCES "recipes"("id") ON DELETE CASCADE ON UPDATE NO ACTION;
 
 -- AddForeignKey
@@ -574,7 +590,7 @@ ALTER TABLE "meal_plan_days" ADD CONSTRAINT "meal_plan_days_meal_plan_id_user_id
 ALTER TABLE "meal_plan_days" ADD CONSTRAINT "meal_plan_days_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE NO ACTION;
 
 -- AddForeignKey
-ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_day_id_user_id_fkey" FOREIGN KEY ("meal_plan_day_id", "user_id") REFERENCES "meal_plan_days"("id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
+ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_day_id_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_day_id", "meal_plan_id", "user_id") REFERENCES "meal_plan_days"("id", "meal_plan_id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
 
 -- AddForeignKey
 ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_id", "user_id") REFERENCES "meal_plans"("id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
@@ -614,6 +630,9 @@ ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_plan_id_u
 
 -- AddForeignKey
 ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_plan_meal_id_user_id_fkey" FOREIGN KEY ("meal_plan_meal_id", "user_id") REFERENCES "meal_plan_meals"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+
+-- AddForeignKey
+ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_plan_meal_id_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_meal_id", "meal_plan_id", "user_id") REFERENCES "meal_plan_meals"("id", "meal_plan_id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
 
 -- AddForeignKey
 ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_entry_id_user_id_fkey" FOREIGN KEY ("meal_entry_id", "user_id") REFERENCES "meal_entries"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;

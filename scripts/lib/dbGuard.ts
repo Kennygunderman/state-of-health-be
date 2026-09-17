@@ -11,10 +11,15 @@
 // per-row guarantee, so this module reinstates it one level up, per process: an
 // unowned write can only ever land in a database the rules below recognise, and
 // the two scripts that could populate a shared environment — `catalog-load` and
-// `recipes-seed` — proceed against a non-development database only when a human
-// has typed that database's name after `--confirm-target`. `seed-dev` is the one
-// script here that writes user-scoped rows, which is exactly what §5.1 protects,
-// so it gets no confirmation door at all.
+// `recipes-seed` — proceed without a human typing that database's name after
+// `--confirm-target` only when the database's own NAME says development (a
+// `_dev` suffix, with or without a clone index, on a local host). A local
+// database that is development by its HOST ALONE — every deployment database a
+// release can reach, because it is reachable only over loopback from the
+// deployment host — has a name that says nothing about it, so both writers
+// demand the typed name there too (see evaluateScriptDatabase). `seed-dev` is
+// the one script here that writes user-scoped rows, which is exactly what §5.1
+// protects, so it gets no confirmation door at all.
 //
 // Nothing in this file opens a connection or reads a credential. It imports only
 // ./logger (deliberately not Prisma — the whole point is to be safe to load
@@ -28,8 +33,28 @@ import type { ScriptLogger } from './logger';
 
 export type DatabaseOriginClass = 'development' | 'test' | 'shadow' | 'unknown';
 
+/**
+ * WHICH HALF of a recognised class's rule matched — the database's own name, or
+ * the host on its own. Every recognised class is host-gated, so `'name'` always
+ * means "this name, on a local host"; `'host'` is reachable only through the
+ * DEVELOPMENT_HOSTS arm at the end of classifyDatabaseOrigin, where the name
+ * matched no rule at all.
+ */
+export type DatabaseOriginMatch = 'name' | 'host';
+
 export interface DatabaseOrigin {
     originClass: DatabaseOriginClass;
+    /**
+     * Which half of the matched rule certified this origin, on a recognised
+     * class; absent on `unknown`, where no rule matched.
+     *
+     * OPTIONAL by design, so a caller composing a `DatabaseOrigin`-shaped
+     * literal to drive evaluateScriptDatabase keeps compiling. That optionality
+     * is the one place the policy could be weakened by omission, so the
+     * `development_or_confirmed` branch treats an absent value as `'host'` —
+     * the stricter reading, which demands the typed database name.
+     */
+    match?: DatabaseOriginMatch;
     /**
      * `''` whenever the URL does not fix the host — missing, unparsable, naming
      * no authority, or overridden by a connection parameter in its query
@@ -109,9 +134,9 @@ export const CI_DATABASE_NAME = 'ci';
 // The clone-index tail, and the reason the name rules are patterns rather than
 // `endsWith` calls. An agent clone is provisioned with one database triple of
 // its own — `soh_dev_<index>`, `soh_test_<index>`, `soh_shadow_<index>`, all on
-// the same local host — so on such a machine the mandated test and shadow names
-// carry a numeric index AFTER the suffix and `endsWith(TEST_DATABASE_SUFFIX)` is
-// false for both. Left unrecognised they fell through to the host rule at the
+// the same local host — so on such a machine every mandated name carries a
+// numeric index AFTER the suffix and `endsWith(TEST_DATABASE_SUFFIX)` is false
+// for all three. Left unrecognised they fell through to the host rule at the
 // end of classifyDatabaseOrigin and classified `development`, the weakest
 // class: `catalog-load`/`recipes-seed` stopped demanding `--confirm-target`
 // before writing catalog data into the clone's TEST database, `seed-dev` became
@@ -120,13 +145,13 @@ export const CI_DATABASE_NAME = 'ci';
 // name the operator was told to use.
 //
 // The index is OPTIONAL, which is what makes this additive: every bare Agent
-// Action Plan §0.4.4 name (`soh_test`, `soh_shadow`) still matches, and matches
-// through the same rule and the same reason as before.
+// Action Plan §0.4.4 name (`soh_dev`, `soh_test`, `soh_shadow`) still matches,
+// and matches through the same rule and the same reason as before.
 //
-// Both patterns are BUILT FROM the exported suffix constants instead of being
-// re-typed as regex literals, so renaming a constant can never leave the rule
-// and the constant it is named after disagreeing. Interpolating them is safe:
-// each is an underscore followed by lower-case letters, with no
+// All three patterns are BUILT FROM the exported suffix constants instead of
+// being re-typed as regex literals, so renaming a constant can never leave the
+// rule and the constant it is named after disagreeing. Interpolating them is
+// safe: each is an underscore followed by lower-case letters, with no
 // regular-expression metacharacter, so each contributes only literal
 // characters to the pattern.
 //
@@ -135,10 +160,10 @@ export const CI_DATABASE_NAME = 'ci';
 // form; rejecting the padded spelling would reinstate exactly the `development`
 // fall-through these rules close.
 //
-// Neither pattern carries the `g` or `y` flag. They are module-level constants
-// shared by every call, and those flags make `RegExp.prototype.test` advance
-// `lastIndex`, which would let one input classify differently on alternate
-// calls — a guard that is right every other time is not a guard.
+// None of the three carries the `g` or `y` flag. They are module-level
+// constants shared by every call, and those flags make `RegExp.prototype.test`
+// advance `lastIndex`, which would let one input classify differently on
+// alternate calls — a guard that is right every other time is not a guard.
 //
 // CLONE_INDEX_TAIL_SOURCE is the tail ALONE, with no `$` folded into it, and the
 // anchor is written where each pattern is built. It is exported for the same
@@ -149,6 +174,9 @@ export const CI_DATABASE_NAME = 'ci';
 export const CLONE_INDEX_TAIL_SOURCE = '(?:_[0-9]+)?';
 export const TEST_DATABASE_NAME_PATTERN = new RegExp(`${TEST_DATABASE_SUFFIX}${CLONE_INDEX_TAIL_SOURCE}$`);
 export const SHADOW_DATABASE_NAME_PATTERN = new RegExp(`${SHADOW_DATABASE_SUFFIX}${CLONE_INDEX_TAIL_SOURCE}$`);
+export const DEVELOPMENT_DATABASE_NAME_PATTERN = new RegExp(
+    `${DEVELOPMENT_DATABASE_SUFFIX}${CLONE_INDEX_TAIL_SOURCE}$`,
+);
 
 // The database-name half of the test rule, with no host in it: a `_test`
 // suffix with or without a clone index, or CI's plainly named database.
@@ -174,17 +202,26 @@ export const isShadowDatabaseName = (database: string): boolean => SHADOW_DATABA
 // same reason as the two above: one definition, so a caller composing its own
 // check cannot derive a second one that disagrees.
 //
-// A plain suffix, deliberately NOT the clone-index pattern the test and shadow
-// names accept, and the asymmetry is a decision rather than an omission.
-// `development` is the one class with a second arm — the DEVELOPMENT_HOSTS host
-// rule at the end of classifyDatabaseOrigin — and a clone's `soh_dev_<index>`
-// is provisioned on 127.0.0.1, so it already classifies through that arm;
-// `test` and `shadow` have no host-only arm, which is why for them the indexed
-// pattern is the only path to their class. Widening this one would only ADD
-// acceptances that nothing provisions (`…@postgres/app_dev_7`), which is the
-// wrong direction for a guard.
+// The clone-index pattern, exactly like its test and shadow siblings, and the
+// symmetry is now load-bearing rather than tidy. This predicate used to be a
+// plain `endsWith(DEVELOPMENT_DATABASE_SUFFIX)`, on the reasoning that a
+// clone's `soh_dev_<index>` is provisioned on 127.0.0.1 and so reaches
+// `development` through the DEVELOPMENT_HOSTS arm at the end of
+// classifyDatabaseOrigin anyway. That reasoning stopped holding the moment the
+// two arms stopped being interchangeable: `evaluateScriptDatabase` now demands
+// `--confirm-target` for a `development_or_confirmed` script whenever the class
+// came from the host alone, because a deployment database reached over loopback
+// is indistinguishable from a development one on the host. An indexed
+// development database has to match HERE, by name, or an agent clone's own
+// `soh_dev_46` would start demanding a flag it never needed.
+//
+// The widening is acceptance-ADDING for this predicate — `…@postgres/app_dev_7`
+// is a name it did not accept before — and that is contained: the two
+// `…Origin` predicates below gate every name rule on LOCAL_HOSTS, and the only
+// thing a name rule buys over the host arm is freedom from the confirmation
+// flag on a local host. `soh_dev`, `soh_dev_46` and `soh_dev_046` all match.
 export const isDevelopmentDatabaseName = (database: string): boolean =>
-    database.endsWith(DEVELOPMENT_DATABASE_SUFFIX);
+    DEVELOPMENT_DATABASE_NAME_PATTERN.test(database);
 
 // Connection parameters that move the connection somewhere other than the
 // authority and path the URL displays. libpq reads `host`, `hostname`, `port`,
@@ -495,9 +532,11 @@ export const isShadowDatabaseOrigin = (target: DatabaseTarget): boolean =>
     isLocalDatabaseHost(target.host) && isShadowDatabaseName(target.database);
 
 // Local-host-gated like the two above, and this is the rule whose gate matters
-// most, because `development` is the most privileged class this module hands
-// out: it is the only one `catalog-load` and `recipes-seed` write to without
-// `--confirm-target`, and the only one `seed-dev` accepts at all. Ungated — the
+// most, because this predicate certifies the most privileged origin this module
+// hands out: the only one `catalog-load` and `recipes-seed` write to without
+// `--confirm-target` (the class's other arm, a development HOST with an
+// unrecognised name, does not buy that — see evaluateScriptDatabase), and part
+// of the only class `seed-dev` accepts at all. Ungated — the
 // literal reading of the Agent Action Plan §0.7.1 disjunction, "host in
 // {localhost, 127.0.0.1} OR name ending _dev" — a remote database called
 // `app_dev` reached that class on the strength of its name, so all three of
@@ -580,13 +619,13 @@ export const classifyDatabaseOrigin = (databaseUrl: string | undefined): Databas
     // soh_shadow on the same localhost (Agent Action Plan §0.4.4), so the host
     // establishes only "not production"; the database *name* is the only thing
     // that tells the three apart. If the host rule ran first, soh_test on
-    // localhost would classify `development`, `catalog-load` would stop demanding
-    // `--confirm-target`, and the §0.9.1 gate — which requires
-    // `catalog:load --release v1 --confirm-target soh_test` to succeed *while the
-    // same run without the flag is refused* — would pass vacuously, silently
-    // voiding the only automated proof that the confirmation door exists.
-    // `shadow` is its own class rather than a flavour of development because
-    // Prisma's `migrate diff` resets that database.
+    // localhost would classify `development` with `match: 'host'`, so
+    // `catalog:load --release v1 --confirm-target soh_test` would still be
+    // demanded — the §0.9.1 gate would survive — but every refusal, every
+    // accepted-run log line and `seed-dev`'s whole policy would report the
+    // clone's TEST database as a development one, and `seed-dev` would write
+    // user-scoped rows into it. `shadow` is its own class rather than a flavour
+    // of development because Prisma's `migrate diff` resets that database.
     //
     // All three name rules are local-host-gated — isTestDatabaseOrigin,
     // isShadowDatabaseOrigin and isDevelopmentDatabaseOrigin — so every
@@ -605,21 +644,23 @@ export const classifyDatabaseOrigin = (databaseUrl: string | undefined): Databas
         // on a local host" — which is simply untrue of it, and a reason is the
         // only account of the decision that reaches a log.
         const reason = TEST_DATABASE_NAME_PATTERN.test(database) ? REASON_TEST_SUFFIX : REASON_CI_NAME;
-        return { originClass: 'test', host, database, reason };
+        return { originClass: 'test', host, database, reason, match: 'name' };
     }
     if (isShadowDatabaseOrigin({ host, database })) {
-        return { originClass: 'shadow', host, database, reason: REASON_SHADOW_SUFFIX };
+        return { originClass: 'shadow', host, database, reason: REASON_SHADOW_SUFFIX, match: 'name' };
     }
-    // Still a plain `_dev` suffix rather than the clone-index pattern its two
-    // siblings use, because nothing needs the indexed form here: a clone's
-    // `soh_dev_<index>` is provisioned on 127.0.0.1 and reaches `development`
-    // through the host rule below, the other arm of the §0.7.1 disjunction. See
-    // isDevelopmentDatabaseName.
+    // `match: 'name'` here and `match: 'host'` below — the two arms of the
+    // §0.7.1 development disjunction, told apart because they are not equally
+    // informative. A `_dev` name (with or without a clone index) is a database
+    // somebody named for development; a bare local host is every database that
+    // happens to answer on loopback, deployment databases included. The policy
+    // in evaluateScriptDatabase turns on that distinction, which is why the
+    // field is set here rather than re-derived from `reason` by a caller.
     if (isDevelopmentDatabaseOrigin({ host, database })) {
-        return { originClass: 'development', host, database, reason: REASON_DEVELOPMENT_SUFFIX };
+        return { originClass: 'development', host, database, reason: REASON_DEVELOPMENT_SUFFIX, match: 'name' };
     }
     if (DEVELOPMENT_HOSTS.includes(host)) {
-        return { originClass: 'development', host, database, reason: REASON_DEVELOPMENT_HOST };
+        return { originClass: 'development', host, database, reason: REASON_DEVELOPMENT_HOST, match: 'host' };
     }
 
     return { originClass: 'unknown', host, database, reason: REASON_NO_RULE_MATCHED };
@@ -754,14 +795,45 @@ export const evaluateScriptDatabase = (input: {
         };
     }
 
-    if (policy === 'development_or_confirmed' && origin.originClass !== 'development') {
+    // The confirmation door, and the one thing it turns on: whether the
+    // database's own NAME said development. `origin.match === 'name'` is the
+    // whole test, and it is deliberately not `originClass === 'development'`:
+    // the host arm hands that class to every database answering on loopback,
+    // which is exactly how a deployment database is reached during a release
+    // (release-and-recovery.md step 4 — a remote host is `unknown` and refused
+    // above, so loopback is the only shape a release can use). Under the older
+    // reading this branch was skipped for such a database, and both writers
+    // wrote it with no confirmation demanded while accepting and ignoring
+    // `--confirm-target`, which is not what §0.7.1 states the guard is for:
+    // "no load or seed can run against a non-development one without a human
+    // typing its name".
+    //
+    // FAIL CLOSED on an absent `match`. The field is optional (see
+    // DatabaseOrigin), so a caller-built origin can omit it; omission is read
+    // as `'host'` — confirmation required — because the alternative would let
+    // the strictest case be waived by leaving a field out.
+    const developmentByName = origin.originClass === 'development' && origin.match === 'name';
+
+    if (policy === 'development_or_confirmed' && !developmentByName) {
         if (confirmTarget === null) {
             return {
                 allowed: false,
                 code: 'confirmation_required',
+                // Two messages under one code, because the two cases are not
+                // the same news. A `test`/`shadow` origin is a database the
+                // guard can name the class of; a host-arm `development` one is
+                // a database it knows nothing about beyond where it answers,
+                // and an operator who has just been told the origin is
+                // "development" needs to read why that is not enough here.
+                // Both keep the literal `--confirm-target <database>` remedy.
                 message:
-                    `${script} would write to the ${origin.originClass} ${target}: ` +
-                    `pass ${CONFIRM_TARGET_FLAG} ${origin.database} to confirm.`,
+                    origin.originClass === 'development'
+                        ? `${script} would write to ${target}, which is development by its host alone: its ` +
+                          'name matches no recognised rule, so nothing distinguishes it from a deployment ' +
+                          `database reached over loopback. Pass ${CONFIRM_TARGET_FLAG} ${origin.database} ` +
+                          'to confirm that is the database you mean.'
+                        : `${script} would write to the ${origin.originClass} ${target}: ` +
+                          `pass ${CONFIRM_TARGET_FLAG} ${origin.database} to confirm.`,
             };
         }
         if (confirmTarget !== origin.database) {

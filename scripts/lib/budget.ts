@@ -14,14 +14,36 @@
 // request-scoped and cannot express an unattended run, so the ledger moves to
 // the batch table while the ordering guarantee stays identical.
 //
-// THE CAP IS PER RUN, NOT PER CATEGORY AND NOT GLOBAL-ACROSS-RUNS.
-// CATALOG_MODEL_CALL_BUDGET is "the hard cap on OpenRouter calls — generation
-// and review calls share the one cap — for a single catalog:generate or
-// catalog:validate run" (Agent Action Plan §0.4.3). That is why every aggregate
-// below is scoped by `run_id` and why reserveModelCall takes `batchKey` from
-// its caller rather than deriving it: the two stages share a run's budget and
-// each owns its own key format. Re-scoping any query here to all runs, or to
-// one category, silently changes what the operator's number means.
+// THE CAP IS PER COVERAGE-PLAN SCOPE — ONE PARENT BUDGET THAT GENERATION AND
+// THE ADVISORY REVIEW BOTH DRAW ON. CATALOG_MODEL_CALL_BUDGET is "the hard cap
+// on OpenRouter calls — generation and review calls share the one cap"
+// (Agent Action Plan §0.4.3), and the startup gate the same plan requires is
+// "2 × Σ batches" (§0.7.1, §0.7.3): one generation call and one review call per
+// batch, counted against ONE number. The two calls are made by two stages under
+// two different run rows — catalog-generate-ai.ts opens an `ai_generation` run
+// and catalog-validate.ts's review runs under a `validation` run — so an
+// aggregate scoped by `run_id` alone would hand EACH stage the whole cap and the
+// pipeline could spend twice what the operator authorised, while the 2×
+// estimate it was gated on described one cap. Every cap decision below is
+// therefore scoped by the BUDGET SCOPE: the coverage-plan version both stages'
+// run keys begin with (see budgetScopeOf), restricted to the two run kinds that
+// can spend a model call. The cap is not per category and not global across
+// coverage plans: a new `coveragePlanVersion` is new work with a budget of its
+// own, which is the same boundary batchKeyFor draws for batch identity.
+//
+// PER-RUN FIGURES STILL EXIST, AND THEY ARE REPORTING, NOT ENFORCEMENT.
+// getReservedModelCalls and getModelCallTotals answer "what did THIS run
+// reserve/spend", which is what a run's report and its `catalog_import_runs`
+// mirror state; getScopeReservedModelCalls answers "what has the cap already
+// consumed", which is what a reservation is refused against. Swapping one for
+// the other silently changes what the operator's number means, in the direction
+// that lets a second stage spend an already-exhausted budget.
+//
+// `reserveModelCall` still takes `batchKey` from its caller rather than deriving
+// it, because each stage owns its own key format (catalog-validate.ts's review
+// keys are `review:<runId>:<sourceKey>`), and `run_id` remains in every WRITE
+// predicate: the scope decides whether one more call fits, the run decides whose
+// ledger row records it.
 //
 // WHY THERE IS NO `user_id` IN THESE PREDICATES. Rule §1.5/§5.1 makes every
 // Prisma `where` carry the owner key. catalog_generation_batches has no
@@ -65,8 +87,13 @@
 // `npx prisma generate` must therefore have run against the current
 // prisma/schema.prisma before this file typechecks.
 
-import { recordCounts, requireOpenRun } from './checkpoint';
-import type { CatalogRunDb } from './checkpoint';
+import {
+    VALIDATION_INPUT_SEPARATOR,
+    VALIDATION_SCOPE_SEPARATOR,
+    recordCounts,
+    requireOpenRun,
+} from './checkpoint';
+import type { CatalogRunDb, CatalogRunKind } from './checkpoint';
 import { describeMissingEnv } from './logger';
 import type { ScriptLogger } from './logger';
 // Type-only, and the only direct reference to the generated client anywhere in
@@ -83,6 +110,43 @@ export const DEFAULT_CATALOG_BATCH_SIZE = 25;
 
 const MODEL_CALL_BUDGET_ENV_VAR = 'CATALOG_MODEL_CALL_BUDGET';
 const BATCH_SIZE_ENV_VAR = 'CATALOG_BATCH_SIZE';
+
+/**
+ * The marker catalog-generate-ai.ts puts between the coverage-plan version and
+ * the hash of a narrowed run's restriction (`<version>+partial:<hash>`).
+ *
+ * It lives here rather than in that script because the budget scope is derived
+ * by cutting a run key at exactly this marker (see {@link budgetScopeOf}), and a
+ * separator defined in one file and parsed in another is a drift waiting to
+ * happen: change it there and the scope silently becomes the whole key, giving
+ * a narrowed run a budget of its own. `generationRunScope` imports it from here
+ * so the two cannot disagree. Validation's two markers are checkpoint.ts's
+ * VALIDATION_INPUT_SEPARATOR and VALIDATION_SCOPE_SEPARATOR, imported above for
+ * the same reason.
+ */
+export const GENERATION_PARTIAL_SCOPE_SEPARATOR = '+partial:';
+
+/**
+ * The run kinds that can spend a model call, and therefore the only rows the
+ * shared cap sums over: `ai_generation` (catalog-generate-ai.ts's generation
+ * call) and `validation` (catalog-validate.ts's advisory review call).
+ *
+ * `usda_import` and `release_load` are excluded because they make no model call
+ * and own no batch row — but excluding them is not merely tidy. A release load's
+ * `manifest_version` is a RELEASE version (`v1`), which can be the same string
+ * as a coverage-plan version, so a scope that did not name its kinds would
+ * fold unrelated runs into one budget the moment the two version strings
+ * coincided.
+ */
+export const BUDGET_SCOPE_RUN_KINDS: readonly CatalogRunKind[] = ['ai_generation', 'validation'];
+
+// Every marker that can follow the coverage-plan version in a run key, in no
+// particular order: the scope is the prefix before the EARLIEST of them.
+const BUDGET_SCOPE_SEPARATORS: readonly string[] = [
+    VALIDATION_INPUT_SEPARATOR,
+    GENERATION_PARTIAL_SCOPE_SEPARATOR,
+    VALIDATION_SCOPE_SEPARATOR,
+];
 
 // Zero-padded so batch keys sort lexicographically in a log, a report or an
 // `ORDER BY batch_key`. Four digits covers the coverage plan's largest category
@@ -133,6 +197,24 @@ export type ModelBudgetCode =
 // (budget_misconfigured, budget_insufficient) and for the two batch-identity
 // codes. Nothing is lost: a caller hitting budget_insufficient already holds
 // the BatchPlan it passed in.
+/**
+ * What one reservation leaves behind, as the caller has to report it.
+ *
+ * `reserved` and `remaining` are the SHARED cap's figures — the scope's total
+ * after this reservation, and what the pipeline may still spend — because those
+ * are the numbers a stop decision and an operator's remaining allowance are
+ * made of. `runReserved` is this run's own ledger total, kept separate so a
+ * stage's report and its `catalog_import_runs` mirror state what IT reserved
+ * rather than absorbing the other stage's spend. `budgetScope` names the
+ * allowance, so a log line or a report says which cap the numbers belong to.
+ */
+export interface ModelCallReservation {
+    readonly reserved: number;
+    readonly remaining: number;
+    readonly runReserved: number;
+    readonly budgetScope: string;
+}
+
 export class ModelBudgetError extends Error {
     constructor(
         public readonly code: ModelBudgetCode,
@@ -474,8 +556,61 @@ export const batchKeyFor = (coveragePlanVersion: string, category: string, batch
 };
 
 /**
+ * The budget scope a run belongs to: the coverage-plan version its run key
+ * begins with.
+ *
+ * THIS IS THE PARENT BUDGET'S IDENTITY, and it is derived from the run row
+ * rather than passed in by the caller on purpose. Both spending stages already
+ * build their run key from the coverage-plan version — `<version>` or
+ * `<version>+partial:<hash>` for generation (generationRunScope), and
+ * `<version>@<inputHash>` optionally followed by `+scope:<hash>` for validation
+ * (checkpoint.ts's canonicalValidationRunKey and catalog-validate.ts's
+ * validationRunScope) — so cutting the key at the earliest of those three
+ * markers recovers the version both stages share, with no new parameter to
+ * thread through two scripts, two seams and their fakes. A key with no marker at
+ * all IS the version (generation's canonical key, and the pre-input validation
+ * keys checkpoint.ts's validationRunKeyNamesInput describes), so it maps to
+ * itself.
+ *
+ * A key that cuts to nothing — one that opens with a marker — falls back to the
+ * whole key. That yields a scope of exactly one run family, which is the
+ * conservative direction: it can charge a budget too narrowly (a stage getting
+ * its own cap, the behaviour before the shared budget existed) but never fold
+ * two coverage plans into one cap and refuse work the operator paid for.
+ */
+export const budgetScopeOf = (manifestVersion: string): string => {
+    let cut = manifestVersion.length;
+
+    for (const separator of BUDGET_SCOPE_SEPARATORS) {
+        const index = manifestVersion.indexOf(separator);
+        if (index !== -1 && index < cut) {
+            cut = index;
+        }
+    }
+
+    const scope = manifestVersion.slice(0, cut).trim();
+    return scope.length > 0 ? scope : manifestVersion;
+};
+
+/**
  * The startup gate: fails a run closed before its first vendor call when the
  * plan cannot fit the configured cap.
+ *
+ * WHAT THE ESTIMATE COVERS. `plan.estimatedModelCalls` is `totalBatches ×
+ * modelCallsPerBatch`, and the coverage plan's factor is 2 — one generation call
+ * and one advisory-review call per batch (Agent Action Plan §0.7.1, §0.7.3). It
+ * is therefore the WHOLE pipeline's cost, not this stage's, and it is only
+ * comparable with the cap because the cap is shared: both stages reserve against
+ * one scope-wide allowance (see this module's header), so a plan that passes
+ * here can be executed end to end within the number an operator authorised. A
+ * per-stage cap would make this gate meaningless in both directions — refusing
+ * a generation run for calls it will not make, and then letting the review spend
+ * a second cap it was never gated on.
+ *
+ * It is a gate on the PLAN, not on what is left: an already-reserved scope is
+ * refused by the per-call check in reserveModelCall, which is where headroom is
+ * a fact rather than a forecast, and a resumed run must not be refused for
+ * reservations it made itself on an earlier attempt.
  *
  * The estimate is logged FIRST and unconditionally, whether or not it fits,
  * because an operator starting a long unattended run needs to see what it
@@ -539,9 +674,97 @@ export const getReservedModelCalls = async (db: CatalogRunDb, runId: string): Pr
 };
 
 /**
- * Calls this run may still make. Floored at 0 so an over-reserved run (a cap
- * lowered between two runs of the same pipeline) reports "none left" rather
- * than a negative allowance a caller might treat as headroom.
+ * What this run has reserved, spent and consumed in tokens, in one aggregate.
+ *
+ * Exists because a REPLAY has no counters of its own to report: an invocation
+ * that finds its run already succeeded executed no batch and made no call, so
+ * the only truthful answer to "what did this run spend?" is the ledger's, and
+ * reading it is what keeps a completed-run no-op from reporting a paid run as
+ * having used zero calls. `used` can trail `reserved` legitimately — a
+ * reservation is never refunded and a process killed between the reservation
+ * and the vendor's answer leaves the two apart — so the pair is returned
+ * together rather than as one number.
+ */
+export const getModelCallTotals = async (
+    db: CatalogRunDb,
+    runId: string,
+): Promise<{ reserved: number; used: number; tokensUsed: number }> => {
+    const aggregate = await db.catalog_generation_batches.aggregate({
+        _sum: { model_calls_reserved: true, model_calls_used: true, tokens_used: true },
+        where: { run_id: runId },
+    });
+
+    return {
+        reserved: finiteSum(aggregate._sum.model_calls_reserved),
+        used: finiteSum(aggregate._sum.model_calls_used),
+        tokensUsed: finiteSum(aggregate._sum.tokens_used),
+    };
+};
+
+/**
+ * The run rows one budget scope covers: every generation and validation run
+ * whose key names this coverage-plan version.
+ *
+ * The predicate is EXACT and then separator-anchored — `= scope`, or
+ * `startsWith scope + <marker>` for each marker — never a bare
+ * `startsWith(scope)`, which would fold `v10` into `v1`'s budget and refuse
+ * calls a different coverage plan had paid for.
+ */
+const scopeRunIds = async (db: CatalogRunDb, scope: string): Promise<string[]> => {
+    const runs = await db.catalog_import_runs.findMany({
+        where: {
+            kind: { in: [...BUDGET_SCOPE_RUN_KINDS] },
+            OR: [
+                { manifest_version: scope },
+                ...BUDGET_SCOPE_SEPARATORS.map((separator) => ({
+                    manifest_version: { startsWith: `${scope}${separator}` },
+                })),
+            ],
+        },
+        select: { id: true },
+    });
+
+    return runs.map((run) => run.id);
+};
+
+/**
+ * Calls already reserved against a budget scope — THE FIGURE THE CAP IS
+ * ENFORCED AGAINST.
+ *
+ * Summed across every run the scope covers, so generation's calls and the
+ * advisory review's calls consume one allowance: the pipeline can spend
+ * CATALOG_MODEL_CALL_BUDGET in total, not that much per stage and not that much
+ * per attempt. Like the per-run aggregate this reads the ledger rather than the
+ * `catalog_import_runs.counts` mirror, because a run killed mid-mirror-write
+ * must resume against its real remaining budget.
+ */
+export const getScopeReservedModelCalls = async (db: CatalogRunDb, scope: string): Promise<number> => {
+    const runIds = await scopeRunIds(db, scope);
+
+    // No run in the scope yet: nothing can have been reserved, and an `in: []`
+    // predicate is a needless round trip.
+    if (runIds.length === 0) {
+        return 0;
+    }
+
+    const aggregate = await db.catalog_generation_batches.aggregate({
+        _sum: { model_calls_reserved: true },
+        where: { run_id: { in: runIds } },
+    });
+
+    return finiteSum(aggregate._sum.model_calls_reserved);
+};
+
+/**
+ * Calls the SCOPE this run belongs to may still make. Floored at 0 so an
+ * over-reserved scope (a cap lowered between two stages of the same pipeline)
+ * reports "none left" rather than a negative allowance a caller might treat as
+ * headroom.
+ *
+ * Scope-wide rather than run-wide since the parent budget exists: a caller
+ * asking "how much is left" is asking what the next reservation will be refused
+ * against, and that is the scope's figure. A run whose row cannot be read has
+ * no scope to sum, so it reports no headroom rather than the whole cap.
  */
 export const getRemainingModelCalls = async (
     db: CatalogRunDb,
@@ -549,8 +772,39 @@ export const getRemainingModelCalls = async (
     budgetLimit: number,
 ): Promise<number> => {
     const limit = requirePositiveInteger(budgetLimit, 'budgetLimit');
-    const reserved = await getReservedModelCalls(db, runId);
+    const scope = await readBudgetScope(db, runId);
+
+    if (scope === null) {
+        return 0;
+    }
+
+    const reserved = await getScopeReservedModelCalls(db, scope);
     return Math.max(0, limit - reserved);
+};
+
+// SUM over zero rows is SQL NULL, and a non-finite total cannot be reasoned
+// about at all; both read as "nothing recorded".
+const finiteSum = (value: number | null | undefined): number =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0;
+
+/**
+ * The budget scope of a run, read from the run row, or `null` when the row is
+ * gone.
+ *
+ * `manifest_version` is written once when the run is claimed and never updated
+ * (checkpoint.ts writes status, cursor, counts and log; never the key), which is
+ * what makes this read safe to take BEFORE the scope lock: the value it returns
+ * cannot change under the lock it selects. A missing row is not an error here —
+ * requireOpenRun is the function that owns run identity and answers with its own
+ * typed CheckpointError — so the caller is handed `null` and defers to it.
+ */
+const readBudgetScope = async (db: CatalogRunDb, runId: string): Promise<string | null> => {
+    const run = await db.catalog_import_runs.findUnique({
+        where: { id: runId },
+        select: { manifest_version: true },
+    });
+
+    return run === null ? null : budgetScopeOf(run.manifest_version);
 };
 
 // A Prisma transaction client is exactly the client with $transaction removed
@@ -563,18 +817,22 @@ const transactionRunnerOf = (db: CatalogRunDb): PrismaClient | null => {
     return typeof candidate.$transaction === 'function' ? candidate : null;
 };
 
-// The per-run budget lock. One string parameter, passed as a bound parameter
-// rather than interpolated, and $executeRaw rather than $queryRaw because
-// pg_advisory_xact_lock returns `void`, which Prisma cannot deserialise into a
-// result row (P2010).
+// The budget-scope lock — per coverage-plan version, which is what the cap
+// spans (see budgetScopeOf), NOT per run: generation and the advisory review
+// reserve under two different run rows against one allowance, so two
+// reservations racing at `limit - 1` from two stages must queue behind each
+// other exactly as two reservations from one stage do. One string parameter,
+// passed as a bound parameter rather than interpolated, and $executeRaw rather
+// than $queryRaw because pg_advisory_xact_lock returns `void`, which Prisma
+// cannot deserialise into a result row (P2010).
 //
 // This mirrors the per-user `pg_advisory_xact_lock(hashtext('meal-planning:' ||
 // userId))` idiom the Agent Action Plan specifies for every mutating
 // meal-planning transaction; the key is namespaced so the two lock spaces
 // cannot collide. Transaction-scoped, so it is released by the commit or the
 // rollback and cannot be leaked by a killed script.
-const lockRunBudget = async (db: CatalogRunDb, runId: string): Promise<void> => {
-    const lockKey = `catalog-budget:${runId}`;
+const lockBudgetScope = async (db: CatalogRunDb, scope: string): Promise<void> => {
+    const lockKey = `catalog-budget:${scope}`;
     await db.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey}))`;
 };
 
@@ -695,33 +953,43 @@ const bindReservationToRun = async (
 };
 
 // The whole of the reservation decision, in the order that makes the cap a cap.
-// Returns the reservation count the run held BEFORE this one, so the caller can
-// report `reserved`/`remaining` without a second aggregate.
+// Returns what the SCOPE and the RUN each held BEFORE this reservation, so the
+// caller can report the cap's figures and its own run's without a second
+// aggregate.
 //
 // THE CAP CHECK AND THE INCREMENT ARE ONE ATOMIC STEP, AND THAT IS WHY THE LOCK
 // IS HERE. CATALOG_MODEL_CALL_BUDGET is a hard spending cap (Agent Action Plan
 // §0.4.3), so the aggregate that decides "one more call fits" and the increment
 // that consumes the allowance must not be separable: two callers reserving at
 // `limit - 1` would otherwise both read `limit - 1`, both pass the check and
-// both increment, and the run would spend past a cap an operator set in money.
-// A per-RUN advisory lock is what serialises them — per run and not per batch
-// key, because the cap spans every batch row the run owns, so two reservations
-// under two DIFFERENT keys racing at `limit - 1` must queue behind each other
-// too. (An earlier revision of this file argued the race could not occur
-// because one process owns a run end to end. That is an assumption about every
-// present and future caller, and it is not one a money cap should rest on.)
+// both increment, and the pipeline would spend past a cap an operator set in
+// money. A per-SCOPE advisory lock is what serialises them — per coverage-plan
+// version, and neither per run nor per batch key, because the cap spans every
+// batch row every run of that plan owns, so two reservations racing at
+// `limit - 1` must queue behind each other whether they come from one stage or
+// from generation and the advisory review at once. (An earlier revision of this
+// file argued the race could not occur because one process owns a run end to
+// end. That is an assumption about every present and future caller, and it is
+// not one a money cap should rest on — and it was never true across the two
+// stages, which run as two processes by design.)
 //
 // ORDER IS LOAD-BEARING. The lock is taken BEFORE the aggregate: under
 // PostgreSQL's read-committed default every statement takes a fresh snapshot,
 // so the aggregate that runs once the lock is held sees the previous holder's
 // committed increment. Raising the isolation level would break exactly that and
 // must revisit this function. hashtext narrows the key to a 32-bit integer, so
-// two unrelated runs can collide and then merely wait for each other, which is
+// two unrelated scopes can collide and then merely wait for each other, which is
 // harmless.
 //
-// The locked section is four fast statements and contains NO vendor call — the
-// model call happens after reserveModelCall returns — so a multi-hour import
-// serialises on the ledger and on nothing else.
+// The scope is read from the run row BEFORE the lock, and that read is safe
+// because `manifest_version` is written once at claim time and never updated
+// (see readBudgetScope): the value cannot change under the lock it selects, and
+// a run row that has vanished is handed to requireOpenRun, which owns run
+// identity and refuses it with its own typed error.
+//
+// The locked section is a handful of fast statements and contains NO vendor call
+// — the model call happens after reserveModelCall returns — so a multi-hour
+// import serialises on the ledger and on nothing else.
 const claimModelCallReservation = async (
     db: CatalogRunDb,
     input: {
@@ -733,8 +1001,15 @@ const claimModelCallReservation = async (
         logger?: ScriptLogger;
     },
     limit: number,
-): Promise<number> => {
-    await lockRunBudget(db, input.runId);
+): Promise<{ scopeReserved: number; runReserved: number; scope: string }> => {
+    // `null` only when the run row is gone; requireOpenRun below turns that into
+    // its own `run_not_found`, so the placeholder scope is never used for a
+    // decision. It still has to be a non-empty string, because it is the lock
+    // key and locking on nothing would let two vanished-run callers proceed
+    // together.
+    const scope = (await readBudgetScope(db, input.runId)) ?? input.runId;
+
+    await lockBudgetScope(db, scope);
 
     // Before the aggregate, because a cap computed over a run that does not
     // exist or has already been settled is meaningless, and before the insert,
@@ -745,24 +1020,34 @@ const claimModelCallReservation = async (
     // deleted or closed between the check and the write.
     await requireOpenRun(db, input.runId);
 
-    const reserved = await getReservedModelCalls(db, input.runId);
+    // THE SCOPE'S SUM, NOT THE RUN'S: this is the parent budget generation and
+    // the advisory review share (see this module's header). The run's own figure
+    // is read alongside it for the caller's report, and it is never what the cap
+    // is measured against.
+    const scopeReserved = await getScopeReservedModelCalls(db, scope);
+    const runReserved = await getReservedModelCalls(db, input.runId);
 
     // `>=`, unlike the `>` in assertModelCallBudget: there the question is
     // whether N more calls fit, here it is whether one more does. Thrown before
     // any increment and before the vendor call, so nothing has been spent and
     // the rollback of this transaction leaves the ledger exactly as it was.
-    if (reserved >= limit) {
+    if (scopeReserved >= limit) {
         input.logger?.warn('model_budget_exhausted', {
             runId: input.runId,
+            budgetScope: scope,
             batchKey: input.batchKey,
-            reserved,
+            reserved: scopeReserved,
+            runReserved,
             limit,
         });
         throw new ModelBudgetError(
             'budget_exhausted',
-            `${MODEL_CALL_BUDGET_ENV_VAR} of ${limit} model call(s) is exhausted for this run ` +
-                `(${reserved} already reserved), so no further model call may be made.`,
-            reserved,
+            `${MODEL_CALL_BUDGET_ENV_VAR} of ${limit} model call(s) is exhausted for coverage plan ` +
+                `${scope} (${scopeReserved} already reserved across its generation and advisory-review ` +
+                'runs, one shared cap), so no further model call may be made. Raise ' +
+                `${MODEL_CALL_BUDGET_ENV_VAR} and re-run the stage to continue this run, or publish a new ` +
+                'coveragePlanVersion, which is new work with a budget of its own.',
+            scopeReserved,
             limit,
         );
     }
@@ -773,7 +1058,7 @@ const claimModelCallReservation = async (
     // lock is what makes the CHECK above safe, not what makes the write atomic.
     await bindReservationToRun(db, input);
 
-    return reserved;
+    return { scopeReserved, runReserved, scope };
 };
 
 /**
@@ -788,6 +1073,11 @@ const claimModelCallReservation = async (
  * `CheckpointError('run_not_found' | 'run_not_open')` — not a ModelBudgetError —
  * when the run id does not exist or has already been settled, since run identity
  * is that module's contract and this one asks it before writing anything.
+ *
+ * The cap it enforces is the BUDGET SCOPE's, shared with the other stage of the
+ * same coverage plan (see this module's header): `reserved` and `remaining`
+ * describe that shared allowance, while `runReserved` is this run's own ledger
+ * figure for its report.
  */
 export const reserveModelCall = async (
     db: CatalogRunDb,
@@ -800,7 +1090,7 @@ export const reserveModelCall = async (
         budgetLimit: number;
         logger?: ScriptLogger;
     },
-): Promise<{ reserved: number; remaining: number }> => {
+): Promise<ModelCallReservation> => {
     const limit = requirePositiveInteger(input.budgetLimit, 'budgetLimit');
     const runner = transactionRunnerOf(db);
 
@@ -812,7 +1102,7 @@ export const reserveModelCall = async (
     // LOCK that serialises, not the transaction; but a caller that brings its
     // own transaction holds this run's budget lock until IT commits, so such a
     // caller must not make the paid model call inside that transaction.
-    const reserved = runner
+    const claimed = runner
         ? await runner.$transaction((tx) => claimModelCallReservation(tx, input, limit))
         : await claimModelCallReservation(db, input, limit);
 
@@ -831,24 +1121,31 @@ export const reserveModelCall = async (
     // in that transaction — its boundary, its choice.)
     await recordCounts(db, input.runId, { modelCallsReserved: 1 });
 
-    const reservedAfter = reserved + 1;
+    const reservedAfter = claimed.scopeReserved + 1;
 
     // Debug, not info: a full generation run reserves on the order of a
     // thousand calls, and the two events an operator must see are the startup
     // estimate and the per-call usage record.
     input.logger?.debug('model_call_reserved', {
         runId: input.runId,
+        budgetScope: claimed.scope,
         batchKey: input.batchKey,
         category: input.category,
         reserved: reservedAfter,
+        runReserved: claimed.runReserved + 1,
         remaining: limit - reservedAfter,
     });
 
     // A crash between here and the vendor call leaves the reservation standing.
-    // That is the intended direction: the run has lost one call's worth of
+    // That is the intended direction: the scope has lost one call's worth of
     // budget it may not have spent, which is conservative, where the opposite
     // error would let a retry loop spend without limit.
-    return { reserved: reservedAfter, remaining: limit - reservedAfter };
+    return {
+        reserved: reservedAfter,
+        remaining: limit - reservedAfter,
+        runReserved: claimed.runReserved + 1,
+        budgetScope: claimed.scope,
+    };
 };
 
 // Token counts arrive from a vendor response body, so they are guarded before
@@ -882,13 +1179,67 @@ const normalizeTokensUsed = (tokensUsed?: number): number => {
  * usage at all. The caller always knows its run id (it just reserved against
  * it), so the pairing is explicit rather than derived from the row, and a key
  * belonging to another run is refused instead of charged.
+ *
+ * IT IS SAFE TO RETRY, which is what catalog-validate.ts's advisory review does
+ * before it treats a spend as unrecorded: the batch-row increment and the
+ * run-row mirror are one transaction, so a failure leaves neither applied and
+ * the second attempt records the call exactly once (see the comment on the
+ * boundary below). A retry after a SUCCESSFUL call would of course double-count
+ * — the contract is one call, one `recordModelCallUsage` that returned, and a
+ * retry only of one that threw.
  */
 export const recordModelCallUsage = async (
     db: CatalogRunDb,
     input: { runId: string; batchKey: string; succeeded: boolean; tokensUsed?: number; logger?: ScriptLogger },
 ): Promise<void> => {
     const tokensUsed = normalizeTokensUsed(input.tokensUsed);
+    const runner = transactionRunnerOf(db);
 
+    // BOTH WRITES OR NEITHER, so that a caller's retry is exactly-once.
+    //
+    // This function writes twice: the authoritative increment on the batch row,
+    // then the diagnostic mirror on the run row. catalog-validate.ts's advisory
+    // review RETRIES a usage write that did not land before it treats the spend
+    // as unrecorded (it must: an unrecorded paid call stops the review and fails
+    // the run), and without a boundary a mirror failure after a successful
+    // increment would make that retry add the same call to `model_calls_used`
+    // twice. Wrapped, the failure rolls the increment back and the retry applies
+    // the pair once.
+    //
+    // WHY THIS IS THE OPPOSITE CHOICE FROM THE RESERVATION PATH, where the
+    // mirror is deliberately left OUTSIDE the transaction: there, the write the
+    // mirror could roll back is the one that ENFORCES THE CAP, so a diagnostic
+    // must never be able to undo it. Here neither write enforces anything —
+    // the cap is measured on `model_calls_reserved`, which this function never
+    // touches and never refunds — so rolling both back costs only a retry and
+    // buys an accurate spend figure. A caller that brought its own transaction
+    // runs in place, as everywhere else in this module: Prisma does not nest,
+    // and that caller's boundary is its own choice.
+    if (runner) {
+        await runner.$transaction((tx) => writeModelCallUsage(tx, input, tokensUsed));
+    } else {
+        await writeModelCallUsage(db, input, tokensUsed);
+    }
+
+    // Never the prompt, the completion, the API key or a caught error object —
+    // logger.ts's safeError is the sanctioned way to reference a failure, and
+    // the caller owns that reporting. This line carries counters only.
+    input.logger?.info('model_call_recorded', {
+        runId: input.runId,
+        batchKey: input.batchKey,
+        succeeded: input.succeeded,
+        tokensUsed,
+    });
+};
+
+// The two writes themselves, extracted so the transaction above can hold both
+// and a caller that owns a transaction can supply its own client. Throws the
+// same typed errors it always did; nothing here catches.
+const writeModelCallUsage = async (
+    db: CatalogRunDb,
+    input: { runId: string; batchKey: string; succeeded: boolean; logger?: ScriptLogger },
+    tokensUsed: number,
+): Promise<void> => {
     // One run-bound statement, so the two increments cannot be applied to
     // another run's row and need no lock of their own: Prisma's `{increment}`
     // is computed by PostgreSQL, not in application code, and the `run_id`
@@ -936,14 +1287,4 @@ export const recordModelCallUsage = async (
     // The caller's run id, never the row's: mirroring into whatever run owned
     // the row is exactly how a run's reported spend drifts from what it paid.
     await recordCounts(db, input.runId, { modelCallsUsed: 1, tokensUsed });
-
-    // Never the prompt, the completion, the API key or a caught error object —
-    // logger.ts's safeError is the sanctioned way to reference a failure, and
-    // the caller owns that reporting. This line carries counters only.
-    input.logger?.info('model_call_recorded', {
-        runId: input.runId,
-        batchKey: input.batchKey,
-        succeeded: input.succeeded,
-        tokensUsed,
-    });
 };

@@ -11,6 +11,16 @@
 // a full bucket would have to be restarted; one that waits simply finishes
 // later, which is the whole point of the checkpointing around it).
 //
+// THOSE 900 ARE A CEILING, NOT A DEFAULT. `USDA_IMPORT_POLICY_CAP_PER_HOUR` is
+// the import's own maximum and `USDA_VENDOR_CAP_PER_HOUR` is the vendor's, and
+// the two are deliberately different numbers: configuration may LOWER the rate
+// and nothing may raise it past the policy cap, because a run configured at the
+// vendor's full 1,000 stays inside what the key allows while spending the live
+// feature's share of it. A ceiling that only defaulted to 900 would be
+// satisfied by `USDA_IMPORT_RATE_LIMIT_PER_HOUR=1000`, which is exactly the
+// headroom this module exists to reserve being handed back by an environment
+// variable.
+//
 // This module paces requests and reports what it paced (§1.1). It reads no
 // manifest, touches no database, and decides nothing about catalog records.
 // It deliberately does not import `usda.service.ts`: it gates transport, it
@@ -103,8 +113,34 @@ export const USDA_HOST = 'api.nal.usda.gov';
 /** USDA's published ceiling: 1,000 requests per hour per API key. */
 export const USDA_VENDOR_CAP_PER_HOUR = 1000;
 
-/** 900 of that ceiling, leaving 100 per hour for the running API. */
-export const DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR = 900;
+/**
+ * The importer's OWN maximum: 900 per hour, whatever the vendor would allow.
+ *
+ * This is a product guarantee rather than a preference, and it is the reason
+ * the two caps are separate constants. The vendor cap describes what the KEY
+ * may spend; this one describes what the IMPORT may spend of it, and the 100
+ * per hour between them are not slack — they are the allowance the running
+ * API's `/api/macros/estimate`, `/api/macros/label-scan` and
+ * `/api/macros/search-branded-foods` traffic draws on the SAME credential
+ * (AAP §0.7.1 Group 1, §0.4.3). Configuring the import at the vendor's full
+ * 1,000 does not overspend the key — it spends the live feature's share of it,
+ * and the failure lands on a user request rather than on this run.
+ *
+ * So no configuration widens it. It is the bound
+ * `getUsdaImportRateLimitPerHour` enforces on `USDA_IMPORT_RATE_LIMIT_PER_HOUR`
+ * and the default `policyCapPerHour` every limiter is built with; a caller that
+ * needs a LOWER ceiling passes one, and nothing may pass a higher one.
+ */
+export const USDA_IMPORT_POLICY_CAP_PER_HOUR = 900;
+
+/**
+ * The rate an import runs at when nothing is configured — the policy ceiling
+ * itself, which is why it is expressed in terms of it rather than repeated as
+ * a second 900 that could drift from it. The default IS the maximum here: the
+ * import wants every request it is allowed, and the headroom it must leave is
+ * already subtracted.
+ */
+export const DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR = USDA_IMPORT_POLICY_CAP_PER_HOUR;
 
 /** One USDA detail batch (`POST /foods` takes 20 ids) may go out back-to-back. */
 export const DEFAULT_BURST_CAPACITY = 20;
@@ -130,6 +166,13 @@ const RATE_LIMIT_ENV_VAR = 'USDA_IMPORT_RATE_LIMIT_PER_HOUR';
  * The offending numbers travel on the error (§8) so a caller can report them
  * without re-parsing the message. They are `null` when the failure did not
  * involve that particular number.
+ *
+ * `vendorCapPerHour` carries the hourly ceiling the offending value was
+ * measured against, which is the vendor's 1,000 for most rejections and
+ * `USDA_IMPORT_POLICY_CAP_PER_HOUR` for the one rejection whose bound is the
+ * import's own maximum. It is named for the common case and deliberately not
+ * split into two fields: a caller reports the bound that was broken, and a
+ * second field would let it report the one that was not.
  */
 export class RateLimitConfigError extends Error {
     constructor(
@@ -268,6 +311,51 @@ export interface BucketState {
 }
 
 /**
+ * Physical USDA attempts split by the status class the vendor answered with.
+ *
+ * The limiter is the only place in the import that can count this. It gates
+ * `globalThis.fetch`, so it sees every physical attempt — including the three
+ * retries `usda.service.ts` may make inside one logical call, which its own
+ * callers never learn about — and it holds the `Response` the delegate
+ * returned, whose `status` is a header field that costs nothing to read and
+ * does not touch or consume the body.
+ *
+ * The three statuses that get their own counter are the three the retry ladder
+ * treats as transient, and they are counted EXACTLY rather than as a range:
+ * `throttled429` is the vendor saying the key is over its hourly cap, which is
+ * the one number that tells an operator this module's ceiling was set too high
+ * or shared with something it does not know about; `timeout408` is the vendor
+ * being slow; and `retryable400` is USDA's documented habit of rejecting a
+ * request that succeeds when retried verbatim, which would otherwise be
+ * indistinguishable from a malformed request in `otherClientError`. Lumping
+ * the three into "4xx" is what made the previous report unable to answer "how
+ * many 429s".
+ */
+export interface UsdaStatusClassCounts {
+    /** 200-299. */
+    ok2xx: number;
+    /** Exactly 400 — retried verbatim by `usda.service.ts`, not a client defect. */
+    retryable400: number;
+    /** Exactly 408. */
+    timeout408: number;
+    /** Exactly 429 — the vendor refusing because the KEY is over its hourly cap. */
+    throttled429: number;
+    /** The rest of 4xx: 401/403 (a bad key) and 404 among them. */
+    otherClientError: number;
+    /** 500 and above. */
+    serverError: number;
+    /**
+     * 1xx and 3xx, and any answer whose `status` is not a finite number — a
+     * stub transport, or a runtime that resolved something that is not a
+     * `Response`. Such an answer is still one attempt charged to the hour, so
+     * it is counted rather than dropped: dropping it would break the
+     * `attempts` identity on `UsdaRequestStats`, which is the only thing that
+     * makes the reported split checkable.
+     */
+    otherStatus: number;
+}
+
+/**
  * What the limiter paced. `catalog-import-usda.ts` writes this verbatim into
  * `data/meal-planning/reports/latest/import-report.json` as the `usdaRequests`
  * block, which `catalog-report.ts` reconciles against the import half — so
@@ -275,13 +363,71 @@ export interface BucketState {
  * reports, and no field here may carry a secret (no URLs, no key fragments,
  * no host beyond the configured one). A field may be ADDED; none may be
  * renamed, removed or given a new meaning.
+ *
+ * EVERY FIELD IS MEASURED. Not one of them is seeded from the manifest, the
+ * coverage plan or an estimate: they are what this limiter counted while it
+ * paced the run, which is the whole reason the report may quote them as fact.
+ *
+ * THE IDENTITY THAT MAKES THE SPLIT CHECKABLE.
+ *
+ *     attempts === ok2xx + retryable400 + timeout408 + throttled429 +
+ *                  otherClientError + serverError + otherStatus +
+ *                  transportFailures
+ *
+ * It holds because `attempts` is incremented immediately before the gated
+ * `fetch` call and every admitted attempt then settles in exactly one of those
+ * buckets — a status class when the delegate resolved, `transportFailures`
+ * when it threw. An attempt still in flight is already charged to `attempts`
+ * and not yet to a bucket, so a reader of `stats()` taken mid-run can be short
+ * by the requests outstanding at that instant; the importer reads it after its
+ * last batch, where nothing is outstanding. A report where the identity does
+ * not hold is a report to distrust rather than to reconcile.
+ *
+ * EVERY FIELD HERE IS REQUIRED, THE STATUS SPLIT INCLUDED. This type is the
+ * `usdaRequests` field contract and the importer spreads a stats value into
+ * that block verbatim, so an optional counter would let a committed report be
+ * written with a measurement quietly missing — which reads downstream as "this
+ * run made no request of that kind" rather than as "nobody recorded it". A
+ * caller with nothing to measure reports no block at all
+ * (`usdaRequests.unmeasured` with its reason) instead of a stats object with
+ * holes in it.
  */
 export interface UsdaRequestStats {
     configuredPerHour: number;
     vendorCapPerHour: number;
+    /**
+     * The import's own maximum in force for this run
+     * (`USDA_IMPORT_POLICY_CAP_PER_HOUR` unless a caller lowered it). Reported
+     * beside `vendorCapPerHour` because the two are what make the headroom
+     * checkable from the artefact alone: `vendorCapPerHour - policyCapPerHour`
+     * is what was reserved for the running API, and `configuredPerHour` can be
+     * read against the bound that was actually enforced rather than against
+     * the vendor's, which no import is allowed to reach.
+     */
+    policyCapPerHour: number;
     burstCapacity: number;
     /** Physical fetches gated — `usda.service.ts`'s internal retries included. */
     attempts: number;
+    /**
+     * Those same physical attempts split by the status class the vendor
+     * answered with. See `UsdaStatusClassCounts` for why the limiter is the
+     * only place this can be counted, and the identity above for how a reader
+     * checks the split against `attempts`.
+     */
+    statusClassCounts: UsdaStatusClassCounts;
+    /**
+     * Attempts whose `fetch` REJECTED instead of answering — DNS failure, a
+     * dropped connection, an abort. They are the other half of the identity
+     * above, and they are worth their own counter rather than a status bucket
+     * because they are a different fault: a 5xx means the import reached USDA
+     * and USDA failed, while one of these means it never got there, and only
+     * the second one implicates the host the import is running on.
+     *
+     * The error itself is never captured or reshaped here — it is rethrown
+     * exactly as thrown, so `usda.service.ts`'s retry ladder sees what it
+     * always saw and the vendor boundary stays the vendor boundary's business.
+     */
+    transportFailures: number;
     pauses: number;
     totalPausedMs: number;
     longestPauseMs: number;
@@ -348,12 +494,22 @@ export interface UsdaRateLimiter {
      * still succeeds once that owner steps down.
      */
     install(): () => void;
+    /** Everything this limiter measured; see `UsdaRequestStats`. */
     stats(): UsdaRequestStats;
 }
 
 export interface UsdaRateLimiterOptions {
     requestsPerHour: number;
     vendorCapPerHour?: number;
+    /**
+     * The import's own hourly maximum, defaulting to
+     * `USDA_IMPORT_POLICY_CAP_PER_HOUR`. It exists so a caller can go LOWER —
+     * a smoke run on a key that is also serving a busy environment, say — and
+     * for no other reason: it is validated at or below `vendorCapPerHour`, so
+     * passing a larger one is refused as the misconfiguration it is rather
+     * than honoured as a widening of the ceiling.
+     */
+    policyCapPerHour?: number;
     burstCapacity?: number;
     /** A bare hostname or a base URL — `usda.service.ts` honours `USDA_BASE_URL`. */
     host?: string;
@@ -456,6 +612,13 @@ const readDecimalInteger = (raw: string): DecimalIntegerRead => {
  * quietly reverts to its default only affects the caller, whereas a rate that
  * quietly reverts hides a typo that either wastes hours of import time or
  * throttles the key the live API shares.
+ *
+ * The upper bound it enforces is `USDA_IMPORT_POLICY_CAP_PER_HOUR`, NOT the
+ * vendor cap. Bounding this read at 1,000 was the same mistake as having no
+ * bound at all for the thing the number protects: 901 through 1,000 are all
+ * inside what USDA permits the key and all eat into the 100 per hour the
+ * running API needs on it, so they are refused here — at startup, in one place,
+ * before a single request is paced — rather than quietly honoured.
  */
 export const getUsdaImportRateLimitPerHour = (env: NodeJS.ProcessEnv = process.env): number => {
     const raw = env[RATE_LIMIT_ENV_VAR];
@@ -489,12 +652,24 @@ export const getUsdaImportRateLimitPerHour = (env: NodeJS.ProcessEnv = process.e
         );
     }
 
-    if (read.value <= 0 || read.value > USDA_VENDOR_CAP_PER_HOUR) {
+    if (read.value <= 0 || read.value > USDA_IMPORT_POLICY_CAP_PER_HOUR) {
+        // The bound this value broke is the IMPORT ceiling, so that is the
+        // number travelling as the error's cap — reporting 1,000 would name a
+        // limit a configured 950 does not break and leave the operator
+        // looking for a different problem. Both numbers are in the message
+        // because the remedy depends on the difference between them: the
+        // refusal is not "USDA would throttle you", it is "the running API
+        // needs the rest of that key".
         throw new RateLimitConfigError(
-            `${RATE_LIMIT_ENV_VAR} must be an integer between 1 and ${USDA_VENDOR_CAP_PER_HOUR} (got ${read.value})`,
+            `${RATE_LIMIT_ENV_VAR} must be an integer between 1 and ${USDA_IMPORT_POLICY_CAP_PER_HOUR} ` +
+                `(got ${read.value}): the import must not exceed the import ceiling of ` +
+                `${USDA_IMPORT_POLICY_CAP_PER_HOUR} requests/hour; USDA's per-key cap is ` +
+                `${USDA_VENDOR_CAP_PER_HOUR} and the remaining ` +
+                `${USDA_VENDOR_CAP_PER_HOUR - USDA_IMPORT_POLICY_CAP_PER_HOUR}/hour are reserved for the ` +
+                `running API's estimate, label-scan and branded-search traffic on the same key`,
             read.value,
             null,
-            USDA_VENDOR_CAP_PER_HOUR,
+            USDA_IMPORT_POLICY_CAP_PER_HOUR,
         );
     }
 
@@ -732,6 +907,66 @@ export const isUsdaRequestUrl = (input: unknown, host: string = USDA_HOST): bool
         return false;
     }
 };
+
+/**
+ * Which bucket of `UsdaStatusClassCounts` one answered attempt belongs to.
+ *
+ * Exported and pure for the same reason the window rules are: the boundaries
+ * are the part someone could get wrong — 400, 408 and 429 are counted EXACTLY
+ * and everything else in 4xx is `otherClientError`, so a `<= 429` or a `>= 400`
+ * written the wrong way round would silently move a throttling report into a
+ * bad-key report — and a test pins them with no clock, no network and no
+ * `Response`.
+ *
+ * The input is `unknown` on purpose. The declared type of `Response.status` is
+ * `number`, but this runs against whatever the installed `fetch` resolved: a
+ * stub transport, an instrumentation wrapper, or a runtime resolving something
+ * that is not a `Response` at all. An attempt has already been charged to the
+ * hour by the time this is asked, so an unreadable status has to land
+ * SOMEWHERE (`otherStatus`) rather than be dropped — the `attempts` identity on
+ * `UsdaRequestStats` is what the report's split is checked against, and a
+ * dropped attempt is exactly what would break it.
+ */
+export const usdaStatusClass = (status: unknown): keyof UsdaStatusClassCounts => {
+    if (typeof status !== 'number' || !Number.isFinite(status)) {
+        return 'otherStatus';
+    }
+    // The three transient statuses first, and by equality: each is one status
+    // the retry ladder treats differently from its neighbours, and each is the
+    // answer to a question about the run that a 4xx range cannot answer.
+    if (status === 400) {
+        return 'retryable400';
+    }
+    if (status === 408) {
+        return 'timeout408';
+    }
+    if (status === 429) {
+        return 'throttled429';
+    }
+    if (status >= 200 && status < 300) {
+        return 'ok2xx';
+    }
+    if (status >= 400 && status < 500) {
+        return 'otherClientError';
+    }
+    if (status >= 500) {
+        return 'serverError';
+    }
+    return 'otherStatus';
+};
+
+// Every class starts at zero rather than absent, because a class with no
+// attempts really did have none: these counters only ever grow from attempts
+// this limiter admitted, so a zero here is a measurement and not a gap.
+const emptyStatusClassCounts = (): UsdaStatusClassCounts => ({
+    ok2xx: 0,
+    retryable400: 0,
+    timeout408: 0,
+    throttled429: 0,
+    otherClientError: 0,
+    serverError: 0,
+    otherStatus: 0,
+});
 
 // Deliberately not `unref()`'d: a pause has to keep the process alive, or a
 // run that pauses near the end would exit mid-import and look like a clean
@@ -1625,13 +1860,26 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
 export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRateLimiter => {
     const requestsPerHour = options.requestsPerHour;
     const vendorCapPerHour = options.vendorCapPerHour ?? USDA_VENDOR_CAP_PER_HOUR;
+    // DEFAULTED, the import's ceiling is the LOWER of the two caps. A caller
+    // modelling a stricter vendor — a mock server, a key on a reduced quota —
+    // must not be refused over a policy cap it never set, and an import may
+    // never spend past the vendor's cap whatever the policy number says.
+    // PASSED, it is validated rather than clamped: quietly lowering a ceiling
+    // an operator chose is how a run ends up paced at a rate nobody asked for.
+    const policyCapPerHour = options.policyCapPerHour ?? Math.min(USDA_IMPORT_POLICY_CAP_PER_HOUR, vendorCapPerHour);
     const capacity = options.burstCapacity ?? Math.min(requestsPerHour, DEFAULT_BURST_CAPACITY);
     const logger = options.logger;
 
-    const reject = (message: string): never => {
-        throw new RateLimitConfigError(message, requestsPerHour, capacity, vendorCapPerHour);
+    // The cap the offending value was measured against travels on the error, so
+    // each rejection below names the bound it actually broke. It defaults to
+    // the vendor's because that is the ceiling most of them are about.
+    const reject = (message: string, cap: number = vendorCapPerHour): never => {
+        throw new RateLimitConfigError(message, requestsPerHour, capacity, cap);
     };
 
+    // No `cap` is named here: the bound a non-integer or non-positive value
+    // broke is the shape a rate has to have, not any hourly ceiling, so these
+    // keep reporting the vendor cap as the context it always was.
     const requirePositiveInteger = (label: string, value: number): void => {
         if (!Number.isInteger(value) || value <= 0) {
             const observed = Number.isFinite(value) ? `${value}` : 'not a number';
@@ -1641,6 +1889,7 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
 
     requirePositiveInteger('requestsPerHour', requestsPerHour);
     requirePositiveInteger('vendorCapPerHour', vendorCapPerHour);
+    requirePositiveInteger('policyCapPerHour', policyCapPerHour);
     // A capacity below one whole token could never be spent, so `acquire`
     // would wait for a token the clamp forbids it to ever hold — an import
     // that hangs instead of running.
@@ -1670,12 +1919,54 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
     //
     // What the configuration must satisfy is consequently narrower than the
     // old `C + R <= vendorCap`: the ceiling itself has to fit under the
-    // vendor's cap, and the burst has to be spendable within the ceiling.
-    if (requestsPerHour > vendorCapPerHour) {
+    // IMPORT's cap, that cap has to fit under the vendor's, and the burst has
+    // to be spendable within the ceiling.
+    //
+    // THE THIRD NUMBER, AND WHY IT IS NOT THE VENDOR'S. `requestsPerHour`
+    // is checked against `policyCapPerHour`, never against
+    // `vendorCapPerHour`: the vendor's cap is what the KEY may spend, and the
+    // import is allowed only the part of it that is not reserved for the
+    // running API, so a rate of 950 under a cap of 1,000 is a rate the vendor
+    // would serve and the live feature would pay for. Checking the policy cap
+    // subsumes the vendor check — `requestsPerHour <= policyCapPerHour <=
+    // vendorCapPerHour` — which is why there is one comparison here and not
+    // two, and why the order below matters: the policy cap is validated
+    // against the vendor's FIRST, so a caller cannot widen the ceiling by
+    // passing a policy cap of its own. That direction is a misconfiguration
+    // and is refused; passing a LOWER one is the option the parameter exists
+    // for.
+    if (policyCapPerHour > vendorCapPerHour) {
         reject(
-            `requestsPerHour ${requestsPerHour} exceeds vendorCapPerHour ${vendorCapPerHour}: ` +
-                `the importer's rolling-hour ceiling is the total it may spend, so it has to fit ` +
-                `under the vendor's hourly cap with headroom left for the running API`,
+            `policyCapPerHour ${policyCapPerHour} exceeds vendorCapPerHour ${vendorCapPerHour}: the import's ` +
+                `own ceiling is a share of the vendor's hourly cap and can only be lower than it, so a larger ` +
+                `one is a misconfiguration rather than a wider allowance`,
+        );
+    }
+    // AND IT CANNOT BE RAISED PAST THE PRODUCT POLICY EITHER. Bounding the
+    // option only by the vendor's cap would leave the 900 guarantee resting on
+    // caller discipline: `policyCapPerHour: 1000` sits under a vendor cap of
+    // 1,000 and hands the live API's 100 straight back, which is the same
+    // defect as a ceiling that is merely a default, one layer up. The option
+    // exists to go LOWER — a smoke run beside a busy environment — so lower is
+    // all it can do, and raising the import's share is a code change made here
+    // with the headroom argument in front of you, not a constructor argument.
+    if (policyCapPerHour > USDA_IMPORT_POLICY_CAP_PER_HOUR) {
+        reject(
+            `policyCapPerHour ${policyCapPerHour} exceeds the import ceiling of ` +
+                `${USDA_IMPORT_POLICY_CAP_PER_HOUR} requests/hour: an import may be paced SLOWER than the ` +
+                `policy ceiling but never faster, because the ` +
+                `${USDA_VENDOR_CAP_PER_HOUR - USDA_IMPORT_POLICY_CAP_PER_HOUR}/hour above it are the running ` +
+                `API's share of the same key`,
+            USDA_IMPORT_POLICY_CAP_PER_HOUR,
+        );
+    }
+    if (requestsPerHour > policyCapPerHour) {
+        reject(
+            `requestsPerHour ${requestsPerHour} exceeds policyCapPerHour ${policyCapPerHour}: the importer's ` +
+                `rolling-hour ceiling is the total it may spend, and it is capped below the vendor's ` +
+                `${vendorCapPerHour}/hour so the remaining ${vendorCapPerHour - policyCapPerHour}/hour stay ` +
+                `available to the running API's traffic on the same key`,
+            policyCapPerHour,
         );
     }
     // A burst wider than the hourly ceiling can never be spent in full — the
@@ -1730,6 +2021,13 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
 
     const counters = {
         attempts: 0,
+        // Charged in `paced`, one bucket per admitted attempt, so these two
+        // account for exactly the same physical requests `attempts` counts
+        // (UsdaRequestStats's identity). Nothing else may touch them: a count
+        // taken anywhere but around the gated call would either double-charge
+        // an attempt or charge one the limiter never admitted.
+        statusClassCounts: emptyStatusClassCounts(),
+        transportFailures: 0,
         pauses: 0,
         totalPausedMs: 0,
         longestPauseMs: 0,
@@ -1749,6 +2047,21 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
             counters.firstAttemptAt = at;
         }
         counters.lastAttemptAt = at;
+    };
+
+    // Reads the ONE header field the accounting needs and nothing else. The
+    // body is never read, never cloned and never buffered, so the response the
+    // caller receives is untouched — which is the constraint that makes
+    // counting here safe at all: a limiter that consumed a response to classify
+    // it would break every caller downstream of it.
+    //
+    // The defensive read is not ceremony. `Response.status` is typed `number`,
+    // but this sees whatever the installed transport resolved, and an attempt
+    // already charged to the hour must land in a bucket whatever that turns out
+    // to be (see `usdaStatusClass`).
+    const recordStatus = (response: unknown): void => {
+        const status = (response as { status?: unknown } | null | undefined)?.status;
+        counters.statusClassCounts[usdaStatusClass(status)] += 1;
     };
 
     const recordPause = (waitMs: number): void => {
@@ -1879,14 +2192,42 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
         // logical lookup and miss up to three real vendor requests; it also
         // catches the background cache refresh, which no service call fronts,
         // and correctly counts nothing for a cache hit that never fetches.
+        //
+        // BEING AT THE TRANSPORT IS ALSO WHAT MAKES THE STATUS SPLIT POSSIBLE.
+        // This wrapper holds the `Response` the delegate returned, and
+        // `status` is a header field: reading it touches nothing a caller will
+        // later consume, while the retry ladder inside `usda.service.ts`
+        // resolves several physical answers into one logical outcome and can
+        // therefore no longer say how many of them were 429s. So the count
+        // that the import report needs exists in exactly one place, and this
+        // is it.
         const paced = async (...args: Parameters<FetchFn>): ReturnType<FetchFn> => {
             // Everything that is not USDA traffic — OpenRouter, evidence
             // retrieval — passes straight through: no token, no stats, no log
-            // line, no delay.
-            if (isUsdaRequestUrl(args[0], host)) {
-                await acquire();
+            // line, no delay. It is not awaited here either, so nothing about
+            // its timing or its errors changes.
+            if (!isUsdaRequestUrl(args[0], host)) {
+                return original(...args);
             }
-            return original(...args);
+
+            await acquire();
+
+            // From here the attempt is charged to `attempts`, so it must be
+            // charged to exactly one bucket as well — a status class if the
+            // delegate answers, a transport failure if it throws.
+            try {
+                const response = await original(...args);
+                recordStatus(response);
+                return response;
+            } catch (error) {
+                counters.transportFailures += 1;
+                // Rethrown exactly as caught. Vendor and transport failures
+                // stay the vendor boundary's business (§9): `usda.service.ts`
+                // decides what a failure means and whether to retry it, and an
+                // error reshaped, wrapped or logged here would either change
+                // that decision or put a URL carrying `api_key` into a log.
+                throw error;
+            }
         };
 
         const restore = (): void => {
@@ -1938,6 +2279,10 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
             host,
             configuredPerHour: requestsPerHour,
             burstCapacity: capacity,
+            // Both ceilings, because the enforced one is the policy cap and a
+            // line carrying only the vendor's would leave an operator reading
+            // the run's headroom off the wrong number.
+            policyCapPerHour,
             vendorCapPerHour,
             ledgerKind: ledgerDescription.kind,
             ledgerScope: ledgerDescription.scope,
@@ -1955,8 +2300,14 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
         return {
             configuredPerHour: requestsPerHour,
             vendorCapPerHour,
+            policyCapPerHour,
             burstCapacity: capacity,
             attempts: counters.attempts,
+            // Copied, not handed out. The importer spreads this object into a
+            // committed JSON report, and a caller holding the live counter
+            // object could alter what the run then reports about itself.
+            statusClassCounts: { ...counters.statusClassCounts },
+            transportFailures: counters.transportFailures,
             pauses: counters.pauses,
             totalPausedMs: counters.totalPausedMs,
             longestPauseMs: counters.longestPauseMs,

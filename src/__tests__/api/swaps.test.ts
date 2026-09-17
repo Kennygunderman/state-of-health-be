@@ -74,9 +74,16 @@
 import { Prisma, catalog_foods, recipe_versions } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
 import { loadPlannedMealsForGroceries, rebuildPlanGroceries } from '../../services/grocery.service';
+// The module OBJECT, because `jest.spyOn` needs one to install the spy on: the
+// case that counts a commit's preference reads wraps `loadPreferencesRow` in
+// place, which a named import gives no handle to.
+import * as preferencesService from '../../services/preferences.service';
+// The same, for the canonical target read the commit resolves exactly once.
+import * as targetsService from '../../services/targets.service';
 import {
     GroceryItem,
     GroceryListResponse,
+    InvalidRequestDetail,
     MealPlanDayEnvelopeResponse,
     MealPlanMealResponse,
     SwapAlternativesResponse,
@@ -1509,6 +1516,12 @@ describe('POST one committed swap', () => {
  * ------------------------------------------------------------------------- */
 
 describe('the gates a swap commit passes', () => {
+    /**
+     * A syntactically valid meal id that no plan holds — the parser accepts it,
+     * so the refusal it draws is the one the gates below decide and not a `400`.
+     */
+    const ABSENT_MEAL_ID = '33333333-3333-4333-8333-333333333333';
+
     /** Nothing about the plan moved: the assertion every refusal below repeats. */
     const expectNothingWritten = async (mealBefore: { revision: number }): Promise<void> => {
         expect(await storedLunch()).toEqual(mealBefore);
@@ -1592,6 +1605,48 @@ describe('the gates a swap commit passes', () => {
         expectRefusal(response, 409, 'plan_not_active', { replacementPlanId: successor.id });
         expect(await storedLunch()).toEqual(mealBefore);
         expect(await ledgerRowsFor(SWAP_KEY)).toHaveLength(0);
+    });
+
+    it('still answers a superseded plan 409, even when the meal id it names is in no plan at all', async () => {
+        // THE ORDER OF THE FOUR CHECKS IS THE ANSWER, and this is the case that
+        // pins it. Both refusals are true of this request — the plan has been
+        // replaced AND the meal id names nothing — so whichever check runs
+        // first decides what the client is told. §0.5.1 judges the plan's status
+        // before the meal, because "your week has moved, here is the new one" is
+        // the actionable half; answering `404` would send a stale screen looking
+        // for a meal instead of for the current week. It is the check ORDER that
+        // guarantees it, not the order the facts happen to be read in.
+        await prisma.meal_plans.update({ where: { id: fixture.planId }, data: { status: 'superseded' } });
+
+        const successor = await makePlan(USER_ID, {
+            startDate: addDaysToDayKey(PLAN_START_DAY_KEY, PLAN_DAY_COUNT),
+            dayCount: PLAN_DAY_COUNT,
+            slots: [],
+            replaced_plan_id: fixture.planId,
+        });
+        const mealBefore = await storedLunch();
+
+        const response = await postSwap(swapBody(fixture.equalPortionCandidate.id, 1), {
+            mealId: ABSENT_MEAL_ID,
+        });
+
+        expectRefusal(response, 409, 'plan_not_active', { replacementPlanId: successor.id });
+        expect(await storedLunch()).toEqual(mealBefore);
+        expect(await ledgerRowsFor(SWAP_KEY)).toHaveLength(0);
+    });
+
+    it("answers a writable plan's unknown meal id 404, which is the other half of that order", async () => {
+        // The same request against a plan that IS writable: with no status
+        // refusal to report, the missing meal is what the client hears — so the
+        // `409` above is the order at work rather than `plan_not_active`
+        // swallowing every refusal on the route.
+        const mealBefore = await storedLunch();
+        const response = await postSwap(swapBody(fixture.equalPortionCandidate.id, 1), {
+            mealId: ABSENT_MEAL_ID,
+        });
+
+        expectRefusal(response, 404, 'Plan not found');
+        await expectNothingWritten(mealBefore);
     });
 
     it('refuses a plan whose last day has passed, as ended', async () => {
@@ -1689,6 +1744,108 @@ describe('the gates a swap commit passes', () => {
             expect(ledger).toHaveLength(1);
             expect(ledger[0].response_status).toBe(200);
         });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * What a commit resolves while it holds the lock
+ *
+ * A commit resolves its whole context ONCE, because every round trip inside its
+ * transaction is time any other writer of this user's plan spends queued behind
+ * the same per-user advisory lock. There are three resolutions and the cases
+ * below count them:
+ *
+ *  * ONE plan read, carrying the lifecycle, the revision and the targets
+ *    snapshot together.
+ *  * ONE `preferences.service.ts::loadPreferencesRow`, for the zone that decides
+ *    what "today" is (so an ended week is refused) AND the five eligibility
+ *    columns candidate selection is judged by.
+ *  * ONE `targets.service.ts::getTargets`, the canonical target read the plan
+ *    card and Account read through as well.
+ *
+ * THE THIRD OF THOSE DOES TOUCH `meal_plan_preferences` AGAIN, and these cases
+ * say so rather than pretending otherwise: `getTargets` is a single
+ * `users ⋈ meal_plan_preferences` join, and that join must stay one statement
+ * because the verdict it reaches compares the two rows — split in two, the
+ * untouched legacy `PUT /api/user/targets`, which holds no meal-planning lock,
+ * could commit between the halves and the pair would report `estimated` on
+ * numbers that had already moved. What is pinned here is therefore the number of
+ * RESOLUTIONS, which is the thing a future refactor can regress: one
+ * `loadPreferencesRow` and one `getTargets` per commit, never a second of
+ * either.
+ * ------------------------------------------------------------------------- */
+
+describe('what a swap commit resolves while it holds the lock', () => {
+    /**
+     * COUNTING SPIES, NOT STUBS: no `mockImplementation`, so both real reads run
+     * and the commit each case drives is the same commit every other case in
+     * this file drives.
+     */
+    const countContextReads = () => ({
+        preferenceReads: jest.spyOn(preferencesService, 'loadPreferencesRow'),
+        targetReads: jest.spyOn(targetsService, 'getTargets'),
+    });
+
+    it('resolves the preferences row and the current targets exactly once each', async () => {
+        const { preferenceReads, targetReads } = countContextReads();
+
+        try {
+            const body = await commitSwapOrThrow(swapBody(fixture.equalPortionCandidate.id, 1));
+
+            expect(body.planRevision).toBe(PLAN_REVISION_AFTER);
+
+            // The callers are projected to their user ids before the
+            // assertion: each recorded call also carries the transaction
+            // client, and a failure that tried to print those would be a
+            // serialisation of the whole Prisma client rather than a readable
+            // diff.
+            //
+            // Two preference calls would mean "today" and the restrictions had
+            // each fetched the row for themselves. Two target calls would mean
+            // the commit context resolved them and something downstream —
+            // `loadSwapSelection`, as it once did — resolved them again, a
+            // second `users ⋈ meal_plan_preferences` join inside the lock.
+            expect(preferenceReads.mock.calls.map(([userId]) => userId)).toEqual([USER_ID]);
+            expect(targetReads.mock.calls.map(([userId]) => userId)).toEqual([USER_ID]);
+        } finally {
+            // Restored in a `finally` for the reason `afterEach` restores the
+            // two flag stubs: this suite runs in band beside files that call the
+            // real implementations.
+            preferenceReads.mockRestore();
+            targetReads.mockRestore();
+        }
+    });
+
+    it('answers that one commit with the swapped meal, the rebuilt day and the bumped revision', async () => {
+        // The behaviour half of the case above, driven with the same spies
+        // installed: resolving the context once must not have changed what a
+        // commit ANSWERS or what it writes. The targets the selection was scored
+        // against are the ones the day is reported against, so the day's totals
+        // are the proof that the single resolution reached the selection intact.
+        const { preferenceReads, targetReads } = countContextReads();
+
+        try {
+            const body = await commitSwapOrThrow(swapBody(fixture.equalPortionCandidate.id, 1));
+
+            expect(body.meal.id).toBe(fixture.lunchMealId);
+            expect(body.meal.recipe.versionId).toBe(fixture.equalPortionCandidate.id);
+            expect(body.meal.planned).toEqual(EQUAL_CANDIDATE_NUTRITION);
+            expect(body.day.id).toBe(fixture.plannedDayId);
+            expect(body.day.plannedTotals).toEqual(rounded(dayTotalsWithLunchReplacedBy(EQUAL_CANDIDATE_NUTRITION)));
+            expect(body.planRevision).toBe(PLAN_REVISION_AFTER);
+
+            // And the rows behind that answer, because a response agreeing with
+            // nothing on disk is the failure this suite exists to catch.
+            expect((await storedLunch()).recipe_version_id).toBe(fixture.equalPortionCandidate.id);
+            expect((await storedDay()).planned_calories).toBe(DAY_TOTALS_AFTER_EQUAL.calories);
+            expect((await storedPlan()).revision).toBe(PLAN_REVISION_AFTER);
+
+            expect(preferenceReads).toHaveBeenCalledTimes(1);
+            expect(targetReads).toHaveBeenCalledTimes(1);
+        } finally {
+            preferenceReads.mockRestore();
+            targetReads.mockRestore();
+        }
     });
 });
 
@@ -2066,6 +2223,299 @@ describe('the grocery consequences of a swap', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * The one statement a grocery diff is applied through
+ *
+ * `rebuildPlanGroceries` runs inside the commit's interactive transaction while
+ * its per-user advisory lock is held, so the number of statements it issues is
+ * the number of round trips every other writer of this user's plan waits for. It
+ * therefore applies the whole of a diff's `updates` in ONE
+ * `UPDATE … FROM (VALUES …)` rather than one statement per changed row (AAP
+ * §0.7.3's no-per-item-query requirement).
+ *
+ * Two cases, because one alone cannot show it. The first drives a real swap that
+ * moves several lines at once and asserts the outcome — every changed row's
+ * columns, every untouched row byte-identical, and the check marks and the flag
+ * the set-based write must not disturb. The second asserts the property itself:
+ * one statement for a diff of several updates, and none at all for a diff with
+ * nothing to update.
+ * ------------------------------------------------------------------------- */
+
+/** 100 g in the mass family, which is where a gram-portion food's line lives. */
+const ONE_MEAL_MASS_TEXT = '3.5 oz';
+const ONE_MEAL_MASS_QUANTITY = 3.5;
+
+/** 200 g in the same family — two meals of one food. */
+const TWO_MEAL_MASS_TEXT = '7.1 oz';
+const TWO_MEAL_MASS_QUANTITY = 7.1;
+
+/** The aisle every food this suite shops for files under. */
+const PRODUCE_CATEGORY = 'produce';
+
+/**
+ * The instant the direct-call case raises its flag at, injected through
+ * `rebuildPlanGroceries`'s own `now` parameter.
+ *
+ * Fixed, and fixed with a non-zero millisecond field, because that is what makes
+ * the `TIMESTAMP(3)` round trip provable: the set-based statement binds the
+ * instant as an ISO-8601 wall time cast `::timestamp(3)`, and a cast that shifted
+ * or truncated it would show up here as a `flagged_at` that is not this value to
+ * the millisecond.
+ */
+const FLAG_INSTANT = new Date('2026-03-04T05:06:07.789Z');
+
+/** How many lines the doubled week moves, which is the diff the one statement carries. */
+const DOUBLED_WEEK_UPDATE_COUNT = 4;
+
+/**
+ * A transaction client that records the raw statements issued through it and
+ * passes every call on to the real one.
+ *
+ * A recording PROXY rather than a fabricated stub, and the reason is the
+ * invariant under test: `rebuildPlanGroceries` compares the affected-row count
+ * with the number of rows its diff decided and raises a fault when they differ,
+ * so a stub returning an invented count would either have to reimplement the
+ * diff or defeat the very check that makes the single statement safe. Forwarding
+ * to a real interactive transaction keeps that check honest and additionally
+ * proves the statement is valid SQL that PostgreSQL applies to the rows it
+ * names — while `recorded` still answers the question a stub was wanted for: how
+ * many statements were issued, carrying which parameters.
+ */
+const recordingTransaction = (tx: Prisma.TransactionClient, recorded: Prisma.Sql[]): Prisma.TransactionClient =>
+    new Proxy(tx, {
+        get: (target, property, receiver): unknown => {
+            if (property !== '$executeRaw') {
+                return Reflect.get(target, property, receiver);
+            }
+
+            const executeRaw = Reflect.get(target, property, receiver) as (
+                statement: Prisma.Sql,
+                ...values: unknown[]
+            ) => Promise<number>;
+
+            return (statement: Prisma.Sql, ...values: unknown[]): Promise<number> => {
+                recorded.push(statement);
+
+                return executeRaw.call(target, statement, ...values);
+            };
+        },
+    });
+
+describe('the one statement a grocery diff is applied through', () => {
+    /** The lines a week planning one extra day carries, which no swap of the lunch moves. */
+    interface AnchoredWorld {
+        /** On a day the swap never touches, and sorting before every other line. */
+        anchorFoods: readonly [catalog_foods, catalog_foods];
+        /** The arriving food, named so it sorts LAST and leaves the anchors' order alone. */
+        lateFood: catalog_foods;
+        /** Eligible and admissible at ×1, exactly as `equalPortionCandidate` is. */
+        candidate: FixtureRecipeVersion;
+    }
+
+    /**
+     * Adds a breakfast on a day the swapped lunch has nothing to do with, and a
+     * candidate whose arriving food sorts after every existing line.
+     *
+     * BOTH HALVES EXIST TO MAKE "UNTOUCHED" REACHABLE. List order is aisle then
+     * name, so a line that arrives or leaves renumbers every row after it —
+     * which is a real update, and would leave a diff of this shape with no
+     * untouched row to compare. Anchoring two lines at the top of the alphabet
+     * on a day the swap does not replan, and naming the arriving food so it
+     * sorts last, leaves those two rows genuinely untouched by the commit: same
+     * grams, same text, same `sort_order`.
+     */
+    const anchorTheWeek = async (): Promise<AnchoredWorld> => {
+        const anchorFoods: [catalog_foods, catalog_foods] = [
+            await makeShoppableFood('Anchor Beets'),
+            await makeShoppableFood('Anchor Greens'),
+        ];
+        const anchorRecipe = await makeTwoIngredientRecipe(
+            'swap-suite-anchor',
+            'Anchor Bowl',
+            anchorFoods,
+            BASE_PER_100G,
+        );
+
+        await plantMeals(fixture.dayIds[FIRST_DAY_INDEX], [
+            { slot: 'breakfast', slotTime: '08:00', recipeVersionId: anchorRecipe.id },
+        ]);
+
+        const lateFood = await makeShoppableFood('Zesty Peppers');
+        const candidate = await makeTwoIngredientRecipe(
+            'swap-suite-candidate-multi-row',
+            'Candidate Moving Several Lines',
+            [fixture.sharedFood, lateFood],
+            HEAVIER_PER_100G,
+        );
+
+        // The anchored day's own lines have to be on the list before the swap
+        // diffs it, so the list is rebuilt from the week as it now stands.
+        await writeInitialGroceryList(USER_ID, fixture.planId);
+
+        return { anchorFoods, lateFood, candidate };
+    };
+
+    it('applies a diff that moves several lines at once, and leaves every other line alone', async () => {
+        const { anchorFoods, lateFood, candidate } = await anchorTheWeek();
+
+        // Three check marks, each proving something different survives a write
+        // that never mentions `is_checked`: the row that goes UP (and is
+        // flagged), the row only the renumbering touches, and a row the diff
+        // reports unchanged.
+        const acknowledged = await checkGroceryLine(fixture.sharedFood);
+
+        await checkGroceryLine(fixture.unchangedFood);
+        await checkGroceryLine(anchorFoods[0]);
+
+        const anchoredBefore = (await storedGroceryRows()).filter((row) =>
+            anchorFoods.some((food) => food.id === row.catalog_food_id),
+        );
+
+        expect(anchoredBefore).toHaveLength(anchorFoods.length);
+
+        const before = new Date();
+        const body = await commitSwapOrThrow(swapBody(candidate.id, 1));
+        const after = new Date();
+
+        // One line arrives (the late-sorting food), one leaves (nothing plans it
+        // now), one went up — and three rows were written by the single
+        // statement: the shared line, the decreased line, and the unchanged line
+        // whose `sort_order` the removal moved.
+        expect(body.groceryChangeSummary).toEqual({ added: 1, removed: 1, increased: 1 });
+
+        const shared = await requireGroceryRowFor(fixture.sharedFood);
+        const decreased = await requireGroceryRowFor(fixture.decreasingFood);
+        const renumbered = await requireGroceryRowFor(fixture.unchangedFood);
+        const arrived = await requireGroceryRowFor(lateFood);
+
+        // Anchor Beets 0, Anchor Greens 1, Decreasing Lentils 2, Shared Beans 3,
+        // Unchanged Greens 4, Zesty Peppers 5 — aisle then name, with Removed
+        // Squash gone from the middle of it.
+        expect(grams(shared.quantity_grams)).toBe(GRAMS_PER_MEAL * 2);
+        expect(shared.display_quantity).toBe(TWO_MEAL_MASS_QUANTITY);
+        expect(shared.display_unit).toBe('oz');
+        expect(shared.display_text).toBe(TWO_MEAL_MASS_TEXT);
+        expect(shared.name).toBe(fixture.sharedFood.display_name);
+        expect(shared.category).toBe(PRODUCE_CATEGORY);
+        expect(shared.sort_order).toBe(3);
+        expect(shared.is_checked).toBe(true);
+        expect(grams(shared.previous_quantity_grams)).toBe(GRAMS_PER_MEAL);
+        bracketed(shared.flagged_at, before, after);
+
+        expect(grams(decreased.quantity_grams)).toBe(GRAMS_PER_MEAL);
+        expect(decreased.display_quantity).toBe(ONE_MEAL_MASS_QUANTITY);
+        expect(decreased.display_text).toBe(ONE_MEAL_MASS_TEXT);
+        expect(decreased.name).toBe(fixture.decreasingFood.display_name);
+        expect(decreased.category).toBe(PRODUCE_CATEGORY);
+        expect(decreased.sort_order).toBe(2);
+        expect(decreased.is_checked).toBe(false);
+        expect(decreased.previous_quantity_grams).toBeNull();
+        expect(decreased.flagged_at).toBeNull();
+
+        // Only the renumbering moved this one, so its amount and its text are
+        // the ones it already had — and its check mark is still set.
+        expect(grams(renumbered.quantity_grams)).toBe(GRAMS_PER_MEAL * 2);
+        expect(renumbered.display_text).toBe(TWO_MEAL_MASS_TEXT);
+        expect(renumbered.sort_order).toBe(4);
+        expect(renumbered.is_checked).toBe(true);
+        expect(renumbered.flagged_at).toBeNull();
+
+        expect(grams(arrived.quantity_grams)).toBe(GRAMS_PER_MEAL);
+        expect(arrived.sort_order).toBe(5);
+        expect(arrived.is_checked).toBe(false);
+        expect(await groceryRowFor(fixture.removedFood)).toBeUndefined();
+
+        // Byte-identical, every column included: the two anchored lines are not
+        // in the diff's updates, so no part of the one statement may reach them.
+        const anchoredAfter = (await storedGroceryRows()).filter((row) =>
+            anchorFoods.some((food) => food.id === row.catalog_food_id),
+        );
+
+        expect(anchoredAfter).toEqual(anchoredBefore);
+
+        // And the flag the statement wrote reads back through the DTO intact:
+        // "was" is the amount the shopper acknowledged, "now" is the row's own
+        // text, the delta is positive, and the instant is the stored one to the
+        // millisecond.
+        const listed = requireListedItemFor(await readGroceryList(), fixture.sharedFood);
+
+        expect(listed.flag?.previousDisplayText).toBe(acknowledged.displayText);
+        expect(listed.flag?.previousDisplayText).toBe(ONE_MEAL_MASS_TEXT);
+        expect(listed.flag?.newDisplayText).toBe(TWO_MEAL_MASS_TEXT);
+        expect(listed.flag?.deltaDisplayText).toBe('+3.6 oz');
+        expect(listed.flag?.flaggedAt).toBe((shared.flagged_at as Date).toISOString());
+    });
+
+    it('issues one statement for a diff of several rows, and none for a diff with nothing to update', async () => {
+        // Checked first, so the doubling below has a flag to raise: the instant
+        // it is raised at is the value the `::timestamp(3)` round trip is
+        // measured by.
+        await checkGroceryLine(fixture.sharedFood);
+
+        const before = await storedGroceryRows();
+        const recorded: Prisma.Sql[] = [];
+
+        await prisma.$transaction(async (tx) => {
+            // The same week twice over: every line's amount doubles, so every
+            // stored row is an update and nothing is inserted or removed — a
+            // multi-row diff with no other kind of write in it.
+            const meals = await loadPlannedMealsForGroceries(tx, USER_ID, fixture.planId);
+            const doubled = [...meals, ...meals];
+            const recording = recordingTransaction(tx, recorded);
+            const rebuild = {
+                userId: USER_ID,
+                planId: fixture.planId,
+                meals: doubled,
+                now: FLAG_INSTANT,
+            };
+
+            expect(await rebuildPlanGroceries(recording, rebuild)).toEqual({
+                added: 0,
+                removed: 0,
+                increased: DOUBLED_WEEK_UPDATE_COUNT,
+            });
+
+            // ONE statement for four changed rows, carrying every one of their
+            // ids as a bound parameter.
+            expect(recorded).toHaveLength(1);
+            expect(recorded[0].text).toContain('UPDATE grocery_items');
+            expect(recorded[0].text).toContain('FROM (VALUES');
+
+            for (const row of before) {
+                expect(recorded[0].values).toContain(row.id);
+            }
+
+            // Run again against the same week and the diff has nothing to
+            // update, so no statement is issued at all — `Prisma.join` is never
+            // handed an empty list and the lock is held for no extra round trip.
+            expect(await rebuildPlanGroceries(recording, rebuild)).toEqual({
+                added: 0,
+                removed: 0,
+                increased: 0,
+            });
+            expect(recorded).toHaveLength(1);
+        });
+
+        const after = await storedGroceryRows();
+
+        expect(after).toHaveLength(before.length);
+
+        for (const [index, row] of after.entries()) {
+            // The write really landed, on every row, through that one statement.
+            expect(grams(row.quantity_grams)).toBe((grams(before[index].quantity_grams) as number) * 2);
+            expect(row.is_checked).toBe(before[index].is_checked);
+            expect(row.checked_at).toEqual(before[index].checked_at);
+        }
+
+        // The flagged row's instant is the injected one to the millisecond,
+        // which is the `TIMESTAMP(3)` round trip the statement's cast promises.
+        const flagged = await requireGroceryRowFor(fixture.sharedFood);
+
+        expect((flagged.flagged_at as Date).toISOString()).toBe(FLAG_INSTANT.toISOString());
+        expect(grams(flagged.previous_quantity_grams)).toBe(GRAMS_PER_MEAL);
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * A logged, then twice-swapped slot — the A → B → C chain
  *
  * The one case that separates "logged-then-swapped" derived from the ENTRIES
@@ -2228,6 +2678,184 @@ describe('a slot that was logged and then swapped twice', () => {
  * is the local proof for the NESTED shape these three endpoints have, where a
  * plan id and a meal id can be owned by different people.
  * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * A malformed id in the NESTED path
+ *
+ * All three endpoints carry `:planId` and `:mealId`, and the preview a third id
+ * as well. Only `recipeVersionId` was covered malformed above, which leaves the
+ * two PARENT ids — the ones every request to this family carries — untested on
+ * every one of the three.
+ *
+ * WHY THIS IS NOT COSMETIC. A non-UUID reaching a `where: { id }` predicate on a
+ * `uuid` column is a PostgreSQL cast error, so the alternative to a parsed
+ * refusal is a `500` with a driver message where §0.5.2 promises a `400
+ * invalid_request` naming the field — and on the commit it is a `500` on a WRITE
+ * path, where the ledger reservation and `buildRequestFingerprint` are already
+ * in motion. That is why each of `swap.logic.ts`'s three parsers runs as the
+ * FIRST statement of its service entry point, before any I/O.
+ *
+ * WHAT EACH CASE PINS. The exact body, including the ORDER of `details`: the
+ * parsers judge every id rather than short-circuiting on the first, and they
+ * report them in PATH order (`planId`, then `mealId`, then `recipeVersionId`),
+ * so one round trip fixes a request with two bad ids and the client renders its
+ * inline errors in the order the request reads. The commit adds the body's own
+ * fields AFTER the path's, in one verdict.
+ *
+ * AND THAT NOTHING MOVED. A refusal that had already reserved the key would be
+ * indistinguishable from this one at the status line, and it would leave the key
+ * unusable — so every case re-reads the meal, the day, the plan, the grocery
+ * rows and the ledger. `requestParserWiring.test.ts` makes the same point about
+ * the service entry points with no database at all; this is the HTTP half, with
+ * one.
+ * ------------------------------------------------------------------------- */
+
+describe('a malformed id in the nested path', () => {
+    /** Not a UUID in any version, and not an id the routes could ever mint. */
+    const MALFORMED_ID = 'not-a-uuid';
+
+    const PLAN_ID_DETAIL: InvalidRequestDetail = { field: 'planId', code: 'invalid_id' };
+    const MEAL_ID_DETAIL: InvalidRequestDetail = { field: 'mealId', code: 'invalid_id' };
+    const RECIPE_VERSION_ID_DETAIL: InvalidRequestDetail = { field: 'recipeVersionId', code: 'invalid_id' };
+
+    /** What any of the three requests resolves to, so one table can hold all three. */
+    type SwapResponse = Awaited<ReturnType<typeof getAlternatives>>;
+
+    /** A case name, the request it sends, and the details it must be answered with. */
+    type MalformedPathCase = [string, () => PromiseLike<SwapResponse>, InvalidRequestDetail[]];
+
+    /**
+     * Everything these requests must not have touched.
+     *
+     * Whole rows rather than revisions alone: a parse that had reached the
+     * database could have written `swapped_at`, `flags` or the day's stored
+     * totals without moving a revision at all.
+     */
+    const untouchedState = async () => ({
+        lunch: await storedLunch(),
+        day: await storedDay(),
+        plan: await storedPlan(),
+        groceries: await storedGroceryRows(),
+    });
+
+    const cases: MalformedPathCase[] = [
+        [
+            'the alternatives read with a malformed planId',
+            () => getAlternatives({ planId: MALFORMED_ID }),
+            [PLAN_ID_DETAIL],
+        ],
+        [
+            'the alternatives read with a malformed mealId',
+            () => getAlternatives({ mealId: MALFORMED_ID }),
+            [MEAL_ID_DETAIL],
+        ],
+        [
+            'the alternatives read with both path ids malformed',
+            () => getAlternatives({ planId: MALFORMED_ID, mealId: MALFORMED_ID }),
+            [PLAN_ID_DETAIL, MEAL_ID_DETAIL],
+        ],
+        [
+            'the preview with a malformed planId',
+            () => getPreview(fixture.equalPortionCandidate.id, { planId: MALFORMED_ID }),
+            [PLAN_ID_DETAIL],
+        ],
+        [
+            'the preview with a malformed mealId',
+            () => getPreview(fixture.equalPortionCandidate.id, { mealId: MALFORMED_ID }),
+            [MEAL_ID_DETAIL],
+        ],
+        [
+            'the preview with both parent ids malformed',
+            () => getPreview(fixture.equalPortionCandidate.id, { planId: MALFORMED_ID, mealId: MALFORMED_ID }),
+            [PLAN_ID_DETAIL, MEAL_ID_DETAIL],
+        ],
+        [
+            // All three of the preview's ids at once, which is the only case
+            // that shows `recipeVersionId` is reported LAST rather than first —
+            // the order the path is read in, not the order the parser happens to
+            // check in.
+            'the preview with all three ids malformed',
+            () => getPreview(MALFORMED_ID, { planId: MALFORMED_ID, mealId: MALFORMED_ID }),
+            [PLAN_ID_DETAIL, MEAL_ID_DETAIL, RECIPE_VERSION_ID_DETAIL],
+        ],
+        [
+            'the commit with a malformed planId',
+            () => postSwap(swapBody(fixture.equalPortionCandidate.id, 1), { planId: MALFORMED_ID }),
+            [PLAN_ID_DETAIL],
+        ],
+        [
+            'the commit with a malformed mealId',
+            () => postSwap(swapBody(fixture.equalPortionCandidate.id, 1), { mealId: MALFORMED_ID }),
+            [MEAL_ID_DETAIL],
+        ],
+        [
+            'the commit with both path ids malformed',
+            () =>
+                postSwap(swapBody(fixture.equalPortionCandidate.id, 1), {
+                    planId: MALFORMED_ID,
+                    mealId: MALFORMED_ID,
+                }),
+            [PLAN_ID_DETAIL, MEAL_ID_DETAIL],
+        ],
+        [
+            // The path AND the body wrong together, which is what makes the
+            // commit's single-verdict parse observable: a portion outside the
+            // offered set is reported BESIDE the two path ids and after them,
+            // rather than the caller being sent back twice.
+            'the commit with both path ids and the portion malformed',
+            () =>
+                postSwap(swapBody(fixture.equalPortionCandidate.id, 1.1), {
+                    planId: MALFORMED_ID,
+                    mealId: MALFORMED_ID,
+                }),
+            [PLAN_ID_DETAIL, MEAL_ID_DETAIL, { field: 'portionMultiplier', code: 'unknown_value' }],
+        ],
+    ];
+
+    it.each(cases)('answers %s with 400 invalid_request naming every bad id', async (_case, send, details) => {
+        const before = await untouchedState();
+
+        const response = await send();
+
+        // The whole body, in order: `expectRefusal` would accept `details` in
+        // any arrangement, and the arrangement is part of the contract here.
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({ error: 'invalid_request', details });
+
+        // Parsed before any I/O, so there is nothing to have half-written: the
+        // meal, the day, the plan and the shopping list are the rows this suite
+        // seeded, and the commit's key never reached the ledger.
+        expect(await untouchedState()).toEqual(before);
+        expect(await ledgerRowsFor(SWAP_KEY)).toHaveLength(0);
+        expect(await prisma.meal_plan_actions.count()).toBe(0);
+    });
+
+    it('never answers a malformed parent id as a 404, a 422 or a 500', async () => {
+        // The three answers a malformed id would produce if it were NOT parsed
+        // and the reason each would be wrong: a `404` (the plan read missed)
+        // tells a client its plan is gone when it merely built a bad URL, a
+        // `422 recipe_ineligible` tells it the meal no longer fits, and a `500`
+        // is the PostgreSQL cast error surfacing with no field named at all.
+        const answers = await Promise.all([
+            getAlternatives({ planId: MALFORMED_ID }),
+            getAlternatives({ mealId: MALFORMED_ID }),
+            getPreview(fixture.equalPortionCandidate.id, { planId: MALFORMED_ID }),
+            getPreview(fixture.equalPortionCandidate.id, { mealId: MALFORMED_ID }),
+            postSwap(swapBody(fixture.equalPortionCandidate.id, 1), { planId: MALFORMED_ID }),
+            postSwap(swapBody(fixture.equalPortionCandidate.id, 1), { mealId: MALFORMED_ID }),
+        ]);
+
+        expect(answers.map((answer) => answer.status)).toEqual([400, 400, 400, 400, 400, 400]);
+
+        for (const answer of answers) {
+            // And the refusal says nothing about the schema or the driver that
+            // produced it — the id is named, the table is not (Rule §4).
+            const serialised = JSON.stringify(answer.body);
+
+            expect(serialised).not.toMatch(/PrismaClient|Invalid `|uuid|meal_plan|at Object\./i);
+        }
+    });
+});
 
 describe('ownership and the capability gate', () => {
     it('answers every one of the three endpoints 503 while the feature is off', async () => {

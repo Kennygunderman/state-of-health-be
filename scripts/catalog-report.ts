@@ -6,15 +6,29 @@
 //   data/meal-planning/reports/latest/validation-report.json
 //       one machine-readable record per PUBLISHED food — its identity, the
 //       provenance of its nutrition, the portions and the identity evidence
-//       behind it, and every check with the value observed and the bound that
-//       observation was measured against — plus the three-tier rollup and the
-//       per-category quarantine counts over the same rows.
+//       behind it, every check with the value observed and the bound that
+//       observation was measured against, and for every vocabulary check the
+//       item does NOT record, the reason its own facts show it could not be
+//       evaluated — plus the three-tier rollup, the per-category quarantine
+//       counts over the same rows, and the withheld-identity audit that names
+//       every candidate, quarantined and rejected row the catalog held back.
 //
 //   data/meal-planning/reports/latest/import-report.json
 //       the aggregate half only: counts by category, identity source and
-//       nutrition provenance, the duplicate and quarantine figures, the
-//       coverage gaps, and the EXACT per-category shortfall. Every other field
-//       in that file belongs to `catalog:import` and is preserved untouched.
+//       nutrition provenance, the duplicate and quarantine figures, the same
+//       withheld-identity audit, the coverage gaps, and the EXACT per-category
+//       shortfall. Every other field in that file belongs to `catalog:import`
+//       and is preserved untouched.
+//
+// WHY A CLAIM IN THIS FILE IS ALWAYS COMPUTED. Two kinds of statement can be
+// wrong in an evidence artefact: a measurement that disagrees with the rows,
+// and a CLAIM ABOUT the measurements that nothing checked. The second is the
+// more dangerous, because it reads as a conclusion. So every such claim here —
+// that every published item accounts for every check, that the whole list of
+// withheld identities is present, that a category met its target — is derived
+// from the counters beside it and states the unmet case when it does not hold.
+// The superseded-key prune below exists for the same reason: a claim an earlier
+// producer wrote must not survive into a document whose data contradicts it.
 //
 // THIS STAGE IS READ-ONLY. It is the evidence stage, and evidence that could
 // alter its subject is not evidence. There is no `create`, `update`, `upsert`,
@@ -39,11 +53,36 @@
 // is excluded from every published count — so if the two disagree, one of them
 // is understating or overstating the distance between the catalog and the plan,
 // and a shortfall is the one number in this pipeline that must never be
-// negotiable. The run therefore writes the validation report, reads its
-// quarantine block back off disk, compares it with the figures bound for the
-// import report, and REFUSES to write the second artefact if they differ,
-// naming both numbers. Inconsistent evidence is worse than none: it is wrong
-// and it looks authoritative.
+// negotiable. The run therefore writes the validation report to a STAGING
+// file, reads its quarantine block back off that file, compares it with the
+// figures bound for the import report, and REFUSES to publish either artefact
+// if they differ, naming both numbers. Inconsistent evidence is worse than
+// none: it is wrong and it looks authoritative.
+//
+// WHY BOTH ARTEFACTS ARE STAGED AND PUBLISHED AS ONE SET. The pair is only
+// evidence together: the aggregate figures in one are reconciled against the
+// per-item records in the other, so a run that replaced the first file and
+// then failed would leave a reconciled half beside an unreconciled half — or,
+// worse, a validation report truncated mid-item that still looks like JSON to
+// a reader who does not reach its end. Both documents are therefore written to
+// hidden sibling staging files, checked for completeness, and renamed over
+// their canonical paths back to back at the very end; any failure before that
+// point discards the staging files and leaves the PREVIOUS pair exactly as it
+// was. The whole run holds an exclusive publication lock on the output
+// directory, so the import and generation stages — which own the other half of
+// `import-report.json` — cannot write into it between this run's read of that
+// file and its promotion of the merged result.
+//
+// WHY BOTH PASSES RUN IN ONE SNAPSHOT. The aggregate figures come from one
+// scan of `catalog_foods` and the per-item records from a second, and the two
+// numbers they produce are reconciled against each other. Two passes over a
+// catalog that a concurrent `catalog:load` or `catalog:validate` is changing
+// would reconcile figures taken from two different states — the drift would be
+// small, plausible and undetectable. `main()` therefore opens a REPEATABLE
+// READ transaction and both passes read through it, and the run then asserts
+// that the number of per-item records emitted equals the number of published
+// rows the aggregate pass counted. The snapshot makes the two passes agree; the
+// assertion is what proves they did.
 //
 // A shortfall against the 10,000 accepted-item requirement is reported exactly
 // and stated as an unmet requirement. It is never rounded, smoothed against a
@@ -67,8 +106,20 @@ import path from 'path';
 import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
 import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
 import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
-import { ManifestError, loadCoveragePlan, loadEvidenceAllowlist, reportPath } from './lib/manifest';
-import type { CatalogFoodState, CoveragePlan } from './lib/manifest';
+import {
+    MERGED_REPORT_COMPOUND_BLOCKS,
+    ManifestError,
+    discardStagedArtifacts,
+    loadCoveragePlan,
+    loadEvidenceAllowlist,
+    mergeStageReport,
+    promoteStagedArtifacts,
+    reportPath,
+    stageJsonArtifact,
+    stagingPathFor,
+    withArtifactPublicationLock,
+} from './lib/manifest';
+import type { CatalogFoodState, CoveragePlan, StagedArtifact } from './lib/manifest';
 
 // The decode half of the storage rule `catalog-validate` writes under:
 // `nutrition_assumptions` is a JSON-encoded array in a TEXT column. Imported
@@ -81,6 +132,7 @@ import { parseStoredAssumptions } from './catalog-validate';
 // food state resolve to (Rule backend-architecture §1.2 and §7 — pure
 // functions decide, the aggregation loop and the file writing orchestrate).
 import {
+    CATALOG_CHECK_NAMES,
     CATALOG_QUARANTINE_CHECK_NAMES,
     CATALOG_REJECT_CHECK_NAMES,
     CATALOG_REVIEW_CHECK_NAMES,
@@ -118,10 +170,67 @@ const REQUIRED_PUBLISHED_ITEMS = 10000;
  * the whole set. */
 const PAGE_SIZE = 500;
 
+/**
+ * The isolation both passes read through.
+ *
+ * REPEATABLE READ rather than SERIALIZABLE: the run only reads, so it needs a
+ * stable snapshot and not conflict detection, and on PostgreSQL REPEATABLE
+ * READ gives every statement in the transaction the same snapshot taken at the
+ * first one — which is exactly the guarantee the aggregate pass and the
+ * per-item pass need to be reconcilable. SERIALIZABLE would add
+ * serialisation-failure retries to a read-only report for no benefit.
+ *
+ * Recorded in the artefact (`siblingReconciliation.validationReport`), so the
+ * evidence states the condition under which its two halves were measured.
+ */
+export const REPORT_SNAPSHOT_ISOLATION = 'RepeatableRead';
+
+/**
+ * How long the snapshot may be held, and how long the run waits for a
+ * connection to open it.
+ *
+ * The timeout has to cover BOTH passes and the serialisation of a
+ * tens-of-megabytes document, because the per-item pass streams as it scans —
+ * that interleaving is what bounds memory, and it is why the transaction spans
+ * the write rather than only the reads. Thirty minutes is far beyond the
+ * minute or two a full catalog takes and is a liveness bound, not a budget: a
+ * run that hits it has lost its snapshot, and `report_snapshot_failed` says so
+ * rather than letting two passes describe two states.
+ */
+const REPORT_SNAPSHOT_TIMEOUT_MS = 30 * 60 * 1000;
+const REPORT_SNAPSHOT_MAX_WAIT_MS = 30 * 1000;
+
 /** The publication status whose rows carry the per-item evidence records. */
 const PUBLISHED = 'published';
 const QUARANTINED = 'quarantined';
 const REJECTED = 'rejected';
+/** `catalog_foods.identity_source` for a row generation proposed. */
+const AI_GENERATED_IDENTITY_SOURCE = 'ai_generated';
+const CANDIDATE = 'candidate';
+
+/**
+ * The three statuses a row can hold that mean "the catalog withheld it", in the
+ * order the audit reports them.
+ *
+ * `retired` is deliberately not one of them: a retired row WAS published by an
+ * earlier release and is still referenceable, so filing it under "withheld"
+ * would misreport a row that was never held back. It is counted per category on
+ * every category row like the other statuses.
+ */
+const WITHHELD_STATUSES: readonly string[] = [CANDIDATE, QUARANTINED, REJECTED];
+
+/**
+ * The most identities the audit collects PER STATUS.
+ *
+ * A cap is needed because the identities are held in memory across the whole
+ * scan, and a catalog that quarantined everything would otherwise size this
+ * stage by the table rather than by the evidence. It is not a silent
+ * truncation: the per-status totals beside the list are measured from every row
+ * scanned, the cap itself is emitted as `identityCap`, and the number of
+ * identities it left out is emitted as `identitiesOmittedByCap` in the same
+ * block — so a reader can always tell a complete list from a capped one.
+ */
+const WITHHELD_IDENTITY_LIMIT = 5000;
 
 /** Named because the read-back that reconciles the two artefacts slices the
  * document at exactly this key (see `reconcileQuarantineFigures`). */
@@ -144,7 +253,21 @@ export type CatalogReportErrorCode =
     | 'quarantine_reconciliation_failed'
     | 'unknown_category_filter'
     | 'scoped_report_needs_out_dir'
-    | 'report_unreadable';
+    | 'report_unreadable'
+    /**
+     * The per-item records emitted do not number what the aggregate pass
+     * measured. Under one snapshot the two passes see one catalog, so a
+     * disagreement means the report is not describing a single state — and a
+     * report that states one published total and evidences a different number
+     * of items is exactly the artefact a reviewer cannot use.
+     */
+    | 'item_count_mismatch'
+    /**
+     * The snapshot the two passes share could not be opened or could not be
+     * held for the whole run (a transaction timeout, a lost connection). The
+     * run produces nothing rather than two passes over two different states.
+     */
+    | 'report_snapshot_failed';
 
 export class CatalogReportError extends Error {
     constructor(
@@ -285,12 +408,15 @@ export const describeUsage = (): string =>
         '',
         'Options:',
         '  --category <code>  Report one coverage-plan category instead of the whole',
-        '                     catalog. A scoped report is partial evidence, so it also',
-        '                     requires --out and will not overwrite the committed',
-        '                     full-catalog artefacts.',
+        '                     catalog. A scoped report is partial evidence, so it',
+        '                     requires an --out directory OUTSIDE the committed report',
+        '                     directory: the run is refused when its output resolves to',
+        '                     that directory or inside it, whether --out was omitted or',
+        '                     pointed there explicitly.',
         '  --out <dir>        Write the artefacts to this directory instead of the',
         '                     default. A relative path resolves against the backend',
-        '                     package root.',
+        '                     package root, and symlinks are resolved before the',
+        '                     scoped-report check above.',
         `                     Default: data/meal-planning/reports/latest`,
         '  --help, -h         Print this usage block and exit 0.',
         '',
@@ -302,6 +428,15 @@ export const describeUsage = (): string =>
         '                             quarantine, coverage gaps and the exact',
         "                             shortfall. The import stage's own fields are",
         '                             merged into, never overwritten',
+        '',
+        'How they are written:',
+        '  Both documents are staged beside their canonical paths, reconciled against',
+        '  each other, and then renamed into place back to back, holding an exclusive',
+        '  publication lock on the output directory. A failure at any point leaves the',
+        '  previous pair exactly as it was, so a failed run produces no evidence rather',
+        '  than half-replaced evidence. Both passes over catalog_foods read through one',
+        `  ${REPORT_SNAPSHOT_ISOLATION} snapshot, and the run refuses to publish unless the number of`,
+        '  per-item records equals the number of published rows it counted.',
         '',
         'Inputs read:',
         `  ${COVERAGE_PLAN_RELATIVE_PATH}   the per-category published`,
@@ -328,6 +463,109 @@ const writeUsage = (level: LogLevel): void => {
  */
 export const resolveOutDir = (out: string | null): string =>
     out === null ? path.dirname(reportPath(VALIDATION_REPORT_FILE)) : path.resolve(__dirname, '..', out);
+
+/** The directory holding the committed whole-catalog artefacts. */
+export const canonicalReportDirectory = (): string => path.dirname(reportPath(VALIDATION_REPORT_FILE));
+
+/**
+ * Resolves `absolutePath` through any symlink on it, as far as the path exists.
+ *
+ * Needed because the scoped-report guard below compares two directories, and a
+ * lexical comparison alone can be walked around: a symlink, a bind mount or a
+ * case-insensitive filesystem can name the committed report directory without
+ * spelling it. Resolution stops at the deepest ancestor that exists and the
+ * remaining segments are appended lexically, so the guard also works for an
+ * `--out` directory the run has not created yet.
+ */
+export const canonicalizeDirectoryPath = (absolutePath: string): string => {
+    const resolved = path.resolve(absolutePath);
+    const trailing: string[] = [];
+    let existing = resolved;
+
+    while (!fs.existsSync(existing)) {
+        const parent = path.dirname(existing);
+        if (parent === existing) {
+            // Reached the filesystem root without finding anything that
+            // exists: there is nothing to resolve, so the lexical form is the
+            // best answer available and the guard still compares two absolute
+            // paths.
+            return resolved;
+        }
+        trailing.unshift(path.basename(existing));
+        existing = parent;
+    }
+
+    let realExisting: string;
+    try {
+        realExisting = fs.realpathSync(existing);
+    } catch (error) {
+        // A path that exists but cannot be resolved (a permission boundary on
+        // an ancestor) is reported as its lexical form rather than failing the
+        // run: the guard then compares lexically, which is weaker but never
+        // wrong in the permissive direction for the paths this stage writes.
+        logger.warn('out_dir_realpath_unavailable', {
+            stage: STAGE,
+            path: existing,
+            error: safeError(error),
+        });
+        realExisting = existing;
+    }
+
+    return trailing.length === 0 ? realExisting : path.join(realExisting, ...trailing);
+};
+
+/**
+ * Whether `resolvedOutDir` IS the canonical report directory or sits inside it.
+ *
+ * Pure: both paths are arguments, already absolute and already resolved
+ * through their symlinks by the caller, so this decision is pinned by
+ * `src/__tests__/scripts/` without touching a filesystem (Rule
+ * backend-architecture §1.2, §11).
+ */
+export const writesIntoCanonicalReportDirectory = (resolvedOutDir: string, canonicalDir: string): boolean => {
+    const out = path.resolve(resolvedOutDir);
+    const canonical = path.resolve(canonicalDir);
+    if (out === canonical) {
+        return true;
+    }
+    const relative = path.relative(canonical, out);
+    return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+};
+
+/**
+ * The refusal a `--category` run earns when its artefacts would land on the
+ * committed whole-catalog pair, or `null` when the output directory is safe.
+ *
+ * A scoped run measures ONE category: its `coverage`, `requirement`,
+ * `shortfall` and per-item records cover that category alone. Published at the
+ * canonical paths those figures would read exactly like whole-catalog evidence
+ * — same file names, same shape, same `reportVersion` — while understating the
+ * catalog by every other category. So the destination is checked, not merely
+ * the presence of the flag: omitting `--out` and passing the canonical
+ * directory as `--out` produce the same artefacts in the same place, and a
+ * guard that only asks whether the flag was given refuses one and waves the
+ * other through.
+ */
+export const scopedReportRefusal = (input: {
+    readonly category: string;
+    readonly out: string | null;
+    readonly resolvedOutDir: string;
+    readonly canonicalReportDir: string;
+}): string | null => {
+    if (!writesIntoCanonicalReportDirectory(input.resolvedOutDir, input.canonicalReportDir)) {
+        return null;
+    }
+
+    const destination =
+        input.out === null ? 'the default report directory' : `--out ${input.out} (resolved to ${input.resolvedOutDir})`;
+
+    return (
+        `--category ${input.category} produces partial evidence, so it must not be written to the committed report ` +
+        `directory ${input.canonicalReportDir}. This run would write it there through ${destination}, replacing the ` +
+        `whole-catalog ${VALIDATION_REPORT_FILE} and the aggregate half of ${IMPORT_REPORT_FILE} with a single ` +
+        "category's figures under the same file names. Pass --out <dir> pointing outside that directory."
+    );
+};
 
 // ---------------------------------------------------------------------------
 // Determinism helpers.
@@ -437,10 +675,26 @@ export interface ReportFoodRow {
     readonly identity_status: string;
     readonly nutrition_provenance: string;
     readonly nutrition_basis: string;
+    /**
+     * Read for the same reason `nutrition_basis` is: the two together are what
+     * decide whether the per-100 g normalisation had any arithmetic to do, and
+     * therefore whether `invalid_basis_amount` and `non_finite_computed_value`
+     * could have been recorded on this row at all (see
+     * {@link notApplicableChecksForItem}).
+     */
+    readonly basis_amount: number;
     readonly publication_status: string;
     readonly food_group: string;
     readonly usda_data_type: string | null;
     readonly catalog_validation_records: ValidationRecordRow | null;
+    /**
+     * The row's component count, measured rather than inferred from
+     * `nutrition_provenance`: the component checks
+     * (`empty_component_set`, `invalid_component_quantity`) are recorded only
+     * where a component set was derived, and "this food declares no components"
+     * is a fact about the table, not about the provenance label.
+     */
+    readonly _count: { readonly catalog_food_components: number };
 }
 
 /**
@@ -474,9 +728,11 @@ const FOOD_SELECTION = {
     identity_status: true,
     nutrition_provenance: true,
     nutrition_basis: true,
+    basis_amount: true,
     publication_status: true,
     food_group: true,
     usda_data_type: true,
+    _count: { select: { catalog_food_components: true } },
     catalog_validation_records: {
         select: {
             canonical_identity: true,
@@ -555,8 +811,145 @@ export interface QuarantinedIdentity {
     readonly displayName: string;
     readonly identitySource: string;
     readonly outcome: string | null;
+    /** The failed check names, sorted — the index into the evidence below. */
     readonly failingChecks: readonly string[];
+    /**
+     * The same failures with their observed value and bound, so the reason this
+     * row was withheld is readable without re-running the validator. Names
+     * sorted identically to {@link failingChecks}, and the audit asserts the two
+     * state the same set.
+     */
+    readonly failingCheckEvidence: readonly WithheldCheckEvidence[];
 }
+
+/**
+ * One withheld row's identity, for any of the three statuses that mean the
+ * catalog did not publish it.
+ *
+ * The same fields as a quarantined identity plus the status itself, because the
+ * audit lists all three together and "what was withheld and why" is unanswerable
+ * without saying which kind of withholding it was: a candidate is awaiting a
+ * judgement, a quarantined row is unusable until more data arrives, and a
+ * rejected row is never publishable. {@link CatalogMeasurement.quarantinedIdentities}
+ * is a VIEW of this one collection rather than a second pass over the rows, so
+ * the quarantine block and the audit can never disagree about the same row.
+ */
+export interface WithheldIdentity extends QuarantinedIdentity {
+    readonly publicationStatus: string;
+}
+
+/* ---------------------------------------------------------------------------
+ * WHETHER GENERATED CONTENT REACHED THE CATALOG, MEASURED
+ *
+ * `dataProvenance` carries a legal determination about the USDA data, which is
+ * why it is preserved rather than rewritten. Two of its keys are not legal
+ * facts though: one ASSERTS that no generated content is present and the other
+ * explains it with "no generation ran for this catalog". A generation stage
+ * that has since run writes its own counters into the same artefact, so those
+ * two sentences can end up standing beside 157 executed batches and several
+ * hundred generated rows and flatly contradicting them.
+ *
+ * So the question is measured instead, on both sides of the publication line:
+ * how many generated identities are PUBLISHED (the number that decides whether
+ * anything needs the estimate labelling the Agent Action Plan §0.7.3 requires),
+ * and how many were generated and WITHHELD, by the status withholding them.
+ * Zero published with hundreds withheld is a meaningful, checkable statement;
+ * "no generation ran" is neither, once one has.
+ * ------------------------------------------------------------------------- */
+
+export interface GeneratedContentPresence {
+    readonly publishedGeneratedFoods: number;
+    readonly withheldGeneratedRowsByStatus: Readonly<Record<string, number>>;
+    readonly withheldGeneratedRowsTotal: number;
+    readonly measuredFrom: string;
+    readonly labellingConsequence: string;
+    readonly statement: string;
+}
+
+/**
+ * Generated identities either side of the publication line.
+ *
+ * Pure, so the statement can be pinned by a unit test: it is the sentence a
+ * reader will take as the artefact's answer on whether an AI estimate is in
+ * front of a user.
+ *
+ * WHY IT TAKES COUNTERS AND NOT THE IDENTITY LIST. The withheld identity list
+ * is CAPPED at {@link WITHHELD_IDENTITY_LIMIT} per status, so counting
+ * generated rows by walking it would state a figure that silently stops at the
+ * cap while claiming to describe every withheld row — and would do so only on a
+ * catalog large enough for the cap to bite, which is precisely the catalog
+ * nobody can check by hand. `withheldByIdentitySourceAndStatus` is accumulated
+ * over every row the run scans, BEFORE the cap is applied, so the count here is
+ * the whole population by construction.
+ *
+ * `retired` is a withholding status like the other three: a previously published
+ * food a later release no longer carries. It is counted here when the scope
+ * scanned it, because a retired generated row is still in the database and still
+ * absent from the release, which is the distinction this block is drawing.
+ */
+export const generatedContentPresence = (
+    publishedByIdentitySource: Readonly<Record<string, number>>,
+    withheldByIdentitySourceAndStatus: Readonly<Record<string, Readonly<Record<string, number>>>>,
+): GeneratedContentPresence => {
+    const published = publishedByIdentitySource[AI_GENERATED_IDENTITY_SOURCE] ?? 0;
+    const withheldByStatus: Record<string, number> = {};
+    for (const [status, count] of Object.entries(withheldByIdentitySourceAndStatus[AI_GENERATED_IDENTITY_SOURCE] ?? {})) {
+        if (count > 0) {
+            withheldByStatus[status] = count;
+        }
+    }
+    const withheldTotal = Object.values(withheldByStatus).reduce((sum, count) => sum + count, 0);
+    // formatCount throughout, as everywhere else in this file: a five-figure
+    // count without separators reads as a different order of magnitude.
+    const describe = Object.keys(withheldByStatus)
+        .sort(compareStrings)
+        .map((status) => `${status} ${formatCount(withheldByStatus[status])}`);
+
+    return {
+        publishedGeneratedFoods: published,
+        withheldGeneratedRowsByStatus: sortedRecord(withheldByStatus),
+        withheldGeneratedRowsTotal: withheldTotal,
+        measuredFrom:
+            'catalog_foods.identity_source, counted over published rows and over every withheld row this run ' +
+            'scanned — accumulated as the rows are read, before the per-status cap on the listed identities, so ' +
+            'neither figure stops at that cap. Not read from a generation counter, so it states what is in the ' +
+            'catalog rather than what a run attempted.',
+        labellingConsequence:
+            published === 0
+                ? 'No generated identity is published, so no search row, recipe or diary entry in this release ' +
+                  'carries AI-estimated nutrition and the estimate labelling the Agent Action Plan requires has ' +
+                  'nothing to label. Recipe planning is unaffected either way: it admits source_backed ' +
+                  'ingredients only.'
+                : `${formatCount(published)} generated identity(ies) are published, so every one of them must carry an ` +
+                  'estimate label in search, in detail and in the diary, and none of them is eligible as a recipe ' +
+                  'ingredient.',
+        statement:
+            `${formatCount(published)} generated identity(ies) published; ${formatCount(withheldTotal)} ` +
+            `generated row(s) withheld` +
+            (describe.length === 0 ? '' : ` (${describe.join(', ')})`) +
+            '. A withheld row is in the database and counted here, but it is absent from the release, from search ' +
+            'and from recipe eligibility.',
+    };
+};
+
+/**
+ * The quarantine block's view of a withheld identity: the same facts without
+ * the status, which every entry in that block carries by construction.
+ *
+ * Written out field by field rather than by deleting a key, so the emitted
+ * shape is declared in one place and a new field on the audit cannot silently
+ * appear in the quarantine block.
+ */
+export const toQuarantinedIdentity = (identity: WithheldIdentity): QuarantinedIdentity => ({
+    sourceKey: identity.sourceKey,
+    category: identity.category,
+    foodState: identity.foodState,
+    displayName: identity.displayName,
+    identitySource: identity.identitySource,
+    outcome: identity.outcome,
+    failingChecks: identity.failingChecks,
+    failingCheckEvidence: identity.failingCheckEvidence,
+});
 
 export interface IdentityCollision {
     readonly canonicalName: string;
@@ -601,6 +994,12 @@ const MIRRORED_FIELDS: readonly {
  * dump; the count beside the list is the complete figure. */
 const MISMATCH_EXAMPLE_LIMIT = 20;
 
+/** Enough named items to act on an unexplained check gap — which is a pattern
+ * across a release rather than a per-item accident — without dumping the
+ * catalog. The per-name counts beside the list are exact, and the number of
+ * items the cap left unnamed is emitted with them. */
+const UNEXPLAINED_GAP_EXAMPLE_LIMIT = 20;
+
 export interface CategoryMeasurement {
     byPublicationStatus: Record<string, number>;
     publishedFoodStates: Record<string, number>;
@@ -629,10 +1028,48 @@ export interface CatalogMeasurement {
     readonly publishedItemsWithNoFailingCheck: number;
     readonly publishedItemsWithBothReviewFlags: number;
     readonly unrecognisedCheckNames: Record<string, number>;
+    /** Vocabulary check names per published item, as a distribution: how many
+     * items recorded how many names. Replaces the single scalar an aggregate
+     * can only state when every item happens to agree. */
+    readonly publishedRecordedChecksPerItem: Record<string, number>;
+    /** Not-applicable entries over the published items, counted by check name. */
+    readonly publishedNotApplicableByName: Record<string, number>;
+    /** The same entries counted by the stable reason code that explained them. */
+    readonly publishedNotApplicableByReasonCode: Record<string, number>;
+    /** Items whose recorded ∪ not-applicable names cover the whole vocabulary. */
+    readonly publishedItemsWithCompleteVocabulary: number;
+    /** Items carrying at least one absence no applicability rule explains. */
+    readonly publishedItemsWithUnexplainedGap: number;
+    /** Those unexplained absences counted by check name. */
+    readonly publishedUnexplainedByName: Record<string, number>;
+    /** Named examples of them, capped; the counts above are exact. */
+    readonly publishedUnexplainedExamples: readonly { readonly sourceKey: string; readonly names: readonly string[] }[];
+    readonly publishedUnexplainedExamplesOmitted: number;
     readonly quarantinedByCheck: Record<string, number>;
     readonly quarantinedByCategory: Record<string, number>;
     readonly rejectedByCheck: Record<string, number>;
+    readonly candidateByCheck: Record<string, number>;
     readonly quarantinedIdentities: readonly QuarantinedIdentity[];
+    /**
+     * Every candidate, quarantined and rejected row's identity, in one sorted
+     * collection — the audit that answers "what did the catalog withhold, and
+     * why" from the committed evidence alone.
+     */
+    readonly withheldIdentities: readonly WithheldIdentity[];
+    /**
+     * Identities the {@link WITHHELD_IDENTITY_LIMIT} cap left out, per status.
+     * Emitted beside every list this collection feeds, so a capped list is
+     * never mistaken for a complete one.
+     */
+    readonly withheldIdentitiesOmitted: Record<string, number>;
+    /**
+     * Every withheld row this run scanned, counted by `identity_source` and
+     * then by `publication_status` — accumulated BEFORE the cap above, so it is
+     * the whole withheld population however large it is. The identity list is
+     * evidence a reader inspects; this is the population a figure is derived
+     * from, and the two must not be confused (see generatedContentPresence).
+     */
+    readonly withheldByIdentitySourceAndStatus: Record<string, Record<string, number>>;
     readonly publishedWithoutValidationRecord: readonly string[];
     readonly publishedAliasRecords: number;
     readonly publishedEvidenceRecords: number;
@@ -645,12 +1082,64 @@ export interface CatalogMeasurement {
     readonly rowsWithValidationRecord: number;
 }
 
+/**
+ * One failed check as a withheld row's evidence states it: the name, the tier
+ * that decided the row's disposition, and the DATA behind the verdict.
+ *
+ * WHY THE NAME ALONE IS NOT ENOUGH. A withheld identity that says only
+ * `out_of_category_range` tells an operator which rule the row broke and
+ * nothing about how badly, or against what — so the row cannot be triaged, a
+ * bound cannot be re-examined, and the withholding cannot be checked without
+ * re-running the validator. `observed` and `bound` are already on every stored
+ * check (src/types/catalog.ts::CatalogValidationCheck) and they are exactly the
+ * non-sensitive judgement data: a kcal figure against a category range, a
+ * gram mass against a basis, a name against a pattern. Nothing in a check is
+ * user data — these tables have no `user_id` column at all — so carrying them
+ * into the evidence artefacts discloses nothing.
+ *
+ * `pass` is `false` on every entry, by construction: this projection is built
+ * only from checks the record states as failed. It is emitted anyway so a
+ * reader of one entry does not have to know that to read it.
+ */
+export interface WithheldCheckEvidence {
+    readonly name: string;
+    /** `'unrecognised'` where the stored name is outside the vocabulary. */
+    readonly tier: string;
+    readonly pass: false;
+    readonly observed: number | string | null;
+    readonly bound: number | string | null;
+}
+
 interface FailingCheckSummary {
     readonly names: readonly string[];
+    /**
+     * The same failures as {@link names}, with the observed value and bound
+     * each one recorded. Same order, so the two are read as one list.
+     */
+    readonly failing: readonly WithheldCheckEvidence[];
     readonly entries: number;
     readonly passed: number;
     readonly byTier: Readonly<Record<string, number>>;
 }
+
+/**
+ * A stored `observed` or `bound` as the artefact may carry it.
+ *
+ * The column is JSON, so the value can be anything the writer put there. A
+ * number or a string passes through; `null` is the honest value for a presence
+ * check that has neither; anything else — an object, an array, a boolean —
+ * becomes its JSON text rather than being dropped, because a value the reader
+ * cannot interpret is still better evidence than a silently missing one.
+ */
+const asCheckValue = (value: unknown): number | string | null => {
+    if (value === null || value === undefined) {
+        return null;
+    }
+    if (typeof value === 'number' || typeof value === 'string') {
+        return value;
+    }
+    return JSON.stringify(value);
+};
 
 const KNOWN_CHECK_NAMES: ReadonlySet<string> = new Set<string>([
     ...CATALOG_REJECT_CHECK_NAMES,
@@ -672,6 +1161,7 @@ const tierOfCheck = (name: string): string | null =>
 
 const summarizeChecks = (checks: unknown, unrecognised: Record<string, number>): FailingCheckSummary => {
     const names: string[] = [];
+    const failing: WithheldCheckEvidence[] = [];
     const byTier: Record<string, number> = {};
     let entries = 0;
     let passed = 0;
@@ -692,12 +1182,345 @@ const summarizeChecks = (checks: unknown, unrecognised: Record<string, number>):
             continue;
         }
         names.push(name);
+        // The judgement data beside the name, read from the record rather than
+        // re-derived: `observed` and `bound` are what the validator compared,
+        // and a report that re-computed them could disagree with the record it
+        // is describing.
+        failing.push({
+            name,
+            tier: tier ?? 'unrecognised',
+            pass: false,
+            observed: asCheckValue(record.observed),
+            bound: asCheckValue(record.bound),
+        });
         if (tier !== null) {
             increment(byTier, tier);
         }
     }
 
-    return { names, entries, passed, byTier };
+    return { names, failing, entries, passed, byTier };
+};
+
+// ---------------------------------------------------------------------------
+// Per-item check completeness.
+//
+// THE PROBLEM THIS SOLVES. The vocabulary has 23 names and a published item's
+// record carries only the checks the validator EVALUATED on it — a name whose
+// precondition the item does not meet is absent, not failed. Read without that
+// distinction, a record carrying a subset of the 23 looks like evidence with
+// holes in it, and a report that simply asserted "every item carries every
+// check" would be making a claim its own item records contradict.
+//
+// The distinction cuts both ways, and the second direction is the one that
+// bites: a check the validator DID evaluate must never be filed here as
+// inapplicable. See the four names deliberately absent from
+// CHECK_APPLICABILITY_RULES below.
+//
+// So the completeness claim is COMPUTED here instead: for every vocabulary name
+// absent from an item's record, either this item's own measured facts explain
+// why the check could not apply — and the explanation is emitted as evidence
+// beside the checks — or the absence is an UNEXPLAINED GAP and is named as one.
+// Nothing in here invents a pass, an observed value or a bound for a check the
+// validator did not evaluate: a not-applicable entry carries `applicable:
+// false` and a reason, and no verdict at all.
+// ---------------------------------------------------------------------------
+
+/**
+ * The volume basis, the one `nutrition_basis` value whose conversion consults a
+ * density (`missing_density`'s applicability rule below).
+ */
+const PER_100ML = 'per_100ml';
+
+const AI_GENERATED = 'ai_generated';
+const INGREDIENT_DERIVED = 'ingredient_derived';
+
+/**
+ * The keys a portion entry would carry if it stated per-serving nutrient values
+ * of its own — the second nutrient statement `portion_conversion_drift` needs
+ * in order to have anything to compare the per-100 g values against.
+ *
+ * Matched case- and separator-insensitively because the record's `portion_units`
+ * is whatever JSON the writing stage stored: the validator writes the storage
+ * casing, and an importer that carried a source's own per-serving block could
+ * write either.
+ */
+const PORTION_NUTRIENT_KEYS: ReadonlySet<string> = new Set<string>([
+    'calories',
+    'kcal',
+    'energy',
+    'protein',
+    'proteing',
+    'carbs',
+    'carbsg',
+    'carbohydrate',
+    'fat',
+    'fatg',
+    'fiber',
+    'fiberg',
+]);
+
+const normalizeKey = (key: string): string => key.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const statesPerServingNutrients = (entry: unknown): boolean => {
+    const record = asRecord(entry);
+    return record !== null && Object.keys(record).some((key) => PORTION_NUTRIENT_KEYS.has(normalizeKey(key)));
+};
+
+/**
+ * The measured facts about ONE published item that decide which checks could
+ * have applied to it.
+ *
+ * Every field is read off the item's own row or its own validation record —
+ * there is no catalog-wide value in here — because a reason derived from an
+ * aggregate ("no food in this release is ai_generated") would not be evidence
+ * about this item.
+ */
+export interface PublishedItemFacts {
+    readonly sourceKey: string;
+    readonly category: string;
+    readonly foodState: string;
+    readonly identitySource: string;
+    readonly nutritionProvenance: string;
+    readonly nutritionBasis: string;
+    readonly basisAmount: number;
+    /** Rows in `catalog_food_components` for this food. */
+    readonly componentRows: number;
+    /** Entries in the validation record's `portion_units`. */
+    readonly portionUnits: number;
+    /** Those entries that state per-serving nutrient values of their own. */
+    readonly portionUnitsStatingNutrients: number;
+    /** The check names the validator recorded on this item, as recorded. */
+    readonly recordedCheckNames: readonly string[];
+}
+
+/** One vocabulary name this item's facts show the validator could not evaluate. */
+export interface CheckNotApplicable {
+    readonly name: string;
+    readonly tier: string;
+    readonly applicable: false;
+    /** A stable code for aggregation; the prose beside it is item-specific. */
+    readonly reasonCode: string;
+    readonly reason: string;
+}
+
+export interface ItemCheckCompleteness {
+    /** Vocabulary names recorded on this item, sorted. */
+    readonly recorded: readonly string[];
+    /** Recorded names the vocabulary does not declare, sorted. */
+    readonly recordedOutsideVocabulary: readonly string[];
+    readonly notApplicable: readonly CheckNotApplicable[];
+    /** Absent names no applicability rule covers — the honest "we cannot explain this". */
+    readonly unexplained: readonly string[];
+    /** True only when recorded ∪ notApplicable covers the whole vocabulary. */
+    readonly complete: boolean;
+}
+
+/**
+ * One applicability rule: when the check COULD have been recorded, and the
+ * reason it could not be, written from the item's own facts.
+ *
+ * Held as data rather than as a chain of `if`s so the rule set can be read as a
+ * list, and so a name with no rule is visibly uncovered instead of falling
+ * through a final `else` into an invented explanation.
+ */
+interface CheckApplicabilityRule {
+    readonly applies: (facts: PublishedItemFacts) => boolean;
+    readonly reasonCode: string;
+    readonly reason: (facts: PublishedItemFacts) => string;
+}
+
+/**
+ * Why each rule is the rule, traced to the recording site in
+ * `src/services/catalog.logic.ts` — the module that owns the checks:
+ *
+ *  * `brand_pattern_name` is pushed only for an `ai_generated` candidate
+ *    (`validateCatalogCandidate`), because a USDA Branded record's brand was
+ *    asserted by the vendor rather than proposed by a model.
+ *  * `empty_component_set` and `invalid_component_quantity` are produced only
+ *    inside `deriveComponentNutrition`, which runs for an ingredient-derived
+ *    food's component set.
+ *  * `missing_density` is reachable only from the `per_100ml` branch of
+ *    `normalizeToPer100g`: millilitres become grams through the stored density,
+ *    and nothing else consults one.
+ *  * `portion_conversion_drift` returns `null` when the candidate states no
+ *    per-serving nutrition, or when no field could be compared
+ *    (`portionDriftCheck`). A stored row carries one nutrient statement on one
+ *    basis, so unless the record's portion entries carry per-serving values
+ *    there is nothing to compare.
+ *  * `default_portion_count` and `unsupported_portion` are both inside
+ *    `presenceChecks`' `portions.length > 0` guard, so a record stating no
+ *    portion at all is the only thing that can leave them out. They are
+ *    deliberately APPLICABLE to an item that does state portions: an item with
+ *    portions and no `default_portion_count` entry is a record written before
+ *    that check existed, and that is exactly what this helper must report as a
+ *    gap rather than explain away.
+ *
+ * FOUR NAMES DELIBERATELY HAVE NO RULE HERE, and their absence from this map is
+ * the point. `invalid_basis_amount` and `non_finite_computed_value` are
+ * EVALUATED by `normalizeToPer100g` on every candidate it converts — the basis
+ * test unconditionally, the finiteness guards on the basis mass, the rescale
+ * factor and every rescaled nutrient — and a published item is by definition
+ * one whose conversion succeeded. There is therefore no fact about a published
+ * item that could make either check inapplicable to it, and an earlier version
+ * of this map that claimed otherwise filed `applicable: false` against two
+ * checks that had in fact run and passed on all of them.
+ *
+ * They are now recorded as passes at the point the record is written
+ * (`scripts/catalog-validate.ts::recordedChecks`), so a current record carries
+ * both. A record that does NOT carry them is one written before that fix, and
+ * the honest report of it is an UNEXPLAINED gap — a record to re-validate —
+ * which is exactly what a name with no rule produces here.
+ *
+ * `unknown_tag_code` and `inconsistent_tag_set` are the other two, for the same
+ * reason arrived at from the other end. `tagVocabularyChecks` omits them when
+ * their inputs are unavailable — the first needs at least one of the two tag
+ * lists, the second needs both, because it is a statement about their agreement
+ * — so on a bare candidate either can legitimately be absent. But the stage
+ * that judges a stored row for publication is not a bare candidate:
+ * `scripts/catalog-validate.ts::candidateFromRow` supplies BOTH lists from the
+ * row (its `selection` names `allergen_tags` and `diet_tags`, and both columns
+ * are NOT NULL with a `[]` default — an omitted list is stored as the empty set
+ * it means, and an empty supplied list is an ANSWER the checks judge). Every
+ * record that stage writes therefore evaluates both, and no fact about a
+ * PUBLISHED item can make either inapplicable to it. A rule keyed on the stored
+ * lists being empty would be precisely the unfounded claim the paragraph above
+ * describes, since `[]` cannot be told apart from a list nobody supplied. A
+ * record lacking them predates the checks, and is reported as the gap it is.
+ */
+const CHECK_APPLICABILITY_RULES: Readonly<Record<string, CheckApplicabilityRule>> = {
+    [CATALOG_CHECK_NAMES.BRAND_PATTERN_NAME]: {
+        applies: (facts) => facts.identitySource === AI_GENERATED,
+        reasonCode: 'identity_source_is_not_ai_generated',
+        reason: (facts) =>
+            `the generated-name screen runs only on an ${AI_GENERATED} candidate; this item's identity_source is ` +
+            `"${facts.identitySource}"`,
+    },
+    [CATALOG_CHECK_NAMES.EMPTY_COMPONENT_SET]: {
+        applies: (facts) => facts.componentRows > 0 || facts.nutritionProvenance === INGREDIENT_DERIVED,
+        reasonCode: 'no_component_set_was_derived',
+        reason: (facts) =>
+            `component nutrition is derived only for an ${INGREDIENT_DERIVED} food; this item declares ` +
+            `${formatCount(facts.componentRows)} component row(s) and its nutrition_provenance is ` +
+            `"${facts.nutritionProvenance}"`,
+    },
+    [CATALOG_CHECK_NAMES.INVALID_COMPONENT_QUANTITY]: {
+        applies: (facts) => facts.componentRows > 0 || facts.nutritionProvenance === INGREDIENT_DERIVED,
+        reasonCode: 'no_component_set_was_derived',
+        reason: (facts) =>
+            `a component quantity can only be judged where a component exists; this item declares ` +
+            `${formatCount(facts.componentRows)} component row(s) and its nutrition_provenance is ` +
+            `"${facts.nutritionProvenance}"`,
+    },
+    [CATALOG_CHECK_NAMES.MISSING_DENSITY]: {
+        applies: (facts) => facts.nutritionBasis === PER_100ML,
+        reasonCode: 'no_volume_basis_to_convert',
+        reason: (facts) =>
+            `a density is consulted only to convert a volume basis to grams; this item states its nutrition ` +
+            `${facts.nutritionBasis}`,
+    },
+    [CATALOG_CHECK_NAMES.PORTION_CONVERSION_DRIFT]: {
+        applies: (facts) => facts.portionUnitsStatingNutrients > 0,
+        reasonCode: 'no_per_serving_values_to_compare',
+        reason: (facts) =>
+            `the per-100 g values had nothing to be compared against: the record's ` +
+            `${formatCount(facts.portionUnits)} portion unit(s) state amounts and gram weights and none carries ` +
+            'source-stated per-serving nutrient values',
+    },
+    [CATALOG_CHECK_NAMES.DEFAULT_PORTION_COUNT]: {
+        applies: (facts) => facts.portionUnits > 0,
+        reasonCode: 'no_portions_stated',
+        reason: () => 'the default-portion count is taken over the record\u2019s stated portions, and it states none',
+    },
+    [CATALOG_CHECK_NAMES.UNSUPPORTED_PORTION]: {
+        applies: (facts) => facts.portionUnits > 0,
+        reasonCode: 'no_portions_stated',
+        reason: () => 'portion amounts, units and weights are judged over the record\u2019s stated portions, and it states none',
+    },
+};
+
+/**
+ * The vocabulary names this item's own facts explain the absence of, the ones
+ * they do not, and the completeness that follows.
+ *
+ * Pure: it reads the facts it is handed and nothing else, so the same item
+ * yields the same evidence in the aggregate pass and in the per-item pass.
+ */
+export const notApplicableChecksForItem = (facts: PublishedItemFacts): ItemCheckCompleteness => {
+    const recordedNames = new Set(facts.recordedCheckNames);
+    const recorded: string[] = [];
+    const recordedOutsideVocabulary: string[] = [];
+    for (const name of recordedNames) {
+        if (KNOWN_CHECK_NAMES.has(name)) {
+            recorded.push(name);
+        } else {
+            recordedOutsideVocabulary.push(name);
+        }
+    }
+
+    const notApplicable: CheckNotApplicable[] = [];
+    const unexplained: string[] = [];
+
+    for (const name of [...KNOWN_CHECK_NAMES].sort(compareStrings)) {
+        if (recordedNames.has(name)) {
+            continue;
+        }
+
+        const rule = CHECK_APPLICABILITY_RULES[name];
+        if (rule === undefined || rule.applies(facts)) {
+            // Either no rule covers this name, or the item DOES meet the
+            // precondition and the check is still absent. Both are reported as
+            // gaps: a report that guessed at a reason here would be the same
+            // unfounded claim this block exists to remove.
+            unexplained.push(name);
+            continue;
+        }
+
+        notApplicable.push({
+            name,
+            tier: tierOfCheck(name) ?? 'unrecognised',
+            applicable: false,
+            reasonCode: rule.reasonCode,
+            reason: rule.reason(facts),
+        });
+    }
+
+    return {
+        recorded: recorded.sort(compareStrings),
+        recordedOutsideVocabulary: recordedOutsideVocabulary.sort(compareStrings),
+        notApplicable,
+        unexplained,
+        complete: unexplained.length === 0,
+    };
+};
+
+/**
+ * One published item's facts, read from its row and its validation record.
+ *
+ * Shared by both passes so the per-item evidence and the aggregate counts are
+ * derived from identical inputs — two extractions would be two chances to
+ * disagree about the same item.
+ */
+export const publishedItemFacts = (row: ReportFoodRow, record: ValidationRecordRow): PublishedItemFacts => {
+    const portions = asArray(record.portion_units);
+
+    return {
+        sourceKey: row.source_key,
+        category: row.category,
+        foodState: row.food_state,
+        identitySource: row.identity_source,
+        nutritionProvenance: row.nutrition_provenance,
+        nutritionBasis: row.nutrition_basis,
+        basisAmount: row.basis_amount,
+        componentRows: row._count.catalog_food_components,
+        portionUnits: portions.length,
+        portionUnitsStatingNutrients: portions.filter((entry) => statesPerServingNutrients(entry)).length,
+        recordedCheckNames: asArray(record.checks)
+            .map((entry) => {
+                const check = asRecord(entry);
+                return check !== null && typeof check.name === 'string' ? check.name : '';
+            })
+            .filter((name) => name.length > 0),
+    };
 };
 
 const emptyCategoryMeasurement = (): CategoryMeasurement => ({
@@ -742,8 +1565,20 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
     const quarantinedByCheck: Record<string, number> = {};
     const quarantinedByCategory: Record<string, number> = {};
     const rejectedByCheck: Record<string, number> = {};
+    const candidateByCheck: Record<string, number> = {};
     const publishedEvidenceRecordsPerItem: Record<string, number> = {};
-    const quarantinedIdentities: QuarantinedIdentity[] = [];
+    const publishedRecordedChecksPerItem: Record<string, number> = {};
+    const publishedNotApplicableByName: Record<string, number> = {};
+    const publishedNotApplicableByReasonCode: Record<string, number> = {};
+    const publishedUnexplainedByName: Record<string, number> = {};
+    const publishedUnexplainedExamples: { sourceKey: string; names: readonly string[] }[] = [];
+    const withheldIdentities: WithheldIdentity[] = [];
+    const withheldIdentitiesOmitted: Record<string, number> = {};
+    const withheldCollected: Record<string, number> = {};
+    // Uncapped, and deliberately separate from the collected list: a figure
+    // derived from a capped list understates the population it claims to
+    // describe, and does so only once the catalog is too big to check by hand.
+    const withheldByIdentitySourceAndStatus: Record<string, Record<string, number>> = {};
     const publishedWithoutValidationRecord: string[] = [];
     const publishedIdentities = new Map<string, string[]>();
     const recordFieldMismatches: RecordFieldMismatch[] = [];
@@ -758,6 +1593,9 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
     let publishedEvidenceRecords = 0;
     let publishedItemsWithoutEvidence = 0;
     let publishedItemsWithAdvisoryReview = 0;
+    let publishedItemsWithCompleteVocabulary = 0;
+    let publishedItemsWithUnexplainedGap = 0;
+    let publishedUnexplainedExamplesOmitted = 0;
 
     const categoryOf = (category: string): CategoryMeasurement => {
         const existing = categories[category];
@@ -767,6 +1605,46 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
         const created = emptyCategoryMeasurement();
         categories[category] = created;
         return created;
+    };
+
+    /**
+     * Records one withheld row's identity, or counts it as omitted once the cap
+     * for its status is reached.
+     *
+     * The counter is incremented rather than the row dropped, because a list
+     * that stopped silently would read as the complete set of withheld
+     * identities for a catalog that has more.
+     */
+    const collectWithheldIdentity = (row: ReportFoodRow, summary: FailingCheckSummary): void => {
+        // Counted first and unconditionally: this is the population, and it must
+        // not depend on whether the identity below was listed or capped out.
+        const bySource =
+            withheldByIdentitySourceAndStatus[row.identity_source] ??
+            (withheldByIdentitySourceAndStatus[row.identity_source] = {});
+        increment(bySource, row.publication_status);
+
+        // A counter per status rather than a scan of what is already collected:
+        // the scan would be quadratic in the withheld row count, on a stage
+        // whose whole memory discipline is per-page.
+        if ((withheldCollected[row.publication_status] ?? 0) >= WITHHELD_IDENTITY_LIMIT) {
+            increment(withheldIdentitiesOmitted, row.publication_status);
+            return;
+        }
+        increment(withheldCollected, row.publication_status);
+
+        withheldIdentities.push({
+            sourceKey: row.source_key,
+            category: row.category,
+            foodState: row.food_state,
+            displayName: row.display_name,
+            identitySource: row.identity_source,
+            outcome: row.catalog_validation_records === null ? null : row.catalog_validation_records.outcome,
+            failingChecks: [...summary.names].sort(compareStrings),
+            failingCheckEvidence: [...summary.failing].sort((left, right) =>
+                compareStrings(left.name, right.name),
+            ),
+            publicationStatus: row.publication_status,
+        });
     };
 
     await forEachFoodPage(db, where, (rows) => {
@@ -860,6 +1738,32 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
                     publishedChecks[check.name] = tally;
                 }
 
+                // The completeness evidence for this item, measured here in the
+                // aggregate pass and recomputed identically from the same facts
+                // when its own record is emitted (see `toItemRecord`).
+                const completeness = notApplicableChecksForItem(publishedItemFacts(row, record));
+                increment(publishedRecordedChecksPerItem, String(completeness.recorded.length));
+                for (const entry of completeness.notApplicable) {
+                    increment(publishedNotApplicableByName, entry.name);
+                    increment(publishedNotApplicableByReasonCode, entry.reasonCode);
+                }
+                if (completeness.complete) {
+                    publishedItemsWithCompleteVocabulary += 1;
+                } else {
+                    publishedItemsWithUnexplainedGap += 1;
+                    for (const name of completeness.unexplained) {
+                        increment(publishedUnexplainedByName, name);
+                    }
+                    if (publishedUnexplainedExamples.length < UNEXPLAINED_GAP_EXAMPLE_LIMIT) {
+                        publishedUnexplainedExamples.push({
+                            sourceKey: row.source_key,
+                            names: completeness.unexplained,
+                        });
+                    } else {
+                        publishedUnexplainedExamplesOmitted += 1;
+                    }
+                }
+
                 const summary = summarizeChecks(record.checks, unrecognisedCheckNames);
                 publishedCheckEntries += summary.entries;
                 if (summary.names.length === 0) {
@@ -886,30 +1790,36 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
                 continue;
             }
 
-            if (row.publication_status === QUARANTINED) {
-                increment(quarantinedByCategory, row.category);
+            // THE WITHHELD ROWS — the other half of the evidence.
+            //
+            // A published count on its own cannot answer "what did the catalog
+            // NOT publish, and why", and that question is exactly what an
+            // operator reading a shortfall needs answered. So all three
+            // withholding statuses are treated identically here: the same
+            // failing-check summarisation, the same identity fields and the
+            // same sort. Quarantine keeps its own per-category and per-check
+            // counters as well, because both artefacts state those figures and
+            // `reconcileQuarantineFigures` compares them across the two files.
+            if (WITHHELD_STATUSES.includes(row.publication_status)) {
                 const summary = summarizeChecks(record === null ? null : record.checks, unrecognisedCheckNames);
-                for (const name of summary.names) {
-                    increment(quarantinedByCheck, name);
-                    increment(category.quarantinedByCheck, name);
-                }
-                quarantinedIdentities.push({
-                    sourceKey: row.source_key,
-                    category: row.category,
-                    foodState: row.food_state,
-                    displayName: row.display_name,
-                    identitySource: row.identity_source,
-                    outcome: record === null ? null : record.outcome,
-                    failingChecks: [...summary.names].sort(compareStrings),
-                });
-                continue;
-            }
 
-            if (row.publication_status === REJECTED) {
-                const summary = summarizeChecks(record === null ? null : record.checks, unrecognisedCheckNames);
-                for (const name of summary.names) {
-                    increment(rejectedByCheck, name);
+                if (row.publication_status === QUARANTINED) {
+                    increment(quarantinedByCategory, row.category);
+                    for (const name of summary.names) {
+                        increment(quarantinedByCheck, name);
+                        increment(category.quarantinedByCheck, name);
+                    }
+                } else if (row.publication_status === REJECTED) {
+                    for (const name of summary.names) {
+                        increment(rejectedByCheck, name);
+                    }
+                } else {
+                    for (const name of summary.names) {
+                        increment(candidateByCheck, name);
+                    }
                 }
+
+                collectWithheldIdentity(row, summary);
             }
         }
     });
@@ -931,6 +1841,12 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
             compareStrings(left.canonicalName, right.canonicalName) || compareStrings(left.foodState, right.foodState),
     );
 
+    // Sorted once, on the stable source key, so both the audit and the
+    // quarantine block emit their identities in the same reproducible order.
+    const sortedWithheld = [...withheldIdentities].sort((left, right) =>
+        compareStrings(left.sourceKey, right.sourceKey),
+    );
+
     return {
         rowsScanned,
         byPublicationStatus,
@@ -949,10 +1865,25 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
         publishedItemsWithNoFailingCheck,
         publishedItemsWithBothReviewFlags: publishedItemsWithMultipleReviewFailures,
         unrecognisedCheckNames,
+        publishedRecordedChecksPerItem,
+        publishedNotApplicableByName,
+        publishedNotApplicableByReasonCode,
+        publishedItemsWithCompleteVocabulary,
+        publishedItemsWithUnexplainedGap,
+        publishedUnexplainedByName,
+        publishedUnexplainedExamples,
+        publishedUnexplainedExamplesOmitted,
         quarantinedByCheck,
         quarantinedByCategory,
         rejectedByCheck,
-        quarantinedIdentities: quarantinedIdentities.sort((left, right) => compareStrings(left.sourceKey, right.sourceKey)),
+        candidateByCheck,
+        // One collection, two views: the quarantine block's list is a FILTER of
+        // the audit's rather than a second traversal, so the two cannot state
+        // different identities for the same quarantined row.
+        quarantinedIdentities: sortedWithheld.filter((entry) => entry.publicationStatus === QUARANTINED).map(toQuarantinedIdentity),
+        withheldIdentities: sortedWithheld,
+        withheldIdentitiesOmitted,
+        withheldByIdentitySourceAndStatus,
         publishedWithoutValidationRecord: [...publishedWithoutValidationRecord].sort(compareStrings),
         publishedAliasRecords,
         publishedEvidenceRecords,
@@ -1006,10 +1937,47 @@ export interface CoverageRow {
     readonly candidateVolume: number | null;
     readonly published: number;
     readonly shortfall: number;
+    /**
+     * Whether this category's own publishedTarget is unmet — `shortfall > 0`,
+     * stated as its own field rather than left to be inferred from the number
+     * beside it.
+     *
+     * A per-category target is a requirement in its own right: recipe
+     * eligibility draws on specific categories, so a surplus elsewhere buys
+     * nothing here. A reader or a release gate must be able to see the verdict
+     * for this category without comparing two numbers and without consulting
+     * the whole-catalog flag, which can only ever be the conjunction of these.
+     */
+    readonly unmet: boolean;
     readonly quarantined: number;
     readonly candidate: number;
     readonly rejected: number;
     readonly retired: number;
+    /**
+     * Rows that exist for this category and COULD reach the published set:
+     * `published + candidate + quarantined`.
+     *
+     * `rejected` is excluded because a reject-tier failure is never publishable,
+     * and `retired` because a retired row was published by an earlier release
+     * and a later one carrying it again is a load-time decision this stage does
+     * not make. Pure arithmetic over the four measured counts beside it — it
+     * asserts nothing about whether any particular withholding CAN be resolved,
+     * only about how many rows there are to resolve.
+     */
+    readonly reachableCeiling: number;
+    /**
+     * The part of {@link shortfall} that no judgement could close:
+     * `max(0, publishedTarget - reachableCeiling)`.
+     *
+     * Zero means the target is reachable from rows already in the database, so
+     * the gap is a withholding to be triaged — the withheld identities and
+     * their failing checks say which. Non-zero means this many rows were never
+     * obtained for the category at all, and no re-validation, bound change or
+     * curator pass can produce them: the input has to grow. That distinction is
+     * what an operator reading an unmet target needs first, and it cannot be
+     * read off the shortfall alone.
+     */
+    readonly shortfallBeyondEveryRowObtained: number;
     readonly itemsWithRejectTierFailure: number;
     readonly itemsWithQuarantineTierFailure: number;
     readonly itemsWithReviewTierFailure: number;
@@ -1057,16 +2025,25 @@ export const buildCoverageRows = (
             };
         }
 
+        const quarantined = statusCount(category.byPublicationStatus, QUARANTINED);
+        const candidate = statusCount(category.byPublicationStatus, 'candidate');
+        const reachableCeiling = entry.published + candidate + quarantined;
+
         return {
             category: entry.category,
             publishedTarget: entry.publishedTarget,
             candidateVolume: planCategory === undefined ? null : planCategory.candidateVolume,
             published: entry.published,
+            // Exact, as `computeCoverageShortfall` measured it: never rounded,
+            // never offset against a surplus in another category.
             shortfall: entry.shortfall,
-            quarantined: statusCount(category.byPublicationStatus, QUARANTINED),
-            candidate: statusCount(category.byPublicationStatus, 'candidate'),
+            unmet: entry.shortfall > 0,
+            quarantined,
+            candidate,
             rejected: statusCount(category.byPublicationStatus, REJECTED),
             retired: statusCount(category.byPublicationStatus, 'retired'),
+            reachableCeiling,
+            shortfallBeyondEveryRowObtained: Math.max(0, entry.publishedTarget - reachableCeiling),
             itemsWithRejectTierFailure: category.publishedItemsWithRejectFailure,
             itemsWithQuarantineTierFailure: category.publishedItemsWithQuarantineFailure,
             itemsWithReviewTierFailure: category.publishedItemsWithReviewFailure,
@@ -1108,6 +2085,231 @@ export const quarantinePerCategory = (
         perCategory[category] = count;
     }
     return sortedRecord(perCategory);
+};
+
+/**
+ * The per-category count of rows holding one publication status.
+ *
+ * Every plan category appears — a category with none reports a measured zero
+ * rather than a missing key, which is the difference between "none were
+ * withheld here" and "this run did not look" — and a category the plan does not
+ * declare appears too when it holds rows of that status, because dropping it
+ * would understate what the catalog withheld.
+ */
+export const perCategoryByStatus = (
+    rows: readonly CoverageRow[],
+    measurement: CatalogMeasurement,
+    status: string,
+): Record<string, number> => {
+    const perCategory: Record<string, number> = {};
+
+    for (const row of rows) {
+        const category = measurement.categories[row.category];
+        perCategory[row.category] = category === undefined ? 0 : statusCount(category.byPublicationStatus, status);
+    }
+
+    for (const [category, measured] of Object.entries(measurement.categories)) {
+        const count = statusCount(measured.byPublicationStatus, status);
+        if (count > 0) {
+            perCategory[category] = count;
+        }
+    }
+
+    return sortedRecord(perCategory);
+};
+
+/** What each withholding status means, so the audit is readable without the policy docs. */
+const WITHHELD_STATUS_MEANING: Readonly<Record<string, string>> = {
+    candidate: 'imported or generated and not yet judged, or judged and left for a curator to classify. Never searchable.',
+    quarantined: 'judged unusable as it stands. Re-validated on the next run, never published on an invented value.',
+    rejected: 'a reject-tier check disqualified it. Never publishable.',
+};
+
+/** The fields every identity in the audit carries. */
+const WITHHELD_IDENTITY_FIELDS: readonly string[] = [
+    'sourceKey',
+    'category',
+    'foodState',
+    'displayName',
+    'identitySource',
+    'outcome',
+    'failingChecks',
+    'failingCheckEvidence',
+    'publicationStatus',
+];
+
+export interface WithheldIdentityAudit {
+    readonly purpose: string;
+    readonly statuses: readonly string[];
+    readonly statusMeaning: Readonly<Record<string, string>>;
+    readonly identityFields: readonly string[];
+    /** Rows per withholding status, plus `withheldTotal` — measured over every row scanned. */
+    readonly totals: Readonly<Record<string, number>>;
+    readonly perCategory: Readonly<Record<string, Readonly<Record<string, number>>>>;
+    readonly byCheck: Readonly<Record<string, Readonly<Record<string, number>>>>;
+    readonly identities: Readonly<Record<string, readonly WithheldIdentity[]>>;
+    readonly identityCap: number;
+    readonly identitiesOmittedByCap: Readonly<Record<string, number>>;
+    readonly identitiesListed: Readonly<Record<string, number>>;
+    readonly everyWithheldIdentityListed: boolean;
+    readonly listedIdentitiesWithNoFailingCheck: Readonly<Record<string, number>>;
+    /**
+     * Failed checks stated WITH their observed value and bound, per status —
+     * counted over the listed identities, so it is directly comparable with
+     * `failingChecksListed` below. A name without its judgement data cannot be
+     * triaged, so the two figures being equal is the property this audit
+     * claims.
+     */
+    readonly failingCheckEvidenceEntries: Readonly<Record<string, number>>;
+    readonly failingChecksListed: Readonly<Record<string, number>>;
+    /**
+     * True only where every listed identity's evidence states exactly the
+     * failing-check names that identity lists — computed per entry, not by
+     * comparing the two totals, so a name lost on one row and gained on another
+     * cannot cancel out.
+     */
+    readonly everyFailingCheckStatesItsEvidence: boolean;
+    readonly measuredFrom: string;
+    readonly note: string;
+}
+
+/**
+ * The withheld-identity audit: what the catalog did not publish, why, and where.
+ *
+ * WHY IT EXISTS. A published count and a shortfall say how far the catalog is
+ * from the plan; they do not say which rows were held back or what held them,
+ * and an operator reading committed evidence cannot act on a shortfall without
+ * that. Agent Action Plan §0.7.1's report requirement names the quarantined
+ * list explicitly, and the same question applies to the two other statuses that
+ * mean a row is not published: a candidate awaiting a judgement and a rejected
+ * row are equally absent from every published figure.
+ *
+ * WHAT IT MEASURES AND WHAT IT DOES NOT. Every figure here is counted from the
+ * rows this run scanned. The prose is generated from those figures — there is
+ * no sentence in it that asserts a cause the run did not measure — and the
+ * identity lists carry each row's own failing checks as the validator recorded
+ * them, never a reason inferred here. Where the per-status cap left identities
+ * out, the cap and the omitted count are stated in this same block.
+ */
+export const buildWithheldIdentityAudit = (
+    rows: readonly CoverageRow[],
+    measurement: CatalogMeasurement,
+): WithheldIdentityAudit => {
+    const totals: Record<string, number> = {};
+    const perCategory: Record<string, Record<string, number>> = {};
+    const byCheck: Record<string, Record<string, number>> = {};
+    const identities: Record<string, readonly WithheldIdentity[]> = {};
+    const identitiesListed: Record<string, number> = {};
+    const listedIdentitiesWithNoFailingCheck: Record<string, number> = {};
+    const identitiesOmittedByCap: Record<string, number> = {};
+    const failingCheckEvidenceEntries: Record<string, number> = {};
+    const failingChecksListed: Record<string, number> = {};
+    let identitiesWhoseEvidenceDisagrees = 0;
+
+    const checksOfStatus = (status: string): Record<string, number> => {
+        if (status === QUARANTINED) {
+            return measurement.quarantinedByCheck;
+        }
+        if (status === REJECTED) {
+            return measurement.rejectedByCheck;
+        }
+        return measurement.candidateByCheck;
+    };
+
+    let withheldTotal = 0;
+    for (const status of WITHHELD_STATUSES) {
+        const total = statusCount(measurement.byPublicationStatus, status);
+        withheldTotal += total;
+        totals[status] = total;
+        perCategory[status] = perCategoryByStatus(rows, measurement, status);
+        byCheck[status] = sortedRecord(checksOfStatus(status));
+
+        const listed = measurement.withheldIdentities.filter((entry) => entry.publicationStatus === status);
+        identities[status] = listed;
+        identitiesListed[status] = listed.length;
+        listedIdentitiesWithNoFailingCheck[status] = listed.filter(
+            (entry) => entry.failingChecks.length === 0,
+        ).length;
+        identitiesOmittedByCap[status] = measurement.withheldIdentitiesOmitted[status] ?? 0;
+
+        // Counted per entry, and the agreement checked per entry: a report that
+        // compared only the two totals would pass a set where one row lost a
+        // name and another gained one.
+        let evidenceEntries = 0;
+        let namesListed = 0;
+        for (const entry of listed) {
+            evidenceEntries += entry.failingCheckEvidence.length;
+            namesListed += entry.failingChecks.length;
+            const evidenceNames = entry.failingCheckEvidence
+                .map((check) => check.name)
+                .sort(compareStrings)
+                .join('\u0000');
+            if (evidenceNames !== [...entry.failingChecks].sort(compareStrings).join('\u0000')) {
+                identitiesWhoseEvidenceDisagrees += 1;
+            }
+        }
+        failingCheckEvidenceEntries[status] = evidenceEntries;
+        failingChecksListed[status] = namesListed;
+    }
+    totals.withheldTotal = withheldTotal;
+
+    const listedTotal = WITHHELD_STATUSES.reduce((total, status) => total + (identitiesListed[status] ?? 0), 0);
+    const omittedTotal = WITHHELD_STATUSES.reduce((total, status) => total + (identitiesOmittedByCap[status] ?? 0), 0);
+
+    const perStatusPhrase = WITHHELD_STATUSES.map(
+        (status) => `${formatCount(totals[status] ?? 0)} ${status}`,
+    ).join(', ');
+    const noFailingCheckTotal = WITHHELD_STATUSES.reduce(
+        (total, status) => total + (listedIdentitiesWithNoFailingCheck[status] ?? 0),
+        0,
+    );
+    const evidenceEntriesTotal = WITHHELD_STATUSES.reduce(
+        (total, status) => total + (failingCheckEvidenceEntries[status] ?? 0),
+        0,
+    );
+    const namesListedTotal = WITHHELD_STATUSES.reduce(
+        (total, status) => total + (failingChecksListed[status] ?? 0),
+        0,
+    );
+    const everyFailingCheckStatesItsEvidence = identitiesWhoseEvidenceDisagrees === 0;
+
+    return {
+        purpose:
+            'What the catalog withheld and why: the identity of every row that is not published, the checks that ' +
+            'failed on it, and the per-category split of each withholding status. A shortfall cannot be acted on ' +
+            'from a total alone.',
+        statuses: WITHHELD_STATUSES,
+        statusMeaning: WITHHELD_STATUS_MEANING,
+        identityFields: WITHHELD_IDENTITY_FIELDS,
+        totals: sortedRecord(totals),
+        perCategory,
+        byCheck,
+        identities,
+        identityCap: WITHHELD_IDENTITY_LIMIT,
+        identitiesOmittedByCap: sortedRecord(identitiesOmittedByCap),
+        identitiesListed: sortedRecord(identitiesListed),
+        everyWithheldIdentityListed: omittedTotal === 0 && listedTotal === withheldTotal,
+        listedIdentitiesWithNoFailingCheck: sortedRecord(listedIdentitiesWithNoFailingCheck),
+        failingCheckEvidenceEntries: sortedRecord(failingCheckEvidenceEntries),
+        failingChecksListed: sortedRecord(failingChecksListed),
+        everyFailingCheckStatesItsEvidence,
+        measuredFrom:
+            'catalog_foods.publication_status joined to catalog_validation_records for the failing checks, their ' +
+            'observed values and bounds, and the outcome. Both the per-category split and the identities exist only in those tables, which is why a ' +
+            'report derived from the committed release artefacts \u2014 which carry published rows only \u2014 can ' +
+            'state neither.',
+        // Every number in this sentence is one of the measured figures above.
+        note:
+            `${formatCount(withheldTotal)} row(s) are withheld from the published catalog: ${perStatusPhrase}. ` +
+            `${formatCount(listedTotal)} identity(ies) are listed here with the checks that failed on them, and ` +
+            `${formatCount(omittedTotal)} were left out by the ${formatCount(WITHHELD_IDENTITY_LIMIT)}-per-status ` +
+            `cap. ${formatCount(noFailingCheckTotal)} listed identity(ies) carry no failing check at all, which is ` +
+            'what a row awaiting a judgement or held by an identity or classification floor looks like rather than ' +
+            `a row a check disqualified. ${formatCount(evidenceEntriesTotal)} failing check(s) are stated with the ` +
+            `observed value and bound the validator recorded, against ${formatCount(namesListedTotal)} failing ` +
+            `check name(s) listed, and every listed identity's evidence states exactly the names it lists: ` +
+            `${everyFailingCheckStatesItsEvidence ? 'yes' : 'NO \u2014 see everyFailingCheckStatesItsEvidence'}.`,
+    };
 };
 
 const describeVerdict = (input: {
@@ -1175,9 +2377,59 @@ export interface RequirementBlock {
     readonly categoriesMeasured: number;
     readonly categoriesBelowTarget: number;
     readonly categoriesAtOrAboveTarget: number;
+    /**
+     * The whole-catalog per-category verdict: true only when EVERY measured
+     * category meets its own publishedTarget.
+     *
+     * The conjunction of the per-category `unmet` flags and nothing else — it
+     * is never softened by the aggregate 10,000-item requirement being met,
+     * because the two are different requirements over the same rows.
+     */
+    readonly everyCategoryMeetsItsTarget: boolean;
+    /**
+     * The categories that do not, with the exact shortfall of each and the part
+     * of it that no judgement over existing rows could close.
+     */
+    readonly categoriesUnmet: readonly {
+        readonly category: string;
+        readonly shortfall: number;
+        readonly reachableCeiling: number;
+        readonly shortfallBeyondEveryRowObtained: number;
+    }[];
+    /**
+     * How the whole per-category shortfall divides, in rows: the part that could
+     * be closed by resolving withholdings over rows already in the database,
+     * and the part for which no row exists at all.
+     *
+     * Arithmetic over the per-category counts, stated here because it decides
+     * what an operator does about an unmet target — triage the withheld
+     * rows, or obtain more input — and because the shortfall total alone
+     * cannot distinguish the two.
+     */
+    readonly shortfallComposition: {
+        readonly total: number;
+        readonly closableByResolvingWithheldRows: number;
+        readonly beyondEveryRowObtained: number;
+        readonly note: string;
+    };
     readonly unmetRequirements: readonly { readonly code: string; readonly detail: string }[];
     readonly verdict: string;
 }
+
+/**
+ * One unmet category as the requirement block states it.
+ *
+ * Declared once and used by both artefacts' requirement blocks, so the two
+ * cannot state a different field set for the same category.
+ */
+const unmetCategoryEntry = (
+    row: CoverageRow,
+): { category: string; shortfall: number; reachableCeiling: number; shortfallBeyondEveryRowObtained: number } => ({
+    category: row.category,
+    shortfall: row.shortfall,
+    reachableCeiling: row.reachableCeiling,
+    shortfallBeyondEveryRowObtained: row.shortfallBeyondEveryRowObtained,
+});
 
 export const buildRequirementBlock = (input: {
     readonly plan: CoveragePlan;
@@ -1205,12 +2457,28 @@ export const buildRequirementBlock = (input: {
                 `${formatCount(REQUIRED_PUBLISHED_ITEMS - publishedItems)}.`,
         });
     }
+    // How the gap divides: rows that exist and are withheld, against rows that
+    // were never obtained. Summed over the short categories only, because a
+    // surplus elsewhere closes none of it.
+    const beyondEveryRow = rows
+        .filter((row) => row.unmet)
+        .reduce(
+            (totals, row) => ({
+                closable: totals.closable + (row.shortfall - row.shortfallBeyondEveryRowObtained),
+                beyond: totals.beyond + row.shortfallBeyondEveryRowObtained,
+            }),
+            { closable: 0, beyond: 0 },
+        );
+
     if (shortfall.shortfallTotal > 0) {
         unmetRequirements.push({
             code: 'categories_below_published_target',
             detail:
                 `${formatCount(categoriesBelowTarget)} categories short of their publishedTarget by ` +
-                `${formatCount(shortfall.shortfallTotal)} items in total; the per-category figures are in categories[].`,
+                `${formatCount(shortfall.shortfallTotal)} items in total; the per-category figures are in ` +
+                `categories[]. ${formatCount(beyondEveryRow.beyond)} of those items exceed every row obtained for ` +
+                'their category, so they cannot be produced by any judgement over the rows already imported or ' +
+                'generated.',
         });
     }
     if (scopedTo !== null) {
@@ -1241,6 +2509,24 @@ export const buildRequirementBlock = (input: {
         categoriesMeasured: rows.length,
         categoriesBelowTarget,
         categoriesAtOrAboveTarget: rows.length - categoriesBelowTarget,
+        // Read off the per-category rows, so the flag and the rows cannot
+        // disagree, and stated even when the aggregate requirement is met.
+        everyCategoryMeetsItsTarget: rows.every((row) => !row.unmet),
+        categoriesUnmet: rows.filter((row) => row.unmet).map(unmetCategoryEntry),
+        shortfallComposition: {
+            total: shortfall.shortfallTotal,
+            closableByResolvingWithheldRows: beyondEveryRow.closable,
+            beyondEveryRowObtained: beyondEveryRow.beyond,
+            note:
+                `Of ${formatCount(shortfall.shortfallTotal)} item(s) short across ` +
+                `${formatCount(categoriesBelowTarget)} category(ies), ${formatCount(beyondEveryRow.closable)} ` +
+                'could at most be closed by resolving a withholding over rows already in the database \u2014 the ' +
+                'withheld identities and their failing checks say which \u2014 and ' +
+                `${formatCount(beyondEveryRow.beyond)} exceed every row obtained for their category, so no ` +
+                're-validation, bound change or curator pass can produce them. Rejected rows are excluded from the ' +
+                'reachable ceiling because a reject-tier failure is never publishable. This is arithmetic over the ' +
+                'per-category counts and asserts no cause; the counters that bear on one are in the import report.',
+        },
         unmetRequirements,
         verdict: describeVerdict({
             scopedTo,
@@ -1258,7 +2544,14 @@ export const buildRequirementBlock = (input: {
 /** Field-level attribution, merged into whatever `producedBy` the artefact
  * already carries so the stage's own entries survive (see `mergeOwnedFields`). */
 const mergeProducedBy = (existing: unknown, aggregate: Readonly<Record<string, unknown>>): Record<string, unknown> => {
-    const merged: Record<string, unknown> = { ...(asRecord(existing) ?? {}) };
+    // Pruned on the way in for the same reason the sub-objects are: the
+    // attribution block is where an earlier producer recorded HOW the aggregate
+    // half was produced, and a preserved claim that it came from committed
+    // files rather than from a database would contradict the
+    // aggregateFieldsDerivedFrom written right beside it. The stageFields*
+    // entries, which belong to the stage that wrote them, are not named in
+    // SUPERSEDED_KEYS and survive untouched.
+    const merged: Record<string, unknown> = pruneSupersededKeys('producedBy', asRecord(existing) ?? {});
     for (const key of Object.keys(aggregate)) {
         merged[key] = aggregate[key];
     }
@@ -1285,6 +2578,16 @@ const aggregateProducedBy = (ownedFieldNames: readonly string[]): Record<string,
         'carried through untouched.',
     aggregateFieldsPreserved:
         'Fields this stage does not own are preserved exactly as found; it never rewrites another stage\u2019s counters.',
+    // The one exception to the line above, written down so it is auditable from
+    // the artefact: a key an earlier producer wrote whose question this stage
+    // now MEASURES is removed rather than preserved, because preserving it
+    // would leave a claim beside data that contradicts it. Counters belonging
+    // to another stage are never on this list.
+    aggregateFieldsSuperseded: supersededKeyPaths(),
+    aggregateFieldsSupersededNote:
+        'Keys removed on this write because this stage now measures what they asserted. Each is listed as ' +
+        '<block>.<key>; scripts/catalog-report.ts SUPERSEDED_KEYS records what supersedes each one. Nothing else ' +
+        'is removed \u2014 in particular no counter from catalog:import, catalog:generate or catalog:validate.',
 });
 
 /** A tuple list rather than an object literal, so the emitted key order is
@@ -1338,8 +2641,14 @@ const buildCheckVocabularyBlock = (plan: CoveragePlan, measurement: CatalogMeasu
     const planQuarantineChecks = [...plan.quarantineChecks].sort(compareStrings);
     const derivedQuarantineChecks = [...CATALOG_QUARANTINE_CHECK_NAMES].sort(compareStrings);
 
+    const vocabularyNames = [...KNOWN_CHECK_NAMES].sort(compareStrings);
+    const itemsWithCompleteVocabulary = measurement.publishedItemsWithCompleteVocabulary;
+    const itemsWithUnexplainedGap = measurement.publishedItemsWithUnexplainedGap;
+
     return {
         source: CHECK_VOCABULARY_SOURCE,
+        vocabularySize: vocabularyNames.length,
+        names: vocabularyNames,
         quarantineSubsetOwnedBy: `${COVERAGE_PLAN_RELATIVE_PATH} quarantineChecks`,
         // Measured, not assumed: catalog.logic derives its quarantine-tier
         // names from the tier map so a script can assert code and data agree,
@@ -1358,12 +2667,55 @@ const buildCheckVocabularyBlock = (plan: CoveragePlan, measurement: CatalogMeasu
         recordedOnSomePublishedItems: recordedOnSomeItems,
         notRecordedOnAnyPublishedItem: notRecorded,
         notRecordedNote:
-            'Which checks a run records is a property of that run, not of this aggregate: a name recorded on no ' +
-            'published item is reported as such and no reason is inferred for it.',
+            'Which checks a run records is a property of that run, not of this aggregate, so no aggregate-level ' +
+            'reason is inferred for a name recorded on no published item. Where the absence IS explainable it is ' +
+            'explained per item instead, from that item\u2019s own facts, on its record under notApplicableChecks ' +
+            'and in perItemCompleteness below \u2014 which is the only level at which such a reason is evidence ' +
+            'rather than a generalisation.',
         unrecognisedCheckNames: sortedRecord(measurement.unrecognisedCheckNames),
         unrecognisedCheckNamesNote:
             'Check names found on a record that the vocabulary does not declare. They are counted and named rather ' +
             'than filed under a guessed tier, because a tier decides a row\u2019s disposition.',
+        // THE COMPLETENESS CLAIM, COMPUTED. Every figure below is counted over
+        // the published items; none of them is asserted. `perItemCompleteness`
+        // is true only when EVERY item's recorded names plus the names its own
+        // facts show could not apply cover the whole vocabulary — so a single
+        // item with an unexplained absence makes it false and names the gap.
+        perItemCompleteness: {
+            scope: 'the published rows this run measured',
+            itemsMeasured: publishedItems,
+            recordedChecksPerItem: sortedRecord(measurement.publishedRecordedChecksPerItem),
+            recordedChecksPerItemNote:
+                'A distribution, not a single number: how many vocabulary checks each published item records, ' +
+                'keyed by that count. One key means every item records the same number of checks.',
+            notApplicableEntriesByCheck: sortedRecord(measurement.publishedNotApplicableByName),
+            notApplicableEntriesByReasonCode: sortedRecord(measurement.publishedNotApplicableByReasonCode),
+            notApplicableNote:
+                'A not-applicable entry is evidence that the check could not have been evaluated on that item, ' +
+                'derived from that item\u2019s own measured facts and carried on its record beside the checks. It ' +
+                'never carries a pass, an observed value or a bound, because the validator evaluated nothing to ' +
+                'observe.',
+            itemsCarryingEveryCheckOrAnExplanation: itemsWithCompleteVocabulary,
+            itemsWithAnUnexplainedAbsence: itemsWithUnexplainedGap,
+            everyItemAccountsForEveryCheck: itemsWithUnexplainedGap === 0 && publishedItems > 0,
+            unexplainedAbsencesByCheck: sortedRecord(measurement.publishedUnexplainedByName),
+            unexplainedAbsenceExamples: measurement.publishedUnexplainedExamples,
+            unexplainedAbsenceExampleCap: UNEXPLAINED_GAP_EXAMPLE_LIMIT,
+            unexplainedAbsenceExamplesOmittedByCap: measurement.publishedUnexplainedExamplesOmitted,
+            claim:
+                publishedItems === 0
+                    ? 'No published item was measured, so no completeness claim is made.'
+                    : itemsWithUnexplainedGap === 0
+                      ? `All ${formatCount(publishedItems)} published items account for all ` +
+                        `${formatCount(vocabularyNames.length)} vocabulary checks: each name is either recorded on ` +
+                        'the item or carried as a not-applicable entry whose reason is derived from that item\u2019s ' +
+                        'own facts.'
+                      : `UNMET: ${formatCount(itemsWithUnexplainedGap)} of ${formatCount(publishedItems)} published ` +
+                        `items leave at least one of the ${formatCount(vocabularyNames.length)} vocabulary checks ` +
+                        'neither recorded nor explained. The names and the item counts are in ' +
+                        'unexplainedAbsencesByCheck; re-running npm run catalog:validate re-judges those rows under ' +
+                        'the current check set.',
+        },
     };
 };
 
@@ -1409,6 +2761,10 @@ const CATEGORIES_LEGEND = {
     candidateVolume: `The category\u2019s candidateVolume in ${COVERAGE_PLAN_RELATIVE_PATH}, ceil(1.25 x publishedTarget).`,
     published: 'Measured: rows whose publication_status is published.',
     shortfall: 'max(0, publishedTarget - published), exact and never rounded.',
+    unmet:
+        'Measured: true when this category\u2019s shortfall is above zero. A per-category target is its own ' +
+        'requirement \u2014 recipe eligibility draws on specific categories \u2014 so a surplus in another category ' +
+        'never clears it.',
     quarantined:
         'Measured from catalog_foods, which is the only place the split by category exists \u2014 the committed ' +
         'release artefacts carry published rows only, so a report derived from them states this as unmeasured.',
@@ -1445,7 +2801,11 @@ const ITEM_RECORD_FIELDS: readonly string[] = [
     'publicationStatus',
     'reviewedAt',
     'sourceVersions',
+    'notApplicableChecks',
 ];
+
+/** The fields a not-applicable entry carries — no pass, no observed, no bound. */
+const NOT_APPLICABLE_FIELDS: readonly string[] = ['name', 'tier', 'applicable', 'reasonCode', 'reason'];
 
 export const buildValidationReportEntries = (input: {
     readonly plan: CoveragePlan;
@@ -1486,9 +2846,11 @@ export const buildValidationReportEntries = (input: {
         [
             'purpose',
             'Acceptance evidence that every published catalog food carries a machine-readable validation record, with ' +
-                'the observed value and the bound it was measured against for every check. This artefact records what ' +
-                `was measured; the bounds, tiers and category targets it measures against are owned by ` +
-                `${COVERAGE_PLAN_RELATIVE_PATH} and are cited, not restated as policy here.`,
+                'the observed value and the bound it was measured against for every check, and with an explicit ' +
+                'not-applicable entry for every check name the item\u2019s own facts show could not be evaluated on ' +
+                'it. The rows the catalog withheld are named in withheldIdentityAudit with the checks that failed on ' +
+                'them. This artefact records what was measured; the bounds, tiers and category targets it measures ' +
+                `against are owned by ${COVERAGE_PLAN_RELATIVE_PATH} and are cited, not restated as policy here.`,
         ],
         ['producedBy', null],
         [
@@ -1573,6 +2935,21 @@ export const buildValidationReportEntries = (input: {
                 scope: 'the published rows this run measured',
                 checkEntriesRecorded: measurement.publishedCheckEntries,
                 byCheck: sortedRecord(checksByCheck),
+                // MEASURED, never asserted: true only when no published item
+                // leaves a vocabulary name both unrecorded and unexplained.
+                // `evaluated` above counts the items a check RAN on, which is a
+                // different question — a name absent from an item because its
+                // precondition was not met is accounted for by the
+                // not-applicable evidence, and the two are reconciled in
+                // checkVocabulary.perItemCompleteness.
+                everyItemCarriesEveryCheck:
+                    measurement.publishedItemsWithUnexplainedGap === 0 && publishedItems > 0,
+                everyItemCarriesEveryCheckMeaning:
+                    'For every published item, each of the vocabulary\u2019s checks is either recorded on that ' +
+                    'item with its observation and bound, or carried on it as a not-applicable entry whose reason ' +
+                    'is derived from that item\u2019s own measured facts. The per-check, per-reason and ' +
+                    'per-unexplained-name figures behind this flag are in checkVocabulary.perItemCompleteness.',
+                itemsWithAnUnexplainedAbsence: measurement.publishedItemsWithUnexplainedGap,
             },
         ],
         ['categoriesLegend', CATEGORIES_LEGEND],
@@ -1588,12 +2965,20 @@ export const buildValidationReportEntries = (input: {
                     'recoverable from the committed release artefacts, which carry published rows only.',
                 countsTowardPublishedTarget: false,
                 identities: measurement.quarantinedIdentities,
+                identityCap: WITHHELD_IDENTITY_LIMIT,
+                identitiesOmittedByCap: measurement.withheldIdentitiesOmitted[QUARANTINED] ?? 0,
+                identitiesNote:
+                    'One entry per quarantined row, sorted by source key, each carrying the checks that failed on ' +
+                    'it as the validator recorded them. The candidate and rejected rows are listed the same way in ' +
+                    'withheldIdentityAudit; total above is measured over every scanned row whether or not the cap ' +
+                    'listed it.',
                 whyTheShortfallStaysTruthful:
                     'A quarantined record is never published on an invented value, so it is excluded from every ' +
                     'published count and from the coverage figures. That is what makes the per-category shortfall the ' +
                     'honest distance to the plan rather than a number inflated by unusable rows.',
             },
         ],
+        ['withheldIdentityAudit', buildWithheldIdentityAudit(rows, measurement)],
         [
             'provenance',
             {
@@ -1673,13 +3058,30 @@ export const buildValidationReportEntries = (input: {
             'measurementGaps',
             [
                 {
-                    field: 'per-item records for quarantined, rejected, candidate and retired rows',
+                    field:
+                        'the PASSING checks, identity evidence and portions of quarantined, rejected, candidate ' +
+                        'and retired rows',
                     value: null,
                     reason:
-                        'This artefact carries per-item evidence for published rows. The quarantined identities and ' +
-                        'their failing checks are named in the quarantine block; rejected and candidate rows are ' +
-                        'counted by category and by check, and the stage that judged them evidences them in the ' +
-                        'import report.',
+                        'The full per-item record \u2014 every check passing and failing, the identity evidence and ' +
+                        'the portions \u2014 is carried for published rows, which is what the catalog serves. For a ' +
+                        'withheld row, withheldIdentityAudit carries its identity, its category, its outcome and ' +
+                        'every FAILING check WITH the observed value and bound the validator recorded, which is ' +
+                        'what the withholding has to be read from; the checks that passed on it are not restated, ' +
+                        'because they did not contribute to it. The quarantined rows appear again, identically, in ' +
+                        'the quarantine block. A retired row was published by an earlier release and is counted per ' +
+                        'category rather than filed as withheld.',
+                },
+                {
+                    field: 'the cause of any per-category shortfall',
+                    value: null,
+                    reason:
+                        'This stage measures the DISTANCE to each target and states it exactly; it measures nothing ' +
+                        'about why the distance exists and therefore names no cause. The counters that bear on one ' +
+                        '\u2014 candidates imported and refused, generation batches planned and executed, identity ' +
+                        'evidence verified \u2014 belong to catalog:import and catalog:generate and are preserved as ' +
+                        'those stages wrote them in reports/latest/import-report.json. A cause asserted here would ' +
+                        'be an inference wearing a measurement\u2019s clothes.',
                 },
                 {
                     field: 'stage counters from the catalog:validate run',
@@ -1709,6 +3111,17 @@ export const buildValidationReportEntries = (input: {
                     'Keys are camelCase because this is evidence read off the wire side of the contract, while the ' +
                     'same facts are snake_case in the database and in the release JSONL. The translation happens here ' +
                     'and only here. Enum values keep their stored form, so a value stays greppable against both.',
+                recordedChecksPerItem: sortedRecord(measurement.publishedRecordedChecksPerItem),
+                recordedChecksPerItemNote:
+                    'How many vocabulary checks each record carries, as a distribution keyed by that count \u2014 ' +
+                    'not a single number, which an aggregate can only state when every item happens to agree. The ' +
+                    'names an item does not record are accounted for on the record itself, under ' +
+                    'notApplicableChecks.',
+                notApplicableChecksField: NOT_APPLICABLE_FIELDS,
+                notApplicableChecksNote:
+                    'Beside each record\u2019s checks, one entry per vocabulary name the item\u2019s own facts show ' +
+                    'the validator could not evaluate. It carries applicable: false and a reason and never a pass, ' +
+                    'an observed value or a bound \u2014 nothing here invents a verdict the validator did not reach.',
                 identityEvidenceProjection: IDENTITY_EVIDENCE_FIELDS,
                 identityEvidenceProjectionNote:
                     'Each retrieval record is projected to these fields. The request body and cache key the ' +
@@ -1788,6 +3201,11 @@ export const toItemRecord = (row: ReportFoodRow, record: ValidationRecordRow): R
     publicationStatus: record.publication_status,
     reviewedAt: isoDate(record.reviewed_at),
     sourceVersions: camelizeKeys(record.source_versions),
+    // Computed from the same facts the aggregate pass measured, so the per-item
+    // evidence and checkVocabulary.perItemCompleteness cannot disagree about
+    // this item: every vocabulary name is either in `checks` above, as the
+    // validator wrote it, or here with the reason it could not be evaluated.
+    notApplicableChecks: notApplicableChecksForItem(publishedItemFacts(row, record)).notApplicable,
 });
 
 // ---------------------------------------------------------------------------
@@ -1806,12 +3224,147 @@ export const toItemRecord = (row: ReportFoodRow, record: ValidationRecordRow): R
 const subObjectOf = (existing: Readonly<Record<string, unknown>> | null, key: string): Record<string, unknown> =>
     existing === null ? {} : { ...(asRecord(existing[key]) ?? {}) };
 
+/* ---------------------------------------------------------------------------
+ * Superseded keys — the reason a regenerated report cannot carry a contradicted
+ * claim.
+ *
+ * THE MECHANISM THIS CLOSES. A sub-object is merged one key at a time, so this
+ * stage's measurements land on the keys it owns and every other key keeps its
+ * value — which is exactly right for another stage's COUNTER and exactly wrong
+ * for a CLAIM an earlier producer wrote about data this stage now measures. A
+ * sentence saying the quarantined identities are unavailable survives beside
+ * the identities; `checksPerItem: 13` survives beside a measured distribution;
+ * `everyItemCarriesEveryCheck: true` survives beside the computed flag that
+ * says otherwise. The artefact then reads as consistent while asserting the
+ * opposite of what it shows, which is worse than either alone.
+ *
+ * WHY A NAMED LIST AND NOT A WIPE. A blanket "drop what I do not own" would
+ * take the import stage's `usdaRequests` and `modelSpend`, the validate stage's
+ * `counts`, `failedChecks` and `duplicateIdentities`, and the per-stage
+ * quarantine attribution (`atImport`, `atValidate`) — figures this stage cannot
+ * measure and must never restate. So each removal is written down with what
+ * supersedes it, and anything not named here survives the merge untouched.
+ * ------------------------------------------------------------------------- */
+
+interface SupersededKey {
+    /** The key removed from the sub-object named by the entry it appears under. */
+    readonly key: string;
+    /** The field this stage now emits that answers the same question. */
+    readonly supersededBy: string;
+}
+
+/**
+ * Keys an earlier producer wrote that this stage's own measurements replace,
+ * per sub-object. Keyed by the sub-object's name in the artefact, so a reader
+ * can find the removal beside the block it applies to.
+ */
+const SUPERSEDED_KEYS: Readonly<Record<string, readonly SupersededKey[]>> = {
+    quarantine: [
+        // Superseded by the measured perCategory map: a reason saying the split
+        // is unmeasurable cannot stand beside the split.
+        { key: 'perCategoryUnmeasuredReason', supersededBy: 'quarantine.perCategory (measured per category)' },
+        { key: 'identitiesUnavailableReason', supersededBy: 'quarantine.identities (measured, one entry per row)' },
+        // Superseded by the validate stage's duplicateIdentityAccounting and by
+        // withheldIdentityAudit: the note mixed lost identities, quarantined
+        // rows and inserted alias rows in one sentence.
+        {
+            key: 'duplicateIdentityNote',
+            supersededBy: 'duplicateIdentityAccounting (catalog:validate), each figure in its own unit',
+        },
+    ],
+    quarantined: [
+        { key: 'perCategoryUnmeasuredReason', supersededBy: 'quarantined.perCategory (measured per category)' },
+        { key: 'identitiesUnavailableReason', supersededBy: 'quarantined.identities (measured, one entry per row)' },
+        {
+            key: 'duplicateIdentityNote',
+            supersededBy: 'duplicateIdentityAccounting (catalog:validate), each figure in its own unit',
+        },
+    ],
+    duplicatesRemoved: [
+        {
+            key: 'duplicateIdentityNote',
+            supersededBy: 'duplicateIdentityAccounting (catalog:validate), each figure in its own unit',
+        },
+    ],
+    checksOverPublishedItems: [
+        {
+            key: 'everyItemCarriesEveryCheck',
+            supersededBy: 'the computed everyItemCarriesEveryCheck and checkVocabulary.perItemCompleteness',
+        },
+    ],
+    checkVocabulary: [
+        {
+            key: 'evaluatedCount',
+            supersededBy: 'checkVocabulary.vocabularySize and perItemCompleteness.recordedChecksPerItem',
+        },
+    ],
+    itemRecords: [
+        {
+            key: 'checksPerItem',
+            supersededBy: 'itemRecords.recordedChecksPerItem (a measured distribution, not a scalar)',
+        },
+    ],
+    dataProvenance: [
+        // The legal determination, its citations and the source-dataset
+        // versions in this block are preserved untouched. These two are not
+        // legal facts: one asserts the absence of generated content and the
+        // other explains it with a claim about whether generation ran, which
+        // the generation counters in the same artefact can contradict outright.
+        {
+            key: 'aiGeneratedContentPresent',
+            supersededBy: 'dataProvenance.generatedContent (measured either side of the publication line)',
+        },
+        {
+            key: 'aiGenerationPolicy',
+            supersededBy:
+                'dataProvenance.generatedContent.labellingConsequence and generationRefusalPolicy, which state ' +
+                'the measured consequence and the standing refusal rule separately',
+        },
+    ],
+    producedBy: [
+        // All three describe how the AGGREGATE half was produced, and all three
+        // assert it came from the committed release artefacts rather than from a
+        // database — which this stage's own aggregateFieldsDerivedFrom
+        // contradicts. The stageFields* keys beside them belong to the stage
+        // that wrote them and are untouched.
+        { key: 'databaseIndependence', supersededBy: 'producedBy.aggregateFieldsDerivedFrom and aggregateFieldsAccess' },
+        { key: 'itemRecordSource', supersededBy: 'producedBy.aggregateFieldsDerivedFrom' },
+        { key: 'regenerability', supersededBy: 'producedBy.aggregateFieldsDeterminism and aggregateFieldsPreserved' },
+    ],
+};
+
+/** Every superseded key this stage prunes, as `<block>.<key>` — emitted in the
+ * artefact so a removal is auditable from the file rather than only from here. */
+export const supersededKeyPaths = (): readonly string[] =>
+    Object.entries(SUPERSEDED_KEYS)
+        .flatMap(([block, keys]) => keys.map((entry) => `${block}.${entry.key}`))
+        .sort(compareStrings);
+
+/**
+ * Drops the keys {@link SUPERSEDED_KEYS} names for one sub-object.
+ *
+ * Exported for its unit test: the two properties that matter — the named key is
+ * gone, and every key that is not named survives byte for byte — are exactly
+ * what a test can pin and a reviewer cannot.
+ */
+export const pruneSupersededKeys = (
+    blockName: string,
+    block: Readonly<Record<string, unknown>>,
+): Record<string, unknown> => {
+    const superseded = SUPERSEDED_KEYS[blockName] ?? [];
+    const pruned: Record<string, unknown> = { ...block };
+    for (const entry of superseded) {
+        delete pruned[entry.key];
+    }
+    return pruned;
+};
+
 const mergeSubObject = (
     existing: Readonly<Record<string, unknown>> | null,
     key: string,
     own: Readonly<Record<string, unknown>>,
 ): Record<string, unknown> => {
-    const merged = subObjectOf(existing, key);
+    const merged = pruneSupersededKeys(key, subObjectOf(existing, key));
     for (const ownKey of Object.keys(own)) {
         merged[ownKey] = own[ownKey];
     }
@@ -1829,6 +3382,11 @@ const IMPORT_REPORT_CATEGORY_FIELDS = [
     'published',
     'quarantined',
     'shortfall',
+    // The per-category verdict travels with the per-category figures, in both
+    // artefacts and on every row: a gate reading this file must not have to
+    // re-derive it, and a row that carried the shortfall without the verdict is
+    // how a deficit gets read as a metric.
+    'unmet',
     'candidate',
     'rejected',
     'retired',
@@ -1876,6 +3434,12 @@ export const buildImportReportEntries = (input: {
     readonly rows: readonly CoverageRow[];
     readonly requirement: RequirementBlock;
     readonly quarantine: QuarantineFigures;
+    /** Per-item records the companion artefact carries, as this run counted
+     * them while writing it. */
+    readonly itemRecords: number;
+    /** Published rows the aggregate pass counted, whatever their category —
+     * the figure `itemRecords` was reconciled against. */
+    readonly publishedRowsMeasured: number;
     readonly validationReportRelativePath: string;
     readonly scopedTo: string | null;
     readonly existing: Readonly<Record<string, unknown>> | null;
@@ -1914,6 +3478,13 @@ export const buildImportReportEntries = (input: {
                 publishedTotal: shortfall.publishedTotal,
                 shortfallTotal: shortfall.shortfallTotal,
                 meetsPerCategoryTargets: shortfall.meetsTarget,
+                // The same verdict as requirement.everyCategoryMeetsItsTarget,
+                // read off the same rows: both artefacts state it, and
+                // siblingReconciliation compares the figures behind it.
+                everyCategoryMeetsItsTarget: rows.every((row) => !row.unmet),
+                categoriesUnmet: rows.filter((row) => row.unmet).map(unmetCategoryEntry),
+                shortfallComposition: requirement.shortfallComposition,
+                categoriesBelowTarget: rows.filter((row) => row.unmet).length,
                 categoriesMeasured: rows.length,
                 unknownCategories: [...shortfall.unknownCategories].sort(compareStrings),
                 measuredFrom: 'catalog_foods.publication_status grouped by category',
@@ -1950,6 +3521,7 @@ export const buildImportReportEntries = (input: {
                     quarantined: row.quarantined,
                     candidate: row.candidate,
                     shortfall: row.shortfall,
+                    unmet: row.unmet,
                 })),
         ],
         [
@@ -2014,10 +3586,8 @@ export const buildImportReportEntries = (input: {
                 perCategory: quarantine.perCategory,
                 countsTowardPublishedTarget: false,
                 identities: measurement.quarantinedIdentities,
-                // Set to null because this stage supplies the identities: a
-                // preserved sentence saying they are unavailable would be a
-                // claim the data beside it contradicts.
-                identitiesUnavailableReason: null,
+                identityCap: WITHHELD_IDENTITY_LIMIT,
+                identitiesOmittedByCap: measurement.withheldIdentitiesOmitted[QUARANTINED] ?? 0,
                 measuredFrom:
                     'catalog_foods.publication_status = quarantined, joined to catalog_validation_records for the ' +
                     'failing checks. Both the per-category split and the identities exist only in those tables, which ' +
@@ -2025,6 +3595,29 @@ export const buildImportReportEntries = (input: {
                 note:
                     'A quarantined record is never published on an invented value, so it counts toward no published ' +
                     'figure and toward no target. That is what keeps the shortfall truthful.',
+            }),
+        ],
+        // The same audit both artefacts need, built from the same measurement:
+        // quarantine is one of three statuses that mean a row is not published,
+        // and a reader of this file's coverage gaps needs the other two as well.
+        ['withheldIdentityAudit', buildWithheldIdentityAudit(rows, measurement)],
+        [
+            // The legal determination, the citations and the source-dataset
+            // versions in this block are the import stage's and are preserved
+            // byte for byte. Only the two generated-content assertions
+            // SUPERSEDED_KEYS names are replaced, by the measurement below —
+            // see WHETHER GENERATED CONTENT REACHED THE CATALOG, MEASURED.
+            'dataProvenance',
+            mergeSubObject(existing, 'dataProvenance', {
+                generatedContent: generatedContentPresence(
+                    measurement.publishedByIdentitySource,
+                    measurement.withheldByIdentitySourceAndStatus,
+                ),
+                generationRefusalPolicy:
+                    'Generation proposes generic preparations only and never a branded product: a candidate whose ' +
+                    'name matches a brand pattern is refused at parse time, and a candidate whose identity evidence ' +
+                    'does not retrieve is withheld rather than published. The rule stands whether or not a ' +
+                    'generation run has happened, so it is stated separately from the measurement above.',
             }),
         ],
         [
@@ -2041,14 +3634,28 @@ export const buildImportReportEntries = (input: {
                     path: input.validationReportRelativePath,
                     writtenByThisRun: true,
                     publishedItems: shortfall.publishedTotal,
+                    publishedRowsMeasured: input.publishedRowsMeasured,
+                    itemRecords: input.itemRecords,
+                    itemRecordsAgreeWithPublishedRows: input.itemRecords === input.publishedRowsMeasured,
                     shortfallTotal: shortfall.shortfallTotal,
                     quarantineTotal: quarantine.total,
                     quarantinePerCategoryAgrees: true,
+                    snapshotIsolation: REPORT_SNAPSHOT_ISOLATION,
                     agreementNote:
-                        'Both artefacts were written from one scan, and the quarantine figures in this file were ' +
-                        'compared against the block read back off the validation report before this file was ' +
-                        'written. A disagreement ends the run instead of producing two reports that cannot both be ' +
-                        'right.',
+                        'Both artefacts were written from one REPEATABLE READ snapshot of catalog_foods \u2014 the ' +
+                        'aggregate figures from one pass over it and the per-item records from a second \u2014 so the ' +
+                        'two describe the same catalog state. Three things were checked before either file ' +
+                        'replaced its predecessor: that the number of per-item records equals publishedRowsMeasured ' +
+                        '(which is what proves the snapshot held for the whole run), that the quarantine figures ' +
+                        'here match the block read back off the staged validation report, and that both documents ' +
+                        'are complete. A disagreement ends the run with both previous artefacts intact instead of ' +
+                        'producing two reports that cannot both be right.',
+                    publishedItemsNote:
+                        'publishedItems counts published rows in the categories the coverage plan declares, because ' +
+                        'that is what the shortfall is measured from; publishedRowsMeasured counts every published ' +
+                        'row whatever its category, because that is the scope the per-item records were written ' +
+                        'over. They differ only when a published row sits in a category the plan does not declare, ' +
+                        'which coverage.unknownCategories names.',
                 },
             }),
         ],
@@ -2064,12 +3671,23 @@ export const buildImportReportEntries = (input: {
                         'wrote them, and this stage adds nothing to them.',
                 },
                 {
-                    field: 'reject-tier per-item evidence',
+                    field: 'the cause of any per-category shortfall',
+                    value: null,
+                    reason:
+                        'coverageGaps states the exact distance to each unmet target and no cause for it: the ' +
+                        'counters that bear on one \u2014 plannedBatches, executedBatches, refusedCandidates, ' +
+                        'aiGenerationCounts, usdaRequests \u2014 are the import and generation stages\u2019 own ' +
+                        'measurements, preserved in this file by the stages that wrote them. This stage measures ' +
+                        'the distance, not the reason.',
+                },
+                {
+                    field: 'the full per-item check record for rejected rows',
                     value: null,
                     reason:
                         'A rejected row carries a validation record and is counted here by the check that ' +
-                        'disqualified it, but per-item evidence in the validation report covers published rows, ' +
-                        'which is what the catalog serves.',
+                        'disqualified it, and it is named with that check in withheldIdentityAudit. Its complete ' +
+                        'check record, with every observation and bound, is not restated: the per-item half of the ' +
+                        'validation report covers published rows, which is what the catalog serves.',
                 },
             ],
         ],
@@ -2090,12 +3708,36 @@ export const buildImportReportEntries = (input: {
 export interface ReportSink {
     write(chunk: string): Promise<void>;
     end(): Promise<void>;
+    /**
+     * Abandons the sink without publishing anything. Safe to call after
+     * `end()` and safe to call twice, so the failure path can release the
+     * descriptor without having to know how far the writer got.
+     */
+    destroy(): void;
 }
 
-export type OpenSink = (absolutePath: string) => ReportSink;
+/** A sink onto the staging file for `finalPath`, and the staged artefact that
+ * `promote` turns into the artefact at that path. */
+export interface StagedSink {
+    readonly sink: ReportSink;
+    readonly staged: StagedArtifact;
+}
 
+export type OpenStagedSink = (absolutePath: string) => StagedSink;
+
+/**
+ * Every filesystem effect this stage has, behind one seam.
+ *
+ * Nothing here writes a canonical path: a document is STAGED and then
+ * PROMOTED, which is what makes the reconciled pair appear together and makes
+ * a failed run leave the previous pair untouched (see this file's header).
+ * `src/__tests__/scripts/` drives `runReport` with a fake implementation, so
+ * the staging, the reconciliation read and the promotion order are assertable
+ * without a filesystem.
+ */
 export interface ReportIo {
-    readonly openSink: OpenSink;
+    /** Opens a sink onto a staging file beside `absolutePath`. */
+    readonly openStagedSink: OpenStagedSink;
     /**
      * The artefact's fields WITHOUT its `items` map, or `null` when the file
      * does not exist.
@@ -2104,18 +3746,54 @@ export interface ReportIo {
      * preserve a header out of, so the read stops at the `items` key and parses
      * the prefix. A file with no `items` key — the import report — is parsed
      * whole.
+     *
+     * Called for two different things: the CANONICAL path, to preserve the
+     * fields another stage owns, and a STAGING path, to read back the document
+     * this run just wrote so the two artefacts are reconciled against what
+     * will actually land.
      */
     readonly readHeaderObject: (absolutePath: string) => Record<string, unknown> | null;
-    readonly writeJsonObject: (absolutePath: string, value: Readonly<Record<string, unknown>>) => void;
+    /** Writes the complete document to a staging file for `absolutePath`. */
+    readonly stageJsonObject: (absolutePath: string, value: Readonly<Record<string, unknown>>) => StagedArtifact;
+    /** Renames a checked staged set over its canonical paths, back to back. */
+    readonly promote: (staged: readonly StagedArtifact[]) => void;
+    /** Removes staging files without touching any canonical path. */
+    readonly discard: (staged: readonly StagedArtifact[]) => void;
+    /**
+     * Runs `publish` holding an exclusive publication lock on `directory`, so
+     * no other stage can write into the report pair while this run reads one
+     * half, merges it and promotes the result.
+     */
+    readonly withPublicationLock: <T>(directory: string, holder: string, publish: () => Promise<T>) => Promise<T>;
 }
 
-/** Generous beside a header of a few tens of kilobytes, and small enough that
- * the bound is what stops a runaway read rather than available memory. */
-const HEADER_READ_LIMIT_BYTES = 4 * 1024 * 1024;
+/**
+ * The bound on the prefix read back to preserve another stage's fields.
+ *
+ * Sized against the LARGEST header this stage can write, not against the
+ * smallest: the withheld-identity audit lists up to
+ * {@link WITHHELD_IDENTITY_LIMIT} identities per status and the quarantine
+ * block lists the quarantined ones again, so a catalog that withheld tens of
+ * thousands of rows carries a header of a few megabytes rather than the few
+ * tens of kilobytes it used to. A limit below that would make the read-back —
+ * and therefore the reconciliation that gates the second artefact — fail on
+ * exactly the catalog whose evidence matters most.
+ *
+ * Still a bound and not "whatever fits": a full validation report is tens of
+ * megabytes of item records, so this stops a runaway read long before
+ * available memory does.
+ */
+const HEADER_READ_LIMIT_BYTES = 32 * 1024 * 1024;
 
 const openFileSink = (absolutePath: string): ReportSink => {
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-    const stream = fs.createWriteStream(absolutePath, { encoding: 'utf-8' });
+    // `wx`, not the default `w`: exclusive creation refuses an entry that
+    // already exists, including a symlink someone else pre-placed at this
+    // staging name, so the stream can never be pointed at a file outside the
+    // output directory (CWE-59). `--out` accepts arbitrary directories, so this
+    // matters on any shared one; manifest.ts opens its own staging files the
+    // same way, and this was the one writer still using the permissive flag.
+    const stream = fs.createWriteStream(absolutePath, { encoding: 'utf-8', flags: 'wx' });
 
     // A persistent listener, so a write failure between chunks is recorded
     // rather than raised as an unhandled 'error' event; `once` below turns a
@@ -2144,6 +3822,27 @@ const openFileSink = (absolutePath: string): ReportSink => {
                 stream.end(() => resolve());
             });
             throwIfFailed();
+            // The staged document only becomes promotable here, so this is
+            // where it has to be durable. `end()` flushes to the OS but not to
+            // the disk: without this fsync a power loss after promotion could
+            // leave the canonical path naming a file whose tail never landed —
+            // and the completeness check reads that tail, so it would have
+            // passed on data that no longer exists. The JSON staging path in
+            // manifest.ts fsyncs for the same reason; the streamed path is
+            // larger, which makes the window wider rather than narrower.
+            const descriptor = fs.openSync(absolutePath, 'r+');
+            try {
+                fs.fsyncSync(descriptor);
+            } finally {
+                fs.closeSync(descriptor);
+            }
+        },
+        // `destroy` is idempotent on a Node stream and does not throw after
+        // `end`, and the persistent 'error' listener above absorbs the
+        // ERR_STREAM_DESTROYED it may emit — so the failure path can always
+        // call it without masking the error that caused the failure.
+        destroy: (): void => {
+            stream.destroy();
         },
     };
 };
@@ -2205,13 +3904,26 @@ const readHeaderObjectFromFile = (absolutePath: string): Record<string, unknown>
     );
 };
 
+/**
+ * The real filesystem, through `scripts/lib/manifest.ts`.
+ *
+ * Every write goes to a staging file and every publication is a rename, so the
+ * atomicity is the pipeline's one implementation rather than this stage's own
+ * (`stagingPathFor`, `stageJsonArtifact`, `promoteStagedArtifacts`,
+ * `discardStagedArtifacts` and `withArtifactPublicationLock` are shared with
+ * `catalog-import-usda.ts`, `catalog-generate-ai.ts` and `catalog-validate.ts`,
+ * which write into the same two files).
+ */
 export const defaultReportIo = (): ReportIo => ({
-    openSink: openFileSink,
-    readHeaderObject: readHeaderObjectFromFile,
-    writeJsonObject: (absolutePath, value): void => {
-        fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-        fs.writeFileSync(absolutePath, `${JSON.stringify(value, null, 2)}\n`, 'utf-8');
+    openStagedSink: (absolutePath): StagedSink => {
+        const staged: StagedArtifact = { finalPath: absolutePath, stagingPath: stagingPathFor(absolutePath) };
+        return { sink: openFileSink(staged.stagingPath), staged };
     },
+    readHeaderObject: readHeaderObjectFromFile,
+    stageJsonObject: (absolutePath, value): StagedArtifact => stageJsonArtifact(absolutePath, value),
+    promote: promoteStagedArtifacts,
+    discard: discardStagedArtifacts,
+    withPublicationLock: withArtifactPublicationLock,
 });
 
 /** Re-indents a pretty-printed value so it can be nested inside a document
@@ -2352,9 +4064,80 @@ export const reconcileQuarantineFigures = (input: {
 
     throw new CatalogReportError(
         `the quarantine figures in ${input.validationReportPath} disagree with the figures bound for ` +
-            `${input.importReportPath}, so one of the two artefacts is wrong and ${IMPORT_REPORT_FILE} was not ` +
-            `written: ${disagreements.join('; ')}.`,
+            `${input.importReportPath}, so one of the two artefacts is wrong and neither was published: ` +
+            `${disagreements.join('; ')}.`,
         'quarantine_reconciliation_failed',
+    );
+};
+
+/** How many per-item records the emitting pass produced, against what the
+ * aggregate pass counted, and what the emitter had to skip. */
+export interface ItemCountReconciliation {
+    /** Records written into the validation report's `items` map. */
+    readonly itemsEmitted: number;
+    /** `publication_status = published` rows the aggregate pass counted. */
+    readonly publishedRowsMeasured: number;
+    /** Published rows the emitting pass found with no validation record. */
+    readonly skippedWithoutRecord: number;
+    /** The first few of those rows, named so an operator can act. */
+    readonly skippedNamed: readonly string[];
+}
+
+/** How many skipped identities the failure names before summarising. */
+const SKIPPED_NAMED_LIMIT = 20;
+
+/**
+ * The two passes must have seen one catalog.
+ *
+ * The aggregate pass counts published rows; the emitting pass writes one record
+ * per published row. Those numbers are the same number measured twice, and the
+ * whole point of reading both through one snapshot is that they cannot drift —
+ * so a difference is not a discrepancy to report in the artefact, it is
+ * evidence that the run is not describing a single state, and the run ends
+ * before either file is published.
+ *
+ * A published row the emitter had to skip fails the run even when the totals
+ * happen to agree: `assertEveryPublishedItemHasARecord` already proved on the
+ * aggregate pass that every published row carries a record, so a skip means the
+ * row lost it mid-run — and two offsetting changes can leave the totals equal
+ * while the evidence is short by one item.
+ */
+export const reconcileItemCount = (input: {
+    readonly validationReportPath: string;
+    readonly reconciliation: ItemCountReconciliation;
+}): void => {
+    const { itemsEmitted, publishedRowsMeasured, skippedWithoutRecord, skippedNamed } = input.reconciliation;
+
+    if (itemsEmitted === publishedRowsMeasured && skippedWithoutRecord === 0) {
+        return;
+    }
+
+    const problems: string[] = [];
+    if (itemsEmitted !== publishedRowsMeasured) {
+        problems.push(
+            `${formatCount(itemsEmitted)} per-item record(s) were written for ` +
+                `${formatCount(publishedRowsMeasured)} published row(s) the aggregate pass counted`,
+        );
+    }
+    if (skippedWithoutRecord > 0) {
+        const named = skippedNamed.slice(0, SKIPPED_NAMED_LIMIT).join(', ');
+        const remainder =
+            skippedWithoutRecord > skippedNamed.length
+                ? ` and ${formatCount(skippedWithoutRecord - skippedNamed.length)} more`
+                : '';
+        problems.push(
+            `${formatCount(skippedWithoutRecord)} published row(s) carried no catalog_validation_records row when ` +
+                `the records were written, although the aggregate pass found one for every published row: ` +
+                `${named}${remainder}`,
+        );
+    }
+
+    throw new CatalogReportError(
+        `the two passes over catalog_foods did not describe the same catalog, so neither artefact was published and ` +
+            `the previous ${VALIDATION_REPORT_FILE} and ${IMPORT_REPORT_FILE} are intact: ${problems.join('; ')}. ` +
+            'Both passes read through one REPEATABLE READ snapshot, so this means the snapshot was not held for the ' +
+            'whole run — re-run the report with no other catalog stage running.',
+        'item_count_mismatch',
     );
 };
 
@@ -2377,13 +4160,36 @@ export interface ReportOutcome {
     readonly validationReportPath: string;
     readonly importReportPath: string;
     readonly rowsScanned: number;
+    /**
+     * Published rows in the categories the coverage plan declares — the total
+     * the shortfall is measured from. A published row in a category the plan
+     * does not declare is excluded here and named in `coverage.unknownCategories`.
+     */
     readonly publishedItems: number;
+    /**
+     * Every `publication_status = published` row the aggregate pass counted,
+     * whatever its category. This is the figure the per-item record count is
+     * reconciled against, because the emitting pass is scoped by publication
+     * status and not by the plan.
+     */
+    readonly publishedRows: number;
     readonly itemRecords: number;
     readonly quarantined: number;
     readonly shortfallTotal: number;
     readonly requirementMet: boolean;
     readonly unmetRequirements: readonly string[];
 }
+
+/**
+ * The key under which this stage records what its write into
+ * `import-report.json` preserved. Each stage writing that file has its own
+ * (`importStageWrite`, `generationStageWrite`), so the three notes sit beside
+ * each other rather than overwriting one another.
+ */
+export const REPORT_STAGE_NOTE_KEY = 'reportStageWrite';
+
+/** The lock holder name this stage takes on the output directory. */
+const PUBLICATION_HOLDER = `${STAGE}:artefacts`;
 
 export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => {
     const { db, plan, options, outDir, logger: runLogger, io } = deps;
@@ -2399,101 +4205,206 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
 
     const where: Record<string, unknown> = scopedTo === null ? {} : { category: scopedTo };
 
-    const measurement = await measureCatalog(db, where);
-    runLogger.info('catalog_measured', {
-        stage: STAGE,
-        rowsScanned: measurement.rowsScanned,
-        byPublicationStatus: JSON.stringify(sortedRecord(measurement.byPublicationStatus)),
-        categoryFilter: scopedTo,
-    });
-
-    // Before either artefact is written: a published food with no validation
-    // record would make this report claim evidence that does not exist.
-    assertEveryPublishedItemHasARecord(measurement);
-
-    const shortfall = computeCoverageShortfall(policy, measurement.publishedByCategory);
-    const rows = buildCoverageRows(policy, plan, measurement, shortfall);
-    const requirement = buildRequirementBlock({ plan, measurement, shortfall, rows, scopedTo });
-    const quarantine: QuarantineFigures = {
-        total: statusCount(measurement.byPublicationStatus, QUARANTINED),
-        perCategory: quarantinePerCategory(rows, measurement),
-    };
-
     const validationReportPath = path.join(outDir, VALIDATION_REPORT_FILE);
     const importReportPath = path.join(outDir, IMPORT_REPORT_FILE);
 
-    const existingValidationReport = io.readHeaderObject(validationReportPath);
-    const validationEntries = buildValidationReportEntries({
-        plan,
-        policy,
-        allowlistVersion: deps.allowlistVersion,
-        evidenceRegistrySnapshot: deps.evidenceRegistrySnapshot,
-        measurement,
-        shortfall,
-        rows,
-        requirement,
-        scopedTo,
-        existing: existingValidationReport,
-    });
+    // The lock spans the WHOLE run, not just the two renames. The half of
+    // `import-report.json` this stage does not own is read at the end and
+    // merged into what it writes; an import or generation run publishing into
+    // that file between the read and the promotion would have its counters
+    // silently reverted to the values this run read. Holding the lock across
+    // both passes also means the artefacts an operator finds afterwards were
+    // produced by exactly one publisher.
+    return io.withPublicationLock(outDir, PUBLICATION_HOLDER, async (): Promise<ReportOutcome> => {
+        const measurement = await measureCatalog(db, where);
+        runLogger.info('catalog_measured', {
+            stage: STAGE,
+            rowsScanned: measurement.rowsScanned,
+            byPublicationStatus: JSON.stringify(sortedRecord(measurement.byPublicationStatus)),
+            categoryFilter: scopedTo,
+        });
 
-    const { itemCount } = await writeValidationReport({
-        sink: io.openSink(validationReportPath),
-        existing: existingValidationReport,
-        entries: validationEntries,
-        emitItems: async (emit) => {
-            await forEachFoodPage(db, { ...where, publication_status: PUBLISHED }, async (page) => {
-                for (const row of page) {
-                    const record = row.catalog_validation_records;
-                    if (record === null) {
-                        continue;
-                    }
-                    await emit(row.source_key, toItemRecord(row, record));
-                }
+        // Before either artefact is written: a published food with no validation
+        // record would make this report claim evidence that does not exist.
+        assertEveryPublishedItemHasARecord(measurement);
+
+        const shortfall = computeCoverageShortfall(policy, measurement.publishedByCategory);
+        const rows = buildCoverageRows(policy, plan, measurement, shortfall);
+        const requirement = buildRequirementBlock({ plan, measurement, shortfall, rows, scopedTo });
+        const quarantine: QuarantineFigures = {
+            total: statusCount(measurement.byPublicationStatus, QUARANTINED),
+            perCategory: quarantinePerCategory(rows, measurement),
+        };
+        const publishedRows = statusCount(measurement.byPublicationStatus, PUBLISHED);
+
+        // The CANONICAL file, so the fields the import and generation stages own
+        // are the ones preserved; the staged document read back below is this
+        // run's own output.
+        const existingValidationReport = io.readHeaderObject(validationReportPath);
+        const validationEntries = buildValidationReportEntries({
+            plan,
+            policy,
+            allowlistVersion: deps.allowlistVersion,
+            evidenceRegistrySnapshot: deps.evidenceRegistrySnapshot,
+            measurement,
+            shortfall,
+            rows,
+            requirement,
+            scopedTo,
+            existing: existingValidationReport,
+        });
+
+        const validationSink = io.openStagedSink(validationReportPath);
+        const staged: StagedArtifact[] = [validationSink.staged];
+
+        try {
+            let skippedWithoutRecord = 0;
+            const skippedNamed: string[] = [];
+
+            const { itemCount } = await writeValidationReport({
+                sink: validationSink.sink,
+                existing: existingValidationReport,
+                entries: validationEntries,
+                emitItems: async (emit) => {
+                    await forEachFoodPage(db, { ...where, publication_status: PUBLISHED }, async (page) => {
+                        for (const row of page) {
+                            const record = row.catalog_validation_records;
+                            if (record === null) {
+                                // Counted and named rather than passed over: the
+                                // aggregate pass already proved every published row
+                                // has a record, so this can only mean the two passes
+                                // disagree, which `reconcileItemCount` turns into a
+                                // failed run below.
+                                skippedWithoutRecord += 1;
+                                if (skippedNamed.length < SKIPPED_NAMED_LIMIT) {
+                                    skippedNamed.push(row.source_key);
+                                }
+                                continue;
+                            }
+                            await emit(row.source_key, toItemRecord(row, record));
+                        }
+                    });
+                },
             });
-        },
+            runLogger.info('validation_report_staged', {
+                stage: STAGE,
+                path: validationReportPath,
+                stagingPath: validationSink.staged.stagingPath,
+                itemRecords: itemCount,
+                publishedRowsMeasured: publishedRows,
+                skippedWithoutRecord,
+            });
+
+            // The proof that the snapshot held: one number measured twice.
+            reconcileItemCount({
+                validationReportPath,
+                reconciliation: {
+                    itemsEmitted: itemCount,
+                    publishedRowsMeasured: publishedRows,
+                    skippedWithoutRecord,
+                    skippedNamed,
+                },
+            });
+
+            // Read back from the STAGED document, not from the object just
+            // built: what the next stage and the next reviewer will read is the
+            // file, and only the file can show that what this run measured is
+            // what it actually serialised. Reading the canonical path here
+            // instead would reconcile against the PREVIOUS run's artefact.
+            reconcileQuarantineFigures({
+                validationReportPath,
+                importReportPath,
+                onDisk: quarantineFiguresOf(
+                    io.readHeaderObject(validationSink.staged.stagingPath),
+                    validationSink.staged.stagingPath,
+                ),
+                measured: quarantine,
+            });
+
+            const existingImportReport = io.readHeaderObject(importReportPath);
+            // One merge policy for all three stages that write this file
+            // (`MERGED_REPORT_COMPOUND_BLOCKS`), so a sub-key a sibling stage
+            // contributes to a shared block cannot be dropped by a top-level
+            // replacement here — the same helper `catalog-import-usda.ts` and
+            // `catalog-generate-ai.ts` write through.
+            const merge = mergeStageReport(
+                existingImportReport,
+                Object.fromEntries(
+                    buildImportReportEntries({
+                        measurement,
+                        shortfall,
+                        rows,
+                        requirement,
+                        quarantine,
+                        itemRecords: itemCount,
+                        publishedRowsMeasured: publishedRows,
+                        validationReportRelativePath: `data/meal-planning/reports/latest/${VALIDATION_REPORT_FILE}`,
+                        scopedTo,
+                        existing: existingImportReport,
+                    }),
+                ),
+                {
+                    noteKey: REPORT_STAGE_NOTE_KEY,
+                    stage: STAGE,
+                    compoundBlocks: MERGED_REPORT_COMPOUND_BLOCKS,
+                },
+            );
+
+            staged.push(io.stageJsonObject(importReportPath, merge.document));
+            runLogger.info('import_report_staged', {
+                stage: STAGE,
+                path: importReportPath,
+                preservedKeys: merge.preservedKeys.join(','),
+                preservedSubKeys: JSON.stringify(merge.preservedSubKeys),
+            });
+
+            // The publication: both documents are complete, both are reconciled
+            // against each other, and only now does either replace what is on
+            // disk.
+            io.promote(staged);
+            runLogger.info('artefacts_published', {
+                stage: STAGE,
+                validationReport: validationReportPath,
+                importReport: importReportPath,
+                itemRecords: itemCount,
+            });
+
+            return {
+                validationReportPath,
+                importReportPath,
+                rowsScanned: measurement.rowsScanned,
+                publishedItems: shortfall.publishedTotal,
+                publishedRows,
+                itemRecords: itemCount,
+                quarantined: quarantine.total,
+                shortfallTotal: shortfall.shortfallTotal,
+                requirementMet: requirement.requirementMet,
+                unmetRequirements: requirement.unmetRequirements.map((entry) => entry.code),
+            };
+        } catch (error) {
+            // A failure before `promote` has touched nothing canonical, and a
+            // failure inside `promote` has already rolled the set back to the
+            // generation it found (manifest.ts publishes through a journal, so
+            // the canonical paths are all-new or all-previous once it returns).
+            // Either way the recovery here is the same: drop the staging files
+            // and re-raise. The sink is destroyed first in case the failure
+            // happened mid-stream. A failed report is a run that produced no
+            // evidence, never a run that half-replaced the evidence it was
+            // rewriting — but note that is a property of the journal, not of
+            // this handler, which cannot undo a rename by itself.
+            validationSink.sink.destroy();
+            io.discard(staged);
+            runLogger.warn('artefacts_discarded', {
+                stage: STAGE,
+                stagingPaths: staged.map((artifact) => artifact.stagingPath).join(','),
+                validationReport: validationReportPath,
+                importReport: importReportPath,
+                previousArtefacts: 'rolled back to the generation this run found',
+                error: safeError(error),
+            });
+            throw error;
+        }
     });
-    runLogger.info('validation_report_written', { stage: STAGE, path: validationReportPath, itemRecords: itemCount });
-
-    // Read back from disk, not from the object just built: what the next stage
-    // and the next reviewer will read is the file, and only the file can show
-    // that what this run measured is what actually landed.
-    reconcileQuarantineFigures({
-        validationReportPath,
-        importReportPath,
-        onDisk: quarantineFiguresOf(io.readHeaderObject(validationReportPath), validationReportPath),
-        measured: quarantine,
-    });
-
-    const existingImportReport = io.readHeaderObject(importReportPath);
-    io.writeJsonObject(
-        importReportPath,
-        mergeOwnedFields(
-            existingImportReport,
-            buildImportReportEntries({
-                measurement,
-                shortfall,
-                rows,
-                requirement,
-                quarantine,
-                validationReportRelativePath: `data/meal-planning/reports/latest/${VALIDATION_REPORT_FILE}`,
-                scopedTo,
-                existing: existingImportReport,
-            }),
-        ),
-    );
-    runLogger.info('import_report_merged', { stage: STAGE, path: importReportPath });
-
-    return {
-        validationReportPath,
-        importReportPath,
-        rowsScanned: measurement.rowsScanned,
-        publishedItems: shortfall.publishedTotal,
-        itemRecords: itemCount,
-        quarantined: quarantine.total,
-        shortfallTotal: shortfall.shortfallTotal,
-        requirementMet: requirement.requirementMet,
-        unmetRequirements: requirement.unmetRequirements.map((entry) => entry.code),
-    };
 };
 
 // ---------------------------------------------------------------------------
@@ -2527,12 +4438,75 @@ const requirementFields = (outcome: ReportOutcome): LogFields => ({
 });
 
 /**
+ * The client capability this stage needs beyond {@link ReportDb}: an
+ * interactive transaction to pin a snapshot in.
+ *
+ * Declared structurally and reached through one cast at the call site, for the
+ * same reason `ReportDb` is — it is the narrowest surface this stage can be
+ * handed, so the snapshot cannot quietly become a place where writes happen.
+ */
+interface SnapshotCapableClient {
+    $transaction: <T>(
+        run: (tx: unknown) => Promise<T>,
+        options: {
+            readonly isolationLevel: typeof REPORT_SNAPSHOT_ISOLATION;
+            readonly timeout: number;
+            readonly maxWait: number;
+        },
+    ) => Promise<T>;
+}
+
+/** Whether an error is one Prisma raised — every Prisma error code is `P` and
+ * digits, and none of this stage's own errors carry a `code` of that shape. */
+const isPrismaError = (error: unknown): boolean => {
+    const code = (error as { code?: unknown } | null)?.code;
+    return typeof code === 'string' && /^P\d/.test(code);
+};
+
+/**
+ * Runs `run` against a pinned snapshot of the catalog.
+ *
+ * Both of this stage's passes read through the client it hands over, so they
+ * see one catalog state however long the run takes and whatever else is
+ * writing to the database (see this file's header).
+ */
+const openReportSnapshot = async <T>(client: SnapshotCapableClient, run: (db: ReportDb) => Promise<T>): Promise<T> => {
+    try {
+        return await client.$transaction((tx) => run(tx as ReportDb), {
+            isolationLevel: REPORT_SNAPSHOT_ISOLATION,
+            timeout: REPORT_SNAPSHOT_TIMEOUT_MS,
+            maxWait: REPORT_SNAPSHOT_MAX_WAIT_MS,
+        });
+    } catch (error) {
+        // A failure raised INSIDE the snapshot keeps its own code: it is a
+        // finding about the catalog or about the artefacts, not about the
+        // snapshot, and relabelling it would send an operator to the wrong
+        // place.
+        if (error instanceof CatalogReportError || error instanceof ManifestError || error instanceof DatabaseOriginError) {
+            throw error;
+        }
+        if (isPrismaError(error)) {
+            throw new CatalogReportError(
+                'the snapshot the two passes share could not be opened or could not be held for the whole run, so ' +
+                    'no artefact was written and the previous pair is intact: ' +
+                    `${safeError(error).message} (isolation ${REPORT_SNAPSHOT_ISOLATION}, timeout ` +
+                    `${REPORT_SNAPSHOT_TIMEOUT_MS} ms, connection wait ${REPORT_SNAPSHOT_MAX_WAIT_MS} ms).`,
+                'report_snapshot_failed',
+            );
+        }
+        // Anything else is re-raised as itself and reported under
+        // `unexpected_error`, never relabelled as a snapshot problem.
+        throw error;
+    }
+};
+
+/**
  * Exit codes say whether EVIDENCE WAS PRODUCED, not whether the evidence is
- * good news: 0 means both artefacts were written and reconciled, 1 means they
- * were not. An unmet requirement is a successfully measured finding — it is
- * stated in `requirement.unmetRequirements` and logged as `requirement_unmet`
- * — and conflating it with a failed run would leave an operator unable to tell
- * a shortfall from a missing report.
+ * good news: 0 means both artefacts were published and reconciled, 1 means
+ * they were not. An unmet requirement is a successfully measured finding — it
+ * is stated in `requirement.unmetRequirements` and logged as
+ * `requirement_unmet` — and conflating it with a failed run would leave an
+ * operator unable to tell a shortfall from a missing report.
  */
 const main = async (): Promise<number> => {
     const parsed = parseArgs(process.argv.slice(2));
@@ -2563,29 +4537,50 @@ const main = async (): Promise<number> => {
     const allowlist = loadEvidenceAllowlist();
 
     const scopedTo = parsed.options.category;
+    if (scopedTo !== null && !plan.categories.some((entry) => entry.category === scopedTo)) {
+        throw new CatalogReportError(
+            `--category ${scopedTo} is not a category ${COVERAGE_PLAN_RELATIVE_PATH} declares. It declares: ` +
+                `${plan.categories.map((entry) => entry.category).sort(compareStrings).join(', ')}.`,
+            'unknown_category_filter',
+        );
+    }
+
+    // The artefacts are written to the directory as the operator named it, so
+    // the paths in the log and in any failure are the ones they typed. The
+    // scoped-report check below compares the two directories with their
+    // symlinks resolved instead, because the DESTINATION is what decides that
+    // check and a symlink, a bind mount or a differently-spelled path would
+    // otherwise name the committed report directory without matching it.
+    const outDir = resolveOutDir(parsed.options.out);
+    const canonicalReportDir = canonicalReportDirectory();
+    const resolvedOutDir = canonicalizeDirectoryPath(outDir);
+    const resolvedCanonicalReportDir = canonicalizeDirectoryPath(canonicalReportDir);
+    const writesCommittedArtefacts = writesIntoCanonicalReportDirectory(resolvedOutDir, resolvedCanonicalReportDir);
+
     if (scopedTo !== null) {
-        if (!plan.categories.some((entry) => entry.category === scopedTo)) {
-            throw new CatalogReportError(
-                `--category ${scopedTo} is not a category ${COVERAGE_PLAN_RELATIVE_PATH} declares. It declares: ` +
-                    `${plan.categories.map((entry) => entry.category).sort(compareStrings).join(', ')}.`,
-                'unknown_category_filter',
-            );
-        }
-        // A scoped run measures part of the catalog, and partial evidence must
-        // never take the place of the committed whole-catalog artefacts — which
-        // is exactly what writing it to the default directory would do.
-        if (parsed.options.out === null) {
-            throw new CatalogReportError(
-                `--category ${scopedTo} produces partial evidence, so it also requires --out <dir>: writing it to ` +
-                    'the default report directory would replace the whole-catalog artefacts with a single ' +
-                    "category's figures.",
-                'scoped_report_needs_out_dir',
-            );
+        // Omitting `--out` and passing the committed directory as `--out`
+        // produce the same partial artefacts in the same place, so both are
+        // refused: a guard that only asked whether the flag was given would
+        // wave the explicit form through.
+        const refusal = scopedReportRefusal({
+            category: scopedTo,
+            out: parsed.options.out,
+            resolvedOutDir,
+            canonicalReportDir: resolvedCanonicalReportDir,
+        });
+        if (refusal !== null) {
+            throw new CatalogReportError(refusal, 'scoped_report_needs_out_dir');
         }
     }
 
-    const outDir = resolveOutDir(parsed.options.out);
-    logger.info('stage_invoked', { stage: STAGE, outDir, categoryFilter: scopedTo });
+    logger.info('stage_invoked', {
+        stage: STAGE,
+        outDir,
+        resolvedOutDir,
+        canonicalReportDir: resolvedCanonicalReportDir,
+        writesCommittedArtefacts,
+        categoryFilter: scopedTo,
+    });
 
     // HERE rather than at module load: `src/prisma/client.ts` constructs the
     // client at import time, so importing this module for its exported
@@ -2593,16 +4588,26 @@ const main = async (): Promise<number> => {
     const { prisma } = await import('../src/prisma/client');
 
     try {
-        const outcome = await runReport({
-            db: prisma as unknown as ReportDb,
-            plan,
-            allowlistVersion: allowlist.allowlistVersion,
-            evidenceRegistrySnapshot: allowlist.registrySnapshot,
-            options: parsed.options,
-            outDir,
-            logger,
-            io: defaultReportIo(),
-        });
+        // BOTH PASSES INSIDE ONE SNAPSHOT. The aggregate figures and the
+        // per-item records are two scans whose totals are reconciled against
+        // each other, so they must read one catalog state; a concurrent
+        // `catalog:load`, `catalog:validate` or `catalog:generate` between the
+        // passes would otherwise produce a report that reconciles two states
+        // and reads as consistent. The transaction is read-only by
+        // construction — `ReportDb` exposes `findMany` and nothing else — so it
+        // takes no row locks and blocks no writer; it only pins a snapshot.
+        const outcome = await openReportSnapshot(prisma as unknown as SnapshotCapableClient, async (db) =>
+            runReport({
+                db,
+                plan,
+                allowlistVersion: allowlist.allowlistVersion,
+                evidenceRegistrySnapshot: allowlist.registrySnapshot,
+                options: parsed.options,
+                outDir,
+                logger,
+                io: defaultReportIo(),
+            }),
+        );
 
         if (outcome.unmetRequirements.length > 0) {
             logger.warn('requirement_unmet', requirementFields(outcome));
@@ -2612,6 +4617,7 @@ const main = async (): Promise<number> => {
             stage: STAGE,
             rowsScanned: outcome.rowsScanned,
             publishedItems: outcome.publishedItems,
+            publishedRows: outcome.publishedRows,
             itemRecords: outcome.itemRecords,
             quarantined: outcome.quarantined,
             perCategoryShortfallTotal: outcome.shortfallTotal,

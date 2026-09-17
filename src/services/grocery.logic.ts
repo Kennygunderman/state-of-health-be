@@ -371,11 +371,17 @@ export const classifyQuantityChange = (previous: number, next: number): GroceryQ
 /**
  * The food's default portion, as `catalog_food_portions` stores it.
  *
- * `amount` travels with the unit because the two only mean something together:
- * "0.5 cup / 107 g" states a different density from "1 cup / 107 g", and
- * {@link volumeDensityFor} divides it out. A projection that dropped it would
- * read every portion as one of its unit and misstate every volume row whose
- * portion is not.
+ * `amount` travels with the unit because the two only mean something together,
+ * and it carries a different meaning in each measured family — which is why a
+ * projection that dropped it would misstate rows in two ways:
+ *
+ *  * For a VOLUME portion it is the divisor of the density: "0.5 cup / 107 g"
+ *    states a different density from "1 cup / 107 g", and
+ *    {@link volumeDensityFor} divides it out.
+ *  * For a COUNT portion it is the CARDINALITY — how many items one portion is
+ *    — which `utils/units.ts` multiplies the portion count by. Reading it off
+ *    the description instead disagrees with the column for 138 of the shipped
+ *    catalog's default count portions.
  */
 export interface GroceryDefaultPortion {
     description: string;
@@ -456,6 +462,224 @@ export const volumeDensityFor = (facts: GroceryConversionFacts): number | null =
 };
 
 /**
+ * The words that make a portion description a CONTAINER or a SERVING rather
+ * than a countable item.
+ *
+ * Two groups, and both say the same thing about the data: the portion describes
+ * the package the shop sells the food in, or a reference amount someone chose
+ * to tabulate it against, and neither is a thing a shopper can be told to buy a
+ * number of. "1 can, drained" (253 g of chickpeas) is a can of an unstated
+ * size, and "RACC" is a regulatory reference amount — printing either as a
+ * shopping unit produces exactly the unsized container line §0.1.4 rules out
+ * ("container units are never generated") and the display contract of
+ * `docs/meal-planning/planning-policy.md` §6 repeats.
+ *
+ * THREE GROUPS, and the third is neither a package nor a tabulation unit: a
+ * DOSING OR SINGLE-SERVE measure — "scoop" (the protein-powder scoop),
+ * "individual", "recipe yield" — which names an amount somebody dispenses
+ * rather than a thing on a shelf, and is just as unsized as a can.
+ *
+ * CLOSED AND CATALOG-DERIVED, like every other word list in this feature: 788
+ * of the 3,514 count-family default portions in catalog release v1 match this
+ * set or {@link CONTAINER_PORTION_PHRASES}, and of the 69 foods the seeded
+ * recipes use the only matches are `usda:173800` (Chickpeas, canned) and
+ * `usda:174285` (Kidney beans, canned) — both
+ * `{amount: 1, unit: 'each', description: '1 can, drained'}`, at 253 g and
+ * 266 g.
+ *
+ * WHERE THE BOUNDARY IS DRAWN, and it is drawn deliberately so it can be
+ * reviewed rather than inherited:
+ *
+ *  * A VESSEL, A TABULATION UNIT OR A DOSE is disqualified. Every word below
+ *    names one, whether it heads the description or sits inside it.
+ *  * A BARE SIZE OR GRADE LABEL WITH NO ITEM NOUN KEEPS COUNTING —
+ *    "regular" (106 rows), "miniature" (75), "miniature/bite size" (67),
+ *    "whole" (13), "bite size", "slice, any size", "cubic inch". These are
+ *    terse labels the catalog wrote on a countable item, not containers and
+ *    not serving references, so counting them prints the item the shopper buys
+ *    a number of. Measuring them instead would be a scope decision no finding
+ *    asks for, and it would take 2,000-odd truthful count rows with it.
+ *  * A DESCRIPTION WHOSE HEAD NOUN IS A REAL ITEM KEEPS COUNTING — slice,
+ *    piece, sandwich, fillet, patty, chop, rib, steak, link, egg, clove,
+ *    apple, cookie, cracker, waffle, muffin, roll, bar, cone, cube, wedge,
+ *    pod, ear, leaf, fruit, berry, cake, pie, pizza, taco, tortilla, pita,
+ *    pickle, ball, tablet and the rest of the release's item vocabulary. The
+ *    corpus matrix in `__tests__/grocery.logic.test.ts` pins one case per form
+ *    family on both sides of this boundary, quoted verbatim from the release.
+ *
+ * `yield` and `refuse` are DELIBERATELY ABSENT AS WORDS. "1 chop without
+ * refuse (Yield from 1 cooked chop, with refuse, weighing 172g)", "rib (yield
+ * after cooking, bone removed)", "steak (yield from 181 g raw meat)" and
+ * "pod, yields" are real countable items that USDA happens to describe through
+ * their yield — 57 allowed rows mention the word — so admitting either word
+ * would weigh rows that should be counted. The one yield form that is NOT an
+ * item, "recipe yield", is therefore matched as a PHRASE instead
+ * ({@link CONTAINER_PORTION_PHRASES}).
+ */
+const CONTAINER_PORTION_WORDS: ReadonlySet<string> = new Set([
+    // Containers and vessels — the package, not its contents.
+    'can',
+    'cans',
+    'bottle',
+    'bottles',
+    'jar',
+    'jars',
+    'container',
+    'containers',
+    'package',
+    'packages',
+    'packet',
+    'packets',
+    'bag',
+    'bags',
+    'box',
+    'boxes',
+    'carton',
+    'cartons',
+    'tub',
+    'tubs',
+    'pouch',
+    'pouches',
+    'tin',
+    'tins',
+    'envelope',
+    'envelopes',
+    'sachet',
+    'sachets',
+    'tray',
+    'trays',
+    'case',
+    'cases',
+    'wrapper',
+    'wrappers',
+    // A serving vessel is a vessel: "KFC Bowl" states no size either.
+    'bowl',
+    'bowls',
+    // Servings and reference amounts — a tabulation unit, not an item.
+    'serving',
+    'servings',
+    'racc',
+    'portion',
+    'portions',
+    'order',
+    'orders',
+    'meal',
+    'meals',
+    // A packaged dinner is a meal by another name: the release writes the same
+    // frozen entree both ways ("meal (11 oz)", "Swanson Salisbury Steak Dinner
+    // (11 oz)"), and one word disqualifying without the other would split one
+    // form family down the middle.
+    'dinner',
+    'dinners',
+    'helping',
+    'helpings',
+    'item',
+    'items',
+    'unit',
+    'units',
+    // Doses and single-serve references — an amount dispensed, not an item.
+    // The release's seven scoop rows are protein powders ("scoop",
+    // "scoop Gold Standard", "scoop, NFS"), and its 28 `individual` rows
+    // ("small/individual", "individual (3.5 fl oz)") name a single-serve
+    // reference with no item noun behind it.
+    'scoop',
+    'scoops',
+    'individual',
+]);
+
+/**
+ * The disqualifying PHRASES: contiguous runs of whole words that make a portion
+ * description a serving reference, where no single word of the run does.
+ *
+ * "recipe yield" (2 rows in release v1) is a recipe's whole output, which is
+ * neither a package nor an item — but `yield` alone cannot be a disqualifying
+ * word, because 57 allowed rows are real items USDA describes through their
+ * yield ("rib (yield after cooking, bone removed)"). Matching the run keeps
+ * both readings: the phrase is disqualified, the bare word is not.
+ *
+ * CLOSED, like the word set, and matched with the same {@link containsWordRun}
+ * the state suffix uses, so the two whole-word phrase matches in this file
+ * cannot drift apart.
+ */
+const CONTAINER_PORTION_PHRASES: readonly (readonly string[])[] = [['recipe', 'yield']];
+
+/** Every whole word of a description, lower-cased: "container (6 oz)" -> [container, oz]. */
+const descriptionWords = (description: string): string[] => description.toLowerCase().match(/[a-z]+/g) ?? [];
+
+/**
+ * Whether `words` contains `run` as a contiguous sequence of whole words.
+ *
+ * Two rules here read text this way and both need whole-word runs rather than
+ * substrings: {@link describesContainerOrServing} matches a portion
+ * description's disqualifying phrases, and {@link buildGroceryName} matches a
+ * name's own qualifiers against a food state's words. One matcher serves both.
+ */
+const containsWordRun = (words: readonly string[], run: readonly string[]): boolean => {
+    if (run.length === 0 || run.length > words.length) {
+        return false;
+    }
+
+    for (let start = 0; start + run.length <= words.length; start += 1) {
+        if (run.every((word, offset) => words[start + offset] === word)) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
+/**
+ * Whether a count-family default portion describes a container or a serving
+ * instead of a countable item.
+ *
+ * THE SCAN IS THE WHOLE DESCRIPTION, not the head noun, because the release
+ * routinely puts the disqualifying word somewhere else: `"serving 1/2 cup"`,
+ * `"container refrigerated 4 oz"`, `"regular microwave bag"`,
+ * `"kids meal order"` and `"package without flavor packet"` all name a
+ * container or a serving in a word the head-noun rule of `utils/units.ts` would
+ * never reach. Every whole word is therefore tested against
+ * {@link CONTAINER_PORTION_WORDS} and every contiguous word run against
+ * {@link CONTAINER_PORTION_PHRASES}, and one match of either is enough.
+ *
+ * AN AMBIGUOUS DESCRIPTION ERRS TOWARD A MEASURE. A false match weighs a row
+ * that could have been counted — "227 g" instead of "1 tub" — which is a
+ * truthful, if plainer, shopping line, because the grams are what the
+ * aggregation actually measured. A missed match prints a unit the data cannot
+ * size, which is the one output §0.1.4 forbids. The asymmetry is the reason the
+ * list is generous with vessel words and silent about words like `yield` that
+ * merely accompany a real item.
+ *
+ * IT IS STILL NOT A GUESS. Both lists are closed and release-derived, and the
+ * boundary they draw — vessels, tabulation units and doses out, bare size
+ * labels and item nouns in — is documented on
+ * {@link CONTAINER_PORTION_WORDS} and pinned form family by form family, in
+ * both directions, by the corpus matrix in `__tests__/grocery.logic.test.ts`.
+ *
+ * Exported so the decision is testable on its own: it is the predicate behind
+ * {@link displayFamilyForPortion}'s count answer, and the release data it is
+ * closed against is the kind of thing that needs pinning rather than reasoning
+ * about.
+ */
+export const describesContainerOrServing = (description: string): boolean => {
+    const words = descriptionWords(description);
+
+    return (
+        words.some((word) => CONTAINER_PORTION_WORDS.has(word)) ||
+        CONTAINER_PORTION_PHRASES.some((phrase) => containsWordRun(words, phrase))
+    );
+};
+
+/**
+ * The measured family a food can be shown in: `volume` when it can state a
+ * density, `mass` otherwise.
+ *
+ * Grams are always renderable — they are what was measured — so this is total,
+ * and it is what every non-count answer below comes through.
+ */
+const measuredFamilyFor = (facts: GroceryConversionFacts): UnitFamily =>
+    volumeDensityFor(facts) === null ? 'mass' : 'volume';
+
+/**
  * The unit family a new row is created in, chosen from the food's default
  * portion and from nothing else.
  *
@@ -471,21 +695,28 @@ export const volumeDensityFor = (facts: GroceryConversionFacts): number | null =
  *    and demanding millilitres of it would fail the whole shopping list over a
  *    unit choice nobody asked for. (This is the defect the shipped release
  *    exposed: 41 of 42 seeded recipes carry such an ingredient.)
- *  * `count` — the token is a count one AND the portion has a positive gram
- *    weight, the same requirement `requireCountPortion` enforces when the amount
- *    is rendered. Without it there is no "50 g each" to divide by, so the row
- *    cannot be counted and is weighed instead.
+ *  * `count` — the token is a count one, the portion has a positive gram weight
+ *    (the same requirement `requireCountPortion` enforces when the amount is
+ *    rendered — without it there is no "50 g each" to divide by), AND the
+ *    description names a countable ITEM rather than a container or a serving
+ *    ({@link describesContainerOrServing}). A count-family token alone is not
+ *    enough: `each` is the generic token the release gives every non-metric
+ *    portion, so "1 can, drained" and "RACC" arrive in the count family and
+ *    would otherwise be printed as shopping units. Those fall through to the
+ *    measured decision instead, which is where §0.1.4's "container units are
+ *    never generated" is actually enforced.
  *  * `mass` — everything else, including an unrecognised portion unit (the
- *    mockup's "1 bottle" is exactly this case, and container units are never
- *    generated) and a food with no default portion at all.
+ *    mockup's "1 bottle" is exactly this case) and a food with no default
+ *    portion at all.
  *
  * The decision still rests on the portion, because it has to be reproducible:
  * the family is chosen ONCE at plan generation and read back from the row's own
  * stored `display_unit` on every later update (§0.7.3, and the unit-family lock
- * in this file's header). A stored row is therefore never re-judged here — see
- * {@link storedRowFamily}, which keeps failing loudly for a stored volume row
- * whose food can no longer state a density, since that is a real invariant break
- * rather than a rendering choice.
+ * in this file's header). A STORED ROW IS THEREFORE NEVER RE-JUDGED HERE — only
+ * newly built rows take this decision, and {@link storedRowFamily} keeps
+ * reading an existing row's family off its own `display_unit`, failing loudly
+ * for a stored volume row whose food can no longer state a density, since that
+ * is a real invariant break rather than a rendering choice.
  *
  * Takes the whole {@link GroceryConversionFacts} rather than the portion alone
  * because the density is half of the volume question and lives beside it.
@@ -500,10 +731,14 @@ export const displayFamilyForPortion = (facts: GroceryConversionFacts): UnitFami
     const family = unitFamily(portion.unit);
 
     if (family === 'volume') {
-        return volumeDensityFor(facts) === null ? 'mass' : 'volume';
+        return measuredFamilyFor(facts);
     }
 
     if (family === 'count') {
+        if (describesContainerOrServing(portion.description)) {
+            return measuredFamilyFor(facts);
+        }
+
         return Number.isFinite(portion.gram_weight) && portion.gram_weight > 0 ? 'count' : 'mass';
     }
 
@@ -537,9 +772,11 @@ const requireCountPortion = (portion: GroceryDefaultPortion | null): GroceryDefa
  *  - `count` divides by the default portion's gram weight — 600 g of egg at
  *    50 g each is "12 eggs" — and stores {@link COUNT_DISPLAY_UNIT} rather than
  *    the pluralised word, so the row's family stays readable. The stored
- *    quantity counts ITEMS, not portions: a portion that counts several items
- *    ("5 sprigs", 1 g) is multiplied out by `utils/units.ts`, so 9 g of dill is
- *    45 sprigs. Every count comparison below therefore works in items too.
+ *    quantity counts ITEMS, not portions: the whole portion goes to
+ *    `utils/units.ts`, which multiplies the portions out by the portion's
+ *    stored `amount` — dill weed is `{amount: 5, description: '5 sprigs'}` at
+ *    1 g, so 9 g is 45 sprigs. Every count comparison below therefore works in
+ *    items too.
  *  - `mass` tiers grams -> oz -> lb in `utils/units.ts`.
  */
 export const buildGroceryDisplay = (
@@ -561,7 +798,10 @@ export const buildGroceryDisplay = (
 
     if (family === 'count') {
         const portion = requireCountPortion(facts.default_portion);
-        const rendered = formatCount(quantityGrams / portion.gram_weight, portion.description);
+        // The whole portion, not just its description: `amount` is the
+        // cardinality the item count is multiplied by, and it is a column
+        // rather than something inferred from the label.
+        const rendered = formatCount(quantityGrams / portion.gram_weight, portion);
 
         return { family, quantity: rendered.value, unit: COUNT_DISPLAY_UNIT, text: rendered.text };
     }
@@ -603,95 +843,104 @@ export const indexFoodStatesByName = (
     return index;
 };
 
-/**
- * The states that need no qualifier of their own: a shopper buys the food as
- * the shop sells it. `raw` is the catalog's default and `as_purchased` says the
- * same thing about a food that is never sold in another state — oil, honey,
- * vinegar, milk — so "Olive oil, as purchased" adds a code where §0.1.4's own
- * grocery example reads "Olive oil".
- */
-const SHOPPING_FORM_STATES: ReadonlySet<string> = new Set([RAW_FOOD_STATE, 'as_purchased']);
+/** The state code's own words: `as_purchased` -> `['as', 'purchased']`. */
+const stateWords = (foodState: string): string[] => foodState.toLowerCase().match(/[a-z]+/g) ?? [];
 
 /**
- * The words that already state a given preparation, per state.
+ * Whether the name's own qualifiers already state this state, LITERALLY.
  *
- * Catalog display names carry their own preparation qualifier — "Brown rice,
- * cooked", "Black beans, canned", "Turkey breast, sliced" — so appending the
- * state produces "Brown rice, cooked, cooked" and "Black beans, canned,
- * cooked". Matching is per state and against the name's LAST qualifier only,
- * never a keyword scan of the whole name: "Rolled oats, dry" on a `cooked` row
- * is a different food from the dry one and must still read "..., cooked".
+ * Only the qualifiers are read — everything after the FIRST comma — so a food
+ * whose own NOUN resembles a state is unaffected: "Dry-aged beef" on a `dry`
+ * row still earns its suffix, because "dry" there describes the beef rather
+ * than stating how it is stored. And a qualifier naming a DIFFERENT state is
+ * not the state either: "Rolled oats, dry" on a `cooked` row is a different
+ * food from the dry one and must still read "..., cooked".
+ *
+ * The match is literal containment of the state's OWN words as a contiguous run
+ * of whole words, and nothing else: no synonyms, no equivalences, no
+ * stem-matching. That is what makes the rule predictable — "Brown rice, cooked"
+ * and "Peas, cooked in water" say `cooked` and keep their names, while
+ * "Black beans, canned" does not say `cooked` and is suffixed to "Black beans,
+ * canned, cooked". Reading "canned" as a way of saying "cooked" is precisely the
+ * substitution that used to hide the stored state behind a preparation word the
+ * catalog happened to choose.
  */
-const STATE_SYNONYMS: Record<string, readonly string[]> = {
-    dry: ['dry', 'dried', 'uncooked'],
-    cooked: ['cooked', 'canned', 'boiled', 'roasted', 'braised', 'steamed', 'grilled', 'baked'],
-    prepared: [
-        'prepared',
-        'canned',
-        'jarred',
-        'bottled',
-        'sliced',
-        'shredded',
-        'smoked',
-        'roasted',
-        'pickled',
-        'cured',
-    ],
-};
-
-// Only the qualifiers are read — everything after the FIRST comma — so the
-// food's own noun can never be mistaken for a preparation. "Tuna, canned in
-// water" states its preparation inside a phrase and "Beef, ground, cooked" in
-// the last of two qualifiers, so every qualifier word is tested rather than one
-// of them compared whole.
-const statesItsOwnPreparation = (baseName: string, foodState: string): boolean => {
-    const synonyms = Object.prototype.hasOwnProperty.call(STATE_SYNONYMS, foodState)
-        ? STATE_SYNONYMS[foodState]
-        : null;
-
-    if (!synonyms) {
-        return false;
-    }
-
+const qualifiersStateTheState = (baseName: string, foodState: string): boolean => {
     const [, ...qualifiers] = baseName.split(',');
     const words = qualifiers.join(' ').toLowerCase().match(/[a-z]+/g) ?? [];
 
-    return words.some((word) => synonyms.includes(word));
+    return containsWordRun(words, stateWords(foodState));
 };
 
 /**
- * The shopping name: the base name, plus the state when the state is worth
- * saying.
+ * The shopping name: the base name, plus the state whenever the state is not
+ * `raw`.
  *
- * Three rules, in this order, because they can disagree:
+ * §0.7.3 and §6.2 of `docs/meal-planning/planning-policy.md` state the rule this
+ * implements: "the food state is shown as a name suffix whenever it is not
+ * `raw`, or whenever two states of one food coexist on the list… `raw` alone
+ * earns no suffix, because it is the unmarked case". A shopper buying
+ * `as_purchased` honey and `cooked` chickpeas is buying two different kinds of
+ * thing, and the row is the only place that can say so.
  *
- *  1. COEXISTENCE ALWAYS WINS. While one base name is on the list in more than
- *     one state, every one of its rows is qualified — that is what keeps
- *     "Rice, dry" and "Rice, cooked" two distinguishable lines, and suppressing
- *     either would collapse two rows to one name.
- *  2. A SHOPPING-FORM STATE IS SILENT. {@link SHOPPING_FORM_STATES} needs no
- *     qualifier: "Chicken breast", "Olive oil".
- *  3. A NAME THAT ALREADY SAYS IT IS LEFT ALONE. "Brown rice, cooked" on a
- *     `cooked` row is complete; §0.7.3's suffix exists to tell states apart,
- *     not to repeat one the catalog already wrote.
+ * THE STATE IS STATED EXACTLY ONCE — never omitted, and never twice. Three
+ * rules, in this order:
  *
- * Otherwise the state is appended, and `as_purchased` reads as "as purchased":
- * the stored value is a code, and this is the one place a grocery code becomes
- * words, because the name is text this module owns.
+ *  1. COEXISTENCE QUALIFIES EVERY ROW THAT DOES NOT ALREADY SAY ITS STATE.
+ *     While one base name is on the list in more than one state, each of its
+ *     rows has to render a distinguishable line — that is what keeps "Rice,
+ *     dry" and "Rice, cooked" two lines rather than one — and it is the only
+ *     reason a `raw` row is ever qualified. But a name that ALREADY states the
+ *     row's own state needs no suffix to be distinguishable: a "Peas, cooked"
+ *     food present in both `cooked` and `raw` renders "Peas, cooked" and
+ *     "Peas, cooked, raw", which are two distinct lines each stating its own
+ *     state once. Suffixing the first would render "Peas, cooked, cooked",
+ *     which states it twice.
+ *  2. UNLESS ANOTHER COEXISTING STATE IS LITERALLY STATED TOO, IN WHICH CASE
+ *     THE SUFFIX IS UNCONDITIONAL. This is the collision guard, and it is why
+ *     rule 1 is not simply "de-duplicate first". A base name can state BOTH
+ *     states of a coexisting pair — "Beans, cooked and dry" in `cooked` and in
+ *     `dry` — and de-duplicating both rows would render one identical string
+ *     twice, which is exactly the collapse coexistence exists to prevent. Both
+ *     are therefore suffixed: "Beans, cooked and dry, cooked" and "Beans,
+ *     cooked and dry, dry".
+ *
+ *     The guard is also what makes rule 1 safe in general. At most ONE row of a
+ *     coexisting name can ever de-duplicate: if two rows both stated their own
+ *     state, the qualifiers they SHARE would state both states, and the guard
+ *     would fire for both. And a de-duplicated name (the bare base) can never
+ *     equal a suffixed one (the base plus ", state"), so no pair of rows can
+ *     collide.
+ *  3. OTHERWISE THE STATE IS APPENDED UNLESS THE NAME ALREADY SAYS IT. `raw`
+ *     alone is silent; every other state is appended, with the underscores read
+ *     as words ("as purchased"), unless the name's own qualifiers already
+ *     contain those words literally ({@link qualifiersStateTheState}) — which is
+ *     only ever a de-duplication, never a substitution. So "Brown rice, cooked"
+ *     stays as it is and "Black beans, canned" becomes "Black beans, canned,
+ *     cooked": the catalog's qualifier is kept AND the stored state is stated,
+ *     exactly once.
+ *
+ * This is the one place a grocery state code becomes words, because the name is
+ * text this module owns.
  */
 export const buildGroceryName = (baseName: string, foodState: string, statesByName: FoodStatesByName): string => {
     const coexistingStates = statesByName.get(baseName);
     const suffixed = `${baseName}, ${foodState.replace(/_/g, ' ')}`;
+    const nameStatesThisState = qualifiersStateTheState(baseName, foodState);
 
     if (coexistingStates !== undefined && coexistingStates.size > 1) {
-        return suffixed;
+        const nameStatesACoexistingState = [...coexistingStates].some(
+            (state) => state !== foodState && qualifiersStateTheState(baseName, state),
+        );
+
+        return nameStatesThisState && !nameStatesACoexistingState ? baseName : suffixed;
     }
 
-    if (SHOPPING_FORM_STATES.has(foodState) || statesItsOwnPreparation(baseName, foodState)) {
+    if (foodState === RAW_FOOD_STATE) {
         return baseName;
     }
 
-    return suffixed;
+    return nameStatesThisState ? baseName : suffixed;
 };
 
 /* ---------------------------------------------------------------------------

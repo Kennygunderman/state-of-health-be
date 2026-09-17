@@ -46,10 +46,20 @@ import {
     formatQuarters,
     formatInUnit,
     pluralizeCount,
-    parseCountPortion,
+    CountPortionMeasure,
+    countPortionLabel,
     countPortionItems,
     formatCount,
 } from '../units';
+
+/**
+ * A stored count portion, as `catalog_food_portions` holds it: `amount` is the
+ * cardinality and `description` the label. Both are stated at every call site
+ * below, because the two disagreeing is the defect these cases exist for —
+ * 138 of the shipped catalog's 139 non-unit count amounts say something other
+ * than their `amount`, or nothing at all, in front of their noun.
+ */
+const countPortion = (description: string, amount = 1): CountPortionMeasure => ({ amount, description });
 
 const MASS_UNITS: string[] = [
     'g',
@@ -743,15 +753,47 @@ describe('pluralizeCount — the count decides', () => {
 });
 
 describe('pluralizeCount — irregular plurals', () => {
+    /**
+     * EVERY entry of the exceptions table, in BOTH directions, because the
+     * table is inverted to read the other way and an entry dropped from it
+     * fails silently in whichever direction nothing asserts. The general rules
+     * would give "tomatos", "leafs", "halfs", "cooky", "pierogy" and
+     * "goldfishes".
+     */
     const EXCEPTION_CASES: Array<[string, string]> = [
         ['egg', 'eggs'],
         ['tomato', 'tomatoes'],
+        ['potato', 'potatoes'],
         ['leaf', 'leaves'],
         ['loaf', 'loaves'],
+        ['half', 'halves'],
+        ['cookie', 'cookies'],
+        ['pierogi', 'pierogies'],
+        // An invariant plural: the -sh rule would append -es to it.
+        ['goldfish', 'goldfish'],
     ];
 
     it.each(EXCEPTION_CASES)('pluralises %s as %s', (description, expected) => {
         expect(pluralizeCount(2, description)).toBe(expected);
+    });
+
+    it.each(EXCEPTION_CASES)('reads one %s back out of %s', (expected, plural) => {
+        expect(pluralizeCount(1, plural)).toBe(expected);
+    });
+
+    /*
+     * The three the -ies and -sh rules get wrong, named as the strings a
+     * shopper would otherwise have read. "1 cooky" is what the shipped code
+     * printed for a `{amount: 3, description: 'cookies'}` portion.
+     */
+    const WRONG_UNDER_THE_GENERAL_RULES: Array<[number, string, string]> = [
+        [1, 'cookies', 'cooky'],
+        [1, 'pierogies', 'pierogy'],
+        [4, 'goldfish', 'goldfishes'],
+    ];
+
+    it.each(WRONG_UNDER_THE_GENERAL_RULES)('never renders %p of "%s" as "%s"', (count, description, wrong) => {
+        expect(pluralizeCount(count, description)).not.toBe(wrong);
     });
 
     const CASED_EXCEPTION_CASES: Array<[string, string]> = [
@@ -828,11 +870,11 @@ describe('pluralizeCount — multi-word descriptions', () => {
 
 describe('formatCount', () => {
     it('renders a count with its pluralised description', () => {
-        expect(formatCount(12, 'egg')).toEqual({ value: 12, unit: 'eggs', text: '12 eggs' });
+        expect(formatCount(12, countPortion('egg'))).toEqual({ value: 12, unit: 'eggs', text: '12 eggs' });
     });
 
     it('keeps the singular for one', () => {
-        expect(formatCount(1, 'egg')).toEqual({ value: 1, unit: 'egg', text: '1 egg' });
+        expect(formatCount(1, countPortion('egg'))).toEqual({ value: 1, unit: 'egg', text: '1 egg' });
     });
 
     const BARE_DESCRIPTIONS: Array<[string, string]> = [
@@ -841,90 +883,141 @@ describe('formatCount', () => {
     ];
 
     it.each(BARE_DESCRIPTIONS)('renders the bare number for %s', (_case, description) => {
-        expect(formatCount(3, description)).toEqual({ value: 3, unit: '', text: '3' });
+        expect(formatCount(3, countPortion(description))).toEqual({ value: 3, unit: '', text: '3' });
     });
 
     it('trims the description before using it', () => {
-        expect(formatCount(2, '  egg  ')).toEqual({ value: 2, unit: 'eggs', text: '2 eggs' });
+        expect(formatCount(2, countPortion('  egg  '))).toEqual({ value: 2, unit: 'eggs', text: '2 eggs' });
     });
 
     it('rounds to a whole item, because half a lime is not a shopping instruction', () => {
-        expect(formatCount(2.4, 'clove')).toEqual({ value: 2, unit: 'cloves', text: '2 cloves' });
-        expect(formatCount(2.6, 'clove')).toEqual({ value: 3, unit: 'cloves', text: '3 cloves' });
+        expect(formatCount(2.4, countPortion('clove'))).toEqual({ value: 2, unit: 'cloves', text: '2 cloves' });
+        expect(formatCount(2.6, countPortion('clove'))).toEqual({ value: 3, unit: 'cloves', text: '3 cloves' });
     });
 
     it('never displays a positive count as zero', () => {
-        expect(formatCount(0.4, 'egg')).toEqual({ value: 1, unit: 'egg', text: '1 egg' });
+        expect(formatCount(0.4, countPortion('egg'))).toEqual({ value: 1, unit: 'egg', text: '1 egg' });
     });
 
     it('renders a true zero as zero rather than clamping it up', () => {
-        expect(formatCount(0, 'egg')).toEqual({ value: 0, unit: 'eggs', text: '0 eggs' });
+        expect(formatCount(0, countPortion('egg'))).toEqual({ value: 0, unit: 'eggs', text: '0 eggs' });
     });
 
     it.each(NON_FINITE_QUANTITIES)('throws for a %s count', (_case, count) => {
-        expect(() => formatCount(count, 'egg')).toThrow(UnitConversionError);
-        expect(() => formatCount(count, 'egg')).toThrow('count must be a finite number');
+        expect(() => formatCount(count, countPortion('egg'))).toThrow(UnitConversionError);
+        expect(() => formatCount(count, countPortion('egg'))).toThrow('count must be a finite number');
     });
 });
 
 /*
- * The shipped catalog's count portions, as `catalog_food_portions.description`
- * stores them: the item is named first and qualified afterwards ("egg, large",
- * "can, drained"), and a portion counting several items states the amount in
- * front of the noun ("5 sprigs", USDA's dill weed portion at 1 g). Both halves
- * have to be read rather than rendered verbatim — a grocery row that printed
- * the portion count in front of the description read "9 5 sprigs", and
- * inflecting the description's last word read "6 1 egg, larges".
+ * The shipped catalog's count portions, as `catalog_food_portions` stores them:
+ * the item is named first and qualified afterwards ("egg, large", "can,
+ * drained"), the description sometimes repeats the amount in front of the noun
+ * ("5 sprigs") and sometimes says nothing about it at all ("cookies" at
+ * `amount: 3`). The LABEL comes from the text and the CARDINALITY from the
+ * column, which is what keeps a grocery row from reading "9 5 sprigs" or
+ * "6 1 egg, larges" on one side and from undercounting a multi-item portion on
+ * the other.
  */
-describe('parseCountPortion', () => {
-    it('reads the amount a description states, and the noun it counts', () => {
-        expect(parseCountPortion('5 sprigs')).toEqual({ itemsPerPortion: 5, noun: 'sprigs' });
+describe('countPortionLabel', () => {
+    it('drops an amount the description repeats', () => {
+        expect(countPortionLabel('5 sprigs')).toBe('sprigs');
     });
 
-    it('counts one item when the description states no amount', () => {
-        expect(parseCountPortion('container (6 oz)')).toEqual({ itemsPerPortion: 1, noun: 'container (6 oz)' });
+    it('keeps a description that states no amount', () => {
+        expect(countPortionLabel('container (6 oz)')).toBe('container (6 oz)');
     });
 
     it('keeps the qualifier with the noun', () => {
-        expect(parseCountPortion('1 egg, large')).toEqual({ itemsPerPortion: 1, noun: 'egg, large' });
+        expect(countPortionLabel('1 egg, large')).toBe('egg, large');
     });
 
     it('trims the description', () => {
-        expect(parseCountPortion('  1 avocado  ')).toEqual({ itemsPerPortion: 1, noun: 'avocado' });
+        expect(countPortionLabel('  1 avocado  ')).toBe('avocado');
     });
 
-    it('reads a fractional amount', () => {
-        expect(parseCountPortion('0.5 fillet')).toEqual({ itemsPerPortion: 0.5, noun: 'fillet' });
+    it('drops a fractional leading amount too', () => {
+        expect(countPortionLabel('0.5 fillet')).toBe('fillet');
+    });
+
+    it('keeps a bare plural label, which is the shape that carries its amount in the column', () => {
+        // `{amount: 3, description: 'cookies', gram_weight: 44}`, as the
+        // release ships it: nothing to strip, and the 3 is not in the text.
+        expect(countPortionLabel('cookies')).toBe('cookies');
+        expect(countPortionLabel('crackers (1 NLEA serving)')).toBe('crackers (1 NLEA serving)');
     });
 
     const NOT_AN_AMOUNT: Array<[string, string]> = [
-        ['a leading zero, which would erase the row', '0 slices'],
+        ['a leading zero, which states no amount', '0 slices'],
         ['a number with no noun after it', '12'],
         ['a number joined to its noun', '12oz'],
         ['an empty description', ''],
     ];
 
-    it.each(NOT_AN_AMOUNT)('counts portions for %s', (_case, description) => {
-        expect(parseCountPortion(description)).toEqual({ itemsPerPortion: 1, noun: description.trim() });
+    it.each(NOT_AN_AMOUNT)('keeps %s whole', (_case, description) => {
+        expect(countPortionLabel(description)).toBe(description.trim());
     });
 });
 
 describe('countPortionItems', () => {
-    it('multiplies portions by the items one portion counts', () => {
-        expect(countPortionItems(9, '5 sprigs')).toBe(45);
+    it('multiplies portions by the stored amount', () => {
+        // USDA's dill weed portion: `{amount: 5, description: '5 sprigs'}` at
+        // 1 g, so nine grams is nine portions and forty-five sprigs.
+        expect(countPortionItems(9, countPortion('5 sprigs', 5))).toBe(45);
     });
 
     it('counts portions directly when one portion is one item', () => {
-        expect(countPortionItems(6, '1 egg, large')).toBe(6);
+        expect(countPortionItems(6, countPortion('1 egg, large'))).toBe(6);
+    });
+
+    /*
+     * THE COLUMN DECIDES, NOT THE TEXT. Both shapes below are real release
+     * portions whose description disagrees with their `amount` — 138 of the 139
+     * non-unit count amounts do — and reading the text would undercount them
+     * threefold and elevenfold respectively.
+     */
+    const RELEASE_SHAPES: Array<[string, number, string, number, number]> = [
+        ['cookies at amount 3', 3, 'cookies', 3, 9],
+        ['crackers (1 NLEA serving) at amount 11', 11, 'crackers (1 NLEA serving)', 2, 22],
+    ];
+
+    it.each(RELEASE_SHAPES)('counts %s from the column', (_case, amount, description, portions, expected) => {
+        expect(countPortionItems(portions, countPortion(description, amount))).toBe(expected);
+    });
+
+    it('does not count a repeated amount twice', () => {
+        // "5 sprigs" states its five in both places. The column is read and the
+        // text is only stripped, so nine grams is 45 sprigs and never 225.
+        expect(countPortionItems(9, countPortion('5 sprigs', 5))).toBe(45);
+        expect(countPortionItems(9, countPortion('5 sprigs', 5))).not.toBe(225);
+    });
+
+    /*
+     * The defensive reading of an unusable `amount`: one portion counts one
+     * item. Validation quarantines such a portion long before a shopping list
+     * sees it, so the choice is between counting portions and counting nothing,
+     * and a zero or negative multiplier would erase or invert the row.
+     */
+    const UNUSABLE_AMOUNTS: Array<[string, number]> = [
+        ['zero', 0],
+        ['negative', -3],
+        ['infinite', Number.POSITIVE_INFINITY],
+        ['NaN', Number.NaN],
+    ];
+
+    it.each(UNUSABLE_AMOUNTS)('treats a %s amount as one item per portion', (_case, amount) => {
+        expect(countPortionItems(4, countPortion('cookies', amount))).toBe(4);
     });
 
     it.each(NON_FINITE_QUANTITIES)('throws for a %s number of portions', (_case, portions) => {
-        expect(() => countPortionItems(portions, '5 sprigs')).toThrow(UnitConversionError);
-        expect(() => countPortionItems(portions, '5 sprigs')).toThrow('count must be a finite number');
+        expect(() => countPortionItems(portions, countPortion('5 sprigs', 5))).toThrow(UnitConversionError);
+        expect(() => countPortionItems(portions, countPortion('5 sprigs', 5))).toThrow(
+            'count must be a finite number',
+        );
     });
 
     it('throws rather than returning an infinite item count', () => {
-        expect(() => countPortionItems(Number.MAX_VALUE, '5 sprigs')).toThrow(UnitConversionError);
+        expect(() => countPortionItems(Number.MAX_VALUE, countPortion('5 sprigs', 5))).toThrow(UnitConversionError);
     });
 });
 
@@ -1020,26 +1113,74 @@ describe('pluralizeCount — real catalog portion descriptions', () => {
 
 describe('formatCount — a portion that counts several items', () => {
     it('renders the items, not the portions', () => {
-        // USDA states dill weed as 5 sprigs per gram, so nine grams is 45
-        // sprigs — a ninefold undercount if the portion were the item.
-        expect(formatCount(9, '5 sprigs')).toEqual({ value: 45, unit: 'sprigs', text: '45 sprigs' });
+        // USDA states dill weed as `{amount: 5, description: '5 sprigs'}` at
+        // 1 g, so nine grams is 45 sprigs — a fivefold undercount if the
+        // portion were the item.
+        expect(formatCount(9, countPortion('5 sprigs', 5))).toEqual({ value: 45, unit: 'sprigs', text: '45 sprigs' });
     });
 
     it('renders a single item of a plural description in the singular', () => {
-        expect(formatCount(0.2, '5 sprigs')).toEqual({ value: 1, unit: 'sprig', text: '1 sprig' });
+        expect(formatCount(0.2, countPortion('5 sprigs', 5))).toEqual({ value: 1, unit: 'sprig', text: '1 sprig' });
     });
 
     it('counts portions when one portion is one item', () => {
-        expect(formatCount(6, '1 egg, large')).toEqual({ value: 6, unit: 'eggs, large', text: '6 eggs, large' });
+        expect(formatCount(6, countPortion('1 egg, large'))).toEqual({
+            value: 6,
+            unit: 'eggs, large',
+            text: '6 eggs, large',
+        });
     });
 
     it('never repeats the portion amount in the text', () => {
-        expect(formatCount(6, '1 egg, large').text).not.toContain('1 egg');
-        expect(formatCount(9, '5 sprigs').text).not.toContain('5 sprigs,');
+        expect(formatCount(6, countPortion('1 egg, large')).text).not.toContain('1 egg');
+        expect(formatCount(9, countPortion('5 sprigs', 5)).text).not.toContain('5 sprigs,');
     });
 
     it('keeps the singular for exactly one of a one-item portion', () => {
-        expect(formatCount(1, '1 avocado')).toEqual({ value: 1, unit: 'avocado', text: '1 avocado' });
+        expect(formatCount(1, countPortion('1 avocado'))).toEqual({ value: 1, unit: 'avocado', text: '1 avocado' });
+    });
+
+    /*
+     * The two release shapes whose description says nothing about their
+     * cardinality, rendered as a shopper reads them. The 132 g / 31 g totals
+     * are three and two stored portions respectively, and the old
+     * description-derived rule printed "3 cookies" and "2 crackers" for them.
+     */
+    it('renders the nine cookies three stored portions come to', () => {
+        // `{amount: 3, description: 'cookies', gram_weight: 44}`: 132 g is
+        // three portions of three cookies.
+        expect(formatCount(132 / 44, countPortion('cookies', 3))).toEqual({
+            value: 9,
+            unit: 'cookies',
+            text: '9 cookies',
+        });
+    });
+
+    it('renders eleven crackers for one stored portion of them', () => {
+        expect(formatCount(31 / 31, countPortion('crackers (1 NLEA serving)', 11))).toEqual({
+            value: 11,
+            unit: 'crackers (1 NLEA serving)',
+            text: '11 crackers (1 NLEA serving)',
+        });
+    });
+
+    it('says "1 cookie" rather than "1 cooky" for a third of a portion', () => {
+        // The inflection half of the same defect: one item of a `cookies`
+        // portion has to singularise, and the -ies rule read backwards gave
+        // "cooky".
+        expect(formatCount(1 / 3, countPortion('cookies', 3))).toEqual({
+            value: 1,
+            unit: 'cookie',
+            text: '1 cookie',
+        });
+    });
+
+    it('keeps an invariant plural invariant', () => {
+        expect(formatCount(2, countPortion('goldfish', 12)).text).toBe('24 goldfish');
+    });
+
+    it('never counts nothing for a positive quantity, whatever the stored amount says', () => {
+        expect(formatCount(0.1, countPortion('cookies', 0)).text).toBe('1 cookie');
     });
 });
 

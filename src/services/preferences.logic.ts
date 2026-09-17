@@ -1919,10 +1919,49 @@ const parseReviewStep = (
  * ------------------------------------------------------------------------- */
 
 /**
- * Either the request is worth reading the stored row for, or here is the
- * complete 400 it earns without one.
+ * What the request stage establishes: the 400 the request earns with no row
+ * read at all, or which of the two reasons it has for reading one.
+ *
+ * `needs_context` is not an acceptance. It says the request itself is clean AND
+ * a rule whose other half lives in the stored row is applicable, so the answer
+ * is not final until that row is read — as distinct from `ok`, where the
+ * request stage has judged every rule the body can be judged by. Both go on to
+ * the row (the revision comparison always needs it), and the distinction is
+ * what stops a caller reading "no error" as "nothing left to check".
  */
-export type PreferenceRequestVerdict = { kind: 'ok' } | PreferenceErrorVerdict;
+export type PreferenceRequestVerdict =
+    | { kind: 'ok' }
+    | { kind: 'needs_context' }
+    | PreferenceErrorVerdict;
+
+/**
+ * The details of a refusal whose ONLY fault is keys the client may not write,
+ * or null when the refusal says anything else as well.
+ *
+ * One owner for the rule `ReadOnlyFieldError` names (AAP §0.5.2's
+ * `read_only_field`), because two layers ask it: `preferences.service.ts`
+ * raises the class from the request stage for every caller, and
+ * `mealPlanning.controller.ts` — which now runs the same request-stage parse at
+ * the HTTP boundary — raises it there for the route. A predicate written twice
+ * would let the two disagree about which bodies are "read-only only", and the
+ * class would then be the answer on one path and a plain verdict on the other.
+ *
+ * A MIXED refusal answers null on purpose: a read-only key beside an
+ * out-of-range age must stay one 400 naming both (AAP §0.7.4), which the
+ * verdict already does and a single-condition class cannot.
+ *
+ * The emptiness guard is load-bearing rather than defensive — `every` is true
+ * of an empty list, so without it a refusal with no details would be reported
+ * as a read-only refusal naming nothing. No parser produces one today; this is
+ * where that stays true.
+ */
+export const readOnlyFieldRefusal = (
+    verdict: PreferenceErrorVerdict,
+): readonly InvalidRequestDetail[] | null =>
+    verdict.details.length > 0 &&
+    verdict.details.every((detail) => detail.code === PREFERENCE_FIELD_CODES.READ_ONLY_FIELD)
+        ? verdict.details
+        : null;
 
 /**
  * A step envelope whose step and body are usable, with every context-free
@@ -2006,40 +2045,46 @@ const inspectSetupStepEnvelope = (step: unknown, body: unknown): StepEnvelopeIns
  * not the nine-item set, a malformed meal time. All of them come back in ONE
  * 400, in the order this endpoint has always produced.
  *
- * WHEN IT RETURNS `ok`, IT MEANS ONE OF TWO THINGS, and the caller treats them
- * alike — proceed to the row:
+ * EVERY REQUEST-ONLY REFUSAL IS RETURNED IMMEDIATELY, whole. A body already
+ * known to be unstorable does not earn a database read: AAP §0.5.2 puts
+ * validation before any Prisma work, and an authenticated caller who can be
+ * refused for free must not be able to make the server read a row per malformed
+ * attempt. This stage previously withheld such a refusal whenever a
+ * row-dependent rule was ALSO applicable, on the argument that its answer might
+ * name fewer offending controls than the row-backed parse would (AAP §0.7.4) —
+ * but that argument buys one extra detail with a read for a body that cannot be
+ * stored under any row. The deferred detail is not lost: it is reported on the
+ * client's next attempt, once the request-only errors it is mixed with are
+ * fixed, which is the same round trip the client would have spent on them
+ * anyway.
  *
- *  * nothing the request can be judged on is wrong; or
- *  * something is wrong, but a rule that needs the stored row was also
- *    applicable, so this stage's answer could be INCOMPLETE and returning it
- *    would name fewer offending controls than the screen must show at once
- *    (AAP §0.7.4). The two goal-weight coherence rules are the only such rules
- *    here, and each is applicable only when the body carries the answer that
- *    can conflict with a stored one. The authoritative parse then produces the
- *    whole answer from the row, exactly as it did before this stage existed.
- *
- * So a refusal from here is always the same refusal {@link parseSetupStep}
- * would have given, and never a subset of it.
+ * `needs_context` is the answer when the request is clean and a rule that reads
+ * the row is applicable. The two goal-weight coherence rules are the only such
+ * rules here, and each is applicable only when the body carries the answer that
+ * can conflict with a stored one. Everything else clean is `ok`.
  */
 export const parseSetupStepRequest = (step: unknown, body: unknown): PreferenceRequestVerdict => {
     const verdict = parseSetupStep(step, body, { stage: 'request', currentRevision: null });
 
-    if (verdict.kind !== 'error') {
-        // 'ok' needs no answer here, and a stale revision is the row's verdict to
-        // give, never this stage's.
-        return { kind: 'ok' };
+    if (verdict.kind === 'error') {
+        // Every detail in it was produced with no row in hand, so it is exactly
+        // the request's own 400 — complete for what the request alone decides,
+        // and never a narrowing of some other verdict.
+        return verdict;
     }
 
     const record = asRecord(body);
     // `goalWeightKg` is judged against the STORED current weight, and the body
-    // step's `weightKg` against the stored goal and target — so a refusal for a
-    // body carrying either may be missing that rule's detail.
-    const coherenceDeferred =
+    // step's `weightKg` against the stored goal and target — so for a clean body
+    // carrying either, the row still has a verdict to add.
+    const coherenceApplicable =
         record !== null &&
         ((step === 'goal' && Object.prototype.hasOwnProperty.call(record, 'goalWeightKg')) ||
             (step === 'body' && Object.prototype.hasOwnProperty.call(record, 'weightKg')));
 
-    return coherenceDeferred ? { kind: 'ok' } : verdict;
+    // A stale revision is the row's verdict to give and never this stage's, so
+    // `verdict.kind` is 'ok' here by construction.
+    return coherenceApplicable ? { kind: 'needs_context' } : { kind: 'ok' };
 };
 
 /**
@@ -2405,30 +2450,39 @@ const inspectPreferencesUpdateEnvelope = (body: unknown): UpdateEnvelopeInspecti
  *  * the schedule/meal-times pair, unless the body carries both;
  *  * the budget amount and its "no preference" checkbox, unless both are sent.
  *
- * When one of those was applicable and this stage still found something else
- * wrong, it returns `ok` rather than a refusal that could name fewer offending
- * controls than the row-backed parse would (AAP §0.7.4) — the caller proceeds
- * and {@link parsePreferencesUpdate} answers in full. A refusal from here is
- * therefore always the complete one.
+ * A REFUSAL IS STILL RETURNED IMMEDIATELY when one of those is applicable, and
+ * that is the whole of the change this stage underwent. It used to answer `ok`
+ * for such a body so that {@link parsePreferencesUpdate} could add the pair
+ * rule's detail to the list (AAP §0.7.4) — at the cost of an authenticated
+ * Prisma read for a partial that no stored row could make valid, which AAP
+ * §0.5.2 puts validation ahead of. The pair rule's detail reaches the client on
+ * its next attempt, once the request-only errors are fixed; the read it would
+ * have cost does not happen at all.
+ *
+ * `needs_context` is the answer for a clean body one of those four rules is
+ * applicable to. Everything else clean is `ok`.
  */
 export const parsePreferencesUpdateRequest = (body: unknown): PreferenceRequestVerdict => {
     const verdict = parsePreferencesUpdate(body, { stage: 'request', currentRevision: null });
 
-    if (verdict.kind !== 'error') {
-        // 'ok' needs no answer here, and a stale revision is the row's verdict to
-        // give, never this stage's.
-        return { kind: 'ok' };
+    if (verdict.kind === 'error') {
+        // Judged with no row in hand, so every detail in it is the request's
+        // own; a body this stage refuses is refused whatever the row holds.
+        return verdict;
     }
 
     const record = asRecord(body);
 
     if (record === null) {
-        return verdict;
+        // Unreachable: a non-object body is the envelope's first refusal and has
+        // already returned above. Narrowing rather than asserting, so the key
+        // probes below cannot be written against a null.
+        return { kind: 'ok' };
     }
 
     const has = (key: keyof PreferencesUpdatePayload): boolean =>
         Object.prototype.hasOwnProperty.call(record, key);
-    const pairDeferred =
+    const pairApplicable =
         (has('goal') && !has('paceLbPerWeek')) ||
         ((has('goal') || has('weightKg') || has('goalWeightKg')) &&
             !(has('goal') && has('weightKg') && has('goalWeightKg'))) ||
@@ -2436,7 +2490,7 @@ export const parsePreferencesUpdateRequest = (body: unknown): PreferenceRequestV
         ((has('budget') || has('noBudgetPreference')) &&
             !(has('budget') && has('noBudgetPreference')));
 
-    return pairDeferred ? { kind: 'ok' } : verdict;
+    return pairApplicable ? { kind: 'needs_context' } : { kind: 'ok' };
 };
 
 /**

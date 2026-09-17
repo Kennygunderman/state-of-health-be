@@ -13,7 +13,7 @@
     "howToHandDeriveARow": "Take the row index, split it with generation.indexDecomposition, read the three tokens off the part lists, then apply generation.rowDerivation field by field. generation.workedExamples does exactly that for row 0 and row 9999 and prints the resulting columns, so a reviewer can check the rules against two known answers without running anything.",
     "columnNaming": "snake_case keys are database columns and camelCase keys are configuration; see description. Nothing in this file is a wire DTO, so no camelCase response shape appears — the mapper that produces those is the code under test, not fixture data.",
     "tokenVocabulary": "Five disjoint token vocabularies do five different jobs. A base word, a preparation and a descriptor build the canonical name. A searchWord is appended to search_text and appears in no name, so it is reachable only through the food's own search_vector. An aliasWord heads the generated alias row and appears in no search_text, so it is reachable only through the alias contribution. vocabularyRules states the disjointness the expander asserts, and why each of its clauses is load-bearing.",
-    "whyEveryRankTies": "Every row carries exactly four distinct lexemes at frequency one — three name tokens plus the searchWord — and every generated alias exactly three. Because the vocabularies are disjoint after stemming, a query term can occur at most once per document, so ts_rank returns the same value for every member of a single-term match set and the ordering is decided entirely by display_name ASC then source_key ASC. That is the property that makes a page sequence hand-derivable, and it is also the sharpest test available for the tiebreakers: a ranking that silently fell back to a database id would reorder these pages immediately.",
+    "whyEveryRankTies": "This holds for every full-text kind, and deliberately not for the partial kind. Full text: every row carries exactly four distinct lexemes at frequency one — three name tokens plus the searchWord — and every generated alias exactly three. Because the vocabularies are disjoint after stemming, a query term can occur at most once per document; and because every name in the corpus is exactly three words with its descriptor last, the two per-row factors the ranking applies — the word count it divides a full-text score by, and the head-noun tier it multiplies by — take the SAME value for every member of a single-term match set. The scores therefore tie and the ordering is decided entirely by display_name ASC then source_key ASC. Partial (prefix) kinds do not tie: a prefix match scores by how much of the matched text the typed prefix covers, so the rows whose matched text is shortest lead, and display_name then source_key order only the rows tied on that coverage. Both properties make a page sequence hand-derivable, and the tie is the sharpest test available for the tiebreakers: a ranking that silently fell back to a database id would reorder these pages immediately.",
     "expectedSemantics": "expected lists the COMPLETE ordered match set when the set holds 20 rows or fewer, and otherwise the first 5 source keys of the ordered match set — which are the first 5 ids of page 1 at limit 25. In both cases the order is the documented one (rank, then display_name ASC, then source_key ASC), so expected is an ordering assertion and not only a membership one. An empty expected means the query must return no rows at all, which this fixture states for three different causes; unlike the acceptance query set, where a zero-result query would be unscoreable, the zero-result path is itself a mechanic here and is pinned deliberately. matchSetSizes carries the exact size of every match set, including the ones expected truncates.",
     "publishedFilterRows": "unpublishedRows are the only rows in this file that are not part of the generated corpus. They exist so the publication filter is exercised rather than assumed, and they carry no portion row on purpose: search filters them out before the portion lookup, so if the filter ever regressed the mapper would raise CatalogMappingError for a food with no default portion and the regression would be loud instead of silent."
   },
@@ -1085,12 +1085,12 @@
       "full triple": "1 row, or 2 for the shared word",
       "aliasWord + preparationWord + descriptorWord": "1 row, or 2 for the shared word",
       "name token + alias token": "0 rows, always. plainto_tsquery ANDs the terms and every contribution scores ONE document, so a name token and an alias token can never be satisfied together however plainly both belong to the same food.",
-      "name prefix": "the same rows as the base word it prefixes, at rank 0 instead of a ts_rank value, because names begin with their base word",
-      "alias prefix": "the same rows as the alias word it prefixes, at rank 0; nothing but the alias rows begins with an alias word",
+      "name prefix": "the same rows as the base word it prefixes, because names begin with their base word; scored by prefix coverage of display_name rather than by a ts_rank value, so the set is the same size but its order is not alphabetical throughout",
+      "alias prefix": "the same rows as the alias word it prefixes; nothing but the alias rows begins with an alias word. Scored by prefix coverage of the alias text, so the denominator is the alias and not the name",
       "two preparations or two descriptors": "0 rows. plainto_tsquery ANDs the tokens and every row carries exactly one of each part.",
       "unpublished word": "0 rows, whatever the form, because the filter runs first"
     },
-    "orderingWithinAMatchSet": "Ranks tie, so the order is display_name ASC then source_key ASC — alphabetical by name, NOT row-index order. The first page of a base-word query is therefore the alphabetically first preparations of that base, not preparations[0] to preparations[3], and an implementation that returned insertion order would fail on the first page."
+    "orderingWithinAMatchSet": "For a full-text match set the ranks tie, so the order is display_name ASC then source_key ASC — alphabetical by name, NOT row-index order. The first page of a base-word query is therefore the alphabetically first preparations of that base, not preparations[0] to preparations[3], and an implementation that returned insertion order would fail on the first page. For a prefix match set the ranks do not tie: coverage orders the shortest matched text first, and the alphabetical pair orders only within one coverage value — so the first page of a prefix query is the alphabetically first of the SHORTEST names in the set, which is why the partial queries expect rows whose preparation and descriptor are both six letters long. See readingGuide.whyEveryRankTies."
   },
   "kinds": {
     "closedSet": "The six kinds are the ones data/meal-planning/search-benchmark.v1.json defines, unchanged, so one helper can read a query entry from either file. What follows is only how each maps onto this corpus.",
@@ -1469,11 +1469,11 @@
       "q": "wendr",
       "kind": "partial",
       "expected": [
-        "synthetic-bench10k:09415",
-        "synthetic-bench10k:09815",
-        "synthetic-bench10k:09416",
-        "synthetic-bench10k:09816",
-        "synthetic-bench10k:09405"
+        "synthetic-bench10k:09225",
+        "synthetic-bench10k:09625",
+        "synthetic-bench10k:09220",
+        "synthetic-bench10k:09620",
+        "synthetic-bench10k:09221"
       ]
     },
     {
@@ -1481,11 +1481,11 @@
       "q": "quibb",
       "kind": "partial",
       "expected": [
-        "synthetic-bench10k:01015",
-        "synthetic-bench10k:01016",
-        "synthetic-bench10k:01005",
-        "synthetic-bench10k:01017",
-        "synthetic-bench10k:01018"
+        "synthetic-bench10k:00825",
+        "synthetic-bench10k:00820",
+        "synthetic-bench10k:00821",
+        "synthetic-bench10k:00822",
+        "synthetic-bench10k:00829"
       ]
     },
     {
@@ -1493,11 +1493,11 @@
       "q": "murni",
       "kind": "partial",
       "expected": [
-        "synthetic-bench10k:00215",
-        "synthetic-bench10k:00216",
-        "synthetic-bench10k:00205",
-        "synthetic-bench10k:00217",
-        "synthetic-bench10k:00218"
+        "synthetic-bench10k:00025",
+        "synthetic-bench10k:00020",
+        "synthetic-bench10k:00021",
+        "synthetic-bench10k:00022",
+        "synthetic-bench10k:00029"
       ]
     },
     {
@@ -1505,11 +1505,11 @@
       "q": "jurnal",
       "kind": "partial",
       "expected": [
-        "synthetic-bench10k:09415",
-        "synthetic-bench10k:09815",
-        "synthetic-bench10k:09416",
-        "synthetic-bench10k:09816",
-        "synthetic-bench10k:09405"
+        "synthetic-bench10k:09225",
+        "synthetic-bench10k:09625",
+        "synthetic-bench10k:09220",
+        "synthetic-bench10k:09620",
+        "synthetic-bench10k:09221"
       ]
     },
     {
@@ -1517,11 +1517,11 @@
       "q": "palmen",
       "kind": "partial",
       "expected": [
-        "synthetic-bench10k:07815",
-        "synthetic-bench10k:07816",
-        "synthetic-bench10k:07805",
-        "synthetic-bench10k:07817",
-        "synthetic-bench10k:07818"
+        "synthetic-bench10k:07625",
+        "synthetic-bench10k:07620",
+        "synthetic-bench10k:07621",
+        "synthetic-bench10k:07622",
+        "synthetic-bench10k:07629"
       ]
     }
   ],
@@ -1579,8 +1579,8 @@
     "q024": "bases[0].searchWord. It appears in every row of that base's search_text and in no canonical_name, no display_name and no alias, so it is matched only through the food's own search_vector — the contribution that exists because search_text may carry words the name does not.",
     "q026": "Two tokens of one generated alias. Both must be found in the SAME document, which is why no query in this file mixes a name token with an alias token: plainto_tsquery ANDs the terms and each contribution is scored against one document, so a food's own search_text and its alias never satisfy an AND together.",
     "q030": "Zero results from an UNCURATED misspelling. The kind definition is deliberate: a misspelling is retrievable only when it has been curated into an alias, and this one has not been, while its near neighbour 'zentyl' has. It is also a different LEXEME from both the stored word and the curated misspelling, which had to be checked against plainto_tsquery rather than assumed: 'zentyll' would have been wrong here, because the english stemmer folds it onto 'zentyl' and the curated alias would have answered it.",
-    "q031": "A prefix of a canonical name, matched through the name prefix fallback at rank 0. Every row of the match set therefore ties at rank 0 and the whole page order is decided by the two name tiebreakers.",
-    "q033": "A prefix of an alias word and of nothing else, and not a lexeme of any document, so it reaches the corpus only through the alias prefix fallback, at rank 0."
+    "q031": "A prefix of a canonical name, matched through the name prefix fallback and through nothing else — 'wendr' is a lexeme of no document, so no full-text contribution can reach these rows. The fallback scores by how much of display_name the five typed characters cover, so the 56 rows whose preparation and descriptor are both six letters (name length 21) lead the set, and display_name ASC then source_key ASC order those 56 among themselves. The shared-word base pair puts two rows on each of those names, which is what makes source_key the visible tiebreaker here: 09225 before 09625.",
+    "q033": "A prefix of an alias word and of nothing else, and not a lexeme of any document, so it reaches the corpus only through the alias prefix fallback. Coverage is measured against the ALIAS text rather than the name — the one query shape in this file that pins which of the two strings the prefix branch divides by."
   },
   "paginationCheck": {
     "queryIds": [
@@ -1608,7 +1608,7 @@
     "invariant": "For each id in queryIds, pages 1, 2 and 3 fetched at limit (offsets 0, 25 and 50) concatenated must equal the first min(singlePageLimit, total) food ids of one singlePageLimit fetch of the same query, in the same order, with no id repeated and none missing.",
     "referenceModeReason": "GET /catalog/foods validates limit as 1 to 50, so a 75-item fetch over HTTP answers 400 invalid_request. The reference is therefore read in process through catalog.service.searchPublishedFoods, which deliberately does not clamp limit for exactly this reason. Do not lower singlePageLimit to 50 to make it routable and do not put the reference through the endpoint: the first weakens the invariant, the second cannot express it.",
     "queryIdSelection": "Every query in this file whose match set holds at least singlePageLimit rows, so all three pages are full and the concatenation is a real traversal. The widest sets are 800 rows and the narrowest of these 400, against a release-data pagination check whose widest query matches 8 published foods and fills no page at all: covering multi-page traversal is the one thing the synthetic corpus can do that the loaded release cannot yet, and it is the reason this fixture exists rather than a second copy of the acceptance set.",
-    "derivability": "The reference order is hand-derivable, which is what makes a failure diagnosable rather than merely red: ranks tie across each of these sets, so the first 75 ids are the first 75 rows of the match set sorted by display_name ASC then source_key ASC."
+    "derivability": "The reference order is hand-derivable, which is what makes a failure diagnosable rather than merely red. For the full-text ids here the ranks tie, so the first 75 ids are the first 75 rows of the match set sorted by display_name ASC then source_key ASC. For the five partial ids (q031 to q035) the order is the same two sorts applied within each prefix-coverage value, shortest matched text first — still a pure function of the part lists, and still independent of insertion order, which is the property this invariant exists to catch."
   },
   "mechanicsExpectations": {
     "standing": "Structural expectations only, and every one of them exact. None is a quality threshold and none may be reported as acceptance evidence; see acceptanceStatus.",

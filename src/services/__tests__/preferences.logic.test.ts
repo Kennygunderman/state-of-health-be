@@ -51,9 +51,11 @@ import {
     parsePreferencesUpdateRequest,
     parseSetupStep,
     parseSetupStepRequest,
+    readOnlyFieldRefusal,
     PlannedMealForFlagging,
     POUNDS_TO_KILOGRAMS,
     PREFERENCE_FIELD_CODES,
+    PreferenceErrorVerdict,
     PreferencesUpdateContext,
     poundsToKilograms,
     reconcileSetupStateForRoute,
@@ -3330,6 +3332,73 @@ describe('parsePreferencesUpdate', () => {
  * be answering a question it cannot see the data for.
  * ------------------------------------------------------------------------- */
 
+describe('readOnlyFieldRefusal', () => {
+    const verdictOf = (details: InvalidRequestDetail[]): PreferenceErrorVerdict => ({
+        kind: 'error',
+        code: 'invalid_request',
+        message: 'test verdict',
+        details,
+    });
+    const readOnly = (field: string): InvalidRequestDetail => ({
+        field,
+        code: PREFERENCE_FIELD_CODES.READ_ONLY_FIELD,
+    });
+
+    // The predicate both layers ask: the service raises `ReadOnlyFieldError`
+    // from the request stage, and the controller raises it at the HTTP boundary
+    // from the same verdict. One owner, so the two cannot classify a body
+    // differently and answer it as a class on one path and a verdict on the
+    // other.
+    it('answers the whole detail list when every detail is a read-only key', () => {
+        const details = [readOnly('setupStatus'), readOnly('revision')];
+
+        expect(readOnlyFieldRefusal(verdictOf(details))).toEqual(details);
+    });
+
+    it('answers null when any detail says something else as well', () => {
+        // A mixed body must stay one 400 naming every offending control at
+        // once (AAP §0.7.4), which a single-condition class cannot carry.
+        const details = [
+            readOnly('setupStatus'),
+            { field: 'diet', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+        ];
+
+        expect(readOnlyFieldRefusal(verdictOf(details))).toBeNull();
+    });
+
+    it('answers null for a refusal carrying no details at all', () => {
+        // `every` is true of an empty list, so without the emptiness guard this
+        // would be reported as a read-only refusal naming nothing.
+        expect(readOnlyFieldRefusal(verdictOf([]))).toBeNull();
+    });
+
+    it('classifies what the request-stage parsers actually produce', () => {
+        const stepVerdict = parseSetupStepRequest('goal', {
+            goal: 'lose',
+            paceLbPerWeek: 1,
+            timeZone: ZONE,
+            expectedRevision: 4,
+            setupStatus: 'completed',
+            revision: 9,
+        });
+        const updateVerdict = parsePreferencesUpdateRequest({
+            diet: 'vegan',
+            timeZone: ZONE,
+            expectedRevision: 4,
+            setupStep: 'review',
+        });
+
+        expect(stepVerdict.kind).toBe('error');
+        expect(updateVerdict.kind).toBe('error');
+        expect(
+            readOnlyFieldRefusal(stepVerdict as PreferenceErrorVerdict)?.map((detail) => detail.field),
+        ).toEqual(['setupStatus', 'revision']);
+        expect(
+            readOnlyFieldRefusal(updateVerdict as PreferenceErrorVerdict)?.map((detail) => detail.field),
+        ).toEqual(['setupStep']);
+    });
+});
+
 describe('parseSetupStepRequest', () => {
     const goalEnvelopeBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
         goal: 'lose',
@@ -3475,18 +3544,86 @@ describe('parseSetupStepRequest', () => {
         );
     });
 
-    it('yields instead of answering when a rule that needs the row was also applicable', () => {
-        // `goalWeightKg` is judged against the STORED current weight, so a
-        // refusal from this stage could be missing that detail. Rather than
-        // report a shorter list than the screen must show, the stage defers the
-        // whole answer to the row-backed parse.
-        expect(
-            parseSetupStepRequest('goal', goalEnvelopeBody({ goal: 'shrink', goalWeightKg: 70 })),
-        ).toEqual({ kind: 'ok' });
-        // The same body without the row-dependent answer is refused here.
-        expect(codesFor(parseSetupStepRequest('goal', goalEnvelopeBody({ goal: 'shrink' })), 'goal')).toEqual([
-            PREFERENCE_FIELD_CODES.UNKNOWN_VALUE,
+    it('refuses a known-bad body even where a rule that needs the row is also applicable', () => {
+        // The defect this pins: the stage used to answer `ok` for this body
+        // because `goalWeightKg` is judged against the STORED current weight, so
+        // the service read the row for a request no row could make storable.
+        // Nothing about a stored weight turns a pace of 9 into an accepted one
+        // (AAP 0.5.2 — validation before any Prisma work).
+        const body = goalEnvelopeBody({
+            goal: 'lose',
+            paceLbPerWeek: 9,
+            goalWeightKg: 70,
+            setupStatus: 'completed',
+            timeZone: 'Mars/Phobos',
+        });
+
+        // The WHOLE request-only list, envelope and field alike, in this
+        // endpoint's order — an early refusal is not a shortened one.
+        expect(fieldsOf(parseSetupStepRequest('goal', body))).toEqual([
+            'setupStatus',
+            'timeZone',
+            'paceLbPerWeek',
         ]);
+        // And detail for detail the verdict the service used to reach by
+        // reading the row first: the row-backed parse is untouched by this
+        // change, so where the stored half adds nothing, the 400 the client
+        // receives is byte-identical to the one it received before. The
+        // refusal moved earlier; it did not move.
+        expect(parseSetupStepRequest('goal', body)).toEqual(
+            parseSetupStep('goal', body, stepContext({ currentRevision: 4 })),
+        );
+    });
+
+    it('reports the deferred coherence detail on the next attempt, not by reading the row for this one', () => {
+        // The trade the refusal above makes, stated exactly. With a stored
+        // weight of 60 kg a target of 70 is incoherent for `lose`, so the
+        // row-backed parse names three fields where the request stage names
+        // two. The client fixes the two it was told about and learns the third
+        // on the attempt it was going to make anyway — while a body that is
+        // malformed on every attempt never reaches the database at all.
+        const body = goalEnvelopeBody({ goal: 'lose', paceLbPerWeek: 9, goalWeightKg: 70 });
+
+        expect(fieldsOf(parseSetupStepRequest('goal', body))).toEqual(['paceLbPerWeek']);
+        expect(
+            fieldsOf(parseSetupStep('goal', body, stepContext({ currentRevision: 4, currentWeightKg: 60 }))),
+        ).toEqual(['paceLbPerWeek', 'goalWeightKg']);
+    });
+
+    it.each([
+        ['goal', goalEnvelopeBody({ goalWeightKg: 70 })],
+        [
+            'body',
+            {
+                age: 34,
+                heightCm: 178,
+                weightKg: 79,
+                sexForEstimate: 'female',
+                heightUnitPref: 'ft_in',
+                weightUnitPref: 'lb',
+                timeZone: ZONE,
+                expectedRevision: 4,
+            },
+        ],
+    ])('answers needs_context for a clean %s body a stored value still has a verdict on', (step, body) => {
+        // Not `ok`: the goal step's target weight and the body step's current
+        // weight are each half of the coherence tuple whose other half is
+        // stored, so the answer is not final until the row is read.
+        expect(parseSetupStepRequest(step, body)).toEqual({ kind: 'needs_context' });
+    });
+
+    it('answers ok for a clean body no stored value bears on', () => {
+        // The third arm, and the contrast that makes `needs_context` mean
+        // something: this body carries no goal weight, so every rule that can
+        // judge it has been judged.
+        expect(parseSetupStepRequest('goal', goalEnvelopeBody())).toEqual({ kind: 'ok' });
+        expect(
+            parseSetupStepRequest('activity', {
+                activityLevel: 'active',
+                timeZone: ZONE,
+                expectedRevision: 4,
+            }),
+        ).toEqual({ kind: 'ok' });
     });
 });
 
@@ -3566,13 +3703,15 @@ describe('parsePreferencesUpdateRequest', () => {
     it('judges nothing that needs the stored row', () => {
         // Both of these are refusals the row decides — a revision that lost the
         // race, and a target weight on the wrong side of a stored current weight
-        // — so this stage must let them through.
+        // — so this stage must let them through. The second says
+        // `needs_context` rather than `ok` because the tuple's other halves are
+        // stored, which is exactly the verdict that is still outstanding.
         expect(
             parsePreferencesUpdateRequest({ diet: 'vegan', timeZone: ZONE, expectedRevision: 99 }),
         ).toEqual({ kind: 'ok' });
         expect(
             parsePreferencesUpdateRequest({ goalWeightKg: 200, timeZone: ZONE, expectedRevision: 4 }),
-        ).toEqual({ kind: 'ok' });
+        ).toEqual({ kind: 'needs_context' });
     });
 
     it('names every envelope problem at once', () => {
@@ -3611,31 +3750,89 @@ describe('parsePreferencesUpdateRequest', () => {
         expect(verdict).toEqual(parsePreferencesUpdate(body, { currentRevision: 4 }));
     });
 
-    it.each([
+    const PAIR_RULE_EDITS: readonly [string, Record<string, unknown>][] = [
         ['the goal without its pace', { goal: 'lose' }],
         ['a target weight without the current one', { goalWeightKg: 70 }],
         ['meal times without the schedule', { mealTimes: [] }],
         ['a budget amount without the checkbox', { budget: { amount: 0, currency: 'USD' } }],
-    ])('yields on %s, because the row holds the other half', (_label, edit) => {
-        // Each of these bodies ALSO carries a refusable field, and the stage
-        // still yields: answering would name fewer controls than the row-backed
-        // parse will.
-        expect(
-            parsePreferencesUpdateRequest({ ...edit, diet: 'carnivore', timeZone: ZONE, expectedRevision: 4 }),
-        ).toEqual({ kind: 'ok' });
+    ];
+
+    it.each(PAIR_RULE_EDITS)(
+        'still refuses a request-only error beside %s, whose other half the row holds',
+        (_label, edit) => {
+            // Each of these bodies ALSO carries an invalid diet, and the stage
+            // used to answer `ok` for all four — sending the service to read a
+            // row for a partial `carnivore` makes unstorable whatever is in it.
+            // The diet is named now; the pair rule's own verdict follows on the
+            // next attempt (AAP 0.5.2 over 0.7.4's one-400 completeness).
+            expect(
+                fieldsOf(
+                    parsePreferencesUpdateRequest({
+                        ...edit,
+                        diet: 'carnivore',
+                        timeZone: ZONE,
+                        expectedRevision: 4,
+                    }),
+                ),
+            ).toContain('diet');
+        },
+    );
+
+    it('answers exactly what the row-backed parse answers when the stored halves are coherent', () => {
+        // The HTTP contract, pinned where it is decidable: this is the body
+        // `api/preferences.test.ts` sends against a stored row whose goal,
+        // weight, pace and target agree with it, and the row-backed parse —
+        // which this change does not touch — produces the same verdict detail
+        // for detail. So the 400 the client receives did not move; only the
+        // Prisma read that used to precede it is gone.
+        const body = { goalWeightKg: 70, diet: 'carnivore', timeZone: ZONE, expectedRevision: 4 };
+
+        expect(parsePreferencesUpdateRequest(body)).toEqual(
+            parsePreferencesUpdate(
+                body,
+                updateContext({
+                    currentGoal: 'lose',
+                    currentWeightKg: 79,
+                    currentGoalWeightKg: 70,
+                    currentPaceLbPerWeek: 1,
+                }),
+            ),
+        );
     });
+
+    it.each(PAIR_RULE_EDITS)(
+        'answers needs_context for a partial whose only outstanding rule is %s',
+        (_label, edit) => {
+            // The other half of the same four rules: with nothing the request
+            // alone decides left wrong, the stage says the row still has a
+            // verdict to give rather than claiming the partial is fully judged.
+            expect(
+                parsePreferencesUpdateRequest({ ...edit, timeZone: ZONE, expectedRevision: 4 }),
+            ).toEqual({ kind: 'needs_context' });
+        },
+    );
 
     it('does not invent a refusal the stored half would have cleared', () => {
         // The regression this staging must not cause: a user whose stored pace
-        // is 1 lb/week switching to `lose` sends no pace, and that is correct.
+        // is 1 lb/week switching to `lose` sends no pace, and that is correct —
+        // so the stage defers to the row instead of refusing.
         expect(
             parsePreferencesUpdateRequest({ goal: 'lose', timeZone: ZONE, expectedRevision: 4 }),
-        ).toEqual({ kind: 'ok' });
+        ).toEqual({ kind: 'needs_context' });
         expect(
             parsePreferencesUpdateRequest({ budget: null, timeZone: ZONE, expectedRevision: 4 }),
-        ).toEqual({ kind: 'ok' });
+        ).toEqual({ kind: 'needs_context' });
         expect(
             parsePreferencesUpdateRequest({ mealTimes: [], timeZone: ZONE, expectedRevision: 4 }),
+        ).toEqual({ kind: 'needs_context' });
+    });
+
+    it('answers ok for a clean partial none of the four pair rules applies to', () => {
+        // The third arm: a diet edit touches no pair, so every rule that can
+        // judge this body has been judged and only the revision comparison is
+        // outstanding.
+        expect(
+            parsePreferencesUpdateRequest({ diet: 'vegan', timeZone: ZONE, expectedRevision: 4 }),
         ).toEqual({ kind: 'ok' });
     });
 });

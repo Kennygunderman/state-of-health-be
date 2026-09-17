@@ -46,7 +46,11 @@
 //    key, so there is no ledger row to look for and none is sought. Both
 //    endpoints are driven through the same incompatibility and required to
 //    produce identical flag state, because two paths through one lifecycle is
-//    how they come to disagree.
+//    how they come to disagree. That lifecycle is also where the save's
+//    ATOMICITY becomes provable: a failure injected into the recomputation —
+//    after the preference row and a meal's flags have been written — is the
+//    only way to show that a save which cannot finish leaves nothing behind,
+//    and it too is driven through both endpoints.
 //
 // 5. THE GATE IS PER HANDLER, NOT PER ROUTER. With `MEAL_PLANNING_ENABLED` off
 //    all three preference routes answer `503 feature_disabled` while
@@ -85,12 +89,32 @@
 // the UTC day key is always inside the start-date window the server computes in
 // the user's own zone.
 
+import type { meal_plan_meals, meal_plan_preferences, meal_plans } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
+import { ReadOnlyFieldError } from '../../services/mealPlanning.errors';
 import { NO_PREFERENCES_REVISION, PREFERENCE_FIELD_CODES } from '../../services/preferences.logic';
-import { MealFlag, PreferencesResponse, PreferencesSaveResponse } from '../../types/mealPlanning';
+// The namespace form, beside the named imports above, because one case spies on
+// the module's `evaluateMealAgainstPreferences` export to inject a failure
+// inside the flag recomputation — the same instrument `api/targets.test.ts`
+// uses on `grocery.service.ts` to hold a publication transaction open.
+import * as preferencesLogic from '../../services/preferences.logic';
+// Likewise: the recipe read is the cross-module call that opens each active
+// plan's recomputation, and spying on it is how one case fails a save AFTER a
+// whole plan — audit record included — has been recomputed.
+import * as recipeService from '../../services/recipe.service';
+// The two service entry points, called directly by the cases that assert what a
+// caller of the service — rather than of the endpoint — is handed.
+import { savePreferences, saveSetupStep } from '../../services/preferences.service';
+import {
+    AffectedMealsResponse,
+    MealFlag,
+    PreferencesResponse,
+    PreferencesSaveResponse,
+} from '../../types/mealPlanning';
 import { isMealPlanningEnabled } from '../../utils/featureFlags';
 import {
     FIXTURE_ENDED_PLAN_START_DAY_KEY,
+    addDaysToDayKey,
     makeCatalogFood,
     makePlan,
     makePreferences,
@@ -145,6 +169,20 @@ const TIME_ZONE = 'America/New_York';
 
 /** A second zone, for the "refreshed on every save" case. */
 const OTHER_TIME_ZONE = 'Europe/Berlin';
+
+/**
+ * A third zone, for the cases that save a plan-bearing user a NEW zone.
+ *
+ * Different from the stored `TIME_ZONE`, so a half-written `time_zone` column
+ * would be visible, and BEHIND UTC like it, which is the load-bearing half:
+ * `OTHER_TIME_ZONE` is ahead of UTC, so for the last hours of a UTC day the day
+ * key a save derives from it is already tomorrow — and the flag recomputation,
+ * which excludes a plan whose `end_date` is before that day (§0.5.1), would
+ * then skip the one-day fixture entirely and recompute nothing. A zone west of
+ * UTC can only ever name today or yesterday, both of which keep the fixture's
+ * week running.
+ */
+const WESTERN_TIME_ZONE = 'America/Los_Angeles';
 
 const PREFERENCES_PATH = '/api/meal-planning/preferences';
 const TARGETS_PATH = '/api/meal-planning/targets';
@@ -254,6 +292,19 @@ const storedFlags = async (mealId: string): Promise<unknown> =>
             select: { flags: true },
         })
     ).flags;
+
+/**
+ * One planned meal's stored `revision`, which a flag recomputation must NOT
+ * move: flags are derived from preferences rather than a change to what was
+ * planned, and the revision clients pin for a write is the plan's.
+ */
+const storedMealRevision = async (mealId: string): Promise<number> =>
+    (
+        await prisma.meal_plan_meals.findUniqueOrThrow({
+            where: { id: mealId },
+            select: { revision: true },
+        })
+    ).revision;
 
 /** The plan-level audit record the last recomputation left behind. */
 const storedIncompatibilityFlags = async (planId: string): Promise<unknown> =>
@@ -1294,7 +1345,9 @@ describe('PUT /api/meal-planning/preferences', () => {
 
             // The other half of the asymmetry: the tier is a DERIVED value, so
             // the response carries one the request was not allowed to state.
-            // £42 a week over four meals a day is 1.50 a meal, which is tier 1.
+            // $42 a week over four meals a day is $1.50 a meal, which is tier 1
+            // — USD is the only currency this version accepts (§0.5.2), and the
+            // tier thresholds are calibrated to it.
             const saved = await saveAllOk({
                 mealSchedule: 'three_plus_snack',
                 mealTimes: FOUR_MEAL_TIMES,
@@ -1310,6 +1363,12 @@ describe('PUT /api/meal-planning/preferences', () => {
     });
 
     describe('a refused save is one transaction that wrote nothing', () => {
+        // BOTH REFUSALS HERE ARE DECIDED BEFORE ANYTHING IS WRITTEN — one on a
+        // revision that has moved, one on a field the parser rejects — which is
+        // exactly what they are for. The complementary half, a failure AFTER
+        // the preference row has been written and inside the flag
+        // recomputation, needs the flag fixture and is proved in "a save
+        // refused after the preference row was written" below.
         it('writes nothing when the revision has moved', async () => {
             await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
             const before = await storedRowOrThrow();
@@ -1348,6 +1407,247 @@ describe('PUT /api/meal-planning/preferences', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * Validation the request alone decides, answered before any row is read
+ *
+ * Both saves parse the REQUEST first (§0.5.2, "validation applied before any
+ * Prisma or planning work"). The bodies below are the ones that used to get
+ * past that stage: each carries an error the request alone decides AND an
+ * answer whose coherence rule reads the stored row, and the parsers took the
+ * second as a reason to answer `ok` so the service read the row before
+ * producing the 400 the request had already earned.
+ *
+ * WHAT IS ASSERTED HERE IS THE ANSWER, not the absence of the query — the
+ * status, the code and the whole detail list, as the wire has always carried
+ * them for the two cases where the stored row has nothing to add. That the
+ * parse now happens with no I/O at all is `api/requestParserWiring.test.ts`'s
+ * claim, against a recording Prisma stub. The third case states the one
+ * observable consequence of the change: a detail the row WOULD have
+ * contributed arrives on the client's next attempt instead of in the same 400.
+ * ------------------------------------------------------------------------- */
+
+describe('a body the request alone refuses', () => {
+    it('answers the step save with every request-only field, though a row rule applies to it too', async () => {
+        // `goalPayload` carries `goalWeightKg`, which is judged against the
+        // STORED current weight — the applicable row rule that used to make
+        // this stage yield. The refusal is unchanged: a read-only key and a
+        // pace outside the closed set, in the order this endpoint reports them.
+        const response = await saveStep(
+            'goal',
+            goalPayload({ paceLbPerWeek: 9, setupStatus: 'completed' }),
+        );
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: [
+                { field: 'setupStatus', code: PREFERENCE_FIELD_CODES.READ_ONLY_FIELD },
+                { field: 'paceLbPerWeek', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ],
+        });
+        expect(await storedRow()).toBeNull();
+    });
+
+    it('answers the full save with every request-only field, though a pair rule applies to it too', async () => {
+        // A lone `goalWeightKg` leaves the other two members of the coherence
+        // tuple to the row, so this body is one of the four the full save used
+        // to defer. The stored tuple is coherent with what it sends, so the
+        // detail list is exactly the one this request has always received.
+        await makePreferences(USER_ID, {
+            time_zone: TIME_ZONE,
+            revision: 1,
+            goal: 'lose',
+            pace_lb_per_week: 1,
+            goal_weight_kg: GOAL_WEIGHT_KG,
+            weight_kg: CURRENT_WEIGHT_KG,
+        });
+        const before = await storedRowOrThrow();
+
+        const response = await saveAll({
+            goalWeightKg: GOAL_WEIGHT_KG,
+            diet: 'carnivore',
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: [{ field: 'diet', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE }],
+        });
+        expect(await storedRowOrThrow()).toEqual(before);
+    });
+
+    it('reports a deferred coherence detail on the next attempt rather than reading the row for a refused one', async () => {
+        // The trade the two cases above make explicit. This body sends a
+        // current weight that contradicts the stored target — a rule only the
+        // row can apply — BESIDE an invalid diet. The first answer names the
+        // diet alone, because no stored value could have made `carnivore`
+        // storable; the incoherent weight is reported the moment the request is
+        // otherwise well formed, on the round trip the client was going to
+        // spend fixing the diet anyway.
+        await makePreferences(USER_ID, {
+            time_zone: TIME_ZONE,
+            revision: 1,
+            goal: 'lose',
+            pace_lb_per_week: 1,
+            goal_weight_kg: GOAL_WEIGHT_KG,
+            weight_kg: CURRENT_WEIGHT_KG,
+        });
+        const before = await storedRowOrThrow();
+
+        const refused = await saveAll({
+            weightKg: GOAL_WEIGHT_KG - 10,
+            diet: 'carnivore',
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(refused.status).toBe(400);
+        expect(fieldsOf(refused)).toEqual(['diet']);
+
+        const retried = await saveAll({
+            weightKg: GOAL_WEIGHT_KG - 10,
+            diet: 'vegan',
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(retried.status).toBe(400);
+        expect(detailsOf(retried)).toEqual([
+            { field: 'goalWeightKg', code: PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT },
+        ]);
+        // Neither attempt wrote anything, which is what makes the second one a
+        // retry of the same edit rather than a follow-up to a partial save.
+        expect(await storedRowOrThrow()).toEqual(before);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * Keys the client may not write
+ *
+ * A body whose ONLY problem is server-owned or unknown keys leaves the
+ * preference service as `ReadOnlyFieldError` — the class the error inventory
+ * pairs with the controller's `read_only_field` mapping, and which nothing
+ * constructed before. It carries the WHOLE detail list, so every route to the
+ * same 400 produces the same body: the controller's own boundary parse refuses
+ * this body before the service is entered (it runs the same parser), the
+ * service raises the class for any other caller, and the three cases below
+ * assert the body the client reads back either way — three offending keys,
+ * three details, one 400, on both endpoints.
+ *
+ * A MIXED body keeps travelling as the verdict, because one 400 must still name
+ * every offending control (§0.7.4) — and that is asserted here in both
+ * directions, so the split cannot degenerate into "throw for anything
+ * containing a read-only key".
+ * ------------------------------------------------------------------------- */
+
+/** Two server-owned keys and one name that exists nowhere, in one body. */
+const THREE_UNWRITABLE_KEYS: JsonBody = {
+    setupStatus: 'completed',
+    revision: 9,
+    nickname: 'anything',
+};
+
+/** The three `read_only_field` details that body must earn, in the order it sent them. */
+const THREE_READ_ONLY_DETAILS = [
+    { field: 'setupStatus', code: PREFERENCE_FIELD_CODES.READ_ONLY_FIELD },
+    { field: 'revision', code: PREFERENCE_FIELD_CODES.READ_ONLY_FIELD },
+    { field: 'nickname', code: PREFERENCE_FIELD_CODES.READ_ONLY_FIELD },
+];
+
+/**
+ * The same two saves called directly, for the one assertion the wire cannot
+ * carry: which layer refused. Both bodies are the HTTP ones above.
+ */
+const READ_ONLY_RAISING_SAVES: readonly [string, () => Promise<unknown>][] = [
+    ['the step save', () => saveSetupStep(USER_ID, 'goal', goalPayload(THREE_UNWRITABLE_KEYS))],
+    [
+        'the full save',
+        () =>
+            savePreferences(USER_ID, {
+                ...THREE_UNWRITABLE_KEYS,
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            }),
+    ],
+];
+
+describe('a body whose only problem is keys the client may not write', () => {
+    it('answers the step save with one detail per offending key', async () => {
+        const response = await saveStep('goal', goalPayload(THREE_UNWRITABLE_KEYS));
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: THREE_READ_ONLY_DETAILS,
+        });
+        expect(await storedRow()).toBeNull();
+    });
+
+    it('answers the full save with one detail per offending key', async () => {
+        await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+        const before = await storedRowOrThrow();
+
+        const response = await saveAll({
+            ...THREE_UNWRITABLE_KEYS,
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: THREE_READ_ONLY_DETAILS,
+        });
+        expect(await storedRowOrThrow()).toEqual(before);
+    });
+
+    it('keeps a read-only key and a field error in the same 400 on the full save', async () => {
+        await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+        const response = await saveAll({
+            nickname: 'anything',
+            diet: 'carnivore',
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: [
+                { field: 'nickname', code: PREFERENCE_FIELD_CODES.READ_ONLY_FIELD },
+                { field: 'diet', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ],
+        });
+    });
+
+    // The step endpoint's mixed case is the first case of 'a body the request
+    // alone refuses' above — `setupStatus` beside a pace outside the closed
+    // set, in one 400 — so it is not repeated here.
+
+    it.each(READ_ONLY_RAISING_SAVES)(
+        'raises ReadOnlyFieldError from %s, carrying every offending key',
+        async (_label, save) => {
+            // THE ONE CASE IN THIS FILE THAT DOES NOT GO THROUGH `request`,
+            // because the raise is not observable from outside: the controller
+            // parses the request at its own boundary and refuses this body with
+            // the identical `400 {error, details}` before the service is
+            // entered, by design (the two run the same parser). The service is
+            // still where the class is constructed — it is the answer every
+            // caller of `saveSetupStep`/`savePreferences` gets — so the service
+            // boundary is where the raise is asserted, with the same detail
+            // list the HTTP cases above read back.
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            await expect(save()).rejects.toThrow(ReadOnlyFieldError);
+            await expect(save()).rejects.toMatchObject({ details: THREE_READ_ONLY_DETAILS });
+            expect(await storedRevision()).toBe(1);
+        },
+    );
+});
+
+/* ---------------------------------------------------------------------------
  * The incompatibility-flag lifecycle
  *
  * `preferences.service.ts` is the declared single owner of this lifecycle and
@@ -1375,8 +1675,18 @@ interface FlagFixture {
     fastMealId: string;
     /** The forty-minute milk-and-eggs lunch every conflict below lands on. */
     slowMealId: string;
+    /** Every day's compatible breakfast, in plan order. One entry for a one-day plan. */
+    fastMealIds: string[];
+    /** Every day's forty-minute lunch, in plan order — the meals a recompute must all move. */
+    slowMealIds: string[];
     /** That lunch's recipe, so a second plan can carry the same conflict. */
     slowRecipeVersionId: string;
+    /**
+     * The breakfast's only ingredient — the one answer that can move a meal no
+     * diet, allergen or cooking limit reaches, which is what the post-write
+     * rollback cases need in order to fail AFTER a meal's flags were written.
+     */
+    fastFoodId: string;
     milkFoodId: string;
 }
 
@@ -1397,6 +1707,7 @@ interface FlagFixture {
 const seedFlagFixture = async (
     uid: string,
     cookingTimeLimitMin: number,
+    dayCount: number = 1,
 ): Promise<FlagFixture> => {
     const milk = await makeCatalogFood({
         display_name: 'Whole milk',
@@ -1426,27 +1737,41 @@ const seedFlagFixture = async (
     const dayKey = utcTodayDayKey();
     const plan = await makePlan(uid, {
         startDate: dayKey,
-        dayCount: 1,
+        dayCount,
         slots: [
             { slot: 'breakfast', slot_time: '08:00', recipeVersionId: fast.id },
             { slot: 'lunch', slot_time: '12:30', recipeVersionId: slow.id },
         ],
     });
 
-    const meals = plan.meal_plan_days[0].meal_plan_meals;
-    const fastMeal = meals.find((meal) => meal.slot === 'breakfast');
-    const slowMeal = meals.find((meal) => meal.slot === 'lunch');
+    // Every day plans the same two slots, so a multi-day fixture is the same
+    // conflict repeated — which is what makes "one statement wrote them all"
+    // assertable. Collected in plan order (day, then slot), the order the
+    // recomputation's audit record is required to use.
+    const fastMealIds: string[] = [];
+    const slowMealIds: string[] = [];
 
-    if (fastMeal === undefined || slowMeal === undefined) {
-        throw new Error('the flag fixture did not plan both of its slots');
+    for (const day of plan.meal_plan_days) {
+        const fastMeal = day.meal_plan_meals.find((meal) => meal.slot === 'breakfast');
+        const slowMeal = day.meal_plan_meals.find((meal) => meal.slot === 'lunch');
+
+        if (fastMeal === undefined || slowMeal === undefined) {
+            throw new Error('the flag fixture did not plan both of its slots on every day');
+        }
+
+        fastMealIds.push(fastMeal.id);
+        slowMealIds.push(slowMeal.id);
     }
 
     return {
         planId: plan.id,
         dayKey,
-        fastMealId: fastMeal.id,
-        slowMealId: slowMeal.id,
+        fastMealId: fastMealIds[0],
+        slowMealId: slowMealIds[0],
+        fastMealIds,
+        slowMealIds,
         slowRecipeVersionId: slow.id,
+        fastFoodId: oats.id,
         milkFoodId: milk.id,
     };
 };
@@ -1621,6 +1946,53 @@ describe('a preference save recomputes the active plan’s incompatibility flags
         ]);
     });
 
+    it('writes every changed meal of a multi-day plan, and leaves the unchanged ones alone', async () => {
+        // The recomputation applies one plan's changed verdicts as a SINGLE
+        // statement, so "it wrote the meals that moved" has to be asserted
+        // across more than one of them: a per-meal loop and a batch that only
+        // carries its first row are indistinguishable on a one-meal plan.
+        // Three days × two slots — the three forty-minute lunches move, the
+        // three ten-minute breakfasts do not.
+        const fixture = await seedFlagFixture(USER_ID, 60, RUNNING_WEEK_DAY_COUNT);
+
+        const saved = await saveAllOk({
+            cookingTimeLimitMin: 30,
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(saved.affectedMealCount).toBe(RUNNING_WEEK_DAY_COUNT);
+
+        for (const mealId of fixture.slowMealIds) {
+            expect(await storedFlags(mealId)).toEqual([{ code: 'cooking_time', detail: ['40'] }]);
+            // The write carries the flags and nothing else.
+            expect(await storedMealRevision(mealId)).toBe(1);
+        }
+
+        for (const mealId of fixture.fastMealIds) {
+            expect(await storedFlags(mealId)).toEqual([]);
+            expect(await storedMealRevision(mealId)).toBe(1);
+        }
+
+        // One audit record naming all three flagged meals in plan order, and
+        // ONE revision bump however many meals moved.
+        expect(await storedIncompatibilityFlags(fixture.planId)).toEqual({
+            flaggedMealIds: fixture.slowMealIds,
+            codes: ['cooking_time'],
+            recomputedAt: expect.any(String),
+        });
+        expect(await planRevision(fixture.planId)).toBe(2);
+
+        // And the no-op rerun over the same three meals: every verdict is
+        // already stored, so the batch has nothing to apply and the plan's
+        // revision stands still while the preference revision advances.
+        const again = await saveAllOk({ age: 41, timeZone: TIME_ZONE, expectedRevision: 2 });
+
+        expect(again.preferences.revision).toBe(3);
+        expect(again.affectedMealCount).toBe(RUNNING_WEEK_DAY_COUNT);
+        expect(await planRevision(fixture.planId)).toBe(2);
+    });
+
     it('leaves a superseded plan untouched while flagging the active one', async () => {
         const active = await seedFlagFixture(USER_ID, 60);
         // The same running week and the same forty-minute recipe, stored
@@ -1649,6 +2021,586 @@ describe('a preference save recomputes the active plan’s incompatibility flags
         ]);
         expect(await storedFlags(supersededMealId)).toEqual([]);
         expect(await planRevision(superseded.id)).toBe(1);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A save that fails AFTER the preference row was written
+ *
+ * Every negative case above this point is refused BEFORE the row is touched —
+ * on a revision that has moved, on a field the parser rejects, or on the
+ * feature gate — so between them they say nothing about the half of the save
+ * that actually holds several writes. That half is: the preference row lands
+ * first, then `meal_plan_meals.flags` is rewritten for every meal of every
+ * active plan whose verdict moved, then `meal_plans.incompatibility_flags`
+ * records what changed (§0.5.1, §0.7.3).
+ *
+ * WHAT A HALF-COMMITTED SAVE WOULD COST. A save that kept its preference write
+ * and lost the recomputation would leave the user's revision bumped — so their
+ * client believes the answer landed and pins the new value — with flags
+ * recomputed for only part of their week and a plan-level audit record
+ * describing a recomputation that never finished. The 16 settings banner counts
+ * flagged meals, so it would under-report the meals the new answer really
+ * affects, and "Review affected meals" would open on a subset while the rest of
+ * the week silently disagreed with the preferences the same screen displays.
+ * Nothing above can see that: only a failure INSIDE the recomputation can.
+ *
+ * SO ONE IS INJECTED, at the only place in that loop where a deterministic
+ * failure is available without changing production code:
+ * `preferences.logic.ts::evaluateMealAgainstPreferences`, the pure verdict
+ * `recomputePlanFlags` asks for once per meal, spied with an implementation
+ * that calls the real rule through for the first meal and throws on the second.
+ * The fault therefore fires with the preference row already updated AND the
+ * first meal's flags already written, which is what makes "nothing changed" a
+ * statement about a ROLLBACK rather than about a request that never began.
+ * Nothing about the lock, the transaction or the writes is stubbed, and the spy
+ * is removed before anything is read back.
+ *
+ * BOTH SAVE ENDPOINTS ARE COVERED, because §0.5.2 gives them ONE flag
+ * lifecycle: the step endpoint in edit mode "recomputes incompatibility flags
+ * in the same transaction exactly as the full save does". Two paths into one
+ * transaction is how one of them comes to commit half of it.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The message the injected failure carries, asserted ABSENT from what the
+ * handler logged (see `expectResidualFaultLogged`).
+ *
+ * What proves a case's 500 came from THIS fault rather than from a fixture the
+ * request choked on is the seam's own reach — `evaluations` and
+ * `verdictsBeforeFault` below — beside a `request_failed` event naming this
+ * route, a 500, `internal_error` and an untyped throw. The message is the one
+ * part of the fault that must never reach the log, so it is asserted there as
+ * an absence rather than as the attribution.
+ */
+const FLAG_FAULT_MESSAGE = 'injected flag recomputation failure';
+
+/**
+ * Which meal the injected failure falls on, counted in the order
+ * `recomputePlanFlags` reads them (day date, then slot order).
+ *
+ * The SECOND, and that is the whole point of the number: the first meal's
+ * verdict is then computed for real and written before the transaction dies,
+ * whereas failing on the first would land before any meal write and prove only
+ * that the preference row alone rolls back.
+ */
+const FAILING_MEAL_POSITION = 2;
+
+/**
+ * Which active plan the second fault falls on, counted in the start-date order
+ * `recomputeActivePlanFlags` walks them.
+ *
+ * The SECOND, because the audit write is the LAST statement of a plan's
+ * recomputation and is followed only by reads: failing as the NEXT plan's
+ * recomputation opens is what places a failure after
+ * `meal_plans.incompatibility_flags` has been written without changing
+ * production code. A failure AT that statement is not reachable from a test —
+ * it is a direct Prisma call on the transaction client the service was handed,
+ * and the only instrument that could intercept it is `prisma.$use` middleware
+ * on the shared client, which has no unregister and would therefore follow this
+ * file into every later case and suite.
+ */
+const FAILING_PLAN_POSITION = 2;
+
+/** The message the second fault carries, asserted ABSENT from what the handler logged. */
+const PLAN_LOOP_FAULT_MESSAGE = 'injected plan recipe read failure';
+
+/**
+ * Silences and records the handler's own error log for the duration of one
+ * request: the 500 path records the fault as a server event and answers one
+ * stable code (Rule backend-architecture §8), which every case below asserts —
+ * and which would otherwise print a deliberate fault's event in a passing run.
+ */
+const captureHandlerLog = () => jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+/**
+ * Asserts the ONE server event the residual 500 emits, and that the injected
+ * fault's message is not in it.
+ *
+ * `mealPlanning.controller.ts::failRequest` answers an unmapped throw with the
+ * single stable code `internal_error` and records it through
+ * `logSafeEvent('error', 'request_failed', …)`, which writes ONE string —
+ * `[meal-planning] request_failed {…}` — to `console.error`. So a 500 is
+ * attributed here by the route that answered it, the status, that code and the
+ * throw's CLASS NAME rather than by the message it used to be named with.
+ * `errorName` is `Error` for both faults below because both are deliberately
+ * untyped: a mapped error class would have been answered as its own status, so
+ * this field is what separates "the injected fault ended the request" from "a
+ * typed rejection did".
+ *
+ * The message's ABSENCE is asserted beside them rather than assumed. Redacting
+ * it is the point of that shape — a fault's message can carry a stack, a
+ * failing statement's values or a connection string — so an assertion that
+ * only matched the fields would still pass if the message came back.
+ */
+const expectResidualFaultLogged = (
+    logged: readonly unknown[][],
+    action: string,
+    faultMessage: string,
+): void => {
+    expect(logged).toHaveLength(1);
+    // ONE argument, and a string: the second argument that used to carry the
+    // error object is exactly where the message reached the log.
+    expect(logged[0]).toHaveLength(1);
+
+    const [failureLine] = logged[0];
+
+    expect(failureLine).toContain('[meal-planning] request_failed');
+    expect(failureLine).toContain(`"action":"${action}"`);
+    expect(failureLine).toContain(`"userId":"${USER_ID}"`);
+    expect(failureLine).toContain('"status":500');
+    expect(failureLine).toContain('"code":"internal_error"');
+    expect(failureLine).toContain('"errorName":"Error"');
+    expect(failureLine).not.toContain(faultMessage);
+};
+
+/** What a request driven through the injected recomputation failure leaves behind. */
+interface PostWriteFaultOutcome {
+    response: HttpResponse;
+    /** How many meals the recomputation reached, the last of them the one that failed. */
+    evaluations: number;
+    /** The verdicts it obtained BEFORE the fault, in the order it read the meals. */
+    verdictsBeforeFault: MealFlag[][];
+    /** What the handler logged, so the 500 is attributed rather than assumed. */
+    logged: unknown[][];
+}
+
+/**
+ * Sends one request with the flag recomputation failing on
+ * {@link FAILING_MEAL_POSITION}, and reports what the fault saw.
+ *
+ * The real rule is captured BEFORE the spy replaces the export, so the
+ * call-through reaches the rule and not the mock; `jest` records a call before
+ * it runs the implementation, which is what makes the counter below count the
+ * invocation it is inside.
+ */
+const sendUnderFlagRecomputationFault = async (
+    send: () => Promise<HttpResponse>,
+): Promise<PostWriteFaultOutcome> => {
+    const evaluateForReal = preferencesLogic.evaluateMealAgainstPreferences;
+    const evaluate = jest
+        .spyOn(preferencesLogic, 'evaluateMealAgainstPreferences')
+        .mockImplementation((meal, preferences) => {
+            if (evaluate.mock.calls.length >= FAILING_MEAL_POSITION) {
+                throw new Error(FLAG_FAULT_MESSAGE);
+            }
+
+            return evaluateForReal(meal, preferences);
+        });
+    const logged = captureHandlerLog();
+
+    try {
+        const response = await send();
+
+        return {
+            response,
+            evaluations: evaluate.mock.calls.length,
+            // Only the calls that RETURNED: the failing one is recorded as a
+            // throw, so this is exactly the set of verdicts the loop had in
+            // hand — and therefore wrote where they differed — before the
+            // transaction died.
+            verdictsBeforeFault: evaluate.mock.results.flatMap((result) =>
+                result.type === 'return' ? [result.value] : [],
+            ),
+            // Copied out rather than handed over by reference, because
+            // `mockRestore` below resets the recorded state.
+            logged: logged.mock.calls.map((call) => [...call]),
+        };
+    } finally {
+        // `jest.config.ts` sets `clearMocks` and deliberately NOT
+        // `restoreMocks`, so an implementation left installed here would follow
+        // this file into every later case — including the ones that must reach
+        // the real rule. Restored in a `finally`, so a failed expectation
+        // cannot leak it either.
+        evaluate.mockRestore();
+        logged.mockRestore();
+    }
+};
+
+/** What a request driven through the injected plan-loop failure leaves behind. */
+interface PlanLoopFaultOutcome {
+    response: HttpResponse;
+    /** How many plans the recomputation opened, the last of them the one that failed. */
+    plansOpened: number;
+    logged: unknown[][];
+}
+
+/**
+ * Sends one request with the recomputation failing as it opens plan
+ * {@link FAILING_PLAN_POSITION}, so the plans before it are recomputed in full
+ * — meal flags, plan revision and audit record — before the transaction dies.
+ *
+ * The seam is `recipe.service.ts::getPlanningRecipeVersionsByIds`, the single
+ * owner of recipe reads and the first thing `recomputePlanFlags` asks for per
+ * plan. Spread arguments rather than named ones, so the call-through cannot
+ * drift from the signature it stands in for.
+ */
+const sendUnderSecondPlanRecipeReadFault = async (
+    send: () => Promise<HttpResponse>,
+): Promise<PlanLoopFaultOutcome> => {
+    const readForReal = recipeService.getPlanningRecipeVersionsByIds;
+    const read = jest
+        .spyOn(recipeService, 'getPlanningRecipeVersionsByIds')
+        .mockImplementation(async (...args) => {
+            if (read.mock.calls.length >= FAILING_PLAN_POSITION) {
+                throw new Error(PLAN_LOOP_FAULT_MESSAGE);
+            }
+
+            return readForReal(...args);
+        });
+    const logged = captureHandlerLog();
+
+    try {
+        const response = await send();
+
+        return {
+            response,
+            plansOpened: read.mock.calls.length,
+            logged: logged.mock.calls.map((call) => [...call]),
+        };
+    } finally {
+        read.mockRestore();
+        logged.mockRestore();
+    }
+};
+
+/** Everything a preference save can move, as the database holds it and as the client reads it. */
+interface PreferenceWorld {
+    row: meal_plan_preferences;
+    plan: meal_plans;
+    meals: meal_plan_meals[];
+    read: PreferencesResponse;
+    affected: AffectedMealsResponse;
+}
+
+const readAffectedMeals = async (
+    planId: string,
+    uid: string = USER_ID,
+): Promise<AffectedMealsResponse> => {
+    const response: HttpResponse = await asUser(
+        request.get(`/api/meal-planning/plans/${planId}/affected-meals`),
+        { uid },
+    );
+
+    if (response.status !== 200) {
+        throw new Error(
+            `reading the affected meals answered ${response.status}: ${JSON.stringify(response.body)}`,
+        );
+    }
+
+    return response.body as AffectedMealsResponse;
+};
+
+/**
+ * The COMPLETE state a preference save can move, so that comparing it after a
+ * refusal is byte-for-byte rather than a list of columns someone remembered.
+ *
+ * WHOLE ROWS, not projections. `revision`, `setup_step`, `setup_status`,
+ * `time_zone`, `diet` and `allergens` are the members these cases are really
+ * about, and every meal's `flags` and `revision` beside the plan's `revision`
+ * and `incompatibility_flags` are what a half-finished recomputation would show
+ * up in — but reading the remaining columns costs nothing and catches the
+ * partial write nobody predicted. The meals are ordered exactly as
+ * `recomputePlanFlags` walks them, so two snapshots of an unchanged plan are
+ * element-wise comparable.
+ *
+ * The two READS are here for the same reason the rows are: what the client sees
+ * has to roll back with what was stored, and `affected-meals` is the request
+ * the 16 banner's "Review affected meals" action makes.
+ */
+const snapshotWorld = async (planId: string, uid: string = USER_ID): Promise<PreferenceWorld> => ({
+    row: await storedRowOrThrow(uid),
+    plan: await prisma.meal_plans.findUniqueOrThrow({ where: { id: planId } }),
+    meals: await prisma.meal_plan_meals.findMany({
+        where: { meal_plan_id: planId },
+        orderBy: [{ meal_plan_days: { date: 'asc' } }, { sort_order: 'asc' }],
+    }),
+    read: await readPreferencesOk(uid),
+    affected: await readAffectedMeals(planId, uid),
+});
+
+/**
+ * The same snapshot over several plans, sequentially so two runs read them in
+ * the same order.
+ */
+const snapshotWorlds = async (
+    planIds: readonly string[],
+    uid: string = USER_ID,
+): Promise<PreferenceWorld[]> => {
+    const worlds: PreferenceWorld[] = [];
+
+    for (const planId of planIds) {
+        worlds.push(await snapshotWorld(planId, uid));
+    }
+
+    return worlds;
+};
+
+describe('a save refused after the preference row was written', () => {
+    /**
+     * What the ten-minute vegan breakfast is flagged for once its own food is
+     * disliked — the only verdict that moves a meal no diet, allergen or
+     * cooking limit in the closed sets can reach.
+     */
+    const BREAKFAST_DISLIKE_FLAGS: MealFlag[] = [{ code: 'dislike', detail: ['Oats, rolled'] }];
+
+    /**
+     * What the forty-minute milk-and-eggs lunch is flagged for under the save
+     * these cases re-send: the diet, the two allergens and the dislike, but NOT
+     * `cooking_time` — that save raises the limit back to 60, so the flags it
+     * lands are its own verdict rather than a leftover of the arrangement.
+     */
+    const LUNCH_PREFERENCE_FLAGS: MealFlag[] = [
+        { code: 'allergen', detail: ['eggs', 'milk'] },
+        { code: 'diet', detail: ['vegan'] },
+        { code: 'dislike', detail: ['Whole milk'] },
+    ];
+
+    it('rolls a full save back whole, and accepts the identical request once the fault is gone', async () => {
+        const fixture = await seedFlagFixture(USER_ID, 60);
+
+        // A COMMITTED SAVE FIRST, so the state the refusal is compared against
+        // is not the empty one: the lunch already carries a flag, the plan
+        // already carries the audit record of it, and both revisions have
+        // already moved. Against a fresh fixture "nothing changed" could pass
+        // by nothing ever having been written; against this one it can only
+        // mean the previous values were RESTORED.
+        const arranged = await saveAllOk({
+            cookingTimeLimitMin: 15,
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(arranged.affectedMealCount).toBe(1);
+        expect(await storedFlags(fixture.fastMealId)).toEqual([]);
+
+        const before = await snapshotWorld(fixture.planId);
+
+        expect(before.row.revision).toBe(2);
+        expect(before.affected.meals.map((meal) => meal.mealId)).toEqual([fixture.slowMealId]);
+
+        // Every column a partial write could leak, moved at once: the diet, the
+        // allergens, the dislike pair, the cooking limit and the zone all
+        // differ from what is stored, so a save that committed its preference
+        // write and lost the rest is visible in the row rather than hidden
+        // behind a value that happened to match already. Held in a const
+        // because the recovery below re-sends it byte for byte.
+        const save: JsonBody = {
+            diet: 'vegan',
+            allergens: ['milk', 'eggs'],
+            dislikedFoodIds: [fixture.fastFoodId, fixture.milkFoodId],
+            cookingTimeLimitMin: 60,
+            timeZone: WESTERN_TIME_ZONE,
+            expectedRevision: 2,
+        };
+
+        const faulted = await sendUnderFlagRecomputationFault(() => saveAll(save));
+
+        // THE FAULT WAS REACHED, AND REACHED LATE. Two evaluations means the
+        // loop ran past the preference write and past the breakfast, whose
+        // verdict it obtained for real — and, differing from the empty flags
+        // stored above, wrote — before the lunch failed.
+        expect(faulted.evaluations).toBe(2);
+        expect(faulted.verdictsBeforeFault).toEqual([BREAKFAST_DISLIKE_FLAGS]);
+
+        // An unclassified failure is the one 500 these endpoints answer, and the
+        // body is the single stable code a client can map — never this route's
+        // prose and never anything internal (§0.5.2).
+        expect(faulted.response.status).toBe(500);
+        expect(faulted.response.body).toEqual({ error: 'internal_error' });
+        expectResidualFaultLogged(faulted.logged, 'preferences.save', FLAG_FAULT_MESSAGE);
+
+        // The whole world, byte for byte.
+        expect(await snapshotWorld(fixture.planId)).toEqual(before);
+
+        // THE OTHER DIRECTION, and the sharpest evidence the rollback was
+        // complete: the IDENTICAL request, still pinning revision 2, is
+        // ACCEPTED — which it could only be if the refused attempt left the
+        // revision exactly where it found it — and now commits every part of
+        // what the fault interrupted, once.
+        const committed = await saveAllOk(save);
+
+        expect(committed.preferences.revision).toBe(3);
+        expect(committed.preferences.diet).toBe('vegan');
+        expect(committed.preferences.timeZone).toBe(WESTERN_TIME_ZONE);
+        expect(committed.affectedMealCount).toBe(2);
+        expect(await storedFlags(fixture.fastMealId)).toEqual(BREAKFAST_DISLIKE_FLAGS);
+        expect(await storedFlags(fixture.slowMealId)).toEqual(LUNCH_PREFERENCE_FLAGS);
+        expect(await planRevision(fixture.planId)).toBe(before.plan.revision + 1);
+        expect(await storedIncompatibilityFlags(fixture.planId)).toEqual({
+            flaggedMealIds: [fixture.fastMealId, fixture.slowMealId],
+            codes: ['diet', 'allergen', 'dislike'],
+            recomputedAt: expect.any(String),
+        });
+    });
+
+    it('rolls a step save back whole, leaving the setup state and the revision it pinned untouched', async () => {
+        const fixture = await seedFlagFixture(USER_ID, 60);
+
+        // Arranged THROUGH THE STEP ENDPOINT, so this case exercises that path
+        // end to end instead of borrowing the full save's write: the cooking
+        // step commits a fifteen-minute limit, which flags the forty-minute
+        // lunch and leaves the ten-minute breakfast alone.
+        const arranged = await saveStepOk(
+            'cooking',
+            cookingPayload({ cookingTimeLimitMin: 15, expectedRevision: 1 }),
+        );
+
+        expect(arranged.affectedMealCount).toBe(1);
+        expect(await storedFlags(fixture.fastMealId)).toEqual([]);
+
+        const before = await snapshotWorld(fixture.planId);
+
+        expect(before.row.revision).toBe(2);
+        expect(before.row.setup_status).toBe('completed');
+        expect(before.affected.meals.map((meal) => meal.mealId)).toEqual([fixture.slowMealId]);
+
+        // THE `dislikes` STEP, AND THE FIXTURE DECIDES THAT RATHER THAN TASTE.
+        // A step carries exactly one answer (§0.5.2), and the breakfast — vegan
+        // oats with no allergen tag and a ten-minute total — cannot be moved by
+        // any `Diet` member, any allergen or any limit in the closed set. A
+        // dislike of its own food is the only answer that moves it, and moving
+        // the FIRST meal is what puts the injected failure after a real
+        // meal-flag write. The zone moves with it, so the envelope every step
+        // carries is part of what must roll back.
+        const save: JsonBody = dislikesPayload({
+            dislikedFoodIds: [fixture.fastFoodId, fixture.milkFoodId],
+            timeZone: WESTERN_TIME_ZONE,
+            expectedRevision: 2,
+        });
+
+        const faulted = await sendUnderFlagRecomputationFault(() => saveStep('dislikes', save));
+
+        expect(faulted.evaluations).toBe(2);
+        expect(faulted.verdictsBeforeFault).toEqual([BREAKFAST_DISLIKE_FLAGS]);
+        expect(faulted.response.status).toBe(500);
+        expect(faulted.response.body).toEqual({ error: 'internal_error' });
+        // The STEP route's own event, which is what keeps this case a statement
+        // about that endpoint: the two save paths answer the same code, so the
+        // `action` is the only thing in the 500 that tells them apart.
+        expectResidualFaultLogged(faulted.logged, 'preferences.saveStep', FLAG_FAULT_MESSAGE);
+
+        // Including `setup_status` and `setup_step`: a step save writes the
+        // state machine's output beside the answer, so a partial commit here
+        // would move a completed user's stored progress as well as their
+        // revision.
+        expect(await snapshotWorld(fixture.planId)).toEqual(before);
+
+        const committed = await saveStepOk('dislikes', save);
+
+        expect(committed.preferences.revision).toBe(3);
+        expect(committed.preferences.setupStatus).toBe('completed');
+        expect(committed.preferences.timeZone).toBe(WESTERN_TIME_ZONE);
+        expect(committed.preferences.dislikedFoods.map((food) => food.id)).toEqual([
+            fixture.fastFoodId,
+            fixture.milkFoodId,
+        ]);
+        expect(committed.affectedMealCount).toBe(2);
+        expect(await storedFlags(fixture.fastMealId)).toEqual(BREAKFAST_DISLIKE_FLAGS);
+        // The fifteen-minute limit the arrangement saved is still in force —
+        // one step moves one answer — so the lunch carries the new dislike
+        // beside the flag it already had.
+        expect(await storedFlags(fixture.slowMealId)).toEqual([
+            { code: 'dislike', detail: ['Whole milk'] },
+            { code: 'cooking_time', detail: ['40'] },
+        ]);
+        expect(await planRevision(fixture.planId)).toBe(before.plan.revision + 1);
+        expect(await storedIncompatibilityFlags(fixture.planId)).toEqual({
+            flaggedMealIds: [fixture.fastMealId, fixture.slowMealId],
+            codes: ['dislike', 'cooking_time'],
+            recomputedAt: expect.any(String),
+        });
+    });
+
+    it('takes a completed plan’s audit record and revision back with it when the next plan fails', async () => {
+        const fixture = await seedFlagFixture(USER_ID, 60);
+        // A SECOND ACTIVE, UNENDED WEEK, starting the day after the first ends,
+        // carrying the same forty-minute milk-and-eggs recipe.
+        //
+        // `recomputeActivePlanFlags` walks every such plan in start-date order,
+        // and a plan's recomputation ENDS with the audit write to
+        // `meal_plans.incompatibility_flags`. So failing as the SECOND plan
+        // opens is what puts a failure after the FIRST plan's whole write set —
+        // its meals' flags, its revision and its audit record — which is the
+        // one part of the lifecycle the meal-level fault above cannot reach.
+        // It also means this is the only case that exercises the per-plan loop
+        // at all: everything else in this file has one plan.
+        const upcoming = await makePlan(USER_ID, {
+            startDate: addDaysToDayKey(fixture.dayKey, 1),
+            dayCount: 1,
+            slots: [
+                { slot: 'lunch', slot_time: '12:30', recipeVersionId: fixture.slowRecipeVersionId },
+            ],
+        });
+        const upcomingMealId = upcoming.meal_plan_days[0].meal_plan_meals[0].id;
+
+        // One committed save over both weeks, so each plan already carries a
+        // flagged meal, a bumped revision and an audit record for the rollback
+        // to restore.
+        const arranged = await saveAllOk({
+            cookingTimeLimitMin: 15,
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(arranged.affectedMealCount).toBe(2);
+
+        const before = await snapshotWorlds([fixture.planId, upcoming.id]);
+
+        expect(await storedIncompatibilityFlags(fixture.planId)).toEqual({
+            flaggedMealIds: [fixture.slowMealId],
+            codes: ['cooking_time'],
+            recomputedAt: expect.any(String),
+        });
+
+        const save: JsonBody = {
+            diet: 'vegan',
+            allergens: ['milk', 'eggs'],
+            dislikedFoodIds: [fixture.fastFoodId, fixture.milkFoodId],
+            cookingTimeLimitMin: 60,
+            timeZone: WESTERN_TIME_ZONE,
+            expectedRevision: 2,
+        };
+
+        const faulted = await sendUnderSecondPlanRecipeReadFault(() => saveAll(save));
+
+        // TWO PLANS OPENED MEANS THE FIRST ONE FINISHED. The loop only asks for
+        // the second plan's recipes after `recomputePlanFlags` has returned for
+        // the first, and that function's last statement is the audit write —
+        // which ran, because this save moves the breakfast's verdict (proved by
+        // the commit below) and the audit write happens whenever any verdict
+        // changed.
+        expect(faulted.plansOpened).toBe(2);
+        expect(faulted.response.status).toBe(500);
+        expect(faulted.response.body).toEqual({ error: 'internal_error' });
+        expectResidualFaultLogged(faulted.logged, 'preferences.save', PLAN_LOOP_FAULT_MESSAGE);
+
+        // Both weeks, byte for byte — including the first plan's audit record,
+        // which still describes the fifteen-minute save rather than the
+        // recomputation that was interrupted.
+        expect(await snapshotWorlds([fixture.planId, upcoming.id])).toEqual(before);
+
+        // And the identical request, still pinning revision 2, commits both
+        // weeks at once.
+        const committed = await saveAllOk(save);
+
+        expect(committed.preferences.revision).toBe(3);
+        expect(committed.affectedMealCount).toBe(3);
+        expect(await storedFlags(fixture.fastMealId)).toEqual(BREAKFAST_DISLIKE_FLAGS);
+        expect(await storedFlags(fixture.slowMealId)).toEqual(LUNCH_PREFERENCE_FLAGS);
+        expect(await storedFlags(upcomingMealId)).toEqual(LUNCH_PREFERENCE_FLAGS);
+        expect(await planRevision(fixture.planId)).toBe(3);
+        expect(await planRevision(upcoming.id)).toBe(3);
+        expect(await storedIncompatibilityFlags(fixture.planId)).toEqual({
+            flaggedMealIds: [fixture.fastMealId, fixture.slowMealId],
+            codes: ['diet', 'allergen', 'dislike'],
+            recomputedAt: expect.any(String),
+        });
+        expect(await storedIncompatibilityFlags(upcoming.id)).toEqual({
+            flaggedMealIds: [upcomingMealId],
+            codes: ['diet', 'allergen', 'dislike'],
+            recomputedAt: expect.any(String),
+        });
     });
 });
 

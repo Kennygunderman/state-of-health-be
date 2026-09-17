@@ -2064,22 +2064,55 @@ describe('fetchEvidence — the retrieval record', () => {
         });
     });
 
-    describe('what is logged', () => {
-        it('names the host and never the path or the query a model proposed', async () => {
+    /**
+     * WHAT IS REPORTED, AND BY WHOM.
+     *
+     * This module used to `console.warn` every refusal. A refusal is the normal
+     * outcome — a model proposes up to three URLs per candidate and most are
+     * refused before a socket exists — so at catalog scale that was tens of
+     * thousands of unstructured lines duplicating what the one caller in the
+     * repository already records properly:
+     * `scripts/catalog-generate-ai.ts::collectIdentityEvidence` emits a bounded
+     * structured `evidence_refused` event at debug level from the result
+     * below, and tallies the reasons into the run report's `refusalsByReason`.
+     *
+     * So the service reports a refusal by RETURNING it, and writes nothing. The
+     * security property that made the old line worth capturing — AAP §0.3.2's
+     * "URLs are logged only at the host level" — is asserted here on the result
+     * the caller logs from, which is where it now has to hold.
+     */
+    describe('what is reported', () => {
+        it('returns the host and never the path or the query a model proposed', async () => {
             const subject = harness({ lookup: resolvesTo({ address: '10.0.0.1', family: 4 }) });
 
-            refusalOf(
+            const refusal = refusalOf(
                 await retrieve(subject, {
                     url: `https://${CANDIDATE_HOST}/internal-report/171077?token=shhh-secret`,
                 }),
             );
 
-            expect(warnings).toHaveLength(1);
-            expect(warnings[0]).toContain(CANDIDATE_HOST);
-            expect(warnings[0]).not.toContain('internal-report');
-            expect(warnings[0]).not.toContain('shhh-secret');
-            expect(warnings[0]).toContain('address_not_globally_routable');
+            expect(refusal.reason).toBe('address_not_globally_routable');
+            expect(refusal.host).toBe(CANDIDATE_HOST);
+            // Everything a caller can log about this refusal, in one string:
+            // the reason and the explanation, neither of which may quote the
+            // model-proposed path or its query.
+            const reportable = `${refusal.reason} ${refusal.detail}`;
+            expect(reportable).not.toContain('internal-report');
+            expect(reportable).not.toContain('shhh-secret');
+            expect(reportable).not.toContain('171077');
             expectNoRequestAttempted(subject);
+        });
+
+        it('writes nothing itself, however many refusals it decides', async () => {
+            const subject = harness({ lookup: resolvesTo({ address: '10.0.0.1', family: 4 }) });
+
+            for (let attempt = 0; attempt < 3; attempt += 1) {
+                refusalOf(await retrieve(subject, { url: `https://${CANDIDATE_HOST}/page-${attempt}` }));
+            }
+
+            // The caller owns the log, so a normal rejection cannot flood a
+            // terminal or a CI log from in here.
+            expect(warnings).toEqual([]);
         });
 
         it('says nothing at all about a retrieval that succeeded', async () => {
@@ -2093,11 +2126,13 @@ describe('fetchEvidence — the retrieval record', () => {
         it('reports a refusal decided before a host was known without inventing one', async () => {
             const subject = harness();
 
-            refusalOf(await retrieve(subject, { url: 'https://169.254.169.254/latest/meta-data/' }));
+            const refusal = refusalOf(await retrieve(subject, { url: 'https://169.254.169.254/latest/meta-data/' }));
 
-            expect(warnings).toHaveLength(1);
-            expect(warnings[0]).toContain('ip_literal_host');
-            expect(warnings[0]).toContain('unknown');
+            expect(refusal.reason).toBe('ip_literal_host');
+            // Null, not the literal 'unknown': no host was established, and a
+            // placeholder in this field would read as one that was.
+            expect(refusal.host).toBeNull();
+            expect(warnings).toEqual([]);
             expectNothingResolved(subject);
             expectNoRequestAttempted(subject);
         });

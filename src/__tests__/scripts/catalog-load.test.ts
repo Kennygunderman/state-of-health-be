@@ -674,6 +674,44 @@ describe('a tampered release is refused with nothing written', () => {
         });
         expect((await tableCounts()).runs).toBe(0);
     });
+
+    it('refuses a manifest that declares one member twice, with nothing read and nothing written', async () => {
+        // The internal-ambiguity refusal ON THE PATH THAT READS BYTES. `main`
+        // never reaches it — preflight reports the same defect as a
+        // prerequisite gap first — but `runLoad` is exported and driven
+        // directly, and a caller that skipped preflight must not end up
+        // verifying a member against whichever of two digests came last.
+        const built = writeRelease('v1', publishedSlice());
+        const declared = built.manifest.files.find(
+            (file) => file.path === PORTIONS_FILE,
+        ) as CatalogReleaseManifest['files'][number];
+        const doctored: CatalogReleaseManifest = {
+            ...built.manifest,
+            files: [...built.manifest.files, { ...declared, sha256: 'f'.repeat(64) }],
+        };
+
+        const failure = await runLoad(loadDeps(built, { manifest: doctored })).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        expect(failure).toBeInstanceOf(CatalogLoadError);
+        const refusal = failure as CatalogLoadError;
+        expect(refusal.code).toBe('release_member_declared_twice');
+        expect(refusal.context.file).toBe(PORTIONS_FILE);
+
+        // Refused while assembling the file list, so no member was streamed and
+        // no run row was opened.
+        expect(await tableCounts()).toEqual({
+            foods: 0,
+            aliases: 0,
+            portions: 0,
+            components: 0,
+            validationRecords: 0,
+            runs: 0,
+        });
+        expect(await getActiveReleaseLoad(prisma)).toBeNull();
+    });
 });
 
 /* ---------------------------------------------------------------------------
@@ -1782,6 +1820,123 @@ describe('a load that fails after partial progress', () => {
 });
 
 /* ---------------------------------------------------------------------------
+ * (c2) Failure PART WAY THROUGH one food's transaction
+ *
+ * The block above interrupts a load BETWEEN foods, where each food either
+ * committed whole or was never begun. This one interrupts a load INSIDE one
+ * food's transaction, after some of that food's child rows have been written,
+ * because that is the only state in which the run's counters and the database
+ * can disagree: PostgreSQL rolls the writes back, and an in-memory increment
+ * taken before the commit would survive that rollback and be persisted into the
+ * failed run row that AAP §0.7.1 requires to be truthful repair evidence.
+ *
+ * THE FAILURE COMES FROM THE RELEASE'S OWN CONTENT, not from a seam and not
+ * from a mocked internal: the last food is given a SECOND default portion, and
+ * `unique_default_catalog_food_portion` — the partial unique index over
+ * `catalog_food_id WHERE is_default` — refuses the second insert. Every release
+ * check passes it (portions are unique per description, and one file cannot
+ * state a cross-row database invariant), so the refusal lands where it is
+ * wanted: after the food row, after its aliases and after its first portion.
+ * ------------------------------------------------------------------------- */
+
+/** The last published food in `source_key` order, so every other food settles before it. */
+const LAST_FOOD_IN_RELEASE = 'usda:9200123';
+
+/** The extra portion that collides with that food's existing default. */
+const SECOND_DEFAULT_PORTION = '10 olives';
+
+const sliceWithTwoDefaultPortionsOnTheLastFood = (): ReleaseContent => {
+    const slice = publishedSlice();
+    const existing = slice.portions.find(
+        (portion) => portion.food_source_key === LAST_FOOD_IN_RELEASE && portion.is_default === true,
+    ) as Row;
+
+    return {
+        ...slice,
+        portions: [...slice.portions, { ...existing, description: SECOND_DEFAULT_PORTION, is_default: true }],
+    };
+};
+
+describe('a load that fails part way through one food\'s transaction', () => {
+    it('records no count for the child rows the rollback removed', async () => {
+        const slice = sliceWithTwoDefaultPortionsOnTheLastFood();
+        const sourceKeys = slice.foods.map((food) => String(food.source_key)).sort();
+        // Stated as an assertion because the arithmetic below depends on it: the
+        // colliding food is the LAST one the release states, so the failure
+        // comes after every other food has settled.
+        expect(sourceKeys[sourceKeys.length - 1]).toBe(LAST_FOOD_IN_RELEASE);
+        expect(slice.portions.filter((portion) => portion.food_source_key === LAST_FOOD_IN_RELEASE)).toHaveLength(2);
+
+        const built = writeRelease('v1', slice);
+
+        const failure = await runLoad(loadDeps(built)).then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+        // PostgreSQL's own refusal, mid-transaction: the second default portion
+        // violates the partial unique index.
+        expect((failure as { code?: unknown } | null)?.code).toBe('P2002');
+
+        // The whole food is gone — the row the transaction created, its aliases
+        // and both of its portions — because the transaction rolled back.
+        expect(await foodBySourceKey(LAST_FOOD_IN_RELEASE)).toBeNull();
+        expect(
+            await prisma.catalog_food_portions.count({ where: { description: SECOND_DEFAULT_PORTION } }),
+        ).toBe(0);
+
+        const runs = await runRows();
+        expect(runs).toHaveLength(1);
+        expect(runs[0].status).toBe('failed');
+        expect(await getActiveReleaseLoad(prisma)).toBeNull();
+
+        // THE ASSERTION THE FINDING IS ABOUT. The target started empty, so every
+        // row it now holds is one this run inserted — which makes the failed
+        // run's counts checkable against the database itself rather than against
+        // a restated expectation. Before the per-transaction accounting, the
+        // rolled-back food's alias and portion writes were already in
+        // `state.counts` and were persisted here, so `aliasesWritten` and
+        // `portionsWritten` each exceeded the rows that exist.
+        // There was something to over-count. The release states two aliases and
+        // two portions for the food whose transaction rolled back, and
+        // `reconcileAliases` plus the first portion insert both ran before the
+        // collision — so a run-wide counter mutated inside the transaction
+        // would have kept three writes the database does not hold.
+        expect(slice.aliases.filter((alias) => alias.food_source_key === LAST_FOOD_IN_RELEASE)).toHaveLength(2);
+
+        const stored = await tableCounts();
+        // Facts about the release rather than about rows, counted outside every
+        // transaction and therefore unaffected by the rollback: one per distinct
+        // batch key this database does not hold.
+        const unresolvedBatches = new Set(
+            slice.foods.map((food) => food.generation_batch_key).filter((key) => key !== null && key !== undefined),
+        ).size;
+
+        expect(runs[0].counts).toEqual({
+            foodsInserted: stored.foods,
+            aliasesWritten: stored.aliases,
+            portionsWritten: stored.portions,
+            validationRecordsWritten: stored.validationRecords,
+            // The two derived parents were deferred and the deferred pass never
+            // ran, so nothing was written for them: a truthful count of work
+            // attempted, and the reason `componentsWritten` is absent entirely.
+            foodsDeferred: 2,
+            generationBatchUnresolved: unresolvedBatches,
+        });
+        expect(stored.components).toBe(0);
+        expect(stored.foods).toBe(built.manifest.counts.foods - 3);
+
+        // And the repair: the same release with the colliding portion removed
+        // reconciles the food the rollback left absent and activates.
+        const repaired = await runLoad(loadDeps(writeRelease('v1', publishedSlice())));
+
+        expect(repaired.activated).toBe(true);
+        expect(repaired.countChecks.every((check) => check.ok)).toBe(true);
+        expect((await foodBySourceKey(LAST_FOOD_IN_RELEASE))?.catalog_food_portions).toHaveLength(1);
+    });
+});
+
+/* ---------------------------------------------------------------------------
  * (d) The upgrade
  * ------------------------------------------------------------------------- */
 
@@ -2185,6 +2340,101 @@ describe('preflight refuses a manifest that cannot be acted on', () => {
         const gaps = preflight(preflightDeps(built, { loadReleaseManifest: () => doctored }));
 
         expect(gaps.map((gap) => gap.code)).toContain('release_manifest_member_missing');
+    });
+
+    /**
+     * A well-formed digest that is not any member's, so a duplicate declaration
+     * differs from the one beside it in the one field a verification is held to.
+     */
+    const FOREIGN_DIGEST = 'f'.repeat(64);
+
+    const declarationOf = (built: BuiltRelease, member: string): CatalogReleaseManifest['files'][number] =>
+        built.manifest.files.find((file) => file.path === member) as CatalogReleaseManifest['files'][number];
+
+    it('refuses a member declared twice with conflicting measurements, rather than keeping the last declaration', () => {
+        const built = writeRelease('v1', publishedSlice());
+        const declared = declarationOf(built, FOODS_FILE);
+        const doctored: CatalogReleaseManifest = {
+            ...built.manifest,
+            files: [
+                ...built.manifest.files,
+                // The same member again, stating another digest and one row
+                // more: two declarations of one file that cannot both be true.
+                { ...declared, sha256: FOREIGN_DIGEST, row_count: declared.row_count + 1 },
+            ],
+        };
+
+        const gaps = preflight(preflightDeps(built, { loadReleaseManifest: () => doctored }));
+
+        // THE DUPLICATION AND NOTHING ELSE. The second declaration's row_count
+        // disagrees with counts.foods, so a loader that collapsed the pair to
+        // the last entry would report that disagreement instead — a complaint
+        // derived from a declaration the document itself contradicts, sending
+        // the operator after the wrong defect.
+        expect(gaps.map((gap) => gap.code)).toEqual(['release_manifest_member_duplicated']);
+    });
+
+    it('refuses a member declared twice even when both declarations agree', () => {
+        // Ambiguity is structural, not a function of the contents: the manifest
+        // is the release's file list, and a member listed twice would be
+        // verified twice and stated twice in the run's cursor.
+        const built = writeRelease('v1', publishedSlice());
+        const doctored: CatalogReleaseManifest = {
+            ...built.manifest,
+            files: [...built.manifest.files, { ...declarationOf(built, ALIASES_FILE) }],
+        };
+
+        const gaps = preflight(preflightDeps(built, { loadReleaseManifest: () => doctored }));
+
+        expect(gaps.map((gap) => gap.code)).toEqual(['release_manifest_member_duplicated']);
+    });
+
+    it('refuses a files[] entry that names no path rather than passing over it', () => {
+        const built = writeRelease('v1', publishedSlice());
+        const doctored: CatalogReleaseManifest = {
+            ...built.manifest,
+            files: [
+                ...built.manifest.files,
+                // A manifest is a JSON document, so its declared type does not
+                // bind what arrives: this entry carries measurements and no
+                // "path" at all.
+                {
+                    name: FOODS_FILE,
+                    sha256: FOREIGN_DIGEST,
+                    row_count: 1,
+                    bytes: 1,
+                } as unknown as CatalogReleaseManifest['files'][number],
+            ],
+        };
+
+        const gaps = preflight(preflightDeps(built, { loadReleaseManifest: () => doctored }));
+
+        // Reported as misdeclared, and NOT turned into a hunt for a file called
+        // "undefined": a coerced name would send the operator looking for a
+        // file the manifest never stated.
+        expect(gaps.map((gap) => gap.code)).toEqual(['release_manifest_entry_invalid']);
+    });
+
+    it('reports a member whose entry carries no usable path as both misdeclared and undeclared', () => {
+        const built = writeRelease('v1', publishedSlice());
+        const doctored: CatalogReleaseManifest = {
+            ...built.manifest,
+            files: built.manifest.files.map((file) =>
+                file.path === COMPONENTS_FILE
+                    ? ({ ...file, path: 42 } as unknown as CatalogReleaseManifest['files'][number])
+                    : file,
+            ),
+        };
+
+        const gaps = preflight(preflightDeps(built, { loadReleaseManifest: () => doctored }));
+
+        // Both facts, because they are two different fixes: the entry is
+        // defective, and the member it was meant to describe is therefore not
+        // declared at all.
+        expect(gaps.map((gap) => gap.code).sort()).toEqual([
+            'release_manifest_entry_invalid',
+            'release_manifest_member_missing',
+        ]);
     });
 
     it('refuses a manifest stating fewer validation records than foods', () => {

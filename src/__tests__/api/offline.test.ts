@@ -412,6 +412,27 @@ const firstMealOf = (plan: Record<string, any>, dayIndex = 0): Record<string, an
  * `afterEach` because the suite runs `--runInBand`: a trap left installed would
  * follow this file and break every later suite — most spectacularly the two
  * vendor service suites, which stub transports of their own.
+ *
+ * `afterAll` closes the suite on three guarantees: the database holds none of
+ * this file's rows, `globalThis.fetch` is the real one, and the environment is
+ * as the module graph left it.
+ *
+ * The truncation is the part `beforeEach` cannot supply. Truncating before each
+ * test makes every case HERE order-independent, and does nothing for the file
+ * that runs next: the last case's user, preferences, catalog and plan rows
+ * survive the suite, and under `--runInBand` the next suite's first test is the
+ * one that finds them — a stray published week or thirteen extra catalog foods
+ * read as that suite's own state. §0.9.1 requires each suite to be independent
+ * of run order, which is a claim about what a suite LEAVES as much as what it
+ * expects, so the residue is removed by the file that created it rather than by
+ * whoever follows it.
+ *
+ * The truncation runs first and the release/restore follow it in a `finally`.
+ * Those two calls are this file's last word on process-wide state, so they
+ * belong after the only work in the hook that can still fail; and the `finally`
+ * is what stops a failing truncation from skipping them, because a trap — or
+ * the probe key one case installs — outliving this file would break every suite
+ * after it instead of just this one.
  * -------------------------------------------------------------------------- */
 
 beforeEach(async () => {
@@ -427,9 +448,13 @@ afterEach(() => {
     restoreEnvironment();
 });
 
-afterAll(() => {
-    releaseNetworkTrap();
-    restoreEnvironment();
+afterAll(async () => {
+    try {
+        await truncateFeatureTables();
+    } finally {
+        releaseNetworkTrap();
+        restoreEnvironment();
+    }
 });
 
 describe('the offline premise this suite rests on', () => {

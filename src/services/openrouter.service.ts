@@ -51,10 +51,67 @@ export type OpenRouterErrorKind =
     | 'network'
     | 'unparseable';
 
+// The closed kind set as a runtime value, so `safeMessage` below can be built
+// from a membership test rather than from a type annotation. A `kind` is typed,
+// but a cast can defeat a type; the description this module promises is
+// content-free only if the code — not the compiler — decides what may appear in
+// it.
+const KNOWN_ERROR_KINDS: ReadonlySet<string> = new Set<OpenRouterErrorKind>([
+    'not_configured',
+    'http',
+    'empty',
+    'timeout',
+    'network',
+    'unparseable',
+]);
+
+const UNKNOWN_ERROR_KIND = 'unknown_kind';
+
+// THE TWO DESCRIPTIONS OF ONE FAILURE, AND WHICH ONE A CALLER MAY LOG.
+//
+// `message` is vendor-influenced. The `http` branch of callOpenRouter puts the
+// first 300 characters of the failed response BODY in it, and the `network`
+// branch puts the transport's own description of the thrown value in it. That
+// is deliberate and load-bearing in exactly one place: estimate.service.ts
+// re-raises the text verbatim as an EstimateFailedError, which
+// /api/macros/estimate and /api/macros/label-scan have returned to the client
+// since they shipped, so the six strings are an API contract (AAP §0.4.3) and
+// none of them may change.
+//
+// `safeMessage` is what everything else uses. A log line, a persisted
+// diagnostic, a committed report artefact and a run ledger all outlive the
+// request and are read by people who are not the caller, and a vendor or model
+// response body in any of them is data exfiltration by another name (CWE-532):
+// scripts/lib/logger.ts's scrubSecrets removes credential PATTERNS, and
+// arbitrary prose carries no pattern to remove. So this property is assembled
+// only from the closed kind set above and the numeric HTTP status — two values
+// this module owns end to end — and therefore cannot carry a byte the vendor
+// chose.
+//
+// Both catalog stages translate an OpenRouterError into their own error
+// (scripts/catalog-generate-ai.ts::asGenerationFailure,
+// scripts/catalog-validate.ts::asReviewFailure) and take `safeMessage`; a
+// future caller that logs `message` instead reopens the leak, which is why the
+// distinction is stated on the class rather than in a comment at each site.
+const describeFailureSafely = (kind: string, status?: number): string => {
+    const namedKind = KNOWN_ERROR_KINDS.has(kind) ? kind : UNKNOWN_ERROR_KIND;
+
+    return Number.isInteger(status)
+        ? `OpenRouter call failed (${namedKind}, status ${String(status)})`
+        : `OpenRouter call failed (${namedKind})`;
+};
+
 // Every failure leaving this module is an OpenRouterError, so no caller ever
 // pattern-matches a vendor error shape. Each caller translates `kind` into its
 // own domain error, which is why no domain error is referenced here.
 export class OpenRouterError extends Error {
+    /**
+     * The failure described without a byte of vendor or model content: the
+     * `kind`, and the HTTP status when there is one. Safe to log, to persist and
+     * to ship in a report — see the reasoning above the class.
+     */
+    public readonly safeMessage: string;
+
     constructor(
         public readonly kind: OpenRouterErrorKind,
         message: string,
@@ -62,6 +119,7 @@ export class OpenRouterError extends Error {
     ) {
         super(message);
         this.name = 'OpenRouterError';
+        this.safeMessage = describeFailureSafely(kind, status);
     }
 }
 

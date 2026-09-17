@@ -354,8 +354,8 @@ const FOOD_C = catalogFood('usda:9200112').id;
  *  - `snapshot_per_100g` and the quantity trio: 100 g of a 100 kcal /
  *    5 / 15 / 2 / 1 food, so each arithmetic probe reads as the boundary it was
  *    written to pin instead of as a rounding accident. Whether the fixture's
- *    real numbers reproduce is asserted separately, for all ten committed
- *    versions, under "the committed recipe graph" at the end of this file.
+ *    real numbers reproduce is asserted separately, for every committed
+ *    version, under "the committed recipe graph" at the end of this file.
  *  - `snapshot_diet_tags`: emptied. The diet-intersection and badge probes need
  *    a baseline that earns no diet tag; the fixture row carries the four tags
  *    cooked brown rice genuinely has, and the fixture-derived section asserts
@@ -2530,11 +2530,15 @@ describe('validateRecipeDeclaration', () => {
  * The committed recipe graph
  *
  * Everything above pins one rule at a time with a focused fixture. This section
- * runs the same rules over the WHOLE committed graph — all ten
- * `recipe_versions` rows and their forty-two `recipe_ingredients` rows — and
- * that is a different kind of test: the fixture states what each version's
- * columns are, and these assertions require the derivation to reproduce them
- * from the ingredient rows alone.
+ * runs the same rules over the WHOLE committed graph — every `recipe_versions`
+ * row and every `recipe_ingredients` row the fixture holds, which at the time
+ * of writing is twelve versions and fifty-one ingredient rows — and that is a
+ * different kind of test: the fixture states what each version's columns are,
+ * and these assertions require the derivation to reproduce them from the
+ * ingredient rows alone. The counts are never asserted from this prose: the
+ * first case below reads them from the fixture's own `counts` block, so a
+ * corpus that grows moves the numbers here out of date without ever letting an
+ * assertion pass against the wrong number of rows.
  *
  * That is the invariant a per-rule probe cannot reach, because a probe supplies
  * its own inputs and its own answer. Here the fixture supplies both, the rows

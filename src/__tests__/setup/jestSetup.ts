@@ -9,6 +9,19 @@ assertTestDatabase();
 // error when it is ABSENT, and an empty string is a configured-but-invalid key
 // that would be sent to the vendor. Removing them makes offline the suite's
 // default and is what `api/offline.test.ts` rests on.
+//
+// THIS IS THE WHOLE OF THE VENDOR PROTECTION IN *THIS* PROCESS, and it is
+// enough here: with no key, no request is ever built. `globalThis.fetch` is
+// deliberately left alone, because several suites replace it themselves to
+// observe the rate limiter wrapping it, and a deny installed here would be
+// either overwritten by them or in their way.
+//
+// It does not extend to a CHILD process, and two script suites launch real CLI
+// entry points as children that must carry keys to get past their own
+// `preflight`. Those children install `./vendorNetworkDeny` through `--require`
+// instead, which refuses every request channel and records that it did. The
+// split is deliberate: absent keys where nothing needs them, an enforced
+// refusal where something does.
 delete process.env.USDA_API_KEY;
 delete process.env.OPENROUTER_API_KEY;
 

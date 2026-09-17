@@ -38,8 +38,12 @@
 //   * `api/ownership.test.ts` owns the exhaustive tenancy matrix. This file
 //     carries the local proof that a foreign and an absent plan id are
 //     indistinguishable, because it is a property of these routes' own 404.
-//   * `api/fault.test.ts` owns the POST-COMMIT abort seam. This file uses only
-//     the DECODED `generation` fault, which throws before the transaction.
+//   * `api/fault.test.ts` owns the POST-COMMIT abort seam. The DECODED
+//     `generation` fault this file arms throws BEFORE the transaction opens, by
+//     design (§0.9.4), so it proves the pre-transaction path and nothing else;
+//     the cases that need a publication to fail once the week is already
+//     written reach that moment through the transaction's own grocery step —
+//     see "the publication transaction's own seam" below.
 //   * `api/grocery.test.ts` owns the grocery diff and its flags. This file
 //     asserts only what a REGENERATION does to the list: an unchanged line keeps
 //     its check mark.
@@ -71,14 +75,17 @@
 // determinism case at the end depends on.
 //
 // TWO FIXTURE DETAILS THAT ARE REQUIREMENTS RATHER THAN TASTE. The shared
-// catalog food's default portion is stated in GRAMS: `makeCatalogFood`'s own
-// default is "1 cup", a volume unit, with a null `density_g_per_ml`, which
-// `utils/units.ts` refuses — and a grocery rendering fault surfaces as
-// `PlanGenerationError`, so a generated week would fail for a reason that has
-// nothing to do with planning. And every recipe in a generator world shops for
-// the SAME food, so the published grocery list is one row whose quantity does
-// not depend on which recipes the seed chose; that is what makes the
-// regeneration carry-over assertion measure the carry-over rather than the seed.
+// catalog food's default portion is stated in GRAMS rather than left at
+// `makeCatalogFood`'s own "1 cup". Either publishes: a volume portion with a
+// null `density_g_per_ml` is NOT refused, because `grocery.logic.ts` derives the
+// density from the portion itself (200 g to the cup) and degrades a food that
+// can state neither to mass rather than failing. What the choice fixes is what
+// the row then holds — grams make the week's one line a MASS line, whose stored
+// `display_unit` the post-write rollback case below invalidates and then
+// restores. And every recipe in a generator world shops for the SAME
+// food, so the published grocery list is one row whose quantity does not depend
+// on which recipes the seed chose; that is what makes the regeneration
+// carry-over assertion measure the carry-over rather than the seed.
 //
 // THE FAULT AND FLAG SEAMS ARE SPIED, NOT ASSIGNED. `utils/featureFlags.ts`
 // resolves `MEAL_PLANNING_ENABLED` and `MEAL_PLANNING_FAULT` once at import
@@ -98,7 +105,18 @@ import { randomUUID } from 'node:crypto';
 
 import type { Prisma } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
-import { generatePlan, getCurrentMealPlan, regeneratePlan } from '../../services/mealPlan.service';
+import * as groceryService from '../../services/grocery.service';
+// The repetition cap is READ from the policy module rather than restated: the
+// rows asserted below have to honour the number the generator actually enforces,
+// and a literal `2` here would keep passing if the policy ever moved.
+import { MAX_RECIPE_USES_PER_WEEK } from '../../services/mealPlan.logic';
+import {
+    generatePlan,
+    getAffectedMeals,
+    getCurrentMealPlan,
+    getMealPlanDay,
+    regeneratePlan,
+} from '../../services/mealPlan.service';
 import type {
     AffectedMealsResponse,
     CurrentMealPlanResponse,
@@ -111,6 +129,7 @@ import type {
 } from '../../types/mealPlanning';
 import { MEAL_SLOTS, RECIPE_BADGES, RECIPE_ICON_KEYS } from '../../types/recipe';
 import * as featureFlags from '../../utils/featureFlags';
+import { UnitConversionError } from '../../utils/units';
 import {
     FIXTURE_ENDED_PLAN_START_DAY_KEY,
     FIXTURE_TARGETS,
@@ -500,6 +519,114 @@ const seedDiaryEntry = (seed: DiaryEntrySeed) =>
 const asJsonFlags = (flags: readonly MealFlag[]): Prisma.InputJsonValue =>
     flags as unknown as Prisma.InputJsonValue;
 
+/* ---------------------------------------------------------------------------
+ * The publication transaction's own seam — failing AFTER the week is written
+ *
+ * §0.5.1's "a failed generation persists nothing" is a claim about a specific
+ * moment: the plan, its seven days and their meals inserted, the old week
+ * superseded on a regeneration, and the commit then abandoned. The decoded
+ * `generation` fault cannot reach that moment — §0.9.4 fixes it after the
+ * in-memory search and BEFORE `prisma.$transaction`, which is the whole point of
+ * it — so the two seams below do, and neither alters the code under test:
+ *
+ *  * REAL DATA. The list is built inside the transaction from the meals as
+ *    STORED, so the week can be assembled from a recipe carrying a defect the
+ *    search never looks at (`grocery.logic.ts` refuses a non-positive
+ *    ingredient gram weight, and the planning projection does not read gram
+ *    weights at all), and a regeneration's carry-over can meet a stored row
+ *    whose `display_unit` no longer names a unit family. Both raise the grocery
+ *    domain's own error classes, which `mealPlan.service.ts` translates into
+ *    `PlanGenerationError` — so the route still answers §0.5.2's only 5xx, and
+ *    a 500 would mean the translation had been lost. The same taste as
+ *    `api/swaps.test.ts`'s "rebuild fails after the meal has been written".
+ *  * THE WRITER ITSELF, WRITTEN THEN THROWN, for the one state real data cannot
+ *    reach: the grocery rows inserted as well. `writePlanGroceryRows` is spied
+ *    with an implementation that awaits the REAL function and then throws, so
+ *    everything a publication writes genuinely exists in the transaction that
+ *    is about to be abandoned.
+ *
+ * Each is restored by the case that installed it, like every other spy here.
+ * ------------------------------------------------------------------------- */
+
+/** What the publication had already written when the grocery step began. */
+interface PublicationWriteObservation {
+    /** How many `meal_plan_meals` rows the new plan already holds. */
+    readonly plannedMeals: number;
+    /** The user's plan statuses, sorted, so a supersede that happened is visible. */
+    readonly planStatuses: string[];
+    /** The user's grocery rows — the old plan's list, on a regeneration. */
+    readonly groceryRows: number;
+}
+
+/**
+ * Records what the publication transaction can already see, immediately before
+ * it builds the grocery list.
+ *
+ * AN OBSERVER, NOT A STUB: it calls the real loader, reads three counts through
+ * the transaction's own client, and returns the loader's result untouched. It is
+ * what separates the two readings of an empty database after a 502 — "wrote the
+ * week and rolled it back" from "never wrote it at all" — which is the whole
+ * distinction a post-write rollback proof rests on. A real-data fault leaves no
+ * trace of its own, so without this reading the assertion would be satisfied by
+ * a service that refused before opening the transaction.
+ *
+ * `loadPlannedMealsForGroceries` is where it belongs: `mealPlan.service.ts`
+ * calls it with the transaction client as the first statement of the grocery
+ * step, by which point the plan, its days and its meals are inserted and, on a
+ * regeneration, the old plan is already superseded.
+ */
+const observePublicationWrites = (userId: string = USER_ID) => {
+    const observations: PublicationWriteObservation[] = [];
+    const loadPlannedMeals = groceryService.loadPlannedMealsForGroceries;
+    const spy = jest
+        .spyOn(groceryService, 'loadPlannedMealsForGroceries')
+        .mockImplementation(async (tx, owner, planId) => {
+            const meals = await loadPlannedMeals(tx, owner, planId);
+            const plans = await tx.meal_plans.findMany({
+                where: { user_id: userId },
+                select: { status: true },
+            });
+
+            observations.push({
+                plannedMeals: meals.length,
+                planStatuses: plans.map((plan) => plan.status).sort(),
+                groceryRows: await tx.grocery_items.count({ where: { user_id: userId } }),
+            });
+
+            return meals;
+        });
+
+    return { observations, restore: () => spy.mockRestore() };
+};
+
+/**
+ * Makes the grocery write insert the list and then abandon the commit.
+ *
+ * The real writer runs first and its report is kept, so the case can state that
+ * the rows existed rather than assume it. `UnitConversionError` is thrown
+ * because the CLASS is what `mealPlan.service.ts` recognises as a grocery
+ * rendering fault and translates into `PlanGenerationError`; the message is only
+ * for the server log. Throwing an unrecognised class would be a different test —
+ * it would assert the 500 that an untranslated fault earns.
+ */
+const failAfterGroceryRowsAreWritten = () => {
+    const insertedBeforeTheThrow: number[] = [];
+    const writeRows = groceryService.writePlanGroceryRows;
+    const spy = jest
+        .spyOn(groceryService, 'writePlanGroceryRows')
+        .mockImplementation(async (tx, params) => {
+            const written = await writeRows(tx, params);
+
+            insertedBeforeTheThrow.push(written.insertedCount);
+
+            throw new UnitConversionError(
+                'injected by api/plans.test.ts after the grocery rows were written, to abandon the commit',
+            );
+        });
+
+    return { spy, insertedBeforeTheThrow };
+};
+
 beforeEach(async () => {
     await truncateFeatureTables();
 });
@@ -604,6 +731,93 @@ describe('POST /api/meal-planning/plans', () => {
                 plan_revision_after: FIRST_REVISION,
                 meal_plan_id: asPlan(response.body).id,
             });
+        });
+
+        it('attaches every meal to the day of its own date, and spaces the week as §0.7.3 requires', async () => {
+            // TWO CLAIMS ABOUT THE ROWS A PUBLICATION LEAVES, both of which the
+            // response alone cannot make: it groups meals under days by reading
+            // these same rows back, so a week whose meals hung off the wrong day
+            // would be reported exactly as consistently as a correct one.
+            //
+            // The first is the parentage the batched insert establishes. Plan,
+            // days and meals go in as three statements — one `create`, one
+            // `createManyAndReturn` for the seven days, one `createMany` for the
+            // week's meals — and the meals find their parent through a map keyed
+            // by the day's DATE rather than by the position the bulk insert
+            // reported. What makes a mis-keyed map visible is the repetition rule
+            // itself: it forbids a recipe on consecutive days, so two adjacent
+            // days can never legitimately share one, and a day's meals landing on
+            // its neighbour's row would show up here as a week that repeats
+            // across a day boundary.
+            //
+            // The second is that rule as PERSISTED: at most
+            // `MAX_RECIPE_USES_PER_WEEK` uses across the week and never on
+            // consecutive days — §0.7.3's two clauses and, since the generator no
+            // longer adds an unwritten same-day ban, all of them. Whether the
+            // search finds a week needing a recipe twice in ONE day is
+            // `mealPlan.logic.test.ts`'s subject; what is asserted here is that
+            // the week it did find is stored spaced and capped.
+            await seedGeneratorWorld(USER_ID);
+
+            const startDate = utcTodayDayKey();
+            const plan = await publishWeek({ startDate });
+            const days = await storedDays(plan.id);
+            const meals = await storedMeals(plan.id);
+
+            expect(days).toHaveLength(PLAN_DAY_COUNT);
+            expect(meals).toHaveLength(PLAN_DAY_COUNT * MEALS_PER_DAY);
+
+            // `storedDays` orders by date, so index arithmetic below is calendar
+            // order and not insertion order.
+            const recipesByDate = days.map((day) => {
+                const dayKey = day.date.toISOString().slice(0, 10);
+                const attached = meals.filter((meal) => meal.meal_plan_day_id === day.id);
+
+                expect(dayKey).toBe(addDaysToDayKey(startDate, day.day_index));
+                expect(attached).toHaveLength(MEALS_PER_DAY);
+                // Every child row carries the plan and the owner beside its day,
+                // which is the referencing side of the tenant foreign keys
+                // (§5.1) and is written by the batch rather than row by row.
+                for (const meal of attached) {
+                    expect(meal.meal_plan_id).toBe(plan.id);
+                    expect(meal.user_id).toBe(USER_ID);
+                }
+                expect([...attached].map((meal) => meal.sort_order).sort()).toEqual(
+                    Array.from({ length: MEALS_PER_DAY }, (_unused, index) => index),
+                );
+
+                return attached.map((meal) => meal.recipe_version_id);
+            });
+
+            // Uses are counted per MEAL and spacing is compared per DAY, because
+            // the two clauses count different things: the cap is on appearances
+            // across the week (two of which §0.7.3 allows to fall on one day),
+            // while "never on consecutive days" is about a day holding a recipe
+            // at all.
+            const usesByRecipeVersion = new Map<string, number>();
+
+            recipesByDate.forEach((today, dayIndex) => {
+                for (const recipeVersionId of today) {
+                    usesByRecipeVersion.set(
+                        recipeVersionId,
+                        (usesByRecipeVersion.get(recipeVersionId) ?? 0) + 1,
+                    );
+                }
+
+                if (dayIndex === 0) {
+                    return;
+                }
+
+                const yesterday = new Set(recipesByDate[dayIndex - 1]);
+
+                for (const recipeVersionId of today) {
+                    expect(yesterday.has(recipeVersionId)).toBe(false);
+                }
+            });
+
+            for (const uses of usesByRecipeVersion.values()) {
+                expect(uses).toBeLessThanOrEqual(MAX_RECIPE_USES_PER_WEEK);
+            }
         });
 
         it('plans every slot of the stored schedule at a portion the recipe describes', async () => {
@@ -888,9 +1102,16 @@ describe('POST /api/meal-planning/plans', () => {
 
             expect(asErrorBody(faulted.body)).toEqual({ error: 'plan_generation_failed' });
 
-            // §0.5.1: a refused generation persists NOTHING — the fault is raised
-            // before the transaction opens, so the reservation never happens
-            // either.
+            // §0.5.1: a refused generation persists NOTHING. The fault is raised
+            // after the in-memory search and before the PUBLISHING transaction
+            // opens, so no plan, day, meal or grocery row is ever written — and
+            // no ledger row survives either. One reservation WAS attempted
+            // before the fault, by the replay preflight
+            // (`mealPlanningAction.service.ts::replayCommittedKeyedAction`,
+            // which takes the per-user lock and reserves inside its own
+            // two-statement transaction); it rolled that transaction back, so
+            // the count below is zero because the attempt was undone rather
+            // than because it never happened.
             expect(await storedPlans()).toHaveLength(0);
             expect(await prisma.meal_plan_days.count({ where: { user_id: USER_ID } })).toBe(0);
             expect(await prisma.meal_plan_meals.count({ where: { user_id: USER_ID } })).toBe(0);
@@ -904,6 +1125,151 @@ describe('POST /api/meal-planning/plans', () => {
             expect(asPlan(retried.body).revision).toBe(FIRST_REVISION);
             expect(await storedPlans()).toHaveLength(1);
             expect(await storedActions()).toHaveLength(1);
+        });
+    });
+
+    /* -----------------------------------------------------------------------
+     * A publication that fails AFTER the week is written
+     *
+     * The other half of the fault case above, and the harder half: that one is
+     * raised before the transaction opens, so nothing it asserts depends on a
+     * rollback. These two fail with the plan, its seven days and their
+     * twenty-one meals already inserted — and, in the second case, with the
+     * grocery list inserted too. Only the transaction's rollback makes §0.5.1's
+     * "failures persist nothing" true here, so it is asserted on every table the
+     * commit had touched by then, on the `setup_status` the same transaction
+     * writes, and on the ledger key that must still be usable afterwards.
+     * --------------------------------------------------------------------- */
+
+    describe('a publication that fails after the plan rows are written', () => {
+        it('rolls the week back when the list cannot be built from the meals it wrote', async () => {
+            // `ready_for_review`, so `markSetupCompleted` — which shares the
+            // publication transaction — has something to move. Left at
+            // `completed` the assertion below would hold whether the write rolled
+            // back or not.
+            const world = await seedGeneratorWorld(USER_ID, { setup_status: 'ready_for_review' });
+
+            // A defect the SEARCH cannot see and the shopping list cannot
+            // survive. `recipe.service.ts`'s planning projection reads a
+            // recipe's per-serving figures and its ingredient identities and
+            // never their gram weights, so every candidate stays eligible and a
+            // week still closes; the list is aggregated from exactly those gram
+            // weights, and `grocery.logic.ts` refuses a non-positive one rather
+            // than shopping for nothing. Zero is the defect a bad import
+            // actually leaves behind, and every fixture recipe carries it, so
+            // whichever seven days the seed assembles reach it.
+            const zeroed = await prisma.recipe_ingredients.updateMany({
+                where: { recipe_version_id: { in: world.recipes.map((recipe) => recipe.id) } },
+                data: { gram_weight: 0 },
+            });
+
+            expect(zeroed.count).toBe(PLANNABLE_RECIPE_COUNT);
+
+            const body = generateBody();
+            const observer = observePublicationWrites();
+            let faulted;
+
+            try {
+                faulted = await postPlan(body).expect(502);
+            } finally {
+                observer.restore();
+            }
+
+            // Proven before anything is concluded from the empty tables below:
+            // the transaction had written the whole week when it reached the
+            // grocery step it died in. An empty database after a refusal that
+            // never opened a transaction would satisfy every other assertion
+            // here.
+            expect(observer.observations).toEqual([
+                {
+                    plannedMeals: PLAN_DAY_COUNT * MEALS_PER_DAY,
+                    planStatuses: ['active'],
+                    groceryRows: 0,
+                },
+            ]);
+
+            // §0.5.2's only 5xx for this route. The grocery domain's error
+            // classes are deliberately outside the meal-planning vocabulary, so
+            // an untranslated one would surface as an unclassifiable 500 — which
+            // is a different defect from the one this case is about, and worth
+            // separating.
+            expect(faulted.status).not.toBe(500);
+            expect(asErrorBody(faulted.body)).toEqual({ error: 'plan_generation_failed' });
+
+            // §0.5.1: nothing survives — not the week, not its children, not the
+            // list the writer got half-way through, and not the reservation.
+            expect(await storedPlans()).toHaveLength(0);
+            expect(await prisma.meal_plan_days.count({ where: { user_id: USER_ID } })).toBe(0);
+            expect(await prisma.meal_plan_meals.count({ where: { user_id: USER_ID } })).toBe(0);
+            expect(await prisma.grocery_items.count({ where: { user_id: USER_ID } })).toBe(0);
+            expect(await storedActions()).toHaveLength(0);
+            // The setup transition rides in the same transaction, so a status
+            // that had advanced would mean part of the commit survived it.
+            expect(await storedSetupStatus()).toBe('ready_for_review');
+
+            // Repaired, the SAME key publishes once: the reservation rolled back
+            // with everything else, so the key is still a first attempt rather
+            // than a used one replaying a 502.
+            await prisma.recipe_ingredients.updateMany({
+                where: { recipe_version_id: { in: world.recipes.map((recipe) => recipe.id) } },
+                data: { gram_weight: INGREDIENT_GRAM_WEIGHT },
+            });
+
+            const published = asPlan((await postPlan(body).expect(201)).body);
+
+            expect(published.revision).toBe(FIRST_REVISION);
+            expect(await storedPlans()).toHaveLength(1);
+            expect(await storedDays(published.id)).toHaveLength(PLAN_DAY_COUNT);
+            expect(await storedGroceries(published.id)).toHaveLength(1);
+            expect(await storedActions()).toHaveLength(1);
+            expect(await storedSetupStatus()).toBe('completed');
+        });
+
+        it('rolls the grocery rows back too when the write fails after inserting them', async () => {
+            await seedGeneratorWorld(USER_ID, { setup_status: 'ready_for_review' });
+
+            const body = generateBody();
+            const seam = failAfterGroceryRowsAreWritten();
+            let faulted;
+
+            try {
+                faulted = await postPlan(body).expect(502);
+                // Proven to have run before anything is read from the response:
+                // a spy that never fired would leave a green case asserting the
+                // unfaulted path, exactly as an unarmed flag would above. Inside
+                // the `try` because `mockRestore` clears the call record along
+                // with the implementation, so the count is gone by the `finally`.
+                expect(seam.spy).toHaveBeenCalledTimes(1);
+            } finally {
+                seam.spy.mockRestore();
+            }
+
+            // One line inserted is the whole list of a week that shops for one
+            // food, so the REAL writer ran: the plan, its days, its meals and
+            // its groceries all existed inside the transaction. The array is the
+            // seam's own closure, so restoring the spy does not empty it.
+            expect(seam.insertedBeforeTheThrow).toEqual([1]);
+
+            expect(faulted.status).not.toBe(500);
+            expect(asErrorBody(faulted.body)).toEqual({ error: 'plan_generation_failed' });
+
+            expect(await storedPlans()).toHaveLength(0);
+            expect(await prisma.meal_plan_days.count({ where: { user_id: USER_ID } })).toBe(0);
+            expect(await prisma.meal_plan_meals.count({ where: { user_id: USER_ID } })).toBe(0);
+            expect(await prisma.grocery_items.count({ where: { user_id: USER_ID } })).toBe(0);
+            expect(await storedActions()).toHaveLength(0);
+            expect(await storedSetupStatus()).toBe('ready_for_review');
+
+            // And with the seam gone the same key commits once, at the revision
+            // the first attempt would have published.
+            const published = asPlan((await postPlan(body).expect(201)).body);
+
+            expect(published.revision).toBe(FIRST_REVISION);
+            expect(published.summary.groceryItemCount).toBe(1);
+            expect(await storedPlans()).toHaveLength(1);
+            expect(await storedGroceries(published.id)).toHaveLength(1);
+            expect(await storedActions()).toHaveLength(1);
+            expect(await storedSetupStatus()).toBe('completed');
         });
     });
 
@@ -1840,6 +2206,47 @@ describe('GET /api/meal-planning/plans/current', () => {
             expect((await getCurrent().expect(200)).body).toEqual({ current: null, upcoming: null });
         });
 
+        it('reports the replacement, and never the week it replaced, after a regeneration', async () => {
+            // THE COHERENCE THIS COLLECTION OWES ITS CLIENT. Resolving which
+            // plan is `current` and describing that plan are separate reads, and
+            // a regeneration committing between them used to produce a body no
+            // state of the database ever held: the superseded predecessor,
+            // reported under `current`, carrying the `'superseded'` status the
+            // later read saw. `mealPlan.service.ts::readInPlanSnapshot` answers
+            // both from one `RepeatableRead` snapshot, so the member a plan
+            // arrives under and the status inside it are the same instant.
+            //
+            // Driven through the real regeneration route rather than an UPDATE
+            // to `status`, because a hand-written column would leave no
+            // successor — and the successor is the half of the answer that must
+            // appear.
+            await seedGeneratorWorld(USER_ID);
+
+            const replaced = await publishWeek({ startDate: utcTodayDayKey() });
+            const replacement = asPlan(
+                (await postRegenerate(replaced.id, regenerateBody()).expect(201)).body,
+            );
+
+            expect(await storedPlan(replaced.id)).toMatchObject({ status: 'superseded' });
+
+            const current = asCurrent((await getCurrent().expect(200)).body);
+
+            expect(current.current?.id).toBe(replacement.id);
+            expect(current.current?.status).toBe('active');
+            expect(current.current?.revision).toBe(FIRST_REVISION);
+            // The replaced week occupied the same dates, so it can only have
+            // been excluded by its lifecycle; and it is not hiding in the other
+            // member either.
+            expect(current.upcoming).toBeNull();
+
+            for (const member of [current.current, current.upcoming]) {
+                if (member !== null && member !== undefined) {
+                    expect(member.status).toBe('active');
+                    expect(member.id).not.toBe(replaced.id);
+                }
+            }
+        });
+
         it('excludes another tenant’s week', async () => {
             const { plan } = await seedPlannedWeek(OTHER_USER_ID, { sequence: 492 });
 
@@ -1929,6 +2336,56 @@ describe('GET /api/meal-planning/plans/:planId/days/:date', () => {
         expect(envelope.day.meals).toHaveLength(MEALS_PER_DAY);
     });
 
+    it('reports a regenerated-away week as superseded and unwritable, at the revision it now holds', async () => {
+        // The envelope's LIFECYCLE CLAIM and the day rows beside it come from
+        // separate reads, and after a real supersession those two reads used to
+        // be able to disagree: the plan row read first said `'active'` at
+        // revision 1 while the regeneration had already moved it, so the body
+        // invited a Swap or a Log that the write path would refuse with
+        // `409 plan_not_active`. Both now come from one `RepeatableRead`
+        // snapshot (`readInPlanSnapshot`), so what the envelope says about the
+        // week matches the day it returns.
+        //
+        // `api/planDayWriteability.test.ts` owns the lifecycle × zone matrix;
+        // what is asserted here is this route's contract after the one
+        // transition a user can actually cause, and that history stays readable
+        // through it.
+        const dayKey = utcTodayDayKey();
+
+        await seedGeneratorWorld(USER_ID);
+
+        const replaced = await publishWeek({ startDate: dayKey });
+        const replacement = asPlan((await postRegenerate(replaced.id, regenerateBody()).expect(201)).body);
+        const stored = await storedPlan(replaced.id);
+
+        expect(stored.status).toBe('superseded');
+
+        const superseded = asEnvelope((await getDay(replaced.id, dayKey).expect(200)).body);
+
+        expect(superseded.planId).toBe(replaced.id);
+        expect(superseded.planStatus).toBe('superseded');
+        // The revision the row holds NOW, not the one it held when the client
+        // last looked — freshness is what lets a stale screen notice it moved.
+        expect(superseded.planRevision).toBe(stored.revision);
+        expect(superseded.planRevision).toBe(FIRST_REVISION + 1);
+        expect(superseded.isWritable).toBe(false);
+        // Readable, and still its own week: the diary entries logged from it
+        // link to these meals (§0.5.2 defines no `plan_not_active` on this
+        // route).
+        expect(superseded.day.date).toBe(dayKey);
+        expect(superseded.day.meals).toHaveLength(MEALS_PER_DAY);
+
+        const active = asEnvelope((await getDay(replacement.id, dayKey).expect(200)).body);
+
+        expect(active).toMatchObject({
+            planId: replacement.id,
+            planStatus: 'active',
+            planRevision: FIRST_REVISION,
+            isWritable: true,
+        });
+        expect(active.day.meals).toHaveLength(MEALS_PER_DAY);
+    });
+
     it('reports every day of the week it holds, and no other', async () => {
         const { plan } = await seedPlannedWeek(USER_ID);
         const startKey = plan.start_date.toISOString().slice(0, 10);
@@ -1994,6 +2451,133 @@ describe('GET /api/meal-planning/plans/:planId/days/:date', () => {
         expect(asEnvelope((await getDay(foreign.plan.id, dayKey, OTHER_USER_ID).expect(200)).body).planId).toBe(
             foreign.plan.id,
         );
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The snapshot the two lifecycle-reporting reads share
+ *
+ * The cases above assert the CONTRACT those reads owe: a plan arrives under the
+ * member its lifecycle says it belongs to, and the envelope reports the week's
+ * revision as it now stands. Neither can fail on an unlucky interleaving,
+ * because neither stages one — so they would both stay green if the reads went
+ * back to the autocommit client, which is precisely what `F01` and `F02` were.
+ *
+ * What the two cases here pin is the MECHANISM, with no race to lose. The first
+ * reads back the isolation level each read asks for, because `RepeatableRead` is
+ * load-bearing rather than decorative: PostgreSQL's default READ COMMITTED takes
+ * a fresh snapshot per statement, so a transaction at that level would leave
+ * both reads exactly as interleavable as they were. The second stages the
+ * interleaving deliberately — a supersession committed on another connection
+ * after the read's snapshot is open — and asserts the read still describes the
+ * week it resolved, which is the whole of what one snapshot buys.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Captures the options every `prisma.$transaction` of one call is opened with,
+ * and lets a test act between BEGIN and the work inside it.
+ *
+ * The original is bound before the spy is installed, so the pass-through cannot
+ * re-enter the mock; `interleave` runs after one statement has been issued on
+ * the transaction client — which is where PostgreSQL takes a `RepeatableRead`
+ * transaction's snapshot — and before the read's own first statement.
+ */
+const recordTransactions = async <TResult>(
+    call: () => Promise<TResult>,
+    interleave?: () => Promise<void>,
+): Promise<{ result: TResult; options: unknown[] }> => {
+    const options: unknown[] = [];
+    const original = prisma.$transaction.bind(prisma) as (...args: unknown[]) => Promise<unknown>;
+    const spy = jest.spyOn(prisma, '$transaction').mockImplementation(((...args: unknown[]) => {
+        const [work, passed] = args;
+
+        options.push(passed);
+
+        if (interleave === undefined) {
+            return original(work, passed);
+        }
+
+        return original(async (tx: Prisma.TransactionClient) => {
+            // One statement, to open the snapshot, then the concurrent commit.
+            await tx.meal_plans.count({ where: { user_id: USER_ID } });
+            await interleave();
+
+            return (work as (client: Prisma.TransactionClient) => Promise<unknown>)(tx);
+        }, passed);
+    }) as never);
+
+    try {
+        return { result: await call(), options };
+    } finally {
+        spy.mockRestore();
+    }
+};
+
+describe('the two lifecycle reads share one snapshot', () => {
+    it('opens exactly one RepeatableRead transaction each, and the flag read opens none', async () => {
+        const dayKey = utcTodayDayKey();
+        const { plan } = await seedPlannedWeek(USER_ID);
+
+        const current = await recordTransactions(() => getCurrentMealPlan(USER_ID));
+
+        // One transaction for the whole read — the zone, the lifecycle states
+        // the members are chosen from, and each chosen week's own rows.
+        expect(current.options).toEqual([{ isolationLevel: 'RepeatableRead' }]);
+        expect(current.result.current?.id).toBe(plan.id);
+
+        const day = await recordTransactions(() => getMealPlanDay(USER_ID, plan.id, dayKey));
+
+        expect(day.options).toEqual([{ isolationLevel: 'RepeatableRead' }]);
+        expect(day.result.kind).toBe('ok');
+
+        // The documented asymmetry: `getAffectedMeals` makes no lifecycle claim,
+        // so it stays on the autocommit client and opens nothing. Asserted so
+        // the split is a decision on the record rather than an oversight.
+        const affected = await recordTransactions(() => getAffectedMeals(USER_ID, plan.id));
+
+        expect(affected.options).toEqual([]);
+        expect(affected.result.kind).toBe('ok');
+    });
+
+    it('describes the week it resolved even when a supersession commits mid-read', async () => {
+        // THE INTERLEAVING `F01` DESCRIBES, STAGED. The read's snapshot is open;
+        // then another connection supersedes the very plan it is about to
+        // resolve and describe. With one snapshot the answer is the week as it
+        // stood — resolved as `current` AND reported `'active'`, one instant
+        // throughout. Statement by statement it would not be: the resolution and
+        // the hydration would straddle the commit and the body would claim a
+        // status no answer of this route may carry.
+        await seedGeneratorWorld(USER_ID);
+
+        const plan = await publishWeek({ startDate: utcTodayDayKey() });
+        const supersede = async (): Promise<void> => {
+            await prisma.meal_plans.update({
+                where: { id: plan.id, user_id: USER_ID },
+                data: { status: 'superseded', revision: FIRST_REVISION + 1 },
+            });
+        };
+
+        const { result, options } = await recordTransactions(
+            () => getCurrentMealPlan(USER_ID),
+            supersede,
+        );
+
+        expect(options).toEqual([{ isolationLevel: 'RepeatableRead' }]);
+        expect(result.current?.id).toBe(plan.id);
+        expect(result.current?.status).toBe('active');
+        expect(result.current?.revision).toBe(FIRST_REVISION);
+        expect(result.current?.days).toHaveLength(PLAN_DAY_COUNT);
+
+        // The commit really landed, so the coherent answer above was a snapshot
+        // and not a database that never changed.
+        expect(await storedPlan(plan.id)).toMatchObject({
+            status: 'superseded',
+            revision: FIRST_REVISION + 1,
+        });
+
+        // And nothing of that view outlives the request: the next read resolves
+        // against the committed state, where the week is gone.
+        expect((await getCurrent().expect(200)).body).toEqual({ current: null, upcoming: null });
     });
 });
 
@@ -2117,6 +2701,80 @@ describe('GET /api/meal-planning/plans/:planId/affected-meals', () => {
 const publishWeek = async (
     overrides: GenerateBodyOverrides = {},
 ): Promise<MealPlanResponse> => asPlan((await postPlan(generateBody(overrides)).expect(201)).body);
+
+/**
+ * Everything a regeneration would touch about the week it replaces, read as
+ * STORED.
+ *
+ * WHOLE ROWS, not a projection of the interesting columns. Every refusal and
+ * every rollback below promises that the published week is exactly as it was,
+ * and a projection proves that only of the columns someone thought to name —
+ * the revision the supersede bumped, the `replaced_plan_id` it stamped, the
+ * `checked_at` a rebuilt list rewrote or the flag it raised would each sit
+ * outside it. Prisma's `Decimal` and `Date` values compare BY VALUE under
+ * `toEqual`, so two reads of an unchanged row are equal without being
+ * reformatted first, and each reader above fixes its own order.
+ *
+ * The user's OTHER plans and the action ledger travel in the same snapshot,
+ * because "nothing moved" includes the successor plan a refused regeneration
+ * must not have left behind and the reservation it must not have stranded.
+ */
+const weekSnapshot = async (planId: string, userId: string = USER_ID) => ({
+    plan: await storedPlan(planId),
+    days: await storedDays(planId),
+    meals: await storedMeals(planId),
+    groceries: await storedGroceries(planId),
+    plans: await storedPlans(userId),
+    actions: await storedActions(userId),
+});
+
+type WeekSnapshot = Awaited<ReturnType<typeof weekSnapshot>>;
+
+/**
+ * Re-reads the week a snapshot was taken of and insists it is what it was.
+ *
+ * Six comparisons rather than one deep-equal of the whole object, so a failure
+ * names WHICH part of the promise broke: the plan row, a day, a meal, a grocery
+ * line's amount or check state, a plan that appeared, or a ledger row.
+ */
+const expectWeekUnchanged = async (before: WeekSnapshot): Promise<void> => {
+    const after = await weekSnapshot(before.plan.id, before.plan.user_id);
+
+    expect(after.plan).toEqual(before.plan);
+    expect(after.days).toEqual(before.days);
+    expect(after.meals).toEqual(before.meals);
+    expect(after.groceries).toEqual(before.groceries);
+    expect(after.plans).toEqual(before.plans);
+    expect(after.actions).toEqual(before.actions);
+};
+
+/**
+ * Checks the week's single grocery line through the real route, as a user's tap
+ * would, and answers with its id.
+ *
+ * Through the ROUTE for the reason the carry-over case above states: writing
+ * `is_checked` by hand sets no acknowledged baseline, so the check state a
+ * refusal has to leave alone would not be the state the product produces. Every
+ * generator world here shops for one food, so one line is the whole list and a
+ * second would mean the world changed under the case.
+ */
+const checkTheOnlyGroceryLine = async (planId: string): Promise<string> => {
+    const rows = await storedGroceries(planId);
+    const line = rows[0];
+
+    if (rows.length !== 1 || line === undefined) {
+        throw new Error(
+            `a published week shops for exactly one line; plan ${planId} has ${String(rows.length)}`,
+        );
+    }
+
+    await asUser(
+        request.put(`${PLANS_PATH}/${planId}/groceries/${line.id}`).send({ isChecked: true }),
+        { uid: USER_ID },
+    ).expect(200);
+
+    return line.id;
+};
 
 describe('POST /api/meal-planning/plans/:planId/regenerate', () => {
     describe('replacing a week', () => {
@@ -2446,6 +3104,201 @@ describe('POST /api/meal-planning/plans/:planId/regenerate', () => {
         });
     });
 
+    /* -----------------------------------------------------------------------
+     * The two 422 verdicts — §0.5.2's "the same 422 codes with the old plan
+     * intact"
+     *
+     * Regeneration inherits both of generation's 422s, and each says something
+     * different: `targets_missing` is the targets gate refusing to build a week
+     * on numbers that are not all there, and `no_matching_meals` is the search
+     * itself reporting that no week fits the answers on file. §0.5.2 attaches
+     * ONE promise to both — the week the user already has is intact — so each
+     * case here is half a shape assertion and half an atomicity proof, compared
+     * against a complete snapshot of the published week taken with a grocery
+     * line already checked.
+     *
+     * Both verdicts are raised before the publication transaction opens, so
+     * what they prove is that the ledger and the plan are never reached. The
+     * failure that fires INSIDE the transaction, once the replacement rows
+     * exist, is the last describe of this block.
+     * --------------------------------------------------------------------- */
+
+    describe('the 422 verdicts', () => {
+        it('answers targets_missing, names the cleared fields, and leaves the week whole', async () => {
+            await seedGeneratorWorld(USER_ID);
+
+            const first = await publishWeek({ startDate: utcTodayDayKey() });
+
+            await checkTheOnlyGroceryLine(first.id);
+
+            // Two of the four columns the planner needs, cleared directly: the
+            // shape of an account whose target set is not all there, which
+            // §0.5.2 describes as the independently nullable legacy case. The
+            // gate reads the pair as INCOMPLETE and NAMES the fields, rather
+            // than answering `targets_unconfirmed` about values it cannot judge
+            // at all. The truth matrix itself is `api/targets.test.ts`'s.
+            await prisma.users.update({
+                where: { id: USER_ID },
+                data: { target_carbs_g: null, target_fat_g: null },
+            });
+
+            const before = await weekSnapshot(first.id);
+            // Every pin in the body is the CURRENT value — the plan's revision,
+            // the preferences' and the targets' — so `targets_missing` is the
+            // only refusal this request can earn. A stale pin would be answered
+            // 409 by the plan's own gate or by the revision comparison before
+            // the targets were ever judged, and the case would pass while
+            // proving nothing about either.
+            const response = await postRegenerate(first.id, regenerateBody()).expect(422);
+
+            expect(asErrorBody(response.body)).toEqual({
+                error: 'targets_missing',
+                // In the canonical field order, and only the two that were
+                // cleared: 09b asks the user for exactly these.
+                missing: ['carbs', 'fat'],
+            });
+
+            expect(await storedPlan(first.id)).toMatchObject({
+                status: 'active',
+                revision: FIRST_REVISION,
+                generation_attempt: FIRST_ATTEMPT,
+                replaced_plan_id: null,
+                // The audit column a regeneration writes about a week it
+                // replaces; a refusal leaves it unwritten.
+                incompatibility_flags: null,
+            });
+            expect(await storedDays(first.id)).toHaveLength(PLAN_DAY_COUNT);
+            expect(await storedMeals(first.id)).toHaveLength(PLAN_DAY_COUNT * MEALS_PER_DAY);
+            // Only the publication's own row: the refusal reserved nothing, so
+            // the key it carried is still unused.
+            expect((await storedActions()).map((action) => action.action_type)).toEqual(['generate']);
+            await expectWeekUnchanged(before);
+        });
+
+        it('answers no_matching_meals with typed constraints, and leaves the week whole', async () => {
+            await seedGeneratorWorld(USER_ID);
+
+            const first = await publishWeek({ startDate: utcTodayDayKey() });
+
+            await checkTheOnlyGroceryLine(first.id);
+
+            // The week was published from a catalog whose every recipe takes 25
+            // minutes. 15 is a real cooking tier (§0.7.3's 15 / 30 / 45 / 60)
+            // and leaves every slot without a single eligible recipe, so the
+            // same catalog that filled a week a moment ago can no longer fill
+            // one. The revision moves with the narrowing because a preference
+            // save is what narrows it in the product, and the request pins the
+            // NEW value — pinning the old one would be answered
+            // `409 stale_revision` and the search would never run, which is the
+            // mistake that makes a case like this prove nothing.
+            const narrowed = await prisma.meal_plan_preferences.update({
+                where: { user_id: USER_ID },
+                data: { cooking_time_limit_min: 15, revision: { increment: 1 } },
+            });
+
+            const before = await weekSnapshot(first.id);
+            const response = await postRegenerate(
+                first.id,
+                regenerateBody({ expectedPreferencesRevision: narrowed.revision }),
+            ).expect(422);
+            const body = asErrorBody(response.body);
+
+            // THE WHOLE BODY, not three members of it. The rows come exactly in
+            // the order the analysis emits them: with every slot empty it
+            // reports the coverage itself and the one relaxation that reopens
+            // the week — the next cooking tier — and nothing else, because no
+            // nutrition band and no portion can fill a slot that has no recipes
+            // at all. `allergiesKept` is the literal `true` because it is a
+            // promise rather than a flag (§0.5.2): no relaxation the analysis
+            // offers ever trades an allergy away. And the comparison is of the
+            // complete object, so a fourth top-level key — a diagnostics blob, a
+            // free-text reason, anything the client would not know to render —
+            // fails this case rather than riding along unnoticed. WHICH verdicts
+            // the analysis reaches is `mealPlan.logic.test.ts`'s subject; that
+            // the route puts exactly them on the wire as typed values the client
+            // formats itself is this file's.
+            expect(body).toEqual({
+                error: 'no_matching_meals',
+                limitingConstraints: [
+                    {
+                        constraintKey: 'slot_coverage',
+                        value: 0,
+                        unit: 'recipes',
+                        slots: ['breakfast', 'lunch', 'dinner'],
+                        editStep: 'schedule',
+                    },
+                    {
+                        constraintKey: 'cooking_time',
+                        value: 15,
+                        unit: 'minutes',
+                        slots: [],
+                        editStep: 'cooking',
+                    },
+                ],
+                allergiesKept: true,
+            });
+
+            const constraints = body.limitingConstraints as LimitingConstraint[];
+
+            for (const constraint of constraints) {
+                // The same closed sets the generation-side case pins, asserted
+                // again here because this body is assembled from a different
+                // error instance and a member that stopped belonging would
+                // reach the client as an unrenderable pill.
+                expect([
+                    'cooking_time',
+                    'dislikes',
+                    'diet',
+                    'nutrition_tolerance',
+                    'portion_limits',
+                    'slot_coverage',
+                    'catalog_coverage',
+                ]).toContain(constraint.constraintKey);
+                expect(['minutes', 'foods', 'percent', 'recipes']).toContain(constraint.unit);
+                expect(Array.isArray(constraint.slots)).toBe(true);
+                expect(typeof constraint.editStep).toBe('string');
+                expect(constraint.editStep.length).toBeGreaterThan(0);
+            }
+
+            expect(await storedPlan(first.id)).toMatchObject({
+                status: 'active',
+                revision: FIRST_REVISION,
+                generation_attempt: FIRST_ATTEMPT,
+                replaced_plan_id: null,
+                incompatibility_flags: null,
+            });
+            expect(await storedDays(first.id)).toHaveLength(PLAN_DAY_COUNT);
+            expect(await storedMeals(first.id)).toHaveLength(PLAN_DAY_COUNT * MEALS_PER_DAY);
+            expect((await storedActions()).map((action) => action.action_type)).toEqual(['generate']);
+            await expectWeekUnchanged(before);
+
+            // And the verdict is about the ANSWERS rather than about this
+            // attempt: widened back to the tier the week was built under, the
+            // same request publishes a replacement. That is what makes the 422
+            // above a report the user can act on from 10c rather than a dead
+            // end.
+            const widened = await prisma.meal_plan_preferences.update({
+                where: { user_id: USER_ID },
+                data: { cooking_time_limit_min: 30, revision: { increment: 1 } },
+            });
+            const replacement = asPlan(
+                (
+                    await postRegenerate(
+                        first.id,
+                        regenerateBody({ expectedPreferencesRevision: widened.revision }),
+                    ).expect(201)
+                ).body,
+            );
+
+            expect(replacement.generationAttempt).toBe(FIRST_ATTEMPT + 1);
+            expect((await storedPlan(first.id)).status).toBe('superseded');
+            expect((await storedActions()).map((action) => action.action_type)).toEqual([
+                'generate',
+                'regenerate',
+            ]);
+        });
+    });
+
     describe('a current week and an upcoming one', () => {
         it('lets either be regenerated, because the conflict checks exclude the plan being replaced', async () => {
             await seedGeneratorWorld(USER_ID);
@@ -2551,6 +3404,181 @@ describe('POST /api/meal-planning/plans/:planId/regenerate', () => {
                 'generate',
                 'regenerate',
             ]);
+        });
+    });
+
+    /* -----------------------------------------------------------------------
+     * A regeneration that fails AFTER the replacement is written
+     *
+     * The regeneration half of the same proof, and the one 16b's own note rests
+     * on: "if generation fails the current plan is retained". By the time these
+     * two fail, the old week has been SUPERSEDED and its revision bumped inside
+     * the transaction, and the replacement's seven days and twenty-one meals
+     * exist — so "retained" is true only because the commit is abandoned whole.
+     * The week is therefore compared against a complete pre-call snapshot taken
+     * with one grocery line already checked, which puts the check mark, its
+     * acknowledged baseline and its clear flag inside the comparison rather
+     * than beside it.
+     * --------------------------------------------------------------------- */
+
+    describe('a regeneration that fails after the replacement is written', () => {
+        it('leaves the published week whole when the carry-over cannot be rendered', async () => {
+            await seedGeneratorWorld(USER_ID);
+
+            const first = await publishWeek({ startDate: utcTodayDayKey() });
+            const lineId = await checkTheOnlyGroceryLine(first.id);
+            const renderedUnit = (
+                await prisma.grocery_items.findUniqueOrThrow({ where: { id: lineId } })
+            ).display_unit;
+
+            // The unit-family lock, broken the way only real data can break it:
+            // a stored row whose `display_unit` no longer names a family. A
+            // regeneration re-renders every line it carries over through the
+            // family the row was created in and refuses to guess one it cannot
+            // read — the same production fault `api/swaps.test.ts` uses for a
+            // rebuild, reached here from the publication writer instead.
+            await prisma.grocery_items.update({
+                where: { id: lineId, user_id: USER_ID },
+                data: { display_unit: 'bottle' },
+            });
+
+            const before = await weekSnapshot(first.id);
+            const body = regenerateBody();
+            const observer = observePublicationWrites();
+            let faulted;
+
+            try {
+                faulted = await postRegenerate(first.id, body).expect(502);
+            } finally {
+                observer.restore();
+            }
+
+            // Inside the transaction the supersede had already happened — two
+            // plans, one of them superseded — and the replacement already held
+            // the whole week, while the only grocery rows in existence were
+            // still the old plan's one line. That is what makes the comparison
+            // below a rollback proof rather than a statement that nothing was
+            // attempted.
+            expect(observer.observations).toEqual([
+                {
+                    plannedMeals: PLAN_DAY_COUNT * MEALS_PER_DAY,
+                    planStatuses: ['active', 'superseded'],
+                    groceryRows: 1,
+                },
+            ]);
+
+            expect(faulted.status).not.toBe(500);
+            expect(asErrorBody(faulted.body)).toEqual({ error: 'plan_generation_failed' });
+
+            // §0.9.2's "old plan still active", now for a failure that happened
+            // after it had been superseded: the status, the revision the
+            // supersede bumped, the attempt and the replacement pointer are all
+            // where the publication left them.
+            expect(await storedPlan(first.id)).toMatchObject({
+                status: 'active',
+                revision: FIRST_REVISION,
+                generation_attempt: FIRST_ATTEMPT,
+                replaced_plan_id: null,
+                incompatibility_flags: null,
+            });
+            // No successor: the plan the transaction inserted is gone with it.
+            expect(await storedPlans()).toHaveLength(1);
+            expect(await storedDays(first.id)).toHaveLength(PLAN_DAY_COUNT);
+            expect(await storedMeals(first.id)).toHaveLength(PLAN_DAY_COUNT * MEALS_PER_DAY);
+            expect(await storedGroceries(first.id)).toHaveLength(1);
+            // Only the publication's own row: the regeneration's reservation
+            // shared the transaction, so no key was stranded.
+            expect((await storedActions()).map((action) => action.action_type)).toEqual(['generate']);
+            await expectWeekUnchanged(before);
+
+            // Repaired, the same key regenerates once and carries the attempt
+            // forward — and the check mark the rollback preserved travels into
+            // the week that finally replaces it, which is the carry-over the
+            // failed attempt left possible.
+            await prisma.grocery_items.update({
+                where: { id: lineId, user_id: USER_ID },
+                data: { display_unit: renderedUnit },
+            });
+
+            const replacement = asPlan((await postRegenerate(first.id, body).expect(201)).body);
+
+            expect(replacement.generationAttempt).toBe(FIRST_ATTEMPT + 1);
+            expect((await storedPlan(first.id)).status).toBe('superseded');
+            expect((await storedActions()).map((action) => action.action_type)).toEqual([
+                'generate',
+                'regenerate',
+            ]);
+
+            const rebuilt = await storedGroceries(replacement.id);
+
+            expect(rebuilt).toHaveLength(1);
+            expect(rebuilt[0]?.is_checked).toBe(true);
+            expect(rebuilt[0]?.display_unit).toBe(renderedUnit);
+        });
+
+        it('leaves the published week whole when the write fails after inserting the new list', async () => {
+            await seedGeneratorWorld(USER_ID);
+
+            const first = await publishWeek({ startDate: utcTodayDayKey() });
+
+            await checkTheOnlyGroceryLine(first.id);
+
+            const before = await weekSnapshot(first.id);
+            const body = regenerateBody();
+            const observer = observePublicationWrites();
+            const seam = failAfterGroceryRowsAreWritten();
+            let faulted;
+
+            try {
+                faulted = await postRegenerate(first.id, body).expect(502);
+                // Inside the `try`, because `mockRestore` in the `finally`
+                // clears the call record along with the implementation.
+                expect(seam.spy).toHaveBeenCalledTimes(1);
+            } finally {
+                seam.spy.mockRestore();
+                observer.restore();
+            }
+
+            // Everything a regeneration writes existed at once: the supersede,
+            // the replacement's whole week, and then its grocery line beside the
+            // old plan's — two rows where the database now holds one.
+            expect(seam.insertedBeforeTheThrow).toEqual([1]);
+            expect(observer.observations).toEqual([
+                {
+                    plannedMeals: PLAN_DAY_COUNT * MEALS_PER_DAY,
+                    planStatuses: ['active', 'superseded'],
+                    groceryRows: 1,
+                },
+            ]);
+
+            expect(faulted.status).not.toBe(500);
+            expect(asErrorBody(faulted.body)).toEqual({ error: 'plan_generation_failed' });
+
+            expect(await storedPlan(first.id)).toMatchObject({
+                status: 'active',
+                revision: FIRST_REVISION,
+                generation_attempt: FIRST_ATTEMPT,
+                replaced_plan_id: null,
+                incompatibility_flags: null,
+            });
+            expect(await storedPlans()).toHaveLength(1);
+            expect(await storedDays(first.id)).toHaveLength(PLAN_DAY_COUNT);
+            expect(await storedMeals(first.id)).toHaveLength(PLAN_DAY_COUNT * MEALS_PER_DAY);
+            expect(await prisma.grocery_items.count({ where: { user_id: USER_ID } })).toBe(1);
+            expect((await storedActions()).map((action) => action.action_type)).toEqual(['generate']);
+            await expectWeekUnchanged(before);
+
+            // And with the seam gone the same key commits once, at the attempt
+            // the failed one would have published.
+            const replacement = asPlan((await postRegenerate(first.id, body).expect(201)).body);
+
+            expect(replacement.generationAttempt).toBe(FIRST_ATTEMPT + 1);
+            expect((await storedPlan(first.id)).status).toBe('superseded');
+            expect((await storedActions()).map((action) => action.action_type)).toEqual([
+                'generate',
+                'regenerate',
+            ]);
+            expect((await storedGroceries(replacement.id))[0]?.is_checked).toBe(true);
         });
     });
 });

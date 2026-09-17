@@ -1,25 +1,6 @@
 // The request-parser wiring suite: every user-scoped meal-planning entry point
 // answers a MALFORMED request before it reaches Prisma.
 //
-// AAP §0.5.2 requires "server-side validation applied before any Prisma or
-// planning work (`*.logic.ts` parsers, 400 with field codes)". Every parser in
-// this feature is pure and separately unit-tested in its own `*.logic.test.ts`,
-// so those suites establish that the RULES are right. They cannot establish
-// that anything CALLS them, and a correct parser no entry point invokes leaves a
-// malformed request travelling exactly as far as it did before it was written:
-//
-//   * a non-UUID `planId` reaches a `where: { id, user_id }` predicate, where
-//     PostgreSQL rejects the uuid cast and the client is told `500`;
-//   * `2026-02-30` reaches `new Date('2026-02-30T00:00:00.000Z')` and becomes
-//     an Invalid Date that queries as `NULL`, so a real calendar error looks
-//     like an empty day;
-//   * `expectedPlanRevision: 1e30` passes `Number.isInteger` and reaches
-//     `buildRequestFingerprint`'s canonicaliser or the `Int` column, again a
-//     `500`;
-//   * `portionMultiplier: 2.5` reaches `requireBoundPortion`, which answers
-//     `409 preview_stale` — telling the user their preview went stale when the
-//     request was never well formed in the first place.
-//
 // WHY IT IS ITS OWN FILE, BESIDE `ownership.test.ts` RATHER THAN INSIDE IT.
 // The malformed-id class of AAP §0.9.2's ownership matrix is proven here, while
 // the foreign-id and nonexistent-id classes — which need real rows to
@@ -86,6 +67,16 @@
 // that refused everything, which is the one way a validation gate can be wrong
 // in the opposite direction.
 //
+// FOR THREE ROUTES THAT RECORDED CALL IS `$transaction`, AND THAT IS ITSELF THE
+// CLAIM. The swap commit opens one because it reserves an idempotency key; the
+// current-plan and day reads open one because each RESOLVES a plan's lifecycle
+// and then describes it, and only a single `RepeatableRead` snapshot keeps the
+// two halves of such an answer describing the same instant
+// (`mealPlan.service.ts::readInPlanSnapshot`, `F01`/`F02`). Asserting the first
+// recorded call is that transaction pins "one consistent snapshot" with no race
+// to stage, and the refusal cases directly above prove the path parse still runs
+// in front of it.
+//
 // TWO PROOFS ARE MADE AT THE CONTROLLER, NOT THE SERVICE, because that is
 // where those two parses live. `GET /catalog/foods/suggestions` and
 // `GET /recipes/:recipeVersionId` are parsed by
@@ -150,9 +141,11 @@ import {
 import {
     generatePlan,
     getAffectedMeals,
+    getCurrentMealPlan,
     getMealPlanDay,
     regeneratePlan,
 } from '../../services/mealPlan.service';
+import { ReadOnlyFieldError } from '../../services/mealPlanning.errors';
 import { logPlannedMeal } from '../../services/plannedMealLog.service';
 import { savePreferences, saveSetupStep } from '../../services/preferences.service';
 import { commitSwap, getSwapAlternatives, getSwapPreview } from '../../services/swap.service';
@@ -257,6 +250,37 @@ const expectRefusedBeforeIo = async (
     expect(prismaCalls).toEqual([]);
 
     return verdict;
+};
+
+/**
+ * Asserts an entry point refused a request by THROWING `ReadOnlyFieldError`
+ * naming `field`, and that it did so without a single database call.
+ *
+ * The sibling of `expectRefusedBeforeIo` for the one refusal this feature
+ * raises rather than returns: a body whose only problem is server-owned keys is
+ * a typed error the controller maps to the same `400 invalid_request` body,
+ * carrying every offending key. The claim this file makes is unchanged — the
+ * request is answered before any read — and only the shape of the answer
+ * differs, so the no-call assertion is the same one.
+ */
+const expectReadOnlyThrowBeforeIo = async (
+    call: () => Promise<unknown>,
+    field: string,
+): Promise<void> => {
+    prismaCalls.length = 0;
+
+    const outcome = await call().then(
+        (value) => value,
+        (thrown: unknown) => thrown,
+    );
+
+    expect(outcome).toBeInstanceOf(ReadOnlyFieldError);
+
+    const { details } = outcome as ReadOnlyFieldError;
+
+    expect(details.map((detail) => detail.field)).toContain(field);
+    expect(details.every((detail) => detail.code === 'read_only_field')).toBe(true);
+    expect(prismaCalls).toEqual([]);
 };
 
 /**
@@ -542,10 +566,12 @@ describe('plan read entry points parse before any I/O (F22)', () => {
         await expectRefusedBeforeIo(() => getAffectedMeals(USER_ID, 'plan-1'), 'planId', 'invalid_id');
     });
 
-    it('lets a well-formed day read reach the database', async () => {
-        expect(await expectReachesDatabase(() => getMealPlanDay(USER_ID, PLAN_ID, DAY_KEY))).toBe(
-            'meal_plans.findFirst',
-        );
+    it('lets a well-formed day read open its transaction', async () => {
+        expect(await expectReachesDatabase(() => getMealPlanDay(USER_ID, PLAN_ID, DAY_KEY))).toBe('$transaction');
+    });
+
+    it('lets a well-formed current-plan read open its transaction', async () => {
+        expect(await expectReachesDatabase(() => getCurrentMealPlan(USER_ID))).toBe('$transaction');
     });
 
     it('lets a well-formed affected-meals read reach the database', async () => {
@@ -562,12 +588,15 @@ describe('plan read entry points parse before any I/O (F22)', () => {
      *
      * An injected date must not pull any read forward: the parse still comes
      * first, so a malformed path is refused with no database call even though
-     * "today" was supplied. And on the well-formed side the FIRST recorded call
-     * must still be the owner-scoped plan read — if the zone lookup
-     * (`meal_plan_preferences.findUnique`, inside `resolveUserToday`) were
-     * reached first, a request for a plan that is not the caller's would pay for
-     * a preferences read before its 404, and the ownership check would sit
-     * behind an unrelated query.
+     * "today" was supplied. And on the well-formed side the first recorded call
+     * must be `$transaction` — the read's own snapshot (`F01`/`F02`), which the
+     * parse still precedes. The ordering INSIDE that transaction (the
+     * owner-scoped plan row, then the day, then the zone `resolveUserToday`
+     * reads) is stated and reasoned in `mealPlan.service.ts` and is no longer
+     * observable through this stub, because opening the transaction is the only
+     * call it records; what `api/ownership.test.ts` proves against real rows is
+     * the REFUSAL that ordering exists for — a foreign plan answers exactly as
+     * an absent one does.
      */
     it('refuses a malformed day read before any I/O even with a clock supplied', async () => {
         await expectRefusedBeforeIo(
@@ -577,9 +606,9 @@ describe('plan read entry points parse before any I/O (F22)', () => {
         );
     });
 
-    it('reads the caller’s plan before the zone its writeability is judged in', async () => {
+    it('opens the day read’s snapshot only after the path has been judged, clock or no clock', async () => {
         expect(await expectReachesDatabase(() => getMealPlanDay(USER_ID, PLAN_ID, DAY_KEY, INJECTED_NOW))).toBe(
-            'meal_plans.findFirst',
+            '$transaction',
         );
     });
 });
@@ -728,10 +757,9 @@ describe('preference saves parse their envelope before any I/O (SVC-09)', () => 
     });
 
     it('refuses a server-owned key in a step body', async () => {
-        await expectRefusedBeforeIo(
+        await expectReadOnlyThrowBeforeIo(
             () => saveSetupStep(USER_ID, 'goal', stepBody({ setupStatus: 'completed' })),
             'setupStatus',
-            'read_only_field',
         );
     });
 
@@ -758,10 +786,9 @@ describe('preference saves parse their envelope before any I/O (SVC-09)', () => 
     });
 
     it('refuses a server-owned key in a full save body', async () => {
-        await expectRefusedBeforeIo(
+        await expectReadOnlyThrowBeforeIo(
             () => savePreferences(USER_ID, updateBody({ targetRoute: 'manual' })),
             'targetRoute',
-            'read_only_field',
         );
     });
 
@@ -835,12 +862,13 @@ describe('preference saves parse their envelope before any I/O (SVC-09)', () => 
 
     it('reads the row for a body whose other half is stored, rather than answer short', async () => {
         // `goal: 'lose'` with no pace is judged against the STORED pace, so the
-        // request stage cannot produce the complete answer and must not produce
-        // a partial one — it yields, and the row-backed parse answers.
+        // request stage cannot settle it and yields `needs_context`; the
+        // row-backed parse answers. The body carries no request-only error of
+        // its own, which is what makes the read here the deferral rather than an
+        // amplified refusal: a body that IS malformed is now answered before any
+        // read, whichever coherence rule was also applicable.
         expect(
-            await expectReachesDatabase(() =>
-                savePreferences(USER_ID, updateBody({ goal: 'lose', diet: 'carnivore' })),
-            ),
+            await expectReachesDatabase(() => savePreferences(USER_ID, updateBody({ goal: 'lose' }))),
         ).toBe('meal_plan_preferences.findUnique');
     });
 

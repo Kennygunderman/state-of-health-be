@@ -362,6 +362,36 @@ const SECRET_BEARING_KEY_WORDS: ReadonlySet<string> = new Set([
 // therefore matched as PHRASES against the key with its separators removed,
 // since splitting `apiKey` or `x-api-key` into words would produce the excluded
 // `key` again. `serviceaccount` is in the list for FIREBASE_SERVICE_ACCOUNT.
+//
+// The phrase match is UNANCHORED — anywhere in the collapsed key — and stays
+// that way. Anchoring it to the end would be tidier and would silently stop
+// redacting `serviceAccountJson`, `apiKeyHeader` and the plural `apiKeys`,
+// every one of which is a name this codebase could plausibly grow, so the
+// looseness is the safe direction of the trade and is not a defect to fix.
+//
+// THE PRICE OF THAT LOOSENESS, AND WHO PAYS IT: A FIELD NAME IS A FIXED
+// IDENTIFIER, NEVER DERIVED FROM DATA.
+//
+// Because the match is unanchored and decided before recursion, ANY key whose
+// name merely mentions a credential loses its whole value to `***` — including
+// a key that was only ever going to hold safe prose. A caller that builds field
+// names out of data therefore cannot predict which of its fields survive:
+// `catalog-import-usda.ts` reported unmet prerequisites as one field per gap
+// code, and `gap_usda_api_key_missing` collapsed to `gapusdaapikeymissing`,
+// matched `apikey`, and replaced the requirement-and-remedy sentence an
+// operator needed with `***` — the safe half of the diagnostic destroyed while
+// nothing unsafe was ever present.
+//
+// The contract both sides of that keep is: the KEY is a fixed identifier the
+// author wrote, and anything derived from data — a gap code, a check name, a
+// category, a source key — goes in a VALUE. A set of them is one neutral plural
+// key holding structured objects (`gaps: [{code, requirement, remedy}]`), whose
+// own keys are fixed and whose values still pass through SCRUB_RULES. That is
+// what "redact values, not safe diagnostic prose" means operationally, and it
+// costs nothing: a credential appearing INSIDE such prose is still scrubbed by
+// the value rules above — `USDA_API_KEY=abc` becomes `USDA_API_KEY=***` and a
+// DSN loses its userinfo — so moving the code out of the key name protects the
+// diagnostic without weakening the vocabulary below.
 const SECRET_BEARING_KEY_PHRASES: readonly string[] = [
     'apikey',
     'accesstoken',

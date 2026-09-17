@@ -36,6 +36,16 @@
  *    served at any age, a row past its TTL refreshes off the request path, two
  *    rapid calls issue one refresh, and a rejecting `findUnique` or `upsert`
  *    never fails the caller.
+ *  - **The retrieval status ledger.** `usda_api_cache.http_status` records the
+ *    status of the exchange that produced the row — the successful attempt, not
+ *    a retried `400` — and `getFoodsBatchWithRetrieval` reports the *observed*
+ *    origin, status, retrieval time and payload of the call that served it. A
+ *    row cached before the column existed reports `null`, never a substituted
+ *    `200`: `catalog_validation_records.identity_evidence` quotes this value as
+ *    a §0.3.2 retrieval record, and inventing a status nobody saw is the defect
+ *    review finding OBSEV-F12 reports. The origin is asserted to say `network`
+ *    *after* the live path's awaited cache write has already made the row
+ *    readable, because row presence is exactly what cannot answer it.
  *  - **Every failure leaves as a `UsdaError`.** A raw `Response`, a bare
  *    `TypeError` from the network, or a `SyntaxError` from an unreadable body
  *    escaping this module would force callers to pattern-match a vendor error
@@ -68,13 +78,19 @@ import {
     getBrandedFood,
     getFoodDetail,
     getFoodsBatch,
+    getFoodsBatchWithRetrieval,
     isRetryableUsdaStatus,
     listFoods,
     normalizeFdcIds,
     searchBrandedFoods,
     searchGenericFoods,
 } from '../usda.service';
-import type { GenericFoodCandidate, UsdaFoodDetail, UsdaFoodPortion } from '../usda.service';
+import type {
+    GenericFoodCandidate,
+    UsdaBatchRetrievalFacts,
+    UsdaFoodDetail,
+    UsdaFoodPortion,
+} from '../usda.service';
 
 /**
  * Derived from the boundary's own signature rather than imported from
@@ -168,6 +184,13 @@ const unrequestedIdMessage = (returned: number): string => `USDA batch returned 
 interface UsdaCacheRow {
     cache_key: string;
     payload: unknown;
+    /**
+     * The upstream status of the exchange that produced `payload`. `null` is
+     * the legacy case and is modelled rather than avoided: rows written before
+     * the column existed carry no status, and the boundary must report that
+     * absence instead of substituting a 200 (review finding OBSEV-F12).
+     */
+    http_status: number | null;
     fetched_at: Date;
 }
 
@@ -177,8 +200,8 @@ interface FindUniqueArgs {
 
 interface UpsertArgs {
     where: { cache_key: string };
-    create: { cache_key: string; payload: unknown };
-    update: { payload: unknown; fetched_at: Date };
+    create: { cache_key: string; payload: unknown; http_status: number };
+    update: { payload: unknown; http_status: number; fetched_at: Date };
 }
 
 /**
@@ -199,9 +222,19 @@ const cache = prismaDouble.usda_api_cache;
 
 const rows = new Map<string, UsdaCacheRow>();
 
-/** A row written `ageMs` before the fixed clock, whatever its key's TTL. */
-const seedRow = (cacheKey: string, payload: unknown, ageMs: number): void => {
-    rows.set(cacheKey, { cache_key: cacheKey, payload, fetched_at: new Date(FIXED_NOW - ageMs) });
+/**
+ * A row written `ageMs` before the fixed clock, whatever its key's TTL.
+ *
+ * `httpStatus` defaults to the 200 a successful fetch would have recorded;
+ * `null` seeds the legacy shape — a row cached before `http_status` existed.
+ */
+const seedRow = (cacheKey: string, payload: unknown, ageMs: number, httpStatus: number | null = 200): void => {
+    rows.set(cacheKey, {
+        cache_key: cacheKey,
+        payload,
+        http_status: httpStatus,
+        fetched_at: new Date(FIXED_NOW - ageMs),
+    });
 };
 
 const storedRow = (cacheKey: string): UsdaCacheRow => {
@@ -220,6 +253,14 @@ const storedRow = (cacheKey: string): UsdaCacheRow => {
 const readKeys = (): string[] => cache.findUnique.mock.calls.map(([args]) => args.where.cache_key);
 
 const writtenKeys = (): string[] => cache.upsert.mock.calls.map(([args]) => args.where.cache_key);
+
+/**
+ * The statuses the module asked the table to record, in order — `create` and
+ * `update` are read together because the column has to be written on both, or a
+ * refreshed row would keep the status of the payload it replaced.
+ */
+const writtenStatuses = (): Array<[number, number]> =>
+    cache.upsert.mock.calls.map(([args]): [number, number] => [args.create.http_status, args.update.http_status]);
 
 // ---------------------------------------------------------------------------
 // The fetch stub
@@ -564,8 +605,20 @@ beforeEach(() => {
         const existing = rows.get(where.cache_key);
         const row: UsdaCacheRow =
             existing === undefined
-                ? { cache_key: create.cache_key, payload: create.payload, fetched_at: new Date(Date.now()) }
-                : { ...existing, payload: update.payload, fetched_at: update.fetched_at };
+                ? {
+                    cache_key: create.cache_key,
+                    payload: create.payload,
+                    http_status: create.http_status,
+                    // Mirrors the column default (`now()`), which the create
+                    // branch relies on rather than sending a timestamp.
+                    fetched_at: new Date(Date.now()),
+                }
+                : {
+                    ...existing,
+                    payload: update.payload,
+                    http_status: update.http_status,
+                    fetched_at: update.fetched_at,
+                };
         rows.set(where.cache_key, row);
 
         return row;
@@ -724,6 +777,70 @@ describe('cacheKeyFor', () => {
             for (const key of keys) {
                 expect(key).not.toContain('api_key');
                 expect(key).not.toContain(API_KEY);
+            }
+        });
+    });
+
+    /**
+     * The keys the SHIPPED call sites actually read, asserted as the literal
+     * strings the module produced before `http_status` was added to the table
+     * (review finding OBSEV-F12 touched every write on this path). These are
+     * live `usda_api_cache.cache_key` primary-key values: a changed GET key
+     * orphans every deployed row and pushes the running API back through
+     * USDA's hourly limit, so the literals are captured from the previous
+     * build rather than recomputed from the builder they are guarding.
+     *
+     * Asserted through the functions rather than through `cacheKeyFor` alone,
+     * because the defect being guarded against is a call site passing
+     * different params — which a builder-only assertion cannot see.
+     */
+    describe('the deployed key of every shipped call site', () => {
+        it('reads the byte-identical legacy key for each request-path and import fetcher', async () => {
+            respondWith(
+                jsonResponse(searchSample('genericFoundationComplete').payload),
+                jsonResponse(searchSample('brandedComplete').payload),
+                jsonResponse(detailSample('brandedDetailComplete').payload),
+                jsonResponse([portionSample('srLegacyPortions').payload]),
+                jsonResponse([detailSample('brandedDetailComplete').payload]),
+            );
+
+            await searchGenericFoods('  Chicken   Breast ');
+            await searchBrandedFoods('Cheerios');
+            await getBrandedFood('9000301');
+            // Shares getBrandedFood's key for the same id: a cache hit that
+            // consumes no queued response, which is itself the guarantee that
+            // the two keys are still one string.
+            await getFoodDetail(9000301);
+            await listFoods('Foundation');
+            await getFoodsBatch([9000301]);
+
+            expect(readKeys()).toEqual([
+                '/foods/search?dataType=Survey (FNDDS),SR Legacy,Foundation&pageNumber=1&pageSize=6&query=chicken breast',
+                '/foods/search?dataType=Branded&pageNumber=1&pageSize=20&query=cheerios',
+                '/food/9000301?format=full',
+                '/food/9000301?format=full',
+                '/foods/list?dataType=Foundation&pageNumber=1&pageSize=200',
+                'POST /foods?#{"fdcIds":[9000301],"format":"full"}',
+            ]);
+        });
+
+        it('keeps cacheKeyForRequest GET output equal to cacheKeyFor for those same keys', () => {
+            const params: Array<[string, Record<string, string>]> = [
+                [
+                    '/foods/search',
+                    {
+                        query: 'chicken breast',
+                        dataType: 'Survey (FNDDS),SR Legacy,Foundation',
+                        pageSize: '6',
+                        pageNumber: '1',
+                    },
+                ],
+                ['/food/9000301', { format: 'full' }],
+                ['/foods/list', { dataType: 'Foundation', pageSize: '200', pageNumber: '1' }],
+            ];
+
+            for (const [path, entries] of params) {
+                expect(cacheKeyForRequest('GET', path, entries)).toBe(cacheKeyFor(path, entries));
             }
         });
     });
@@ -1493,6 +1610,81 @@ describe('fetchFromUsda', () => {
             await expect(listFoods('Branded')).resolves.toHaveLength(1);
             await jest.advanceTimersByTimeAsync(0);
         });
+
+        /**
+         * The upstream status is a mandatory field of a retrieval record
+         * (Agent Action Plan §0.3.2) and the catalog import copies it onto
+         * every `catalog_validation_records.identity_evidence` record, so this
+         * boundary has to persist what it observed. Before review finding
+         * OBSEV-F12 the status was read off the `Response` and discarded, and
+         * the import had nothing to quote but a hardcoded 200.
+         */
+        describe('the status it records with the payload', () => {
+            it('writes the observed status on both branches of the upsert', async () => {
+                respondWith(jsonResponse(listPayload()));
+
+                await listFoods('Branded');
+                await jest.advanceTimersByTimeAsync(0);
+
+                expect(writtenStatuses()).toEqual([[200, 200]]);
+                expect(storedRow(listKey('Branded')).http_status).toBe(200);
+            });
+
+            /**
+             * A 2xx that is not 200 is what separates "records what USDA
+             * answered" from "records the number a developer expected": both
+             * satisfy `response.ok`, and only the first reports 201.
+             */
+            it('records the status the vendor actually answered, not a fixed 200', async () => {
+                respondWith(jsonResponse(listPayload(), 201));
+
+                await listFoods('Branded');
+                await jest.advanceTimersByTimeAsync(0);
+
+                expect(storedRow(listKey('Branded')).http_status).toBe(201);
+            });
+
+            it('records the successful attempt, not the retried 400 before it', async () => {
+                const key = listKey('Branded');
+                respondWith(failureResponse(400), jsonResponse(listPayload()));
+
+                const call = listFoods('Branded');
+                await jest.advanceTimersByTimeAsync(BACKOFF_SEQUENCE_MS[0]);
+                await call;
+                await jest.advanceTimersByTimeAsync(0);
+
+                expect(requestCount()).toBe(2);
+                expect(storedRow(key).http_status).toBe(200);
+            });
+
+            /**
+             * The refresh replaces the payload, so it must replace the status
+             * too — a refreshed row carrying the status of the response it no
+             * longer holds would be evidence about a payload that is gone.
+             */
+            it('replaces a legacy row without a status when the background refresh writes it back', async () => {
+                const key = listKey('Branded');
+                seedRow(key, listPayload(), SEARCH_TTL_MS + DAY_MS, null);
+                respondWith(jsonResponse([portionSample('fnddsPortions').payload], 200));
+
+                await listFoods('Branded');
+                await jest.advanceTimersByTimeAsync(0);
+
+                expect(writtenKeys()).toEqual([key]);
+                expect(storedRow(key).http_status).toBe(200);
+            });
+
+            it('leaves the status of a legacy row null while it is only being served', async () => {
+                const key = listKey('Branded');
+                seedRow(key, listPayload(), DAY_MS, null);
+
+                await expect(listFoods('Branded')).resolves.toHaveLength(1);
+
+                expect(requestCount()).toBe(0);
+                expect(writtenKeys()).toEqual([]);
+                expect(storedRow(key).http_status).toBeNull();
+            });
+        });
     });
 
     describe('the TTL a path resolves to', () => {
@@ -1891,6 +2083,254 @@ describe('the new fetchers', () => {
             const error = await vendorFailure(getFoodsBatch(BATCH_IDS));
 
             expect(error.message).toBe(notAnObjectMessage('batch'));
+        });
+    });
+
+    /**
+     * The provenance half of the batch fetcher (review finding OBSEV-F12).
+     *
+     * `catalog_validation_records.identity_evidence` is a §0.3.2 retrieval
+     * record and the upstream status is one of its mandatory fields, so the
+     * import cannot be left to infer one. Each fact here is asserted as
+     * *observed by the call*: the reason the facts travel out of the call at
+     * all is that the live path now awaits its own cache write, after which
+     * "is there a row?" answers `yes` for a fetch and a replay alike.
+     */
+    describe('getFoodsBatchWithRetrieval', () => {
+        const BATCH_IDS = [9000302, 9000301];
+        const BATCH_KEY = 'POST /foods?#{"fdcIds":[9000301,9000302],"format":"full"}';
+        const batchPayload = (): unknown[] => [
+            detailSample('brandedDetailComplete').payload,
+            detailSample('detailMissingCaloriesFallback').payload,
+        ];
+
+        const retrievalOf = async (ids: ReadonlyArray<string | number> = BATCH_IDS): Promise<UsdaBatchRetrievalFacts> =>
+            (await getFoodsBatchWithRetrieval(ids)).retrieval;
+
+        it('returns the same records getFoodsBatch does, under the same key', async () => {
+            respondWith(jsonResponse(batchPayload()));
+
+            const { details, retrieval } = await getFoodsBatchWithRetrieval(BATCH_IDS);
+            // Served from the row the call above wrote, so one queued response
+            // covers both: the delegation is what keeps them identical.
+            const plain = await getFoodsBatch(BATCH_IDS);
+
+            expect(details).toEqual(plain);
+            expect(requestCount()).toBe(1);
+            expect(retrieval.cacheKey).toBe(BATCH_KEY);
+            expect(retrieval.requestedFdcIds).toEqual([9000301, 9000302]);
+        });
+
+        it('reports a live fetch as network, with the status it observed and its own clock', async () => {
+            respondWith(jsonResponse(batchPayload()));
+
+            const retrieval = await retrievalOf();
+
+            expect(retrieval.origin).toBe('network');
+            expect(retrieval.httpStatus).toBe(200);
+            expect(retrieval.fetchedAt.getTime()).toBe(FIXED_NOW);
+            expect(retrieval.payload).toEqual(batchPayload());
+        });
+
+        /**
+         * The race this interface exists to close: the row the live call wrote
+         * is already readable when the caller inspects it, so a caller that
+         * derived the origin from row presence would call every fetch a cache
+         * hit. The origin is observed instead, and says `network`.
+         */
+        it('still reports network although the row it just wrote is already on record', async () => {
+            respondWith(jsonResponse(batchPayload()));
+
+            const retrieval = await retrievalOf();
+
+            expect(storedRow(BATCH_KEY).payload).toEqual(batchPayload());
+            expect(retrieval.origin).toBe('network');
+        });
+
+        /**
+         * The ordering root cause of OBSEV-F12's second half: this path used to
+         * fire the cache write and not await it, so the row a caller looked for
+         * straight afterwards was usually not there yet — and a caller reading
+         * provenance off the table concluded the response had come from cache.
+         *
+         * Proven against a write that lands on a later tick: a call that awaits
+         * its write cannot settle before the row is recorded, and the
+         * fire-and-forget version settles immediately.
+         */
+        it('does not settle until its cache write has been recorded', async () => {
+            const WRITE_LATENCY_MS = 5;
+            cache.upsert.mockImplementation(async ({ where, create }) => {
+                await new Promise<void>((resolve) => setTimeout(resolve, WRITE_LATENCY_MS));
+                const row: UsdaCacheRow = {
+                    cache_key: create.cache_key,
+                    payload: create.payload,
+                    http_status: create.http_status,
+                    fetched_at: new Date(Date.now()),
+                };
+                rows.set(where.cache_key, row);
+
+                return row;
+            });
+            respondWith(jsonResponse(batchPayload()));
+
+            let settled = false;
+            const call = getFoodsBatchWithRetrieval(BATCH_IDS);
+            void call.then(() => {
+                settled = true;
+            });
+
+            await jest.advanceTimersByTimeAsync(WRITE_LATENCY_MS - 1);
+
+            expect(rows.has(BATCH_KEY)).toBe(false);
+            expect(settled).toBe(false);
+
+            await jest.advanceTimersByTimeAsync(1);
+
+            expect(settled).toBe(true);
+            expect((await call).retrieval.origin).toBe('network');
+            expect(storedRow(BATCH_KEY).http_status).toBe(200);
+        });
+
+        it('reports a replay as cache, with the recorded status and the row fetched_at', async () => {
+            seedRow(BATCH_KEY, batchPayload(), 40 * DAY_MS, 200);
+
+            const retrieval = await retrievalOf();
+
+            expect(requestCount()).toBe(0);
+            expect(retrieval.origin).toBe('cache');
+            expect(retrieval.httpStatus).toBe(200);
+            expect(retrieval.fetchedAt.getTime()).toBe(FIXED_NOW - 40 * DAY_MS);
+            expect(retrieval.payload).toEqual(batchPayload());
+        });
+
+        it('quotes a recorded status that is not 200 rather than normalising it', async () => {
+            seedRow(BATCH_KEY, batchPayload(), DAY_MS, 201);
+
+            expect((await retrievalOf()).httpStatus).toBe(201);
+        });
+
+        /**
+         * A row cached before `usda_api_cache.http_status` existed carries no
+         * status, and the status is a mandatory field of the retrieval record
+         * this response becomes (AAP §0.3.2). Replaying such a row would make
+         * it an ABSORBING STATE — every later call would serve it, so the
+         * status could never be observed for that batch and the published
+         * evidence would stay null forever while this module looked correct.
+         * Re-fetching is the only way the field can ever be obtained, and
+         * substituting a 200 instead is precisely the defect OBSEV-F12 reports.
+         */
+        it('re-fetches a pre-ledger row rather than replaying it forever', async () => {
+            seedRow(BATCH_KEY, [{ fdcId: 1, description: 'Stale' }], 40 * DAY_MS, null);
+            respondWith(jsonResponse(batchPayload()));
+
+            const retrieval = await retrievalOf();
+
+            // Not a replay: this call went to the vendor, so the status it
+            // reports is one it actually observed.
+            expect(requestCount()).toBe(1);
+            expect(retrieval.origin).toBe('network');
+            expect(retrieval.httpStatus).toBe(200);
+            expect(retrieval.fetchedAt.getTime()).toBe(FIXED_NOW);
+            expect(retrieval.payload).toEqual(batchPayload());
+        });
+
+        /**
+         * The row is replaced whole. Annotating a pre-ledger row with a status
+         * obtained from a different response would attach this exchange's
+         * status to the older payload — the same fabrication in a subtler form
+         * — so payload, status and retrieval time move together.
+         */
+        it('replaces payload, status and fetched_at together, then serves the row', async () => {
+            seedRow(BATCH_KEY, [{ fdcId: 1, description: 'Stale' }], 40 * DAY_MS, null);
+            respondWith(jsonResponse(batchPayload(), 203));
+
+            await retrievalOf();
+
+            const row = storedRow(BATCH_KEY);
+            // The observed status, not a hardcoded 200.
+            expect(row.http_status).toBe(203);
+            expect(row.payload).toEqual(batchPayload());
+            expect(row.fetched_at.getTime()).toBe(FIXED_NOW);
+
+            // And the condition is SELF-CLEARING: the row now carries a status,
+            // so the next call replays it and spends no request. One re-fetch
+            // per pre-ledger batch, once, rather than added steady-state load.
+            const replay = await retrievalOf();
+
+            expect(requestCount()).toBe(1);
+            expect(replay.origin).toBe('cache');
+            expect(replay.httpStatus).toBe(203);
+        });
+
+        it('does not fail the vendor call when the cache write rejects', async () => {
+            const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+            cache.upsert.mockRejectedValue(new Error('read-only transaction'));
+            respondWith(jsonResponse(batchPayload()));
+
+            const { details, retrieval } = await getFoodsBatchWithRetrieval(BATCH_IDS);
+
+            expect(details).toHaveLength(2);
+            expect(retrieval.origin).toBe('network');
+            expect(retrieval.httpStatus).toBe(200);
+            // The failure is reported, not swallowed: a cache that stopped
+            // accepting writes is an operational fact, and the import's next
+            // run would otherwise re-spend the hour's requests in silence.
+            expect(logged).toHaveBeenCalledWith('Failed to cache USDA batch response:', 'read-only transaction');
+
+            logged.mockRestore();
+        });
+
+        it('falls through to a live fetch, reported as network, when findUnique rejects', async () => {
+            cache.findUnique.mockRejectedValueOnce(new Error('connection terminated'));
+            respondWith(jsonResponse(batchPayload()));
+
+            const retrieval = await retrievalOf();
+
+            expect(retrieval.origin).toBe('network');
+            expect(retrieval.httpStatus).toBe(200);
+        });
+
+        it('carries the status of the successful attempt, not of the retried 400', async () => {
+            respondWith(failureResponse(400), jsonResponse(batchPayload(), 200));
+
+            const call = getFoodsBatchWithRetrieval(BATCH_IDS);
+            await jest.advanceTimersByTimeAsync(BACKOFF_SEQUENCE_MS[0]);
+            const { retrieval } = await call;
+
+            expect(requestCount()).toBe(2);
+            expect(retrieval.httpStatus).toBe(200);
+            expect(storedRow(BATCH_KEY).http_status).toBe(200);
+        });
+
+        /**
+         * An empty batch issues no request and reads no row, so there is no
+         * retrieval to describe. Refusing is the point: the alternative is a
+         * fabricated origin and timestamp on an evidence record.
+         */
+        it('refuses an empty id list instead of inventing retrieval facts', async () => {
+            const error = await vendorFailure(getFoodsBatchWithRetrieval([]));
+
+            expect(error.message).toBe(
+                'USDA batch retrieval requires at least one FDC id: an empty batch makes no request, so there is ' +
+                    'nothing to describe',
+            );
+            expect(requestCount()).toBe(0);
+            expect(cache.findUnique).not.toHaveBeenCalled();
+        });
+
+        it('applies the same twenty-id cap and identity checks as getFoodsBatch', async () => {
+            const ids = Array.from({ length: MAX_BATCH_FDC_IDS + 1 }, (_unused, index) => 9000101 + index);
+
+            expect((await vendorFailure(getFoodsBatchWithRetrieval(ids))).message).toBe(
+                overLengthBatchMessage(MAX_BATCH_FDC_IDS + 1),
+            );
+
+            respondWith(jsonResponse([detailSample('detailNoServingFieldsServingTextNull').payload]));
+
+            expect((await vendorFailure(getFoodsBatchWithRetrieval(BATCH_IDS))).message).toBe(
+                unrequestedIdMessage(9000310),
+            );
+            expect(requestCount()).toBe(1);
         });
     });
 

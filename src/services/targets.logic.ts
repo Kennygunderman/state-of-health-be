@@ -26,7 +26,12 @@
 //  * BOUNDS ARE NOT A GOAL-SPECIFIC RULE. The floor applies to every goal, not
 //    just weight loss. See `applyTargetBounds`.
 
-import { MAX_REVISION, PREFERENCE_FIELD_CODES } from './preferences.logic';
+import {
+    MAX_REVISION,
+    PREFERENCE_FIELD_CODES,
+    SetupStateSnapshot,
+    nextSetupState,
+} from './preferences.logic';
 import {
     ActivityLevel,
     ClampReason,
@@ -39,6 +44,8 @@ import {
     PaceLbPerWeek,
     SaveEstimatedTargetsPayload,
     SaveManualTargetsPayload,
+    SetupStatus,
+    SetupStep,
     SexForEstimate,
     StoredEstimateSnapshot,
     TargetEstimateInputs,
@@ -246,13 +253,22 @@ export interface BoundedCalories {
 }
 
 /**
- * The `meal_plan_preferences` columns the estimate reads, as stored.
+ * The `meal_plan_preferences` columns the estimate reads, as stored — the seven
+ * stored answers the energy equation evaluates, and the complete set of them:
+ * a change to any one moves the figure {@link computeTargetEstimate} produces,
+ * and a change to anything outside this shape cannot.
  *
  * Declared structurally so a Prisma row satisfies it without this module
  * importing Prisma. Every enumerated column is `string | null` because the
  * backing columns are plain TEXT with no enum and no CHECK constraint: an
  * unrecognised value is possible in principle and is treated as unusable rather
  * than coerced to a default.
+ *
+ * `goal_weight_kg` IS DELIBERATELY ABSENT, and it is not an oversight. It is a
+ * destination the user typed, not a term in the equation — `calculateBmr` reads
+ * weight, height, age and sex, `calculateTdee` the activity level, and
+ * `calculateGoalAdjustment` the goal and the pace; nothing reads the goal
+ * weight, so changing "I'd like to reach 170 lb" moves no target.
  */
 export interface EstimateInputsRow {
     goal: string | null;
@@ -281,10 +297,8 @@ export interface EstimateInputsRow {
  * evaluated without it.
  *
  * It is deliberately NOT a member of {@link EstimateInputsRow}: that interface
- * is the key space of {@link ESTIMATE_INPUT_COLUMNS} and the argument shape of
- * {@link estimateInputsChanged}, which is about which answers move the
- * EQUATION. The route moves no term in the equation; it decides whether the
- * equation is asked at all.
+ * holds the answers that move the EQUATION. The route moves no term in the
+ * equation; it decides whether the equation is asked at all.
  */
 export interface EstimateAvailabilityRow extends EstimateInputsRow {
     target_route: string | null;
@@ -737,81 +751,6 @@ export const buildStoredEstimate = (estimate: TargetEstimateResponse): StoredEst
 });
 
 /* ---------------------------------------------------------------------------
- * The estimate's inputs, and when they have changed
- * ------------------------------------------------------------------------- */
-
-/**
- * The seven stored answers the energy equation reads — the complete set whose
- * change moves the figure {@link computeTargetEstimate} produces.
- *
- * Typed as keys of {@link EstimateInputsRow}, so a column added to that shape
- * stops this list compiling until it has been classified. The alternative is a
- * silent omission, and an omitted input is one whose change is never recorded
- * as a change of the user's calculable details.
- *
- * `goal_weight_kg` IS DELIBERATELY ABSENT, and it is not an oversight. It is a
- * destination the user typed, not a term in the equation — `calculateBmr` reads
- * weight, height, age and sex, `calculateTdee` the activity level, and
- * `calculateGoalAdjustment` the goal and the pace; nothing reads the goal
- * weight. Changing "I'd like to reach 170 lb" moves no target.
- *
- * `target_route` is absent for the same reason and a stronger one: it decides
- * whether the equation is evaluated at all rather than what it evaluates to,
- * which is why it lives on {@link EstimateAvailabilityRow} instead.
- */
-export const ESTIMATE_INPUT_COLUMNS: readonly (keyof EstimateInputsRow)[] = [
-    'goal',
-    'pace_lb_per_week',
-    'age',
-    'height_cm',
-    'weight_kg',
-    'sex_for_estimate',
-    'activity_level',
-];
-
-/**
- * Whether a pending column write actually changes one of the estimate's inputs.
- *
- * This is the rule behind `meal_plan_preferences.estimate_inputs_revision`, the
- * write-side counter `preferences.service.ts` maintains: it advances only where
- * a save moves one of the seven answers the energy equation actually reads, so
- * the column records "when did this user's calculable details last change?".
- *
- * IT IS NOT `TargetsResponse.stale`, and must not be made to be. Staleness is
- * the ancestry check AAP §0.5.2 defines — `targets_input_revision` against
- * `preferences.revision` — and {@link deriveTargetsResponse} is not even given
- * this counter, so the two cannot be conflated by editing one of them. What
- * this rule is good for is diagnosing the difference between the two questions
- * ("did anything change?" versus "did a term of the equation change?") without
- * either answer being inferred from the other.
- *
- * `writes` is the patch a save is about to apply, read in PRISMA'S OWN
- * SEMANTICS so that this rule and the statement it guards cannot disagree: a
- * key that is absent or `undefined` is not being written and is ignored, while
- * an explicit `null` is a clear and counts as a change when a value was stored.
- *
- * EQUALITY, NOT MENTION. Re-saving the body step with the same measurements
- * moves no input, so the counter stands still. Keying this off which step was
- * saved instead would advance it on every revisit of a wizard screen.
- *
- * `current === null` is the row's creation: writing an input then is a change
- * (there was no answer before it), writing an explicit null is not.
- */
-export const estimateInputsChanged = (
-    current: EstimateInputsRow | null,
-    writes: Partial<EstimateInputsRow>,
-): boolean =>
-    ESTIMATE_INPUT_COLUMNS.some((column) => {
-        const next = writes[column];
-
-        if (next === undefined) {
-            return false;
-        }
-
-        return current === null ? next !== null : next !== current[column];
-    });
-
-/* ---------------------------------------------------------------------------
  * Manual targets
  * ------------------------------------------------------------------------- */
 
@@ -1198,6 +1137,87 @@ export const assessFeasibility = (values: MealPlanMacroTotals): TargetsFeasibili
     }
 
     return { ok: warnings.length === 0, warnings };
+};
+
+/* ---------------------------------------------------------------------------
+ * PUT /meal-planning/targets — the manual route's setup stop
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The two server-owned setup columns a target save advances, as the row spells
+ * them.
+ *
+ * Snake_case because these are columns rather than a wire shape: the service
+ * spreads them straight into the statement that stores the confirmed targets,
+ * and naming them anything else would need a mapping layer for two values whose
+ * only consumer is that one UPDATE.
+ */
+export interface ManualSetupAdvance {
+    setup_step: SetupStep;
+    setup_status: SetupStatus;
+}
+
+/**
+ * Where setup stands after a MANUAL target confirmation — or nothing at all,
+ * which is the answer for every other way this route is reached.
+ *
+ * WHY A TARGET SAVE MOVES THE RESUME MARKER AT ALL. `targets_manual` is a stop
+ * on the manual route's wizard (`MANUAL_ROUTE_ORDER`), and it is the only stop
+ * that does not save as a setup step: the manual target screen commits through
+ * `PUT /meal-planning/targets` (AAP §0.7.4), so no
+ * `PUT /meal-planning/preferences/steps/:step` request can ever answer it. If
+ * this save leaves the marker alone, nothing does — a user who force-quits
+ * after saving their targets resumes on the target editor they just completed
+ * instead of on Diet, and the manual route stalls there.
+ *
+ * THE TRANSITION IS NOT DECIDED HERE. `nextSetupState` owns sequential
+ * progress, the monotonic status rule and the pull-back to a provably
+ * unanswered step, and it is handed `targets_manual` as the step just answered
+ * — which its own `isCurrentStop` already recognises as a stop a step save
+ * cannot reach. Naming the successor as a literal would fork that decision in
+ * two, and the fork would be invisible until someone reordered the route.
+ *
+ * EVERY GUARD IS A STATE THIS ROUTE REALLY REACHES, and each one must write
+ * nothing:
+ *
+ *  * NO ROW. A user editing targets from Account before any onboarding: the row
+ *    the save creates is `not_started` with no marker, and advancing it would
+ *    invent onboarding progress from a target edit.
+ *  * AN ESTIMATED CONFIRMATION. `ESTIMATED_ROUTE_ORDER` goes body → activity →
+ *    diet and has no target stop at all: that route confirms its figure on the
+ *    Review screen as the first step of generating (AAP §0.7.4), which is not a
+ *    wizard stop and earns no progress. The estimated arm also refuses a
+ *    manual-route row outright (`resolveEstimateInputs`), so a row bearing this
+ *    marker cannot reach a successful estimated save — the guard states the
+ *    rule rather than relying on that.
+ *  * `not_started`. The Account-only row again, on its second and later saves.
+ *  * `ready_for_review` or `completed`. The user has finished the wizard (and,
+ *    when completed, has a published week): this is the plan-settings target
+ *    editor, and awarding wizard progress there is precisely the regression the
+ *    state machine's monotonic status rule exists to prevent.
+ *  * A NON-MANUAL `target_route`. A row that has moved back to the estimated
+ *    route since the marker was written; its stops are the estimated ones.
+ *  * A MARKER THAT IS NOT `targets_manual`. Either an edit-mode re-save from
+ *    later in the wizard, or a row already past the target screen — the stop
+ *    has been answered once and progress is not earned twice.
+ */
+export const resolveManualTargetSetupAdvance = (
+    stored: SetupStateSnapshot | null,
+    source: TargetRoute,
+): ManualSetupAdvance | null => {
+    if (
+        stored === null ||
+        source !== 'manual' ||
+        stored.setupStatus !== 'in_progress' ||
+        stored.targetRoute !== 'manual' ||
+        stored.setupStep !== 'targets_manual'
+    ) {
+        return null;
+    }
+
+    const transition = nextSetupState(stored, 'targets_manual', 'manual');
+
+    return { setup_step: transition.setupStep, setup_status: transition.setupStatus };
 };
 
 /* ---------------------------------------------------------------------------

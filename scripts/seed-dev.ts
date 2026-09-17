@@ -69,6 +69,21 @@
 //     library permanently, so seeding foods would leave the Add Food screen
 //     worse than seeding nothing does.
 //
+// WHAT IT NEVER LOGS. No line this file emits carries the email or the raw user
+// id. Both arrive from the operator — `--user-id` can name a real Firebase uid
+// and `--email` a real address — so a log that echoed them would persist a
+// person's identifiers on a developer machine or in CI (CWE-532). Every event
+// reports `userRef` instead, the one-way truncated digest defined in the
+// Reporting section below, and reports each object as its outcome code rather
+// than its value, so no nutrition target, weight or diary bucket name is
+// printed either. The only place the defaults appear in full is `--help`, which
+// documents two constants declared in this file rather than anybody's data.
+// THE FAILURE PATH HOLDS THE SAME LINE BY PROVENANCE: a message this
+// repository composed is forwarded, a message Prisma or the runtime composed is
+// not, because those serialize the arguments of the call that failed and
+// removing an identity from text by substitution can only remove the spellings
+// it was handed. See `describeFailure` and `failureFields`.
+//
 // ITS DATABASE IS DEVELOPMENT ONLY, AND THERE IS NO DOOR. `seed-dev` is
 // `development_only` in scripts/lib/dbGuard.ts, which refuses a test, shadow or
 // unrecognised origin at module load. `--confirm-target` is deliberately absent:
@@ -89,12 +104,23 @@
 import './lib/bootstrap';
 import './lib/dbGuard';
 
+// A Node builtin with no import-time side effect, so it sits below the two
+// guards without weakening either ordering. It exists here for one reason: the
+// only identity this stage may write to a log is a one-way digest of the user
+// id (see `userRef`).
+import { createHash } from 'node:crypto';
+
 import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
 import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
 import type { LogFields, LogLevel } from './lib/logger';
 import { prisma } from '../src/prisma/client';
 import { Prisma } from '../src/generated/prisma';
 import type { PrismaClient } from '../src/generated/prisma';
+// The per-user advisory lock, taken through the module that owns it rather than
+// re-spelled here. See `runSeed` for why a seeder takes the same lock the
+// request path takes; `scripts/` importing from `../src/` is the sanctioned
+// direction and this file already does it for the Prisma client above.
+import { withUserLock } from '../src/services/mealPlanningAction.service';
 
 const STAGE = 'seed-dev';
 
@@ -307,8 +333,6 @@ const DEV_PREFERENCE_ANSWERS = {
     // false. Moving either number alone is how a suite reaches `stale: true`.
     targets_input_revision: 1,
     revision: 1,
-    // Coherence only — no query reads it (see prisma/schema.prisma).
-    estimate_inputs_revision: 1,
 };
 
 /**
@@ -704,10 +728,34 @@ export interface DevelopmentIdentity {
     readonly email: string;
 }
 
-/** What one run did, per object, so created and unchanged are never conflated. */
+/**
+ * The identity a parsed command line names: whichever of `--user-id` and
+ * `--email` were supplied, each falling back to its development default.
+ *
+ * Exported and pure so the defaulting rule is one function rather than two
+ * expressions in `main` — and so a test exercises the rule the command really
+ * uses. It is the last place in this file that handles the raw values as data:
+ * everything downstream either writes them to their own columns or reports them
+ * through {@link userRef}.
+ */
+export const resolveIdentity = (options: SeedOptions): DevelopmentIdentity => ({
+    userId: options.userId === null ? DEFAULT_DEV_USER_ID : options.userId,
+    email: options.email === null ? DEFAULT_DEV_USER_EMAIL : options.email,
+});
+
+/**
+ * What one run did, per object, so created and unchanged are never conflated.
+ *
+ * It carries NO email. The address is an input this stage writes to
+ * `users.email` and has no business handing back: its only former consumer was
+ * the completion log line, which now reports {@link userRef} instead, and a
+ * field that exists on a summary is a field the next caller will log (see
+ * `completionFields`). `userId` stays, because a summary that could not name
+ * the row it acted on would be unusable to a programmatic caller — and because
+ * it is what {@link userRef} is computed from.
+ */
 export interface SeedSummary {
     readonly userId: string;
-    readonly email: string;
     readonly date: string;
     /** Whether `--reset-user` actually removed a row (false when none existed). */
     readonly userReset: boolean;
@@ -833,6 +881,29 @@ const asColumnRecord = (value: object): Record<string, unknown> => value as unkn
  * `confirmed_targets` are compared against each other by the canonical read, so
  * a run that wrote one and failed before the other would leave a user the
  * planner refuses as `legacy` — see the module header.
+ *
+ * IT TAKES THE PER-USER MEAL-PLANNING LOCK FIRST, and it is the same lock the
+ * request path takes. Agent Action Plan §0.5.1's "lock first" rule covers every
+ * mutating meal-planning transaction — preference and target saves included —
+ * and the rows below are exactly those: `meal_plan_preferences` (with
+ * `confirmed_targets`), the four `users.target_*` columns, this user's diary
+ * buckets and its weigh-in, plus a `--reset-user` delete that CASCADES to its
+ * plans, grocery items and action ledger. A developer seeding while the app is
+ * writing for the same user is therefore a real interleaving: without the lock
+ * this transaction could converge the preferences row between a plan
+ * generation's revision check and its insert, or delete a user mid-swap. Taking
+ * `withUserLock` from `src/services/mealPlanningAction.service.ts` rather than
+ * issuing the SQL again here is what keeps ONE definition of the key
+ * (`hashtext('meal-planning:' || userId)`) — a second spelling that drifted by
+ * one character would be a lock nobody contends for, and it would look exactly
+ * like this code.
+ *
+ * The lock is TRANSACTION-SCOPED: `pg_advisory_xact_lock` is released at COMMIT
+ * and at ROLLBACK, so there is no unlock call for this script to forget and an
+ * interrupted seed cannot wedge the user it was seeding. It is taken before the
+ * reset delete and before the first read, so every outcome below is decided
+ * against state no other session can move underneath it — which is what makes
+ * `unchanged` a claim about the row rather than about a moment.
  */
 export const runSeed = async (options: SeedDevOptions): Promise<SeedSummary> => {
     const { client, identity } = options;
@@ -848,140 +919,287 @@ export const runSeed = async (options: SeedDevOptions): Promise<SeedSummary> => 
         throw new SeedDevError(`${dayKey} is not a calendar date as YYYY-MM-DD`, 'invalid_date', dayKey);
     }
 
-    return client.$transaction(async (tx) => {
-        // `deleteMany` rather than `delete` so an absent user is a count of 0
-        // instead of a P2025 to catch, and the predicate is the owner key
-        // itself (§5.1: for `users`, `id` IS the owner key). The schema's
-        // ON DELETE CASCADE declarations carry it to this user's preferences,
-        // diary, weigh-ins, foods, plans and workouts — nothing else, and
-        // never a truncate.
-        const resetCount = options.resetUser
-            ? (await tx.users.deleteMany({ where: { id: identity.userId } })).count
-            : 0;
+    // The lock wraps the whole body rather than a prefix of it, so nothing here
+    // runs unserialised: `withUserLock` issues the advisory lock as the first
+    // statement of this transaction and only then calls back.
+    return client.$transaction((tx) =>
+        withUserLock(tx, identity.userId, async (locked) => {
+            // `deleteMany` rather than `delete` so an absent user is a count of 0
+            // instead of a P2025 to catch, and the predicate is the owner key
+            // itself (§5.1: for `users`, `id` IS the owner key). The schema's
+            // ON DELETE CASCADE declarations carry it to this user's preferences,
+            // diary, weigh-ins, foods, plans and workouts — nothing else, and
+            // never a truncate.
+            const resetCount = options.resetUser
+                ? (await locked.users.deleteMany({ where: { id: identity.userId } })).count
+                : 0;
 
-        const declaredUser = developmentUserFields(identity.email);
-        const existingUser = await tx.users.findUnique({
-            where: { id: identity.userId },
-            select: {
-                email: true,
-                target_calories: true,
-                target_protein_g: true,
-                target_carbs_g: true,
-                target_fat_g: true,
-            },
-        });
-
-        const userOutcome: RowOutcome =
-            existingUser === null
-                ? 'created'
-                : matchesDeclaredColumns(asColumnRecord(existingUser), asColumnRecord(declaredUser))
-                  ? 'unchanged'
-                  : 'updated';
-
-        if (userOutcome !== 'unchanged') {
-            await tx.users.upsert({
+            const declaredUser = developmentUserFields(identity.email);
+            const existingUser = await locked.users.findUnique({
                 where: { id: identity.userId },
-                create: { id: identity.userId, ...declaredUser },
-                update: declaredUser,
-            });
-        }
-
-        const declaredPreferences = developmentPreferenceFields();
-        const existingPreferences = await tx.meal_plan_preferences.findUnique({
-            where: { user_id: identity.userId },
-        });
-
-        const preferencesOutcome: RowOutcome =
-            existingPreferences === null
-                ? 'created'
-                : matchesDeclaredColumns(asColumnRecord(existingPreferences), asColumnRecord(declaredPreferences))
-                  ? 'unchanged'
-                  : 'updated';
-
-        // CONVERGED, not create-if-absent: a row left half-answered by an
-        // abandoned wizard run is completed here, because "this user can
-        // generate a week" is the guarantee the script exists to make and a
-        // skipped row cannot honour it. The write is skipped only when the row
-        // already holds every declared value, so a rerun touches nothing.
-        if (preferencesOutcome !== 'unchanged') {
-            await tx.meal_plan_preferences.upsert({
-                where: { user_id: identity.userId },
-                create: { user_id: identity.userId, ...declaredPreferences },
-                update: declaredPreferences,
-            });
-        }
-
-        const mealsCreated: string[] = [];
-        const mealsExisting: string[] = [];
-
-        // `meals` has no unique constraint over (user_id, date, name) — the app
-        // lets a user add and rename meals freely — so this is a scoped lookup
-        // and a conditional insert rather than an upsert. Every predicate
-        // carries `user_id` (§5.1) and `deleted_at: null`, so a bucket the user
-        // deleted stays deleted and is recreated as a new row instead of being
-        // revived. `sort_order` is the index, which is the same value
-        // `getDailyMacros` assigns when it self-heals a day, so a seeded day
-        // sorts identically to a lazily created one.
-        for (let index = 0; index < DIARY_MEAL_NAMES.length; index += 1) {
-            const name = DIARY_MEAL_NAMES[index];
-            const existingMeal = await tx.meals.findFirst({
-                where: { user_id: identity.userId, date, name, deleted_at: null },
-                select: { id: true },
-            });
-
-            if (existingMeal !== null) {
-                mealsExisting.push(name);
-                continue;
-            }
-
-            await tx.meals.create({
-                data: { user_id: identity.userId, date, name, sort_order: index },
-            });
-            mealsCreated.push(name);
-        }
-
-        // The weigh-in follows the shipped reasoning of
-        // `food.service.ts::seedStarterFoodsIfEmpty` exactly: seed only when
-        // the user has never had one. The count carries no date or state
-        // filter, so a weigh-in the developer deleted counts as "had" and is
-        // not resurrected — and one weigh-in is all the About-you prefill
-        // reads, so a second would be noise.
-        const weighInCount = await tx.body_weight_entries.count({ where: { user_id: identity.userId } });
-        const weighInOutcome: SeedSummary['weighInOutcome'] = weighInCount > 0 ? 'existing' : 'created';
-
-        if (weighInOutcome === 'created') {
-            await tx.body_weight_entries.create({
-                data: {
-                    user_id: identity.userId,
-                    weight: DEV_WEIGH_IN_WEIGHT_AS_TYPED,
-                    logged_at: options.now(),
+                select: {
+                    email: true,
+                    target_calories: true,
+                    target_protein_g: true,
+                    target_carbs_g: true,
+                    target_fat_g: true,
                 },
             });
-        }
 
-        return {
-            userId: identity.userId,
-            email: identity.email,
-            date: dayKey,
-            userReset: resetCount > 0,
-            userOutcome,
-            preferencesOutcome,
-            mealsCreated,
-            mealsExisting,
-            weighInOutcome,
-            changed:
-                resetCount > 0 ||
-                userOutcome !== 'unchanged' ||
-                preferencesOutcome !== 'unchanged' ||
-                mealsCreated.length > 0 ||
-                weighInOutcome === 'created',
-        };
-    });
+            const userOutcome: RowOutcome =
+                existingUser === null
+                    ? 'created'
+                    : matchesDeclaredColumns(asColumnRecord(existingUser), asColumnRecord(declaredUser))
+                      ? 'unchanged'
+                      : 'updated';
+
+            if (userOutcome !== 'unchanged') {
+                await locked.users.upsert({
+                    where: { id: identity.userId },
+                    create: { id: identity.userId, ...declaredUser },
+                    update: declaredUser,
+                });
+            }
+
+            const declaredPreferences = developmentPreferenceFields();
+            const existingPreferences = await locked.meal_plan_preferences.findUnique({
+                where: { user_id: identity.userId },
+            });
+
+            const preferencesOutcome: RowOutcome =
+                existingPreferences === null
+                    ? 'created'
+                    : matchesDeclaredColumns(asColumnRecord(existingPreferences), asColumnRecord(declaredPreferences))
+                      ? 'unchanged'
+                      : 'updated';
+
+            // CONVERGED, not create-if-absent: a row left half-answered by an
+            // abandoned wizard run is completed here, because "this user can
+            // generate a week" is the guarantee the script exists to make and a
+            // skipped row cannot honour it. The write is skipped only when the row
+            // already holds every declared value, so a rerun touches nothing.
+            if (preferencesOutcome !== 'unchanged') {
+                await locked.meal_plan_preferences.upsert({
+                    where: { user_id: identity.userId },
+                    create: { user_id: identity.userId, ...declaredPreferences },
+                    update: declaredPreferences,
+                });
+            }
+
+            const mealsCreated: string[] = [];
+            const mealsExisting: string[] = [];
+
+            // `meals` has no unique constraint over (user_id, date, name) — the app
+            // lets a user add and rename meals freely — so this is a scoped lookup
+            // and a conditional insert rather than an upsert. Every predicate
+            // carries `user_id` (§5.1) and `deleted_at: null`, so a bucket the user
+            // deleted stays deleted and is recreated as a new row instead of being
+            // revived. `sort_order` is the index, which is the same value
+            // `getDailyMacros` assigns when it self-heals a day, so a seeded day
+            // sorts identically to a lazily created one.
+            for (let index = 0; index < DIARY_MEAL_NAMES.length; index += 1) {
+                const name = DIARY_MEAL_NAMES[index];
+                const existingMeal = await locked.meals.findFirst({
+                    where: { user_id: identity.userId, date, name, deleted_at: null },
+                    select: { id: true },
+                });
+
+                if (existingMeal !== null) {
+                    mealsExisting.push(name);
+                    continue;
+                }
+
+                await locked.meals.create({
+                    data: { user_id: identity.userId, date, name, sort_order: index },
+                });
+                mealsCreated.push(name);
+            }
+
+            // The weigh-in follows the shipped reasoning of
+            // `food.service.ts::seedStarterFoodsIfEmpty` exactly: seed only when
+            // the user has never had one. The count carries no date or state
+            // filter, so a weigh-in the developer deleted counts as "had" and is
+            // not resurrected — and one weigh-in is all the About-you prefill
+            // reads, so a second would be noise.
+            const weighInCount = await locked.body_weight_entries.count({ where: { user_id: identity.userId } });
+            const weighInOutcome: SeedSummary['weighInOutcome'] = weighInCount > 0 ? 'existing' : 'created';
+
+            if (weighInOutcome === 'created') {
+                await locked.body_weight_entries.create({
+                    data: {
+                        user_id: identity.userId,
+                        weight: DEV_WEIGH_IN_WEIGHT_AS_TYPED,
+                        logged_at: options.now(),
+                    },
+                });
+            }
+
+            return {
+                userId: identity.userId,
+                date: dayKey,
+                userReset: resetCount > 0,
+                userOutcome,
+                preferencesOutcome,
+                mealsCreated,
+                mealsExisting,
+                weighInOutcome,
+                changed:
+                    resetCount > 0 ||
+                    userOutcome !== 'unchanged' ||
+                    preferencesOutcome !== 'unchanged' ||
+                    mealsCreated.length > 0 ||
+                    weighInOutcome === 'created',
+            };
+        }),
+    );
 };
 
 // ---------------------------------------------------------------------------
 // Reporting.
+//
+// NO LOG LINE THIS FILE EMITS CARRIES THE EMAIL OR THE RAW USER ID, and that is
+// a rule about this whole section rather than about two call sites. `--email`
+// and `--user-id` are operator-supplied, and the second is a Firebase uid in
+// production, so a developer pointing this script at their own signed-in
+// account would otherwise persist that account's identifiers into a terminal
+// scrollback, a `tee`'d file or a CI log — CWE-532, and exactly what Rule
+// backend-architecture §8's "log a safe message" and Agent Action Plan §0.10
+// forbid. `scripts/lib/logger.ts` scrubs SECRETS (connection-string userinfo
+// and vendor keys); an email address is neither, so the redaction has to happen
+// where the values are known, which is here.
+//
+// What replaces them is `userRef` below, and what replaces the health-shaped
+// detail is the outcome CODES the run already computed: `target_source`, the
+// per-object `created | updated | unchanged`, the weigh-in's
+// `created | existing`, and counts where names used to be. Every field an
+// operator needs to answer "did this run do anything, to which user, on which
+// day" survives; nothing that describes a person does.
+//
+// The failure path is the one place where the TEXT is not this file's to
+// compose, and it is settled by provenance rather than by inspection: only a
+// message written in this repository is forwarded (with `redactIdentity` over
+// it as a second line), while a vendor's is replaced by the class, the code, a
+// remedy composed here and the phase the run reached. `describeFailure`
+// explains why a vendor message cannot be cleaned by substitution.
 // ---------------------------------------------------------------------------
+
+/**
+ * The length of {@link userRef}'s digest in hex characters — 12, so 48 bits.
+ *
+ * Long enough that two development identities on one machine will not collide
+ * (the birthday bound is ~2^24 distinct ids), short enough to read back out of
+ * a log line at a glance. Truncation is also the second reason the value cannot
+ * be turned back into an id: even an attacker who guesses the construction is
+ * left with a 48-bit prefix that many inputs share.
+ */
+const USER_REF_HEX_LENGTH = 12;
+
+/** What stands in for the address, matching `logger.ts`'s marker for a scrubbed value. */
+const REDACTED_EMAIL = '***';
+
+/**
+ * The only form of a user's identity this stage ever logs: a stable, one-way,
+ * truncated fingerprint of the user id.
+ *
+ * ONE-WAY, so nothing identifying is written — SHA-256 has no inverse, and the
+ * digest is truncated on top of that, so the field cannot be reversed into the
+ * uid or the address it stands for. STABLE, so it is still useful: two runs for
+ * the same developer produce the same `userRef` and their log lines correlate,
+ * which is the whole diagnostic value the raw id used to provide. It is derived
+ * from the user id alone, never from the email, because the id is the value
+ * every row in this seed is keyed by.
+ *
+ * It is NOT a security boundary against a determined guesser — a short list of
+ * candidate uids can be hashed and compared — and it is not offered as one.
+ * What it buys is the whole difference that matters here: a development log
+ * holds an opaque correlator instead of a person's identifiers.
+ */
+export const userRef = (userId: string): string =>
+    createHash('sha256').update(userId, 'utf8').digest('hex').slice(0, USER_REF_HEX_LENGTH);
+
+/**
+ * Removes the two raw identity values from a string this stage is about to
+ * report, replacing the user id with its {@link userRef} and the address with a
+ * fixed marker.
+ *
+ * IT IS DEFENCE IN DEPTH AND NOT THE GUARANTEE, and the difference is
+ * load-bearing enough to state first, because believing the opposite is what
+ * put a hole here once. Literal substitution can only remove the spellings it
+ * is handed. A message composed by someone else can carry the same value in a
+ * spelling that is not the value: `PrismaClientValidationError` SERIALIZES the
+ * arguments of the rejected call, so a uid containing a quote, a backslash or a
+ * control character arrives as its ESCAPED representation —
+ * `synthetic-uid-quote-\"-tail` for a `--user-id` ending `quote-"-tail` — which
+ * matches neither needle and survived this function intact. The set of
+ * escapings a vendor may apply is not enumerable from here, so no amount of
+ * additional cases would close that; what closes it is
+ * {@link failureFields} NOT FORWARDING a message this file did not compose
+ * ({@link describeFailure}'s `provenance`). This function then runs over the
+ * text that is still forwarded — this stage's own messages, which quote no
+ * argument — as a second line rather than as the first.
+ *
+ * The two needles are applied LONGEST FIRST, which matters when one contains
+ * the other: with `--user-id dev` and `--email dev@soh.invalid`, replacing the
+ * shorter needle first would rewrite the address into `<ref>@soh.invalid` and
+ * leave the remainder unmatched. `split`/`join` rather than `replaceAll` so the
+ * needle is never interpreted as a pattern, and an empty needle is skipped
+ * because splitting on `''` would explode the text character by character.
+ */
+export const redactIdentity = (text: string, identity: DevelopmentIdentity | null): string => {
+    if (identity === null) {
+        return text;
+    }
+
+    const replacements: readonly { readonly needle: string; readonly replacement: string }[] = [
+        { needle: identity.userId, replacement: userRef(identity.userId) },
+        { needle: identity.email, replacement: REDACTED_EMAIL },
+    ]
+        .filter((entry) => entry.needle.length > 0)
+        .sort((left, right) => right.needle.length - left.needle.length);
+
+    return replacements.reduce((redacted, entry) => redacted.split(entry.needle).join(entry.replacement), text);
+};
+
+/**
+ * The fields `stage_invoked` reports: which user (as a fingerprint), which day,
+ * and whether the reset was asked for. Pure, and exported so the redaction is
+ * asserted against the production builder rather than against a copy of it.
+ */
+export const invocationFields = (input: {
+    readonly identity: DevelopmentIdentity;
+    readonly dayKey: string;
+    readonly resetUser: boolean;
+}): LogFields => ({
+    stage: STAGE,
+    userRef: userRef(input.identity.userId),
+    date: input.dayKey,
+    resetUser: input.resetUser,
+});
+
+/**
+ * The fields `seed_complete` reports.
+ *
+ * `changed: false` is the honest form of "idempotent": a rerun says so per
+ * object rather than leaving an operator to infer it from silence. Every object
+ * is reported as its OUTCOME CODE and never as its value — `targetSource` is
+ * the route the row claims (`estimated`), not the four numbers, which are a
+ * declared constant an operator can read in this file and are nobody's business
+ * in a log; the diary line reports how many buckets were created against how
+ * many were already there, without naming a user's diary.
+ */
+export const completionFields = (summary: SeedSummary): LogFields => ({
+    stage: STAGE,
+    userRef: userRef(summary.userId),
+    date: summary.date,
+    changed: summary.changed,
+    userReset: summary.userReset,
+    users: summary.userOutcome,
+    mealPlanPreferences: summary.preferencesOutcome,
+    targetSource: DEV_PREFERENCE_ANSWERS.target_source,
+    bodyWeightEntries: summary.weighInOutcome,
+    mealsCreatedCount: summary.mealsCreated.length,
+    mealsExistingCount: summary.mealsExisting.length,
+});
 
 const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
     const fields: LogFields = { stage: STAGE, gapCount: gaps.length };
@@ -995,9 +1213,41 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 };
 
 /**
+ * WHO COMPOSED THE MESSAGE — the one fact that decides whether it may be
+ * reported, and a fact about PROVENANCE rather than about how safe a particular
+ * sentence looks.
+ *
+ * `first_party` is a message written in this repository: this file's own
+ * {@link SeedDevError} and the guard's `DatabaseOriginError`. Neither
+ * interpolates an invocation argument — they name a day key, a flag, a host or
+ * a database class, all of which are either this file's constants or values an
+ * operator has to see — so forwarding them costs nothing and tells the operator
+ * exactly what happened.
+ *
+ * `vendor` is a message composed by something outside this repository: Prisma
+ * and the JavaScript runtime. Those DO echo call arguments —
+ * `PrismaClientValidationError` prints the serialized arguments of the rejected
+ * call, and V8 raises `RangeError: Invalid time zone specified: <value>` — and
+ * they echo them through an escaping this file cannot enumerate, which is why
+ * {@link redactIdentity} cannot be trusted to clean them and why
+ * {@link failureFields} reports the class, the code and a remedy instead.
+ * `unexpected_error` is `vendor` for the same reason it is `unexpected`: an
+ * unrecognised throw has no known author, and "withhold unless known safe" is
+ * the only direction that fails closed.
+ */
+type MessageProvenance = 'first_party' | 'vendor';
+
+interface FailureDescription {
+    readonly code: string;
+    readonly provenance: MessageProvenance;
+    readonly error: { readonly name: string; readonly message: string };
+}
+
+/**
  * Every error class this stage can raise or observe gets its own reported code:
  * its own `SeedDevError` first, then the guard's `DatabaseOriginError`, then
- * Prisma's.
+ * Prisma's. Each also gets its {@link MessageProvenance}, which is what decides
+ * whether the message travels.
  *
  * The catalog error vocabulary (ManifestError, ModelBudgetError,
  * RateLimitConfigError, CheckpointError) is deliberately absent: this file
@@ -1005,45 +1255,212 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
  * can arise here, and importing a module only to narrow an impossible branch
  * would load the catalog ledger into a development seeder. What can arise is
  * Prisma's own failures, and those are what is narrowed — a known request error
- * keeps its `P####` code, which is the code an operator searches for, and
- * `unexpected_error` remains the honest answer for anything unrecognised.
+ * keeps its `P####` code, which is the code an operator searches for and which
+ * is SAFE TO REPORT because Prisma's codes are enumerated constants rather than
+ * anything derived from the call — and `unexpected_error` remains the honest
+ * answer for anything unrecognised.
+ *
+ * `safeError` is still what reads the name and message: it scrubs SECRETS
+ * (connection-string userinfo, vendor keys) from both, which is orthogonal to
+ * the identity question and wanted on either branch. The class name is taken
+ * from it rather than from `constructor.name` for that reason.
  */
-const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
+const describeFailure = (error: unknown): FailureDescription => {
     if (error instanceof SeedDevError) {
-        return { code: error.code, error: safeError(error) };
+        return { code: error.code, provenance: 'first_party', error: safeError(error) };
     }
     if (error instanceof DatabaseOriginError) {
-        return { code: error.code, error: safeError(error) };
+        return { code: error.code, provenance: 'first_party', error: safeError(error) };
     }
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
-        return { code: error.code, error: safeError(error) };
+        return { code: error.code, provenance: 'vendor', error: safeError(error) };
     }
     if (error instanceof Prisma.PrismaClientInitializationError) {
-        return { code: 'prisma_initialization_failed', error: safeError(error) };
+        return { code: 'prisma_initialization_failed', provenance: 'vendor', error: safeError(error) };
     }
     if (error instanceof Prisma.PrismaClientValidationError) {
-        return { code: 'prisma_validation_failed', error: safeError(error) };
+        return { code: 'prisma_validation_failed', provenance: 'vendor', error: safeError(error) };
     }
     // Retained below `SeedDevError`, which is what this stage throws for a bad
     // day key now. A built-in `RangeError` can still reach here from elsewhere
     // — `Intl` and the `Date` constructor raise it — and reporting that under
-    // the same code is more useful than `unexpected_error`.
+    // the same code is more useful than `unexpected_error`. Its message is the
+    // runtime's, though, and `Invalid time zone specified: <value>` is an
+    // argument echo, so it is `vendor`.
     if (error instanceof RangeError) {
-        return { code: 'invalid_date', error: safeError(error) };
+        return { code: 'invalid_date', provenance: 'vendor', error: safeError(error) };
     }
-    return { code: 'unexpected_error', error: safeError(error) };
+    return { code: 'unexpected_error', provenance: 'vendor', error: safeError(error) };
 };
 
 /**
- * The two Prisma failures an operator will actually hit here, given their own
- * remedy on top of the code: a database the migration has not reached, and an
- * email already held by another user row.
+ * What stands in the `message` field of a failure whose text this file did not
+ * compose.
+ *
+ * A fixed sentence written here, so the line still says why it carries no
+ * message rather than looking like an error that had none. It names the reason
+ * because an operator who reads it should not go looking for the missing text:
+ * it was not truncated or lost, it was refused.
  */
-const PRISMA_REMEDIES: Readonly<Record<string, string>> = {
+const WITHHELD_VENDOR_MESSAGE =
+    'withheld: a message composed outside this repository can echo the arguments of the call that failed, ' +
+    'including the seeded user id and email. Report fields: code, remedy, phase.';
+
+/**
+ * A remedy for every code whose MESSAGE IS WITHHELD, composed in this file.
+ *
+ * It is what keeps the operator able to act. A withheld vendor sentence takes
+ * the vendor's own suggestion with it, so a code left without a remedy here
+ * would leave a failure line that names a problem and no next step — which
+ * would make the redaction a cost rather than a trade. Every string below is
+ * this file's own prose about this stage's own inputs and flags, and none names
+ * a value the operator supplied.
+ *
+ * A first-party code is deliberately absent: `SeedDevError` and
+ * `DatabaseOriginError` carry their remedy inside the message that is forwarded
+ * with them, and a second copy here would be a second place to keep in step.
+ */
+const WITHHELD_CODE_REMEDIES: Readonly<Record<string, string>> = {
     P2021: 'The table does not exist in this database. Run "npx prisma migrate deploy" against this DATABASE_URL.',
+    // Names the FLAGS to pass, never the value that collided — the colliding
+    // address is the operator's own input and reporting it back is the same
+    // leak as logging it in the first place.
     P2002: 'Another row already holds that unique value. Pass a different --email, or --user-id to seed a different user.',
     P1001: 'The database could not be reached. Check that it is running and that DATABASE_URL names the right host and port.',
+    prisma_validation_failed:
+        'The seed called Prisma with arguments this schema does not accept, so the generated client and the ' +
+        'migrated schema disagree. Run "npx prisma generate", then "npx prisma migrate deploy" against this ' +
+        'DATABASE_URL, and seed again.',
+    prisma_initialization_failed:
+        'Prisma could not start against this DATABASE_URL. Check that the variable is set, that it names a ' +
+        'reachable host and port, and that the credentials in it are still valid.',
+    invalid_date:
+        'Pass --date as a real calendar day in YYYY-MM-DD form, or omit it to seed today (UTC). The reported ' +
+        'phase says whether the day was rejected before the transaction opened.',
+    unexpected_error:
+        'This failure matched no class this stage knows. The reported error name and phase are what to act on: ' +
+        're-run with --help to confirm the flags, confirm DATABASE_URL names your development database, and ' +
+        'search the error name if it is a dependency\u2019s.',
 };
+
+/**
+ * The remedy for a Prisma code that has no entry above.
+ *
+ * Prisma's `P####` space is open-ended and grows with the client, so the record
+ * cannot be exhaustive over it. This says what is true of all of them and
+ * points at the one authority that is: the code itself.
+ */
+const UNMAPPED_VENDOR_REMEDY =
+    'No remedy is recorded for this code in this stage. It is the vendor\u2019s own error code: look it up in ' +
+    'that vendor\u2019s error reference, clear the cause, and seed again.';
+
+/**
+ * The remedy to report for one described failure, or `undefined` when the
+ * forwarded message already carries it.
+ */
+const remedyFor = (failure: FailureDescription): string | undefined => {
+    if (Object.prototype.hasOwnProperty.call(WITHHELD_CODE_REMEDIES, failure.code)) {
+        return WITHHELD_CODE_REMEDIES[failure.code];
+    }
+    return failure.provenance === 'vendor' ? UNMAPPED_VENDOR_REMEDY : undefined;
+};
+
+/**
+ * How far the run had got, reported so a failure says WHERE it failed without
+ * quoting a message that would say where by quoting the call.
+ *
+ * `startup` covers flag parsing and the origin classification, `preflight` the
+ * schema check, `seed` the transaction itself, and `reporting` everything after
+ * the transaction committed — which is where a failure closing the connection
+ * pool lands. The value only ever moves forward, so what is reported is the
+ * furthest point the run reached, which for a failure is the step it failed in.
+ */
+export type SeedPhase = 'startup' | 'preflight' | 'seed' | 'reporting';
+
+/**
+ * The fields `stage_failed` reports: the machine code, a remedy, the phase the
+ * run had reached, and the error's CLASS — with its message forwarded only when
+ * this repository composed it.
+ *
+ * WHAT IT REPORTS AND WHY THAT IS THE USEFUL SET. A vendor-composed message is
+ * withheld rather than redacted, because redaction is literal and a vendor's
+ * serialization is not: see {@link redactIdentity} and
+ * {@link describeFailure}'s `provenance` for the escaped uid that survived
+ * substitution. What replaces it is what this file owns and what is stable —
+ * the error class, the machine code (a Prisma `P####` is an enumerated
+ * constant, not an argument echo), a remedy composed in
+ * {@link WITHHELD_CODE_REMEDIES}, and the phase — and an operator diagnosing a
+ * failed development seed is better served by those four than by one truncated
+ * vendor sentence: they say which step failed, what class of failure it was and
+ * what to do next, in fields a log search can match on.
+ *
+ * `userRef` is present whenever the run got far enough to resolve an identity,
+ * so a failure line correlates with the `stage_invoked` line above it without
+ * either naming the user.
+ *
+ * Exported and pure for the same reason the two builders above are: the claim
+ * "no reported field carries the email or the raw uid" is only worth making if
+ * a test can make it against the code that builds the fields. `phase` is a
+ * parameter rather than a read of the module-level cursor for exactly that
+ * reason — a builder that read mutable module state could not be tested as a
+ * function of its inputs.
+ */
+export const failureFields = (
+    error: unknown,
+    identity: DevelopmentIdentity | null,
+    phase: SeedPhase | null = null,
+): LogFields => {
+    const failure = describeFailure(error);
+
+    const fields: LogFields = {
+        stage: STAGE,
+        code: failure.code,
+        remedy: remedyFor(failure),
+        error: {
+            name: failure.error.name,
+            message:
+                failure.provenance === 'first_party'
+                    ? redactIdentity(failure.error.message, identity)
+                    : WITHHELD_VENDOR_MESSAGE,
+        },
+    };
+
+    if (phase !== null) {
+        fields.phase = phase;
+    }
+
+    if (identity !== null) {
+        fields.userRef = userRef(identity.userId);
+    }
+
+    return fields;
+};
+
+/**
+ * The identity the current run resolved, published for the failure reporter.
+ *
+ * The failure path is the top-level `.catch` below, which cannot see `main`'s
+ * locals, and {@link failureFields} needs the identity for two things: the
+ * `userRef` that correlates the line with `stage_invoked`, and the needles
+ * {@link redactIdentity} applies to a message this repository composed. Written
+ * exactly once, by `main`, before the first statement that can reach the
+ * database, and read only by that catch — so a failure raised before the flags
+ * parse reports with `null` and no `userRef`, which is the truth about that
+ * failure.
+ */
+let runIdentity: DevelopmentIdentity | null = null;
+
+/**
+ * How far the current run has got, published for the failure reporter beside
+ * the identity above and for the same reason: the top-level `.catch` cannot see
+ * `main`'s locals.
+ *
+ * It replaces the one diagnostic a withheld vendor message takes with it —
+ * WHICH STEP failed. Advanced only on the way forward (see {@link SeedPhase}),
+ * so a failure inside a step reports that step rather than the one `main`'s
+ * `finally` was about to enter.
+ */
+let runPhase: SeedPhase = 'startup';
 
 const main = async (): Promise<number> => {
     const parsed = parseArgs(process.argv.slice(2));
@@ -1070,32 +1487,28 @@ const main = async (): Promise<number> => {
         reason: origin.reason,
     });
 
-    const identity: DevelopmentIdentity = {
-        userId: parsed.options.userId === null ? DEFAULT_DEV_USER_ID : parsed.options.userId,
-        email: parsed.options.email === null ? DEFAULT_DEV_USER_EMAIL : parsed.options.email,
-    };
+    const identity = resolveIdentity(parsed.options);
+    // Published before anything can fail against the database, so the failure
+    // reporter knows which values to redact out of a message it did not write.
+    runIdentity = identity;
     // Resolved here rather than inside the run, so the day that is logged is
     // provably the day that is seeded.
     const dayKey = parsed.options.date === null ? todayDayKey() : parsed.options.date;
 
-    logger.info('stage_invoked', {
-        stage: STAGE,
-        userId: identity.userId,
-        email: identity.email,
-        date: dayKey,
-        resetUser: parsed.options.resetUser,
-    });
+    logger.info('stage_invoked', invocationFields({ identity, dayKey, resetUser: parsed.options.resetUser }));
 
     // `finally` rather than a trailing call: the client holds a connection pool,
     // and a refusal or a failed transaction must release it just as a success
     // does, or the process hangs on an open handle.
     try {
+        runPhase = 'preflight';
         const gaps = await preflight(defaultPreflightDeps());
         if (gaps.length > 0) {
             logger.error('stage_prerequisites_unmet', gapFields(gaps));
             return 1;
         }
 
+        runPhase = 'seed';
         const summary = await runSeed({
             client: prisma,
             now: () => new Date(),
@@ -1104,25 +1517,11 @@ const main = async (): Promise<number> => {
             resetUser: parsed.options.resetUser,
         });
 
-        // `changed: false` is the honest form of "idempotent": a rerun says so
-        // per object rather than leaving an operator to infer it from silence.
-        logger.info('seed_complete', {
-            stage: STAGE,
-            userId: summary.userId,
-            email: summary.email,
-            date: summary.date,
-            changed: summary.changed,
-            userReset: summary.userReset,
-            users: summary.userOutcome,
-            mealPlanPreferences: summary.preferencesOutcome,
-            confirmedTargets: `${DEV_TARGETS.calories} kcal, ${DEV_TARGETS.protein}P / ${DEV_TARGETS.carbs}C / ${DEV_TARGETS.fat}F`,
-            targetSource: DEV_PREFERENCE_ANSWERS.target_source,
-            bodyWeightEntries: summary.weighInOutcome,
-            mealsCreated: summary.mealsCreated,
-            mealsExisting: summary.mealsExisting,
-            mealsCreatedCount: summary.mealsCreated.length,
-            mealsExistingCount: summary.mealsExisting.length,
-        });
+        // Advanced only once the transaction has committed, so a failure
+        // raised while disconnecting below reports `reporting` while a failure
+        // inside the transaction still reports `seed`.
+        runPhase = 'reporting';
+        logger.info('seed_complete', completionFields(summary));
         return 0;
     } finally {
         await prisma.$disconnect();
@@ -1140,16 +1539,7 @@ if (require.main === module) {
             process.exit(exitCode);
         })
         .catch((error: unknown) => {
-            const failure = describeFailure(error);
-            const remedy = Object.prototype.hasOwnProperty.call(PRISMA_REMEDIES, failure.code)
-                ? PRISMA_REMEDIES[failure.code]
-                : undefined;
-            createFatalLogger(STAGE).error('stage_failed', {
-                stage: STAGE,
-                code: failure.code,
-                remedy,
-                error: failure.error,
-            });
+            createFatalLogger(STAGE).error('stage_failed', failureFields(error, runIdentity, runPhase));
             process.exit(1);
         });
 }

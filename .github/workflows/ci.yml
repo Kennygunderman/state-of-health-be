@@ -54,22 +54,32 @@ jobs:
       - run: npm run typecheck:test
       - run: npm run typecheck:scripts
 
-      # docs/meal-planning/expected-schema-diff.sql is the reviewed evidence of
-      # what the migration ledger holds that prisma/schema.prisma cannot
-      # express, in three marker-delimited sections, and this step polices all
-      # three. It re-runs the `prisma migrate diff` command against a throwaway
-      # shadow database, requires the same exit code, and compares the output
-      # with the `prisma-migrate-diff` section; then it executes the committed
-      # `pg-catalog-query` section, read-only, against the database the previous
-      # step applied the ledger to, and compares the result with
-      # `pg-catalog-expected`. The second comparison is not redundant: Prisma's
-      # schema describer leaves expression indexes, index predicates and
-      # scalar-list NOT NULL out of both sides of its diff, so the lower(alias)
-      # index, the five partial-index predicates and the required array
-      # nullability are invisible to the first one. Both fail on any difference
-      # in either direction. The file's header documents both commands for local
-      # use; the node helpers below stand in for psql, which the runner does not
-      # have.
+      # Two committed artefacts carry the reviewed evidence of what the
+      # migration ledger holds that prisma/schema.prisma cannot express, and
+      # this step polices both of them.
+      #
+      # docs/meal-planning/expected-schema-diff.sql is the captured
+      # `prisma migrate diff --script` output between the ledger and the
+      # datamodel, and nothing else. The step re-runs that command against a
+      # throwaway shadow database, requires the same exit code, and compares the
+      # WHOLE file with the output after deleting comment and blank lines from
+      # both sides - the comparison AAP 0.9.1 prescribes, which is why that file
+      # carries no section markers and every header line of it is a `--` line
+      # comment.
+      #
+      # docs/meal-planning/schema-catalog-evidence.sql is the second capture
+      # that command cannot make, in two marker-delimited sections. The step
+      # executes its committed `pg-catalog-query` section, read-only, against
+      # the database the previous step applied the ledger to, and compares the
+      # result with `pg-catalog-expected`. That comparison is not redundant:
+      # Prisma's schema describer leaves expression indexes, index predicates
+      # and scalar-list NOT NULL out of both sides of its diff, so the
+      # lower(alias) index, the five partial-index predicates and the required
+      # array nullability are invisible to the first one.
+      #
+      # Both comparisons fail on any difference in either direction. Each file's
+      # header documents its own command for local use; the node helpers below
+      # stand in for psql, which the runner does not have.
       - name: Schema-drift evidence gate
         run: |
           # Actions runs this under `bash -e`; set it here too so the script
@@ -77,7 +87,8 @@ jobs:
           # around the one command whose non-zero exit is expected.
           set -euo pipefail
 
-          EVIDENCE=docs/meal-planning/expected-schema-diff.sql
+          DIFF_EVIDENCE=docs/meal-planning/expected-schema-diff.sql
+          CATALOG_EVIDENCE=docs/meal-planning/schema-catalog-evidence.sql
           WORK="${RUNNER_TEMP:-/tmp}/schema-evidence"
           mkdir -p "$WORK"
 
@@ -85,37 +96,52 @@ jobs:
           ADMIN_URL="${BASE%/*}/postgres"
           SHADOW_URL="${BASE}_schema_evidence"
 
-          if [ ! -f "$EVIDENCE" ]; then
-            echo "$EVIDENCE is missing; the gate has nothing to compare against."
+          for evidence in "$DIFF_EVIDENCE" "$CATALOG_EVIDENCE"; do
+            if [ ! -f "$evidence" ]; then
+              echo "$evidence is missing; the gate has nothing to compare against."
+              exit 1
+            fi
+          done
+
+          # The migrate-diff artefact is compared as a whole, so the strip runs
+          # over the entire file: everything in it that is neither a line
+          # comment starting at column 0 nor an empty line is captured payload.
+          # An emptied file is drift in its own right - without this check,
+          # deleting the payload would pass silently against a command that had
+          # also stopped emitting it.
+          sed '/^--/d;/^$/d' "$DIFF_EVIDENCE" > "$WORK/expected-diff.txt"
+          if [ ! -s "$WORK/expected-diff.txt" ]; then
+            echo "$DIFF_EVIDENCE is empty once comment lines and blank lines are stripped; the captured statements are gone."
             exit 1
           fi
 
-          # Each section of the evidence is delimited by a marker line starting
-          # at column 0, so the artefact stays SQL-commented and every section
-          # can still be comment-stripped before it is compared. A missing,
-          # duplicated, reordered or empty section is drift in its own right:
-          # without this check, deleting a whole section would pass silently.
+          # Each section of the catalog artefact is delimited by a marker line
+          # starting at column 0, so that file stays SQL-commented and every
+          # section can still be comment-stripped before it is compared. A
+          # missing, duplicated, reordered or empty section is drift in its own
+          # right: without this check, deleting a whole section would pass
+          # silently.
           section_end=0
-          for section in prisma-migrate-diff pg-catalog-query pg-catalog-expected; do
-            begins=$(grep -c "^-- >>> BEGIN $section\$" "$EVIDENCE" || true)
-            ends=$(grep -c "^-- >>> END $section\$" "$EVIDENCE" || true)
+          for section in pg-catalog-query pg-catalog-expected; do
+            begins=$(grep -c "^-- >>> BEGIN $section\$" "$CATALOG_EVIDENCE" || true)
+            ends=$(grep -c "^-- >>> END $section\$" "$CATALOG_EVIDENCE" || true)
             if [ "$begins" -ne 1 ] || [ "$ends" -ne 1 ]; then
-              echo "$EVIDENCE must carry exactly one '-- >>> BEGIN $section' line and one '-- >>> END $section' line, each starting at column 0 (found $begins and $ends)."
+              echo "$CATALOG_EVIDENCE must carry exactly one '-- >>> BEGIN $section' line and one '-- >>> END $section' line, each starting at column 0 (found $begins and $ends)."
               exit 1
             fi
 
-            section_begin=$(grep -n "^-- >>> BEGIN $section\$" "$EVIDENCE" | cut -d: -f1)
-            next_end=$(grep -n "^-- >>> END $section\$" "$EVIDENCE" | cut -d: -f1)
+            section_begin=$(grep -n "^-- >>> BEGIN $section\$" "$CATALOG_EVIDENCE" | cut -d: -f1)
+            next_end=$(grep -n "^-- >>> END $section\$" "$CATALOG_EVIDENCE" | cut -d: -f1)
             if [ "$section_begin" -le "$section_end" ] || [ "$next_end" -le "$section_begin" ]; then
-              echo "$EVIDENCE must open and close its sections in the order prisma-migrate-diff, pg-catalog-query, pg-catalog-expected; $section spans lines $section_begin-$next_end."
+              echo "$CATALOG_EVIDENCE must open and close its sections in the order pg-catalog-query, pg-catalog-expected; $section spans lines $section_begin-$next_end."
               exit 1
             fi
             section_end=$next_end
 
-            sed -n "$((section_begin + 1)),$((next_end - 1))p" "$EVIDENCE" \
+            sed -n "$((section_begin + 1)),$((next_end - 1))p" "$CATALOG_EVIDENCE" \
               | sed '/^--/d;/^$/d' > "$WORK/$section.txt"
             if [ ! -s "$WORK/$section.txt" ]; then
-              echo "The $section section of $EVIDENCE is empty once comment lines and blank lines are stripped."
+              echo "The $section section of $CATALOG_EVIDENCE is empty once comment lines and blank lines are stripped."
               exit 1
             fi
           done
@@ -134,7 +160,7 @@ jobs:
           not_null_arrays=$(grep '^array_column ' "$WORK/pg-catalog-expected.txt" | grep -c ' not_null=true' || true)
 
           if [ "$generated_columns" -lt 1 ] || [ "$hand_managed_indexes" -lt 7 ] || [ "$not_null_arrays" -lt 12 ]; then
-            echo "The pg-catalog-expected section of $EVIDENCE no longer carries the evidence it must:"
+            echo "The pg-catalog-expected section of $CATALOG_EVIDENCE no longer carries the evidence it must:"
             echo "  generated columns:      $generated_columns (at least 1)"
             echo "  hand-managed indexes:   $hand_managed_indexes (at least 7)"
             echo "  NOT NULL array columns: $not_null_arrays (at least 12)"
@@ -178,7 +204,7 @@ jobs:
           set -e
           if [ "$diff_exit" -ne 2 ]; then
             echo "prisma migrate diff exited $diff_exit; the gate expects 2 (differences found)."
-            echo "0 means the evidence file is stale, or the construct it records is gone from the migration."
+            echo "0 means $DIFF_EVIDENCE is stale, or the construct it records is gone from the migration."
             echo "1 means the command itself failed."
             cat "$WORK/actual.sql"
             exit 1
@@ -188,9 +214,9 @@ jobs:
           # or around a statement is compared as content.
           sed '/^--/d;/^$/d' "$WORK/actual.sql" > "$WORK/normalised.sql"
 
-          if ! diff -u "$WORK/prisma-migrate-diff.txt" "$WORK/normalised.sql"; then
-            echo "The prisma-migrate-diff section of $EVIDENCE no longer matches what the command reports."
-            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the section if the change was intended."
+          if ! diff -u "$WORK/expected-diff.txt" "$WORK/normalised.sql"; then
+            echo "$DIFF_EVIDENCE no longer matches what the command reports."
+            echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the capture if the change was intended."
             exit 1
           fi
 
@@ -236,14 +262,83 @@ jobs:
             < "$WORK/pg-catalog-query.txt" > "$WORK/pg-catalog-actual.txt" || exit 1
 
           if ! diff -u "$WORK/pg-catalog-expected.txt" "$WORK/pg-catalog-actual.txt"; then
-            echo "The applied ledger no longer matches the pg-catalog-expected section of $EVIDENCE."
+            echo "The applied ledger no longer matches the pg-catalog-expected section of $CATALOG_EVIDENCE."
             echo "Fix prisma/schema.prisma and prisma/migrations, or regenerate the section if the change was intended."
             exit 1
           fi
 
           echo "schema-drift evidence gate: PASS"
-          echo "  prisma-migrate-diff: $(wc -l < "$WORK/prisma-migrate-diff.txt") statement(s) compared"
-          echo "  pg-catalog-expected: $(wc -l < "$WORK/pg-catalog-actual.txt") line(s) compared - $generated_columns generated column(s), $hand_managed_indexes hand-managed index(es), $not_null_arrays NOT NULL array column(s)"
+          echo "  $DIFF_EVIDENCE: whole file compared against the command's output, which exited 2 - $(wc -l < "$WORK/expected-diff.txt") statement line(s) after stripping comment and blank lines from both sides"
+          echo "  $CATALOG_EVIDENCE: pg-catalog-query executed read-only against the migrated database, $(wc -l < "$WORK/pg-catalog-actual.txt") line(s) compared with pg-catalog-expected - $generated_columns generated column(s), $hand_managed_indexes hand-managed index(es), $not_null_arrays NOT NULL array column(s)"
+
+      # The dual-ledger equivalence gate in src/__tests__/api/compat.test.ts
+      # compares the two migration ledgers on a NORMALISED `pg_dump
+      # --schema-only`, which the Agent Action Plan (0.9.1) makes mandatory
+      # evidence: that suite fails rather than skipping when no usable pg_dump
+      # can be resolved. "Usable" is a version statement — pg_dump refuses to
+      # dump a server newer than itself — and the runner image does not
+      # necessarily carry a client of the service's major. So the choice is
+      # made here, before the tests run, for two reasons: a runner with no
+      # matching client fails at this step with an actionable message instead
+      # of inside Jest, and the resolved runner is exported so the test step
+      # uses the one this step printed. PG_DUMP_BIN names a local executable
+      # (including the versioned install directories a `pg_dump` on PATH may
+      # not point at); PG_DUMP_CONTAINER tells the suite to dump through the
+      # matching client the postgres service image already ships, over that
+      # container's own local socket, which needs no password anywhere.
+      - name: Resolve a PostgreSQL 16 pg_dump for the migration-ledger gate
+        run: |
+          set -euo pipefail
+
+          # The major of the `postgres:16-alpine` service declared above.
+          SERVER_MAJOR=16
+
+          resolved=''
+          resolved_major=''
+          echo "Looking for a pg_dump of major $SERVER_MAJOR or newer:"
+
+          # PATH first, then the versioned client directories a Debian/Ubuntu
+          # install keeps other majors in, newest first.
+          for candidate in pg_dump $(ls /usr/lib/postgresql/*/bin/pg_dump 2>/dev/null | sort -rV || true); do
+            found=$(command -v "$candidate" || true)
+            if [ -z "$found" ]; then
+              continue
+            fi
+            major=$("$found" --version 2>/dev/null | sed -n 's/^pg_dump (PostgreSQL) \([0-9][0-9]*\).*/\1/p' || true)
+            if [ -n "$major" ] && [ "$major" -ge "$SERVER_MAJOR" ]; then
+              resolved="$found"
+              resolved_major="$major"
+              break
+            fi
+            echo "  - $found: pg_dump ${major:-unidentified}, too old for a PostgreSQL $SERVER_MAJOR server"
+          done
+
+          if [ -n "$resolved" ]; then
+            echo "  - $resolved: pg_dump $resolved_major — using this one."
+            echo "PG_DUMP_BIN=$resolved" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # No local client of a usable major. The service container runs
+          # postgres:16-alpine, which ships a matching pg_dump, so the gate can
+          # dump through `docker exec` instead.
+          PORT="${DATABASE_URL##*:}"
+          PORT="${PORT%%/*}"
+          container=$(docker ps --filter "publish=$PORT" --format '{{.Names}}' | head -n 1 || true)
+          if [ -n "$container" ] && docker exec "$container" pg_dump --version >/dev/null 2>&1; then
+            echo "  - container $container publishes port $PORT and ships $(docker exec "$container" pg_dump --version) — using this one."
+            echo "PG_DUMP_CONTAINER=$container" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "No pg_dump able to dump a PostgreSQL $SERVER_MAJOR server is available to this job, and no"
+          echo "container publishing port $PORT ships one. The migration-ledger gate in"
+          echo "src/__tests__/api/compat.test.ts compares both ledgers on a normalised pg_dump --schema-only"
+          echo "and fails without it, because that comparison is the gate's required evidence (0.9.1)."
+          echo "Fix either by installing the client (sudo apt-get update && sudo apt-get install -y"
+          echo "postgresql-client-$SERVER_MAJOR) or by keeping the postgres service container reachable to"
+          echo "docker exec, then re-run."
+          exit 1
 
       - run: npm test
       - run: docker build -t soh-be-ci .

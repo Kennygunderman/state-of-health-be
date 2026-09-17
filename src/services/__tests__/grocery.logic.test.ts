@@ -15,6 +15,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 
 import {
+    FoodStatesByName,
     GROCERY_EPSILON_G,
     COUNT_DISPLAY_UNIT,
     GROCERY_FIELD_CODES,
@@ -35,6 +36,7 @@ import {
     buildGroceryName,
     buildGroceryRows,
     classifyQuantityChange,
+    describesContainerOrServing,
     diffGroceryList,
     displayFamilyForPortion,
     indexFoodStatesByName,
@@ -250,6 +252,7 @@ const RAW = 'raw';
 const COOKED = 'cooked';
 const DRY = 'dry';
 const AS_PURCHASED = 'as_purchased';
+const PREPARED = 'prepared';
 
 const NOW = new Date('2026-07-05T12:00:00.000Z');
 const EARLIER = new Date('2026-07-04T09:30:00.000Z');
@@ -589,9 +592,10 @@ describe('aggregatePlannedGrams', () => {
             expect(rows.find((line) => line.catalog_food_id === ingredient.catalog_food_id)).toMatchObject({
                 food_state: AS_PURCHASED,
                 category: 'dairy_alternatives',
-                // `as_purchased` is how the shop sells it, so the name says
-                // nothing about the state: a shopper reads "Greek yogurt, plain".
-                name: 'Greek yogurt, plain',
+                // The state is not `raw` and the name does not state it, so the
+                // row says it: §0.7.3's suffix rule, applied to the fixture's
+                // own `as_purchased` yogurt.
+                name: 'Greek yogurt, plain, as purchased',
                 quantity_grams: optionalRecipeGramsOf(ingredient),
                 display_unit: 'oz',
                 display_text: '3 oz',
@@ -817,6 +821,393 @@ describe('displayFamilyForPortion', () => {
         expect(displayFamilyForPortion({ density_g_per_ml: null, default_portion: null })).toBe('mass');
     });
 
+    /*
+     * A COUNT-FAMILY TOKEN IS NOT A COUNTABLE ITEM.
+     *
+     * `each` is the generic token catalog release v1 gives every non-metric
+     * portion, so a container and a regulatory reference amount both arrive in
+     * the count family — 788 of its 3,514 count-family default portions
+     * describe one or the other. Counting those prints the free-text
+     * description as the shopping unit ("2 cans, drained"), which is the
+     * unsized container line §0.1.4 rules out and §6 of
+     * `docs/meal-planning/planning-policy.md` repeats: quantities are measured
+     * and container units are never generated.
+     *
+     * THE CORPUS BELOW IS THE POINT OF THIS BLOCK. The rule is a closed word
+     * set plus a closed phrase set, so what it is worth testing is the
+     * BOUNDARY it draws over the data it is closed against: one case per form
+     * family release v1 actually ships, on both sides, quoted verbatim from
+     * `data/meal-planning/catalog/releases/v1/portions.jsonl` with the number
+     * of rows the release holds of that exact description. The sweep at the end
+     * re-derives the split from that file, so neither an over-eager addition
+     * nor a missing form can pass unnoticed.
+     */
+    describe('a portion that describes a container or a serving', () => {
+        /**
+         * THE DISQUALIFIED CORPUS: `[what the form is, the release's own
+         * description, how many rows of it release v1 holds]`.
+         *
+         * One case per form family, and the first is literally `usda:173800`
+         * (Chickpeas, canned) and `usda:174285` (Kidney beans, canned) —
+         * `{amount: 1, unit: 'each', description: '1 can, drained'}` at 253 g
+         * and 266 g, both ingredients of the seeded recipes, so it is the case
+         * the shipped plan would have rendered as cans.
+         *
+         * Three groups: VESSELS (the package, not its contents), SERVING AND
+         * REFERENCE AMOUNTS (a tabulation unit), and DOSES AND SINGLE-SERVE
+         * REFERENCES (an amount dispensed). The composite forms are here for a
+         * second reason — "regular microwave bag", "container refrigerated
+         * 4 oz", "serving 1/2 cup", "kids meal order" and "package without
+         * flavor packet" put the disqualifying word before the noun, after it,
+         * or in the word the description EXCLUDES, which is why the scan reads
+         * every word instead of the head noun.
+         *
+         * The unit token is fixed at `each` throughout: this table is about the
+         * DESCRIPTION, and `each` is the token the release gives almost all of
+         * these rows anyway. The sweep at the end exercises each row's own
+         * stored unit.
+         */
+        const CONTAINER_FORMS: Array<[string, string, number]> = [
+            // Vessels — the package, not its contents.
+            ['a drained can, as usda:173800 and usda:174285 both state it', '1 can, drained', 2],
+            ['a bare can', 'can', 7],
+            ['a can sized in fluid ounces', 'can (6 fl oz)', 5],
+            ['a container with no size stated', 'container, NFS', 30],
+            ['a container sized in a parenthesis', 'container (6 oz)', 18],
+            ['a bare package', 'package', 15],
+            ['a package sized in a parenthesis', 'package (10 oz)', 12],
+            ['a packet', 'packet', 10],
+            ['a branded jar', 'jar, Gerber (4 oz)', 4],
+            ['a bottle', 'bottle', 2],
+            ['a pouch', 'pouch', 1],
+            ['a branded envelope', 'envelope Alba (.675 oz)', 1],
+            ['a bag qualified before the noun', 'regular microwave bag', 9],
+            ['a branded serving bowl', 'KFC Bowl', 1],
+            ['a container qualified after the noun', 'container refrigerated 4 oz', 1],
+            ['a package whose second vessel word is what it excludes', 'package without flavor packet', 3],
+            // Servings and reference amounts — a tabulation unit, not an item.
+            ['a bare serving', 'serving', 101],
+            ['a serving whose vessel word leads the description', 'serving 1/2 cup', 10],
+            ['a serving counted per package', 'serving 9 servings per 24 oz package', 1],
+            ['a regulatory serving', 'NLEA serving', 3],
+            ['a bare regulatory reference amount', 'RACC', 172],
+            ['a restaurant order', 'order', 4],
+            ['a kids meal order', 'kids meal order', 3],
+            ['a frozen meal', 'meal (11 oz)', 2],
+            ['a branded frozen dinner', 'Swanson Salisbury Steak Dinner (11 oz)', 1],
+            ['an item of unstated size', 'item, any size', 28],
+            ['a unit stated through a yield', 'unit (yield from 1 lb ready-to-cook chicken)', 44],
+            // Doses and single-serve references — an amount dispensed.
+            ['a bare scoop', 'scoop', 4],
+            ['a scoop written with its amount', '1 scoop', 1],
+            ['a scoop with no size stated', 'scoop, NFS', 1],
+            ['a branded scoop', 'scoop Gold Standard', 1],
+            ['a recipe\u2019s whole yield, matched as a phrase', 'recipe yield', 2],
+            ['an individual serving sized in fluid ounces', 'individual (3.5 fl oz)', 4],
+            ['an individual serving offered as a size', 'small/individual', 18],
+            ['an individual packet', 'individual packet', 4],
+            ['an individual container', 'container, individual', 2],
+        ];
+
+        it.each(CONTAINER_FORMS)('recognises %s: "%s" (%i release rows)', (_case, description) => {
+            expect(describesContainerOrServing(description)).toBe(true);
+        });
+
+        it.each(CONTAINER_FORMS)('weighs %s: "%s" (%i release rows)', (_case, description) => {
+            expect(displayFamilyForPortion(withPortion({ description, unit: 'each', gram_weight: 253 }))).toBe('mass');
+        });
+
+        it.each(CONTAINER_FORMS)('measures %s as a volume when the food states a density: "%s" (%i release rows)', (_case, description) => {
+            expect(
+                displayFamilyForPortion({
+                    density_g_per_ml: 1,
+                    default_portion: portion({ description, unit: 'each', gram_weight: 253 }),
+                }),
+            ).toBe('volume');
+        });
+
+        /**
+         * THE ALLOWED CORPUS, half one: a real ITEM NOUN, which is a thing a
+         * shopper buys a number of. `[the release's own description, how many
+         * rows of it release v1 holds]`.
+         *
+         * This is the half a keyword scan is most likely to break, and it is
+         * 2,726 of the 3,514 rows — a word admitted carelessly takes hundreds
+         * of truthful count lines with it.
+         */
+        const ITEM_NOUN_FORMS: Array<[string, number]> = [
+            ['slice', 103],
+            ['piece', 141],
+            ['sandwich', 79],
+            ['fillet', 58],
+            ['patty', 38],
+            ['chop', 6],
+            ['link', 12],
+            ['sausage', 2],
+            ['drumstick', 3],
+            ['thigh', 2],
+            ['wing, any size', 13],
+            ['breast', 1],
+            ['leg', 1],
+            ['egg', 114],
+            ['1 clove', 1],
+            ['1 apple, medium', 1],
+            ['1 avocado', 1],
+            ['banana', 2],
+            ['1 carrot, medium', 1],
+            ['stalk', 2],
+            ['pepper', 7],
+            ['1 lemon', 1],
+            ['1 lime', 1],
+            ['baby potato', 29],
+            ['1 tomato, medium', 1],
+            ['olive', 5],
+            ['5 sprigs', 1],
+            ['cookies', 13],
+            ['crackers', 5],
+            ['waffle', 2],
+            ['pancake', 1],
+            ['muffin', 18],
+            ['roll', 16],
+            ['bagel', 2],
+            ['bar', 48],
+            ['cone', 15],
+            ['cube', 6],
+            ['wedge (1.33 oz)', 2],
+            ['pat (1" sq, 1/3" high)', 2],
+            ['spear', 4],
+            ['leaf', 11],
+            ['berry', 6],
+            ['cake', 16],
+            ['pie', 1],
+            ['pizza', 1],
+            ['each taco', 3],
+            ['burrito', 3],
+            ['enchilada, any size', 5],
+            ['tortilla', 2],
+            ['small pita', 3],
+            ['pretzel stick', 2],
+            ['pickle, any size', 1],
+            ['ball', 2],
+            ['tablet', 1],
+        ];
+
+        /**
+         * THE ALLOWED CORPUS, half two: an item USDA describes through its
+         * YIELD, which is why `yield` and `refuse` are absent from the word set
+         * and "recipe yield" is matched as a phrase instead. Every one of these
+         * is a countable chop, rib, steak, pod, fruit or ear.
+         */
+        const YIELD_FORMS: Array<[string, number]> = [
+            ['chop without refuse (Yield from 1 cooked chop, with refuse, weighing 172g)', 1],
+            ['rib (yield after cooking, bone removed)', 2],
+            ['steak (yield from 181 g raw meat)', 1],
+            ['pod, yields', 1],
+            ['fruit without refuse', 5],
+            ['ear (yield after cooking)', 1],
+        ];
+
+        /**
+         * THE ALLOWED CORPUS, half three, and the documented BOUNDARY of the
+         * rule: a bare size or grade label with no item noun STAYS COUNTED.
+         *
+         * These are terse labels the catalog wrote on a countable item — not a
+         * container and not a serving reference — so counting them prints the
+         * item the shopper buys a number of. Measuring them instead would be a
+         * scope decision neither §0.1.4 nor §6.2 asks for, and on these four
+         * descriptions alone it would silently re-unit 261 rows.
+         */
+        const SIZE_LABEL_FORMS: Array<[string, number]> = [
+            ['regular', 106],
+            ['miniature', 75],
+            ['miniature/bite size', 67],
+            ['whole', 13],
+            ['bite size', 2],
+            ['slice, any size', 30],
+            ['cubic inch', 14],
+            ['small', 52],
+            ['large', 11],
+            ['medium', 4],
+        ];
+
+        it.each(ITEM_NOUN_FORMS)('keeps counting the item form "%s" (%i release rows)', (description) => {
+            expect(describesContainerOrServing(description)).toBe(false);
+            expect(displayFamilyForPortion(withPortion({ description, unit: 'each', gram_weight: 50 }))).toBe('count');
+        });
+
+        it.each(YIELD_FORMS)('keeps counting "%s", a real item described through its yield (%i release rows)', (description) => {
+            expect(describesContainerOrServing(description)).toBe(false);
+            expect(displayFamilyForPortion(withPortion({ description, unit: 'each', gram_weight: 50 }))).toBe('count');
+        });
+
+        it.each(SIZE_LABEL_FORMS)('keeps counting the bare size label "%s" (%i release rows)', (description) => {
+            expect(describesContainerOrServing(description)).toBe(false);
+            expect(displayFamilyForPortion(withPortion({ description, unit: 'each', gram_weight: 50 }))).toBe('count');
+        });
+
+        /*
+         * The count portions the seeded recipes actually rely on, each with the
+         * unit token the release stores beside it rather than the `each` the
+         * tables above fix — the descriptions and the tokens vary independently
+         * and both reach `count`.
+         */
+        const SEEDED_RECIPE_COUNT_PORTIONS: Array<[string, string]> = [
+            ['1 egg, large', 'each'],
+            ['1 clove', 'clove'],
+            ['1 apple, medium', 'each'],
+            ['5 sprigs', 'each'],
+            ['1 olive, large', 'each'],
+            ['1 slice', 'slice'],
+            ['piece', 'piece'],
+            ['whole', 'whole'],
+        ];
+
+        it.each(SEEDED_RECIPE_COUNT_PORTIONS)('keeps counting "%s", stored in the release as a %s portion', (description, unit) => {
+            expect(describesContainerOrServing(description)).toBe(false);
+            expect(displayFamilyForPortion(withPortion({ description, unit, gram_weight: 50 }))).toBe('count');
+        });
+
+        const WORDLESS_DESCRIPTIONS: Array<[string, string]> = [
+            ['a description of digits alone', '12'],
+            ['an empty description', ''],
+        ];
+
+        it.each(WORDLESS_DESCRIPTIONS)('finds no container word in %s, so the row still counts', (_case, description) => {
+            expect(describesContainerOrServing(description)).toBe(false);
+            expect(displayFamilyForPortion(withPortion({ description, unit: 'each', gram_weight: 50 }))).toBe('count');
+        });
+
+        it('still weighs a container description whose portion has no gram weight either', () => {
+            expect(displayFamilyForPortion(withPortion({ description: '1 can, drained', unit: 'each', gram_weight: 0 }))).toBe(
+                'mass',
+            );
+        });
+
+        /* -------------------------------------------------------------------
+         * The corpus the two lists are closed against
+         *
+         * Read off disk, like every other release- or fixture-derived case in
+         * this file, and classified once: 3,514 default portions whose stored
+         * unit token resolves to the count family, every one of them put
+         * through the real predicate and the real family decision.
+         *
+         * WHY THE TOTALS ARE ASSERTED. A closed word list is only as good as
+         * the data it was closed against, and both directions can regress
+         * silently: a word added carelessly (`yield`, `whole`, `regular`) moves
+         * hundreds of countable rows onto the scales, and a form family left
+         * out prints a unit the data cannot size. The totals below move the
+         * moment either happens.
+         * ----------------------------------------------------------------- */
+        describe('the release corpus the word and phrase sets are closed against', () => {
+            /** `catalog_food_portions` as the release publishes them, one JSON object per line. */
+            interface ReleasePortion {
+                food_source_key: string;
+                description: string;
+                amount: number;
+                unit: string;
+                gram_weight: number;
+                is_default: boolean;
+            }
+
+            const RELEASE_PORTIONS_PATH = join(
+                __dirname,
+                '..',
+                '..',
+                '..',
+                'data',
+                'meal-planning',
+                'catalog',
+                'releases',
+                'v1',
+                'portions.jsonl',
+            );
+
+            /**
+             * Every DEFAULT portion whose stored unit token is a count one —
+             * the exact population `displayFamilyForPortion` takes this
+             * decision for. `unitFamily` decides what "count" means here, so
+             * the test cannot disagree with the module about the token set.
+             */
+            const countFamilyDefaults: readonly ReleasePortion[] = readFileSync(RELEASE_PORTIONS_PATH, 'utf8')
+                .split('\n')
+                .filter((line) => line.trim().length > 0)
+                .map((line) => JSON.parse(line) as ReleasePortion)
+                .filter((row) => row.is_default && unitFamily(row.unit) === 'count');
+
+            const disqualified = countFamilyDefaults.filter((row) => describesContainerOrServing(row.description));
+            const counted = countFamilyDefaults.filter((row) => !describesContainerOrServing(row.description));
+
+            /** Rows of each exact description, for the verbatim check below. */
+            const rowsPerDescription = countFamilyDefaults.reduce<Map<string, number>>((tally, row) => {
+                tally.set(row.description, (tally.get(row.description) ?? 0) + 1);
+
+                return tally;
+            }, new Map());
+
+            const wordsOf = (description: string): string[] => description.toLowerCase().match(/[a-z]+/g) ?? [];
+
+            it('holds 3,514 default portions in the count family', () => {
+                expect(countFamilyDefaults).toHaveLength(3514);
+            });
+
+            it('measures 788 of them and keeps 2,726 counting', () => {
+                expect(disqualified).toHaveLength(788);
+                expect(counted).toHaveLength(2726);
+            });
+
+            it('quotes every form of the tables above verbatim, at the row count each states', () => {
+                const quoted: Array<[string, number]> = [
+                    ...CONTAINER_FORMS.map(([, description, rows]): [string, number] => [description, rows]),
+                    ...ITEM_NOUN_FORMS,
+                    ...YIELD_FORMS,
+                    ...SIZE_LABEL_FORMS,
+                ];
+
+                for (const [description, rows] of quoted) {
+                    expect(rowsPerDescription.get(description)).toBe(rows);
+                }
+            });
+
+            it('puts not one of the 788 in the count family', () => {
+                for (const row of disqualified) {
+                    expect(displayFamilyForPortion({ density_g_per_ml: null, default_portion: row })).toBe('mass');
+                }
+            });
+
+            it('counts every one of the 2,726, all of which state a positive gram weight', () => {
+                for (const row of counted) {
+                    expect(row.gram_weight).toBeGreaterThan(0);
+                    expect(displayFamilyForPortion({ density_g_per_ml: null, default_portion: row })).toBe('count');
+                }
+            });
+
+            /*
+             * The phrase set's whole reason for existing: `yield` as a bare
+             * word would move all 57 of these onto the scales, so the two
+             * "recipe yield" rows are matched as a run of two whole words
+             * instead.
+             */
+            it('keeps counting the 57 rows that describe an item through its yield', () => {
+                const mentionsAYield = (row: ReleasePortion): boolean =>
+                    wordsOf(row.description).includes('yield') || wordsOf(row.description).includes('yields');
+
+                expect(counted.filter(mentionsAYield)).toHaveLength(57);
+                expect(countFamilyDefaults.filter((row) => row.description === 'recipe yield')).toHaveLength(2);
+                expect(counted.filter((row) => row.description === 'recipe yield')).toHaveLength(0);
+            });
+
+            it('measures every scoop and every individual serving the release ships', () => {
+                const scoops = countFamilyDefaults.filter((row) => wordsOf(row.description).includes('scoop'));
+                const individuals = countFamilyDefaults.filter((row) => wordsOf(row.description).includes('individual'));
+
+                expect(scoops).toHaveLength(7);
+                expect(individuals).toHaveLength(28);
+                expect(counted.filter((row) => wordsOf(row.description).includes('scoop'))).toHaveLength(0);
+                expect(counted.filter((row) => wordsOf(row.description).includes('individual'))).toHaveLength(0);
+            });
+        });
+    });
+
     describe('a row is only put in a family it can actually be rendered in', () => {
         // THE SHIPPED SHAPE, and the reason this function takes the facts rather
         // than the portion alone. A volume-unit default portion against a null
@@ -856,6 +1247,11 @@ describe('displayFamilyForPortion', () => {
                 withPortion({ description: '1 cup', unit: 'cup', gram_weight: 0 }),
                 withPortion({ unit: 'each', gram_weight: 0 }),
                 withPortion({ description: 'bottle', unit: 'bottle' }),
+                withPortion({ description: '1 can, drained', unit: 'each', gram_weight: 253 }),
+                {
+                    density_g_per_ml: 1,
+                    default_portion: portion({ description: 'RACC', unit: 'each', gram_weight: 85 }),
+                },
                 { density_g_per_ml: null, default_portion: null },
             ];
 
@@ -898,6 +1294,54 @@ describe('buildGroceryDisplay', () => {
 
         it('renders a true zero as zero', () => {
             expect(buildGroceryDisplay(0, 'mass', massFacts).text).toBe('0 g');
+        });
+
+        /**
+         * The whole F01 path end to end, on the release's own data: the family
+         * decision and the rendering together, for BOTH foods the finding
+         * names — the two canned legumes the seeded recipes actually use.
+         *
+         * Release v1 ships each of them as
+         * `{amount: 1, unit: 'each', description: '1 can, drained'}` with
+         * `density_g_per_ml: null`, differing only in what the can weighs:
+         * `usda:173800` (Chickpeas, canned) 253 g, `usda:174285` (Kidney
+         * beans, canned) 266 g. One can's worth and two cans' worth are the
+         * amounts a real plan aggregates — a recipe using a whole can, planned
+         * once and planned twice — and each reads as the weight the
+         * aggregation measured, never as "1 can, drained" or "2 cans,
+         * drained". The api suite asserts the same four strings on the wire.
+         */
+        describe('a food whose default portion is a container', () => {
+            /** `[the release food, one can in grams, one can rendered, two cans rendered]`. */
+            const CANNED_LEGUMES: Array<[string, number, string, string]> = [
+                ['usda:173800 (Chickpeas, canned)', 253, '8.9 oz', '1.1 lb'],
+                ['usda:174285 (Kidney beans, canned)', 266, '9.4 oz', '1.2 lb'],
+            ];
+
+            const cannedFacts = (canGrams: number): GroceryConversionFacts => ({
+                density_g_per_ml: null,
+                default_portion: portion({ description: '1 can, drained', unit: 'each', gram_weight: canGrams }),
+            });
+
+            const renderAsBuilt = (grams: number, canGrams: number): string => {
+                const facts = cannedFacts(canGrams);
+
+                return buildGroceryDisplay(grams, displayFamilyForPortion(facts), facts).text;
+            };
+
+            it.each(CANNED_LEGUMES)('reads one can of %s as the ounces it weighs', (_food, canGrams, oneCan) => {
+                expect(renderAsBuilt(canGrams, canGrams)).toBe(oneCan);
+            });
+
+            it.each(CANNED_LEGUMES)('promotes two cans of %s to pounds, still as a measure', (_food, canGrams, _oneCan, twoCans) => {
+                expect(renderAsBuilt(2 * canGrams, canGrams)).toBe(twoCans);
+            });
+
+            it.each(CANNED_LEGUMES)('never puts the container word in the shopping line for %s', (_food, canGrams) => {
+                expect(renderAsBuilt(canGrams, canGrams)).not.toMatch(/can/i);
+                expect(renderAsBuilt(2 * canGrams, canGrams)).not.toMatch(/can/i);
+                expect(displayFamilyForPortion(cannedFacts(canGrams))).toBe('mass');
+            });
         });
     });
 
@@ -1037,9 +1481,15 @@ describe('buildGroceryDisplay', () => {
          * "6 1 egg, larges" and counted 9 g of dill as nine sprigs.
          */
         describe('a real catalog portion description', () => {
-            const shippedFacts = (description: string, gramWeight: number): GroceryConversionFacts => ({
+            /**
+             * A release portion, `amount` included: the cardinality is the
+             * column, so every case states it, and the ones whose description
+             * repeats it state the same number in both places exactly as the
+             * release does.
+             */
+            const shippedFacts = (description: string, gramWeight: number, amount = 1): GroceryConversionFacts => ({
                 density_g_per_ml: null,
-                default_portion: portion({ description, unit: 'each', gram_weight: gramWeight }),
+                default_portion: portion({ description, amount, unit: 'each', gram_weight: gramWeight }),
             });
 
             it('states the amount once, and pluralises the item rather than its qualifier', () => {
@@ -1052,7 +1502,9 @@ describe('buildGroceryDisplay', () => {
             });
 
             it('counts the items a multi-item portion contains', () => {
-                expect(buildGroceryDisplay(9, 'count', shippedFacts('5 sprigs', 1))).toEqual({
+                // `usda:172233`, dill weed: `{amount: 5, gram_weight: 1}`, so
+                // nine grams is nine portions of five sprigs.
+                expect(buildGroceryDisplay(9, 'count', shippedFacts('5 sprigs', 1, 5))).toEqual({
                     family: 'count',
                     quantity: 45,
                     unit: COUNT_DISPLAY_UNIT,
@@ -1061,11 +1513,27 @@ describe('buildGroceryDisplay', () => {
             });
 
             it('reads a single item of a multi-item portion in the singular', () => {
-                expect(buildGroceryDisplay(0.2, 'count', shippedFacts('5 sprigs', 1)).text).toBe('1 sprig');
+                expect(buildGroceryDisplay(0.2, 'count', shippedFacts('5 sprigs', 1, 5)).text).toBe('1 sprig');
             });
 
+            it('counts a portion whose description says nothing about its amount', () => {
+                // `{amount: 3, description: 'cookies', gram_weight: 44}`: 132 g
+                // is nine cookies, which only the column can say. The
+                // description-derived rule read it as three.
+                expect(buildGroceryDisplay(132, 'count', shippedFacts('cookies', 44, 3)).text).toBe('9 cookies');
+            });
+
+            it('singularises that description correctly for one item', () => {
+                expect(buildGroceryDisplay(44 / 3, 'count', shippedFacts('cookies', 44, 3)).text).toBe('1 cookie');
+            });
+
+            // Release portions that are genuinely countable items, with their
+            // real gram weights. The canned-bean portions are deliberately
+            // absent: `displayFamilyForPortion` weighs a container description
+            // rather than counting it, and their measured rendering is asserted
+            // in the mass describe above.
             const SHIPPED_ROWS: Array<[string, number, number, string]> = [
-                ['1 can, drained', 253, 506, '2 cans, drained'],
+                ['1 lemon', 84, 168, '2 lemons'],
                 ['1 avocado', 201, 201, '1 avocado'],
                 ['1 tomato, medium', 123, 369, '3 tomatoes, medium'],
                 ['1 clove', 3, 12, '4 cloves'],
@@ -1247,41 +1715,130 @@ describe('buildGroceryName', () => {
         expect(buildGroceryName('Chicken breast', RAW, new Map())).toBe('Chicken breast');
     });
 
-    /*
-     * The three rules the shopping name balances. A duplicated state ("Brown
-     * rice, cooked, cooked") and a state the shop does not sell the food in any
-     * other way ("Olive oil, as purchased") are both text a shopper has to read
-     * past, and neither tells them anything the name did not already say.
+    /**
+     * EVERY non-raw food the seeded recipes use, with the name the rule
+     * produces for it — the 36 of `data/meal-planning/catalog/releases/v1` the
+     * 43 committed recipes reference, grouped by their stored `food_state`.
+     *
+     * Real release data rather than an invented matrix, because the rule is
+     * about what a shopper reads on a real list: §0.7.3 and §6.2 of
+     * `docs/meal-planning/planning-policy.md` require the state as a suffix
+     * whenever it is not `raw`, so the twelve `as_purchased` foods are
+     * qualified too — a shopper buying `as_purchased` honey and `cooked`
+     * chickpeas is buying two different kinds of thing. The only names that
+     * stay bare are the ones whose own qualifier already contains the state's
+     * words literally.
      */
-    const SHOPPING_FORM_CASES: Array<[string, string]> = [
-        ['Olive oil', 'as_purchased'],
-        ['Canola oil', 'as_purchased'],
-        ['Honey', 'as_purchased'],
-        ['Maple syrup', 'as_purchased'],
-        ['Greek yogurt, plain', 'as_purchased'],
-        ['Almond milk, unsweetened', 'as_purchased'],
+    const RELEASE_NON_RAW_CASES: Array<[string, string, string]> = [
+        // as_purchased — nothing in these names says "as purchased".
+        ['Almond milk, unsweetened', AS_PURCHASED, 'Almond milk, unsweetened, as purchased'],
+        ['Almonds', AS_PURCHASED, 'Almonds, as purchased'],
+        ['Balsamic vinegar', AS_PURCHASED, 'Balsamic vinegar, as purchased'],
+        ['Canola oil', AS_PURCHASED, 'Canola oil, as purchased'],
+        ['Cheddar cheese', AS_PURCHASED, 'Cheddar cheese, as purchased'],
+        ['Feta cheese', AS_PURCHASED, 'Feta cheese, as purchased'],
+        ['Greek yogurt, plain', AS_PURCHASED, 'Greek yogurt, plain, as purchased'],
+        ['Honey', AS_PURCHASED, 'Honey, as purchased'],
+        ['Maple syrup', AS_PURCHASED, 'Maple syrup, as purchased'],
+        ['Milk, 2%', AS_PURCHASED, 'Milk, 2%, as purchased'],
+        ['Oat milk', AS_PURCHASED, 'Oat milk, as purchased'],
+        ['Olive oil', AS_PURCHASED, 'Olive oil, as purchased'],
+        // cooked — "canned" is not a way of saying "cooked", so the catalog's
+        // qualifier is kept AND the state is stated.
+        ['Black beans, canned', COOKED, 'Black beans, canned, cooked'],
+        ['Brown rice, cooked', COOKED, 'Brown rice, cooked'],
+        ['Chickpeas, canned', COOKED, 'Chickpeas, canned, cooked'],
+        ['Kidney beans, canned', COOKED, 'Kidney beans, canned, cooked'],
+        ['Pasta, cooked', COOKED, 'Pasta, cooked'],
+        ['Quinoa, cooked', COOKED, 'Quinoa, cooked'],
+        // dry — three of these already carry the word.
+        ['All-purpose flour', DRY, 'All-purpose flour, dry'],
+        ['Black pepper', DRY, 'Black pepper, dry'],
+        ['Bulgur, dry', DRY, 'Bulgur, dry'],
+        ['Chili powder', DRY, 'Chili powder, dry'],
+        ['Ground cumin', DRY, 'Ground cumin, dry'],
+        ['Lentils, dry', DRY, 'Lentils, dry'],
+        ['Rolled oats, dry', DRY, 'Rolled oats, dry'],
+        ['Salt', DRY, 'Salt, dry'],
+        ['Sunflower seeds', DRY, 'Sunflower seeds, dry'],
+        // prepared — no name in the release says "prepared", including the two
+        // that carry a preparation word of their own.
+        ['Hummus', PREPARED, 'Hummus, prepared'],
+        ['Mayonnaise', PREPARED, 'Mayonnaise, prepared'],
+        ['Olives, black', PREPARED, 'Olives, black, prepared'],
+        ['Peanut butter', PREPARED, 'Peanut butter, prepared'],
+        ['Salsa', PREPARED, 'Salsa, prepared'],
+        ['Soy sauce', PREPARED, 'Soy sauce, prepared'],
+        ['Tuna, canned in water', PREPARED, 'Tuna, canned in water, prepared'],
+        ['Turkey breast, sliced', PREPARED, 'Turkey breast, sliced, prepared'],
+        ['Yellow mustard', PREPARED, 'Yellow mustard, prepared'],
     ];
 
-    it.each(SHOPPING_FORM_CASES)('says nothing about the state of %s, which is sold as purchased', (name, state) => {
-        expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(name);
+    it.each(RELEASE_NON_RAW_CASES)('names %s in the %s state "%s"', (name, state, expected) => {
+        expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(expected);
     });
 
+    it('states every non-raw food\u2019s stored state exactly once', () => {
+        for (const [name, state, expected] of RELEASE_NON_RAW_CASES) {
+            const words = state.replace(/_/g, ' ');
+            const occurrences = expected.split(words).length - 1;
+
+            expect(occurrences).toBe(1);
+            expect(expected.startsWith(name)).toBe(true);
+        }
+    });
+
+    /*
+     * The de-duplication, isolated: a name keeps its own form only when its
+     * qualifiers contain the STATE'S OWN WORDS. "Peas, cooked in water" states
+     * `cooked` inside a phrase, "Dressing, prepared from mix" states `prepared`
+     * in the first of three words, and "Flour, as purchased" states both words
+     * of a two-word state — all of them contiguous runs of whole words.
+     */
     const SELF_STATING_CASES: Array<[string, string]> = [
         ['Brown rice, cooked', COOKED],
         ['Pasta, cooked', COOKED],
         ['Quinoa, cooked', COOKED],
-        ['Black beans, canned', COOKED],
-        ['Kidney beans, canned', COOKED],
-        ['Chickpeas, canned', COOKED],
+        ['Peas, cooked in water', COOKED],
         ['Rolled oats, dry', DRY],
         ['Lentils, dry', DRY],
         ['Bulgur, dry', DRY],
-        ['Tuna, canned in water', 'prepared'],
-        ['Turkey breast, sliced', 'prepared'],
+        ['Dressing, prepared from mix', PREPARED],
+        ['Flour, as purchased', AS_PURCHASED],
     ];
 
     it.each(SELF_STATING_CASES)('does not repeat the state %s already states', (name, state) => {
         expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(name);
+    });
+
+    /*
+     * The substitution the rule must NOT make. Each name carries a preparation
+     * word that used to be read as a synonym of the stored state, which silently
+     * replaced the state the row actually holds.
+     */
+    const PREPARATION_WORD_CASES: Array<[string, string, string]> = [
+        ['Black beans, canned', COOKED, 'Black beans, canned, cooked'],
+        ['Chickpeas, canned', COOKED, 'Chickpeas, canned, cooked'],
+        ['Beef, roasted', DRY, 'Beef, roasted, dry'],
+        ['Tuna, canned in water', PREPARED, 'Tuna, canned in water, prepared'],
+        ['Turkey breast, sliced', PREPARED, 'Turkey breast, sliced, prepared'],
+        ['Oats, uncooked', DRY, 'Oats, uncooked, dry'],
+    ];
+
+    it.each(PREPARATION_WORD_CASES)('states the stored state of %s rather than accepting its preparation word', (name, state, expected) => {
+        expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(expected);
+    });
+
+    it('matches the state as whole words, not as a fragment of one', () => {
+        // "predry" contains the letters of "dry" and says nothing about the
+        // state, so the suffix is still owed.
+        expect(buildGroceryName('Herbs, predry', DRY, new Map())).toBe('Herbs, predry, dry');
+    });
+
+    it('reads the qualifiers only, so a state word inside the food\u2019s own noun is not the state', () => {
+        // "dry" describes the beef, not how the shop stores it, and it sits in
+        // the head segment rather than in a qualifier.
+        expect(buildGroceryName('Dry-aged beef', DRY, new Map())).toBe('Dry-aged beef, dry');
     });
 
     it('reads the qualifiers only, so a name whose noun resembles a state still gets its suffix', () => {
@@ -1307,25 +1864,99 @@ describe('buildGroceryName', () => {
         expect(buildGroceryName(name, state, indexFoodStatesByName([{ name, food_state: state }]))).toBe(expected);
     });
 
-    it('qualifies every line of a coexisting name, even the ones that would otherwise stay silent', () => {
-        // Coexistence outranks both silencing rules: two rows of one base name
-        // must never render the same string, or the shopper reads one line and
-        // buys half of what the week needs.
-        const coexisting = indexFoodStatesByName([
-            { name: 'Black beans, canned', food_state: COOKED },
-            { name: 'Black beans, canned', food_state: DRY },
+    /**
+     * COEXISTENCE, PAIR BY PAIR: `[what the pair is, the shared base name, the
+     * first row's state and rendered name, the second row's]`.
+     *
+     * Two rows of one base name must never render the same string, or the
+     * shopper reads one line and buys half of what the week needs — so a row
+     * that would otherwise stay silent (`raw`, or a name whose qualifier is
+     * merely a preparation word) is qualified here. What coexistence does NOT
+     * do is state a row's state twice: the last pair's name already says
+     * `cooked`, so its cooked line keeps its name and only its raw line is
+     * suffixed, and the two are still distinct.
+     */
+    const COEXISTING_PAIRS: Array<[string, string, [string, string], [string, string]]> = [
+        ['a name that says nothing about either state', 'Rice', [RAW, 'Rice, raw'], [COOKED, 'Rice, cooked']],
+        [
+            'a name whose qualifier is a preparation word rather than a state',
+            'Black beans, canned',
+            [COOKED, 'Black beans, canned, cooked'],
+            [DRY, 'Black beans, canned, dry'],
+        ],
+        ['a shopping-form state beside raw', 'Olive oil', [AS_PURCHASED, 'Olive oil, as purchased'], [RAW, 'Olive oil, raw']],
+        ['a name that already states one of the two states', 'Peas, cooked', [COOKED, 'Peas, cooked'], [RAW, 'Peas, cooked, raw']],
+    ];
+
+    const coexistingIndex = (name: string, first: string, second: string): FoodStatesByName =>
+        indexFoodStatesByName([
+            { name, food_state: first },
+            { name, food_state: second },
         ]);
 
-        expect(buildGroceryName('Black beans, canned', COOKED, coexisting)).toBe('Black beans, canned, cooked');
-        expect(buildGroceryName('Black beans, canned', DRY, coexisting)).toBe('Black beans, canned, dry');
+    /** How many times `name` states `foodState`'s own words. */
+    const timesStated = (name: string, foodState: string): number => name.split(foodState.replace(/_/g, ' ')).length - 1;
 
-        const oilForms = indexFoodStatesByName([
-            { name: 'Olive oil', food_state: 'as_purchased' },
-            { name: 'Olive oil', food_state: RAW },
-        ]);
+    it.each(COEXISTING_PAIRS)('renders %s as two distinct lines', (_case, name, [stateA, expectedA], [stateB, expectedB]) => {
+        const coexisting = coexistingIndex(name, stateA, stateB);
 
-        expect(buildGroceryName('Olive oil', 'as_purchased', oilForms)).toBe('Olive oil, as purchased');
-        expect(buildGroceryName('Olive oil', RAW, oilForms)).toBe('Olive oil, raw');
+        expect(buildGroceryName(name, stateA, coexisting)).toBe(expectedA);
+        expect(buildGroceryName(name, stateB, coexisting)).toBe(expectedB);
+        expect(expectedA).not.toBe(expectedB);
+    });
+
+    it.each(COEXISTING_PAIRS)('states each coexisting state of %s exactly once', (_case, name, [stateA, expectedA], [stateB, expectedB]) => {
+        expect(timesStated(expectedA, stateA)).toBe(1);
+        expect(timesStated(expectedB, stateB)).toBe(1);
+        expect(expectedA.startsWith(name)).toBe(true);
+        expect(expectedB.startsWith(name)).toBe(true);
+    });
+
+    it('suffixes both rows when the shared name states both coexisting states', () => {
+        // The collision guard, and the one case that pays for distinguishability
+        // with a repeated word. "Beans, cooked and dry" states `cooked` AND
+        // `dry` literally, so de-duplicating both rows — the reading the pairs
+        // above take one row at a time — would render one identical string
+        // twice, which is the collapse coexistence exists to prevent. Both are
+        // therefore suffixed, and the two lines stay distinct.
+        const coexisting = coexistingIndex('Beans, cooked and dry', COOKED, DRY);
+        const cooked = buildGroceryName('Beans, cooked and dry', COOKED, coexisting);
+        const dry = buildGroceryName('Beans, cooked and dry', DRY, coexisting);
+
+        expect(cooked).toBe('Beans, cooked and dry, cooked');
+        expect(dry).toBe('Beans, cooked and dry, dry');
+        expect(cooked).not.toBe(dry);
+    });
+
+    it('de-duplicates at most one row of a coexisting name, so no pair can collide', () => {
+        // The general claim behind the guard: a de-duplicated name is the bare
+        // base and a suffixed one is the base plus ", state", so the two can
+        // never be equal — whatever the states, and whatever the name says.
+        const NAMES: readonly string[] = [
+            'Rice',
+            'Peas, cooked',
+            'Beans, cooked and dry',
+            'Olive oil',
+            'Rolled oats, dry',
+            'Dry-aged beef',
+        ];
+        const STATES: readonly string[] = [RAW, COOKED, DRY, PREPARED, AS_PURCHASED];
+
+        for (const name of NAMES) {
+            for (const first of STATES) {
+                for (const second of STATES) {
+                    if (first === second) {
+                        continue;
+                    }
+
+                    const coexisting = coexistingIndex(name, first, second);
+
+                    expect(buildGroceryName(name, first, coexisting)).not.toBe(
+                        buildGroceryName(name, second, coexisting),
+                    );
+                }
+            }
+        }
     });
 });
 
@@ -1452,11 +2083,12 @@ describe('buildGroceryRows', () => {
             [eggFacts(), oilFacts()],
         );
 
-        // The oil's name says nothing about its state: `as_purchased` is how the
-        // shop sells it, and no second form of it is on this list to tell apart.
+        // The eggs are `raw`, which is the unmarked state and earns no suffix;
+        // the oil is `as_purchased`, which does, and its own name does not state
+        // it.
         expect(rows.map((line) => [line.name, line.display_text, line.display_unit])).toEqual([
             ['Eggs', '12 eggs', COUNT_DISPLAY_UNIT],
-            ['Olive oil', '1 cup', 'cup'],
+            ['Olive oil, as purchased', '1 cup', 'cup'],
         ]);
     });
 
@@ -2182,9 +2814,12 @@ describe('buildGroceryFlag', () => {
          * both of the other two strings.
          */
         describe('a portion that counts several items', () => {
+            // USDA's dill weed portion as the release stores it, `amount` and
+            // all: five sprigs weighing one gram. The cardinality is the
+            // column, so it is stated here rather than left to the default.
             const dillFacts = (): GroceryConversionFacts => ({
                 density_g_per_ml: null,
-                default_portion: portion({ description: '5 sprigs', unit: 'each', gram_weight: 1 }),
+                default_portion: portion({ description: '5 sprigs', amount: 5, unit: 'each', gram_weight: 1 }),
             });
 
             const dillRow = (grams: number, baselineGrams: number): StoredGroceryRow => {

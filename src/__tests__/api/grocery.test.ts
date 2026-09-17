@@ -896,6 +896,67 @@ describe('GET the grocery list', () => {
             expect(list.startDate).toBe(FIXTURE_ENDED_PLAN_START_DAY_KEY);
         });
     });
+
+    /* -----------------------------------------------------------------------
+     * A malformed `:planId` on the READ
+     *
+     * The toggle names its two ids and the uncheck-all names its one; the read
+     * carries the same `:planId` and reaches the same `where: { id }` predicate
+     * on a `uuid` column, where a non-UUID is a PostgreSQL cast error and a
+     * `500` carrying a driver message. §0.5.2 promises a `400 invalid_request`
+     * naming the field instead, which is why `getGroceryListController` calls
+     * `parseGroceryListPath` before `getGroceryList`.
+     * --------------------------------------------------------------------- */
+
+    describe('a malformed planId', () => {
+        it('refuses it with 400 invalid_request, naming the parameter', async () => {
+            const before = await storedRows();
+            const secondPlanBefore = await storedRows(fixture.secondPlanId);
+
+            const response = await getList('not-a-uuid').expect(400);
+
+            expect(response.body).toEqual({
+                error: 'invalid_request',
+                details: [{ field: 'planId', code: 'invalid_id' }],
+            });
+            // A read, so nothing should have moved in any case — but the parse
+            // is what keeps the query from running at all, and both plans' lists
+            // and the plan's revision say so.
+            expect(await storedRows()).toEqual(before);
+            expect(await storedRows(fixture.secondPlanId)).toEqual(secondPlanBefore);
+            expect(await planRevision()).toBe(PLAN_REVISION);
+            expect(await actionRowCount()).toBe(0);
+        });
+
+        it('does not answer it as a plan that is gone', async () => {
+            // The distinction the client acts on: a `404` sends it to the
+            // no-plan screen and makes it discard the list it holds, when in
+            // fact it built a bad URL and its plan is untouched. An unknown but
+            // WELL-FORMED id is the genuine `404`, and the two must not be one
+            // answer.
+            const malformed = await getList('not-a-uuid');
+            const unknown = await getList(UNKNOWN_ID);
+
+            expect(malformed.status).toBe(400);
+            expect(unknown.status).toBe(404);
+            expect(malformed.body).not.toEqual(unknown.body);
+        });
+
+        it('names the parameter the same way the two writes do', async () => {
+            // One vocabulary across the three grocery routes (`grocery.logic
+            // .ts`'s `GROCERY_FIELD_CODES`), so the client maps `invalid_id`
+            // once rather than per endpoint.
+            const read = await getList('not-a-uuid').expect(400);
+            const uncheckAll = await postUncheckAll('not-a-uuid').expect(400);
+            const toggle = await putItem('not-a-uuid', itemId('Spinach'), { isChecked: true }).expect(400);
+
+            expect(read.body).toEqual(uncheckAll.body);
+            expect((toggle.body as { details: unknown[] }).details[0]).toEqual({
+                field: 'planId',
+                code: 'invalid_id',
+            });
+        });
+    });
 });
 
 /* ---------------------------------------------------------------------------
@@ -1628,6 +1689,217 @@ describe('the list aggregated from planned portions', () => {
             ['Spinach'],
             ['Rice, cooked', 'Rice, dry'],
         ]);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The two foods the catalog portions by the CONTAINER
+ *
+ * The one shape no other case here carries, and the only place it can be
+ * proved: a food whose default portion is a can — a count-family unit token
+ * (`each`) with a free-text container description — planned into a week, so the
+ * production builder derives the row and the wire carries whatever it derived.
+ * The shipped release holds exactly this for BOTH `usda:173800` (Chickpeas,
+ * canned) and `usda:174285` (Kidney beans, canned), both ingredients of the
+ * committed recipes: `{amount: 1, unit: 'each', description: '1 can, drained'}`
+ * at 253 g and 266 g with a null density. Both are asserted here, because both
+ * are foods a shipped plan renders and one of them passing says nothing about
+ * the other's gram weight tiering the same way.
+ *
+ * §0.1.4 and §6 of `docs/meal-planning/planning-policy.md` fix the contract —
+ * quantities are measured and container units are never generated — so the row
+ * must read as the weight the aggregation measured. TWO WEEKS ARE PLANNED, at
+ * one can and at two: one can of each food lands in ounces (8.9 oz, 9.4 oz)
+ * and two lands in pounds (1.1 lb, 1.2 lb), so the assertions cover the tier
+ * promotion a single week would have hidden. The foods are synthesised with
+ * inline portions rather than added to a data file: this suite's catalog lives
+ * in the `usda:92001xx` fixture block, and the release rows the shapes are
+ * taken from are asserted in `grocery.logic.test.ts`.
+ * ------------------------------------------------------------------------- */
+
+describe('the two foods the catalog portions by the container', () => {
+    /**
+     * The two release foods, as the wire must render them: the release key the
+     * shape is taken from, the catalog name and state stored for it, what one
+     * can weighs, the shopping name the state suffix produces, and the rendered
+     * amount at one can and at two.
+     *
+     * Every string and number here is a value this file STATES rather than one
+     * it recomputes with the formatter under test, which is the same discipline
+     * the shared fixture's `LINES` follow.
+     */
+    const CANNED_LEGUMES = [
+        {
+            source: 'usda:173800',
+            displayName: 'Chickpeas, canned',
+            foodState: 'cooked',
+            canGrams: 253,
+            shoppingName: 'Chickpeas, canned, cooked',
+            oneCan: { quantity: 8.9, unit: 'oz', text: '8.9 oz' },
+            twoCans: { quantity: 1.1, unit: 'lb', text: '1.1 lb' },
+            recipeSlug: 'grocery-suite-container-chickpeas',
+            recipeName: 'Chickpea Stew',
+        },
+        {
+            source: 'usda:174285',
+            displayName: 'Kidney beans, canned',
+            foodState: 'cooked',
+            canGrams: 266,
+            shoppingName: 'Kidney beans, canned, cooked',
+            oneCan: { quantity: 9.4, unit: 'oz', text: '9.4 oz' },
+            twoCans: { quantity: 1.2, unit: 'lb', text: '1.2 lb' },
+            recipeSlug: 'grocery-suite-container-kidney-beans',
+            recipeName: 'Kidney Bean Chili',
+        },
+    ] as const;
+
+    /** The release's own portion description, shared by both foods. */
+    const CAN_DESCRIPTION = '1 can, drained';
+
+    /** The slot each food's recipe is planned in, so one week plans both. */
+    const SLOTS = ['lunch', 'dinner'] as const;
+
+    /** The plan each food id is read from, by how many cans of it the week needs. */
+    let oneCanPlanId: string;
+    let twoCanPlanId: string;
+    const foodIdsBySource = new Map<string, string>();
+
+    beforeEach(async () => {
+        foodIdsBySource.clear();
+
+        const recipeVersionIds: string[] = [];
+
+        for (const legume of CANNED_LEGUMES) {
+            const food = await makeCatalogFood({
+                display_name: legume.displayName,
+                category: 'legume',
+                food_state: legume.foodState,
+                defaultPortion: {
+                    description: CAN_DESCRIPTION,
+                    amount: 1,
+                    unit: 'each',
+                    gram_weight: legume.canGrams,
+                },
+            });
+
+            // One whole can per recipe at a yield of one serving, so a planned
+            // day needs exactly a can and a two-day week exactly two.
+            const version = await makeRecipeVersion({
+                slug: legume.recipeSlug,
+                name: legume.recipeName,
+                catalogFoodId: food.id,
+                yield_servings: 1,
+                ingredients: [
+                    {
+                        catalogFoodId: food.id,
+                        gram_weight: legume.canGrams,
+                        quantity: legume.canGrams,
+                        unit: 'g',
+                        display_text: `${legume.canGrams} g`,
+                    },
+                ],
+            });
+
+            foodIdsBySource.set(legume.source, food.id);
+            recipeVersionIds.push(version.id);
+        }
+
+        const slots = recipeVersionIds.map((recipeVersionId, index) => ({
+            slot: SLOTS[index],
+            slot_time: index === 0 ? '12:30' : '18:30',
+            recipeVersionId,
+        }));
+
+        // Two weeks of their own, and separate start dates at that: the shared
+        // fixture already holds the current week and the ones the describes
+        // above take, and the partial unique index refuses a second active plan
+        // on one start date. Every case here only READS its list, so the week
+        // each sits in is immaterial.
+        const oneCanPlan = await makePlan(USER_ID, { startDate: weekOffsetDayKey(35), dayCount: 1, slots });
+        const twoCanPlan = await makePlan(USER_ID, { startDate: weekOffsetDayKey(42), dayCount: 2, slots });
+
+        for (const plan of [oneCanPlan, twoCanPlan]) {
+            await prisma.$transaction(async (tx) => {
+                await rebuildPlanGroceries(tx, {
+                    userId: USER_ID,
+                    planId: plan.id,
+                    meals: await loadPlannedMealsForGroceries(tx, USER_ID, plan.id),
+                    now: new Date(),
+                });
+            });
+        }
+
+        oneCanPlanId = oneCanPlan.id;
+        twoCanPlanId = twoCanPlan.id;
+    });
+
+    const foodId = (source: string): string => {
+        const id = foodIdsBySource.get(source);
+
+        if (id === undefined) {
+            throw new Error(`the fixture must create a catalog food for ${source}`);
+        }
+
+        return id;
+    };
+
+    /** One food's derived line on one of the two plans, as the client receives it. */
+    const containerItem = async (planId: string, source: string): Promise<GroceryItem> => {
+        const items = everyItem(await readList(planId));
+        const item = items.find((candidate) => candidate.catalogFoodId === foodId(source));
+
+        if (item === undefined) {
+            throw new Error(`the container-portion food ${source} must reach the grocery list`);
+        }
+
+        return item;
+    };
+
+    it.each(CANNED_LEGUMES)(
+        'reaches the wire as the ounces one can of $source weighs, not as a number of cans',
+        async (legume) => {
+            const item = await containerItem(oneCanPlanId, legume.source);
+
+            expect(item.quantityGrams).toBe(legume.canGrams);
+            expect(item.displayText).toBe(legume.oneCan.text);
+            expect(item.displayText).not.toMatch(/can/i);
+        },
+    );
+
+    it.each(CANNED_LEGUMES)('promotes two cans of $source to pounds, still as a measure', async (legume) => {
+        const item = await containerItem(twoCanPlanId, legume.source);
+
+        // "2 cans, drained" is what a count row would have said, and the data
+        // cannot say how large a can is.
+        expect(item.quantityGrams).toBe(2 * legume.canGrams);
+        expect(item.displayText).toBe(legume.twoCans.text);
+        expect(item.displayText).not.toMatch(/can/i);
+    });
+
+    it.each(CANNED_LEGUMES)('stores a unit whose family is readable for $source, so later updates stay in it', async (legume) => {
+        const oneCanRow = await prisma.grocery_items.findFirstOrThrow({
+            where: { meal_plan_id: oneCanPlanId, catalog_food_id: foodId(legume.source) },
+        });
+        const twoCanRow = await prisma.grocery_items.findFirstOrThrow({
+            where: { meal_plan_id: twoCanPlanId, catalog_food_id: foodId(legume.source) },
+        });
+
+        expect(oneCanRow.display_unit).toBe(legume.oneCan.unit);
+        expect(oneCanRow.display_quantity).toBe(legume.oneCan.quantity);
+        expect(oneCanRow.display_text).toBe(legume.oneCan.text);
+
+        expect(twoCanRow.display_unit).toBe(legume.twoCans.unit);
+        expect(twoCanRow.display_quantity).toBe(legume.twoCans.quantity);
+        expect(twoCanRow.display_text).toBe(legume.twoCans.text);
+    });
+
+    it.each(CANNED_LEGUMES)('states the food state the shopper is buying for $source', async (legume) => {
+        // `cooked`, and the catalog's own "canned" qualifier is not a way of
+        // saying it (§0.7.3).
+        const item = await containerItem(oneCanPlanId, legume.source);
+
+        expect(item.foodState).toBe(legume.foodState);
+        expect(item.name).toBe(legume.shoppingName);
     });
 });
 

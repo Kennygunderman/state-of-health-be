@@ -11,9 +11,15 @@
 // exist because a portion description is data the catalog wrote, not a label
 // this module chose:
 //
-//  * A COUNT PORTION MAY STATE ITS OWN AMOUNT. "5 sprigs" is one portion of
-//    five sprigs, so the amount is read off the description and multiplied out
-//    rather than printed in front of it.
+//  * A COUNT PORTION MAY COUNT SEVERAL ITEMS, AND THE STRUCTURED AMOUNT SAYS
+//    HOW MANY. `catalog_food_portions.amount` is the cardinality — "5 sprigs"
+//    is one portion of five sprigs because its `amount` is 5 — and the
+//    description is only the LABEL, with any amount it happens to repeat
+//    stripped off it. The two disagree in the shipped catalog: 139 default
+//    count portions carry an `amount` other than 1 and 138 of those state
+//    something else, or nothing, in front of their noun ("cookies" at
+//    `amount: 3`, "crackers (1 NLEA serving)" at `amount: 11`), so reading the
+//    text would undercount them.
 //  * THE ITEM IS THE HEAD NOUN. "egg, large" pluralises to "eggs, large": the
 //    qualifier after the comma is not the thing being counted.
 //
@@ -446,8 +452,24 @@ export const formatInUnit = (baseAmount: number, unit: string): DisplayQuantity 
 // Irregular plurals the general rule gets wrong ("tomatos", "leafs"). The list
 // is closed against the catalog rather than against English: of the 262 head
 // nouns the shipped count portions use, these are the ones the rules below
-// inflect incorrectly. Every other -o noun in that set takes a plain s
-// (avocados, burritos, tacos, matzos), which is why there is no -o rule.
+// inflect incorrectly, in one direction or the other. Every other -o noun in
+// that set takes a plain s (avocados, burritos, tacos, matzos), which is why
+// there is no -o rule.
+//
+// The table is read BOTH ways — `SINGULAR_EXCEPTIONS` below is its inverse — so
+// one entry fixes one noun in both directions, which is why the last three sit
+// here rather than in a second mechanism:
+//
+//  * `-o` and `-f` singulars whose plural is not a plain s: tomato, potato,
+//    leaf, loaf, half. `egg` is regular and is kept because it is the count
+//    row the design names ("1 egg", "12 eggs").
+//  * `cookie` and `pierogi`, because the -ies plural rule has no correct
+//    inverse for a singular that already ends in a vowel + e or i: "cookies"
+//    read backwards through it is "cooky" and "pierogies" is "pierogy". Both
+//    are real catalog head nouns, and "1 cooky" is what a shopper saw.
+//  * `goldfish`, an invariant plural: the -sh rule would append -es to a word
+//    that does not take it. (`crayfish`, the other -fish noun in the set, is
+//    deliberately absent — "crayfishes" is a standard plural of it.)
 const PLURAL_EXCEPTIONS: Record<string, string> = {
     egg: 'eggs',
     tomato: 'tomatoes',
@@ -455,6 +477,9 @@ const PLURAL_EXCEPTIONS: Record<string, string> = {
     leaf: 'leaves',
     loaf: 'loaves',
     half: 'halves',
+    cookie: 'cookies',
+    pierogi: 'pierogies',
+    goldfish: 'goldfish',
 };
 
 const ES_SUFFIX_PATTERN = /(?:s|x|z|ch|sh)$/;
@@ -516,8 +541,8 @@ const invert = (table: Record<string, string>): Record<string, string> => {
     return inverted;
 };
 
-// The same four irregulars read the other way, built from the table above so
-// the pair cannot drift apart.
+// The same irregulars read the other way, built from the table above so the
+// pair cannot drift apart: adding an entry fixes both directions at once.
 const SINGULAR_EXCEPTIONS: Record<string, string> = invert(PLURAL_EXCEPTIONS);
 
 const ES_PLURAL_PATTERN = /(?:s|x|z|ch|sh)es$/;
@@ -555,69 +580,91 @@ const matchCase = (original: string, replacement: string): string => {
     return replacement;
 };
 
-export interface CountPortionLabel {
+/**
+ * The `catalog_food_portions` columns a stored COUNT portion is counted from.
+ *
+ * Both columns, because they answer different questions and the catalog needs
+ * both answered: `amount` is how many items one portion IS, and `description`
+ * is what to call them.
+ */
+export interface CountPortionMeasure {
     /**
-     * Countable items in ONE stored portion, taken from the description's
-     * leading amount; 1 when it states none.
+     * `amount` — countable items in ONE stored portion. 3 for a
+     * `{amount: 3, description: 'cookies', gram_weight: 44}` portion, so 132 g
+     * is nine cookies.
      */
-    itemsPerPortion: number;
-    /** The item noun alone: "1 egg, large" -> "egg, large", "5 sprigs" -> "sprigs". */
-    noun: string;
+    amount: number;
+    /** `description` — the label, as the catalog wrote it: "1 egg, large", "5 sprigs", "cookies". */
+    description: string;
 }
 
-// A USDA count portion states its own amount inside the description whenever it
-// counts more than one item: "5 sprigs" is one portion of five sprigs and
-// "1 egg, large" one portion of one egg. Rendering the portion count in front
-// of that text reads "9 5 sprigs", and treating the portion as the item
-// undercounts a multi-item portion ninefold, so the amount is read off the
-// description and multiplied out. Every leading number in the shipped catalog
-// equals its portion's stored `amount`, which is what makes the description a
-// sufficient source and keeps this a pure string rule.
+// The amount a description may repeat in front of its noun. It is stripped
+// because the structured `amount` is what multiplies out: printing the item
+// count in front of the text as well reads "9 5 sprigs", and inflecting the
+// text with its amount still attached reads "6 1 egg, larges". Only a positive
+// finite leading number is treated as a repeated amount; "12oz" (no space) and
+// "0 slices" are not, so a label that merely begins with digits keeps them.
 const LEADING_AMOUNT_PATTERN = /^(\d+(?:\.\d+)?)\s+(\S.*)$/;
 
-export const parseCountPortion = (description: string): CountPortionLabel => {
+/**
+ * The label of a count portion: its description with a repeated leading amount
+ * removed.
+ *
+ * "1 egg, large" -> "egg, large", "5 sprigs" -> "sprigs", "cookies" ->
+ * "cookies". Purely textual — it decides nothing about HOW MANY, which is
+ * {@link CountPortionMeasure.amount}'s job.
+ */
+export const countPortionLabel = (description: string): string => {
     const label = description.trim();
     const match = LEADING_AMOUNT_PATTERN.exec(label);
 
     if (!match) {
-        return { itemsPerPortion: 1, noun: label };
+        return label;
     }
 
-    const itemsPerPortion = Number(match[1]);
+    const leadingAmount = Number(match[1]);
 
-    // A leading zero counts nothing and would erase the row. Anything that is
-    // not a positive finite amount therefore leaves the description whole and
-    // counts portions, which is the behaviour of a description that states no
-    // amount at all.
-    if (!Number.isFinite(itemsPerPortion) || itemsPerPortion <= 0) {
-        return { itemsPerPortion: 1, noun: label };
-    }
-
-    return { itemsPerPortion, noun: match[2] };
+    // A leading zero, or anything else that is not a positive finite number, is
+    // not an amount this description is repeating, so the label keeps it.
+    return Number.isFinite(leadingAmount) && leadingAmount > 0 ? match[2] : label;
 };
 
-/** Items in `portions` of a count portion described by `description`. */
-export const countPortionItems = (portions: number, description: string): number => {
+/**
+ * Countable items in ONE portion, taken from the structured column.
+ *
+ * DEFENSIVE BY DESIGN: a non-finite, zero or negative `amount` behaves as 1
+ * rather than erasing or inverting the row. Validation's `unsupported_portion`
+ * check should have quarantined such a food long before it reached a shopping
+ * list, so the choice here is between a row that counts portions and a row that
+ * silently counts nothing — and "one portion is one item" is the reading that
+ * still puts a truthful line in front of the shopper.
+ */
+const itemsPerPortion = (amount: number): number => (Number.isFinite(amount) && amount > 0 ? amount : 1);
+
+/** Items in `portions` of a stored count portion. */
+export const countPortionItems = (portions: number, portion: CountPortionMeasure): number => {
     assertFiniteQuantity(portions, 'count');
 
-    const { itemsPerPortion } = parseCountPortion(description);
-
     return requireFiniteResult(
-        portions * itemsPerPortion,
-        `${String(portions)} portions of "${description.trim()}" to items`,
+        portions * itemsPerPortion(portion.amount),
+        `${String(portions)} portions of "${portion.description.trim()}" to items`,
     );
 };
 
 /**
  * The item noun of a count portion, in the number `count` calls for.
  *
- * The portion's own leading amount is dropped first — "6" portions of
+ * The portion's own repeated amount is dropped first — "6" portions of
  * "1 egg, large" is "6 eggs, large", never "6 1 egg, larges" — and a
  * description the catalog already wrote in the plural is inflected in whichever
  * direction it needs, or left alone when it is already right.
+ *
+ * Takes the description alone, and keeps doing so: the cardinality is the
+ * caller's already-computed `count`, and `mealPlan.mapper.ts` pluralises a
+ * serving description that has no stored portion behind it at all.
  */
 export const pluralizeCount = (count: number, description: string): string => {
-    const { noun } = parseCountPortion(description);
+    const noun = countPortionLabel(description);
     const match = headNounMatch(noun);
 
     if (!match) {
@@ -638,11 +685,22 @@ export const pluralizeCount = (count: number, description: string): string => {
     return noun.slice(0, match.index) + inflected + noun.slice(match.index + word.length);
 };
 
-export const formatCount = (count: number, description: string): DisplayQuantity => {
-    assertFiniteQuantity(count, 'count');
+/**
+ * A count row's rendered amount: `portions` of a stored count portion, as whole
+ * items and their label.
+ *
+ * `portions` is the grams-over-gram-weight figure the caller divided out, so
+ * the items it stands for are `portions × portion.amount` — 132 g of a
+ * `{amount: 3, description: 'cookies', gram_weight: 44}` portion is three
+ * portions and therefore nine cookies. Rounded to a whole item, because half a
+ * lime is not a shopping instruction, and clamped away from zero so a positive
+ * amount never reads as none.
+ */
+export const formatCount = (portions: number, portion: CountPortionMeasure): DisplayQuantity => {
+    assertFiniteQuantity(portions, 'count');
 
-    const { noun } = parseCountPortion(description);
-    const items = countPortionItems(count, description);
+    const noun = countPortionLabel(portion.description);
+    const items = countPortionItems(portions, portion);
     const value = clampPositiveToOne(roundToInteger(items), items);
 
     // A count with no portion description renders as the bare number: "3".

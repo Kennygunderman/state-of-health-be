@@ -25,8 +25,50 @@ import {
 } from '../services/entitlement.service';
 import { CatalogFoodNotFoundError } from '../services/mealPlanning.errors';
 import { getUserId, getUserEmail } from '../utils/getUserId';
+import { describeErrorSafely, logSafeEvent } from '../utils/safeLogger';
 
 const DAY_KEY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * The route descriptors the safe server events below carry.
+ *
+ * They replace the fixed prose each `console.error` used to print as its first
+ * argument: the route's identity is the useful half of those lines, and it is
+ * the half that can be recorded without the error object beside it.
+ */
+const ACTIONS = {
+    dailyMacros: 'diary.dailyMacros',
+    logEntry: 'diary.logEntry',
+    updateEntry: 'diary.updateEntry',
+    deleteEntry: 'diary.deleteEntry',
+    history: 'diary.history',
+    updateTargets: 'diary.updateTargets',
+    estimate: 'ai.estimate',
+    labelScan: 'ai.labelScan',
+    aiUsage: 'ai.usage',
+} as const;
+
+/**
+ * Records one server fault on a diary route, with the route, the status and a
+ * SAFE description of the throw — its class name and, when the runtime supplies
+ * one, its machine code.
+ *
+ * This is the whole of what replaced `console.error('Error …:', error)` on the
+ * nine failure paths in this file. Passing the error object rendered its stack,
+ * a Prisma error's `meta` (which carries the failing statement's values) and,
+ * on the estimate path, `EstimateFailedError.message` — which quotes the
+ * vendor's own response text. None of that can satisfy AAP §0.3.2/§0.7.1, and
+ * Rule backend-architecture §8 asks for a safe message rather than the raw
+ * error. Every response body and status on these routes is unchanged: they are
+ * shipped diary contracts, and this is a logging change only.
+ */
+const logRouteFailure = (action: string, status: number, error: unknown): void => {
+    logSafeEvent('error', 'request_failed', {
+        action,
+        status,
+        ...describeErrorSafely(error),
+    });
+};
 
 export const getDailyMacrosController = async (req: Request, res: Response) => {
     try {
@@ -38,7 +80,7 @@ export const getDailyMacrosController = async (req: Request, res: Response) => {
         const day = await getDailyMacros(userId, date);
         return res.json(day);
     } catch (error) {
-        console.error('Error getting daily macros:', error);
+        logRouteFailure(ACTIONS.dailyMacros, 500, error);
         res.status(500).json({ error: 'Failed to get daily macros' });
     }
 };
@@ -76,12 +118,6 @@ export const logMealEntryController = async (req: Request, res: Response) => {
         // It is judged AFTER the body deliberately: a malformed body must keep
         // earning the frozen 400 that shipped clients read, so this check only
         // speaks where the request would otherwise have reached the database.
-        // The path is judged BEFORE either writer, because `:mealId` reaches a
-        // `@db.Uuid` predicate in both of them and an unparsable id would come
-        // back from PostgreSQL as a 500 for a request only the caller can fix.
-        // It is judged AFTER the body deliberately: a malformed body must keep
-        // earning the frozen 400 that shipped clients read, so this check only
-        // speaks where the request would otherwise have reached the database.
         const path = parseMealEntryPath(req.params);
         if (path.kind === 'error') {
             return res.status(400).json(logEntryErrorBody(path));
@@ -102,7 +138,7 @@ export const logMealEntryController = async (req: Request, res: Response) => {
         if (error instanceof InvalidServingError) {
             return res.status(400).json({ error: 'invalid_serving' });
         }
-        console.error('Error logging meal entry:', error);
+        logRouteFailure(ACTIONS.logEntry, 500, error);
         res.status(500).json({ error: 'Failed to log meal entry' });
     }
 };
@@ -135,7 +171,7 @@ export const updateMealEntryController = async (req: Request, res: Response) => 
         }
         return res.json(entry);
     } catch (error) {
-        console.error('Error updating meal entry:', error);
+        logRouteFailure(ACTIONS.updateEntry, 500, error);
         res.status(500).json({ error: 'Failed to update meal entry' });
     }
 };
@@ -155,7 +191,7 @@ export const deleteMealEntryController = async (req: Request, res: Response) => 
         }
         return res.json({ success: true });
     } catch (error) {
-        console.error('Error deleting meal entry:', error);
+        logRouteFailure(ACTIONS.deleteEntry, 500, error);
         res.status(500).json({ error: 'Failed to delete meal entry' });
     }
 };
@@ -176,7 +212,7 @@ export const getHistoryController = async (req: Request, res: Response) => {
             },
         });
     } catch (error) {
-        console.error('Error getting macros history:', error);
+        logRouteFailure(ACTIONS.history, 500, error);
         res.status(500).json({ error: 'Failed to get macros history' });
     }
 };
@@ -201,12 +237,12 @@ export const updateTargetsController = async (req: Request, res: Response) => {
         }
         return res.json(targets);
     } catch (error) {
-        console.error('Error updating targets:', error);
+        logRouteFailure(ACTIONS.updateTargets, 500, error);
         res.status(500).json({ error: 'Failed to update targets' });
     }
 };
 
-const handleEstimateError = (res: Response, error: unknown, fallback: string) => {
+const handleEstimateError = (res: Response, error: unknown, action: string, fallback: string) => {
     if (error instanceof FeatureDisabledError) {
         return res.status(503).json({ error: 'feature_disabled' });
     }
@@ -219,10 +255,14 @@ const handleEstimateError = (res: Response, error: unknown, fallback: string) =>
         });
     }
     if (error instanceof EstimateFailedError) {
-        console.error('Estimate failed:', error.message);
+        // The class name and nothing else. `EstimateFailedError.message` is
+        // built from the model's own failure text, so printing it put vendor
+        // response content — the one thing a model boundary must not persist —
+        // into the server log.
+        logRouteFailure(action, 502, error);
         return res.status(502).json({ error: 'estimation_failed' });
     }
-    console.error(fallback, error);
+    logRouteFailure(action, 500, error);
     return res.status(500).json({ error: fallback });
 };
 
@@ -239,7 +279,7 @@ export const estimateController = async (req: Request, res: Response) => {
         const estimate = await estimateMeal(hasText ? text.trim() : undefined, hasImage ? imageBase64 : undefined);
         return res.json(estimate);
     } catch (error) {
-        return handleEstimateError(res, error, 'Failed to estimate meal');
+        return handleEstimateError(res, error, ACTIONS.estimate, 'Failed to estimate meal');
     }
 };
 
@@ -254,7 +294,7 @@ export const labelScanController = async (req: Request, res: Response) => {
         const scan = await scanLabel(imageBase64);
         return res.json(scan);
     } catch (error) {
-        return handleEstimateError(res, error, 'Failed to scan label');
+        return handleEstimateError(res, error, ACTIONS.labelScan, 'Failed to scan label');
     }
 };
 
@@ -265,7 +305,7 @@ export const aiUsageController = async (req: Request, res: Response) => {
         const usage = await getAiUsage(userId, getUserEmail(req));
         return res.json(usage);
     } catch (error) {
-        console.error('Error getting AI usage:', error);
+        logRouteFailure(ACTIONS.aiUsage, 500, error);
         res.status(500).json({ error: 'Failed to get AI usage' });
     }
 };

@@ -26,14 +26,21 @@
 //     here, that the three keys are consulted in the declared precedence.
 //
 // HOW A RANK TIE IS CONSTRUCTED, since three of the ordering cases depend on
-// it. `searchPublishedFoods` ranks a food by its BEST contribution, and the
-// prefix branches contribute a constant zero while the two full-text branches
-// contribute a `ts_rank`. `catalog_foods.search_vector` is generated from
+// it. `searchPublishedFoods` ranks a food by its BEST contribution. The two
+// full-text branches score a weighted `ts_rank`; the two prefix branches score
+// how much of the matched text the typed prefix covers, and every prefix score
+// sits strictly below every full-text score, so the prefix band is a band and
+// not a single value. `catalog_foods.search_vector` is generated from
 // `search_text` ALONE, so a food whose `search_text` carries no word of the
-// query can only ever match through the prefix on its name — at rank zero.
-// That is what `UNRELATED_SEARCH_TEXT` below is for: every food seeded with it
-// ties at zero, which is the only way `display_name` and then `source_key` can
-// be observed deciding the order at all.
+// query can only ever match through the prefix on its name — inside that band.
+// That is what `UNRELATED_SEARCH_TEXT` below is for.
+//
+// Coverage is `len(query) / len(matched text)`, so two prefix-only foods tie
+// only when their names are the SAME LENGTH — which is why the three ordering
+// cases below seed names of equal length when they want a tie, and names of
+// deliberately different length when they want coverage to decide. A tie is
+// still the only way `display_name` and then `source_key` can be observed
+// deciding the order at all.
 //
 // EVERY CASE SEEDS ITS OWN WORLD. `beforeEach` truncates, so each `it` starts
 // from an empty catalog and every count, total and page in the assertions is
@@ -198,7 +205,13 @@ const catalogStatus = async (): Promise<{ status: number; body: CatalogStatusRes
 
 /**
  * A published food reachable by {@link TERM} through the prefix on its name and
- * through nothing else, so its rank is the constant zero.
+ * through nothing else, so it scores inside the prefix band.
+ *
+ * TWO SUCH FOODS TIE ONLY WHEN THEIR NAMES ARE THE SAME LENGTH. A prefix
+ * contribution is scored by coverage — the typed prefix's share of the matched
+ * text — so `display_name` decides the score as well as the tiebreaker, and a
+ * tie has to be built rather than assumed. Every ordering case below that needs
+ * a tie therefore uses names of equal length, and says so.
  *
  * `sequence` is always passed explicitly: it is what makes `source_key` and
  * `usda_fdc_id` deterministic, and two foods sharing one would collide on
@@ -482,14 +495,179 @@ describe('GET /api/catalog/foods', () => {
         });
 
         it('breaks a tie on rank with the display name', async () => {
+            // Three names of the SAME LENGTH, so the prefix coverage — and
+            // therefore the rank — is identical and only `display_name` is left
+            // to explain the sequence.
             await makePrefixOnlyFood(3, 'Kumquat Gamma');
             await makePrefixOnlyFood(1, 'Kumquat Alpha');
-            await makePrefixOnlyFood(2, 'Kumquat Beta');
+            await makePrefixOnlyFood(2, 'Kumquat Delta');
 
             const { items } = await searchFoods({ q: TERM });
 
             // Seeded out of order, so insertion order cannot satisfy this.
-            expect(namesOf(items)).toEqual(['Kumquat Alpha', 'Kumquat Beta', 'Kumquat Gamma']);
+            expect(namesOf(items)).toEqual(['Kumquat Alpha', 'Kumquat Delta', 'Kumquat Gamma']);
+        });
+
+        it('puts the name the typed prefix covers most of first', async () => {
+            // Both are reachable only by prefix, so both sit in the prefix band
+            // and `display_name` would order the longer name first. It comes
+            // second, so coverage is what ordered them — the fix for a prefix
+            // match set that used to tie at one rank and fall back to
+            // alphabetical order.
+            await makePrefixOnlyFood(1, 'Kumquat, canned in heavy syrup');
+            await makePrefixOnlyFood(2, 'Kumquat, raw');
+
+            const { items } = await searchFoods({ q: TERM });
+
+            expect(namesOf(items)).toEqual(['Kumquat, raw', 'Kumquat, canned in heavy syrup']);
+        });
+
+        it('puts the food the query names above a food that merely mentions it', async () => {
+            // Both match on meaning, so both are outside the prefix band and
+            // the alphabetically-first name would win on the tiebreaker. The
+            // food whose name IS the term wins instead: its name carries fewer
+            // unrelated words, and the term is its head noun rather than a
+            // qualifier after the comma.
+            await makeCatalogFood({
+                sequence: 1,
+                display_name: 'Bread, kumquat',
+                canonical_name: 'bread, kumquat',
+                search_text: 'bread kumquat baked',
+            });
+            await makeCatalogFood({
+                sequence: 2,
+                display_name: 'Kumquat',
+                canonical_name: 'kumquat',
+                search_text: 'kumquat raw fruit',
+            });
+
+            const { items } = await searchFoods({ q: TERM });
+
+            expect(namesOf(items)).toEqual(['Kumquat', 'Bread, kumquat']);
+        });
+
+        it('does not let a short alias on a vague food outrank a precisely named one', async () => {
+            // The measured defect this scoring exists for: an alias used to be
+            // scored against its own length, so a one-word alias on a food with
+            // a long name outranked the food the user actually meant.
+            const vague = await makeCatalogFood({
+                sequence: 1,
+                display_name: 'Fruit, NS as to type, NS as to preparation',
+                canonical_name: 'fruit, ns as to type, ns as to preparation',
+                search_text: 'fruit unspecified',
+            });
+            await addAlias(vague.id, TERM);
+            await makeCatalogFood({
+                sequence: 2,
+                display_name: 'Kumquat, raw',
+                canonical_name: 'kumquat, raw',
+                search_text: 'kumquat raw fruit',
+            });
+
+            const { items } = await searchFoods({ q: TERM });
+
+            expect(namesOf(items)).toEqual(['Kumquat, raw', 'Fruit, NS as to type, NS as to preparation']);
+        });
+
+        it('puts a full-text match on the head noun above one on a modifier', async () => {
+            // "kumquat bread" is a bread; "Kumquat, raw" is a kumquat. Both
+            // names carry the term and the same number of words, so only the
+            // head-noun rule can separate them — and the alphabetical
+            // tiebreaker would have chosen the other way round.
+            await makeCatalogFood({
+                sequence: 1,
+                display_name: 'Kumquat bread',
+                canonical_name: 'kumquat bread',
+                search_text: 'kumquat bread baked',
+            });
+            await makeCatalogFood({
+                sequence: 2,
+                display_name: 'Kumquat, raw',
+                canonical_name: 'kumquat, raw',
+                search_text: 'kumquat raw fruit',
+            });
+
+            const { items } = await searchFoods({ q: TERM });
+
+            expect(namesOf(items)).toEqual(['Kumquat, raw', 'Kumquat bread']);
+        });
+
+        it('applies the head-noun rule to a name no two collations case-fold alike', async () => {
+            // THE PORTABILITY GUARD, and the reason it is an ordering case here
+            // rather than a unit test. The head noun is extracted TWICE — in
+            // JavaScript for the query (`searchQueryHeadNoun`) and in SQL for
+            // the name — and the two extractions have to produce byte-identical
+            // text or the comparison silently fails and the food drops a tier.
+            // Tier decides `rank`, and `rank` is the FIRST ordering key, so
+            // `COLLATE "C"` on the two text tiebreakers cannot repair it.
+            //
+            // They did diverge. The SQL side folded with `lower()`, which
+            // resolves through the collation, and the JavaScript side with
+            // `toLowerCase()`, which does not: `'MURNİX'.toLowerCase()` gives
+            // `murni` + U+0307 + `x` while `lower('MURNİX')` gives a plain
+            // `murnix` on this database — so NEITHER food below matched on its
+            // head noun, both fell to the head-segment weight, their ranks tied
+            // and the collated name decided, returning them the other way
+            // round. Under an ICU collation the same code matched, which is the
+            // whole defect: the answer depended on the server, and AAP §§0.5.2
+            // and 0.9.3 require two independently loaded databases to agree.
+            //
+            // U+0130 sits in the MIDDLE of the term on purpose. The food that
+            // must rank first has to sort SECOND in C byte order, or a build
+            // with no head-noun signal at all would pass this; a term opening
+            // with U+0130 encodes as 0xC4 0xB0 and would always sort last.
+            const unicodeTerm = 'MURNİX';
+
+            await makeCatalogFood({
+                sequence: 1,
+                display_name: 'MURNİX bread',
+                canonical_name: 'murnİx bread',
+                search_text: 'MURNİX bread',
+                food_state: 'cooked',
+            });
+            await makeCatalogFood({
+                sequence: 2,
+                display_name: 'Zested MURNİX',
+                canonical_name: 'zested murnİx',
+                search_text: 'Zested MURNİX',
+                food_state: 'raw',
+            });
+
+            // The premise, asserted rather than assumed: C byte order puts the
+            // modifier first, so the expectation below can only be met by rank.
+            expect(['MURNİX bread', 'Zested MURNİX'].slice().sort()).toEqual([
+                'MURNİX bread',
+                'Zested MURNİX',
+            ]);
+
+            const { items } = await searchFoods({ q: unicodeTerm });
+
+            expect(namesOf(items)).toEqual(['Zested MURNİX', 'MURNİX bread']);
+        });
+
+        it('puts a name match above a food matched only by its descriptor words', async () => {
+            // The weakest positive band, and the reason it stays positive: the
+            // second food is still found and still returned, it simply cannot
+            // outrank a food that is called what the user typed.
+            await makeCatalogFood({
+                sequence: 1,
+                display_name: 'Aubergine, raw',
+                canonical_name: 'aubergine, raw',
+                search_text: `aubergine raw ${TERM} adjacent`,
+            });
+            await makeCatalogFood({
+                sequence: 2,
+                display_name: 'Kumquat, raw',
+                canonical_name: 'kumquat, raw',
+                search_text: 'kumquat raw fruit',
+            });
+
+            const { items, pagination } = await searchFoods({ q: TERM });
+
+            // Asserted whole, so "still returned" is part of the claim rather
+            // than an inference from the order.
+            expect(pagination).toEqual({ page: 1, limit: SEARCH_DEFAULT_LIMIT, total: 2, totalPages: 1 });
+            expect(namesOf(items)).toEqual(['Kumquat, raw', 'Aubergine, raw']);
         });
 
         it('breaks a tie on rank and display name with the portable source key', async () => {

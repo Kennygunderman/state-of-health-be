@@ -123,6 +123,31 @@ const PLAN_START_DAY_KEY = addDaysToDayKey(TODAY, -1);
 const PLAN_END_DAY_KEY = addDaysToDayKey(TODAY, 5);
 
 /**
+ * The week `POST /meal-planning/plans` publishes for its own-id control: the day
+ * after the fixture week ends, which is the "Plan another week" successor §0.5.2
+ * admits.
+ *
+ * Three rules pick this date rather than {@link TODAY}, and all three have to
+ * hold at once for the control to be a 201 rather than a refusal:
+ *  - the start-date window is `[today, max(today + 30, current.endDate + 1)]`,
+ *    and `TODAY + 6` is inside it;
+ *  - `requireNonConflictingWeek` refuses a week overlapping any other active
+ *    plan, and the caller's fixture week is `[TODAY - 1, TODAY + 5]`, so this
+ *    is the first free start date;
+ *  - at most one active plan may start after today, and the fixture's week
+ *    starts before it, so this publication is the only upcoming one.
+ */
+const SUCCESSOR_WEEK_START_DAY_KEY = addDaysToDayKey(PLAN_END_DAY_KEY, 1);
+
+/** `meal_plans.revision` and `generation_attempt` on a first publication. */
+const FIRST_PLAN_REVISION = 1;
+const FIRST_GENERATION_ATTEMPT = 1;
+
+/** A published week is seven days, and the fixture schedule plans three meals in each. */
+const PLAN_DAY_COUNT = 7;
+const MEALS_PER_DAY = 3;
+
+/**
  * The three slot sizes that make a fixture day land exactly on the plan's
  * target snapshot (2,100 kcal / 158 P / 210 C / 70 F), so a swap candidate of
  * the same size is admissible under the day tolerance and the "own id"
@@ -291,6 +316,60 @@ const seedSharedCatalog = async () => {
 type SharedCatalog = Awaited<ReturnType<typeof seedSharedCatalog>>;
 
 /**
+ * How many further recipes each slot needs before a seven-day search can close,
+ * and therefore before generation or regeneration can answer the 201 §0.5.2
+ * documents for them.
+ *
+ * `mealPlan.logic.ts` needs at least four distinct recipes per slot
+ * (`MIN_ELIGIBLE_RECIPES_PER_SLOT`) because a recipe may be used twice a week
+ * and never on consecutive days (`MAX_RECIPE_USES_PER_WEEK`), which seven days
+ * cannot satisfy with fewer. {@link seedSharedCatalog} deliberately holds only
+ * the four recipes the swap and read cases need — two breakfasts and one each
+ * for lunch and dinner — so the week search would report
+ * `422 no_matching_meals` over it however well-formed the request was. Four
+ * more per slot is one clear of the minimum in every slot, so the search has an
+ * alternative to backtrack to rather than depending on a single arrangement.
+ */
+const PLANNABLE_RECIPES_PER_SLOT = 4;
+
+/**
+ * Widens the shared catalog until a real week can be published, for the two
+ * own-id controls that publish one.
+ *
+ * Seeded PER CASE rather than in `beforeEach`, and that is the point: every
+ * other case in this file measures something against the four-recipe catalog —
+ * the alternatives list asserts it offers exactly one candidate — and a wider
+ * catalog would change what those cases see. The two publications are the only
+ * cases that need a closable week, so they are the only cases that get one.
+ *
+ * Every recipe is sized EXACTLY to its slot ({@link SLOT_SIZES}), so any three
+ * of them land a day on the plan's target snapshot and the day tolerance is
+ * satisfied whichever arrangement the seeded search picks — the control proves
+ * the route published for the right user, and must not be able to fail because
+ * a tolerance was missed. Every recipe also shops for the SAME catalog food as
+ * the fixture week, whose default portion is stated in grams so the published
+ * line's display family is unambiguously `mass`. A volume portion with a null
+ * `density_g_per_ml` is NOT refused — `grocery.logic.ts` derives the density
+ * from the portion itself and falls back to mass when it can derive none — so
+ * the gram portion is about which family the row lands in, not about avoiding a
+ * refusal. What these cases do need is that no grocery rendering fault occurs at
+ * all, because one surfaces as `502 plan_generation_failed` and would fail them
+ * for a reason that has nothing to do with tenancy.
+ */
+const seedPlannableCatalog = async (): Promise<void> => {
+    for (const [slot, size] of Object.entries(SLOT_SIZES)) {
+        for (let index = 0; index < PLANNABLE_RECIPES_PER_SLOT; index += 1) {
+            await makeRecipeVersion({
+                slug: `ownership-plannable-${slot}-${String(index)}`,
+                catalogFoodId: catalog.food.id,
+                meal_slots: [slot],
+                perServing: { ...size },
+            });
+        }
+    }
+};
+
+/**
  * One tenant: its own confirmed targets, a UTC preferences row carrying that
  * tenant's markers ({@link TENANT_PROFILES}), the on-target plan week, its
  * grocery list (built by the real rebuild, since no grocery factory exists) and
@@ -318,7 +397,6 @@ const seedTenant = async (userId: keyof typeof TENANT_PROFILES, catalog: SharedC
         revision: profile.revision,
         targets_revision: profile.revision,
         targets_input_revision: profile.revision,
-        estimate_inputs_revision: profile.revision,
     });
 
     const plan = await makePlan(userId, {
@@ -391,12 +469,21 @@ const swapBody = (recipeVersionId: string, expectedPlanRevision = 1): Record<str
     idempotencyKey: randomUUID(),
 });
 
-/** A well-formed regenerate body. */
+/**
+ * A well-formed regenerate body.
+ *
+ * The two input revisions are USER_A's own, read from the profile rather than
+ * written out, because every case that sends this body sends it as USER_A: a
+ * regeneration pinned to revisions the caller's rows do not hold is refused
+ * `409 stale_revision` before the plan is even searched, which would make the
+ * own-id 201 control unreachable and every refusal case ambiguous about which
+ * check refused it.
+ */
 const regenerateBody = (expectedPlanRevision: number): Record<string, unknown> => ({
     idempotencyKey: randomUUID(),
     expectedPlanRevision,
-    expectedPreferencesRevision: 1,
-    expectedTargetsRevision: 1,
+    expectedPreferencesRevision: TENANT_PROFILES[USER_A].revision,
+    expectedTargetsRevision: TENANT_PROFILES[USER_A].revision,
 });
 
 /**
@@ -467,6 +554,18 @@ interface RouteCase {
     missing: (() => string) | null;
     /** A well-formed body, for the verbs that take one. */
     body?: () => Record<string, unknown>;
+    /**
+     * What this route's own-id control needs in the database beyond the shared
+     * fixture, run before the own path is driven.
+     *
+     * Only the two publications declare one, and only because the shared
+     * fixture cannot carry them (see {@link seedPlannableCatalog}). It is a
+     * per-case hook rather than an addition to `beforeEach` so that no other
+     * case's world changes: awaited by the cases that assert {@link ownStatus}
+     * and by nothing else, since the refusal cases are about ids and are
+     * indifferent to how wide the catalog is.
+     */
+    prepareOwn?: () => Promise<void>;
     /** The status the caller's OWN ids earn — the control that stops the matrix passing vacuously. */
     ownStatus: number;
     /** Why that status proves the id resolved, in the words the test name uses. */
@@ -479,26 +578,44 @@ const planPath = (planId: string): string => `/meal-planning/plans/${planId}`;
 
 const mealPath = (planId: string, mealId: string): string => `${planPath(planId)}/meals/${mealId}`;
 
-/** A plan revision no fixture plan holds, so a write pinned to it cannot be applied. */
-const STALE_PLAN_REVISION = 999;
-
 /**
  * The twenty-two user-scoped routes, in the order the routers declare them.
  *
- * Two of the own-id controls are deliberately not 2xx, and both are more useful
- * than a 2xx would be:
+ * EVERY own-id control is the outcome §0.5.2 documents for the route, including
+ * the two publications. They were once pinned to revisions their own rows did
+ * not hold — a generation at `expectedPreferencesRevision: 99` and a
+ * regeneration at a plan revision no plan carries — which answered
+ * `409 stale_revision` and `409 stale_plan` respectively. Both refusals do reach
+ * their route's own business logic, and the second reaches it only after the
+ * plan is loaded by `{id, user_id}`, so each did prove that the caller's own id
+ * resolved. Neither proved what this matrix exists to be the control for: with
+ * no route in the table answering a real publication, a regression that refused
+ * every generation and every regeneration — for any reason at all — satisfied
+ * every case in this file, and the suite would have reported a tenancy boundary
+ * over a feature that could no longer publish a week.
  *
- *  * `POST /meal-planning/plans` is pinned to revisions the caller's row does
- *    not hold, so it answers `409 stale_revision` carrying the revisions it
- *    READ. The tenants' revisions are far apart ({@link TENANT_PROFILES}), so
- *    those numbers are themselves the proof that the caller's own row was the
- *    one read. A generation with matching revisions would instead run the whole
- *    week search over a four-recipe fixture and answer `422 no_matching_meals`
- *    — a second's work to learn nothing about tenancy.
- *  * `POST …/regenerate` is pinned to a plan revision the plan does not hold,
- *    so it answers `409 stale_plan` with the current one. That check runs AFTER
- *    the plan is loaded by `{id, user_id}`, so reaching it proves the id
- *    resolved for this caller — and it skips the same week search.
+ * So both now send the revisions the caller's own rows actually hold and
+ * publish:
+ *
+ *  * `POST /meal-planning/plans` publishes the successor week
+ *    ({@link SUCCESSOR_WEEK_START_DAY_KEY}) — the one start date the fixture
+ *    leaves free — and answers `201`.
+ *  * `POST …/regenerate` replaces the caller's own fixture week at the revision
+ *    it holds and answers `201`.
+ *
+ * Each therefore needs a catalog a seven-day search can close, which the shared
+ * fixture deliberately is not, and each declares the `prepareOwn` hook that
+ * seeds one. `the two publications the matrix answers 201 for` reads the
+ * published rows back — whose they are, what the ledger recorded, and that the
+ * other tenant did not move — because the matrix row itself can only compare a
+ * status code.
+ *
+ * What this costs is the two refusals above, and nothing else: both were
+ * evidence about a REVISION rather than about an id, `409 stale_revision` is
+ * proved by `plans.test.ts` and `409 stale_plan` by
+ * `the write paths › accepts every one of those writes against the caller's own
+ * ids`, which still drives a regeneration at a revision the plan no longer holds
+ * and pins the current one it reports.
  */
 const ROUTE_CASES: readonly RouteCase[] = [
     {
@@ -593,13 +710,14 @@ const ROUTE_CASES: readonly RouteCase[] = [
         foreign: null,
         missing: null,
         body: () => ({
-            startDate: TODAY,
+            startDate: SUCCESSOR_WEEK_START_DAY_KEY,
             idempotencyKey: randomUUID(),
-            expectedPreferencesRevision: 99,
-            expectedTargetsRevision: 99,
+            expectedPreferencesRevision: TENANT_PROFILES[USER_A].revision,
+            expectedTargetsRevision: TENANT_PROFILES[USER_A].revision,
         }),
-        ownStatus: 409,
-        ownMeaning: 'the revisions the caller’s own row holds',
+        prepareOwn: seedPlannableCatalog,
+        ownStatus: 201,
+        ownMeaning: 'a week published for the caller alone',
         mutates: true,
     },
     {
@@ -642,9 +760,10 @@ const ROUTE_CASES: readonly RouteCase[] = [
         own: () => `${planPath(a.plan.id)}/regenerate`,
         foreign: () => `${planPath(b.plan.id)}/regenerate`,
         missing: () => `${planPath(missingId())}/regenerate`,
-        body: () => regenerateBody(STALE_PLAN_REVISION),
-        ownStatus: 409,
-        ownMeaning: 'the revision the caller’s own plan holds',
+        body: () => regenerateBody(FIRST_PLAN_REVISION),
+        prepareOwn: seedPlannableCatalog,
+        ownStatus: 201,
+        ownMeaning: 'a replacement for the caller’s own week',
         mutates: true,
     },
     {
@@ -1349,6 +1468,13 @@ describe('the route inventory this matrix is built from', () => {
         // in the same way. Driving each own-id path proves the path exists — a
         // path no router declares falls through both mounts to Express's own
         // 404, whose body is HTML rather than this feature's JSON.
+        //
+        // `prepareOwn` is deliberately NOT run here: this loop asserts a
+        // property of the PATH, and the two publications answer
+        // `422 no_matching_meals` over the unwidened catalog — a JSON answer
+        // from a real handler, which is exactly what is being checked. The
+        // status those two own paths owe is asserted by `every user-scoped route
+        // answers the caller's own ids`, which does run the hook.
         for (const routeCase of ROUTE_CASES) {
             const response = await sendAs(routeCase, routeCase.own(), USER_A);
 
@@ -1382,6 +1508,12 @@ describe('every user-scoped route answers the caller’s own ids', () => {
     // each against a freshly seeded fixture, so no row can be made to pass or
     // fail by what another row wrote.
     it.each(ROUTE_CASES)('$label answers $ownStatus with $ownMeaning', async (routeCase: RouteCase) => {
+        // Whatever this route's own-id control needs beyond the shared fixture,
+        // which for the two publications is a catalog a seven-day search can
+        // close. Each case has its own freshly seeded database, so this reaches
+        // nothing but the row it is declared on.
+        await routeCase.prepareOwn?.();
+
         const response = await sendAs(routeCase, routeCase.own(), USER_A);
 
         // The route and the body ride along with the status: the route so a
@@ -1394,6 +1526,275 @@ describe('every user-scoped route answers the caller’s own ids', () => {
         });
     });
 });
+
+/* ---------------------------------------------------------------------------
+ * The two publications, read back
+ *
+ * The matrix row above can compare a status code and nothing else, and a 201 is
+ * the one own-id outcome whose correctness is mostly in the ROWS: a route that
+ * answered 201 while publishing under the wrong `user_id`, or while moving a
+ * line of the other tenant's list, would satisfy it. So each publication is
+ * driven once more here and the database is read afterwards — whose the new
+ * plan, days, meals and grocery rows are, what the ledger recorded, and that
+ * every row of the other tenant's is byte-identical to the moment before the
+ * call.
+ *
+ * These two cases are the own-resource evidence §0.5.2 documents for
+ * `POST /meal-planning/plans` and `POST …/regenerate` (both `201`); the plan
+ * DTO's nutrition rounding and `portionText` are still not asserted anywhere in
+ * this file, for the reason the header gives.
+ * ------------------------------------------------------------------------- */
+
+describe('the two publications the matrix answers 201 for', () => {
+    /**
+     * `MealPlanResponse`'s documented key set (§0.5.2), asserted as a whole
+     * rather than sampled: a publication that answered 201 with a body missing
+     * `days` or carrying an extra member would still be a broken contract, and
+     * the 201 is what the client reads its new week from.
+     */
+    const MEAL_PLAN_RESPONSE_KEYS = [
+        'id',
+        'revision',
+        'generationAttempt',
+        // Unconditional, and that is why it belongs in a key set asserted as a
+        // whole: `meal_plans.generation_key` is NOT NULL and
+        // `mealPlan.mapper.ts::toMealPlanResponse` — the single place a plan DTO
+        // is built — maps it with no fallback, so every published plan carries
+        // the key of the write that published it. It is what lets a client whose
+        // 201 was lost prove a plan it reads is the one its own pending request
+        // produced (§0.7.2).
+        'generationKey',
+        'startDate',
+        'endDate',
+        'status',
+        'targets',
+        'generationTargets',
+        'targetsStale',
+        'preferencesRevision',
+        'targetsRevision',
+        'hasIncompatibilities',
+        'summary',
+        'days',
+    ];
+
+    /**
+     * Everything of user B's a publication of A's could conceivably have
+     * reached, read whole so the comparison is the rows themselves and not a
+     * count of them.
+     *
+     * `grocery_items` carries B's check mark by the time this is taken (see
+     * each case), because an all-unchecked list would compare equal to a list
+     * whose checks had been cleared — which is exactly one of the things a
+     * publication running under the wrong owner would do, since a regeneration
+     * rewrites the list it replaces.
+     */
+    const rowsOfUserB = async () => ({
+        plans: await prisma.meal_plans.findMany({ where: { user_id: USER_B }, orderBy: { id: 'asc' } }),
+        days: await prisma.meal_plan_days.findMany({ where: { user_id: USER_B }, orderBy: { id: 'asc' } }),
+        meals: await prisma.meal_plan_meals.findMany({ where: { user_id: USER_B }, orderBy: { id: 'asc' } }),
+        groceryItems: await prisma.grocery_items.findMany({
+            where: { user_id: USER_B },
+            orderBy: { id: 'asc' },
+        }),
+        actions: await prisma.meal_plan_actions.findMany({
+            where: { user_id: USER_B },
+            orderBy: { id: 'asc' },
+        }),
+    });
+
+    /** The route row under test, so the request is the same one the matrix drives. */
+    const routeCaseFor = (declaration: string): RouteCase => {
+        const routeCase = ROUTE_CASES.find((candidate) => candidate.declaration === declaration);
+
+        if (routeCase === undefined) {
+            throw new Error(`${declaration} has no route case`);
+        }
+
+        return routeCase;
+    };
+
+    /**
+     * The published week as the caller's own, asserted from the rows rather
+     * than from the response that claims them: every day, every meal and every
+     * grocery line of the new plan carries the caller's `user_id`, and the
+     * summary the client reads agrees with what was actually written.
+     */
+    const expectPlanOwnedBy = async (
+        body: Record<string, unknown>,
+        expected: { startDate: string; generationAttempt: number; replacedPlanId: string | null },
+    ): Promise<string> => {
+        expect(Object.keys(body).sort()).toEqual([...MEAL_PLAN_RESPONSE_KEYS].sort());
+        expect(body).toMatchObject({
+            revision: FIRST_PLAN_REVISION,
+            generationAttempt: expected.generationAttempt,
+            startDate: expected.startDate,
+            endDate: addDaysToDayKey(expected.startDate, PLAN_DAY_COUNT - 1),
+            status: 'active',
+            targets: FIXTURE_TARGETS,
+            generationTargets: FIXTURE_TARGETS,
+            targetsStale: false,
+            preferencesRevision: TENANT_PROFILES[USER_A].revision,
+            targetsRevision: TENANT_PROFILES[USER_A].revision,
+            hasIncompatibilities: false,
+        });
+
+        const planId = body.id as string;
+        const plan = await prisma.meal_plans.findUniqueOrThrow({ where: { id: planId } });
+
+        expect({
+            user_id: plan.user_id,
+            status: plan.status,
+            revision: plan.revision,
+            generation_attempt: plan.generation_attempt,
+            replaced_plan_id: plan.replaced_plan_id,
+        }).toEqual({
+            user_id: USER_A,
+            status: 'active',
+            revision: FIRST_PLAN_REVISION,
+            generation_attempt: expected.generationAttempt,
+            replaced_plan_id: expected.replacedPlanId,
+        });
+
+        // The children, each read by the plan alone and checked for the owner:
+        // a row written under the wrong `user_id` would be invisible to a query
+        // that scoped by both.
+        const days = await prisma.meal_plan_days.findMany({
+            where: { meal_plan_id: planId },
+            orderBy: { day_index: 'asc' },
+        });
+        const meals = await prisma.meal_plan_meals.findMany({ where: { meal_plan_id: planId } });
+        const groceryItems = await prisma.grocery_items.findMany({ where: { meal_plan_id: planId } });
+
+        expect(days).toHaveLength(PLAN_DAY_COUNT);
+        expect(days.map((day) => day.day_index)).toEqual([...days.keys()]);
+        expect(meals).toHaveLength(PLAN_DAY_COUNT * MEALS_PER_DAY);
+        expect(groceryItems.length).toBeGreaterThan(0);
+        expect(new Set(days.map((day) => day.user_id))).toEqual(new Set([USER_A]));
+        expect(new Set(meals.map((meal) => meal.user_id))).toEqual(new Set([USER_A]));
+        expect(new Set(groceryItems.map((item) => item.user_id))).toEqual(new Set([USER_A]));
+        // A fresh list starts unchecked, and a regeneration's carry-over can
+        // only copy from a list of the caller's own — either way nothing here
+        // arrives checked, because neither fixture tenant checked a line of A's.
+        expect(groceryItems.filter((item) => item.is_checked)).toEqual([]);
+
+        expect(body.summary).toEqual({
+            plannedMeals: meals.length,
+            groceryItemCount: groceryItems.length,
+            loggedEntryCount: 0,
+        });
+        expect((body.days as unknown[]).map((day) => (day as { date: string }).date)).toEqual(
+            days.map((_, dayIndex) => addDaysToDayKey(expected.startDate, dayIndex)),
+        );
+
+        return planId;
+    };
+
+    /**
+     * The ledger after one publication: exactly one row, the caller's, of the
+     * action type the route performs, completed with the status the client was
+     * given and pointing at the plan it created.
+     *
+     * "Exactly one" is the assertion that matters as much as its contents — a
+     * second row would mean the keyed sequence ran twice, and a row for USER_B
+     * is checked by {@link rowsOfUserB} rather than here.
+     */
+    const expectSingleLedgerRow = async (
+        actionType: string,
+        idempotencyKey: string,
+        planId: string,
+    ): Promise<void> => {
+        const actions = await prisma.meal_plan_actions.findMany({ where: { user_id: USER_A } });
+
+        expect(actions).toHaveLength(1);
+        expect({
+            user_id: actions[0].user_id,
+            action_type: actions[0].action_type,
+            idempotency_key: actions[0].idempotency_key,
+            response_status: actions[0].response_status,
+            meal_plan_id: actions[0].meal_plan_id,
+            plan_revision_after: actions[0].plan_revision_after,
+        }).toEqual({
+            user_id: USER_A,
+            action_type: actionType,
+            idempotency_key: idempotencyKey,
+            response_status: 201,
+            meal_plan_id: planId,
+            plan_revision_after: FIRST_PLAN_REVISION,
+        });
+    };
+
+    it('publishes the caller’s successor week, and moves nothing of the other tenant’s', async () => {
+        await seedPlannableCatalog();
+        // B's own check mark, so "untouched" below includes the check state a
+        // list rewrite would have cleared.
+        await toggleGroceryItem(USER_B, b.plan.id, b.groceryItem.id, { isChecked: true }, NOW);
+
+        const before = await rowsOfUserB();
+        const generation = routeCaseFor('POST /meal-planning/plans');
+        const body = generation.body?.() ?? {};
+
+        const response = await asUser(request.post(`/api${generation.own()}`), { uid: USER_A })
+            .send(body)
+            .expect(201);
+
+        const planId = await expectPlanOwnedBy(response.body as Record<string, unknown>, {
+            startDate: SUCCESSOR_WEEK_START_DAY_KEY,
+            generationAttempt: FIRST_GENERATION_ATTEMPT,
+            replacedPlanId: null,
+        });
+
+        // A second week, not a replacement: the fixture week is still the
+        // caller's current one, at the revision it held.
+        expect(planId).not.toBe(a.plan.id);
+        expect(
+            await prisma.meal_plans.findUniqueOrThrow({
+                where: { id: a.plan.id },
+                select: { status: true, revision: true, replaced_plan_id: true },
+            }),
+        ).toEqual({ status: 'active', revision: FIRST_PLAN_REVISION, replaced_plan_id: null });
+
+        await expectSingleLedgerRow('generate', body.idempotencyKey as string, planId);
+        expect(await rowsOfUserB()).toStrictEqual(before);
+    });
+
+    it('replaces the caller’s own week with one of their own, and moves nothing of the other tenant’s', async () => {
+        await seedPlannableCatalog();
+        await toggleGroceryItem(USER_B, b.plan.id, b.groceryItem.id, { isChecked: true }, NOW);
+
+        const before = await rowsOfUserB();
+        const regeneration = routeCaseFor('POST /meal-planning/plans/:planId/regenerate');
+        const body = regeneration.body?.() ?? {};
+
+        const response = await asUser(request.post(`/api${regeneration.own()}`), { uid: USER_A })
+            .send(body)
+            .expect(201);
+
+        // The replacement keeps the replaced week's dates (§0.5.1: a
+        // regeneration rebuilds a week, it never moves one) and points at the
+        // plan it replaced, which is the link the client follows from a stale
+        // screen.
+        const planId = await expectPlanOwnedBy(response.body as Record<string, unknown>, {
+            startDate: PLAN_START_DAY_KEY,
+            generationAttempt: FIRST_GENERATION_ATTEMPT + 1,
+            replacedPlanId: a.plan.id,
+        });
+
+        expect(planId).not.toBe(a.plan.id);
+        // The replaced week is superseded with its revision bumped, so a screen
+        // still holding the previous value is answered `409 stale_plan` rather
+        // than mutating a week that has been replaced.
+        expect(
+            await prisma.meal_plans.findUniqueOrThrow({
+                where: { id: a.plan.id },
+                select: { user_id: true, status: true, revision: true },
+            }),
+        ).toEqual({ user_id: USER_A, status: 'superseded', revision: FIRST_PLAN_REVISION + 1 });
+
+        await expectSingleLedgerRow('regenerate', body.idempotencyKey as string, planId);
+        expect(await rowsOfUserB()).toStrictEqual(before);
+    });
+});
+
 
 describe('another tenant’s id is indistinguishable from an id that names nothing', () => {
     const scoped = ROUTE_CASES.filter(
@@ -1667,6 +2068,12 @@ describe('identity comes from the token, never from the body', () => {
     });
 
     it.each(writeRoutes)('$label never lands on the tenant its body names', async (routeCase) => {
+        // The publications' own-id control is a real 201, and the assertion
+        // below compares this response against `ownStatus`, so this case needs
+        // the same closable catalog the matrix row does. It seeds tenant-less
+        // recipe rows only, so it cannot be what leaves user B unchanged.
+        await routeCase.prepareOwn?.();
+
         const before = await snapshotOfUserB();
         const body = {
             ...(routeCase.body?.() ?? {}),

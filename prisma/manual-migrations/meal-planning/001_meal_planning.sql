@@ -36,9 +36,10 @@
 -- invisible to that command - a recorded AAP-versus-tool divergence, with the
 -- measurements behind it in the evidence file's header. All three classes are
 -- nonetheless policed on every CI run: docs/meal-planning/expected-schema-diff.sql
--- carries the migrate-diff output AND two pg_catalog sections that pin the
--- generated column's expression, every hand-managed index's access method,
--- uniqueness, keys and predicate, and every array column's NOT NULL and
+-- carries the captured migrate-diff output, and
+-- docs/meal-planning/schema-catalog-evidence.sql carries two pg_catalog sections
+-- that pin the generated column's expression, every hand-managed index's access
+-- method, uniqueness, keys and predicate, and every array column's NOT NULL and
 -- default. Those sections measure the AUTHORITATIVE ledger as applied, never
 -- this operator copy, which that gate does not run - so what holds this copy to
 -- the authoritative migration remains the ledger-equivalence gate in
@@ -298,7 +299,6 @@ CREATE TABLE IF NOT EXISTS "meal_plan_preferences" (
     "targets_input_revision" INTEGER,
     "estimated_targets" JSONB,
     "revision" INTEGER NOT NULL DEFAULT 0,
-    "estimate_inputs_revision" INTEGER NOT NULL DEFAULT 0,
 
     CONSTRAINT "meal_plan_preferences_pkey" PRIMARY KEY ("id")
 );
@@ -409,6 +409,9 @@ CREATE INDEX IF NOT EXISTS "catalog_import_runs_kind_started_at_idx" ON "catalog
 CREATE UNIQUE INDEX IF NOT EXISTS "catalog_generation_batches_batch_key_key" ON "catalog_generation_batches"("batch_key");
 
 -- CreateIndex
+CREATE INDEX IF NOT EXISTS "catalog_generation_batches_run_id_idx" ON "catalog_generation_batches"("run_id");
+
+-- CreateIndex
 CREATE INDEX IF NOT EXISTS "catalog_foods_publication_status_category_idx" ON "catalog_foods"("publication_status", "category");
 
 -- CreateIndex
@@ -442,6 +445,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS "recipes_slug_key" ON "recipes"("slug");
 CREATE UNIQUE INDEX IF NOT EXISTS "recipe_versions_recipe_id_version_key" ON "recipe_versions"("recipe_id", "version");
 
 -- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "recipe_versions_id_recipe_id_key" ON "recipe_versions"("id", "recipe_id");
+
+-- CreateIndex
 CREATE INDEX IF NOT EXISTS "recipe_ingredients_recipe_version_id_idx" ON "recipe_ingredients"("recipe_version_id");
 
 -- CreateIndex
@@ -466,6 +472,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_days_meal_plan_id_date_key" ON "mea
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_days_id_user_id_key" ON "meal_plan_days"("id", "user_id");
 
 -- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_days_id_meal_plan_id_user_id_key" ON "meal_plan_days"("id", "meal_plan_id", "user_id");
+
+-- CreateIndex
 CREATE INDEX IF NOT EXISTS "meal_plan_meals_meal_plan_id_user_id_idx" ON "meal_plan_meals"("meal_plan_id", "user_id");
 
 -- CreateIndex
@@ -482,6 +491,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_meals_meal_plan_day_id_slot_key" ON
 
 -- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_meals_id_user_id_key" ON "meal_plan_meals"("id", "user_id");
+
+-- CreateIndex
+CREATE UNIQUE INDEX IF NOT EXISTS "meal_plan_meals_id_meal_plan_id_user_id_key" ON "meal_plan_meals"("id", "meal_plan_id", "user_id");
 
 -- CreateIndex
 CREATE INDEX IF NOT EXISTS "grocery_items_user_id_idx" ON "grocery_items"("user_id");
@@ -511,7 +523,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS "meal_entries_id_user_id_key" ON "meal_entries
 -- Hand-written from here to the foreign keys: constructs the Prisma datamodel
 -- cannot express. `prisma migrate diff` reports none of them and does not
 -- notice their loss either - measured, and recorded in
--- docs/meal-planning/expected-schema-diff.sql - so the check that holds this
+-- docs/meal-planning/schema-catalog-evidence.sql - so the check that holds this
 -- block to the authoritative migration is the ledger-equivalence gate in
 -- src/__tests__/api/compat.test.ts, which compares the two schemas index for
 -- index.
@@ -697,6 +709,18 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
+        WHERE conname = 'recipes_current_version_id_id_fkey'
+          AND conrelid = '"recipes"'::regclass
+    ) THEN
+        ALTER TABLE "recipes" ADD CONSTRAINT "recipes_current_version_id_id_fkey" FOREIGN KEY ("current_version_id", "id") REFERENCES "recipe_versions"("id", "recipe_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+-- AddForeignKey
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
         WHERE conname = 'recipe_versions_recipe_id_fkey'
           AND conrelid = '"recipe_versions"'::regclass
     ) THEN
@@ -805,10 +829,10 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
-        WHERE conname = 'meal_plan_meals_meal_plan_day_id_user_id_fkey'
+        WHERE conname = 'meal_plan_meals_meal_plan_day_id_meal_plan_id_user_id_fkey'
           AND conrelid = '"meal_plan_meals"'::regclass
     ) THEN
-        ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_day_id_user_id_fkey" FOREIGN KEY ("meal_plan_day_id", "user_id") REFERENCES "meal_plan_days"("id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
+        ALTER TABLE "meal_plan_meals" ADD CONSTRAINT "meal_plan_meals_meal_plan_day_id_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_day_id", "meal_plan_id", "user_id") REFERENCES "meal_plan_days"("id", "meal_plan_id", "user_id") ON DELETE CASCADE ON UPDATE NO ACTION;
     END IF;
 END $$;
 
@@ -965,6 +989,18 @@ BEGIN
           AND conrelid = '"meal_plan_actions"'::regclass
     ) THEN
         ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_plan_meal_id_user_id_fkey" FOREIGN KEY ("meal_plan_meal_id", "user_id") REFERENCES "meal_plan_meals"("id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
+    END IF;
+END $$;
+
+-- AddForeignKey
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'meal_plan_actions_meal_plan_meal_id_meal_plan_id_user_id_fkey'
+          AND conrelid = '"meal_plan_actions"'::regclass
+    ) THEN
+        ALTER TABLE "meal_plan_actions" ADD CONSTRAINT "meal_plan_actions_meal_plan_meal_id_meal_plan_id_user_id_fkey" FOREIGN KEY ("meal_plan_meal_id", "meal_plan_id", "user_id") REFERENCES "meal_plan_meals"("id", "meal_plan_id", "user_id") ON DELETE NO ACTION ON UPDATE NO ACTION;
     END IF;
 END $$;
 

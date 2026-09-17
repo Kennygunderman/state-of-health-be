@@ -177,6 +177,7 @@ import {
     MealPlanningTransactionClient,
     replayCommittedKeyedAction,
     runKeyedAction,
+    withMealPlanningTransaction,
 } from './mealPlanningAction.service';
 import { isClockTime } from './preferences.logic';
 import { PreferencesRow, dayKeyInTimeZone, loadPreferencesRow, resolveUserToday } from './preferences.service';
@@ -358,6 +359,9 @@ const PLAN_COLUMNS = {
     id: true,
     revision: true,
     generation_attempt: true,
+    // Reported by the DTO so a client can recognise a plan as the one its own
+    // unresolved generate or regenerate produced (see MealPlanResponse).
+    generation_key: true,
     start_date: true,
     end_date: true,
     status: true,
@@ -624,6 +628,65 @@ const loadPlanLifecycleStates = async (
 };
 
 /* ---------------------------------------------------------------------------
+ * The read snapshot the two lifecycle-reporting reads share
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Runs a multi-statement READ inside one consistent snapshot of the database.
+ *
+ * WHY THE TWO READS BELOW NEED THIS. Each of them resolves a plan's lifecycle in
+ * one statement and then describes that plan in later ones —
+ * {@link getCurrentMealPlan} picks the current and upcoming ids and then
+ * hydrates them, {@link getMealPlanDay} reads `{revision, status, end_date}` and
+ * then reads the day, its diary links and the caller's zone. On the autocommit
+ * client each of those statements sees a different committed state, so a
+ * regeneration committing between two of them made the response INCOHERENT: a
+ * plan the resolution chose while it was active, returned under `current` with
+ * the `'superseded'` status the hydration then read, or a day envelope
+ * advertising `planStatus: 'active'`, `isWritable: true` and a revision the
+ * regeneration had already moved. Neither answer described any state the
+ * database was ever in.
+ *
+ * IT MUST BE `RepeatableRead`, AND THAT IS THE NON-OBVIOUS PART. A plain
+ * transaction would not fix the finding at all: PostgreSQL's default
+ * READ COMMITTED takes a FRESH snapshot for every statement, so wrapping these
+ * reads in `BEGIN … COMMIT` would leave them exactly as interleavable as they
+ * are on the autocommit client. `RepeatableRead` takes the snapshot once, at the
+ * first statement, and every later statement in the transaction reads from it —
+ * which is precisely the property "one coherent point-in-time view" names. It is
+ * also free of retry handling here, because these transactions only READ:
+ * PostgreSQL's serialisation failures (`40001`) are raised at a conflicting
+ * WRITE, and there is none inside this helper's `work`.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT PROMISE. The answer is a coherent view AS OF
+ * the snapshot, not a view that survives being read. A plan superseded a
+ * millisecond after the snapshot is still reported as `current`, and no read can
+ * do better — the response is already on the wire by then. That was never the
+ * bug; the bug was the incoherent MIX of two moments in one body. Acting on a
+ * plan that has since moved stays the write paths' business, and they each
+ * refuse it under the per-user lock with `409 plan_not_active` (superseded, with
+ * the `replacementPlanId` to follow) or `409 stale_plan` — the protocol the
+ * client already implements (§0.5.1, §0.5.2).
+ *
+ * Read-only and SHORT by construction: `work` issues a bounded handful of
+ * indexed lookups and nothing else — no vendor call, no model call, no planning
+ * search — which is the constraint {@link withMealPlanningTransaction} documents
+ * for every transaction in this feature. The day read makes four; the
+ * current-plan read makes two plus seven for each of the at most two weeks it
+ * hydrates. It takes no advisory lock and no row lock either (the targets read
+ * inside it is `targets.service.ts`'s `read_only` form), so it blocks no writer
+ * for as long as it is open.
+ *
+ * One helper rather than the options object spelled out at each call site, so
+ * the isolation level cannot drift between the two reads that depend on it, and
+ * so this explanation lives in one place.
+ */
+const readInPlanSnapshot = <TResult>(
+    work: (tx: MealPlanningTransactionClient) => Promise<TResult>,
+): Promise<TResult> =>
+    withMealPlanningTransaction(work, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead });
+
+/* ---------------------------------------------------------------------------
  * The three route-facing reads
  * ------------------------------------------------------------------------- */
 
@@ -641,20 +704,31 @@ const loadPlanLifecycleStates = async (
  * "Today" is the user's own calendar day, resolved from the zone their last save
  * stored. `now` is a parameter so a test fixes the clock rather than waiting for
  * one.
+ *
+ * EVERY READ RUNS IN ONE SNAPSHOT ({@link readInPlanSnapshot}), because this
+ * function RESOLVES a lifecycle and then DESCRIBES it: the zone, the lifecycle
+ * states the two ids are chosen from, and each chosen plan's own rows. On the
+ * autocommit client a regeneration committing between the resolution and the
+ * hydration returned a plan whose body said `'superseded'` under `current` — an
+ * answer that mixed two moments. The snapshot is what makes the two members and
+ * their bodies describe the same instant; that helper explains why the isolation
+ * level has to be `RepeatableRead` and what the coherent answer does not
+ * promise.
  */
 export const getCurrentMealPlan = async (
     userId: string,
     now: Date = new Date(),
-): Promise<CurrentMealPlanResponse> => {
-    const row = await loadPreferencesRow(userId);
-    const today = dayKeyInTimeZone(now, row?.time_zone ?? null);
-    const { current, upcoming } = resolveCurrentAndUpcoming(await loadPlanLifecycleStates(prisma, userId), today);
+): Promise<CurrentMealPlanResponse> =>
+    readInPlanSnapshot(async (tx) => {
+        const row = await loadPreferencesRow(userId, tx);
+        const today = dayKeyInTimeZone(now, row?.time_zone ?? null);
+        const { current, upcoming } = resolveCurrentAndUpcoming(await loadPlanLifecycleStates(tx, userId), today);
 
-    return {
-        current: current === null ? null : await loadMealPlanResponse(prisma, userId, current.id),
-        upcoming: upcoming === null ? null : await loadMealPlanResponse(prisma, userId, upcoming.id),
-    };
-};
+        return {
+            current: current === null ? null : await loadMealPlanResponse(tx, userId, current.id),
+            upcoming: upcoming === null ? null : await loadMealPlanResponse(tx, userId, upcoming.id),
+        };
+    });
 
 /**
  * The two READ entry points' outcomes: the response, or the path parser's
@@ -710,7 +784,19 @@ export type AffectedMealsResult = { kind: 'ok'; response: AffectedMealsResponse 
  * THE READS ARE ORDERED SO THE REFUSALS STAY CHEAPEST: the owner-scoped plan
  * read comes first, the day second, and the zone lookup only once the answer is
  * certain to be a `200`. A request for someone else's plan therefore still
- * costs exactly one query, and the parse still precedes all three.
+ * costs exactly one query inside the snapshot, and the parse still precedes all
+ * three — and the transaction itself, which is why a malformed path still
+ * records no database call at all (`api/requestParserWiring.test.ts`).
+ *
+ * AND ALL THREE RUN IN ONE SNAPSHOT ({@link readInPlanSnapshot}). The envelope
+ * makes a LIFECYCLE CLAIM about the plan — `planStatus`, `planLifecycle`,
+ * `isWritable` and `planRevision` — beside the day rows it returns, and on the
+ * autocommit client those came from different committed states: a regeneration
+ * committing after the plan read made the response advertise `'active'`,
+ * `isWritable: true` and a revision that had already moved, for a plan the very
+ * next write would refuse. The snapshot changes only THAT: the route is still
+ * readable for a superseded or ended plan, and what it reports about the week is
+ * now coherent with the day it returns.
  *
  * `PlanNotFoundError` covers a plan that is absent or not the caller's AND a
  * date outside the plan's week — §0.5.2's 404 for this route — because
@@ -731,27 +817,29 @@ export const getMealPlanDay = async (
         return parsed;
     }
 
-    const plan = await prisma.meal_plans.findFirst({
-        where: { id: parsed.planId, user_id: userId },
-        // `end_date` is what makes the lifecycle answerable: without it the
-        // envelope can only repeat the stored status.
-        select: { id: true, revision: true, status: true, end_date: true },
+    return readInPlanSnapshot<MealPlanDayResult>(async (tx) => {
+        const plan = await tx.meal_plans.findFirst({
+            where: { id: parsed.planId, user_id: userId },
+            // `end_date` is what makes the lifecycle answerable: without it the
+            // envelope can only repeat the stored status.
+            select: { id: true, revision: true, status: true, end_date: true },
+        });
+
+        if (plan === null) {
+            throw new PlanNotFoundError();
+        }
+
+        const day = await loadMealPlanDayResponse(tx, userId, parsed.planId, parsed.date);
+
+        if (day === null) {
+            throw new PlanNotFoundError();
+        }
+
+        return {
+            kind: 'ok',
+            envelope: toMealPlanDayEnvelopeResponse(plan, day, await resolveUserToday(userId, now, tx)),
+        };
     });
-
-    if (plan === null) {
-        throw new PlanNotFoundError();
-    }
-
-    const day = await loadMealPlanDayResponse(prisma, userId, parsed.planId, parsed.date);
-
-    if (day === null) {
-        throw new PlanNotFoundError();
-    }
-
-    return {
-        kind: 'ok',
-        envelope: toMealPlanDayEnvelopeResponse(plan, day, await resolveUserToday(userId, now)),
-    };
 };
 
 /**
@@ -768,6 +856,14 @@ export const getMealPlanDay = async (
  * stored plan does not carry. This function therefore takes NO clock, unlike the
  * day read above: every member of its answer is a stored value, and no calendar
  * day can change which meals carry a flag.
+ *
+ * AND NO READ SNAPSHOT, unlike the two reads above, for the same reason it takes
+ * no clock: it MAKES NO LIFECYCLE CLAIM. The plan read is an ownership check
+ * whose only output is the 404, the response carries no status, no revision and
+ * no writability, and the flags all come from ONE `findMany` — so there is no
+ * pair of statements whose answers could disagree, and
+ * {@link readInPlanSnapshot} would buy a transaction for nothing. A response
+ * that ever grows a lifecycle field has to move inside the snapshot with it.
  *
  * `:planId` is parsed as the FIRST statement, for the reason
  * {@link getMealPlanDay} states: a malformed id would otherwise reach the
@@ -1106,10 +1202,28 @@ interface PlanPublication {
  * search, not an arithmetic value, and storing its decimal spelling is what lets
  * a week be replayed exactly.
  *
- * The days are inserted one at a time because each day's meals need its
- * generated id; the meals of one day go in as a single `createMany`. That is 14
- * statements for a week, in a fixed order, so two runs of the same publication
- * issue the same statements.
+ * THREE STATEMENTS FOR A WEEK, WHATEVER ITS SIZE: the plan, then all seven days
+ * in one `createManyAndReturn`, then all 21–28 meals in one `createMany`. §0.5.1
+ * requires the plan, days, meals and grocery items to be "inserted together",
+ * and this runs while the per-user advisory lock is held — every statement of it
+ * serialises that user's other writes (a grocery toggle, a swap, a log), so the
+ * count is a latency budget rather than a style preference. It replaces a
+ * per-day `create` plus a per-day `createMany`, which was fifteen.
+ *
+ * THE MEALS ARE MATCHED TO THEIR DAY BY DATE, NEVER BY POSITION.
+ * `createManyAndReturn` is documented to return the inserted rows, but a plan's
+ * meals must not depend on the order a bulk insert reports them in, and the
+ * dates of a week are unique by the `(meal_plan_id, date)` index — so the
+ * returned rows are keyed by their own `date`, read through the same `toDayKey`
+ * the rest of this feature reads `@db.Date` columns with (a `Date` object is
+ * matched by identity as a `Map` key, so the day KEY is what the map holds). A
+ * searched day whose date is absent from the returned rows raises
+ * {@link MealPlanDataError} rather than inserting meals against an `undefined`
+ * parent, which the column would reject anyway with a message naming no day.
+ *
+ * The statements stay in a fixed order — plan, days in the searched week's
+ * order, meals in day-then-`sort_order` order — so two runs of the same
+ * publication issue the same three statements with the same rows.
  */
 const insertGeneratedPlan = async (
     tx: Prisma.TransactionClient,
@@ -1136,24 +1250,43 @@ const insertGeneratedPlan = async (
         select: { id: true },
     });
 
-    for (const day of candidate.plan.days) {
-        const inserted = await tx.meal_plan_days.create({
-            data: {
-                meal_plan_id: plan.id,
-                user_id: publication.userId,
-                date: toStoredDate(day.date),
-                day_index: day.dayIndex,
-                planned_calories: day.plannedTotals.calories,
-                planned_protein_g: day.plannedTotals.protein,
-                planned_carbs_g: day.plannedTotals.carbs,
-                planned_fat_g: day.plannedTotals.fat,
-            },
-            select: { id: true },
-        });
+    const insertedDays = await tx.meal_plan_days.createManyAndReturn({
+        data: candidate.plan.days.map((day) => ({
+            meal_plan_id: plan.id,
+            user_id: publication.userId,
+            date: toStoredDate(day.date),
+            day_index: day.dayIndex,
+            planned_calories: day.plannedTotals.calories,
+            planned_protein_g: day.plannedTotals.protein,
+            planned_carbs_g: day.plannedTotals.carbs,
+            planned_fat_g: day.plannedTotals.fat,
+        })),
+        select: { id: true, date: true },
+    });
 
-        await tx.meal_plan_meals.createMany({
-            data: day.meals.map((meal) => ({
-                meal_plan_day_id: inserted.id,
+    const dayIdByDate = new Map(
+        insertedDays.map((day) => [toDayKey(day.date, 'meal_plan_days.date', day.id), day.id]),
+    );
+
+    await tx.meal_plan_meals.createMany({
+        data: candidate.plan.days.flatMap((day) => {
+            const dayId = dayIdByDate.get(day.date);
+
+            if (dayId === undefined) {
+                // Unreachable: the ids come from the insert of these very dates,
+                // one statement ago, inside this transaction. Raised rather than
+                // skipped because the alternative is a published week silently
+                // missing a day's meals — a plan the client would render as an
+                // empty day and no later read could explain.
+                throw new MealPlanDataError(
+                    `Plan ${plan.id} inserted ${String(insertedDays.length)} days but none of them is ` +
+                        `${day.date}, so its ${String(day.meals.length)} meals have no parent row to reference. ` +
+                        'Refusing to publish a week with an unattached day.',
+                );
+            }
+
+            return day.meals.map((meal) => ({
+                meal_plan_day_id: dayId,
                 meal_plan_id: plan.id,
                 user_id: publication.userId,
                 slot: meal.slot,
@@ -1165,9 +1298,9 @@ const insertGeneratedPlan = async (
                 planned_protein_g: meal.planned.protein,
                 planned_carbs_g: meal.planned.carbs,
                 planned_fat_g: meal.planned.fat,
-            })),
-        });
-    }
+            }));
+        }),
+    });
 
     return plan.id;
 };
@@ -1229,15 +1362,27 @@ const writeGroceriesForNewPlan = async (
  * Raises the injected generation fault, if one is armed.
  *
  * CALLED FROM EXACTLY ONE POSITION IN EACH ENTRY POINT: after the in-memory
- * search has returned and before `prisma.$transaction` opens (§0.9.4). That
- * position is the whole point of the switch rather than a detail of it. Thrown
- * here, nothing has run: no advisory lock, no `meal_plan_actions` reservation,
- * no plan row, no grocery list. So the property §0.9.2 asserts of the fault —
- * "leaves no action row and no plan … and the retry without the fault commits
- * once" — holds because the fault never reaches the ledger at all, not because
- * a rollback tidied up after it. Armed one statement later, inside the
- * transaction, the same throw would exercise a rollback instead and prove
- * nothing about the pre-transaction path a real generation failure takes.
+ * search has returned and before the PUBLISHING `prisma.$transaction` opens
+ * (§0.9.4). That position is the whole point of the switch rather than a detail
+ * of it. Thrown here, NOTHING DURABLE EXISTS: no publishing transaction has
+ * opened, so there is no plan row, no day, no meal, no grocery list, no
+ * `setup_status` write and no completed `meal_plan_actions` row — and no
+ * surviving reserved one either.
+ *
+ * WHICH IS A STATEMENT ABOUT WHAT PERSISTS, NOT ABOUT WHAT HAS RUN. One
+ * transaction HAS already opened and closed by this point:
+ * `replayCommittedKeyedAction`, the ledger preflight both entry points ask
+ * before anything stateful (§0.5.1). It took the per-user advisory lock,
+ * ATTEMPTED the reservation for this very key, and then rolled its own
+ * two-statement transaction back through `KeyedActionPreflightRollback` — so the
+ * lock was released at that rollback and the unused reservation disappeared with
+ * it. That is precisely why §0.9.2's property still holds: "leaves no action row
+ * and no plan … and the retry without the fault commits once" is true because
+ * the only ledger row this request ever wrote was rolled back before the fault
+ * was raised, and the fault itself never reaches the ledger. Armed one statement
+ * later, inside the publishing transaction, the same throw would exercise ITS
+ * rollback instead and prove nothing about the pre-transaction path a real
+ * generation failure takes.
  *
  * AFTER THE SEARCH, THOUGH, NOT BEFORE IT. Raising it earlier would pre-empt
  * `NoMatchingMealsError` and `StaleRevisionError`, so a developer arming

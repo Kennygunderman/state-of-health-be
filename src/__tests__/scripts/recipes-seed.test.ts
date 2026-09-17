@@ -15,18 +15,31 @@
  * refuse on its own; and the stage's `development_or_confirmed` database policy
  * must hold.
  *
- * WHAT THIS SUITE DELIBERATELY DOES NOT SETTLE. The coverage matrix — every
- * diet x single-allergen x slot x time-tier cell, the §0.7.3 guaranteed and
- * reduced thresholds, the slot-composition floors, and equality with the
- * committed `data/meal-planning/recipes/coverage-report.json` — belongs to
- * `src/__tests__/api/seed-rerun.test.ts`, which computes it from the REAL
- * 42-recipe corpus. Restating a cell of it here would assert the same rule
- * twice over a synthetic corpus that cannot satisfy it. What this suite keeps
- * of the report is the WIRING only: that it was written to the injected path,
- * that the committed artefact was left alone, and that a narrowed or dry run
- * writes none. Recipe nutrition, badge derivation, provenance rollup and
- * `isEligibleForPlanning` are pure functions owned by
+ * HOW THE COVERAGE REPORT IS SPLIT BETWEEN THIS SUITE AND THE API ONE. The
+ * table's own invariants are `deriveCoverageReport`'s, so they are pinned HERE,
+ * as pure tests over three hand-written recipes with no database: the dimension
+ * lists, one cell per combination of them (640), the 140 guaranteed and 124
+ * reduced cells with their §0.7.3 thresholds and their disjointness, the four
+ * slot-composition strata and their floors, and the artefact's self-describing
+ * members. What this suite cannot settle is whether the REAL 42-recipe corpus
+ * against the REAL release satisfies those cells and reproduces the committed
+ * `data/meal-planning/recipes/coverage-report.json` byte for byte — that is
+ * `src/__tests__/api/seed-rerun.test.ts`'s subject, and it is an acceptance
+ * check over real data rather than a property of the derivation. What this
+ * suite keeps of the report beyond the pure block is the WIRING: that it was
+ * written to the injected path, that the committed artefact was left alone, and
+ * that a narrowed or dry run writes none. Recipe nutrition, badge derivation,
+ * provenance rollup and `isEligibleForPlanning` are pure functions owned by
  * `src/services/__tests__/recipe.logic.test.ts`.
+ *
+ * WHAT ELSE IT SETTLES ABOUT CONCURRENCY AND RECOVERY. The stage publishes one
+ * transaction per recipe against a catalog another stage can rewrite, so two
+ * blocks below cover what that costs: the catalog hold (a shared graph lock for
+ * the whole run, the per-publication re-read that refuses a drifted ingredient,
+ * and the refusal when another stage owns the graph) and the run ledger (a
+ * succeeded run with its fingerprint, watermark and counts; a failed one at the
+ * watermark an interruption reached; a killed run refused while its lease is
+ * live and resumed once it lapses).
  *
  * WHY IT DRIVES `runSeed(deps)` RATHER THAN THE COMMAND. The stage's own
  * `main()` reads `process.argv`, classifies the ambient `DATABASE_URL` and calls
@@ -75,6 +88,7 @@ import {
     entryScriptName,
     SCRIPT_DATABASE_POLICIES,
 } from '../../../scripts/lib/dbGuard';
+import { CheckpointError } from '../../../scripts/lib/checkpoint';
 import { createLogger, safeError } from '../../../scripts/lib/logger';
 import { loadCoveragePlan, recipesDir, writeJsonFile } from '../../../scripts/lib/manifest';
 import type { CoveragePlan } from '../../../scripts/lib/manifest';
@@ -82,6 +96,7 @@ import type { LogLevel, ScriptLogger } from '../../../scripts/lib/logger';
 import {
     buildIngredientVocabulary,
     describeFailure,
+    deriveCoverageReport,
     equivalentContent,
     findUnlistedInstructionTerms,
     foldPluralToken,
@@ -90,11 +105,20 @@ import {
     parseArgs,
     parseRecipePayload,
     preflight,
+    RECIPE_SEED_RUN_KIND,
+    RECIPE_SEED_RUN_LEASE_MS,
     RecipeSeedError,
     runSeed,
     sameStoredNumber,
 } from '../../../scripts/recipes-seed';
-import type { SeedDb, SeedDeps, SeedOutcome, SeedPreflightDeps } from '../../../scripts/recipes-seed';
+import type {
+    CoverageRecipe,
+    RecipeSeedCursor,
+    SeedDb,
+    SeedDeps,
+    SeedOutcome,
+    SeedPreflightDeps,
+} from '../../../scripts/recipes-seed';
 import { prisma } from '../../prisma/client';
 import { deriveRecipeVersionFields } from '../../services/recipe.logic';
 import type { RecipeAllergenStatus, RecipePublicationIngredient } from '../../services/recipe.logic';
@@ -601,22 +625,33 @@ const COMMITTED_REPORT = path.join(recipesDir(), 'coverage-report.json');
 
 let committedReportModifiedAt: number;
 
-/** Replaces the temporary corpus with exactly these payloads. */
-const writeCorpus = (payloads: readonly Record<string, unknown>[]): void => {
-    for (const entry of fs.readdirSync(recipesDirectory)) {
-        fs.rmSync(path.join(recipesDirectory, entry));
+/** Replaces the corpus in `directory` with exactly these payloads. */
+const writeCorpusInto = (directory: string, payloads: readonly Record<string, unknown>[]): void => {
+    for (const entry of fs.readdirSync(directory)) {
+        fs.rmSync(path.join(directory, entry));
     }
     for (const payload of payloads) {
         fs.writeFileSync(
-            path.join(recipesDirectory, `${payload.slug as string}.json`),
+            path.join(directory, `${payload.slug as string}.json`),
             `${JSON.stringify(payload, null, 2)}\n`,
             'utf8',
         );
     }
 };
 
+/** Replaces the temporary corpus with exactly these payloads. */
+const writeCorpus = (payloads: readonly Record<string, unknown>[]): void => {
+    writeCorpusInto(recipesDirectory, payloads);
+};
+
 const seedDeps = (overrides: Partial<SeedDeps> = {}): SeedDeps => ({
     prisma: prisma as unknown as SeedDb,
+    // The REAL client, always, even in the scenarios that fault `prisma`: the
+    // ledger row is what records that a faulted run failed, so a suite that
+    // faulted it too would destroy the evidence it is asserting. Production
+    // passes the same singleton for both (see `main`), and the one scenario that
+    // omits it deliberately is the probe refusal below.
+    runDb: prisma,
     recipesDir: recipesDirectory,
     now: () => PUBLISHED_AT,
     options: { help: false, only: [], dryRun: false },
@@ -682,6 +717,13 @@ const failingAfter = (write: 'retire' | 'insert'): SeedDb => {
                 return tx.recipe_versions.update(args);
             },
         },
+        // Forwarded, not stubbed: the publication re-reads and locks its
+        // ingredient rows through this seam inside the very transaction the
+        // fault interrupts, so a wrapper that dropped it would fail the run
+        // before reaching the write under test.
+        $queryRaw<TRows>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows> {
+            return tx.$queryRaw<TRows>(query, ...values);
+        },
         $transaction<T>(work: (inner: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
             return tx.$transaction(work, options);
         },
@@ -691,11 +733,159 @@ const failingAfter = (write: 'retire' | 'insert'): SeedDb => {
         catalog_foods: real.catalog_foods,
         recipes: real.recipes,
         recipe_versions: real.recipe_versions,
+        $queryRaw<TRows>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows> {
+            return real.$queryRaw<TRows>(query, ...values);
+        },
         $transaction<T>(work: (tx: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
             return real.$transaction((tx) => work(wrapTx(tx)), options);
         },
     };
 };
+
+/**
+ * The real client with the Nth publication transaction refused outright.
+ *
+ * Unlike `failingAfter`, which faults one write INSIDE a transaction, this
+ * refuses the whole transaction — the recipes before it are committed and the
+ * ones after it are never attempted, which is what an interruption part-way
+ * through the corpus looks like. `runSeed` opens exactly one transaction per
+ * recipe and none of its own, so the counter is a count of publications.
+ */
+const failingOnPublication = (nth: number): SeedDb => {
+    const real = prisma as unknown as SeedDb;
+    let publications = 0;
+
+    return {
+        catalog_foods: real.catalog_foods,
+        recipes: real.recipes,
+        recipe_versions: real.recipe_versions,
+        $queryRaw<TRows>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows> {
+            return real.$queryRaw<TRows>(query, ...values);
+        },
+        $transaction<T>(work: (tx: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
+            publications += 1;
+            return publications === nth
+                ? Promise.reject(new InjectedPublishFailure(`publication ${nth} of the corpus`))
+                : real.$transaction(work, options);
+        },
+    };
+};
+
+/**
+ * The real client with a catalog change committed just before the first
+ * publication transaction opens.
+ *
+ * This is the concurrency F14 is about, in the one form a single-process test
+ * can produce it: the validation pass read the catalog, and by the time the
+ * first recipe is written a catalog stage has moved a row underneath it. The
+ * mutation runs through the real client and commits, so the publication's own
+ * re-read sees exactly what a concurrent `catalog-load` would have left.
+ */
+const mutatingCatalogBeforeFirstPublication = (mutate: () => Promise<void>): SeedDb => {
+    const real = prisma as unknown as SeedDb;
+    let mutated = false;
+
+    return {
+        catalog_foods: real.catalog_foods,
+        recipes: real.recipes,
+        recipe_versions: real.recipe_versions,
+        $queryRaw<TRows>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows> {
+            return real.$queryRaw<TRows>(query, ...values);
+        },
+        async $transaction<T>(work: (tx: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
+            if (!mutated) {
+                mutated = true;
+                await mutate();
+            }
+            return real.$transaction(work, options);
+        },
+    };
+};
+
+/** What was held, on each of the stage's two session locks, at one observation point. */
+interface ObservedHolds {
+    /** Modes on lib/checkpoint.ts's catalog-graph stage lock. */
+    readonly graph: readonly string[];
+    /** Modes on `recipes-seed.ts`'s own recipe-seed writer lock. */
+    readonly writer: readonly string[];
+}
+
+/**
+ * The real client that reports which locks were held when the stage took its
+ * FIRST catalog read — the read every publication's facts come from.
+ *
+ * Both classes are captured at the same instant because the two holds are only
+ * meaningful together: the graph hold must be SHARED (this stage reads the
+ * catalog) and the writer hold must be EXCLUSIVE (this stage writes the recipe
+ * tables), and a reading that could not tell them apart would let either one
+ * disappear unnoticed.
+ */
+const observingFirstCatalogRead = (observed: ObservedHolds[]): SeedDb => {
+    const real = prisma as unknown as SeedDb;
+
+    return {
+        catalog_foods: {
+            async findMany<Row>(args: unknown): Promise<Row[]> {
+                if (observed.length === 0) {
+                    observed.push({ graph: await heldGraphLockModes(), writer: await heldWriterLockModes() });
+                }
+                return real.catalog_foods.findMany<Row>(args);
+            },
+        },
+        recipes: real.recipes,
+        recipe_versions: real.recipe_versions,
+        $queryRaw<TRows>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows> {
+            return real.$queryRaw<TRows>(query, ...values);
+        },
+        $transaction<T>(work: (tx: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
+            return real.$transaction(work, options);
+        },
+    };
+};
+
+/**
+ * The advisory class ids the two session locks this stage takes live under.
+ *
+ * Two-integer advisory keys report their class in `pg_locks.classid` and are
+ * identified as that keyspace by `objsubid = 2`; the one-argument form
+ * (`objsubid = 1`) is where the request path's per-user lock and this stage's
+ * run-claim lock live, so neither can appear in either reading below.
+ *
+ * The two classes are DISTINCT ON PURPOSE and the assertions depend on telling
+ * them apart: `0x434154` ('CAT') is lib/checkpoint.ts's catalog-graph stage lock,
+ * which this stage holds SHARED for the whole run, while `0x525344` ('RSD') is
+ * `recipes-seed.ts`'s own recipe-seed writer lock, which it holds EXCLUSIVELY
+ * over the same window. A single query over the whole keyspace would return both
+ * and could not say which mode belonged to which question.
+ */
+const CATALOG_GRAPH_LOCK_CLASS_ID = 0x434154;
+const RECIPE_SEED_WRITER_LOCK_CLASS_ID = 0x525344;
+
+/**
+ * Advisory locks granted on THIS database under one two-integer class id.
+ *
+ * The database is pinned because `pg_locks` is cluster-wide and sibling
+ * databases hold locks of their own.
+ */
+const heldAdvisoryModes = async (classId: number): Promise<string[]> => {
+    const rows = await prisma.$queryRaw<{ mode: string }[]>`
+        SELECT mode FROM pg_locks
+        WHERE locktype = 'advisory'
+          AND objsubid = 2
+          AND classid = ${classId}
+          AND granted
+          AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+        ORDER BY mode
+    `;
+
+    return rows.map((row) => row.mode);
+};
+
+/** The modes held on lib/checkpoint.ts's catalog-graph stage lock. */
+const heldGraphLockModes = (): Promise<string[]> => heldAdvisoryModes(CATALOG_GRAPH_LOCK_CLASS_ID);
+
+/** The modes held on this stage's own recipe-seed writer lock. */
+const heldWriterLockModes = (): Promise<string[]> => heldAdvisoryModes(RECIPE_SEED_WRITER_LOCK_CLASS_ID);
 
 interface CapturedLine {
     readonly level: LogLevel;
@@ -760,10 +950,10 @@ const readRecipe = async (slug: string) =>
         },
     });
 
-/** The refusal `runSeed` threw, as a `RecipeSeedError`, or a failure naming what it threw instead. */
-const refusalFrom = async (deps: SeedDeps): Promise<RecipeSeedError> => {
+/** The refusal a started `runSeed` threw, as a `RecipeSeedError`, or a failure naming what it threw instead. */
+const refusalOf = async (run: Promise<SeedOutcome>): Promise<RecipeSeedError> => {
     try {
-        await runSeed(deps);
+        await run;
     } catch (error) {
         if (error instanceof RecipeSeedError) {
             return error;
@@ -772,6 +962,287 @@ const refusalFrom = async (deps: SeedDeps): Promise<RecipeSeedError> => {
     }
 
     throw new Error('runSeed resolved where the scenario requires it to refuse');
+};
+
+/** The refusal `runSeed` threw, as a `RecipeSeedError`, or a failure naming what it threw instead. */
+const refusalFrom = (deps: SeedDeps): Promise<RecipeSeedError> => refusalOf(runSeed(deps));
+
+/* ---------------------------------------------------------------------------
+ * Orchestrating two writers
+ *
+ * Every contention scenario below is settled by a HANDSHAKE and never by a
+ * sleep: one side signals that it has reached the state under test, and the
+ * other only acts then. A wall-clock wait would make the outcome depend on the
+ * runner's scheduling, which is the one thing a concurrency test must not do.
+ * The only timeout in this section is a hang guard — it exists so a scenario
+ * that never reaches its rendezvous fails with its own message instead of the
+ * suite's, and it is never what an assertion reads.
+ * ------------------------------------------------------------------------- */
+
+/** A one-shot handshake. `signal()` is idempotent: resolving a promise twice is a no-op. */
+interface Rendezvous {
+    readonly reached: Promise<void>;
+    readonly signal: () => void;
+}
+
+const rendezvous = (): Rendezvous => {
+    let signal: () => void = () => undefined;
+    const reached = new Promise<void>((resolve) => {
+        signal = resolve;
+    });
+
+    return { reached, signal };
+};
+
+/** Generous, because it is a hang guard and not a timing assumption. */
+const RENDEZVOUS_TIMEOUT_MS = 60_000;
+
+/** Awaits a rendezvous, failing with a named error rather than hanging the block. */
+const arriveAt = async (reached: Promise<void>, what: string): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const guard = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+            () => reject(new Error(`timed out after ${RENDEZVOUS_TIMEOUT_MS} ms waiting for ${what}`)),
+            RENDEZVOUS_TIMEOUT_MS,
+        );
+    });
+
+    try {
+        await Promise.race([reached, guard]);
+    } finally {
+        if (timer !== undefined) {
+            clearTimeout(timer);
+        }
+    }
+};
+
+/**
+ * A `runUnderCatalogLock` seam that parks the stage the instant it is inside the
+ * WRITER hold.
+ *
+ * It works as a proof of that because of the order `runSeed` composes the two:
+ * the writer lock is acquired, and only then is this seam called. So a signal
+ * from here is evidence the exclusive hold is live, with no polling and no
+ * assumption. The graph hold is the thing given up by injecting here, and it is
+ * the right one to give up: it is SHARED, so it is irrelevant to whether a
+ * second seed is refused.
+ */
+const parkedInsideTheWriterHold =
+    (entered: Rendezvous, release: Rendezvous) =>
+    async <T>(work: () => Promise<T>): Promise<T> => {
+        entered.signal();
+        await release.reached;
+        return work();
+    };
+
+/** What the contender got, and what was true of the database while it was refused. */
+interface Contention {
+    readonly refusal: RecipeSeedError;
+    readonly holding: SeedOutcome;
+    /** Modes observed on this stage's own advisory class while the holder held it. */
+    readonly writerModesWhileHeld: readonly string[];
+    readonly runRowsWhileHeld: number;
+    readonly recipesWhileHeld: number;
+}
+
+/**
+ * Parks one writer inside the writer hold, runs a second against it, and reports
+ * what the second one got.
+ *
+ * The holder is released only after the contender has settled, so there is no
+ * interleaving in which the contender could have arrived before the lock was
+ * taken or after it was dropped.
+ */
+const refusedWhileAnotherWriterHolds = async (
+    holderOverrides: Partial<SeedDeps>,
+    contenderOverrides: Partial<SeedDeps>,
+): Promise<Contention> => {
+    const entered = rendezvous();
+    const release = rendezvous();
+
+    const holder = runSeed(
+        seedDeps({ ...holderOverrides, runUnderCatalogLock: parkedInsideTheWriterHold(entered, release) }),
+    );
+
+    try {
+        await arriveAt(entered.reached, 'the holding writer to take the recipe-seed writer lock');
+
+        const writerModesWhileHeld = await heldWriterLockModes();
+        const runRowsWhileHeld = await prisma.catalog_import_runs.count();
+        const recipesWhileHeld = await prisma.recipes.count();
+        const refusal = await refusalFrom(seedDeps(contenderOverrides));
+
+        release.signal();
+
+        return { refusal, holding: await holder, writerModesWhileHeld, runRowsWhileHeld, recipesWhileHeld };
+    } catch (error) {
+        // The holder is parked on a promise nothing else will resolve, so it is
+        // released and awaited even on the failing path — a left-behind writer
+        // would hold the lock into the next test.
+        release.signal();
+        await holder.catch(() => undefined);
+        throw error;
+    }
+};
+
+/** Where in the publication loop a paused client stops. */
+type PublicationPausePoint = 'before' | 'after';
+
+interface PausedPublications {
+    readonly db: SeedDb;
+    /** Resolves when the chosen boundary of the Nth publication is reached. */
+    readonly reached: Promise<void>;
+    readonly resume: () => void;
+    /** How many publication transactions this client has been asked to open. */
+    readonly attempted: () => number;
+}
+
+/**
+ * The real client, parked at a publication boundary.
+ *
+ * `before` parks just before the Nth publication transaction opens — which is
+ * after the (N-1)th cursor write — so the parked run's next act is a
+ * PUBLICATION. `after` parks the moment the Nth transaction has COMMITTED and
+ * before the loop's cursor write, so its next act is a CURSOR WRITE. Those are
+ * two of the writes the attempt fence has to refuse independently, and one pause
+ * point could only ever exercise one of them.
+ *
+ * `runSeed` opens exactly one transaction per recipe through this seam and none
+ * of its own — the ledger's transactions go through `runDb`, which is the real
+ * client — so the counter is a count of publications, the same property
+ * `failingOnPublication` relies on.
+ */
+const pausingAtPublication = (nth: number, when: PublicationPausePoint): PausedPublications => {
+    const real = prisma as unknown as SeedDb;
+    const at = rendezvous();
+    const go = rendezvous();
+    let publications = 0;
+
+    return {
+        reached: at.reached,
+        resume: go.signal,
+        attempted: () => publications,
+        db: {
+            catalog_foods: real.catalog_foods,
+            recipes: real.recipes,
+            recipe_versions: real.recipe_versions,
+            $queryRaw<TRows>(query: TemplateStringsArray, ...values: unknown[]): Promise<TRows> {
+                return real.$queryRaw<TRows>(query, ...values);
+            },
+            async $transaction<T>(work: (tx: SeedDb) => Promise<T>, options?: { timeout?: number }): Promise<T> {
+                publications += 1;
+                const thisOne = publications;
+
+                if (thisOne === nth && when === 'before') {
+                    at.signal();
+                    await go.reached;
+                }
+
+                const result = await real.$transaction(work, options);
+
+                if (thisOne === nth && when === 'after') {
+                    at.signal();
+                    await go.reached;
+                }
+
+                return result;
+            },
+        },
+    };
+};
+
+/** Everything both attempts did in a takeover, plus the ledger state between them. */
+interface Supersession {
+    readonly zombieRefusal: RecipeSeedError;
+    /** Every event the superseded attempt's logger recorded, in order. */
+    readonly zombieEvents: readonly string[];
+    /** How many publication transactions the superseded attempt opened. */
+    readonly zombiePublications: number;
+    /**
+     * The run row as it stood the instant AFTER the superseded attempt failed
+     * and BEFORE the new attempt finished — the only window in which "the
+     * zombie's close was refused" is observable rather than inferred.
+     */
+    readonly runWhileTakenOver: { readonly status: string; readonly cursorAttempt: number };
+    readonly takeover: SeedOutcome;
+}
+
+/**
+ * The zombie scenario: a superseded attempt resuming after its run was taken
+ * over, and being refused at the write it resumes into.
+ *
+ * WHAT MAKES A ZOMBIE, AND WHY IT NEEDS A SEAM. The writer lock is
+ * session-scoped, so a process that dies releases it — which is exactly why no
+ * LIVE second writer can exist. The case that leaves is a process whose LOCK
+ * SESSION died while the process itself kept a working connection pool, and no
+ * test can produce that by killing something: killing the process takes the pool
+ * with it. A pass-through `runUnderWriterLock` IS that process, and it is the
+ * only honest way to reach the state the fence exists for.
+ *
+ * WHY THE SUCCESSOR IS ALSO PARKED. It is parked immediately after its claim and
+ * before its first publication, so when the zombie resumes the row is still
+ * `running` under a ROTATED TOKEN. That is the one state in which the token
+ * comparison itself is what refuses the zombie — had the successor been allowed
+ * to finish first, the closed-status check would have refused it and the token
+ * would never have been compared.
+ */
+const zombieResumesAfterTakeover = async (zombiePause: {
+    readonly nth: number;
+    readonly when: PublicationPausePoint;
+}): Promise<Supersession> => {
+    const zombie = pausingAtPublication(zombiePause.nth, zombiePause.when);
+    const zombieLog: { event: string; fields?: Record<string, unknown> }[] = [];
+    const zombieRun = runSeed(
+        seedDeps({
+            prisma: zombie.db,
+            logger: recordingLogger(zombieLog),
+            runUnderWriterLock: <T>(work: () => Promise<T>): Promise<T> => work(),
+        }),
+    );
+
+    try {
+        await arriveAt(
+            zombie.reached,
+            `the superseded attempt to park ${zombiePause.when} publication ${zombiePause.nth}`,
+        );
+
+        const successor = pausingAtPublication(1, 'before');
+        const successorRun = runSeed(seedDeps({ prisma: successor.db, now: () => PROMOTED_AT }));
+
+        try {
+            await arriveAt(successor.reached, 'the new attempt to take the run over');
+
+            zombie.resume();
+
+            const zombieRefusal = await refusalOf(zombieRun);
+            const taken = await prisma.catalog_import_runs.findFirstOrThrow({
+                where: { kind: RECIPE_SEED_RUN_KIND },
+                orderBy: { started_at: 'asc' },
+            });
+
+            successor.resume();
+
+            return {
+                zombieRefusal,
+                zombieEvents: zombieLog.map((entry) => entry.event),
+                zombiePublications: zombie.attempted(),
+                runWhileTakenOver: {
+                    status: taken.status,
+                    cursorAttempt: (taken.cursor as unknown as RecipeSeedCursor).attempt,
+                },
+                takeover: await successorRun,
+            };
+        } catch (error) {
+            successor.resume();
+            await successorRun.catch(() => undefined);
+            throw error;
+        }
+    } catch (error) {
+        zombie.resume();
+        await zombieRun.catch(() => undefined);
+        throw error;
+    }
 };
 
 beforeAll(() => {
@@ -894,10 +1365,18 @@ describe('the first seed', () => {
         );
     });
 
-    // The report's CONTENT — every cell of the diet x allergen x slot x
-    // time-tier table and the §0.7.3 thresholds over it — is
-    // src/__tests__/api/seed-rerun.test.ts's subject, against the real corpus.
-    // What is wiring, and so belongs here, is where the file went.
+    // WHERE THE REPORT'S CLAIMS LIVE, since two suites hold different halves of
+    // them. The exact TABLE INVARIANTS — the dimension lists, the 640 cells, the
+    // 140 guaranteed and 124 reduced cells with their thresholds and their
+    // disjointness, the four composition strata and their §0.7.3 floors — are
+    // pinned in this file, over plain objects, by the `deriveCoverageReport`
+    // block in the pure surface below: they are properties of the derivation and
+    // need no database. `src/__tests__/api/seed-rerun.test.ts` holds the
+    // complementary claim, which this suite cannot make: that the REAL
+    // 42-recipe corpus against the REAL release satisfies those cells and
+    // reproduces the committed artefact byte for byte. What belongs HERE, in
+    // this block, is the wiring: where the file went, and that the committed one
+    // was left alone.
     it('writes the coverage report to the injected path, and the committed artefact is untouched', () => {
         expect(outcome.reportPath).toBe(reportPath());
         expect(outcome.reportSkippedReason).toBeNull();
@@ -1645,6 +2124,680 @@ describe('a narrowed or dry run', () => {
     }, BLOCK_TIMEOUT_MS);
 });
 
+describe('the catalog hold the run publishes under', () => {
+    /**
+     * §0.7.3 lets a `current` recipe version exist only on ingredients that are
+     * published, source-backed and allergen-known at the version it cites. The
+     * facts behind that are read once, for the whole corpus, before the first
+     * publication — so the stage holds the catalog graph's stage lock SHARED for
+     * the whole run, and every publication re-reads and locks its own
+     * ingredients inside its transaction. This block settles both halves plus the
+     * refusal, because either half alone leaves a window.
+     */
+    beforeEach(async () => {
+        await resetCatalog();
+        writeCorpus([tofuBowl(), chickenPlate()]);
+        fs.rmSync(reportPath(), { force: true });
+    }, BLOCK_TIMEOUT_MS);
+
+    it('holds the graph lock shared and its own writer lock exclusively, and releases both', async () => {
+        const observed: ObservedHolds[] = [];
+
+        // NO lock seam injected on either hold: these are the production locks,
+        // each taken on its own dedicated connection — the graph hold by
+        // lib/checkpoint.ts and the writer hold by `recipes-seed.ts` itself —
+        // and both are observed from pg_locks through a third.
+        await runSeed(seedDeps({ prisma: observingFirstCatalogRead(observed) }));
+
+        expect(observed).toHaveLength(1);
+        expect(observed[0].graph).toContain('ShareLock');
+        expect(observed[0].graph).not.toContain('ExclusiveLock');
+        // EXCLUSIVE, and on a different advisory class: the graph hold is shared
+        // and therefore compatible with itself, so it is not and cannot be what
+        // keeps a second seed out (see the stage's ONE RECIPE-SEED WRITER).
+        expect(observed[0].writer).toEqual(['ExclusiveLock']);
+
+        expect(await heldGraphLockModes()).toEqual([]);
+        expect(await heldWriterLockModes()).toEqual([]);
+    }, BLOCK_TIMEOUT_MS);
+
+    it('wraps the whole stage in the hold, from before the first read to after the report', async () => {
+        const atEntry: { recipes: number; report: boolean } = { recipes: -1, report: true };
+        const atExit: { recipes: number; report: boolean } = { recipes: -1, report: false };
+        let held = 0;
+
+        await runSeed(
+            seedDeps({
+                runUnderCatalogLock: async <T>(work: () => Promise<T>): Promise<T> => {
+                    held += 1;
+                    atEntry.recipes = await prisma.recipes.count();
+                    atEntry.report = fs.existsSync(reportPath());
+                    try {
+                        return await work();
+                    } finally {
+                        atExit.recipes = await prisma.recipes.count();
+                        atExit.report = fs.existsSync(reportPath());
+                    }
+                },
+            }),
+        );
+
+        expect(held).toBe(1);
+        // Nothing had been read or written when the hold was taken, and both
+        // recipes plus the report were in place before it was released.
+        expect(atEntry).toEqual({ recipes: 0, report: false });
+        expect(atExit).toEqual({ recipes: 2, report: true });
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses before any write when another stage holds the graph', async () => {
+        const refusal = await refusalFrom(
+            seedDeps({
+                runUnderCatalogLock: () =>
+                    Promise.reject(
+                        new CheckpointError('catalog_stage_locked', '', undefined, {
+                            stage: 'release',
+                            mode: 'shared',
+                            waitedMs: 0,
+                        }),
+                    ),
+            }),
+        );
+
+        expect(refusal.code).toBe('catalog_locked');
+        expect(refusal.message).toContain('holds the lock on the catalog graph');
+        expect(describeFailure(refusal).code).toBe('catalog_locked');
+        expect(await readCounts()).toEqual({
+            recipes: 0,
+            versions: 0,
+            currentVersions: 0,
+            retiredVersions: 0,
+            ingredients: 0,
+        });
+        expect(await prisma.catalog_import_runs.count()).toBe(0);
+        expect(fs.existsSync(reportPath())).toBe(false);
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses the publication when an ingredient stops being publishable under it', async () => {
+        const refusal = await refusalFrom(
+            seedDeps({
+                prisma: mutatingCatalogBeforeFirstPublication(async () => {
+                    await prisma.catalog_foods.update({
+                        where: { source_key: 'test:broccoli-raw' },
+                        data: { publication_status: 'retired' },
+                    });
+                }),
+            }),
+        );
+
+        expect(refusal.code).toBe('catalog_drifted');
+        expect(refusal.message).toContain('the catalog moved under it');
+        expect(refusal.problems.join('\n')).toContain('publication_status "retired"');
+        expect(refusal.problems.join('\n')).toContain('test:broccoli-raw');
+        // NOTHING published: the refusal happens before the first write of the
+        // first publication, and the report is a whole-corpus claim that is
+        // never reached.
+        expect(await readCounts()).toEqual({
+            recipes: 0,
+            versions: 0,
+            currentVersions: 0,
+            retiredVersions: 0,
+            ingredients: 0,
+        });
+        expect(fs.existsSync(reportPath())).toBe(false);
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses the publication when an ingredient is re-versioned under it', async () => {
+        const refusal = await refusalFrom(
+            seedDeps({
+                prisma: mutatingCatalogBeforeFirstPublication(async () => {
+                    await prisma.catalog_foods.update({
+                        where: { source_key: 'test:tofu-firm' },
+                        data: { metadata_version: { increment: 1 }, allergen_tags: ['soy', 'sesame'] },
+                    });
+                }),
+            }),
+        );
+
+        expect(refusal.code).toBe('catalog_drifted');
+        expect(refusal.problems.join('\n')).toContain('moved metadata_version 1 -> 2');
+        expect(refusal.problems.join('\n')).toContain('tofu-broccoli-bowl');
+
+        // The tofu is only in ONE of the two recipes, and the corpus publishes
+        // in slug order — so the chicken plate, whose ingredients did not move,
+        // keeps the transaction it committed before the drift was met, and the
+        // bowl that would have cited the stale metadata version has no row at
+        // all. That asymmetry is the point of refusing per publication: the run
+        // fails and says which recipe it could not publish, rather than
+        // publishing a version whose allergen tags are a snapshot of a row that
+        // has since gained `sesame`.
+        expect(
+            (await prisma.recipes.findMany({ select: { slug: true }, orderBy: { slug: 'asc' } })).map(
+                (row) => row.slug,
+            ),
+        ).toEqual(['chicken-broccoli-plate']);
+        expect(fs.existsSync(reportPath())).toBe(false);
+        expect(
+            (
+                await prisma.catalog_import_runs.findMany({
+                    where: { kind: RECIPE_SEED_RUN_KIND },
+                    select: { status: true, counts: true },
+                })
+            )[0],
+        ).toEqual({ status: 'failed', counts: expect.objectContaining({ recipes_settled: 1 }) });
+    }, BLOCK_TIMEOUT_MS);
+
+    it('leaves an unchanged rerun a no-op even when the catalog moves during it', async () => {
+        await runSeed(seedDeps());
+        const published = await readIdentity();
+
+        // The drift check belongs to the writing paths only: a rerun that
+        // decides `unchanged` must not become a refusal, because a retired food
+        // may legitimately keep backing the version it was already published
+        // into.
+        const outcome = await runSeed(
+            seedDeps({
+                now: () => PROMOTED_AT,
+                prisma: mutatingCatalogBeforeFirstPublication(async () => {
+                    await prisma.catalog_foods.update({
+                        where: { source_key: 'test:broccoli-raw' },
+                        data: { publication_status: 'retired' },
+                    });
+                }),
+            }),
+        );
+
+        expect(outcome.unchanged).toEqual(['chicken-broccoli-plate', 'tofu-broccoli-bowl']);
+        expect(outcome.created).toEqual([]);
+        expect(outcome.promoted).toEqual([]);
+        expect(await readIdentity()).toEqual(published);
+    }, BLOCK_TIMEOUT_MS);
+});
+
+describe('the writer lock that makes this stage the only seed', () => {
+    /**
+     * SCRLOAD-F15's remaining half. The graph hold above is SHARED, so it is
+     * compatible with itself; the run ledger's lease is keyed on the CORPUS
+     * FINGERPRINT, so two different revisions of the files never meet on it, and
+     * an `--only`-narrowed run claims no ledger row at all. Two seeds could
+     * therefore publish overlapping slugs in separate transactions and race the
+     * coverage report. This block settles the lock that stops them: one
+     * exclusive, session-scoped hold on a constant key, taken for every non-dry
+     * run whatever corpus it names and however narrow it is.
+     *
+     * Each case observes the REFUSAL, and observes the hold it was refused by
+     * from `pg_locks` — not the absence of a second publication, which a passing
+     * race would also produce.
+     */
+    let otherDirectory: string;
+    let otherReportPath: string;
+
+    /** A second corpus on disk, so "a different corpus" is a different fingerprint and not a claim. */
+    const otherCorpusDeps = (overrides: Partial<SeedDeps> = {}): Partial<SeedDeps> => ({
+        recipesDir: otherDirectory,
+        reportPath: otherReportPath,
+        ...overrides,
+    });
+
+    beforeEach(async () => {
+        await resetCatalog();
+        writeCorpus([tofuBowl(), chickenPlate()]);
+        fs.rmSync(reportPath(), { force: true });
+
+        otherDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'recipes-seed-other-corpus-'));
+        otherReportPath = path.join(otherDirectory, 'coverage-report.json');
+        // ONE file where the shared corpus has two: a different digest set, so
+        // `deriveCorpusFingerprint` gives it a different `manifest_version` and
+        // the two runs address two different ledger rows.
+        writeCorpusInto(otherDirectory, [tofuBowl()]);
+    }, BLOCK_TIMEOUT_MS);
+
+    afterEach(() => {
+        fs.rmSync(otherDirectory, { recursive: true, force: true });
+    });
+
+    it('refuses a second writer on a DIFFERENT corpus while the first holds the lock', async () => {
+        const contention = await refusedWhileAnotherWriterHolds({}, otherCorpusDeps());
+
+        expect(contention.refusal.code).toBe('seed_writer_locked');
+        expect(contention.refusal.message).toContain('another recipe seed is publishing');
+        expect(describeFailure(contention.refusal).code).toBe('seed_writer_locked');
+        // The hold it was refused by, read from pg_locks rather than assumed.
+        expect(contention.writerModesWhileHeld).toEqual(['ExclusiveLock']);
+        // Refused before it read, claimed or wrote anything: the holder is parked
+        // before its own first read, so a corpus or a ledger row at this instant
+        // could only be the contender's.
+        expect(contention.runRowsWhileHeld).toBe(0);
+        expect(contention.recipesWhileHeld).toBe(0);
+
+        // The holder finished its own corpus untouched by the refusal.
+        expect(contention.holding.created).toEqual(['chicken-broccoli-plate', 'tofu-broccoli-bowl']);
+
+        // And the two really are different work rather than two views of one
+        // corpus: run the refused one on its own and its fingerprint differs, so
+        // the fingerprint-keyed claim lock could never have separated them.
+        const other = await runSeed(seedDeps(otherCorpusDeps({ now: () => THIRD_PUBLISHED_AT })));
+
+        expect(other.run?.manifestVersion).not.toBe(contention.holding.run?.manifestVersion);
+        expect(await heldWriterLockModes()).toEqual([]);
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses a whole-corpus writer while a --only writer holds the lock', async () => {
+        const contention = await refusedWhileAnotherWriterHolds(
+            { options: { help: false, only: ['tofu-broccoli-bowl'], dryRun: false } },
+            {},
+        );
+
+        expect(contention.refusal.code).toBe('seed_writer_locked');
+        expect(contention.writerModesWhileHeld).toEqual(['ExclusiveLock']);
+        // The narrowed holder claims NO ledger row — which is precisely why the
+        // lease cannot be what separates these two, and why the lock is taken
+        // for a narrowed run all the same.
+        expect(contention.holding.run).toBeNull();
+        expect(contention.holding.created).toEqual(['tofu-broccoli-bowl']);
+        expect(contention.runRowsWhileHeld).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses a --only writer while a whole-corpus writer holds the lock', async () => {
+        const contention = await refusedWhileAnotherWriterHolds(
+            {},
+            { options: { help: false, only: ['tofu-broccoli-bowl'], dryRun: false } },
+        );
+
+        expect(contention.refusal.code).toBe('seed_writer_locked');
+        expect(contention.writerModesWhileHeld).toEqual(['ExclusiveLock']);
+        expect(contention.holding.created).toEqual(['chicken-broccoli-plate', 'tofu-broccoli-bowl']);
+        // The narrowed contender published nothing: exactly one version per
+        // recipe, all of them the holder's.
+        expect(await readCounts()).toMatchObject({ recipes: 2, versions: 2, currentVersions: 2, retiredVersions: 0 });
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses when no DATABASE_URL resolves, rather than letting the driver pick a database', async () => {
+        // `new pg.Client({connectionString: undefined})` falls back to the libpq
+        // environment and can connect somewhere nobody named, so the writer lock
+        // would be taken against an unknown database — or against none — while
+        // this seed published as though it were exclusive. dbGuard refuses an
+        // unset DATABASE_URL at module load, so reaching here means a caller
+        // bypassed it, and the refusal is what makes that bypass loud instead of
+        // silently unexclusive.
+        const configured = process.env.DATABASE_URL;
+        delete process.env.DATABASE_URL;
+
+        try {
+            const refusal = await refusalOf(runSeed(seedDeps({})));
+
+            expect(refusal.code).toBe('seed_writer_lock_unavailable');
+            expect(refusal.message).toContain('no DATABASE_URL is set');
+            // Refused before the stage read, claimed or wrote anything: the
+            // writer hold is the outermost wrapper, so nothing below it ran.
+            expect(await prisma.recipes.count()).toBe(0);
+            expect(await prisma.catalog_import_runs.count()).toBe(0);
+            expect(await heldWriterLockModes()).toEqual([]);
+        } finally {
+            process.env.DATABASE_URL = configured;
+        }
+    }, BLOCK_TIMEOUT_MS);
+
+    it('takes no writer lock for a dry run, and a dry run is not refused by one', async () => {
+        const entered = rendezvous();
+        const release = rendezvous();
+        const holder = runSeed(seedDeps({ runUnderCatalogLock: parkedInsideTheWriterHold(entered, release) }));
+
+        try {
+            await arriveAt(entered.reached, 'the holding writer to take the recipe-seed writer lock');
+
+            const dry = await runSeed(seedDeps({ options: { help: false, only: [], dryRun: true } }));
+
+            // Validated everything and was refused by nothing: a dry run
+            // publishes no row and no report, so it owns nothing and waits for
+            // nobody.
+            expect(dry.dryRun).toBe(true);
+            expect(dry.selected).toEqual(['chicken-broccoli-plate', 'tofu-broccoli-bowl']);
+            expect(dry.report).toBeNull();
+            // STILL exactly one hold: the dry run took none of its own, so a
+            // second dry run could not be refused by a first either.
+            expect(await heldWriterLockModes()).toEqual(['ExclusiveLock']);
+            expect(await prisma.recipes.count()).toBe(0);
+
+            release.signal();
+            await holder;
+        } catch (error) {
+            release.signal();
+            await holder.catch(() => undefined);
+            throw error;
+        }
+
+        expect(await heldWriterLockModes()).toEqual([]);
+    }, BLOCK_TIMEOUT_MS);
+});
+
+describe('the run this stage records', () => {
+    /**
+     * §0.7.1's interruption-and-recovery requirement. The corpus publishes one
+     * transaction per recipe, so this block settles what an operator and the
+     * next invocation can learn from the ledger afterwards: a terminal status,
+     * the counts that really committed, a cursor at the watermark, and whether
+     * a run is still live.
+     */
+    const readRuns = async () =>
+        prisma.catalog_import_runs.findMany({
+            where: { kind: RECIPE_SEED_RUN_KIND },
+            orderBy: { started_at: 'asc' },
+        });
+
+    const cursorOf = (row: { cursor: unknown }): RecipeSeedCursor => row.cursor as RecipeSeedCursor;
+
+    beforeEach(async () => {
+        await resetCatalog();
+        writeCorpus([tofuBowl(), chickenPlate()]);
+        fs.rmSync(reportPath(), { force: true });
+    }, BLOCK_TIMEOUT_MS);
+
+    it('closes one succeeded run naming the corpus, its watermark and its committed counts', async () => {
+        const outcome = await runSeed(seedDeps());
+        const runs = await readRuns();
+
+        expect(outcome.run).not.toBeNull();
+        expect(outcome.runSkippedReason).toBeNull();
+        expect(outcome.run).toMatchObject({
+            manifestVersion: outcome.run?.manifestVersion ?? '',
+            resumed: false,
+            attempt: 1,
+            previousSucceededRunId: null,
+        });
+        // The fingerprint names the coverage plan version and then a digest of
+        // the selected bytes, so an operator reading the column sees the policy
+        // it was judged under.
+        expect(outcome.run?.manifestVersion).toMatch(
+            new RegExp(`^${coveragePlan.coveragePlanVersion}@[0-9a-f]{12}$`),
+        );
+
+        expect(runs).toHaveLength(1);
+        expect(runs[0].id).toBe(outcome.run?.runId);
+        expect(runs[0].manifest_version).toBe(outcome.run?.manifestVersion);
+        expect(runs[0].status).toBe('succeeded');
+        expect(runs[0].finished_at).not.toBeNull();
+        expect(runs[0].counts).toEqual({
+            recipes_settled: 2,
+            recipes_created: 2,
+            recipes_promoted: 0,
+            recipes_unchanged: 0,
+            ingredient_rows: outcome.ingredientRows,
+        });
+        expect(cursorOf(runs[0])).toMatchObject({
+            attempt: 1,
+            corpusSlugs: 2,
+            settledSlugs: 2,
+            // The corpus is published in slug order, so the watermark is the
+            // last slug alphabetically.
+            lastSlug: 'tofu-broccoli-bowl',
+            lastAction: 'created',
+            created: 2,
+        });
+    }, BLOCK_TIMEOUT_MS);
+
+    it('opens a new run for a rerun of the same corpus, naming the one that already succeeded', async () => {
+        const first = await runSeed(seedDeps());
+        const second = await runSeed(seedDeps({ now: () => PROMOTED_AT }));
+        const runs = await readRuns();
+
+        // Reconciled again rather than reported complete: the fingerprint names
+        // the corpus and this stage's other input is the catalog, so a
+        // completed-run no-op keyed on the files alone would refuse for ever the
+        // republication §0.5.1 requires when an ingredient snapshot goes stale.
+        expect(second.run?.previousSucceededRunId).toBe(first.run?.runId);
+        expect(second.run?.runId).not.toBe(first.run?.runId);
+        expect(second.run?.resumed).toBe(false);
+        expect(second.run?.manifestVersion).toBe(first.run?.manifestVersion);
+        expect(second.unchanged).toHaveLength(2);
+        expect(second.created).toEqual([]);
+
+        expect(runs.map((row) => row.status)).toEqual(['succeeded', 'succeeded']);
+        expect(runs[1].counts).toEqual({
+            recipes_settled: 2,
+            recipes_created: 0,
+            recipes_promoted: 0,
+            recipes_unchanged: 2,
+            ingredient_rows: 0,
+        });
+    }, BLOCK_TIMEOUT_MS);
+
+    it('closes the run failed at the watermark it reached when the corpus is interrupted', async () => {
+        await expect(runSeed(seedDeps({ prisma: failingOnPublication(2) }))).rejects.toThrow(InjectedPublishFailure);
+
+        const runs = await readRuns();
+
+        expect(runs).toHaveLength(1);
+        expect(runs[0].status).toBe('failed');
+        expect(runs[0].finished_at).not.toBeNull();
+        // The counts are what COMMITTED — one recipe, not the two the corpus
+        // holds — and the cursor names which one, so a repair starts from a fact
+        // rather than from a guess.
+        expect(runs[0].counts).toMatchObject({
+            recipes_settled: 1,
+            recipes_created: 1,
+            recipes_unchanged: 0,
+        });
+        expect(cursorOf(runs[0])).toMatchObject({
+            attempt: 1,
+            corpusSlugs: 2,
+            settledSlugs: 1,
+            lastSlug: 'chicken-broccoli-plate',
+            lastAction: 'created',
+        });
+        expect((runs[0].log as { event: string }[]).map((entry) => entry.event)).toContain('run_failed');
+        // Exactly the half-published corpus the ledger now describes.
+        expect(await prisma.recipes.count()).toBe(1);
+        expect(fs.existsSync(reportPath())).toBe(false);
+    }, BLOCK_TIMEOUT_MS);
+
+    describe('a run whose process was killed before its finalizer', () => {
+        /**
+         * The one exit through which a run stays `running`: the process dies, so
+         * nothing closes the row. The kill is simulated by reopening the row the
+         * interrupted attempt closed and clearing the counts it managed to
+         * write — a killed process never writes counts, because only the close
+         * does — which leaves exactly the state a `kill -9` leaves: `running`,
+         * no terminal counts, and a cursor whose lease is the last thing it
+         * committed.
+         */
+        let killedRunId: string;
+
+        beforeEach(async () => {
+            await expect(runSeed(seedDeps({ prisma: failingOnPublication(2) }))).rejects.toThrow(
+                InjectedPublishFailure,
+            );
+
+            const runs = await readRuns();
+            killedRunId = runs[0].id;
+            await prisma.catalog_import_runs.update({
+                where: { id: killedRunId },
+                data: { status: 'running', finished_at: null, counts: {} },
+            });
+        }, BLOCK_TIMEOUT_MS);
+
+        it('refuses a second seed while that run\'s lease is still live', async () => {
+            const cursor = cursorOf(await prisma.catalog_import_runs.findUniqueOrThrow({ where: { id: killedRunId } }));
+
+            expect(new Date(cursor.leaseUntil).getTime()).toBe(PUBLISHED_AT.getTime() + RECIPE_SEED_RUN_LEASE_MS);
+
+            const refusal = await refusalFrom(seedDeps());
+
+            expect(refusal.code).toBe('seed_in_progress');
+            expect(refusal.message).toContain(killedRunId);
+            // Refused before the corpus was touched: the one recipe the killed
+            // attempt committed is still the only one.
+            expect(await prisma.recipes.count()).toBe(1);
+            expect((await readRuns()).map((row) => row.status)).toEqual(['running']);
+        }, BLOCK_TIMEOUT_MS);
+
+        it('resumes that same run once the lease has lapsed and closes it succeeded', async () => {
+            const outcome = await runSeed(seedDeps({ now: () => PROMOTED_AT }));
+            const runs = await readRuns();
+
+            expect(outcome.run?.runId).toBe(killedRunId);
+            expect(outcome.run?.resumed).toBe(true);
+            expect(outcome.run?.attempt).toBe(2);
+            // The corpus is FINISHED: the recipe the killed attempt never
+            // reached is published, and the one it had committed is reconciled
+            // rather than skipped — the cursor is an interruption record, not a
+            // list of slugs to trust unchecked.
+            expect(outcome.created).toEqual(['tofu-broccoli-bowl']);
+            expect(outcome.unchanged).toEqual(['chicken-broccoli-plate']);
+            expect(await prisma.recipes.count()).toBe(2);
+
+            expect(runs).toHaveLength(1);
+            expect(runs[0].status).toBe('succeeded');
+            expect(runs[0].counts).toEqual({
+                recipes_settled: 2,
+                recipes_created: 1,
+                recipes_promoted: 0,
+                recipes_unchanged: 1,
+                ingredient_rows: outcome.ingredientRows,
+            });
+            expect(cursorOf(runs[0])).toMatchObject({ attempt: 2, settledSlugs: 2 });
+            // The killed attempt's watermark survives its cursor being
+            // overwritten.
+            const events = (runs[0].log as { event: string }[]).map((entry) => entry.event);
+            expect(events).toContain('recipe_seed_attempt_taken_over');
+        }, BLOCK_TIMEOUT_MS);
+    });
+
+    describe('a superseded attempt that resumes after its run was taken over', () => {
+        /**
+         * The residue the session lock cannot cover, and the reason the run row
+         * carries an attempt token as well.
+         *
+         * A writer lock held on a session is released when the process dies —
+         * which is what makes a second LIVE writer impossible. What it leaves is
+         * the process whose LOCK SESSION died while the process itself kept a
+         * working connection pool: a dropped connection, a suspended host, a
+         * statement that came back after an age. That process holds no lock, so
+         * a later invocation legitimately takes the lock, finds the lease lapsed
+         * and takes the run over — and the first one can then wake up and keep
+         * writing. Every write it tries must be refused, and these two cases
+         * refuse it at the two writes it can wake up into: a PUBLICATION and a
+         * CURSOR WRITE. Its terminal close is refused in both.
+         *
+         * `zombieResumesAfterTakeover` parks the successor between its takeover
+         * and its first publication, so the row is `running` under a rotated
+         * token when the zombie resumes — which is the only state in which the
+         * TOKEN COMPARISON is what refuses it, rather than the closed-status
+         * check that would have refused it anyway.
+         */
+        const expectTheTakeoverOwnsEverything = async (observed: Supersession): Promise<void> => {
+            // Refused by the token, not by a closed row: the row was still
+            // `running` under attempt 2 at the instant the zombie failed, so the
+            // zombie's own terminal close did not land either.
+            expect(observed.zombieRefusal.code).toBe('run_attempt_superseded');
+            expect(observed.zombieRefusal.message).toContain('taken over by a later attempt (now attempt 2)');
+            expect(describeFailure(observed.zombieRefusal).code).toBe('run_attempt_superseded');
+            expect(observed.zombieEvents).toContain('run_close_refused');
+            expect(observed.zombieEvents).not.toContain('run_close_failed');
+            expect(observed.zombieEvents).not.toContain('run_finished');
+            expect(observed.runWhileTakenOver).toEqual({ status: 'running', cursorAttempt: 2 });
+
+            // The corpus is the successor's and complete: the recipe the zombie
+            // had committed is reconciled rather than skipped, the one it never
+            // reached is published, and no recipe carries a second version —
+            // which is what a zombie publishing beside the takeover would have
+            // produced.
+            expect(observed.takeover.run?.resumed).toBe(true);
+            expect(observed.takeover.run?.attempt).toBe(2);
+            expect(observed.takeover.created).toEqual(['tofu-broccoli-bowl']);
+            expect(observed.takeover.unchanged).toEqual(['chicken-broccoli-plate']);
+            expect(await readCounts()).toEqual({
+                recipes: 2,
+                versions: 2,
+                currentVersions: 2,
+                retiredVersions: 0,
+                ingredients: await prisma.recipe_ingredients.count(),
+            });
+
+            // ONE run row, closed by the attempt that owns it, with that
+            // attempt's counts and cursor — not the zombie's.
+            const runs = await readRuns();
+
+            expect(runs).toHaveLength(1);
+            expect(runs[0].status).toBe('succeeded');
+            expect(runs[0].counts).toEqual({
+                recipes_settled: 2,
+                recipes_created: 1,
+                recipes_promoted: 0,
+                recipes_unchanged: 1,
+                ingredient_rows: observed.takeover.ingredientRows,
+            });
+            expect(cursorOf(runs[0])).toMatchObject({
+                attempt: 2,
+                corpusSlugs: 2,
+                settledSlugs: 2,
+                lastSlug: 'tofu-broccoli-bowl',
+            });
+            expect((runs[0].log as { event: string }[]).map((entry) => entry.event)).toContain(
+                'recipe_seed_attempt_taken_over',
+            );
+            // Nothing is holding the writer lock once both attempts are done.
+            expect(await heldWriterLockModes()).toEqual([]);
+        };
+
+        it('refuses the PUBLICATION it resumes into, and its close', async () => {
+            const observed = await zombieResumesAfterTakeover({ nth: 2, when: 'before' });
+
+            // It opened a SECOND publication transaction — it really did try to
+            // publish — and that transaction is what the fence refused, as its
+            // first statement and before it took a single ingredient row lock.
+            expect(observed.zombiePublications).toBe(2);
+
+            await expectTheTakeoverOwnsEverything(observed);
+        }, BLOCK_TIMEOUT_MS);
+
+        it('refuses the CURSOR WRITE it resumes into, and its close', async () => {
+            const observed = await zombieResumesAfterTakeover({ nth: 1, when: 'after' });
+
+            // It opened exactly ONE publication transaction, which COMMITTED —
+            // so the write it resumed into is the cursor update that follows a
+            // settled recipe, and that is what was refused. The committed recipe
+            // is not lost: the successor reconciles it as `unchanged` above.
+            expect(observed.zombiePublications).toBe(1);
+
+            await expectTheTakeoverOwnsEverything(observed);
+        }, BLOCK_TIMEOUT_MS);
+    });
+
+    it('claims no run for a dry run or a narrowed run', async () => {
+        const dry = await runSeed(seedDeps({ options: { help: false, only: [], dryRun: true } }));
+
+        expect(dry.run).toBeNull();
+        expect(dry.runSkippedReason).toContain('dry run');
+        expect(await prisma.catalog_import_runs.count()).toBe(0);
+
+        const narrowed = await runSeed(
+            seedDeps({ options: { help: false, only: ['tofu-broccoli-bowl'], dryRun: false } }),
+        );
+
+        expect(narrowed.created).toEqual(['tofu-broccoli-bowl']);
+        expect(narrowed.run).toBeNull();
+        expect(narrowed.runSkippedReason).toContain('narrowed');
+        // A narrowed run publishes one recipe and claims nothing, so it can
+        // neither describe the corpus in the ledger nor block the real seed
+        // through the lease.
+        expect(await prisma.catalog_import_runs.count()).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+
+    it('refuses to publish at all when it has no ledger it can write to', async () => {
+        const refusal = await refusalFrom(
+            // `failingAfter`'s wrapper is a narrow SeedDb with no
+            // catalog_import_runs delegate, and no separate ledger client is
+            // injected — the one configuration in which the run could not be
+            // recorded.
+            seedDeps({ prisma: failingAfter('retire'), runDb: undefined }),
+        );
+
+        expect(refusal.code).toBe('run_ledger_unavailable');
+        expect(refusal.message).toContain('SeedDeps.runDb');
+        expect(await prisma.recipes.count()).toBe(0);
+    }, BLOCK_TIMEOUT_MS);
+});
+
 describe('importing the module', () => {
     it('runs no stage, opens no client and writes nothing', () => {
         const backendRoot = path.resolve(__dirname, '..', '..', '..');
@@ -1902,6 +3055,169 @@ describe('comparing a stored value with the value that was written', () => {
         ).toBe(true);
         expect(equivalentContent({ fiber_g: null }, {})).toBe(false);
         expect(equivalentContent([1, 2], [2, 1])).toBe(false);
+    });
+});
+
+/**
+ * `deriveCoverageReport`, over plain objects and with no database.
+ *
+ * WHY THESE ARE HERE RATHER THAN IN THE API SUITE. The table's SHAPE — which
+ * dimensions it has, that it carries one cell per combination of them, which
+ * cells §0.7.3 calls guaranteed and which reduced, at what thresholds, that the
+ * two sets are disjoint, how a slot splits into the four strata and which
+ * floors each carries — is a property of this pure derivation and of nothing
+ * else. Pinned here, three recipes are enough to state every one of them
+ * exactly, and a change to the derivation fails a named assertion.
+ * `src/__tests__/api/seed-rerun.test.ts` asserts the complementary thing: that
+ * the real 42-recipe corpus against the real release SATISFIES those cells and
+ * reproduces the committed artefact. It measures the corpus against whatever the
+ * report currently emits, so it cannot notice a dimension that disappeared or a
+ * threshold that moved — which is exactly what these tests are for.
+ */
+describe('deriveCoverageReport', () => {
+    const recipe = (
+        slug: string,
+        mealSlots: readonly string[],
+        dietTags: readonly string[],
+        allergenTags: readonly string[],
+        totalMinutes: number,
+    ): CoverageRecipe => ({
+        slug,
+        mealSlots,
+        dietTags,
+        version: {
+            status: 'current',
+            nutrition_provenance: 'source_backed',
+            allergen_status: 'known',
+            total_minutes: totalMinutes,
+            meal_slots: mealSlots,
+            ingredients: [
+                {
+                    catalog_food_id: `${slug}-ingredient`,
+                    snapshot_name: `${slug} ingredient`,
+                    snapshot_provenance: 'source_backed',
+                    snapshot_allergen_tags: allergenTags,
+                    snapshot_diet_tags: dietTags,
+                    is_optional: false,
+                    food_group: 'tofu',
+                    allergen_status: 'known',
+                },
+            ],
+        },
+    });
+
+    const report = deriveCoverageReport([
+        recipe('vegan-quick', ['breakfast'], [...PLANT_DIET_TAGS], [], 10),
+        recipe('vegetarian-slow', ['breakfast', 'lunch'], ['pescatarian', 'vegetarian'], ['milk'], 50),
+        recipe('omnivore', ['dinner'], [], [], 30),
+    ]);
+
+    it('states every dimension of the table and one cell per combination', () => {
+        expect(report.dimensions).toEqual({
+            diets: ['none', 'vegetarian', 'vegan', 'pescatarian'],
+            allergens: ['none', 'milk', 'eggs', 'peanuts', 'tree_nuts', 'soy', 'wheat', 'fish', 'shellfish', 'sesame'],
+            slots: ['breakfast', 'lunch', 'dinner', 'snack'],
+            mainSlots: ['breakfast', 'lunch', 'dinner'],
+            timeTiers: [15, 30, 45, 60],
+        });
+        // 4 x 10 x 4 x 4 = 640, stated as the product AND as the number, so a
+        // dimension that silently lost a member fails here rather than passing a
+        // length check that derived itself from the same list.
+        expect(report.eligibleCounts).toHaveLength(4 * 10 * 4 * 4);
+        expect(report.eligibleCounts).toHaveLength(640);
+        expect(report.recipeCount).toBe(3);
+        expect(report.crossListedRecipeCount).toBe(1);
+    });
+
+    it('counts a cell through the production eligibility rule', () => {
+        const countAt = (diet: string, allergen: string, slot: string, timeTier: number): number | undefined =>
+            report.eligibleCounts.find(
+                (cell) =>
+                    cell.diet === diet &&
+                    cell.allergen === allergen &&
+                    cell.slot === slot &&
+                    cell.timeTier === timeTier,
+            )?.count;
+
+        // Both breakfast recipes at the loosest tier; only the 10-minute one at
+        // the tightest; the milk-bearing one disappears when milk is excluded;
+        // and the vegan one is the only breakfast a vegan may plan.
+        expect(countAt('none', 'none', 'breakfast', 60)).toBe(2);
+        expect(countAt('none', 'none', 'breakfast', 15)).toBe(1);
+        expect(countAt('none', 'milk', 'breakfast', 60)).toBe(1);
+        expect(countAt('vegan', 'none', 'breakfast', 60)).toBe(1);
+    });
+
+    it('marks the guaranteed and reduced cells §0.7.3 names, and nothing else', () => {
+        expect(report.guaranteedCells).toHaveLength(140);
+        expect(report.reducedCells).toHaveLength(124);
+        expect(report.guaranteedCells.every((cell) => cell.threshold === 4)).toBe(true);
+        expect(report.reducedCells.every((cell) => cell.threshold === 2)).toBe(true);
+
+        const key = (cell: { diet: string; allergen: string; slot: string; timeTier: number }): string =>
+            `${cell.diet}|${cell.allergen}|${cell.slot}|${cell.timeTier}`;
+        const guaranteed = new Set(report.guaranteedCells.map(key));
+        expect(report.reducedCells.some((cell) => guaranteed.has(key(cell)))).toBe(false);
+
+        expect(report.guaranteedCells[0]).toMatchObject({
+            diet: 'none',
+            allergen: 'none',
+            slot: 'breakfast',
+            timeTier: 45,
+        });
+        expect(report.reducedCells[0]).toMatchObject({
+            diet: 'vegetarian',
+            allergen: 'milk',
+            slot: 'breakfast',
+            timeTier: 45,
+        });
+    });
+
+    it('splits each slot into the four strata and records the floors §0.7.3 states', () => {
+        expect(report.slotComposition.breakfast).toEqual({
+            dedicatedToSlot: 1,
+            totalEligible: 2,
+            composition: {
+                vegan: { floor: 4, count: 1 },
+                furtherVegetarian: { floor: 3, count: 1 },
+                furtherPescatarian: { floor: 2, count: 0 },
+                furtherOmnivore: { floor: 3, count: 0 },
+            },
+        });
+        // A floor of null is "§0.7.3 states none", which is not a floor of zero.
+        expect(report.slotComposition.snack.composition.furtherPescatarian.floor).toBeNull();
+        expect(report.slotComposition.snack.composition.furtherOmnivore.floor).toBeNull();
+        expect(report.slotComposition.snack.composition.vegan.floor).toBe(4);
+        expect(report.slotComposition.snack.composition.furtherVegetarian.floor).toBe(2);
+    });
+
+    it('carries the self-describing members the committed artefact is reviewed with', () => {
+        expect(report.schemaVersion).toBe(1);
+        expect(report.eligibilityRule.mirrors).toBe('src/services/recipe.logic.ts::isEligibleForPlanning');
+        // The five axes the rule is decided on, in the order the artefact states
+        // them. The rule block has since grown prose members beside `clauses`,
+        // so the axis list is asserted rather than the whole object.
+        expect(report.eligibilityRule.clauses.map((clause) => clause.axis)).toEqual([
+            'slot',
+            'diet',
+            'allergen',
+            'allergenStatus',
+            'time',
+        ]);
+        expect(report.eligibilityRule.timeTiersCumulative).toContain('cumulative');
+        expect(report.repeatRule).toMatchObject({
+            maxUsesPerWeek: 2,
+            consecutiveDaysAllowed: false,
+            minEligiblePerSlotForFullWeek: 4,
+        });
+        // The notes that explain the stratum table to a reader of the file:
+        // that the four strata partition the slot's eligible set, and that a
+        // null floor is not a zero one.
+        expect(report.slotCompositionNotes.strata).toContain('partition');
+        expect(report.slotCompositionNotes.floors).toContain('not the same as a floor of zero');
+        expect(report.boundary).toContain('supported at runtime but not guaranteed');
+        expect(report.boundary).toContain('no_matching_meals');
+        expect(report.boundary).toContain('editStep');
     });
 });
 

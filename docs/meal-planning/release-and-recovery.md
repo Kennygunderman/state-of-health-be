@@ -2,9 +2,14 @@
 
 The operator procedure for putting the meal-planning schema and API into an
 environment, verifying it, switching it on, and getting back out again. The API
-ships **before** the app: every new response field is additive and every new
-route is gated, so an older client is unaffected, while a newer client against
-an older API is not.
+ships **before** the app: every field added to a shipped response is additive,
+and no released client calls any of the twenty-two new routes — of which sixteen
+stay disabled behind the capability flag through the rollout, while six are
+deliberately **ungated** (the three `/api/meal-planning/targets*` operations and
+the three `/api/catalog/*` reads, so the target and food-search surfaces outside
+meal planning keep working whenever planning is switched off). An older client is
+therefore unaffected either way, while a newer client against an older API is
+not. [`api.md`](./api.md) carries the per-route split.
 
 ## What this work delivers — and what it does not
 
@@ -16,9 +21,9 @@ summary, the catalog and benchmark reports, and the physical-device checklist,
 which is included **unrun** because this work had no macOS or Xcode environment.
 Each links its own repository's meal-planning documentation entry point — this
 folder's [`README.md`](./README.md) here, `docs/meal-planning.md` in the app
-repository. Which parts of the feature are in this tree at this commit is a
-separate question, and [the table below](#status-at-this-commit) is the answer to
-it.
+repository. What the commands these steps name actually do to the database they
+are pointed at is a separate question, and
+[What a release loads](#what-a-release-loads) is the answer to it.
 
 **The pull requests are not merged.**
 
@@ -29,35 +34,55 @@ not done — see [Forbidden operations](#forbidden-operations). Read the rest of
 this document as the procedure an operator follows, never as a record of a
 release that happened.
 
-## Status at this commit
+## What a release loads
 
-This document is the release runbook for the whole feature, and parts of the
-feature arrive across several commits on this branch. Every step below is
-therefore written as an instruction to an operator, never as a record of
-something already done — and this table says which of the things those steps
-name are in the tree yet, so nothing here reads as a claim about code that is
-not present. It is the one place that tracks that; the removal script and its
-folder README point here rather than repeating it.
+Every step below is an instruction to an operator, never a record of something
+already done. What the commands step 4 runs do to the database they are pointed
+at is settled here once, because the release order reads better without it and
+because the distinction those commands turn on is the one most easily got wrong.
 
-| Referenced thing | State |
+`data/meal-planning/catalog/releases/v1/` is the reviewed release **artefact**:
+five JSONL members and a `manifest.json` carrying a SHA-256, a byte length and a
+row count for each of them (11,046 foods, 15,939 aliases, 31,899 portions, 0
+components, 11,046 validation records). It is the input a release loads, **not
+loaded data** — committing it puts no row in any database, so a checkout whose
+`catalog:load` has never run has an empty catalog and 42 recipe files that no
+`recipe_versions` row corresponds to.
+
+| Command | What it does to the database in `DATABASE_URL` |
 | --- | --- |
-| `prisma/migrations/20260908000000_meal_planning` (the schema), `prisma/manual-migrations/meal-planning/*`, `docs/meal-planning/expected-schema-diff.sql`, `.github/workflows/ci.yml`, `src/utils/featureFlags.ts`, `MEAL_PLANNING_ENABLED` | present |
-| `data/meal-planning/catalog/releases/v1/` — the reviewed release artefact, with a `manifest.json` carrying a SHA-256 and a row count for each of its five files (11,046 foods, 15,939 aliases, 31,899 portions, 0 components, 11,046 validation records) | present. This is the input a release loads, not loaded data: committing it puts no row in any database. |
-| `npm run catalog:load` | present **and writing**. `catalog:load -- --release v1` finds and accepts the manifest above, verifies all five files against their declared SHA-256, byte length and row count before it writes anything, reconciles the release into `catalog_foods` and its aliases, portions, compositions and validation records — each food's four child sets replaced wholesale inside that food's own transaction — retires a published food the release no longer carries, re-compares the bytes it actually applied against the manifest, verifies the loaded counts against it, and only then records the run that makes it the active release. A rerun of a release already loaded reports 0 inserts and 0 updates. `--dry-run` reports the same reconciliation — the foods it would insert, update, retire and leave unchanged, and the alias, portion, composition and validation-record rows it would write and remove — and writes nothing at all, not even a run row. |
-| `npm run recipes:seed` | present **and writing**. Publishes the 42 committed recipe files as `recipe_versions` rows with their immutable ingredient snapshots against the catalog loaded in `DATABASE_URL`, is idempotent by slug (an unchanged recipe is a no-op; changed content or a stale ingredient snapshot publishes a new version, retires the previous one and moves `recipes.current_version_id` in one transaction), refuses the whole run — publishing nothing — if any file fails validation, and rewrites `data/meal-planning/recipes/coverage-report.json` from the seeded rows on a full run (`--dry-run` and `--only <slug>` both leave it alone). |
-| `npm run search:benchmark` | present as a command, already checking its own inputs, but **it does not write to a database yet**: it ends by reporting `stage_pipeline_pending`, or `stage_prerequisites_unmet` for an input it cannot see, and exits non-zero without touching the database. The measurement body lands with this branch's catalog commits. |
-| `GET /api/catalog/status` | `catalog.service.getStatus` is present; the `/api/catalog` route and controller land with this branch's API commits, so the endpoint is not yet reachable. |
-| Firebase Remote Config `meal_planning_enabled`, the mobile store build | outside this repository |
+| `npm run catalog:load -- --release v1` | **Writes.** Finds and accepts the manifest above, verifies all five files against their declared SHA-256, byte length and row count before it writes anything, reconciles the release into `catalog_foods` and its aliases, portions, compositions and validation records — each food's four child sets replaced wholesale inside that food's own transaction — retires a published food the release no longer carries, re-compares the bytes it actually applied against the manifest, verifies the loaded counts against it, and only then records the run that makes it the active release. A rerun of a release already loaded reports 0 inserts and 0 updates. `--dry-run` reports the same reconciliation — the foods it would insert, update, retire and leave unchanged, and the alias, portion, composition and validation-record rows it would write and remove — and writes nothing at all, not even a run row. |
+| `npm run recipes:seed` | **Writes.** Publishes the 42 committed recipe files as `recipe_versions` rows with their immutable ingredient snapshots against the catalog loaded in `DATABASE_URL`, is idempotent by slug (an unchanged recipe is a no-op; changed content or a stale ingredient snapshot publishes a new version, retires the previous one and moves `recipes.current_version_id` in one transaction), refuses the whole run — publishing nothing — if any file fails validation, and rewrites `data/meal-planning/recipes/coverage-report.json` from the seeded rows on a full run (`--dry-run` and `--only <slug>` both leave it alone). |
+| `npm run search:benchmark` | **Reads only,** by design. It measures `catalog.service.searchPublishedFoods` in process against the fixed query set in `data/meal-planning/search-benchmark.v1.json` under that file's own protocol — one untimed warm-up pass over the whole set, then the three timed passes it declares (`--passes <n>` overrides the count for diagnosis) — scores the top-three and top-ten hit rates, the zero-result rate and p95 latency, and writes `data/meal-planning/reports/latest/benchmark-report.json` (`--out` overrides the path). It is **fail-closed**: a threshold it does not meet exits non-zero with a verdict block naming the metric, its measured value and its bound, and an input it cannot see is refused as `stage_prerequisites_unmet` before it measures anything. Writing no row is a property of a measurement, not a missing stage. |
 
-Run a stage before depending on it, and re-read this table after pulling. Each
-stage names its own unmet inputs on stderr and exits non-zero rather than
-half-loading, so "did this environment's catalog actually load?" is answered by
-running the command and by `GET /api/catalog/status` once it is reachable —
-never by this table alone.
+The benchmark report committed in this repository (`generatedAt`
+2026-09-17T11:13:16Z) records a **passing** verdict against release v1:
+`topThreeHitRate` measured 0.948 against a bound of 0.9 and `topTenHitRate`
+0.991 against 0.97, with a zero-result rate of 0 and a p95 of 80.5 ms, both
+inside theirs. That is a measurement of one database at one moment, which is
+exactly why the verify-before-enable gate in step 5 is a gate and not a
+formality — the report that decides it is the one a target environment's own run
+writes, and a committed pass says nothing about the release a different database
+has loaded. The thresholds themselves are reviewed policy and are recorded in
+[`catalog-policy.md`](./catalog-policy.md), and
+[`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md) is
+where each run's real outcome is tracked; it is not re-argued here.
 
-`npm test` is a real Jest run: `jest.config.ts`, `tsconfig.test.json` and the
-suites under `src/**/__tests__/` are present. What it reports is the test
-toolchain's own milestone, not a release blocker introduced here.
+The HTTP surface those steps verify is mounted. `src/app.ts` mounts
+`catalogRoutes` and `mealPlanningRoutes` under `/api`, both **after**
+`app.use(authenticateFirebaseToken)`, so `/api/catalog/foods`,
+`/api/catalog/foods/suggestions`, `/api/catalog/status`,
+`/api/recipes/:recipeVersionId` and every `/api/meal-planning/*` route is
+reachable — and reachable only with a Firebase ID token. That is the one
+practical consequence for this procedure: `GET /api/catalog/status`, the probe
+step 5 turns on, answers `401` to an unauthenticated call rather than the
+status. `/health` is the endpoint that needs no token, which is why step 3
+probes with it and step 5 does not.
+
+Run a stage before depending on it. Each stage names its own unmet inputs on
+stderr and exits non-zero rather than half-loading, so "did this environment's
+catalog actually load?" is answered by running the command and by
+`GET /api/catalog/status` — never by this document.
 
 ## Release order
 
@@ -90,21 +115,88 @@ to keep if the rest of the procedure is ever adapted.
    `prisma/manual-migrations/meal-planning/` is *not* executed — it is excluded
    from the image and run by no tooling; see
    [Migration ledger](#migration-ledger).
-4. **Load the data.** From an operator checkout of the deployed commit, against
-   the target `DATABASE_URL`:
+4. **Load the data** — from an operator checkout of the deployed commit, run
+   **on the deployment host**, with `npx prisma generate` already run in that
+   checkout. Where these commands run from is part of the procedure rather than
+   a detail of it, because of the guard in front of them.
+
+   `scripts/lib/dbGuard.ts` classifies `DATABASE_URL` at module load, before
+   either writer's own code runs and before anything can reach Prisma, and
+   **every class it recognises is gated on a local host** — `localhost`,
+   `127.0.0.1` or `postgres`. A `DATABASE_URL` naming a deployment's own
+   database host therefore classifies `unknown` and is refused outright with
+   code `unrecognised_origin`, which happens before any policy is consulted, so
+   `--confirm-target` cannot reach it and is not meant to.
+   [`README.md`](./README.md#the-database-origin-guard) carries the full
+   classification. The practical consequence is the invocation itself: **do not
+   run either writer from a workstation pointing `DATABASE_URL` at the
+   deployment** — that run is refused before it opens a connection. Run them
+   where the target database is reachable on a local host: from the deployment
+   host itself, over loopback to the database's own port or container.
+
+   Read the target back before anything writes. The URL is the only thing that
+   decides what gets written, and this project's development environment hands a
+   production `DATABASE_URL` to every new shell that does not override it:
 
    ```bash
-   npm run catalog:load -- --release v1 --confirm-target <database-name>
-   npm run recipes:seed
+   psql "$DATABASE_URL" -tAc \
+     'SELECT current_database(), current_user, inet_server_addr(), inet_server_port()'
+   ```
+
+   Then reconcile once with nothing at stake, and only then for real:
+
+   ```bash
+   # The database the read-back just named, typed once and given to both writers.
+   TARGET_DB='<database-name>'
+
+   npm run catalog:load -- --release v1 --confirm-target "$TARGET_DB" --dry-run
+   npm run catalog:load -- --release v1 --confirm-target "$TARGET_DB"
+   npm run recipes:seed -- --confirm-target "$TARGET_DB"
    npm run search:benchmark
    ```
+
+   The dry run is not a formality: it verifies every manifest digest and reports
+   the whole reconciliation — the foods it would insert, update, retire and
+   leave unchanged, and the child rows it would write and remove. It reads the
+   database to work that out and writes nothing to it: no insert, no update, no
+   transaction, and no run row — which matters, because a run is claimed by its
+   release id, so a dry run that recorded one would stop the real load from ever
+   writing it. A release or a target that is not what you think it is therefore
+   surfaces here with nothing written.
+   `recipes:seed` takes `--dry-run` too, and validates every selected file
+   without writing.
+
+   `--confirm-target` goes to both writers on the real run. Both are
+   `development_or_confirmed`: each refuses at module load with
+   `confirmation_required` unless the flag names that URL's database exactly —
+   the sole exception being a database whose own name says development — and
+   with `confirmation_mismatch` when it names a different one.
+   `search:benchmark` is `any_recognised`, reads only, and takes no
+   confirmation flag.
+
+   **What the guard enforces on this invocation.** A deployment database reached
+   over loopback classifies `development` **on the host alone** — the guard
+   cannot tell it from a development database, and does not claim to. What it
+   does with that is the point: a `development_or_confirmed` writer proceeds
+   without the flag only when the database's own NAME says development (a `_dev`
+   suffix, with or without a clone index, on a local host). A deployment
+   database's name says nothing of the sort, so both writers refuse it with
+   `confirmation_required` until `--confirm-target` names it exactly, and with
+   `confirmation_mismatch` when the name is a near miss. The read-back above is
+   therefore how you learn **which name to type**, not the only thing standing
+   between you and a wrong write: the guard will not write this database until
+   it is named aloud.
+
+   Loading reviewed catalog and recipe reference data into a deployment database
+   is the release step, and it is performed by whoever holds that authority.
+   What [Forbidden operations](#forbidden-operations) rules out is the opposite
+   direction — pointing a development or test run at production data — not this.
 
    `catalog:load` applies the reviewed, checksummed catalog release committed in
    the repository — no live USDA or model calls. Regenerating a catalog from
    vendor output is never part of a release: a new version is produced on a
    development machine, reviewed as `data/meal-planning/catalog/releases/v<N+1>/`
-   in a pull request, and loaded the same way. Both writers refuse a database
-   they cannot classify as development unless `--confirm-target` names it.
+   in a pull request, and loaded the same way.
 
    Repeating a catalog stage on that development machine is safe, and what it
    does depends on how the previous attempt ended. An interrupted stage resumes
@@ -140,6 +232,21 @@ to keep if the rest of the procedure is ever adapted.
    `GET /api/catalog/status` must report the expected release with at least
    10,000 published foods and at least 40 recipes; the benchmark report must
    meet its thresholds; per-table row counts must match the release manifest.
+
+   ```bash
+   curl -sS -H "Authorization: Bearer $ID_TOKEN" \
+     "https://<api-host>/api/catalog/status"
+   ```
+
+   The token is not optional. That route carries no user data, but it sits
+   behind the API's auth boundary like every other `/api` route, so without a
+   Firebase ID token it answers `401` rather than the status — unlike `/health`
+   in step 3. And the benchmark that decides this gate is the report **this
+   environment's** `search:benchmark` run wrote: the copy committed in the
+   repository records a failing verdict (see
+   [What a release loads](#what-a-release-loads)), so a pass here is something
+   to establish and read, never to inherit.
+
    Only then set `MEAL_PLANNING_ENABLED=true` and restart, and confirm
    `GET /api/meal-planning/preferences` answers 200 instead of 503.
 6. **Merge the app pull request only once the backend is live and switched on.**
@@ -277,11 +384,15 @@ idempotency_key = '<key>'` returns 1) with `response_status` and
 `plan_revision_after` both filled. A repeated key with a *different* body is not
 a replay — it answers `409 idempotency_conflict` and writes nothing.
 
-Both checks need the `/api/meal-planning/*` routes, which land with this
-branch's API commits — the same commits the status table above tracks for
-`/api/catalog`. The ledger service itself is in the tree; the HTTP surface in
-front of it is not, so run this check once those routes are reachable rather
-than assuming it passes.
+The `/api/meal-planning/*` routes both checks need are mounted (see
+[What a release loads](#what-a-release-loads)), so the precondition is not the
+routes but the two things in front of them.
+`POST /api/meal-planning/plans/:planId/meals/:mealId/log` is one of the gated
+handlers, so `MEAL_PLANNING_ENABLED` must be `true` for the request to be
+answered at all — with the flag off it is `503 feature_disabled`, nothing is
+written and there is no ledger row to replay — and the request needs a Firebase
+ID token like every other `/api` call. With those two in place nothing else
+stands in the way, so run the check rather than assuming it passes.
 
 ## Rollback
 
@@ -355,12 +466,12 @@ the removal is only recoverable if you keep both in view:
   same ids, same plan and shopping history, same stored responses. That is why
   the `pg_dump` in the script's step 3 is a precondition and not a precaution.
 
-Both halves of a fresh load are available now: `catalog:load` writes the
-reviewed release and `recipes:seed` publishes the committed recipe corpus
-against it — the status table above is where that is tracked. The backup is
-therefore no longer the only route back to that shared content, but it remains
-the only route back to user data, so plan a removal around the backup and check
-the state of both paths rather than assuming either has changed.
+Both halves of a fresh load write: `catalog:load` reconciles the reviewed
+release into the catalog tables and `recipes:seed` publishes the committed
+recipe corpus against it. The backup is therefore not the only route back to
+that shared content — but it is the only route back to user data, and the only
+route back to the exact rows either kind of data had before, so plan a removal
+around the backup.
 
 Afterwards, `_prisma_migrations` still records `20260908000000_meal_planning` as
 applied, so `migrate deploy` would report nothing pending and leave the database
@@ -374,28 +485,31 @@ That folder's README carries the full procedure.
 
 ## Schema drift
 
-`docs/meal-planning/expected-schema-diff.sql` is the committed evidence that
-the migration ledger and `prisma/schema.prisma` have not drifted apart
-unnoticed. It carries **three sections**, each delimited by its own
-`-- >>> BEGIN <name>` / `-- >>> END <name>` marker, and the file's header
-records the exact command that regenerates each one:
+**Two committed artefacts** are the evidence that the migration ledger and
+`prisma/schema.prisma` have not drifted apart unnoticed, and each file's header
+records the exact command that regenerates it:
 
-- `prisma-migrate-diff` — the reviewed output of one `prisma migrate diff
-  --script` run between the ledger and the datamodel. Its single statement is
-  what that command reports for the `STORED` generated `search_vector`
-  expression, which the datamodel can only carry as `Unsupported("tsvector")?`.
-- `pg-catalog-query` — a read-only `pg_catalog` query, scoped to generated
-  columns, hand-managed indexes and array columns.
-- `pg-catalog-expected` — that query's expected result: the generated column's
-  expression, and every hand-managed index's access method, uniqueness, key
-  expressions and predicate, and every array column's `NOT NULL` and default.
+- `docs/meal-planning/expected-schema-diff.sql` — the reviewed output of one
+  `prisma migrate diff --script` run between the ledger and the datamodel, and
+  nothing else, so the whole file is compared as that output. Its single
+  statement is what the command reports for the `STORED` generated
+  `search_vector` expression, which the datamodel can only carry as
+  `Unsupported("tsvector")?`.
+- `docs/meal-planning/schema-catalog-evidence.sql` — the second capture, in
+  **two sections** delimited by their own `-- >>> BEGIN <name>` /
+  `-- >>> END <name>` markers: `pg-catalog-query`, a read-only `pg_catalog`
+  query scoped to generated columns, hand-managed indexes and array columns,
+  and `pg-catalog-expected`, that query's expected result — the generated
+  column's expression, and every hand-managed index's access method,
+  uniqueness, key expressions and predicate, and every array column's
+  `NOT NULL` and default.
 
 The migration writes three things by hand that `prisma migrate diff` does not
 report at all — the `lower(alias)` expression index, the five partial indexes,
 and `NOT NULL` on the twelve required array columns. Prisma 6.9 still emits
-only the generated column, and the evidence file's header records that as an
+only the generated column, and both files' headers record that as an
 AAP-versus-tool divergence with the measurements behind it. What closes the two
-classes the tool omits is the second and third sections: deleting the
+classes the tool omits is the second artefact: deleting the
 `lower(alias)` index, changing a partial index's predicate, or dropping
 `NOT NULL` from a required array column each change the `pg_catalog` result and
 fail the gate.
@@ -411,16 +525,17 @@ equivalence gate compares one ledger against the other and so cannot see a
 construct dropped from both, which is precisely what the `pg_catalog` sections
 catch.
 
-CI's `Schema-drift evidence gate` step runs all three. It runs the migrate-diff
-command against a throwaway shadow database of its own, requires its exit code
-2, and compares `prisma-migrate-diff` with the output after stripping comment
-and blank lines from both sides — failing on any difference in either direction.
-It then executes `pg-catalog-query` read-only against the database the
+CI's `Schema-drift evidence gate` step polices both artefacts. It runs the
+migrate-diff command against a throwaway shadow database of its own, requires
+its exit code 2, and compares the whole of `expected-schema-diff.sql` with the
+output after stripping comment and blank lines from both sides — failing on any
+difference in either direction. It then executes `schema-catalog-evidence.sql`'s
+`pg-catalog-query` section read-only against the database the
 `Apply the migration ledger` step migrated and compares `pg-catalog-expected`
 with the result. It also requires that section to keep at least one generated
 column, seven hand-managed indexes and twelve `NOT NULL` array columns, so
 deleting evidence lines cannot buy a pass either. Every command is in the
-evidence file's header for local use. To prove the ledger and its operator copy
+respective file's header for local use. To prove the ledger and its operator copy
 still agree, follow the equivalence procedure in
 `prisma/manual-migrations/meal-planning/README.md`.
 
@@ -435,10 +550,20 @@ Off-limits for this work, and **none of them was performed**:
 - Submitting an app-store release.
 
 The procedure above is written for whoever holds that authority; this work stops
-at two reviewable pull requests. The two habits that keep the first two items
-honest during ordinary development are the database-origin guard described in
-[`README.md`](./README.md) — which refuses any database it cannot classify, and
-makes the two data writers demand the target's name aloud — and naming the
-target URL explicitly in any command that writes, because this project's
-development environment supplies a production `DATABASE_URL` to every new shell
-that does not override it.
+at two reviewable pull requests. The first item forbids a direction, not a
+command: loading reviewed catalog and recipe reference data into a deployment
+database is step 4 of that procedure, while pointing a development or test run
+at production data is what is out of bounds.
+
+Two habits keep that line honest during ordinary development, and one of them is
+narrower than it sounds. The database-origin guard described in
+[`README.md`](./README.md#the-database-origin-guard) refuses any database it
+cannot classify, and that half always holds — an unrecognised origin is refused
+before any policy is consulted. It makes `catalog:load` and `recipes:seed`
+demand the target's name aloud only **off** a development origin, and a loopback
+URL is a development origin by its host alone, so on the invocation step 4 can
+use the typed name is the operator's discipline rather than the guard's
+enforcement. The second habit is what covers that: naming the target URL
+explicitly in any command that writes, and reading it back before it does,
+because this project's development environment supplies a production
+`DATABASE_URL` to every new shell that does not override it.

@@ -246,6 +246,7 @@ export type CatalogLoadErrorCode =
     | 'release_file_row_count_mismatch'
     | 'release_file_changed_during_load'
     | 'release_member_not_listed'
+    | 'release_member_declared_twice'
     | 'release_published_count_mismatch'
     | 'release_duplicate_food'
     | 'release_duplicate_child'
@@ -449,12 +450,16 @@ export const describeUsage = (): string =>
         '                              remove. Writes nothing and opens no run row, so',
         '                              the release still has to be loaded afterwards.',
         '  --confirm-target <dbname>   Required by scripts/lib/dbGuard.ts, which owns',
-        '                              this flag, whenever DATABASE_URL is not a',
-        '                              development origin: it must name that URL\'s',
-        '                              database exactly. Without it the guard refuses',
-        '                              the run at module load with',
-        '                              code "confirmation_required". Never needed',
-        '                              against a development origin.',
+        '                              this flag, unless the database\'s own NAME says',
+        '                              development — a _dev suffix, with or without a',
+        '                              clone index, on a local host: it must name that',
+        '                              URL\'s database exactly. Without it the guard',
+        '                              refuses the run at module load with',
+        '                              code "confirmation_required". A local database',
+        '                              named anything else is development by its host',
+        '                              alone, and needs the flag like a test or shadow',
+        '                              one; a remote host is unrecognised and no flag',
+        '                              reaches it.',
         '  --help, -h                  Print this usage block and exit 0.',
         '',
         'Inputs read:',
@@ -511,6 +516,25 @@ const isRowCount = (value: unknown): value is number =>
     typeof value === 'number' && Number.isInteger(value) && value >= 0;
 
 /**
+ * One `files[]` entry as the manifest states it, paired with the position it
+ * was stated at.
+ *
+ * The three measurements are `unknown` because the manifest is a JSON document
+ * on disk: its declared type does not bind what actually arrives, and the
+ * checks below are what turn an arrival into a usable digest and row count. The
+ * INDEX is carried so a duplicate can be reported by where each declaration
+ * sits rather than by its content — two entries for one member can differ in
+ * every field, and an operator has to be able to find both of them in the
+ * document.
+ */
+interface ManifestFileDeclaration {
+    readonly index: number;
+    readonly sha256: unknown;
+    readonly row_count: unknown;
+    readonly bytes: unknown;
+}
+
+/**
  * The manifest's INTERNAL consistency, checked before a byte of the release is
  * read: is every member listed exactly once, does each entry carry the digest
  * and counts a verification needs, and does the `counts` block agree with the
@@ -537,16 +561,50 @@ const manifestConsistencyGaps = (
     const gaps: PrerequisiteGap[] = [];
     const reproduce = `Reproduce the release with "npm run catalog:release -- --release ${release} --force".`;
 
-    const byFile = new Map<string, { sha256: unknown; row_count: unknown; bytes: unknown }>();
-    for (const file of files) {
+    // DECLARATIONS ARE COLLECTED PER PATH, NEVER OVERWRITTEN. A manifest that
+    // states one member twice is AMBIGUOUS rather than merely redundant:
+    // keeping the last entry would resolve two conflicting sha256/row_count/
+    // bytes triples in favour of whichever happened to be written last, and
+    // every check below would then run against a declaration the earlier one
+    // contradicts — so the release would be verified against a digest its own
+    // manifest disputes, and the counts a completed load is compared with would
+    // be a choice nobody made. The manifest has to be unambiguous before a byte
+    // of the release is read, so the duplication is refused here.
+    const declarationsByPath = new Map<string, ManifestFileDeclaration[]>();
+    for (const [index, file] of files.entries()) {
         if (file === null || typeof file !== 'object' || typeof file.path !== 'string') {
+            // Reported rather than passed over: an entry this loader cannot even
+            // name a file from is a defective manifest, and skipping it would
+            // leave the release one member short with nothing in the report
+            // saying why — the member would read as absent instead of as
+            // misdeclared.
+            gaps.push({
+                code: 'release_manifest_entry_invalid',
+                requirement: `Every entry in "files" in ${describeReleaseFile(release, 'manifest.json')} must be an object whose "path" names one of the release's five members`,
+                remedy: `${reproduce} An entry with no usable "path" describes no file, so there is nothing for the verification step to measure against it.`,
+                detail: `files[${index}]: ${JSON.stringify(file) ?? String(file)}`,
+            });
             continue;
         }
-        byFile.set(file.path, { sha256: file.sha256, row_count: file.row_count, bytes: file.bytes });
+
+        const declared = declarationsByPath.get(file.path) ?? [];
+        declared.push({ index, sha256: file.sha256, row_count: file.row_count, bytes: file.bytes });
+        declarationsByPath.set(file.path, declared);
+    }
+
+    for (const [declaredPath, declarations] of declarationsByPath) {
+        if (declarations.length > 1) {
+            gaps.push({
+                code: 'release_manifest_member_duplicated',
+                requirement: `${describeReleaseFile(release, 'manifest.json')} must declare each release member exactly once; "${declaredPath}" is declared ${declarations.length} times`,
+                remedy: `${reproduce} Two declarations of one member state two digests and two row counts for the same bytes, and there is no reading of the pair a verification could be held to.`,
+                detail: `declared at ${declarations.map((declaration) => `files[${declaration.index}]`).join(', ')}`,
+            });
+        }
     }
 
     const known = new Set(RELEASE_MEMBERS.map((member) => member.file));
-    for (const listed of byFile.keys()) {
+    for (const listed of declarationsByPath.keys()) {
         if (!known.has(listed)) {
             gaps.push({
                 code: 'release_manifest_member_unknown',
@@ -562,8 +620,8 @@ const manifestConsistencyGaps = (
             : (manifest.counts as unknown as Record<string, unknown>);
 
     for (const member of RELEASE_MEMBERS) {
-        const entry = byFile.get(member.file);
-        if (entry === undefined) {
+        const declarations = declarationsByPath.get(member.file) ?? [];
+        if (declarations.length === 0) {
             gaps.push({
                 code: 'release_manifest_member_missing',
                 requirement: `${describeReleaseFile(release, 'manifest.json')} must list ${member.file} with its SHA-256, row count and byte length`,
@@ -571,6 +629,18 @@ const manifestConsistencyGaps = (
             });
             continue;
         }
+
+        if (declarations.length > 1) {
+            // The duplication above is the whole report for this member. Each
+            // check below compares ONE declaration against the file or the
+            // counts block, and when the document states two there is no
+            // principled choice between them: a complaint derived from an
+            // arbitrary one could vanish the moment the duplicate is removed,
+            // which would send the operator after the wrong defect.
+            continue;
+        }
+
+        const entry = declarations[0];
 
         if (typeof entry.sha256 !== 'string' || !SHA256_HEX_PATTERN.test(entry.sha256)) {
             gaps.push({
@@ -698,7 +768,14 @@ export const preflight = (deps: LoadPreflightDeps): readonly PrerequisiteGap[] =
     gaps.push(...manifestConsistencyGaps(deps.release, manifest, files));
 
     for (const file of files) {
-        const fileName = file === null || typeof file !== 'object' ? '' : String(file.path);
+        if (file === null || typeof file !== 'object' || typeof file.path !== 'string') {
+            // Already refused by `manifestConsistencyGaps` as a misdeclared
+            // entry, and there is no file name to look for: coercing one would
+            // name a path the manifest never stated ("undefined") and send the
+            // operator looking for a file that was never meant to exist.
+            continue;
+        }
+        const fileName = file.path;
 
         let absolutePath: string;
         try {
@@ -1516,7 +1593,32 @@ const verifyRelease = async (deps: LoadDeps): Promise<ReleaseVerification> => {
     // manifest is a document on disk, so its declared type does not bind what
     // arrives — and a direct caller of `runLoad` may not have run preflight.
     const listed = Array.isArray(manifest.files) ? manifest.files : [];
-    const declared = new Map(listed.map((file) => [file.path, file]));
+    const declared = new Map<string, CatalogReleaseManifest['files'][number]>();
+    for (const file of listed) {
+        if (file === null || typeof file !== 'object' || typeof file.path !== 'string') {
+            // An entry naming no file describes no member: preflight refuses it
+            // as `release_manifest_entry_invalid`, and here it simply declares
+            // nothing, so the five members below are unaffected by it.
+            continue;
+        }
+        if (declared.has(file.path)) {
+            // THE SAME REFUSAL PREFLIGHT MAKES, ON THE PATH THAT READS BYTES.
+            // Two declarations of one member state two digests for the same
+            // file, so "verified against the manifest" has no single meaning —
+            // and a map that kept the last one would measure the file against
+            // whichever declaration was written last, which is the collapse
+            // this check exists to refuse. Reached only by a caller that did
+            // not run preflight; kept as the guarantee itself, exactly like the
+            // not-listed refusal below.
+            throw new CatalogLoadError(
+                'release_member_declared_twice',
+                `${describeReleaseFile(deps.release, 'manifest.json')} declares ${file.path} more than once, so there ` +
+                    'is no single digest or row count the member can be verified against; nothing has been written',
+                { file: file.path },
+            );
+        }
+        declared.set(file.path, file);
+    }
     const members: MemberVerification[] = [];
     const identities = new Map<string, MemberIdentity>();
     const foodOrder = new Map<string, number>();
@@ -1659,9 +1761,10 @@ const assertReleaseUnchanged = (deps: LoadDeps, verification: ReleaseVerificatio
 // rather than a fix. There is no tenant to scope to and no request-scoped
 // identity ever reaches this file — it runs only from an operator CLI. The
 // compensating control is scripts/lib/dbGuard.ts, which classifies
-// `DATABASE_URL` before any client exists and demands `--confirm-target` for a
-// non-development origin: the guard decides WHICH DATABASE may be written, and
-// `source_key` decides which row.
+// `DATABASE_URL` before any client exists and demands `--confirm-target` unless
+// the database's own name says development — so a deployment database reached
+// over loopback is named aloud like a test or shadow one: the guard decides
+// WHICH DATABASE may be written, and `source_key` decides which row.
 // ---------------------------------------------------------------------------
 
 export interface LoadDb {
@@ -2759,6 +2862,27 @@ const planChildWrites = (stored: StoredFoodWithChildren | null, prepared: Prepar
     };
 };
 
+/**
+ * Adds one set of counts into another, iterating `LoadCounts`'s own keys.
+ *
+ * Named for this file's own counts rather than `mergeCounts`, which
+ * checkpoint.ts exports for a different job — merging a delta into the run
+ * row's `counts` JSONB — so a reader of either call site cannot mistake one for
+ * the other.
+ *
+ * It exists so a per-food transaction can accumulate what it wrote in counts of
+ * its own and publish them into the run only once the commit has happened (see
+ * `applyFood`), and it iterates rather than naming the fields because a count
+ * added to `LoadCounts` later must not be able to go unmerged: a field nobody
+ * remembered to add here would silently under-report committed work in the very
+ * column an operator reads to decide whether a release is complete.
+ */
+const mergeLoadCounts = (into: MutableLoadCounts, from: MutableLoadCounts): void => {
+    for (const key of Object.keys(from) as (keyof LoadCounts)[]) {
+        into[key] += from[key];
+    }
+};
+
 const addChildDelta = (counts: MutableLoadCounts, delta: ChildDelta): void => {
     counts.aliasesWritten += delta.aliasesWritten;
     counts.aliasesRemoved += delta.aliasesRemoved;
@@ -2768,6 +2892,25 @@ const addChildDelta = (counts: MutableLoadCounts, delta: ChildDelta): void => {
     counts.componentsRemoved += delta.componentsRemoved;
     counts.validationRecordsWritten += delta.validationRecordsWritten;
 };
+
+/**
+ * What one food's transaction COMMITTED, which is the only thing that may reach
+ * the run's state.
+ *
+ * Every effect the transaction has on the run travels back through this value
+ * rather than by writing into `LoadState` from inside the callback: the counts
+ * it accumulated, and the local id of the row it wrote. A rollback therefore
+ * discards them by construction — there is nothing to undo — which is what
+ * keeps a failed run's counts truthful repair evidence (AAP §0.7.1).
+ *
+ * `foodId` is `null` for a food that already matched the release: no statement
+ * was issued, so there is no id this transaction established.
+ */
+interface CommittedFood {
+    readonly outcome: FoodOutcome;
+    readonly foodId: string | null;
+    readonly counts: MutableLoadCounts;
+}
 
 /**
  * Applies one food and its children.
@@ -2878,11 +3021,24 @@ const applyFood = async (
         return 'deferred';
     }
 
-    const outcome = await deps.db.$transaction(
-        async (tx): Promise<FoodOutcome> => {
+    const committed = await deps.db.$transaction(
+        async (tx): Promise<CommittedFood> => {
+            // EVERYTHING THIS TRANSACTION LEARNS IS LOCAL TO IT, and reaches the
+            // run only through the value it resolves with. PostgreSQL rolls the
+            // writes back when a later statement in here throws, but an
+            // in-memory increment survives that rollback — and `closeFailedRun`
+            // writes the run's counts into the failed row, which AAP §0.7.1
+            // requires to be truthful repair evidence. A count for a child row
+            // that never committed would tell an operator work was done that
+            // the database does not hold.
+            const counts = emptyCounts();
+
             const current = await readFoodWithChildren(tx, prepared.sourceKey);
             if (foodMatchesRelease(current, prepared, desired)) {
-                return 'unchanged';
+                // No statement was issued, so there is no id to publish and
+                // nothing to count: the stored food already states what the
+                // release does.
+                return { outcome: 'unchanged', foodId: null, counts };
             }
 
             let foodId: string;
@@ -2902,27 +3058,40 @@ const applyFood = async (
                     await tx.catalog_foods.update({ where: { source_key: prepared.sourceKey }, data: desired });
                 }
                 if (current.publication_status === RETIRED && desired.publication_status === PUBLISHED) {
-                    state.counts.foodsRestored += 1;
+                    counts.foodsRestored += 1;
                 }
                 foodId = current.id;
                 applied = 'updated';
             }
 
-            state.localIdBySourceKey.set(prepared.sourceKey, foodId);
-
             // All four child sets, wholesale, inside this one transaction: the
             // food is published with its composition or not published at all.
-            await reconcileAliases(tx, foodId, current, prepared.aliases, state.counts);
-            await reconcilePortions(tx, foodId, current, prepared.portions, state.counts);
-            await reconcileComponents(tx, foodId, current, prepared.components, resolvedComponentIds, state.counts);
-            await reconcileValidationRecord(tx, foodId, current, prepared.validation, state.counts);
+            // `resolvedComponentIds` was built BEFORE this transaction opened
+            // and already carries every component's local id, so none of the
+            // four reads this food's own entry in `state.localIdBySourceKey` —
+            // which is why that entry can be published after the commit rather
+            // than here (see below).
+            await reconcileAliases(tx, foodId, current, prepared.aliases, counts);
+            await reconcilePortions(tx, foodId, current, prepared.portions, counts);
+            await reconcileComponents(tx, foodId, current, prepared.components, resolvedComponentIds, counts);
+            await reconcileValidationRecord(tx, foodId, current, prepared.validation, counts);
 
-            return applied;
+            return { outcome: applied, foodId, counts };
         },
         { timeout: TRANSACTION_TIMEOUT_MS },
     );
 
-    return outcome;
+    // PAST THE COMMIT, so both publications describe rows that exist. The id of
+    // a food inserted by a transaction that then rolled back would otherwise
+    // stay in the run's map and be handed to a later food's composition as a
+    // RESTRICT foreign key value pointing at nothing, and the counts would
+    // claim child rows the database does not hold.
+    if (committed.foodId !== null) {
+        state.localIdBySourceKey.set(prepared.sourceKey, committed.foodId);
+    }
+    mergeLoadCounts(state.counts, committed.counts);
+
+    return committed.outcome;
 };
 
 /** Counts one settled food and reports it to the progress seam. */

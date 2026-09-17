@@ -308,6 +308,11 @@ import {
     searchCatalogFoodsController,
 } from '../../controllers/catalog.controller';
 import { makeCatalogFood } from '../setup/factories';
+import {
+    foldSearchAscii,
+    SEARCH_ASCII_LOWERCASE,
+    SEARCH_ASCII_UPPERCASE,
+} from '../../services/catalog.logic';
 import { getStatus, getSuggestions, searchPublishedFoods } from '../../services/catalog.service';
 
 const BACKEND_ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -316,27 +321,59 @@ const MIGRATION_SQL = ['20260706000000_init', '20260908000000_meal_planning'].ma
 );
 
 /**
- * Five names chosen because `C` and ICU disagree about all of them.
+ * Five names chosen because `C` and ICU disagree about all of them — and
+ * because the relevance score cannot tell them apart.
  *
- * Case, comma and hyphen are exactly what the two collations weigh differently:
- * `C` compares raw UTF-8 bytes, so uppercase sorts before lowercase and
- * punctuation sorts by its code point, while ICU applies language-aware rules
- * that treat case as a tertiary difference and largely ignore punctuation. The
- * resulting sequences share no common prefix, so any assertion between them is
- * unambiguous.
+ * THE COLLATION HALF. Case is exactly what the two collations weigh
+ * differently: `C` compares raw UTF-8 bytes, so every uppercase letter sorts
+ * before every lowercase one, while ICU treats case as a tertiary difference
+ * and orders lowercase first. Verified on PostgreSQL 16 against these five
+ * names, the two sequences are
+ * `BEANS, BLACK | BEANS, black | Beans, BLACK | Beans, black | beans, BLACK`
+ * under `C` and
+ * `beans, BLACK | Beans, black | Beans, BLACK | BEANS, black | BEANS, BLACK`
+ * under `und-x-icu` — they differ from the first element on, so any assertion
+ * between them is unambiguous.
+ *
+ * THE RANK HALF, which is why these five differ ONLY in case. `display_name`
+ * decides a page's order only once the ranks are equal, and the relevance score
+ * is computed from the name: its word count is the specificity divisor and its
+ * head noun sets the weight. Five names that differ in wording — as an earlier
+ * revision of this fixture had them — therefore carry five different ranks, and
+ * the collation pin below could never be observed. Case-only variants are
+ * identical to the scorer at every step (same twelve characters, same two
+ * words, same head-segment vector `'bean'`, same head noun) while remaining
+ * maximally different to the two collations, so the ranks tie by construction
+ * and the collated name is the only thing left that can explain the sequence.
  */
-const COLLATION_SENSITIVE_NAMES = ['Beans, black', 'Beans black', 'beans, green', 'Beans-lima', 'BEANS, navy'];
+const COLLATION_SENSITIVE_NAMES = ['BEANS, BLACK', 'BEANS, black', 'Beans, BLACK', 'Beans, black', 'beans, BLACK'];
+
+/**
+ * One food state per name, because the names now lower-case to ONE
+ * `canonical_name`.
+ *
+ * `(canonical_name, food_state)` is unique among published rows, so five rows
+ * sharing `beans, black` need five distinct states to be publishable at all.
+ * That is honest data rather than a workaround — raw, cooked, dry, prepared and
+ * as-purchased beans genuinely are distinct catalog rows — and the column takes
+ * no part in search scoring or ordering, so it cannot affect what this file
+ * measures.
+ */
+const COLLATION_FOOD_STATES = ['raw', 'cooked', 'dry', 'prepared', 'as_purchased'];
 
 /**
  * The query term, and the reason every seeded row ties on rank.
  *
  * `searchPublishedFoods` orders by `rank DESC` first, so `display_name` only
  * decides once the ranks are equal — and a test about `display_name` ordering
- * has to make them equal. Two things arrange that: the term is a prefix of every
- * seeded name, so each row draws the same constant `PREFIX_MATCH_RANK` from the
- * prefix branch, and every row is given identical `search_text`, so the
- * full-text branch scores them identically too. `MAX(rank)` is therefore the
- * same value for all five, and the collated `display_name` is the deciding key.
+ * has to make them equal. Three things arrange that, and all three are needed:
+ * the term is a prefix of every seeded name and every name is the same length,
+ * so each row draws the same coverage score from the prefix branch; every row is
+ * given identical `search_text`; and the five names are case variants of one
+ * another, so the full-text branch reads the same word count, the same
+ * head-segment vector and the same head noun from each of them. `MAX(rank)` is
+ * therefore the same value for all five, and the collated `display_name` is the
+ * deciding key.
  */
 const QUERY = 'beans';
 const SHARED_SEARCH_TEXT = 'beans legume';
@@ -422,6 +459,7 @@ beforeAll(async () => {
             sequence: index + 1,
             display_name: name,
             canonical_name: name.toLowerCase(),
+            food_state: COLLATION_FOOD_STATES[index],
             search_text: SHARED_SEARCH_TEXT,
             is_common_dislike: true,
         });
@@ -1203,5 +1241,168 @@ describe('the alias-prefix index the search fallback depends on', () => {
         // check that would catch its loss if one day a caller needed it.
         expect(plan).toContain(INDEX_NAME);
         expect(plan).toContain('Index Scan');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The head-noun tier is locale-free
+ *
+ * WHY THIS IS HERE RATHER THAN IN A UNIT TEST. The head-noun signal is decided
+ * in SQL, between a `to_tsvector` of the food's head noun and a
+ * `plainto_tsquery` of the query's — and the two head nouns are extracted by
+ * two different runtimes, one in `catalog.logic.ts::searchQueryHeadNoun` for the
+ * query and one in `catalog.service.ts` for the name. Only a database can show
+ * whether they agree, and only a database whose collation is not C can show
+ * whether their agreement depends on the collation.
+ *
+ * THE DEFECT THIS PINS. The SQL side folded case with `lower()`, which resolves
+ * through the collation, while the JavaScript side used
+ * `String.prototype.toLowerCase`, which does not: `'İNCİR'.toLowerCase()` is
+ * `i` + U+0307 COMBINING DOT ABOVE, `lower('İNCİR')` is a plain `incir` under
+ * `en_US.utf8`, and under ICU it is different again. So for any name carrying a
+ * non-ASCII capital the head-noun comparison could fail on one server and
+ * succeed on another, putting the food in a different TIER — and tier decides
+ * `rank`, which is the FIRST ordering key. `COLLATE "C"` on the two text
+ * tiebreakers cannot repair that, because it is only consulted once the ranks
+ * are equal. AAP §§0.5.2 and 0.9.3 require two independently loaded databases
+ * to answer with identical ranks and page sequences, so this was a portability
+ * defect and not a cosmetic one.
+ *
+ * Both sides now fold through the one ASCII-only map — `foldSearchAscii` in
+ * JavaScript, `translate()` over the same two exported constants in SQL — so
+ * the comparison's inputs are byte-identical wherever the release is loaded,
+ * and everything outside A-Z is left for `to_tsvector`/`plainto_tsquery` to
+ * normalise, which they do to both halves at once.
+ * ------------------------------------------------------------------------- */
+
+describe('the head-noun tier on a name whose case no two collations fold alike', () => {
+    /**
+     * The query, and why its capital sits in the middle of the word.
+     *
+     * `MURNİX` carries U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE — the
+     * character whose fold differs between JavaScript, glibc and ICU — but it
+     * begins with an ASCII `M`. That matters for the assertion below: the
+     * ordering has to be decided by RANK and not by the collated name, so the
+     * food that should rank FIRST must sort SECOND in C byte order. A term
+     * starting with the non-ASCII capital could never arrange that, because
+     * U+0130 encodes as 0xC4 0xB0 and would always sort last.
+     */
+    const QUERY_TERM = 'MURNİX';
+
+    /** The query IS this food's head noun: it names what the food is. */
+    const HEAD_NOUN_NAME = 'Zested MURNİX';
+
+    /** The query only MODIFIES this food: a bread, not a murnix. */
+    const MODIFIER_NAME = 'MURNİX bread';
+
+    /**
+     * Two words each, so the specificity divisor is equal and cannot explain the
+     * order; distinct states because the two names are distinct canonical names
+     * only after folding, and `(canonical_name, food_state)` is the unique key
+     * among published rows.
+     */
+    const UNICODE_FIXTURE: readonly { name: string; state: string; sequence: number }[] = [
+        { name: HEAD_NOUN_NAME, state: 'raw', sequence: 950 },
+        { name: MODIFIER_NAME, state: 'cooked', sequence: 951 },
+    ];
+
+    const createdIds: string[] = [];
+
+    beforeAll(async () => {
+        for (const row of UNICODE_FIXTURE) {
+            const food = await makeCatalogFood({
+                sequence: row.sequence,
+                display_name: row.name,
+                canonical_name: foldSearchAscii(row.name),
+                food_state: row.state,
+                // The food's own vector has to carry the term, or the full-text
+                // branch never reaches the row and there is no tier to observe.
+                search_text: row.name,
+            });
+            createdIds.push(food.id);
+        }
+    });
+
+    afterAll(async () => {
+        if (createdIds.length === 0) return;
+
+        await prisma.catalog_foods.deleteMany({ where: { id: { in: createdIds } } });
+    });
+
+    it('sorts the two names in the OPPOSITE order to the one rank must produce', async () => {
+        // The premise of the next case, asserted rather than assumed. If these
+        // two names ever sorted the same way the ranking is expected to, the
+        // assertion below would pass on a build with no head-noun signal at all.
+        const rows = await prisma.$queryRaw<{ display_name: string }[]>`
+            SELECT display_name FROM catalog_foods
+            WHERE id = ANY(${createdIds}::uuid[])
+            ORDER BY display_name COLLATE "C" ASC
+        `;
+
+        expect(rows.map((row) => row.display_name)).toEqual([MODIFIER_NAME, HEAD_NOUN_NAME]);
+    });
+
+    it('ranks the food the query NAMES above the food it merely modifies', async () => {
+        const { items, total } = await searchPublishedFoods(QUERY_TERM, 1, 50);
+
+        expect(total).toBe(UNICODE_FIXTURE.length);
+        // Only a locale-free fold gets here. With `lower()` on the SQL side and
+        // `toLowerCase()` on the JavaScript side, neither food matched on its
+        // head noun, both fell to the head-segment weight, their ranks tied, and
+        // the collated name decided — returning MODIFIER_NAME first, which is
+        // what the case above proves is the tie order.
+        expect(items.map((item) => item.name)).toEqual([HEAD_NOUN_NAME, MODIFIER_NAME]);
+    });
+
+    it('pages that order without a gap or a repeat', async () => {
+        const single = await searchPublishedFoods(QUERY_TERM, 1, 50);
+        const paged = [
+            ...(await searchPublishedFoods(QUERY_TERM, 1, 1)).items,
+            ...(await searchPublishedFoods(QUERY_TERM, 2, 1)).items,
+        ].map((item) => item.id);
+
+        expect(paged).toEqual(single.items.map((item) => item.id));
+        expect(new Set(paged).size).toBe(paged.length);
+    });
+
+    it('folds a non-ASCII name identically under this collation and under C', async () => {
+        // The mechanism behind the case above, stated on its own so a reader can
+        // see why it holds. `translate()` is a character-for-character map with
+        // no locale input, so both collations return one value — and that value
+        // is what `foldSearchAscii` returns in JavaScript, which is what makes
+        // the two sides of the comparison byte-identical.
+        for (const { name } of UNICODE_FIXTURE) {
+            const [row] = await prisma.$queryRaw<{ by_default: string; by_c: string }[]>`
+                SELECT translate(${name}, ${SEARCH_ASCII_UPPERCASE}, ${SEARCH_ASCII_LOWERCASE}) AS by_default,
+                       translate(${name} COLLATE "C", ${SEARCH_ASCII_UPPERCASE}, ${SEARCH_ASCII_LOWERCASE}) AS by_c
+            `;
+
+            expect(row.by_default).toBe(foldSearchAscii(name));
+            expect(row.by_c).toBe(foldSearchAscii(name));
+        }
+    });
+
+    it('would not fold it identically through lower(), which is why lower() is gone', async () => {
+        // The other half of the same statement, and the sharp one: `lower()`
+        // resolves through the collation, so on THIS server it answers two
+        // different things for one input depending on which collation the
+        // argument carries. A rank computed through it is a property of the
+        // server rather than of the release.
+        //
+        // Three answers exist for `MURNİX` across the collations this project
+        // meets — ICU folds U+0130 to `i` + U+0307, C leaves it untouched, and
+        // `en_US.utf8` drops the dot to a plain `i` — which is why the fix was
+        // to stop case-folding anything outside A-Z rather than to make one
+        // side imitate the other. This case fails if `lower()` is ever put back
+        // on the head-noun path and someone reasons that the collations agree.
+        const [row] = await prisma.$queryRaw<{ by_default: string; by_c: string }[]>`
+            SELECT lower(${HEAD_NOUN_NAME}) AS by_default,
+                   lower(${HEAD_NOUN_NAME} COLLATE "C") AS by_c
+        `;
+
+        expect(row.by_default).not.toBe(row.by_c);
+        // And neither of them is what JavaScript produces, which is the
+        // divergence the head-noun comparison used to sit on top of.
+        expect(new Set([row.by_default, row.by_c, HEAD_NOUN_NAME.toLowerCase()]).size).toBeGreaterThan(1);
     });
 });

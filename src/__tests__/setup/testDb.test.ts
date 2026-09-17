@@ -31,7 +31,7 @@ import {
 
 const BACKEND_ROOT = join(__dirname, '..', '..', '..');
 const JEST_SETUP_FILE = join(__dirname, 'jestSetup.ts');
-/** The module under test, which is also the `npm run check:test-db` program. */
+/** The module under test, which is also the standalone diagnostic program. */
 const TEST_DB_MODULE = join(__dirname, 'testDb.ts');
 const TEST_TSCONFIG = join(BACKEND_ROOT, 'tsconfig.test.json');
 
@@ -305,7 +305,7 @@ CREATE TABLE "users" (
 const FEATURE_SQL = `CREATE TABLE IF NOT EXISTS "meal_plan_preferences" (
     "id" UUID NOT NULL DEFAULT gen_random_uuid(),
     "user_id" TEXT NOT NULL,
-    "estimate_inputs_revision" INTEGER,
+    "targets_input_revision" INTEGER,
     "allergens" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     CONSTRAINT "meal_plan_preferences_pkey" PRIMARY KEY ("id")
 );
@@ -507,8 +507,8 @@ describe('declaredColumnsFromMigrationSql', () => {
 
         expect([...(declared.get('meal_plan_preferences') ?? [])].sort()).toEqual([
             'allergens',
-            'estimate_inputs_revision',
             'id',
+            'targets_input_revision',
             'user_id',
         ]);
     });
@@ -615,7 +615,7 @@ describe('missingDeclaredColumns', () => {
             ]),
         );
 
-        expect(missing).toEqual(['meal_plan_preferences.estimate_inputs_revision']);
+        expect(missing).toEqual(['meal_plan_preferences.targets_input_revision']);
     });
 
     it('reports an absent table once, rather than once per column it would have', () => {
@@ -648,7 +648,7 @@ describe('missingDeclaredColumns', () => {
 
         expect(missing).toEqual([
             'meal_entries.meal_plan_meal_id',
-            'meal_plan_preferences.estimate_inputs_revision',
+            'meal_plan_preferences.targets_input_revision',
             'users.email',
         ]);
     });
@@ -658,7 +658,7 @@ describe('missingDeclaredColumns', () => {
             ON_DISK,
             driftedOnFeature,
             observed([
-                ['meal_plan_preferences', ['id', 'user_id', 'allergens', 'estimate_inputs_revision']],
+                ['meal_plan_preferences', ['id', 'user_id', 'allergens', 'targets_input_revision']],
                 ['meal_entries', ['nutrition_provenance', 'meal_plan_meal_id']],
             ]),
         );
@@ -685,13 +685,13 @@ describe('describeSchemaFreshnessRefusal', () => {
     };
 
     it('names the database, the host, the migration, both checksums and the missing column', () => {
-        const message = refusalFor(drift, ['meal_plan_preferences.estimate_inputs_revision']);
+        const message = refusalFor(drift, ['meal_plan_preferences.targets_input_revision']);
 
         expect(message).toContain('database "soh_test_46" on host "127.0.0.1"');
         expect(message).toContain(FEATURE_MIGRATION);
         expect(message).toContain(`recorded checksum ${'a'.repeat(64)}`);
         expect(message).toContain(`on-disk checksum  ${'b'.repeat(64)}`);
-        expect(message).toContain('meal_plan_preferences.estimate_inputs_revision');
+        expect(message).toContain('meal_plan_preferences.targets_input_revision');
     });
 
     it('says that migrate deploy will not repair a drift, and how to recreate the database', () => {
@@ -929,7 +929,7 @@ describe('assertSchemaFreshness', () => {
 
             expect(refusal.message).toContain('database "soh_test_46" on host "127.0.0.1"');
             expect(refusal.message).toContain(FEATURE_MIGRATION);
-            expect(refusal.message).toContain('meal_plan_preferences.estimate_inputs_revision');
+            expect(refusal.message).toContain('meal_plan_preferences.targets_input_revision');
             expect(refusal.message).toContain('will not repair this');
         });
 

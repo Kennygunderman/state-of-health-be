@@ -61,9 +61,10 @@ import {
 } from './mealPlanning.errors';
 import { MealPlanningTransactionClient, withUserLock } from './mealPlanningAction.service';
 import { updateTargets } from './nutrition.service';
-import { PreferencesRow, loadPreferencesRow } from './preferences.service';
+import { PreferencesRow, loadPreferencesRow, setupStateOf } from './preferences.service';
 import {
     EstimatedSaveRequest,
+    ManualSetupAdvance,
     TargetsErrorVerdict,
     TargetsPreferencesRow,
     TargetsUserRow,
@@ -73,6 +74,7 @@ import {
     deriveTargetsResponse,
     parseSaveTargetsRequest,
     resolveEstimateInputs,
+    resolveManualTargetSetupAdvance,
 } from './targets.logic';
 
 /* ---------------------------------------------------------------------------
@@ -499,6 +501,13 @@ interface ConfirmedTargetsWrite {
     rowExists: boolean;
     /** The `targets_revision` that read returned, which the UPDATE pins. */
     storedRevision: number;
+    /**
+     * The resume marker this save answers, or null when it answers none —
+     * `targets.logic.ts::resolveManualTargetSetupAdvance`'s verdict, which is
+     * null for every save but a manual confirmation on the manual route's own
+     * target stop.
+     */
+    setupAdvance: ManualSetupAdvance | null;
 }
 
 /**
@@ -575,6 +584,25 @@ const readTargetsRevision = async (
  * there is no revision to pin, the lock makes a concurrent meal-planning create
  * impossible, and stating the two cases separately is what lets the update arm
  * carry a predicate the create arm cannot have.
+ *
+ * THE RESUME MARKER TRAVELS IN THE SAME STATEMENT, on the one save that earns
+ * it: a manual confirmation standing on the manual route's own target stop
+ * (`targets.logic.ts::resolveManualTargetSetupAdvance`). Written here rather
+ * than as a second UPDATE because it is the same fact — the manual target
+ * screen was completed — so the pinned revision that authorises the values must
+ * authorise the marker too, and a refused write must leave setup exactly where
+ * it stood. It is null on the create arm by construction: that arm runs because
+ * there was no row, and a row that does not exist has no marker to advance.
+ *
+ * `meal_plan_preferences.revision` IS DELIBERATELY NOT BUMPED. That counter is
+ * what a client pins when it writes preference ANSWERS, and this write changes
+ * no answer — only the server-owned resume marker. Bumping it would refuse the
+ * very next wizard step save on this exact route (Diet, the stop the marker now
+ * names) with a spurious `409 stale_revision`. The client does not miss the new
+ * marker either: the save-targets mutation invalidates the preferences query
+ * (AAP §0.7.2), so it refetches and reads the advanced marker while the revision
+ * it has pinned stays valid. `targets_revision` keeps its own increment, because
+ * the targets record is what this save does change.
  */
 const writeConfirmedTargets = async (
     locked: MealPlanningTransactionClient,
@@ -614,6 +642,10 @@ const writeConfirmedTargets = async (
             // predicate above has already established what it increments from.
             targets_revision: { increment: 1 },
             ...record,
+            // Empty for every save that answers no setup stop, which leaves
+            // both setup columns exactly as they stood — Prisma writes only the
+            // keys it is given.
+            ...(write.setupAdvance ?? {}),
         },
     });
 
@@ -645,13 +677,23 @@ const writeConfirmedTargets = async (
  *  5. Create or update the preferences row — and THE PINNED REVISION TRAVELS IN
  *     THE UPDATE'S OWN PREDICATE (see {@link writeConfirmedTargets}), because a
  *     check in TypeScript followed by an owner-only write is not an enforced
- *     revision (Rule `backend-architecture` §5.1, AAP §0.5.1). A legacy user
- *     editing targets from Account before any onboarding gets a row created with
- *     `setup_status: 'not_started'` and nothing else set — a target is not
- *     onboarding progress, so generation still answers
- *     `preferences_incomplete` until the wizard actually runs. `revision: 1` on
- *     creation, per §0.5.2, is what the client then pins on its first preference
- *     save.
+ *     revision (Rule `backend-architecture` §5.1, AAP §0.5.1). On the one save
+ *     that stands on the manual route's target stop, THE SAME STATEMENT ALSO
+ *     ADVANCES THE RESUME MARKER off `targets_manual`
+ *     (`resolveManualTargetSetupAdvance`), and it belongs in this transaction
+ *     for the same reason the snapshot does: the completed target screen and
+ *     the values that completed it are one fact, so a refused or rolled-back
+ *     write must leave setup exactly where it stood rather than resuming a user
+ *     past a save that never landed. That stop exists on no other route and
+ *     saves through no other endpoint (AAP §0.7.4), so nothing else can answer
+ *     it. A legacy user editing targets from Account before any onboarding gets
+ *     a row created with `setup_status: 'not_started'` and nothing else set —
+ *     a target is not onboarding progress, so generation still answers
+ *     `preferences_incomplete` until the wizard actually runs, and the advance
+ *     is null on that arm by construction. `revision: 1` on creation, per
+ *     §0.5.2, is what the client then pins on its first preference save; a save
+ *     that advances the marker does NOT move `revision`, for the reason
+ *     {@link writeConfirmedTargets} gives.
  *  6. Write `users.target_*` through `updateTargets(..., tx)` and record the
  *     snapshot, the source and the bumped revision — the pair that makes the
  *     canonical read truthful — together with `estimated_targets`, the account
@@ -708,6 +750,16 @@ export const saveTargets = async (
                 resolved,
                 rowExists: row !== null,
                 storedRevision,
+                // The snapshot comes from `setupStateOf`, the one reading of
+                // these columns, so this save cannot judge setup state by a
+                // rule of its own; whether it moves is
+                // `resolveManualTargetSetupAdvance`'s, and where to is
+                // `nextSetupState`'s. The row is the one already read under the
+                // lock, so the decision and the write see the same state.
+                setupAdvance: resolveManualTargetSetupAdvance(
+                    row === null ? null : setupStateOf(row),
+                    request.source,
+                ),
             });
 
             const written = await updateTargets(userId, resolved.values, locked);

@@ -78,6 +78,7 @@ import {
     GroceryFoodFacts,
     GroceryPlanState,
     GroceryRowDraft,
+    GroceryRowUpdate,
     GrocerySwapContext,
     PlannedMealForGroceries,
     StoredGroceryRow,
@@ -680,6 +681,148 @@ export interface PlanGroceryRebuildParams {
 }
 
 /**
+ * How many characters of an ISO-8601 instant are the `TIMESTAMP(3)` wall time:
+ * `YYYY-MM-DDTHH:mm:ss.mmm`, the zone designator excluded.
+ */
+const ISO_WALL_TIME_LENGTH = 23;
+
+/**
+ * One changed row as a `VALUES` tuple, every column explicitly cast.
+ *
+ * THE CASTS ARE LOAD-BEARING, NOT DECORATION. PostgreSQL infers a `VALUES`
+ * list's row type from its FIRST row, and two of these columns are nullable
+ * (`previous_quantity_grams`, `flagged_at`) — so a diff whose first update
+ * carries `NULL` in either would leave the column typed `text` (the type an
+ * untyped parameter falls back to) and the UPDATE would fail on the assignment
+ * to a `numeric`/`timestamp` column. Casting every column of every row makes the
+ * row type a property of this statement rather than of the diff's ordering, and
+ * pins each value to the column it lands in: `numeric(10,2)` for the two gram
+ * amounts, `double precision` for `display_quantity`, `integer` for
+ * `sort_order`, `uuid` for the row id, `text` for the four string columns.
+ *
+ * `flagged_at` IS `timestamp(3)` WITHOUT TIME ZONE, AND IS BOUND AS ONE.
+ * Prisma stores UTC wall time in such a column, so the instant travels as its
+ * ISO-8601 wall time with the zone designator dropped
+ * (`2026-09-16T16:58:57.708`) and is cast `::timestamp(3)`. `::timestamptz`
+ * would be wrong rather than merely different: converting a `timestamptz` to
+ * `timestamp` applies the SESSION's `TimeZone`, so the same diff would store a
+ * different instant on a server whose session zone is not UTC, and a flag would
+ * start disagreeing with the swap that raised it.
+ *
+ * An unusable instant is named rather than allowed to surface as
+ * `toISOString`'s bare `RangeError`, the same way {@link decimalGrams} names a
+ * non-finite amount: it cannot occur on a value this module produced (the diff
+ * raises a flag at the caller's `now` or carries a stored timestamp forward),
+ * which is exactly why it is reported if it ever does.
+ */
+const groceryUpdateValues = (update: GroceryRowUpdate): Prisma.Sql => {
+    if (update.flagged_at !== null && !Number.isFinite(update.flagged_at.getTime())) {
+        throw new GroceryDataError(
+            `The flag instant decided for grocery row ${update.id} is not a valid date, so the row cannot be written`,
+        );
+    }
+
+    const flaggedAt =
+        update.flagged_at === null ? null : update.flagged_at.toISOString().slice(0, ISO_WALL_TIME_LENGTH);
+
+    return Prisma.sql`(
+        ${update.id}::uuid,
+        ${update.name}::text,
+        ${update.category}::text,
+        ${update.quantity_grams}::numeric(10,2),
+        ${update.display_quantity}::double precision,
+        ${update.display_unit}::text,
+        ${update.display_text}::text,
+        ${update.sort_order}::integer,
+        ${update.previous_quantity_grams}::numeric(10,2),
+        ${flaggedAt}::timestamp(3)
+    )`;
+};
+
+/**
+ * Applies every changed row of one diff in a SINGLE statement.
+ *
+ * ONE `UPDATE … FROM (VALUES …)` RATHER THAN ONE STATEMENT PER ROW, and the
+ * reason is the lock this runs under. A swap's or a regeneration's commit holds
+ * the per-user advisory lock for the whole of its interactive transaction, so
+ * every statement issued inside it is time another writer of this user's plan
+ * spends waiting; a weekly swap can move most of the week's distinct
+ * ingredients, so a per-row write made both the statement count and the lock's
+ * duration grow with the size of the shopping list. Set-based, the cost is one
+ * round trip whatever the diff's size, which is what the no-per-item-query
+ * requirement asks for (Agent Action Plan §0.7.3).
+ *
+ * THE `VALUES` LIST IS BUILT IN THE DIFF'S ORDER, so a transaction that replays
+ * issues the identical statement with the identical parameters every time —
+ * the determinism the per-row loop got from its ordering, kept without its
+ * round trips. Row order inside one statement has no effect on the outcome
+ * (each tuple addresses one row by primary key), so this is about reproducing
+ * the statement, not about the result.
+ *
+ * The predicate carries `{meal_plan_id, user_id}` beside the join on the row id
+ * (§5.1): the pair is the referencing side of the tenant foreign key, so one
+ * user's plan id cannot address another's rows — the same predicate the per-row
+ * writes carried, expressed once. Every value is a bind parameter; nothing is
+ * interpolated as SQL text.
+ *
+ * NOTHING IS ISSUED FOR AN EMPTY DIFF. A swap that moved no surviving line —
+ * the common case for a change confined to new and removed lines — performs no
+ * statement at all, and `Prisma.join` is never handed an empty list (which
+ * would produce `VALUES ()`, a syntax error).
+ *
+ * The affected-row count is checked ONCE, against the number of rows the diff
+ * decided, and the failure keeps the semantics the per-row check had: these rows
+ * were read under the per-user lock, so a miscount means an invariant this
+ * module depends on is broken rather than a conflict a client could act on, and
+ * it is therefore an untyped `Error` reaching the controller as a 500 (§8).
+ */
+const applyGroceryRowUpdates = async (
+    tx: Prisma.TransactionClient,
+    params: PlanGroceryRebuildParams,
+    updates: readonly GroceryRowUpdate[],
+): Promise<void> => {
+    if (updates.length === 0) {
+        return;
+    }
+
+    const written = await tx.$executeRaw(Prisma.sql`
+        UPDATE grocery_items AS g
+        SET name = v.name,
+            category = v.category,
+            quantity_grams = v.quantity_grams,
+            display_quantity = v.display_quantity,
+            display_unit = v.display_unit,
+            display_text = v.display_text,
+            sort_order = v.sort_order,
+            previous_quantity_grams = v.previous_quantity_grams,
+            flagged_at = v.flagged_at
+        FROM (VALUES ${Prisma.join(updates.map(groceryUpdateValues))}) AS v (
+            id,
+            name,
+            category,
+            quantity_grams,
+            display_quantity,
+            display_unit,
+            display_text,
+            sort_order,
+            previous_quantity_grams,
+            flagged_at
+        )
+        WHERE g.id = v.id
+            AND g.meal_plan_id = ${params.planId}::uuid
+            AND g.user_id = ${params.userId}
+    `);
+
+    if (written !== updates.length) {
+        throw new Error(
+            `Updating the grocery rows of plan ${params.planId} wrote ${String(written)} rows instead of ` +
+                `${String(updates.length)}. Every one of them was read under the per-user lock, so none of ` +
+                'them can have moved.',
+        );
+    }
+};
+
+/**
  * Brings a plan's stored list in line with its current meals, and reports what
  * changed.
  *
@@ -703,10 +846,18 @@ export interface PlanGroceryRebuildParams {
  * raises for its own broken invariants: it describes a state no client can act
  * on, so it joins no error vocabulary and reaches the controller as a 500.
  *
- * Writes are issued one at a time in the diff's order, so the statements a
- * transaction replays are the same statements in the same order every time. The
- * count is bounded by the plan's distinct ingredient identities, and a diff
- * touches only the lines a change actually moved.
+ * THE WHOLE RECONCILIATION IS THREE STATEMENTS AT MOST, WHATEVER THE LIST'S
+ * SIZE, because every one of them runs inside the caller's transaction while its
+ * per-user advisory lock is held: one batched `deleteMany` for the removals, one
+ * set-based `UPDATE … FROM (VALUES …)` for every changed row
+ * ({@link applyGroceryRowUpdates}), one `createMany` for the new lines. None of
+ * the three is issued when its half of the diff is empty. A per-row write would
+ * make the statement count — and the time every other writer of this user's plan
+ * spends queued behind the lock — grow with the number of distinct ingredients
+ * the week plans, which §0.7.3's no-per-item-query requirement forbids; each
+ * statement here is instead built from the diff in the diff's order, so a
+ * transaction that replays issues exactly the same statements with exactly the
+ * same parameters.
  */
 export const rebuildPlanGroceries = async (
     tx: Prisma.TransactionClient,
@@ -735,29 +886,7 @@ export const rebuildPlanGroceries = async (
         }
     }
 
-    for (const update of diff.updates) {
-        const written = await tx.grocery_items.updateMany({
-            where: { id: update.id, meal_plan_id: params.planId, user_id: params.userId },
-            data: {
-                name: update.name,
-                category: update.category,
-                quantity_grams: update.quantity_grams,
-                display_quantity: update.display_quantity,
-                display_unit: update.display_unit,
-                display_text: update.display_text,
-                sort_order: update.sort_order,
-                previous_quantity_grams: update.previous_quantity_grams,
-                flagged_at: update.flagged_at,
-            },
-        });
-
-        if (written.count !== 1) {
-            throw new Error(
-                `Updating grocery row ${update.id} of plan ${params.planId} wrote ${String(written.count)} rows ` +
-                    'instead of 1. The row was read under the per-user lock, so it cannot have moved.',
-            );
-        }
-    }
+    await applyGroceryRowUpdates(tx, params, diff.updates);
 
     await writePlanGroceryRows(tx, {
         userId: params.userId,

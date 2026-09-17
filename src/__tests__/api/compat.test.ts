@@ -31,14 +31,22 @@
 //      copy a no-op — every statement reports "already exists, skipping" and
 //      the schema does not move;
 //   3. applying the manual copy by hand and then `migrate resolve --applied`
-//      leaves `migrate deploy` with nothing to apply, which is the operator
-//      procedure the manual-migrations README documents;
+//      stops `migrate deploy` applying that DDL a second time, which is the
+//      whole point of the resolve step in the operator procedure the
+//      manual-migrations README documents — deploy names no migration the copy
+//      covers, everything it does apply is a later migration the copy never
+//      claimed (the copy is the meal-planning DDL and nothing else), and a
+//      further deploy then has nothing left to apply at all;
 //   4. the two resulting schemas are identical — same columns in the same
 //      positions with the same types, defaults and generation expressions, same
-//      indexes, same constraints, and (where pg_dump is available) the same
-//      normalised schema dump;
-//   5. every legacy row survives both ledgers byte-for-byte, and none of the
-//      four additive meal_entries columns was backfilled.
+//      indexes, same constraints, and the same normalised schema dump;
+//   5. every legacy row survives both ledgers byte-for-byte, and neither set
+//      of additive columns was backfilled: none of the four columns
+//      20260908000000_meal_planning adds to meal_entries, and no
+//      usda_api_cache row carries the http_status that
+//      20260909000000_usda_cache_http_status adds, both asserted against a
+//      database where the columns demonstrably exist so the claim cannot pass
+//      by their absence.
 //
 // Safety. This suite never touches the database DATABASE_URL points at. It
 // derives two names from it, refuses to proceed unless each derived name is a
@@ -49,18 +57,24 @@
 // does not ask for the ALLOW_DB_TRUNCATE flag that the truncating helpers use:
 // there is nothing here for that flag to protect.
 //
-// Requirements, and what happens without them. The suite needs a test-class
-// DATABASE_URL and the Prisma CLI; without either it registers a single
-// skipped test whose name says which one is missing, so the gate is visibly
-// absent instead of silently passing. pg_dump is optional in the same way and
-// only skips its own assertion, because the catalogue comparison in (4) is the
-// essential proof and runs from SQL alone. Anything that fails once the
-// environment has claimed capability is a failure, never a skip. The role
-// behind DATABASE_URL must be able to CREATE DATABASE; if it cannot, the
-// PostgreSQL permission error surfaces from beforeAll.
+// Requirements, and what happens without them. 0.9.1 makes this gate a
+// release requirement, so nothing here degrades: a missing prerequisite is a
+// FAILURE, never a skip, because a skipped mandatory gate reports green while
+// producing none of the evidence it exists for. The suite needs a test-class
+// DATABASE_URL, the Prisma CLI, both ledgers, the fixture, and a pg_dump whose
+// major version is at least the server's — the plan compares the ledgers on a
+// normalised `pg_dump --schema-only`, which makes the dump mandatory evidence
+// and not a bonus on top of the catalogue comparison in (4). Whichever is
+// missing, the gate registers a failing test whose name says which one it is,
+// and the message says what was tried and how to make it runnable; see
+// `resolveSchemaDumpRunner` for the three ways a pg_dump is found, one of
+// which needs no PostgreSQL client installed at all. The role behind
+// DATABASE_URL must be able to CREATE DATABASE; if it cannot, the PostgreSQL
+// permission error surfaces from beforeAll.
 
 import { spawnSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { classifyDatabaseOrigin, isTestDatabaseName } from '../../../scripts/lib/dbGuard';
@@ -122,6 +136,36 @@ const ADDITIVE_MEAL_ENTRY_COLUMNS = [
     'nutrition_provenance',
 ] as const;
 
+// The column 20260909000000_usda_cache_http_status adds to usda_api_cache. It
+// is nullable with no default and is deliberately NOT backfilled — that
+// migration's own header refuses to stamp pre-existing rows 200 because doing
+// so "would manufacture exactly the evidence this column exists to record" —
+// so it is treated exactly like the meal_entries four: excluded from the row
+// hashes, and asserted unpopulated afterwards.
+const ADDITIVE_USDA_API_CACHE_COLUMNS = ['http_status'] as const;
+
+// Every column any ledger in prisma/migrations adds to a table this suite
+// fingerprints, by table. The row hashes subtract these so ONE hash query
+// describes a table both before and after the migrations run; a column missing
+// from this map makes an additive, data-preserving migration look like it
+// rewrote rows it never touched.
+//
+// One entry per migration that adds columns to a pre-existing table:
+//   * meal_entries — 20260908000000_meal_planning adds the four link and
+//     provenance columns above;
+//   * usda_api_cache — 20260909000000_usda_cache_http_status adds http_status.
+//
+// A table absent from this map is hashed whole, which is what makes the
+// exclusion narrow: the additive columns are removed from the hash by name,
+// and every other column of every table still reaches it.
+//
+// The value type admits `undefined` because most tables have no entry, and the
+// lookup below is written to read that as "hash the whole row".
+const ADDITIVE_COLUMNS_BY_TABLE: Readonly<Record<string, readonly string[] | undefined>> = {
+    meal_entries: ADDITIVE_MEAL_ENTRY_COLUMNS,
+    usda_api_cache: ADDITIVE_USDA_API_CACHE_COLUMNS,
+};
+
 // The sixteen tables the migration introduces. Listed so the equivalence check
 // cannot pass vacuously: two databases that both failed to gain the feature
 // schema would compare equal to each other.
@@ -162,8 +206,10 @@ interface LegacyFixture {
 type FixtureRow = Record<string, unknown>;
 
 // --------------------------------------------------------------------------
-// Capability probe. Runs at collection time, because whether this suite can
-// run at all decides whether its tests are registered or skipped.
+// Capability probe. Runs at collection time, because what it finds decides
+// which tests are registered: the gate's own cases when the environment can
+// carry them, and otherwise one case that FAILS with the reason. Nothing here
+// produces a skip — see "Requirements" in the header.
 // --------------------------------------------------------------------------
 
 type Capability = { ok: true; ambientUrl: string; ambientDatabase: string } | { ok: false; reason: string };
@@ -194,13 +240,6 @@ const probeCapability = (): Capability => {
     }
 
     return { ok: true, ambientUrl, ambientDatabase: origin.database };
-};
-
-const pgDumpBinary = (): string => process.env.PG_DUMP_BIN || 'pg_dump';
-
-const probePgDump = (): boolean => {
-    const probe = spawnSync(pgDumpBinary(), ['--version'], { encoding: 'utf8' });
-    return probe.status === 0 && /pg_dump/i.test(String(probe.stdout));
 };
 
 // --------------------------------------------------------------------------
@@ -257,7 +296,12 @@ const runPrisma = (url: string, args: string[]): { status: number; stdout: strin
 
 const expectPrismaSuccess = (label: string, result: { status: number; stdout: string; stderr: string }): string => {
     if (result.status !== 0) {
-        throw new Error(`${label} failed with status ${result.status}\n${result.stdout}\n${result.stderr}`);
+        // The CLI's own output is quoted, so it is scrubbed: some Prisma errors
+        // echo the datasource URL back, and this message reaches CI logs.
+        throw new Error(
+            `${label} failed with status ${result.status}\n` +
+                `${withoutCredentials(result.stdout)}\n${withoutCredentials(result.stderr)}`,
+        );
     }
     return result.stdout;
 };
@@ -386,14 +430,22 @@ const readCatalogue = async (url: string): Promise<string[]> =>
     });
 
 // A row count and a content hash per table. The hash is order-independent
-// (string_agg over sorted per-row hashes) and ignores the additive columns, so
-// the identical query describes a table before and after the migration.
+// (string_agg over sorted per-row hashes) and ignores that table's additive
+// columns from ADDITIVE_COLUMNS_BY_TABLE, so the identical query describes a
+// table before and after the migrations.
 const readTableFingerprints = async (url: string, tables: string[]): Promise<Record<string, string>> =>
     withClient(url, async (client) => {
         const fingerprints: Record<string, string> = {};
-        const withoutAdditiveColumns = ADDITIVE_MEAL_ENTRY_COLUMNS.map((column) => `- '${column}'`).join(' ');
 
         for (const table of tables) {
+            // Per table, because the additive columns differ per table: the
+            // jsonb `-` operator is only applied for the columns a migration
+            // adds to THIS table, and a table no migration added a column to
+            // is hashed whole (an empty subtraction list leaves to_jsonb's
+            // result untouched).
+            const withoutAdditiveColumns = (ADDITIVE_COLUMNS_BY_TABLE[table] ?? [])
+                .map((column) => `- '${column}'`)
+                .join(' ');
             // The alias must not be spelled like any column of any table here:
             // `to_jsonb(x)` resolves x to a column before a table alias, so
             // aliasing this `source` silently hashes foods.source instead of the
@@ -449,6 +501,30 @@ const countBackfilledMealEntries = async (url: string): Promise<number> =>
         return result.rows[0].backfilled;
     });
 
+// The usda_api_cache pair of the two reads above, and for the same reason: the
+// count is the no-backfill claim, and the information_schema read is what stops
+// it passing against a database that never gained the column at all.
+const readUsdaApiCacheAdditiveColumns = async (url: string): Promise<string[]> =>
+    withClient(url, async (client) => {
+        const result = await client.query<{ column_name: string }>(
+            `SELECT column_name FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'usda_api_cache'
+               AND column_name = ANY($1::text[])
+             ORDER BY column_name`,
+            [[...ADDITIVE_USDA_API_CACHE_COLUMNS]],
+        );
+        return result.rows.map((row) => row.column_name);
+    });
+
+const countStampedUsdaApiCacheRows = async (url: string): Promise<number> =>
+    withClient(url, async (client) => {
+        const predicate = ADDITIVE_USDA_API_CACHE_COLUMNS.map((column) => `"${column}" IS NOT NULL`).join(' OR ');
+        const result = await client.query<{ stamped: number }>(
+            `SELECT COUNT(*)::int AS stamped FROM usda_api_cache WHERE ${predicate}`,
+        );
+        return result.rows[0].stamped;
+    });
+
 const readSearchVectorDefinition = async (url: string): Promise<string> =>
     withClient(url, async (client) => {
         const result = await client.query<{ is_generated: string; generation_expression: string }>(
@@ -476,17 +552,410 @@ const normalizeSchemaDump = (dump: string): string[] =>
                 !/^\\/.test(line),
         );
 
-const readSchemaDump = (url: string): string[] | null => {
-    const result = spawnSync(
-        pgDumpBinary(),
-        ['--schema-only', '--no-owner', '--no-privileges', '--no-comments', url],
-        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
-    );
-    if (result.status !== 0) {
-        return null;
-    }
-    return normalizeSchemaDump(String(result.stdout ?? ''));
+// --------------------------------------------------------------------------
+// Resolving a pg_dump this gate can actually run, and running it without
+// putting a password where `ps` can read it.
+//
+// §0.9.1 compares the two ledgers on a NORMALISED `pg_dump --schema-only` of
+// each database, so the dump is mandatory evidence rather than a bonus: with
+// no pg_dump there is no gate, which is why nothing below degrades to a skip.
+// "A pg_dump" also means a specific one — pg_dump refuses to dump a server
+// newer than itself — so the major version is part of resolving it.
+//
+// Three ways to get one are tried, in this order, and the first that verifies
+// is the one used:
+//
+//   1. PG_DUMP_BIN — an explicit executable. A host whose `pg_dump` on PATH
+//      belongs to an older major usually still ships the right one under
+//      /usr/lib/postgresql/<major>/bin, and CI resolves it that way and
+//      exports this variable so the choice is visible in the job log.
+//   2. `pg_dump` on PATH.
+//   3. `docker exec <container> pg_dump` — what makes this gate runnable on a
+//      host with no PostgreSQL client at all, because the server itself runs
+//      in a container that ships a client of exactly the matching version.
+//      The container is PG_DUMP_CONTAINER when that is set, and is otherwise
+//      discovered as the running container that publishes the port
+//      DATABASE_URL names.
+//
+// A candidate is accepted only once it has proven both halves of what it is
+// needed for: `--version` identifies a pg_dump whose major is at least the
+// server's, and it can actually dump a database on this server — probed
+// read-only against the ambient test database, because a client of the right
+// version that cannot authenticate, or a container that is not the one behind
+// this URL, is useless in exactly the same way as a missing binary.
+//
+// Credentials. The local path spells the connection out in non-secret flags
+// (--host, --port, --username, --dbname) and passes the password through a
+// PGPASSFILE, because argv is world-readable through `ps` on a shared host and
+// a `postgresql://user:password@…` URL in argv publishes the password to every
+// process on the machine. The container path passes no password at all: it
+// connects over the container's own local socket. No message here quotes the
+// URL, and any connection URL a child process prints is scrubbed of its
+// userinfo before it is quoted.
+// --------------------------------------------------------------------------
+
+/** An explicit pg_dump executable, tried ahead of everything else. */
+const PG_DUMP_BIN_VAR = 'PG_DUMP_BIN';
+
+/** The container running the server, when it must not be discovered. */
+const PG_DUMP_CONTAINER_VAR = 'PG_DUMP_CONTAINER';
+
+/** The dump flags, identical for every runner: DDL only, portable, no noise. */
+const PG_DUMP_SCHEMA_ARGS = ['--schema-only', '--no-owner', '--no-privileges', '--no-comments'] as const;
+
+/** A schema dump is far larger than the default 1 MB pipe buffer allows. */
+const PG_DUMP_MAX_BUFFER = 64 * 1024 * 1024;
+
+/** What `pg_dump --version` prints, and where its major number sits in it. */
+const PG_DUMP_VERSION_PATTERN = /pg_dump\s+\(PostgreSQL\)\s+((\d+)[^\s]*)/i;
+
+/** libpq's default, used when the URL states no port. */
+const DEFAULT_POSTGRES_PORT = '5432';
+
+/**
+ * Removes the userinfo from any connection URL a child process printed, so a
+ * quoted diagnostic cannot carry the password DATABASE_URL holds.
+ */
+const withoutCredentials = (text: string): string => text.replace(/:\/\/[^\s/@]*@/g, '://***@');
+
+/**
+ * Names a target the way `setup/testDb.ts` does — host and database, never the
+ * URL — because these messages reach CI logs and a Jest reporter.
+ */
+const describeTarget = (host: string, database: string): string => `database "${database}" on host "${host}"`;
+
+interface ChildOutcome {
+    status: number;
+    stdout: string;
+    stderr: string;
+}
+
+const runChild = (
+    command: string,
+    args: readonly string[],
+    env: NodeJS.ProcessEnv = process.env,
+): ChildOutcome => {
+    const result = spawnSync(command, [...args], { encoding: 'utf8', maxBuffer: PG_DUMP_MAX_BUFFER, env });
+    // A command that could not be spawned at all — a missing binary, no docker
+    // daemon — reports through `error` and leaves stderr empty, so both are
+    // folded into the one diagnostic the caller quotes.
+    const diagnostics = [result.error === undefined ? '' : result.error.message, String(result.stderr ?? '')]
+        .filter((part) => part.trim() !== '')
+        .join('; ');
+
+    return {
+        status: result.status ?? -1,
+        stdout: String(result.stdout ?? ''),
+        stderr: withoutCredentials(diagnostics),
+    };
 };
+
+/** The first line of a child's output, for a one-line diagnostic. */
+const firstLine = (text: string): string => text.trim().split('\n')[0] ?? '';
+
+/** How a diagnostic quotes a failed child: exit code, then what it said. */
+const describeFailure = (outcome: ChildOutcome): string => {
+    const said = firstLine(outcome.stderr) === '' ? firstLine(outcome.stdout) : firstLine(outcome.stderr);
+    return said === '' ? `exit ${outcome.status}` : `exit ${outcome.status}: ${said}`;
+};
+
+/** The non-secret half of a connection. */
+interface ServerAddress {
+    host: string;
+    port: string;
+    user: string;
+}
+
+/** The ambient connection, with the password kept apart from the rest. */
+interface AmbientConnection {
+    address: ServerAddress;
+    password: string;
+}
+
+const connectionOf = (ambientUrl: string): AmbientConnection => {
+    const url = new URL(ambientUrl);
+    return {
+        address: {
+            host: url.hostname,
+            port: url.port === '' ? DEFAULT_POSTGRES_PORT : url.port,
+            user: decodeURIComponent(url.username),
+        },
+        password: decodeURIComponent(url.password),
+    };
+};
+
+/** Escapes the two characters a PGPASSFILE field treats as syntax. */
+const escapePgpassField = (value: string): string => value.replace(/([\\:])/g, '\\$1');
+
+/**
+ * Runs a local pg_dump with the password in a PGPASSFILE.
+ *
+ * The file is written mode 0600 — libpq ignores a password file that is group-
+ * or world-readable — inside a fresh `mkdtemp` directory that only this user
+ * can enter, and the whole directory is removed in `finally`, so it does not
+ * outlive the one invocation even when pg_dump fails or throws.
+ */
+const runLocalPgDump = (binary: string, connection: AmbientConnection, database: string): ChildOutcome => {
+    const { host, port, user } = connection.address;
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-ledger-pgpass-'));
+    const passFile = path.join(directory, 'pgpass');
+
+    try {
+        fs.writeFileSync(
+            passFile,
+            `${[host, port, database, user, connection.password].map(escapePgpassField).join(':')}\n`,
+            { mode: 0o600 },
+        );
+
+        return runChild(
+            binary,
+            [...PG_DUMP_SCHEMA_ARGS, '--host', host, '--port', port, '--username', user, '--dbname', database],
+            { ...process.env, PGPASSFILE: passFile },
+        );
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+};
+
+/**
+ * Runs pg_dump inside the container that runs the server, over that
+ * container's own local socket — which is why this path passes neither
+ * --host/--port nor any password: a local connection inside the official
+ * postgres image is trusted.
+ */
+const runContainerPgDump = (container: string, connection: AmbientConnection, database: string): ChildOutcome =>
+    runChild('docker', [
+        'exec',
+        container,
+        'pg_dump',
+        ...PG_DUMP_SCHEMA_ARGS,
+        '--username',
+        connection.address.user,
+        '--dbname',
+        database,
+    ]);
+
+/** One way of reaching a pg_dump, before it has been verified. */
+interface DumpCandidate {
+    readonly description: string;
+    readonly version: () => ChildOutcome;
+    readonly dump: (database: string) => ChildOutcome;
+}
+
+/** A verified runner. `dump` throws rather than returning null: see §0.9.1. */
+interface SchemaDumpRunner {
+    /** Names the runner in every message about it, success or failure. */
+    readonly description: string;
+    readonly dump: (database: string) => string[];
+}
+
+const localCandidate = (binary: string, origin: string, connection: AmbientConnection): DumpCandidate => ({
+    description: `"${binary}" (${origin})`,
+    version: () => runChild(binary, ['--version']),
+    dump: (database) => runLocalPgDump(binary, connection, database),
+});
+
+const containerCandidate = (container: string, origin: string, connection: AmbientConnection): DumpCandidate => ({
+    description: `pg_dump inside container "${container}" (${origin})`,
+    version: () => runChild('docker', ['exec', container, 'pg_dump', '--version']),
+    dump: (database) => runContainerPgDump(container, connection, database),
+});
+
+type CandidateVerdict = { accepted: true; runner: SchemaDumpRunner } | { accepted: false; reason: string };
+
+const verifyCandidate = (
+    candidate: DumpCandidate,
+    connection: AmbientConnection,
+    serverMajor: number,
+    probeDatabase: string,
+): CandidateVerdict => {
+    const version = candidate.version();
+    if (version.status !== 0) {
+        return { accepted: false, reason: `${candidate.description}: ${describeFailure(version)}` };
+    }
+
+    const identified = PG_DUMP_VERSION_PATTERN.exec(version.stdout);
+    if (identified === null) {
+        return {
+            accepted: false,
+            reason: `${candidate.description}: --version printed "${firstLine(version.stdout)}", which does not identify a pg_dump`,
+        };
+    }
+
+    const reportedVersion = identified[1];
+    const major = Number(identified[2]);
+    if (major < serverMajor) {
+        return {
+            accepted: false,
+            reason:
+                `${candidate.description}: it is pg_dump ${reportedVersion} and the server is PostgreSQL ` +
+                `${serverMajor}; pg_dump refuses to dump a server newer than itself`,
+        };
+    }
+
+    const probe = candidate.dump(probeDatabase);
+    if (probe.status !== 0) {
+        return {
+            accepted: false,
+            reason:
+                `${candidate.description}: it is pg_dump ${reportedVersion}, but it could not dump ` +
+                `${describeTarget(connection.address.host, probeDatabase)} — ${describeFailure(probe)}`,
+        };
+    }
+    // DDL, not merely output: the ambient database is migrated (the guard in
+    // `setup/testDb.ts` refuses to run the suite otherwise), so a dump of it
+    // that contains no CREATE TABLE did not come from this server, whatever
+    // the candidate answered `--version` with.
+    if (!probe.stdout.includes('CREATE TABLE ')) {
+        return {
+            accepted: false,
+            reason:
+                `${candidate.description}: it is pg_dump ${reportedVersion}, but dumping ` +
+                `${describeTarget(connection.address.host, probeDatabase)} produced no DDL, so it is not ` +
+                'connected to the server this gate compares',
+        };
+    }
+
+    const description = `${candidate.description} reporting PostgreSQL ${reportedVersion}`;
+
+    return {
+        accepted: true,
+        runner: {
+            description,
+            dump: (database) => {
+                const result = candidate.dump(database);
+                if (result.status !== 0) {
+                    throw new Error(
+                        `${description} could not dump ${describeTarget(connection.address.host, database)}: ` +
+                            describeFailure(result),
+                    );
+                }
+
+                const lines = normalizeSchemaDump(result.stdout);
+                if (lines.length === 0) {
+                    // An empty dump on both sides would satisfy the comparison
+                    // and prove nothing, so it is a failure here rather than a
+                    // vacuous pass there.
+                    throw new Error(
+                        `${description} produced an empty schema dump for ` +
+                            `${describeTarget(connection.address.host, database)}`,
+                    );
+                }
+                return lines;
+            },
+        },
+    };
+};
+
+/** Every running container publishing `port`, in the order docker lists them. */
+const discoverServerContainers = (port: string): { containers: string[] } | { reason: string } => {
+    const listed = runChild('docker', ['ps', '--filter', `publish=${port}`, '--format', '{{.Names}}']);
+    if (listed.status !== 0) {
+        return {
+            reason: `no container could be discovered for port ${port}: docker ps ${describeFailure(listed)}`,
+        };
+    }
+
+    const containers = listed.stdout
+        .split('\n')
+        .map((name) => name.trim())
+        .filter((name) => name !== '');
+
+    return containers.length === 0
+        ? { reason: `no running container publishes port ${port}, so the server is not one this gate can dump from` }
+        : { containers };
+};
+
+type DumpRunnerResolution = { ok: true; runner: SchemaDumpRunner } | { ok: false; attempts: string[] };
+
+const resolveSchemaDumpRunner = (
+    connection: AmbientConnection,
+    serverMajor: number,
+    probeDatabase: string,
+): DumpRunnerResolution => {
+    const candidates: DumpCandidate[] = [];
+    const explicitBinary = process.env[PG_DUMP_BIN_VAR];
+    const explicitContainer = process.env[PG_DUMP_CONTAINER_VAR];
+    let discoveryFailure: string | null = null;
+
+    if (explicitBinary !== undefined && explicitBinary.trim() !== '') {
+        candidates.push(localCandidate(explicitBinary.trim(), `from ${PG_DUMP_BIN_VAR}`, connection));
+    }
+    candidates.push(localCandidate('pg_dump', 'found on PATH', connection));
+
+    if (explicitContainer !== undefined && explicitContainer.trim() !== '') {
+        // An explicit container is a decision, not a hint: discovery is not
+        // consulted behind it, so a wrong name fails loudly instead of being
+        // silently replaced by whatever else publishes the port.
+        candidates.push(containerCandidate(explicitContainer.trim(), `from ${PG_DUMP_CONTAINER_VAR}`, connection));
+    } else {
+        const discovered = discoverServerContainers(connection.address.port);
+        if ('reason' in discovered) {
+            discoveryFailure = discovered.reason;
+        } else {
+            for (const container of discovered.containers) {
+                candidates.push(
+                    containerCandidate(
+                        container,
+                        `discovered as a container publishing port ${connection.address.port}`,
+                        connection,
+                    ),
+                );
+            }
+        }
+    }
+
+    const attempts: string[] = [];
+    for (const candidate of candidates) {
+        const verdict = verifyCandidate(candidate, connection, serverMajor, probeDatabase);
+        if (verdict.accepted) {
+            return { ok: true, runner: verdict.runner };
+        }
+        attempts.push(verdict.reason);
+    }
+    if (discoveryFailure !== null) {
+        attempts.push(discoveryFailure);
+    }
+
+    return { ok: false, attempts };
+};
+
+/** What a reader has to be told when the gate cannot produce its evidence. */
+const dumpRunnerFailureMessage = (
+    attempts: string[],
+    serverMajor: number,
+    address: ServerAddress,
+    probeDatabase: string,
+): string =>
+    [
+        'The dual-ledger equivalence gate (Agent Action Plan 0.9.1) compares the two migration ledgers on a ' +
+            'normalised `pg_dump --schema-only`, and no pg_dump able to dump this server could be resolved. ' +
+            'That evidence is mandatory, so the gate fails here rather than skipping it.',
+        `Server: PostgreSQL ${serverMajor}, ${describeTarget(address.host, probeDatabase)}.`,
+        'Tried, in order:',
+        ...attempts.map((attempt) => `  - ${attempt}`),
+        'Any one of these makes it runnable:',
+        `  - install a PostgreSQL ${serverMajor} (or newer) client, so that pg_dump is on PATH;`,
+        `  - set ${PG_DUMP_BIN_VAR} to such a pg_dump (commonly ` +
+            `/usr/lib/postgresql/${serverMajor}/bin/pg_dump when PATH holds an older major);`,
+        `  - make the container that runs the server reachable to \`docker exec\`, by setting ` +
+            `${PG_DUMP_CONTAINER_VAR} to its name or by publishing port ${address.port} from it so it can be ` +
+            'discovered.',
+    ].join('\n');
+
+const readServerMajorVersion = async (url: string): Promise<number> =>
+    withClient(url, async (client) => {
+        const result = await client.query<{ server_version_num: string }>('SHOW server_version_num');
+        const reported = result.rows[0]?.server_version_num;
+        const numeric = Number(reported);
+
+        if (!Number.isFinite(numeric) || numeric <= 0) {
+            throw new Error(`the server reported an unusable version number: ${JSON.stringify(reported)}`);
+        }
+        // 160015 is PostgreSQL 16.15; the major is the leading two digits for
+        // every version pg_dump's compatibility rule is stated in terms of.
+        return Math.floor(numeric / 10_000);
+    });
 
 const symmetricDifference = (left: string[], right: string[]): { onlyInFirst: string[]; onlyInSecond: string[] } => {
     const leftSet = new Set(left);
@@ -514,12 +983,12 @@ const fixtureCollections = (fixture: LegacyFixture): string[] =>
 const capability = probeCapability();
 
 if (!capability.ok) {
-    // Jest prints no test names for a wholly skipped suite, so the skip alone
-    // would be a line of output nobody can act on. This is the reason, written
-    // where it cannot be missed.
+    // Printed as well as failed: a Jest failure arrives after the whole run,
+    // and this is the one line that tells whoever started it, straight away,
+    // that the gate cannot run and why.
     // eslint-disable-next-line no-console
     console.warn(
-        `[compat.test.ts] The dual-ledger equivalence gate did NOT run: ${capability.reason}. ` +
+        `[compat.test.ts] The dual-ledger equivalence gate CANNOT run: ${capability.reason}. ` +
             'It proves that prisma/migrations/20260908000000_meal_planning and ' +
             'prisma/manual-migrations/meal-planning/001_meal_planning.sql produce the same schema and ' +
             'preserve every legacy row. Point DATABASE_URL at a test database to run it.',
@@ -528,10 +997,22 @@ if (!capability.ok) {
 
 describe('migration ledgers', () => {
     if (!capability.ok) {
-        // Registered as a skip rather than silently omitted: the status stays
-        // honest (a skip is not a pass) and the reason travels with the name.
-        it.skip(`prove the Prisma migration and the manual copy agree — not run because ${capability.reason}`, () => {
-            expect(capability.ok).toBe(false);
+        // A registered FAILURE, not a skip. 0.9.1 makes this gate a release
+        // requirement, and a skipped requirement reports green while proving
+        // nothing — which is exactly how a run can end with no evidence that
+        // the two ledgers agree. The reason is the actionable part, so it is
+        // both the test name and the failure.
+        const reason = capability.reason;
+
+        it(`prove the Prisma migration and the manual copy agree — cannot run because ${reason}`, () => {
+            throw new Error(
+                'The dual-ledger equivalence gate (Agent Action Plan 0.9.1) is mandatory and its ' +
+                    `prerequisites are not met: ${reason}. It proves that ` +
+                    'prisma/migrations/20260908000000_meal_planning and ' +
+                    'prisma/manual-migrations/meal-planning/001_meal_planning.sql produce the same schema and ' +
+                    'preserve every legacy row, so it fails rather than skipping. Run it with NODE_ENV=test and ' +
+                    'DATABASE_URL pointing at a test-class database this suite may create neighbours of.',
+            );
         });
         return;
     }
@@ -543,7 +1024,7 @@ describe('migration ledgers', () => {
     // soh_test_<index> or CI's plainly named one.
     const ledgerADatabase = `${capability.ambientDatabase}_ledger_a_test`;
     const ledgerBDatabase = `${capability.ambientDatabase}_ledger_b_test`;
-    const pgDumpAvailable = probePgDump();
+    const connection = connectionOf(ambientUrl);
 
     const fixture = readFixture();
     const legacyTables = fixture.insert_order;
@@ -553,11 +1034,24 @@ describe('migration ledgers', () => {
         fingerprintsBeforeMigration: Record<string, string>;
         fingerprintsAfterMigration: Record<string, string>;
         catalogue: string[];
-        schemaDump: string[] | null;
+        schemaDump: string[];
         publicTables: string[];
         additiveColumns: string[];
         backfilledRows: number;
+        usdaApiCacheAdditiveColumns: string[];
+        stampedUsdaApiCacheRows: number;
         searchVector: string;
+        // The stdout of the FIRST `migrate deploy` this ledger runs — the one
+        // immediately after its `migrate resolve --applied` step, and so the
+        // one whose `Applying migration` lines name exactly what that ledger
+        // left for Prisma to do. Order B's assertions read it: the resolve is
+        // what must stop the meal-planning DDL the operator applied by hand
+        // being applied a second time.
+        deployAfterResolveStdout: string;
+        // The deploy that must have nothing left to do, for both ledgers: for
+        // order A the deploy after the manual reference copy, for order B a
+        // further deploy after the one above applied whatever the manual copy
+        // does not cover.
         finalDeployStdout: string;
     }
 
@@ -566,12 +1060,20 @@ describe('migration ledgers', () => {
     let manualCopyNotices: string[] = [];
     let catalogueBeforeManualCopy: string[] = [];
     let catalogueAfterManualCopy: string[] = [];
+    let dumpRunner: SchemaDumpRunner | null = null;
 
     const outcomeOf = (ledger: LedgerOutcome | null, label: string): LedgerOutcome => {
         if (ledger === null) {
             throw new Error(`ledger ${label} did not complete; its assertions cannot be evaluated`);
         }
         return ledger;
+    };
+
+    const resolvedDumpRunner = (): SchemaDumpRunner => {
+        if (dumpRunner === null) {
+            throw new Error('beforeAll must resolve the pg_dump runner before a ledger is dumped');
+        }
+        return dumpRunner;
     };
 
     // Brings a disposable database to the point where the feature migration is
@@ -597,19 +1099,27 @@ describe('migration ledgers', () => {
 
     const finishLedger = async (
         url: string,
+        database: string,
         loadedRows: Record<string, number>,
         fingerprintsBeforeMigration: Record<string, string>,
+        deployAfterResolveStdout: string,
         finalDeployStdout: string,
     ): Promise<LedgerOutcome> => ({
         loadedRows,
         fingerprintsBeforeMigration,
         fingerprintsAfterMigration: await readTableFingerprints(url, legacyTables),
         catalogue: await readCatalogue(url),
-        schemaDump: pgDumpAvailable ? readSchemaDump(url) : null,
+        // Always a real dump: the runner is resolved in beforeAll and throws if
+        // it cannot produce one, so no ledger can reach its assertions holding
+        // an absent dump that the comparison would then have to tolerate.
+        schemaDump: resolvedDumpRunner().dump(database),
         publicTables: await readPublicTableNames(url),
         additiveColumns: await readMealEntryAdditiveColumns(url),
         backfilledRows: await countBackfilledMealEntries(url),
+        usdaApiCacheAdditiveColumns: await readUsdaApiCacheAdditiveColumns(url),
+        stampedUsdaApiCacheRows: await countStampedUsdaApiCacheRows(url),
         searchVector: await readSearchVectorDefinition(url),
+        deployAfterResolveStdout,
         finalDeployStdout,
     });
 
@@ -625,10 +1135,39 @@ describe('migration ledgers', () => {
             }
         }
 
+        // The dump runner is resolved BEFORE either database is built, and the
+        // failure is thrown from here so that every case in this describe goes
+        // red with one message naming what was tried: the gate's evidence
+        // cannot be produced, which is a failure of the gate and not of one
+        // assertion inside it. The probe is the ambient database — it exists,
+        // it is a test database, and dumping its schema reads nothing the rest
+        // of this suite depends on.
+        const serverMajor = await readServerMajorVersion(ambientUrl);
+        const resolution = resolveSchemaDumpRunner(connection, serverMajor, capability.ambientDatabase);
+
+        if (!resolution.ok) {
+            throw new Error(
+                dumpRunnerFailureMessage(
+                    resolution.attempts,
+                    serverMajor,
+                    connection.address,
+                    capability.ambientDatabase,
+                ),
+            );
+        }
+        dumpRunner = resolution.runner;
+        // The evidence this gate turns on is only as good as the tool that
+        // produced it, so the run says which one that was.
+        // eslint-disable-next-line no-console
+        console.info(
+            `[compat.test.ts] The normalised schema dumps both ledgers are compared on come from ` +
+                `${dumpRunner.description}.`,
+        );
+
         // Order A — the ledger every environment actually runs, then the
         // operator's reference copy on top of it, which must change nothing.
         const preparedA = await prepareLegacyDatabase(ledgerADatabase);
-        expectPrismaSuccess('migrate deploy (order A)', runPrisma(preparedA.url, ['migrate', 'deploy']));
+        const deployA = expectPrismaSuccess('migrate deploy (order A)', runPrisma(preparedA.url, ['migrate', 'deploy']));
         catalogueBeforeManualCopy = await readCatalogue(preparedA.url);
         manualCopyNotices = await applyLedgerFile(preparedA.url, MANUAL_SQL);
         catalogueAfterManualCopy = await readCatalogue(preparedA.url);
@@ -636,11 +1175,27 @@ describe('migration ledgers', () => {
             'migrate deploy after the manual copy (order A)',
             runPrisma(preparedA.url, ['migrate', 'deploy']),
         );
-        ledgerA = await finishLedger(preparedA.url, preparedA.loadedRows, preparedA.fingerprints, redeployA);
+        ledgerA = await finishLedger(
+            preparedA.url,
+            ledgerADatabase,
+            preparedA.loadedRows,
+            preparedA.fingerprints,
+            deployA,
+            redeployA,
+        );
 
         // Order B — the operator procedure the manual-migrations README
         // documents: apply the copy by hand, tell Prisma it is applied, and
-        // deploy, which must then have nothing left to do.
+        // deploy, which must then not apply the copy's DDL a second time.
+        //
+        // That deploy is not necessarily a no-op, and the second one below is
+        // why this half runs two. The copy covers the meal-planning DDL and
+        // nothing else — the README is explicit that the folder holds exactly
+        // three files — so any later migration in prisma/migrations is still
+        // genuinely pending after the resolve, and deploy applying it is the
+        // ledger working rather than the resolve failing. The first deploy is
+        // therefore asserted on what it applied, and the second on there being
+        // nothing left, which is the claim §0.9.1 makes about this order.
         const preparedB = await prepareLegacyDatabase(ledgerBDatabase);
         await applyLedgerFile(preparedB.url, MANUAL_SQL);
         expectPrismaSuccess(
@@ -651,7 +1206,18 @@ describe('migration ledgers', () => {
             'migrate deploy after resolving the manual copy (order B)',
             runPrisma(preparedB.url, ['migrate', 'deploy']),
         );
-        ledgerB = await finishLedger(preparedB.url, preparedB.loadedRows, preparedB.fingerprints, deployB);
+        const redeployB = expectPrismaSuccess(
+            'migrate deploy a second time (order B)',
+            runPrisma(preparedB.url, ['migrate', 'deploy']),
+        );
+        ledgerB = await finishLedger(
+            preparedB.url,
+            ledgerBDatabase,
+            preparedB.loadedRows,
+            preparedB.fingerprints,
+            deployB,
+            redeployB,
+        );
     }, 900_000);
 
     afterAll(async () => {
@@ -776,11 +1342,40 @@ describe('migration ledgers', () => {
             expect(outcome.loadedRows).toEqual(outcomeOf(ledgerA, 'A').loadedRows);
         });
 
-        it('reports nothing left to apply once the migration is resolved as applied', () => {
+        it('never re-applies the DDL the copy already applied, and then reports nothing left to apply', () => {
+            const outcome = outcomeOf(ledgerB, 'B');
+            // Prisma announces each migration it applies on its own line:
+            // "Applying migration `20260908000000_meal_planning`".
+            const applyingLines = outcome.deployAfterResolveStdout
+                .split('\n')
+                .filter((line) => line.includes('Applying migration'));
+            const appliedMigrations = applyingLines
+                .map((line) => /Applying migration `([^`]+)`/.exec(line))
+                .filter((match): match is RegExpExecArray => match !== null)
+                .map((match) => match[1]);
+
             // The operator procedure only holds if `migrate resolve --applied`
             // convinces `migrate deploy` the work is done. If it did not, deploy
-            // would try the Prisma migration on a schema that already has it.
-            expect(outcomeOf(ledgerB, 'B').finalDeployStdout).toMatch(/No pending migrations to apply/);
+            // would try the Prisma migration on a schema that already has it —
+            // which is precisely the second application of the hand-applied DDL
+            // the resolve step exists to prevent, and what the
+            // manual-migrations README tells an operator to run it for.
+            expect(applyingLines.filter((line) => line.includes(FEATURE_MIGRATION))).toEqual([]);
+
+            // Everything the deploy DID apply lies outside the manual copy's
+            // scope. The copy carries the meal-planning DDL and the init schema
+            // is already resolved, so a deploy that named either of those
+            // migrations would be re-running DDL the database already has;
+            // anything else it names is a later migration the copy never
+            // claimed to cover, and applying it is the ledger working.
+            expect(appliedMigrations.filter((name) => name === FEATURE_MIGRATION || name === INIT_MIGRATION)).toEqual(
+                [],
+            );
+
+            // And once those are applied, the ledger is settled: a further
+            // deploy has nothing to do at all, which is what §0.9.1 asserts
+            // about this order.
+            expect(outcome.finalDeployStdout).toMatch(/No pending migrations to apply/);
         });
     });
 
@@ -835,12 +1430,13 @@ describe('migration ledgers', () => {
             // because the collation of a database created the ordinary way is
             // not C. `pg_indexes.indexdef`, which `readCatalogue` records, does
             // carry the class, so the comparison can see it; the pg_catalog
-            // section of `docs/meal-planning/expected-schema-diff.sql` is what
-            // pins it against the ledger being wrong in the same way twice.
+            // sections of `docs/meal-planning/schema-catalog-evidence.sql` are
+            // what pin it against the ledger being wrong in the same way twice.
             //
-            // It also matters that this is the only ledger-equivalence evidence
-            // this run produces: `pg_dump` is absent on this host, so the schema
-            // dump comparison below is skipped and the catalogue is all there is.
+            // The schema-dump comparison below sees the class too, from the
+            // other direction; this assertion is what holds it when the two
+            // ledgers are wrong about it in the same way, which is the one case
+            // a ledger-against-ledger comparison cannot catch.
             expect(a).toHaveLength(1);
             expect(b).toHaveLength(1);
             expect(a[0]).toContain('text_pattern_ops');
@@ -848,23 +1444,30 @@ describe('migration ledgers', () => {
             expect(a).toEqual(b);
         });
 
-        (pgDumpAvailable ? it : it.skip)(
-            `produces an identical pg_dump schema${pgDumpAvailable ? '' : ' — not run because pg_dump is unavailable'}`,
-            () => {
-                const a = outcomeOf(ledgerA, 'A').schemaDump;
-                const b = outcomeOf(ledgerB, 'B').schemaDump;
+        // Unconditional, because 0.9.1 names this comparison as the gate's
+        // evidence: the runner behind it is resolved in beforeAll, which fails
+        // the whole describe if no pg_dump can be found, so there is nothing
+        // left here to make conditional.
+        it('produces an identical normalised pg_dump schema', () => {
+            const a = outcomeOf(ledgerA, 'A').schemaDump;
+            const b = outcomeOf(ledgerB, 'B').schemaDump;
 
-                // pg_dump reproduces what a human reviewer would read, so it
-                // catches anything the catalogue query does not select.
-                expect(a).not.toBeNull();
-                expect(b).not.toBeNull();
-                if (a === null || b === null) {
-                    return;
-                }
-                expect(symmetricDifference(a, b)).toEqual({ onlyInFirst: [], onlyInSecond: [] });
-                expect(a).toEqual(b);
-            },
-        );
+            // Non-vacuity before equality, in the shape the rest of this
+            // describe uses it: two dumps that both missed the feature schema
+            // compare equal to each other and prove nothing. Every table the
+            // migration adds must be in the DDL that is being compared.
+            const missingFrom = (dump: string[]): string[] =>
+                MEAL_PLANNING_TABLES.filter(
+                    (table) => !dump.some((line) => line.includes(`CREATE TABLE public.${table} (`)),
+                );
+            expect(missingFrom(a)).toEqual([]);
+            expect(missingFrom(b)).toEqual([]);
+
+            // pg_dump reproduces what a human reviewer would read, so it
+            // catches anything the catalogue query does not select.
+            expect(symmetricDifference(a, b)).toEqual({ onlyInFirst: [], onlyInSecond: [] });
+            expect(a).toEqual(b);
+        });
     });
 
     describe('legacy data preservation across both ledgers', () => {
@@ -890,6 +1493,29 @@ describe('migration ledgers', () => {
             // user's own numbers as something the server had verified.
             expect(outcomeOf(ledgerA, 'A').backfilledRows).toBe(0);
             expect(outcomeOf(ledgerB, 'B').backfilledRows).toBe(0);
+        });
+
+        it('backfills no observed http_status onto the usda_api_cache rows that predate the column', () => {
+            const a = outcomeOf(ledgerA, 'A');
+            const b = outcomeOf(ledgerB, 'B');
+
+            // Non-vacuity, in two parts, because a count of zero is also what a
+            // database with no such column and a table with no such rows would
+            // produce: the column has to be there afterwards, and the fixture's
+            // cached responses have to be in the table being counted.
+            expect(a.usdaApiCacheAdditiveColumns).toEqual([...ADDITIVE_USDA_API_CACHE_COLUMNS].sort());
+            expect(b.usdaApiCacheAdditiveColumns).toEqual([...ADDITIVE_USDA_API_CACHE_COLUMNS].sort());
+            expect(a.loadedRows.usda_api_cache).toBeGreaterThan(0);
+            expect(b.loadedRows.usda_api_cache).toBeGreaterThan(0);
+
+            // 20260909000000_usda_cache_http_status refuses to stamp rows
+            // written before it with a 200, because that status would be a
+            // status nobody observed — "exactly the evidence this column exists
+            // to record", in the migration's own words. A NULL here is the
+            // truthful reading that a cached response predates the ledger, so
+            // every fixture row must still be carrying one.
+            expect(a.stampedUsdaApiCacheRows).toBe(0);
+            expect(b.stampedUsdaApiCacheRows).toBe(0);
         });
     });
 });
@@ -1392,15 +2018,15 @@ describe('the diary entries endpoint', () => {
 // the key order PostgreSQL holds them in.
 //
 // WHY HERE. The HTTP-level comparison of an original and a replayed response —
-// the request aborted after commit with `x-test-abort-after-commit`, then
+// the request aborted after commit through the post-commit abort header, then
 // replayed over the wire — belongs to `src/__tests__/api/fault.test.ts`, and
 // the lock/reserve races belong to `src/__tests__/api/concurrency.test.ts`
-// (§0.9.2). Those two suites own that evidence; neither exists in this
-// checkpoint, and this file is the only PostgreSQL-backed home available, so
-// the ledger's persistence is proven here at the service seam rather than left
-// modelled inside a unit test. This is a statement of ownership: when those
-// suites land, the wire-level byte comparison is theirs and this describe stays
-// what it is — the column-level proof underneath it.
+// (§0.9.2). Both suites are in this checkpoint and own that evidence, and this
+// describe deliberately does not restate it: what a client sees is theirs, and
+// neither of them reads the column those answers are stored in. That column is
+// what this is — the ledger's persistence at the service seam: the stored
+// `meal_plan_actions` row, the bytes of `response_snapshot` itself and the key
+// order PostgreSQL holds them in, underneath the wire-level proofs.
 // ==========================================================================
 
 import { IdempotencyConflictError } from '../../services/mealPlanning.errors';
@@ -1685,7 +2311,7 @@ describe('the meal-planning action ledger', () => {
 //
 //   * the diary entry DTO — the eleven keys the mobile codec decodes, the two
 //     additive members that are always PRESENT and sometimes null, and no
-//     thirteenth key;
+//     fourteenth key;
 //   * the frozen responses — the five-field 400, the two 404 strings, the
 //     `{success: true}` body, the day-read date guard, and the history page
 //     block with its `parseInt(...) || default` behaviour;

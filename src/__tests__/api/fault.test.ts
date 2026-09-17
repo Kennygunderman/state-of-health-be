@@ -809,12 +809,20 @@ describe('the injected generation fault', () => {
         // `searchCandidateWeek` and `prisma.$transaction`.
         //
         // The two emptiness assertions are the whole point: the fault is raised
-        // in FRONT of the transaction, so there is no advisory lock, no
-        // `meal_plan_actions` reservation and no plan row — nothing was written
-        // and then rolled back, because nothing was ever reached. A check armed
-        // one statement later, inside the transaction, would leave these same
-        // two assertions passing for an entirely different reason, which is why
-        // the position is stated in the service and pinned here.
+        // in FRONT of the PUBLISHING transaction, so no plan, day, meal or
+        // grocery row is written and no ledger row SURVIVES.
+        //
+        // "Survives" rather than "was never reached", which would be untrue:
+        // `generatePlan` calls `replayCommittedKeyedAction` before this fault,
+        // and that preflight opens its own transaction, takes the per-user
+        // `pg_advisory_xact_lock` and attempts this key's `INSERT … ON CONFLICT
+        // DO NOTHING` reservation before rolling the whole thing back through
+        // `KeyedActionPreflightRollback`. So the zero ledger count below is an
+        // UNDONE ATTEMPT, not an attempt that never happened — which is exactly
+        // what makes it worth asserting. A check armed one statement later,
+        // inside the publishing transaction, would leave these same two
+        // assertions passing for an entirely different reason, which is why the
+        // position is stated in the service and pinned here.
         const refused = await withFault('generation', async ({ resolvedFault, generatePlan: faulted }) => {
             expect(resolvedFault).toBe('generation');
 
@@ -830,8 +838,10 @@ describe('the injected generation fault', () => {
         expect(await ledgerRowsFor(GENERATION_USER_ID, GENERATION_KEY)).toHaveLength(0);
 
         // The identical request — same key, same body — once the switch is off.
-        // A key the faulted attempt never reserved is a key the ledger has never
-        // seen, so this is a first publication rather than a replay.
+        // The faulted attempt DID reserve this key, in the preflight's
+        // transaction, and then rolled that reservation back; what matters is
+        // that none of it PERSISTED, so the ledger has no row for the key and
+        // this is a first publication rather than a replay.
         const published = await generatePlan(GENERATION_USER_ID, generateBody(), NOW);
 
         expect(published.kind).toBe('ok');
@@ -996,6 +1006,16 @@ describe('the injected generation fault', () => {
         expect(JSON.parse(JSON.stringify(replay.result.body))).toEqual(
             JSON.parse(JSON.stringify(first.result.body)),
         );
+        // Everything a client can see is identical, and `replayed` is the one
+        // thing that is not — asserted here, against the real ledger, because
+        // this is where the two values are actually produced: the first answer
+        // comes from the transaction that completed the reserved row, the
+        // second from `response_snapshot` read back. The HTTP edge puts this
+        // field in its server event and never in a response, so an operator can
+        // tell a duplicate the ledger absorbed from a commit whose response was
+        // lost while the client still cannot (AAP §0.5.1).
+        expect(first.result.replayed).toBe(false);
+        expect(replay.result.replayed).toBe(true);
         // One plan, one ledger row: the replay answered from the ledger without
         // searching or publishing a second week.
         expect(await generatedPlans()).toHaveLength(1);
@@ -1683,19 +1703,24 @@ describe('the injected generation fault at the HTTP boundary', () => {
 
         expectMachineReadableFailure(refused, { status: 502, code: 'plan_generation_failed' });
 
-        // Nothing was written, and — the load-bearing part — nothing was even
-        // reserved: the fault is raised in FRONT of the transaction, so there is
-        // no ledger row to roll back.
+        // Nothing was written, and — the load-bearing part — no reservation
+        // SURVIVED. The fault is raised in front of the publishing transaction,
+        // but not in front of everything: `replayCommittedKeyedAction` ran
+        // first, took the per-user advisory lock and attempted this key's
+        // reservation, and `KeyedActionPreflightRollback` undid both. So the
+        // zero ledger count below is a reservation attempted and rolled back,
+        // which is precisely why it is worth asserting.
         expect(await plansOf(HTTP_GENERATION_USER_ID)).toHaveLength(0);
         expect(await prisma.meal_plan_days.count({ where: { user_id: HTTP_GENERATION_USER_ID } })).toBe(0);
         expect(await prisma.meal_plan_meals.count({ where: { user_id: HTTP_GENERATION_USER_ID } })).toBe(0);
         expect(await prisma.grocery_items.count({ where: { user_id: HTTP_GENERATION_USER_ID } })).toBe(0);
         expect(await ledgerRowsFor(HTTP_GENERATION_USER_ID, HTTP_GENERATION_KEY)).toHaveLength(0);
 
-        // The identical request once the switch is off. A key the faulted
-        // attempt never reserved is a key the ledger has never seen, so this is
-        // a FRESH commit rather than a replay — which is the property that
-        // distinguishes this seam from the abort one.
+        // The identical request once the switch is off. Because the faulted
+        // attempt's reservation did not persist, the ledger has never seen this
+        // key, so this is a FRESH commit rather than a replay — which is the
+        // property that distinguishes this seam from the abort one, where the
+        // reservation DOES survive and the retry replays the stored response.
         const published = await asUser(request.post(PLANS_PATH), {
             uid: HTTP_GENERATION_USER_ID,
         }).send(body);

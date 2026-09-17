@@ -50,6 +50,8 @@ threshold.
 
 ## Status at this commit
 
+<!-- BEGIN POLICY GATE: status-at-this-commit -->
+
 | Referenced thing | State |
 | --- | --- |
 | `src/services/targets.logic.ts`, `mealPlan.logic.ts`, `swap.logic.ts`, `grocery.logic.ts`, `recipe.logic.ts`, `plannedMealLog.logic.ts`, `preferences.logic.ts` | present; every number below is a named export or a named constant in one of them |
@@ -57,7 +59,9 @@ threshold.
 | `src/types/mealPlanning.ts`, `src/types/recipe.ts`, `src/types/nutrition.ts` | present; every stable code named here is spelled there |
 | `data/meal-planning/recipes/coverage-report.json` | present, generated from the seeded recipe set; §5 quotes it and nothing else |
 | The 42 authored recipe files in `data/meal-planning/recipes/` | present, against a required minimum of 40 |
-| Per-run acceptance evidence — published catalogue counts, benchmark hit rates and latencies | **operator-produced, not in this repository.** See [`catalog-policy.md`](./catalog-policy.md) and [`README.md`](./README.md). Nothing here states a measured result. |
+| Per-run acceptance evidence — published catalogue counts, benchmark hit rates and latencies | **operator-produced, and committed** under `data/meal-planning/reports/latest/` as `import-report.json`, `validation-report.json` and `benchmark-report.json`; the last declares itself the acceptance evidence for search quality. Each figure is owned by the report that measured it — a measurement of one database at one moment — so it is read there and **nothing here states a measured result.** Which runs happened and what each returned is one table, in [`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md#what-was-verified-in-this-environment); see also [`catalog-policy.md`](./catalog-policy.md) and [`README.md`](./README.md). |
+
+<!-- END POLICY GATE: status-at-this-commit -->
 
 ---
 
@@ -88,6 +92,8 @@ coefficient for it. It produces **no estimate at all** rather than a guessed sex
 or an average of the two forms; the user takes the manual-entry route instead.
 That is a deliberate refusal, not a gap: the type `CalculableSex` narrows the
 value out, so `computeTargetEstimate` cannot be handed it.
+
+<!-- BEGIN POLICY GATE: nutrition-targets -->
 
 ## 1.2 The activity factor
 
@@ -357,6 +363,8 @@ The two calorie thresholds are not health bounds. They are the range the recipe
 catalogue can realistically build a week within, which is why they are named for
 the catalogue and not for the user.
 
+<!-- END POLICY GATE: nutrition-targets -->
+
 ## 1.9 Persistence, precedence and staleness
 
 **One canonical writer.** For a user who has opted into meal planning,
@@ -521,6 +529,8 @@ it is source-backed by construction rather than by inspection.
 ---
 
 # 3. Plan generation
+
+<!-- BEGIN POLICY GATE: plan-generation -->
 
 Implemented by `src/services/mealPlan.logic.ts`, pinned by
 `src/services/__tests__/mealPlan.logic.test.ts`. A plan is always exactly one
@@ -929,6 +939,7 @@ authoritative field.
 The limits the user may choose are 15, 30, 45 and 60 minutes, ascending — which
 is also the relaxation ladder `cooking_time` steps up in §3.7.
 
+<!-- END POLICY GATE: plan-generation -->
 
 ---
 
@@ -968,6 +979,8 @@ place. Two boundaries:
   identically for the same inputs, and the smaller portion is the more
   conservative choice.
 
+<!-- BEGIN POLICY GATE: swap-offer -->
+
 A swap is judged against the **whole** day, with a share of 1 — never against a
 slot's cumulative guidance share. The generator scores a partial day because it
 is still filling it; a swap replaces one meal of an already complete day, so the
@@ -990,6 +1003,8 @@ The bound applies to the offer and not merely to the sheet: the preview and the
 commit pick from these same eight, so a recipe the list did not show cannot be
 committed.
 
+<!-- END POLICY GATE: swap-offer -->
+
 **The commit recomputes the portion with the same function and rejects a stale
 preview** with `409 preview_stale` when the recomputed multiplier differs from
 the one the request carried. The preview binds the **portion**, not the targets:
@@ -1003,6 +1018,8 @@ See [`api.md`](./api.md#post-meal-planningplansplanidmealsmealidswap).
 Implemented by `src/services/recipe.logic.ts`, pinned by
 `src/services/__tests__/recipe.logic.test.ts`. Seeded by
 `scripts/recipes-seed.ts`.
+
+<!-- BEGIN POLICY GATE: recipe-rules -->
 
 ## 5.1 Nutrition derivation
 
@@ -1117,6 +1134,8 @@ above is derived from *composition*, and composition says nothing about a shared
 fryer or a shared production line — so the badge would otherwise imply a safety
 assurance the derivation cannot support.
 
+<!-- END POLICY GATE: recipe-rules -->
+
 ## 5.4 Seed-time eligibility
 
 `scripts/recipes-seed.ts` refuses to publish anything that fails any of these.
@@ -1164,6 +1183,8 @@ change to an ingredient's allergen or diet tags changes a recipe's *safety*
 metadata without changing a single number — and a recipe whose allergen
 derivation is out of date is the more dangerous of the two staleness cases.
 
+<!-- BEGIN POLICY GATE: recipe-coverage-matrix -->
+
 ## 5.6 The coverage matrix, and its boundary
 
 Figures below are read from
@@ -1206,6 +1227,41 @@ arithmetic of §3.2 and 2 is the coverage floor §3.7 reports against.
 | **Reduced** | **≥ 2** eligible per main slot — asserted, and **explicitly not sufficient** to fill a week | **124** |
 | **Everything else** | supported at runtime, **not guaranteed** | the remainder |
 
+### Which profiles those cells are
+
+An aggregate count says how many cells are promised and not *which*, so the two
+promised sets are enumerated as the axis values they are built from. Each row
+below is one cross product of `dimensions` in the report, the four rows are
+pairwise disjoint, and the products are written out so a reviewer can re-add
+them:
+
+| Tier | Diet | Excluded allergen | Slot | Cooking-time tier (min) | Cells |
+| --- | --- | --- | --- | --- | --- |
+| **Guaranteed** | `none`, `vegetarian`, `vegan`, `pescatarian` | `none` | `breakfast`, `lunch`, `dinner`, `snack` | 45, 60 | 4 × 1 × 4 × 2 = **32** |
+| **Guaranteed** | `none` | `milk`, `eggs`, `peanuts`, `tree_nuts`, `soy`, `wheat`, `fish`, `shellfish`, `sesame` | `breakfast`, `lunch`, `dinner` | 15, 30, 45, 60 | 1 × 9 × 3 × 4 = **108** |
+| **Reduced** | `vegan`, `vegetarian` | `milk`, `eggs`, `peanuts`, `tree_nuts`, `soy`, `wheat`, `fish`, `shellfish`, `sesame` | `breakfast`, `lunch`, `dinner` | 45, 60 | 2 × 9 × 3 × 2 = **108** |
+| **Reduced** | `none`, `vegetarian`, `vegan`, `pescatarian` | `none` | `breakfast`, `lunch`, `dinner`, `snack` | 30 | 4 × 1 × 4 × 1 = **16** |
+
+32 + 108 = **140** guaranteed cells and 108 + 16 = **124** reduced cells, which
+is the whole of both columns above.
+
+In words, because that is how a reader will look for their own profile.
+**Guaranteed** is every diet with **no** excluded allergen at a cooking-time
+tier of **45 minutes or looser**, for **every** slot including snack; plus the
+unrestricted `none` diet with **any single** excluded allergen at **any** time
+tier, for every **main** slot. **Reduced** is vegan or vegetarian with any
+single excluded allergen at 45 minutes or looser, plus any diet with no excluded
+allergen at the **30-minute** tier — main slots only in the first case, and a
+count of two rather than a week in both.
+
+Two boundaries of the enumeration are worth naming, because they are the ones a
+reader would otherwise assume the other way. **A tighter tier is not implied by
+a looser one**: tiers are cumulative ceilings, so a cell promised at 45 minutes
+says nothing about the same profile at 30 or 15, and the 15-minute tier is
+guaranteed only for the `none` diet. **Snack is promised only where no allergen
+is excluded** — the snack column of every single-allergen cell is in
+"everything else", because the seeded snack set is the smallest of the four.
+
 **A reduced cell is not a working week.** Two eligible recipes cannot fill seven
 days at most twice each without falling on consecutive days. The reduced tier is
 recorded because it is a meaningfully better position than nothing — a swap has
@@ -1225,6 +1281,8 @@ Dislikes are not an axis of the table at all, because they are per-user and
 remove recipes at request time; dislike-driven shortfalls surface only through
 the planner's own coverage check.
 
+<!-- END POLICY GATE: recipe-coverage-matrix -->
+
 ---
 
 # 6. The grocery contract
@@ -1233,6 +1291,8 @@ Implemented by `src/services/grocery.logic.ts` and `src/utils/units.ts`, pinned
 by their tests. **Quantities are measured**, and the design intent behind the
 whole of §6.2 is that **container units are never generated** — the list never
 invents "1 bottle", because nothing in the data says how large a bottle is.
+
+<!-- BEGIN POLICY GATE: grocery-contract -->
 
 ## 6.1 The numeric contract
 
@@ -1271,6 +1331,64 @@ unrecognised token resolves to nothing rather than a guess — guessing `count`
 for an unrecognised token is precisely how a mass quantity would merge into a
 count.
 
+**A count-family token is not on its own enough to count a row.** `each` is the
+generic token the catalogue gives every non-metric portion, so a portion
+describing a *container* ("1 can, drained", "container (6 oz)", "regular
+microwave bag"), a *serving reference* ("serving 1/2 cup", "RACC", "1 item",
+"kids meal order", "Swanson Salisbury Steak Dinner (11 oz)", "KFC Bowl") or a
+*dose* ("scoop", "recipe yield", "small/individual") arrives in the count
+family and would otherwise have its own free text printed as the shopping unit.
+Those portions are **measured instead** — volume when the food can state a
+density, grams otherwise — which is where §6's "container units are never
+generated" is actually enforced, rather than merely intended.
+
+The disqualifying forms are **two closed lists** in `grocery.logic.ts`, both
+read by `describesContainerOrServing`: `CONTAINER_PORTION_WORDS`, the words, and
+`CONTAINER_PORTION_PHRASES`, the contiguous whole-word runs. The scan covers
+**every word of the description**, not its head noun, because the catalogue
+routinely puts the disqualifying word somewhere else in the text — before the
+noun, inside a parenthesis, or in the word the description *excludes*
+("package without flavor packet"). An ambiguous description errs toward a
+measure: "227 g" is a plainer line than "1 tub", and it is the amount that was
+actually measured.
+
+**The boundary between the two lists and the rest of the catalogue is drawn
+deliberately, and it is this.** 788 of the 3,514 count-family default portions
+in the committed release match; the other 2,726 keep counting:
+
+- **A vessel, a tabulation unit or a dose is measured.** Cans, jars,
+  containers, packages, packets, bags, pouches, envelopes and serving bowls;
+  servings, `RACC`, `NLEA serving`, portions, orders, meals and packaged
+  dinners, items and units; scoops, single-serve "individual" references and a
+  "recipe yield". None of them says how much food it holds.
+- **A bare size or grade label with no item noun keeps counting** — "regular"
+  (106 rows), "miniature" (75), "miniature/bite size" (67), "whole" (13), "bite
+  size", "slice, any size", "cubic inch". These are terse labels the catalogue
+  wrote on a countable item, not containers and not serving references, so
+  counting them prints the thing the shopper buys a number of. Measuring them
+  would be a different decision from the one this rule makes, and it would move
+  hundreds of truthful count lines onto the scales.
+- **A description whose head noun is a real item keeps counting** — slice,
+  piece, sandwich, fillet, patty, chop, rib, steak, link, egg, clove, apple,
+  cookie, cracker, waffle, muffin, roll, bar, cone, cube, wedge, pod, ear,
+  leaf, fruit, berry, cake, pie, pizza, taco, tortilla, pita, pickle, ball,
+  tablet and the rest of the release's item vocabulary.
+- **`yield` and `refuse` are words in neither list**, because 57 counting rows
+  are real items USDA happens to describe through their yield ("rib (yield
+  after cooking, bone removed)", "steak (yield from 181 g raw meat)", "pod,
+  yields"). The one yield form that is not an item, "recipe yield", is matched
+  as a **phrase** instead — which is the whole reason the phrase list exists.
+
+`grocery.logic.test.ts` pins this boundary as a corpus: one case per form family
+the release actually ships, on both sides, each quoted verbatim with its row
+count, plus a sweep that re-derives the 3,514 / 788 / 2,726 split from
+`data/meal-planning/catalog/releases/v1/portions.jsonl`. Adding a word carelessly
+and leaving a form family out both fail it.
+
+The family is still decided **once, at generation** — a row already stored keeps
+the family its own `display_unit` records, exactly as this section's invariant
+requires.
+
 **Within a family, the largest unit that keeps the value ≥ 1 is used:**
 
 | Family | Tiers, largest first | Promotes at | Status |
@@ -1299,16 +1417,30 @@ fraction renders alone ("¾").
 numbers**, because a portion description is data the catalogue wrote rather than
 a label this code chose:
 
-- **A count portion may state its own amount.** "5 sprigs" is one portion *of
-  five sprigs*, so the amount is read off the description and multiplied out
-  rather than printed in front of it.
+- **The cardinality is the structured `catalog_food_portions.amount`, and the
+  description is only a label.** "5 sprigs" is one portion *of five sprigs*, and
+  the five comes from the column rather than from the text: 139 of the shipped
+  default count portions state an amount other than 1 and 138 of those disagree
+  with the number their description happens to begin with (`{amount: 3,
+  description: 'cookies'}` is three cookies per 44 g, whatever the text says).
+  Items are therefore `grams ÷ gram_weight × amount`. The label drops a leading
+  amount it repeats, so a row reads "9 cookies" and "6 eggs, large" rather than
+  "9 5 sprigs" or "6 1 egg, larges". An `amount` that is not a positive finite
+  number behaves as 1 — validation should have quarantined such a food long
+  before it reached a list, and counting portions is the reading that still puts
+  a truthful line in front of the shopper.
 - **The item is the head noun.** "egg, large" pluralises to "eggs, large" — the
   qualifier after the comma is not the thing being counted. Inflecting the last
   word instead would produce "larges".
 
 Irregular plurals are a closed exception list — `egg`, `tomato`, `potato`,
-`leaf`, `loaf`, `half` — **closed against the catalogue rather than against
-English.** Of the head nouns the shipped count portions use, those are the ones
+`leaf`, `loaf`, `half`, `cookie`, `pierogi`, `goldfish` — **closed against the
+catalogue rather than against English**, and read in both directions from the
+one table so the pair cannot drift. The last three are the ones the general
+rules got wrong in the singular or invariant direction: the `-ies` rule turns
+"cookies" into "cooky" and "pierogies" into "pierogy" unless the table says
+otherwise, and the `-sh` rule turns "goldfish" into "goldfishes". Of the head
+nouns the shipped count portions use, those are the ones
 the general rules inflect incorrectly; every other `-o` noun in that set takes a
 plain `s` (avocados, burritos, tacos), which is why there is deliberately no
 `-o` rule. A description already written in the plural must not be inflected a
@@ -1320,7 +1452,41 @@ abbreviations.
 
 **The food state is shown as a name suffix** whenever it is not `raw`, or
 whenever two states of one food coexist on the list — "Rice, dry" beside "Rice,
-cooked". `raw` alone earns no suffix, because it is the unmarked case.
+cooked". `raw` alone earns no suffix, because it is the unmarked case, and
+`as_purchased` earns one like every other non-`raw` state ("Olive oil, as
+purchased").
+
+**The only exception is literal duplication.** A name whose own qualifiers — the
+text after its first comma — already contain the state's words as a contiguous
+run of whole words keeps its name: "Brown rice, cooked" and "Peas, cooked in
+water" already say `cooked`. Nothing else suppresses the suffix, and in
+particular a preparation word the catalogue happened to choose is **not** read
+as a way of saying the state: "Black beans, canned" on a `cooked` row becomes
+"Black beans, canned, cooked", which keeps the catalogue's qualifier *and*
+states the stored state. Reading "canned" as "cooked", or "sliced" as
+"prepared", is a substitution that hides the state behind a synonym, and the
+qualifiers-only scan is what keeps a food whose noun resembles a state ("Dry-aged
+beef" on a `dry` row) from losing its suffix.
+
+**Coexistence qualifies every row that does not already say its own state, and
+de-duplication still applies to the one that does.** That is what keeps two rows
+of one base name from ever rendering the same string — the shopper would read
+one line and buy half of what the week needs — while still stating each row's
+state exactly once. A "Peas, cooked" food on the list in both `cooked` and `raw`
+therefore reads "Peas, cooked" and "Peas, cooked, raw": two distinct lines,
+neither of them "Peas, cooked, cooked".
+
+**Coexistence has one exception of its own: a name that literally states *both*
+states.** It is a collision guard rather than a style choice: "Beans, cooked and dry"
+says `cooked` and `dry`, so de-duplicating both rows would render one identical
+string twice — the collapse the coexistence rule exists to prevent. Both are
+suffixed instead ("Beans, cooked and dry, cooked" and "Beans, cooked and dry,
+dry"), and the repeated word is the price of two distinguishable lines. At most
+one row of a coexisting name can ever de-duplicate, because two rows of one base
+name share their qualifiers: if each stated its own state, those shared
+qualifiers would state both, and the guard would fire for both.
+
+<!-- END POLICY GATE: grocery-contract -->
 
 ## 6.3 Aisle categories
 
@@ -1427,6 +1593,8 @@ mismatched meal is a `404`, never a corrected guess.
 integers** — step 2 of §5.2, the single rounding step — so **one serving in the
 diary equals the planned portion exactly.**
 
+<!-- BEGIN POLICY GATE: planned-meal-logging -->
+
 **The eaten fraction comes from the stepper**, within 0.25 to 10 servings at two
 decimal places.
 
@@ -1449,6 +1617,8 @@ domain rather than a column copied off a row — planning admits only
 source-backed, allergen-reviewed recipes, so a planned meal cannot be an
 estimate), and the plan-meal and recipe-version links that let the plan card
 derive its own logged state and the diary derive its caption.
+
+<!-- END POLICY GATE: planned-meal-logging -->
 
 **Double taps and retries return the first result.** The mechanism is the shared
 keyed-write sequence in [`api.md`](./api.md#idempotency-and-replay); the policy
@@ -1509,7 +1679,89 @@ writes and their replay — is the service layer's concern and is documented in
 # Keeping this document true
 
 Every number here must equal its implementation. When one changes, this document
-changes in the same review.
+changes in the same review — and for most of them the review is not the only
+thing enforcing it.
+
+**What is machine-compared.** `src/__tests__/setup/coverageInventory.test.ts`
+(its `policy-document drift gate` block) reads this file off disk, parses the
+regions delimited by `<!-- BEGIN POLICY GATE: <id> -->` and
+`<!-- END POLICY GATE: <id> -->` comments, and compares every value in them with
+the file that owns it. Three kinds of thing inside a marked region count as a
+value, and all three are compared:
+
+- **a number** — a bound, a threshold, a count, a factor, a share, a budget or a
+  precision;
+- **a closed code vocabulary** — the members the region enumerates, and their
+  order where it states one, against the array or the union that declares them;
+- **an algorithm parameter** — a field order, a separator, a digest reduction, a
+  printed formula's operators and operands, a rounding mode. These are compared
+  by *behaviour*: the gate reads the parameters out of this file, applies them to
+  a fixed input set, and compares the result with what the exported function
+  returns for the same input. Nothing restates the algorithm in the test, so a
+  change on either side moves exactly one of the two numbers it prints.
+
+| Gated block | What is compared | Source of truth |
+| --- | --- | --- |
+| `status-at-this-commit` | the authored recipe count, and the corpus floor the table measures it against | `data/meal-planning/recipes/coverage-report.json`, `src/__tests__/api/seed-rerun.test.ts` (the floor) |
+| `nutrition-targets` (§1.2–§1.8) | the four activity factors; the daily adjustment per pound-per-week and every goal-and-pace row including its on-screen copy; the adult input envelope, against *both* logic modules that declare it, and the code vocabularies its input table admits — the sexes, the goals, the paces and how many activity levels it defers to; the three display conversions; the two floors and the ceiling; the `clampReason` at **every** bound it tabulates, and at each of the three the prose names, driven there by `applyTargetBounds`; the unavailability code the resolver returns for a paceless loss or gain row, for an out-of-envelope row, and the status a write-time refusal carries; the macro shares and Atwater divisors, including the divisors inside the mismatch condition; the manual ranges, the zero-macro field code, the three feasibility warnings and their thresholds; the highest basal rate the envelope allows; the macros a floor-clamped target must produce; and both worked derivations — the end-to-end example and the two envelope corners — recomputed by `targets.logic.ts` and compared figure for figure | `src/services/targets.logic.ts`, `src/services/preferences.logic.ts`, `src/types/mealPlanning.ts` (the vocabularies), `src/controllers/mealPlanning.controller.ts` (the write-time status) |
+| `plan-generation` (§3) | the week length; §3.1's clause count, the version status, provenance and allergen status a plannable recipe must carry, the two estimate grades it refuses and the whole diet vocabulary its containment chain closes; the repetition rule and the arithmetic behind the coverage floor; the three scoring weights, in the printed formula **and** in the table, and the reuse cap; §3.4's seed reduction — its five inputs, their order, the separator, the hash and the digest slice — and the candidate identity triple, both recomputed and compared against `derivePlanSeed` and `portableCandidateIdentity`; both schedules' cumulative shares and the per-slot intents they imply; the evaluation budgets and the wall-clock abort; both portion sets; the four day tolerances and the comparison slack; §3.7's whole constraint table — its keys, the order the analysis emits them in, its rank column and its unit vocabulary — the two coverage thresholds, the allergies-kept promise the error carries, and the keys its prose restates; §3.8's four incompatibility flags, in declaration order; the plan status §3.9 says does not exist; the cost-score and per-meal budget bands, against both modules that declare them; the currency; the cooking-time tiers; and every `<status> <code>` outcome it quotes | `src/services/mealPlan.logic.ts`, `mealPlan.service.ts` (the wall-clock abort), `recipe.logic.ts` (the eligibility vocabularies, the flags and the cost-score bands), `preferences.logic.ts` (the currency and the per-meal thresholds), `mealPlanning.errors.ts` (the allergies-kept promise), `src/types/{mealPlanning,nutrition}.ts` (the vocabularies), `src/controllers/mealPlanning.controller.ts` (the quoted statuses) |
+| `swap-offer` (§4) | the share of the day a candidate is judged against; the bound on the alternatives offered, in each place it is stated | `src/services/swap.logic.ts` |
+| `recipe-rules` (§5.1–§5.3) | §5.1's printed derivation — its basis amount, its operators and the per-serving division — recomputed and compared against `deriveRecipeNutrition`, the volume basis converted through a density, the unknown-fibre rule and the zero it refuses, the Atwater divisors, and the sourced-versus-Atwater divergence; §5.2's single rounding step, the values it covers, the full precision before it, the consumed-total arithmetic it prints and the SQL aggregate it cites; §5.3's five badge codes in declaration order with its own count of them, the badges its prose names, the reviewed tag the gluten-free badge reads and the allergen tag the dairy-free badge is withheld by; the high-protein energy share; the quick-badge ceiling | `src/services/recipe.logic.ts`, `src/types/recipe.ts` (the badge set), `catalog.logic.ts` (the basis amount), `plannedMealLog.logic.ts` (the consumed total), `targets.logic.ts` (the Atwater divisors), `preferences.logic.ts` (the allergen tags), `nutrition.service.ts` (the SQL aggregate) |
+| `recipe-coverage-matrix` (§5.6) | the recipe count, against the report *and* the files on disk, and the corpus floor it is measured against; the cross-listed count; the per-slot composition with its floors, and that the four strata sum to the eligible count; the matrix dimensioning; both promise thresholds and both cell counts; the enumerated guaranteed and reduced **profile definitions**, expanded and compared with the report's own promised cells; the tier boundaries, slots and diets the same promises are restated with **in words**; the two boundary sentences, read out of this file rather than quoted in the test; and the outcome it quotes for a profile it does not promise | `data/meal-planning/recipes/coverage-report.json`, `src/__tests__/api/seed-rerun.test.ts` (the floor), `src/services/preferences.logic.ts` (the named allergens), `src/controllers/mealPlanning.controller.ts` (the quoted status) |
+| `grocery-contract` (§6.1–§6.2) | §6.1's printed formula, recomputed and compared against `plannedIngredientGrams`, the decimals a stored total carries and the equality epsilon; §6.2's three display families, each family's tiers with their order and the unit one of each renders in, the mass and volume promotion thresholds, every precision it tabulates rendered through `units.ts`, the quarter glyphs and both rendered examples, the closed irregular-plural list with the plain-`s` nouns it contrasts, the head-noun rule, the already-plural case, the singular-`-s` endings, the portion that states its own amount, and the unmarked food state | `src/services/grocery.logic.ts`, `src/utils/units.ts` |
+| `planned-meal-logging` (§7) | the eaten-servings envelope and its precision, the input method and the provenance | `src/services/plannedMealLog.logic.ts` |
+
+The gate runs **both ways**: every marker in this file must be claimed by that
+test and every block it expects must be present, and each table's row count is
+compared as well — so a deleted row, a dropped marker or a renamed one fails
+rather than quietly shrinking what is checked. Every failure prints both sides
+labelled by the file they came from.
+
+**What is prose rather than gated**, recorded so the claim above is exactly
+true. Only two things qualify: text that sits **outside** every marker, and text
+inside one that states **no duplicated value** by the definition above. Nothing
+else is exempt — a value inside a marked region is compared or it is moved out,
+and moving it out is not available to a value that is duplicated.
+
+Outside every marker, and gated nowhere here:
+
+- §1.1's cited equation, whose coefficients are reproduced from the paper rather
+  than from a source file. A change to the *implementation's* coefficients turns
+  §1.7's worked example red, so the arithmetic is still pinned; the equation's
+  own text is a citation.
+- §2's nutrition-provenance, calculation-method and meal-origin vocabularies,
+  §6.3's aisle categories, §6.4's per-row verdicts and §6.5's banner codes. All
+  four sections lie between marked regions, not inside them; `src/types/` spells
+  those vocabularies and the matching `*.logic.test.ts` files pin them.
+
+Inside a marked region, and not a duplicated value:
+
+- **The names of things.** A column (`total_minutes`, `budget_tier`), a field
+  (`editStep`, `ok`), a type (`HeightUnitPref`, `WeightUnitPref`), a JSON key
+  (`dimensions`), a function, a path (`data/meal-planning/reports/latest/`) or a
+  file (`benchmark-report.json`) names a thing; it carries no value. So do the
+  formulas written entirely in those names — `min(ceiling, max(adjusted, sex
+  floor, BMR))`, `max(0, recipeTier − userTier)`, `costScore`, `perMeal`,
+  `total_minutes` — whose numeric members are gated wherever they appear, and
+  whose behaviour the probes above exercise.
+- **Statements about order rather than value**, where the order has no operands
+  to compare: §3.4's `(score, shuffleRank)` tie-break and §5.3's stable
+  emission order. §3.4's seed reduction and candidate triple are *not* in this
+  class and are compared behaviourally; §5.2's rounding order is not either,
+  and its step table, its value count and its arithmetic are compared.
+- **Cited external figures**, labelled as such where they appear: §1.3's FAO
+  report, §1.4's ≈ 3,500 kcal equivalence with both citations, and the journal
+  volumes and page numbers beside them.
+- **Copy owned by the mobile app**: §1.3's on-screen activity anchors and §7's
+  fraction chips. No backend file states them, so there is nothing here to
+  compare them with; `mobile/` owns both.
+- **Illustrative examples that name no contract value**: §5.6's nouns for its
+  own strata, §6.2's `-o` argument, and the varieties behind a food group — the
+  group itself is compared against the taxonomy, in §3.1 as in §6.2.
+- §1.8's `200`. Every error status this document quotes is compared against the
+  controller mapping that answers it; the success status is Express's default and
+  no source file states it.
+- **Every sentence that argues for a rule** rather than stating a number.
 
 | If you change… | Also update |
 | --- | --- |
@@ -1526,4 +1778,3 @@ Two standing prohibitions for this document:
   that produced them and are never restated here.
 - **Never include a secret, a connection string, a real host or a key.** Nothing
   here needs one.
-
