@@ -43,8 +43,13 @@ because the distinction those commands turn on is the one most easily got wrong.
 
 `data/meal-planning/catalog/releases/v1/` is the reviewed release **artefact**:
 five JSONL members and a `manifest.json` carrying a SHA-256, a byte length and a
-row count for each of them (11,046 foods, 15,939 aliases, 31,899 portions, 0
-components, 11,046 validation records). It is the input a release loads, **not
+row count for each of them. Those five counts are stated by the manifest and
+deliberately **not** restated here — a release is re-cut when the catalogue
+grows, and a copy of its row counts in this procedure is a copy that goes stale
+the moment it is; `catalog:load` verifies every file against the manifest before
+it writes anything, and
+[`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md#what-was-verified-in-this-environment)
+records what the load actually wrote. It is the input a release loads, **not
 loaded data** — committing it puts no row in any database, so a checkout whose
 `catalog:load` has never run has an empty catalog and 42 recipe files that no
 `recipe_versions` row corresponds to.
@@ -55,18 +60,24 @@ loaded data** — committing it puts no row in any database, so a checkout whose
 | `npm run recipes:seed` | **Writes.** Publishes the 42 committed recipe files as `recipe_versions` rows with their immutable ingredient snapshots against the catalog loaded in `DATABASE_URL`, is idempotent by slug (an unchanged recipe is a no-op; changed content or a stale ingredient snapshot publishes a new version, retires the previous one and moves `recipes.current_version_id` in one transaction), refuses the whole run — publishing nothing — if any file fails validation, and rewrites `data/meal-planning/recipes/coverage-report.json` from the seeded rows on a full run (`--dry-run` and `--only <slug>` both leave it alone). |
 | `npm run search:benchmark` | **Reads only,** by design. It measures `catalog.service.searchPublishedFoods` in process against the fixed query set in `data/meal-planning/search-benchmark.v1.json` under that file's own protocol — one untimed warm-up pass over the whole set, then the three timed passes it declares (`--passes <n>` overrides the count for diagnosis) — scores the top-three and top-ten hit rates, the zero-result rate and p95 latency, and writes `data/meal-planning/reports/latest/benchmark-report.json` (`--out` overrides the path). It is **fail-closed**: a threshold it does not meet exits non-zero with a verdict block naming the metric, its measured value and its bound, and an input it cannot see is refused as `stage_prerequisites_unmet` before it measures anything. Writing no row is a property of a measurement, not a missing stage. |
 
-The benchmark report committed in this repository (`generatedAt`
-2026-09-17T11:13:16Z) records a **passing** verdict against release v1:
-`topThreeHitRate` measured 0.948 against a bound of 0.9 and `topTenHitRate`
-0.991 against 0.97, with a zero-result rate of 0 and a p95 of 80.5 ms, both
-inside theirs. That is a measurement of one database at one moment, which is
+The benchmark report committed in this repository records a **passing** verdict
+against release v1: every one of the four thresholds
+`data/meal-planning/search-benchmark.v1.json` declares — `topThreeHitRate` at
+least 0.9, `topTenHitRate` at least 0.97, the zero-result rate at most 0.03 and
+p95 latency at most 150 ms — was met. The bounds are reviewed policy and do not
+move, which is why they can be named here; the **measured** hit rates and
+latencies are not, because a figure copied into this procedure goes stale the
+next time the release is cut. They live in
+`data/meal-planning/reports/latest/benchmark-report.json` beside the
+`generatedAt` of the run that produced them, which is where a reader should read
+them. And that verdict is a measurement of one database at one moment, which is
 exactly why the verify-before-enable gate in step 5 is a gate and not a
 formality — the report that decides it is the one a target environment's own run
 writes, and a committed pass says nothing about the release a different database
-has loaded. The thresholds themselves are reviewed policy and are recorded in
+has loaded. The thresholds' own record is
 [`catalog-policy.md`](./catalog-policy.md), and
 [`requirement-evidence-checklist.md`](./requirement-evidence-checklist.md) is
-where each run's real outcome is tracked; it is not re-argued here.
+where each run's real outcome is tracked; neither is re-argued here.
 
 The HTTP surface those steps verify is mounted. `src/app.ts` mounts
 `catalogRoutes` and `mealPlanningRoutes` under `/api`, both **after**

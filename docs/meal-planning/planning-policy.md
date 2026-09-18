@@ -1353,8 +1353,8 @@ measure: "227 g" is a plainer line than "1 tub", and it is the amount that was
 actually measured.
 
 **The boundary between the two lists and the rest of the catalogue is drawn
-deliberately, and it is this.** 702 of the 3,022 count-family default portions
-in the committed release match; the other 2,320 keep counting:
+deliberately, and it is this.** 776 of the 3,454 count-family default portions
+in the committed release match; the other 2,678 keep counting:
 
 - **A vessel, a tabulation unit or a dose is measured.** Cans, jars,
   containers, packages, packets, bags, pouches, envelopes and serving bowls;
@@ -1362,18 +1362,21 @@ in the committed release match; the other 2,320 keep counting:
   dinners, items and units; scoops, single-serve "individual" references and a
   "recipe yield". None of them says how much food it holds.
 - **A bare size or grade label with no item noun keeps counting** — "regular"
-  (106 rows), "miniature" (75), "miniature/bite size" (67), "whole" (13), "bite
-  size", "slice, any size", "cubic inch". These are terse labels the catalogue
-  wrote on a countable item, not containers and not serving references, so
-  counting them prints the thing the shopper buys a number of. Measuring them
-  would be a different decision from the one this rule makes, and it would move
-  hundreds of truthful count lines onto the scales.
+  (104 rows), "miniature" (75), "miniature/bite size" (67), "slice, any size"
+  (29), "cubic inch" (14), "whole" (13), "bite size" (2). Every one of those
+  shapes is shipped by at least one row of the committed release, which is the
+  point: the boundary is drawn against descriptions the catalogue actually
+  wrote, not against invented ones. These are terse labels the catalogue wrote
+  on a countable item, not containers and not serving references, so counting
+  them prints the thing the shopper buys a number of. Measuring them would be a
+  different decision from the one this rule makes, and it would move hundreds of
+  truthful count lines onto the scales.
 - **A description whose head noun is a real item keeps counting** — slice,
   piece, sandwich, fillet, patty, chop, rib, steak, link, egg, clove, apple,
   cookie, cracker, waffle, muffin, roll, bar, cone, cube, wedge, pod, ear,
   leaf, fruit, berry, cake, pie, pizza, taco, tortilla, pita, pickle, ball,
   tablet and the rest of the release's item vocabulary.
-- **`yield` and `refuse` are words in neither list**, because 57 counting rows
+- **`yield` and `refuse` are words in neither list**, because 52 counting rows
   are real items USDA happens to describe through their yield ("rib (yield
   after cooking, bone removed)", "steak (yield from 181 g raw meat)", "pod,
   yields"). The one yield form that is not an item, "recipe yield", is matched
@@ -1381,7 +1384,7 @@ in the committed release match; the other 2,320 keep counting:
 
 `grocery.logic.test.ts` pins this boundary as a corpus: one case per form family
 the release actually ships, on both sides, each quoted verbatim with its row
-count, plus a sweep that re-derives the 3,022 / 702 / 2,320 split from
+count, plus a sweep that re-derives the 3,454 / 776 / 2,678 split from
 `data/meal-planning/catalog/releases/v1/portions.jsonl`. Adding a word carelessly
 and leaving a form family out both fail it.
 

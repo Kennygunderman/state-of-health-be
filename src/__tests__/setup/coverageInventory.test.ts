@@ -13,6 +13,7 @@ import config, {
 import { ModelBudgetError, getCatalogModelCallBudget } from '../../../scripts/lib/budget';
 import {
     DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR,
+    USDA_IMPORT_POLICY_CAP_PER_HOUR,
     USDA_VENDOR_CAP_PER_HOUR,
 } from '../../../scripts/lib/rateLimiter';
 import {
@@ -2110,6 +2111,21 @@ const USDA_VENDOR_CLAIMS: readonly GatedClaim[] = [
         expected: [USDA_VENDOR_CAP_PER_HOUR - DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR],
     },
     {
+        // The ceiling, which is a DIFFERENT claim from the default above even
+        // though both print the same number today: the default is the value
+        // taken when the variable is unset, and this is the bound nothing may
+        // configure past. The prose stating only the default is what sent an
+        // operator to a rate the tool refuses, so the refusal is gated too —
+        // against `USDA_IMPORT_POLICY_CAP_PER_HOUR`, the constant
+        // `getUsdaImportRateLimitPerHour` enforces, rather than against the
+        // default that happens to alias it (see the assertion of that alias in
+        // the test below).
+        what: 'the import ceiling no configuration may raise the rate past',
+        pattern: /above \*\*(\d+) \(the import ceiling, product policy\)\*\* does not raise the pace/,
+        source: RATE_LIMITER_PATH,
+        expected: [USDA_IMPORT_POLICY_CAP_PER_HOUR],
+    },
+    {
         what: 'the physical attempts one logical USDA call may cost',
         pattern: /retry behaviour of up to (\w+) physical attempts/,
         source: USDA_SERVICE_PATH,
@@ -3376,6 +3392,20 @@ describe('policy-document drift gate', () => {
         it('states the USDA vendor limits the import is paced and shaped by', () => {
             expectGatedClaims(catalogPolicy, 'usda-vendor-limits', USDA_VENDOR_CLAIMS);
             expectGatedClaims(catalogPolicy, 'usda-rate-limit-recap', USDA_RATE_LIMIT_RECAP_CLAIMS);
+
+            // THE ALIAS THE BLOCK'S TWO RATE SENTENCES BOTH DEPEND ON. The
+            // prose states 900 twice — once as the value taken when
+            // `USDA_IMPORT_RATE_LIMIT_PER_HOUR` is unset, once as the ceiling
+            // nothing may configure past — and each of those sentences is
+            // pinned above against the constant that owns it. Both are true
+            // only while `DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR` IS
+            // `USDA_IMPORT_POLICY_CAP_PER_HOUR` (rateLimiter.ts declares the
+            // default as the cap rather than as a second literal). Splitting
+            // them — a default below the cap, say — would leave both gated
+            // claims passing against different numbers while the paragraph read
+            // as though one number did both jobs, so the identity is asserted
+            // here rather than inferred.
+            expect(DEFAULT_USDA_IMPORT_RATE_LIMIT_PER_HOUR).toBe(USDA_IMPORT_POLICY_CAP_PER_HOUR);
 
             // The status the paragraph names as a retried attempt is one of the
             // statuses the service actually retries. `RETRYABLE_STATUSES` is

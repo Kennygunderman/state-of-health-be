@@ -66,14 +66,14 @@ The ten in-scope areas, in the order the specification numbers them.
 | --- | --- | --- | --- | --- |
 | 1 | Seven-step onboarding (intro → goal → body → activity → diet and allergies → food preferences → schedule → cooking and budget), plus editing any answer from the review and plan-settings rows. | tested + ready-for-human-review | API `src/services/__tests__/preferences.logic.test.ts` pins the step parsers, allergen exclusivity (`isNoAllergenSelection`), metric normalisation, the slot/time validation per schedule and time-zone normalisation; `src/__tests__/api/preferences.test.ts` pins that a step save advances the state machine without moving it backwards in edit mode, that a save recomputes an active plan's incompatibility flags, and that a stale `expectedRevision` loses exactly one of two concurrent edits. `app: src/components/MealPlanSetupProvider/__tests__/index.util.test.ts` pins the draft reducers; the per-screen `index.util.test.ts` files pin each step's first-entry state and validate-on-press behaviour. | Resume-after-restart is server-persisted and covered by the API suite. What remains is visual: the eight screens against their frames, the native status bar and safe areas, dynamic type and VoiceOver — none reproducible without a device (see [the checklist](#the-physical-device-checklist--unrun)). Four screens (intro, activity, food preferences, food search) carry no `index.util.ts` and so correctly carry no util test: they hold no derivation worth pinning, their state living in the setup provider and the catalogue queries. |
 | 2 | Deterministic target estimate, reviewed and editable, persisted through the existing user-target columns, with planner, diary and account showing identical values. | tested + ready-for-human-review | API `src/services/__tests__/targets.logic.test.ts` pins the energy equation, the activity factor, the goal adjustment, the bound clamps and which bound bound it (`applyTargetBounds`), the macro split, manual-target parsing (including the rejection of a zero macro) and `assessFeasibility`. `src/__tests__/api/targets.test.ts` pins the canonical read, a confirmed estimate surviving later preference saves as stale-but-unchanged, the pinned revision used as a write predicate, and the publication gate against the untouched legacy writer. `src/__tests__/api/compat.test.ts` pins that the legacy target writer is unchanged. `app: src/queries/mealPlanning/__tests__/useSaveNutritionTargetsMutation.util.test.ts` pins the exact invalidation set that makes the diary and account agree after a save. | Bounds and their provenance labelling live in [`planning-policy.md`](./planning-policy.md) §1; they are not restated here. The cross-surface parity is asserted at the data layer — one write, one read, one invalidation set. That the three surfaces *render* the same number is a visual check on a device. |
-| 3 | Repeatable USDA import and AI-assisted catalogue expansion producing the required published count, each item with a machine-readable validation record, searchable inside the existing Add Food screen. | tested; **one requirement unmet** | API `src/services/__tests__/catalog.logic.test.ts` pins the check tiers, the per-category bounds, canonical-name normalisation, the deterministic `source_key`, identity de-duplication and brand-pattern rejection. `src/services/__tests__/evidence.logic.test.ts` pins the retrieval policy row by row against the committed address table. `src/__tests__/scripts/catalog-import.test.ts` and `catalog-generate.test.ts` pin interruption, checkpoint and budget resume, and an identical rerun producing no duplicate `source_key`; `catalog-load.test.ts` pins load, no-op rerun, recovery after partial progress and a release upgrade. `src/__tests__/api/catalog.test.ts` pins the publication filter, one row per canonical food however many aliases matched, and the catalogue body accepted by the existing diary endpoint. Reports: `data/meal-planning/reports/latest/validation-report.json` and `import-report.json`. | **Unmet, on both counts.** 9,422 published foods against a requirement of 10,000 — **578 short** — though 9,422 of 9,422 carry a validation record with none missing. 13 of the 21 categories sit below their per-category target, **2,392 items short** in total — reported exactly in the report's `coverageGaps` and as `requirementMet: false`, never smoothed against the 8 categories that over-deliver. Every published record now carries a complete identity retrieval with an observed 2xx status, which the previous release did not. Search relevance over the loaded release is **met** and measured — see [the search benchmark](#the-search-benchmark-is-met-and-what-it-does-not-cover). The Add Food surface itself is `ready-for-human-review`. |
+| 3 | Repeatable USDA import and AI-assisted catalogue expansion producing the required published count, each item with a machine-readable validation record, searchable inside the existing Add Food screen. | tested; **the per-category plan unmet** | API `src/services/__tests__/catalog.logic.test.ts` pins the check tiers, the per-category bounds, canonical-name normalisation, the deterministic `source_key`, identity de-duplication and brand-pattern rejection. `src/services/__tests__/evidence.logic.test.ts` pins the retrieval policy row by row against the committed address table. `src/__tests__/scripts/catalog-import.test.ts` and `catalog-generate.test.ts` pin interruption, checkpoint and budget resume, and an identical rerun producing no duplicate `source_key`; `catalog-load.test.ts` pins load, no-op rerun, recovery after partial progress and a release upgrade. `src/__tests__/api/catalog.test.ts` pins the publication filter, one row per canonical food however many aliases matched, and the catalogue body accepted by the existing diary endpoint. Reports: `data/meal-planning/reports/latest/validation-report.json` and `import-report.json`. | **Met on the required count; unmet per category.** 10,928 published foods against a requirement of 10,000 — a **surplus of 928**, recorded as `requirementMet: true` — and 10,928 of 10,928 carry a validation record, with none missing. 13 of the 21 categories remain below their per-category target, **2,361 items short** in total — reported exactly in the report's `coverageGaps` and as `every_category_meets_its_target: false`, never smoothed against the 8 categories that over-deliver. Of that shortfall **187** items could at most be closed by resolving records the pipeline withheld and **2,174** exceed every row the vendor returned for their category. Every published record carries a complete identity retrieval with an observed 2xx status. Search relevance over the loaded release is **met** and measured — see [the search benchmark](#the-search-benchmark-is-met-and-what-it-does-not-cover). The Add Food surface itself is `ready-for-human-review`. |
 | 4 | Seeded recipe catalogue whose ingredients are all imported catalogue foods, with instructions, yield, serving description, times, diet and allergen metadata, and a documented budget tier. | tested | API `src/services/__tests__/recipe.logic.test.ts` pins nutrition derived from stored gram weights, the derivation of allergen tags, allergen status and diet tags from the full ingredient set, badge derivation, and ingredient-snapshot staleness across both the nutrition and metadata versions. `src/__tests__/api/seed-rerun.test.ts` pins the committed corpus, referential closure inside the database, the planning preconditions every ingredient must satisfy, recipe nutrition recomputed from the stored rows, and the declarations the corpus makes about itself. `src/__tests__/scripts/recipes-seed.test.ts` pins the no-op rerun, version promotion on changed content, a declared-versus-derived tag mismatch failing the run, and an unknown ingredient key failing it. Report: `data/meal-planning/recipes/coverage-report.json`. | 42 recipes against a floor of 40, with 269 ingredient rows. The seed is idempotent and its report is reproducible: re-running it here rewrote the coverage report **byte-identically** to the committed one. The report states its own boundary — combinations outside the guaranteed and reduced cells are supported at runtime but not guaranteed, and the planner answers such a user with a limiting-constraint code rather than an empty plan. |
 | 5 | Persisted seven-day plan with explicit local dates, slots, recipe versions and portion multipliers; the app reopens the saved plan. | tested + ready-for-human-review | API `src/services/__tests__/mealPlan.logic.test.ts` pins the seed derivation, candidate construction and its portable pre-order, the repetition rule, the scoring terms, the tie-break fixture (`compareCandidateMoves`) and day-tolerance evaluation. `src/__tests__/api/plans.test.ts` pins every field the plan mapper derives, current-versus-upcoming resolution, the day read and regeneration. `src/__tests__/api/concurrency.test.ts` pins the per-user advisory lock, a superseded plan addressed by its old id and revision, and two parallel requests carrying one idempotency key. `app: src/screens/Macros/components/MealPlanTab/__tests__/index.util.test.ts` pins plan selection, rollover and stale-selection reset. | Determinism is a property of candidate generation, and the tie fixture is what pins it. Reopening the saved plan is exercised at the query layer; that the saved week *appears* on reopening a real app is a device check. |
 | 6 | Recipe detail with the portion display toggle, ingredient quantities, serving size and planned daily totals. | tested + ready-for-human-review | API `src/services/__tests__/recipe.logic.test.ts` pins ingredient scaling as a pure function, so the toggle cannot alter stored data; `src/__tests__/api/recipes.test.ts` pins the response shape, the frozen ingredient snapshot, the closed code sets, and that a retired version is caller-scoped while a current one is shared reference data. `app: src/screens/RecipeDetail/__tests__/index.util.test.ts` pins the toggle's derived quantities and the planned-context composition. | The requirement that the toggle changes displayed amounts only is enforced structurally: the scaling function is pure and no write path exists from this screen. Layout fidelity is visual. |
 | 7 | Swap flow across its states, plus the editable consumed portion at logging time. | tested + ready-for-human-review | API `src/services/__tests__/swap.logic.test.ts` pins one candidate selector shared by the list, preview and commit, portion selection, ranking, the empty-alternatives outcome, the bound-portion requirement, and a logged meal swapped twice. `src/__tests__/api/swaps.test.ts` pins the commit gates, the grocery consequences, the idempotency ledger and a grocery rebuild failing after the meal was written. `src/__tests__/api/fault.test.ts` pins the injected swap fault and a swap whose response is lost after it commits. `app: src/screens/SwapMeal/__tests__/index.util.test.ts`, `index.orchestration.test.ts`, `app: src/screens/SwapPreview/__tests__/index.util.test.ts` and `app: src/queries/mealPlanning/__tests__/useSwapMealMutation.util.test.ts` pin the four screen states and the cache contract. | The drawn loading, empty and failure states are reachable on a device only through the development-only fault-injection variable, whose values are documented in [`README.md`](./README.md). The unconfirmed-outcome variant is distinct from the drawn failure and is pinned by the fault suite. |
 | 8 | Weekly grocery checklist: aggregation, aisle grouping, persisted checks, uncheck-all, flagged increases on already-checked items, and the distinct no-plan versus empty-plan states. | tested + ready-for-human-review | API `src/services/__tests__/grocery.logic.test.ts` pins planned grams per ingredient, aggregation by food and state, the epsilon at which two quantities are equal, change classification, unit-family stability, display construction and row building. `src/__tests__/api/grocery.test.ts` pins the list aggregated from planned portions, a single check mark, uncheck-all, and ownership with the capability gate. `src/__tests__/api/concurrency.test.ts` pins a toggle racing the rebuild a swap performs. `app: src/screens/GroceryList/__tests__/index.util.test.ts` pins the row variants, the two empty states and the presence rule for the uncheck-all action; the two grocery mutation option-factory tests pin the optimistic write and its rollback. | The flagged-increase rule is the subtle one and the logic suite pins it: an increase on a checked row keeps the check and compares against the **last acknowledged** amount, a sub-epsilon change is neither an increase nor a decrease, and a decrease produces no flag. |
 | 9 | Planned-meal logging into the current diary bucket with the server-derived snapshot, idempotent under retries, carrying the provenance caption. | tested + ready-for-human-review | API `src/services/__tests__/plannedMealLog.logic.test.ts` pins the facts a planned entry carries, the portion and snapshot derivation, consumed totals and the diary-meal acceptability rules. `src/__tests__/api/log.test.ts` pins the bucket a planned log targets, the rounding contract, the idempotency ledger and the logged state derived from the diary. `src/services/__tests__/nutrition.logic.test.ts` pins the payload discrimination and the edit that detaches an entry from its plan. `src/__tests__/api/fault.test.ts` pins a planned log whose response is lost after it commits, replaying the stored response rather than writing twice. `app: src/data/models/__tests__/MealEntry.test.ts` pins every provenance caption, and `app: src/queries/api/macros/__tests__/MacrosDecoder.test.ts` pins the absent, null and populated forms of the new fields. | The caption *string* is pinned by the app model test; the caption *as rendered* under a diary row is visual. Deleting or editing the diary entry changing the plan's logged state is covered by the two diary mutation option-factory tests. |
-| 10 | The API surface — routes, controllers, services, types, the additive migration, a real Jest suite replacing the stub, the CLI scripts, the data manifests, the handoff documents, and a PostgreSQL service in CI. | tested, with one named gap | Routes and controllers are mounted and covered by the `src/__tests__/api/*` suites; `src/__tests__/api/ownership.test.ts` pins the route inventory it is built from. The migration is evidenced by two committed artefacts and the one gate that polices both — [`expected-schema-diff.sql`](./expected-schema-diff.sql), the captured `prisma migrate diff --script` output compared as a whole file, and [`schema-catalog-evidence.sql`](./schema-catalog-evidence.sql), the `pg_catalog` extraction and expected result for the expression index, partial-index predicates and array `NOT NULL` that command cannot see — plus the dual-ledger equivalence check in `src/__tests__/api/compat.test.ts`. The stub is gone: `npm test` is a real Jest run of 51 suites, its coverage gate derived from disk by `jest.config.ts` and pinned by `src/__tests__/setup/coverageInventory.test.ts`. `src/__tests__/setup/testDb.test.ts` proves the database guard from outside the process it protects. Scripts are covered by `src/__tests__/scripts/*`. CI declares the PostgreSQL service and every gate. Both repositories' handoff documents are present: this folder's six here, and `app: docs/meal-planning.md` in the app repository, which `app: README.md` links. | **The gap:** the CI workflow has not been observed running on a hosted runner from here; each of its steps was executed locally instead, and the results are in [What was verified](#what-was-verified-in-this-environment). |
+| 10 | The API surface — routes, controllers, services, types, the additive migration, a real Jest suite replacing the stub, the CLI scripts, the data manifests, the handoff documents, and a PostgreSQL service in CI. | tested, with one named gap | Routes and controllers are mounted and covered by the `src/__tests__/api/*` suites; `src/__tests__/api/ownership.test.ts` pins the route inventory it is built from. The migration is evidenced by two committed artefacts and the one gate that polices both — [`expected-schema-diff.sql`](./expected-schema-diff.sql), the captured `prisma migrate diff --script` output compared as a whole file, and [`schema-catalog-evidence.sql`](./schema-catalog-evidence.sql), the `pg_catalog` extraction and expected result for the expression index, partial-index predicates and array `NOT NULL` that command cannot see — plus the dual-ledger equivalence check in `src/__tests__/api/compat.test.ts`. The stub is gone: `npm test` is a real Jest run of 56 suites, its coverage gate derived from disk by `jest.config.ts` and pinned by `src/__tests__/setup/coverageInventory.test.ts`. `src/__tests__/setup/testDb.test.ts` proves the database guard from outside the process it protects. Scripts are covered by `src/__tests__/scripts/*`. CI declares the PostgreSQL service and every gate. Both repositories' handoff documents are present: this folder's six here, and `app: docs/meal-planning.md` in the app repository, which `app: README.md` links. | **The gap:** the CI workflow has not been observed running on a hosted runner from here; each of its steps was executed locally instead, and the results are in [What was verified](#what-was-verified-in-this-environment). |
 
 ### Ownership and error behaviour
 
@@ -106,66 +106,115 @@ from a report. The search benchmark, whose bounds the same measurement
 previously missed, now clears all four; what it covers and what it does not is
 stated with it.
 
-#### The published catalogue count and the per-category plan are both unmet
+#### The required published count is met; the per-category plan is not
 
-Neither the aggregate nor the per-category requirement is met. The catalogue
-publishes **9,422 foods against the requirement of 10,000** — 578 short — and
-**13 of 21 categories are below target, 2,392 items short in total**, while 8
-categories over-deliver. A surplus in one category cannot substitute for a
+The aggregate requirement is met and the per-category one is not, so both are
+stated. The catalogue publishes **10,928 foods against the requirement of
+10,000** — a surplus of **928**, recorded as `requirement_met: true` in the
+release manifest's `acceptance` block — and every one of them is validated and
+carries its own validation record (**10,928 of 10,928**, none missing). But
+**13 of 21 categories are below their published target, 2,361 items short in
+total**, while 8 over-deliver. A surplus in one category cannot substitute for a
 shortfall in another, and recipe eligibility draws on specific categories, so
-both figures are reported rather than netted.
+the per-category figure is reported rather than netted against them.
 
-The shortfall has two measured causes, and neither is a defect in the pipeline.
-The USDA import plans **10,003 records** from the curated manifest — 13,619
-generic vendor records less 2,250 skipped once a category's candidate volume was
-reached, 1,077 brand-pattern names, 282 excluded data classes and 152 curated
-duplicates — so publishing every candidate could not on its own reach 10,000.
-AI generation, which the plan intends to fill the remainder, ran here and
-contributed **nothing publishable**: 3,788 candidates proposed over 159 metered
+The per-category shortfall is broken down rather than left as one number:
+**187** of those 2,361 items could at most be closed by resolving a withholding
+over rows already imported — the withheld identities and their failing checks
+say which — and **2,174** exceed every row the vendor returned for their
+category, so no re-validation, bound change or curator pass can produce them.
+The plan's per-category targets sum to **11,010**, deliberately above the
+requirement so late quarantines cannot put the required count at risk (AAP
+§0.7.3), which is why a per-category gap is a coverage statement rather than a
+size one — and it is still carried here as an unmet requirement, not as a
+metric.
+
+**What closed the aggregate count was curated vendor volume, not the model.**
+The USDA import now plans **12,057 records** where the release this one
+supersedes planned 10,003: 13,619 generic vendor records less 282 excluded data
+classes, 1,077 brand-pattern names, 153 curated duplicates (145 matched by FDC
+id, 8 by canonical identity) and 195 refused once a category's candidate volume
+was reached, plus the manifest's 145 curated entries. The whole of the
+difference from the earlier run sits in one new counter:
+**`admittedByRequirementHeadroom` 2,054** counts records a category's
+candidate-volume cap would previously have skipped, planned anyway because the
+run's total planned count was still below the `plannedVolumeFloor` of **11,300**
+that `usda-manifest.v1.json`'s `requirementHeadroom` block derives from the
+requirement itself. That rule is bounded and declared in committed data rather
+than passed as a flag: it applies only to a run over the whole coverage plan,
+only while the planned total is under the floor, and the moment the floor is
+reached the per-category cap applies again with `skippedCategoryVolumeReached`
+keeping its original meaning. No per-category `publishedTarget` or
+`candidateVolume` moves, and an admitted record is an ordinary vendor record —
+fetched, classified and judged by the same checks as every other,
+`identity_source: 'usda'` with `nutrition_provenance: 'source_backed'`.
+
+AI generation, which the plan intends to fill a remainder, contributed **nothing
+publishable**, and the delivered release contains no generated row at all: all
+10,928 published foods are `identity_source: 'usda'` and
+`nutrition_provenance: 'source_backed'`, and the manifest's
+`published_ingredient_derived` is 0. The committed import report's generation
+stage is a **dry run** over the re-cut plan — 157 planned batches, 3,762 AI
+candidates planned, 0 executed, 0 model calls used, 0 candidates proposed,
+`aiEvidence.verified` 0 — so it measures the plan rather than a spend. The
+generation run that **did** reach the model provider was measured against the
+superseded release and is preserved in this repository's history, at commit
+`d0ad935`'s `import-report.json`: 3,788 candidates proposed over 159 metered
 model calls, 1,127 removed as duplicates, and every surviving row held in
 quarantine on the `unsourced` check because its proposed identity evidence could
 not be retrieved from an allow-listed host (`fetch_failed` on 528 candidates).
-The model proposes plausible deep URLs that do not exist, the one authoritative
-allow-listed food page is a JavaScript application whose served body never
-contains the food name, and the pages that do resolve sit outside the allowlist.
-Widening the allowlist to admit them would be manufacturing provenance, which
-§0.1.2 forbids, so the shortfall is reported as unmet.
+Those figures are history here, not evidence for this release, and the reason
+they did not improve is unchanged: the model proposes plausible deep URLs that do
+not exist, the one authoritative allow-listed food page is a JavaScript
+application whose served body never contains the food name, and the pages that do
+resolve sit outside the allowlist. Widening the allowlist to admit them would be
+manufacturing provenance, which §0.1.2 forbids — which is why the count was
+closed from reviewed vendor volume instead.
 `validation-report.json` and `import-report.json` carry the per-category figures
 and the exact gaps; the plan and its bounds are in
 [`catalog-policy.md`](./catalog-policy.md).
 
-Both of those artefacts record the import, generation and validation run that
-built the catalogue, and they are what that run measured — including its
-`checkVocabulary` of **21 names**, which is the vocabulary the validator carried
-when it judged those rows. The vocabulary is now **23**: `unknown_tag_code` and
-`inconsistent_tag_set` judge the two safety tag lists, and the stage that judges
-a stored row supplies both lists from the row, so a re-validation records both on
-every item. Refreshing these two artefacts means re-running the import and
-generation stages that produced the corpus they describe — a run that reaches
-USDA and the model provider — so they are left as the measurement they are
-rather than half-rewritten, and `catalog-report.ts` reports an item whose record
-predates a check as an **unexplained gap** (a row to re-validate) rather than
-explaining the absence away.
+Both of those artefacts were **re-produced by the run that cut this release**
+(the import-stage write at 2026-09-18T17:03:32Z, the validation stage at
+17:03:47Z), so they measure the corpus they describe rather than an earlier one.
+They record the validator's `checkVocabulary` of **23 names** — where the
+superseded artefacts carried 21 — the two additions being `unknown_tag_code` and
+`inconsistent_tag_set`, which judge the two safety tag lists; the stage that
+judges a stored row supplies both lists from the row, so every item's record
+carries both. The completeness that follows is asserted rather than assumed:
+`perItemCompleteness.itemsWithAnUnexplainedAbsence` is **0** across the 196,704
+check entries recorded over the 10,928 published rows. `catalog-report.ts` still
+reports an item whose record predates a check as an **unexplained gap** (a row to
+re-validate) rather than explaining the absence away; this release gives it none
+to report.
 
 #### The search benchmark is met, and what it does not cover
 
 `npm run search:benchmark` **fails closed and exits non-zero** on any threshold
-it does not meet. Run here against the loaded release it met all four: a top-3
-hit rate of 0.958 (408 of 426 queries) and a top-10 hit rate of 0.991 (422 of
-426) against the bounds of 0.9 and 0.97, a zero-result rate of 0, and a p95
-latency of 93.7 ms over 1,278 timed samples. The committed
-`data/meal-planning/reports/latest/benchmark-report.json` records that verdict
-and the per-query detail behind it, and the pagination check passed with no
-repeated and no dropped row.
+it does not meet. Run here against the loaded release it met **all four**: the
+bounds are a top-3 hit rate of at least 0.9, a top-10 rate of at least 0.97, a
+zero-result rate of at most 0.03 and a p95 latency of at most 150 ms — contract
+values owned by `data/meal-planning/search-benchmark.v1.json`, not measurements,
+which is why they can be stated here without dating. The measured rates and
+latencies behind that verdict live in the committed
+`data/meal-planning/reports/latest/benchmark-report.json` (`generatedAt`
+2026-09-18T17:13:18.728Z) together with the per-query detail, and check 15 above
+records the run's headline outcome. They are deliberately not copied a third
+time into this section: a figure inlined into prose is a figure that goes stale
+the next time the release is cut, which is exactly what happened to the two
+policy documents before this one. The pagination check passed with no repeated
+and no dropped row.
 
 That report is the acceptance evidence for search quality, and it is evidence
-for exactly the corpus and conditions it names — release v1 at 9,422 published
-foods, measured in process against
-`catalog.service.searchPublishedFoods` — and for no others. Four queries still
-sit outside the top ten and are named in the report rather than averaged away:
-q023 `crackers` (rank 21 of 81 matches), q236 `mushrooms` and q237 `mushroom`
-(13 of 93), and q382 `chicken` (12 of 660). A pass at 0.991 is not a claim that
-every common-food search is answered well.
+for exactly the corpus and conditions it names — release v1 at 10,928 published
+foods, measured in process against `catalog.service.searchPublishedFoods` — and
+for no others. Four queries still sit outside the top ten and are named in the
+report rather than averaged away: q023 `crackers`, whose expected row now falls
+outside the measured page altogether, at position 35 of 108 matches; q236
+`mushrooms` and q237 `mushroom`, both at rank 13 of 99; and q382 `chicken` at
+rank 12 of 672. The top-10 rate counts all four as misses rather than smoothing
+them, and a pass at that rate is not a claim that every common-food search is
+answered well.
 
 The Jest suite `src/__tests__/api/benchmark.test.ts` exercises the same
 mechanics over a synthetic corpus and is **explicitly not acceptance
@@ -173,19 +222,22 @@ evidence**: a synthetic corpus can show that ranking, paging and the zero-result
 path behave, but it cannot show that real common-food searches find real foods.
 A green run of it must never be cited as though the bar were met.
 
-The run also established release determinism. All 426 queries returned the same
-rank and the same match-set total on all three timed passes, and the release was
-then loaded into a second, independently created database and measured there.
-Handing that peer report back to the runner
-(`npm run search:benchmark -- --compare-with <peer-report.json>`) recorded the
-comparison machine-readably: **426 of 426 per-query ranks identical, 20 of 20
-portable page sequences identical, the two `determinismFingerprint` digests
-equal**, and the two databases positively established as `distinct` from the
-PostgreSQL system identifier and database oid each run read back — with latency
-the only figure that differed. That is the reproducibility property the release
-ordering was designed for, and it is what makes the figures above a property of
-the release rather than of one load. The committed artefact is the single-run
-report, so its own `crossDatabaseReproduction` block records
+The run also established release determinism. Every query returned the same rank
+and the same match-set total on all three timed passes — the report records that
+per query, in `rankStableAcrossPasses` — and the release was then loaded into a
+second, independently created database and measured there. Handing the committed
+report back to the runner as the peer
+(`npm run search:benchmark -- --out <mine.json> --compare-with
+data/meal-planning/reports/latest/benchmark-report.json`) recorded the
+comparison machine-readably: **every per-query rank identical, every portable
+page sequence identical, the two `determinismFingerprint` digests equal**, and
+the two databases positively established as `distinct` from the PostgreSQL
+system identifier and database oid each run read back — with latency the only
+figure that differed. The counts behind that outcome are in check 16 above,
+which is the row that run belongs to. That is the reproducibility property the
+release ordering was designed for, and it is what makes the report's figures a
+property of the release rather than of one load. The committed artefact is the
+single-run report, so its own `crossDatabaseReproduction` block records
 `not_evaluated_by_a_single_run` together with the four commands that reproduce
 the comparison above.
 
@@ -256,14 +308,22 @@ those artefacts are for, and why this table names them instead of copying them.
 So: headline outcome here, full measurement in the artefact that measured it,
 and neither in the policy documents.
 
-Provenance: the delivered tree — the API submodule at `8da2223` plus the
-documentation and drift-gate changes in this change set — measured on
-2026-09-17. Environment: Linux container, Node 22.23.2 with npm 11.18.0,
-TypeScript 5.8.3, and a local PostgreSQL 16.15 reached over loopback. Database
-roles follow the guard's own rule: a `*_test` database for the suite, a separate
-development database for the migration, load, seed and benchmark runs, and a
-disposable shadow database for the schema diff. No value of `DATABASE_URL` or of
-any credential appears in this document.
+Provenance: the delivered tree — the API submodule at `b4e0e27` and the app
+submodule at `487a66a`. The runs were executed as the work landed, on 2026-09-17
+and 2026-09-18, and every figure below that the grown catalogue release, the
+suites or the lint baseline moved was **re-measured on those two commits**
+rather than carried forward: checks 7, 12, 13, 15, 16, 21, 22 and 23 state what
+a run on this tree returned. Where a row quotes a generated report, the report's
+own `generatedAt` is quoted beside the figures so the measurement dates itself.
+One row measures the release as it stood **before** it was re-cut and says so in
+place — check 14's byte-identical coverage report, whose full re-run would
+rewrite a committed artefact rather than re-read one. Environment: Linux
+container, Node 22.23.2 with npm 11.18.0, TypeScript 5.8.3, and a local
+PostgreSQL 16.15 reached over loopback. Database roles follow the guard's own
+rule: a `*_test` database for the suite, a separate development database for the
+migration, load, seed and benchmark runs, and a disposable shadow database for
+the schema diff. No value of `DATABASE_URL` or of any credential appears in this
+document.
 
 | # | Check | Command | Outcome |
 | --- | --- | --- | --- |
@@ -272,24 +332,24 @@ any credential appears in this document.
 | 3 | API typecheck (tests config) | `npm run typecheck:test` | **exit 0** |
 | 4 | API typecheck (scripts config) | `npm run typecheck:scripts` | **exit 0** |
 | 5 | API build | `npm run build` | **exit 0** |
-| 6 | Migration ledger applied | `npx prisma migrate deploy` on two freshly created databases | **exit 0** on both; `20260706000000_init`, `20260908000000_meal_planning` and `20260909000000_usda_cache_http_status` applied in that order |
-| 7 | API suite with coverage | `NODE_ENV=test ALLOW_DB_TRUNCATE=true npm test` (the gate's own invocation: `jest --ci --runInBand --coverage`) | **51 of 51 suites passed.** 9,451 tests passed, 9,451 total, in 572 s, **nothing skipped** — a skip is not a pass, so the run carrying none is stated rather than left to be counted. **No coverage threshold was violated** — the per-file figures are [below](#per-file-branch-coverage-from-check-7) |
+| 6 | Migration ledger applied | `npx prisma migrate deploy` on two freshly created databases | **exit 0** on both; all four of `20260706000000_init`, `20260908000000_meal_planning`, `20260909000000_usda_cache_http_status` and `20260910000000_catalog_prefix_fold_indexes` applied in that order, which is the whole of `prisma/migrations/` |
+| 7 | API suite with coverage | `NODE_ENV=test ALLOW_DB_TRUNCATE=true npm test` (the gate's own invocation: `jest --ci --runInBand --coverage`) | **56 of 56 suites passed.** 10,717 tests passed, 10,717 total, in 617 s, **nothing skipped** — a skip is not a pass, so the run carrying none is stated rather than left to be counted. **No coverage threshold was violated** — the per-file figures are [below](#per-file-branch-coverage-from-check-7) |
 | 8 | Test-database guard, wrong `NODE_ENV` | `NODE_ENV=development npm test` | **Refused, exit 1**, before any application module or Prisma client was imported: the guard reports that `NODE_ENV` must be exactly `test` |
 | 9 | Test-database guard, wrong database | `npm test` pointed at the development database | **Refused, exit 1**: the guard reports that the database name must end in `_test` or be exactly `ci` |
-| 10 | Schema-drift evidence gate | the workflow's own gate script, run locally against the migrated database | **PASS.** `prisma migrate diff` exited 2 as the gate requires, 1 statement compared and identical to the committed evidence; the catalogue extraction matched on 21 lines — 1 generated column, 7 hand-managed indexes, 12 NOT NULL array columns |
-| 11 | Dual-ledger equivalence | included in check 7 (`src/__tests__/api/compat.test.ts`) | **113 of 113 passed, nothing skipped.** Both ledgers produce the same catalogue and preserve every legacy row unchanged, and the normalised `pg_dump --schema-only` comparison RAN: the suite resolves a dump runner whose major version is at least the server's — here `pg_dump` inside the container publishing the port `DATABASE_URL` names, reporting PostgreSQL 16.15 — and a dump it cannot produce fails the gate rather than skipping it. The gate also holds the third migration: the additive `usda_api_cache.http_status` column is excluded from the legacy row hashes and asserted un-backfilled on both ledgers |
-| 12 | Catalogue release load | `npm run catalog:load -- --release v1` | **exit 0.** 9,422 foods, 13,088 aliases, 27,289 portions, 0 compositions, 9,422 validation records written; all five files verified against the manifest, every published record's identity evidence assessed, and the manifest's source-cache attestation (9,422 of 9,422 records resolved at export) cross-checked, before anything was written |
-| 13 | Catalogue load idempotency | the same command again | **exit 0.** 0 inserted, 0 updated, 9,422 unchanged — idempotent |
-| 14 | Recipe seed | `npm run recipes:seed` | **exit 0.** 42 recipes created with 269 ingredient rows, and the regenerated `coverage-report.json` was **byte-identical** to the committed one (the working tree stayed clean) |
-| 15 | Search benchmark | `npm run search:benchmark` | **exit 0 — all four bounds met.** Top-3 0.958 (408 of 426), top-10 0.991 (422 of 426) against bounds of 0.9 and 0.97; zero-result rate 0 and p95 93.7 ms, both within bound. 426 of 426 queries rank-stable across the timed passes, and — measured against a second, independently loaded database and recorded by `--compare-with` — 426 of 426 ranks and 20 of 20 page sequences identical with equal determinism fingerprints. Recorded as [met, with its limits](#the-search-benchmark-is-met-and-what-it-does-not-cover) |
-| 16 | Release determinism | the release loaded into a second, independently created database, measured there, and the peer report handed back with `npm run search:benchmark -- --compare-with <peer-report.json>` | **`crossDatabaseReproduction.outcome: identical`** — 426 of 426 per-query ranks identical, 20 of 20 portable page sequences identical, the two `determinismFingerprint` digests equal, release checksum identical, and the two databases established as `distinct` from the system identifier and database oid each run read back; latency the only difference |
+| 10 | Schema-drift evidence gate | the workflow's own gate script, run locally against the migrated database | **PASS.** `prisma migrate diff` exited 2 as the gate requires, 1 statement compared and identical to the committed evidence; the catalogue extraction matched on all **23 lines** of the `pg-catalog-expected` payload — 1 generated column, 9 index rows and 13 `array_column` rows, 12 of which carry `not_null=true`. The **1 / 7 / 12** the gate script and [`schema-catalog-evidence.sql`](./schema-catalog-evidence.sql) both name are **floors**, not the measured counts: the section has carried nine indexes since the prefix-fold indexes landed, and a larger set passes while a smaller one cannot — which is why the two files state different numbers from the ones above without contradicting them |
+| 11 | Dual-ledger equivalence | included in check 7 (`src/__tests__/api/compat.test.ts`) | **116 of 116 passed, nothing skipped.** Both ledgers produce the same catalogue and preserve every legacy row unchanged, and the normalised `pg_dump --schema-only` comparison RAN: the suite resolves a dump runner whose major version is at least the server's — here `pg_dump` inside the container publishing the port `DATABASE_URL` names, reporting PostgreSQL 16.15 — and a dump it cannot produce fails the gate rather than skipping it. The gate also holds the third migration: the additive `usda_api_cache.http_status` column is excluded from the legacy row hashes and asserted un-backfilled on both ledgers |
+| 12 | Catalogue release load | `npm run catalog:load -- --release v1` | **exit 0.** 10,928 foods, 15,777 aliases, 31,537 portions, 0 compositions, 10,928 validation records written; all five files verified against the manifest, every published record's identity evidence assessed (10,928 assessed, 10,928 complete, observed status 200 throughout), and the manifest's source-cache attestation (10,928 of 10,928 records resolved at export) cross-checked, before anything was written |
+| 13 | Catalogue load idempotency | the same command again | **exit 0.** 0 inserted, 0 updated, 10,928 unchanged — idempotent |
+| 14 | Recipe seed | `npm run recipes:seed` | **exit 0.** 42 recipes created with 269 ingredient rows, and the regenerated `coverage-report.json` was **byte-identical** to the committed one (the working tree stayed clean). That full run measured the release **before it was re-cut**, and the byte-identity is stated as its result rather than restated as a later one's. Re-run on this tree as `npm run recipes:seed -- --dry-run` against the re-cut release, it validated the same corpus — 42 recipes, 269 ingredient rows, all 69 referenced ingredients resolvable among the 10,928 published canonical names — and, by design on that flag, published nothing and left the report alone |
+| 15 | Search benchmark | `npm run search:benchmark` | **exit 0 — all four bounds met**, and the run that wrote the committed `benchmark-report.json` (`generatedAt` 2026-09-18T17:13:18.728Z) is the one recorded here: top-3 0.955 (407 of 426), top-10 0.991 (422 of 426) against bounds of 0.9 and 0.97; zero-result rate 0 and p95 62.735 ms, both within bound, over 1,278 timed samples at limit 25. 426 of 426 queries were rank-stable across the timed passes. An independent re-run on this tree against a separately loaded database reproduced every relevance figure and both counts, with latency the only difference (p95 64.4 ms) — recorded as check 16. The per-query detail stays in the report; the bounds are in [`catalog-policy.md`](./catalog-policy.md). Read with [met, and what it does not cover](#the-search-benchmark-is-met-and-what-it-does-not-cover) |
+| 16 | Release determinism | the release loaded into a second, independently created database, measured there, and the committed report handed back as the peer with `npm run search:benchmark -- --out <mine.json> --compare-with data/meal-planning/reports/latest/benchmark-report.json` | **`crossDatabaseReproduction.outcome: identical`** — 426 of 426 per-query ranks identical, 20 of 20 portable page sequences identical, `fingerprintsMatch: true` (both runs `363e2950…fc0daf`), the peer's own SHA-256 and `generatedAt` recorded, and the two databases established as `distinct` from the system identifier and database oid each run read back; latency the only difference. Run on this tree against the re-cut release, so the ordering is a property of release v1 rather than of one load |
 | 17 | Service health | `npm run dev`, then the unauthenticated health endpoint | `{"status":"ok","version":"unknown"}` — the database round-trip succeeded. The reported version is `unknown` outside a built image, which is expected |
 | 18 | Auth boundary | the catalogue status endpoint with no token | **401** with a "no token provided" body, confirming the route sits behind authentication — and confirming why authenticated calls could not be exercised here |
-| 19 | Production image build | `docker build -t soh-be-w050 .` from the API repository root (the tag is arbitrary; CI uses `-t soh-be-ci`) | **exit 0**, image 458 MB. The `npm ci`, `npx prisma generate` and `npm ci --omit=dev` layers were served from the local layer cache — `package*.json` and `prisma/` are unchanged, so those layers' inputs are identical — while `COPY src` and `npm run build` executed. The claim this row exists for was then checked directly rather than inferred from a green build: `docker run --rm --entrypoint node -w /app soh-be-w050 -e "…require.resolve…"` resolved `express`, `@prisma/client`, `firebase-admin`, `uuid`, `date-fns`, `dotenv` and `pg` inside the pruned install, with `dist/app.js` and `dist/generated` present. `uuid` is the one that matters: this work moves it from `devDependencies` to `dependencies`, and this image installs with `--omit=dev` |
+| 19 | Production image build | `docker build -t soh-be-w050 .` from the API repository root (the tag is arbitrary; CI uses `-t soh-be-ci`) | **exit 0**, image 458 MB. The `npm ci`, `npx prisma generate` and `npm ci --omit=dev` layers were served from the local layer cache — `package*.json` and `prisma/` are unchanged, so those layers' inputs are identical — while `COPY src` and `npm run build` executed. The claim this row exists for was then checked directly rather than inferred from a green build: `docker run --rm --entrypoint node -w /app soh-be-w050 -e "…require.resolve…"` resolved `express`, `@prisma/client`, `firebase-admin`, `uuid`, `date-fns`, `dotenv` and `pg` inside the pruned install, with `dist/app.js` and `dist/generated` present. `uuid` is the one that matters: this work moves it from `devDependencies` to `dependencies`, and this image installs with `--omit=dev`. That package also carries an open advisory at the version the AAP pins, whose reachability and standing are recorded under [dispositions awaiting a human ruling](#uuid901--ghsa-w5hq-g745-h8pq-accepted-risk-pending-a-ruling) |
 | 20 | App typecheck | `npx tsc --noEmit` | **exit 0** |
-| 21 | App suite | `CI=true npx jest --runInBand --ci` | **111 of 111 suites passed, 5,218 of 5,218 tests**, exit 0 (the pre-feature baseline was 42 suites and 577 tests) |
-| 22 | App lint against the recorded baseline | `npx eslint --no-fix -f json .` then the baseline comparison script | **Comparison exit 0 — 0 new findings** over the after report's 861 results. 44 findings remain in 26 files against a baseline of 49 in 31 files, so the pre-existing count fell and nothing was added. `eslint .` itself still exits non-zero while baseline findings remain, which is expected and is not this gate |
-| 23 | App token-literal gate | `node scripts/token-literal-scan.mjs $(git diff --name-only --diff-filter=ACMR master -- 'src/**/index.styled.ts')` | **exit 0 — 88 stylesheet files scanned, no hardcoded style value found.** The gate's scope is the stylesheets a change touches, which is why the file list is derived rather than fixed; every value in them resolves through a named token |
+| 21 | App suite | `CI=true npx jest --runInBand --ci` | **124 of 124 suites passed, 6,018 of 6,018 tests**, exit 0 (the pre-feature baseline was 42 suites and 577 tests) |
+| 22 | App lint against the recorded baseline | `npx eslint --no-fix -f json .` then the baseline comparison script | **Comparison exit 0 — 0 new findings** over the after report's 886 results. 38 findings remain in 20 files against a baseline of 49 in 31 files, so the pre-existing count fell and nothing was added. `eslint .` itself still exits non-zero while baseline findings remain, which is expected and is not this gate |
+| 23 | App token-literal gate | `node scripts/token-literal-scan.mjs $(git diff --name-only --diff-filter=ACMR master -- 'src/**/*.styled.*' 'src/**/*.tsx' ':(exclude)src/**/__tests__/**')` | **exit 0 — 213 files scanned, no hardcoded style value found.** That invocation is the documented one, and its scope is both file classes the scanner decides between — every styled module a change touches, `.tsx` ones included, and every component `.tsx`, so the JSX-attribute scan runs as well as the style-object scan, with `__tests__` excluded because a stylesheet test's numbers are the expectation it pins. The file list is derived from the diff rather than fixed, for the same reason the lint gate's is. The rationale for each pathspec term is in `app: docs/meal-planning.md` § "The literal scan" |
 
 One reproduction note for check 7, because it is not a property of the code: the
 suite opens a Prisma client per worker, and on a PostgreSQL server shared with
@@ -304,39 +364,38 @@ rule to the URL. On a server with slots to spare no such parameter is needed.
 
 **Where these numbers come from:** check 7 above — `NODE_ENV=test
 ALLOW_DB_TRUNCATE=true npm test`, which runs `jest --ci --runInBand --coverage`
-— executed on the delivered tree (the API submodule at `8da2223` plus the
-documentation and drift-gate changes in this change set) on 2026-09-17, in the
-environment stated at the top of this section, against the `*_test` database.
-Re-running that one command on that tree is what checks this table; the
-`coverage/` directory it writes is not committed. It was run twice on this tree
-while the work was finished, and every figure below is identical in both runs —
-these modules are covered by their own logic suites, so adding tests elsewhere
-moved the test count without moving the coverage.
+— executed on the delivered tree (the API submodule at `b4e0e27`) on
+2026-09-18, in the environment stated at the top of this section, against the
+`*_test` database. Re-running that one command on that tree is what checks this
+table; the `coverage/` directory it writes is not committed.
 
 Two deliberate differences from the reporter's own output: the branch counts
 each percentage is computed from are added as a column, because a percentage
 alone cannot be compared against a fresh run; and the reporter's
 `Uncovered Line #s` column is dropped, because those line numbers move with any
-edit to a module while the percentages and counts do not depend on them.
+edit to a module while the percentages and counts do not depend on them. The
+counts are the `branches.covered` and `branches.total` of the same run's
+`coverage/coverage-summary.json`, which is the text reporter's own source and is
+obtained by adding `--coverageReporters=json-summary` to the invocation above.
 
 ```text
 File                          | % Stmts | % Branch |    Branches | % Funcs | % Lines
 ------------------------------|---------|----------|-------------|---------|---------
-All files                     |   99.67 |    98.67 | 2,754/2,791 |     100 |   99.64
- services                     |   99.64 |    98.64 | 2,623/2,659 |     100 |   99.61
-  catalog.logic.ts            |   99.84 |    98.52 |     402/408 |     100 |   99.83
-  evidence.logic.ts           |   98.25 |    97.03 |     393/405 |     100 |   98.13
-  grocery.logic.ts            |     100 |     99.40 |     166/167 |     100 |     100
+All files                     |   99.49 |     98.3 | 2,904/2,954 |     100 |   99.45
+ services                     |   99.46 |    98.26 | 2,772/2,821 |     100 |   99.41
+  catalog.logic.ts            |   99.85 |    98.31 |     466/474 |     100 |   99.84
+  evidence.logic.ts           |   97.42 |    95.04 |     441/464 |     100 |   97.25
+  grocery.logic.ts            |     100 |     99.4 |     166/167 |     100 |     100
   mealPlan.logic.ts           |     100 |    98.07 |     356/363 |     100 |     100
   mealPlanningAction.logic.ts |     100 |      100 |     105/105 |     100 |     100
   nutrition.logic.ts          |     100 |      100 |       92/92 |     100 |     100
   plannedMealLog.logic.ts     |     100 |      100 |       94/94 |     100 |     100
-  preferences.logic.ts        |   99.87 |    98.90 |     630/637 |     100 |   99.86
+  preferences.logic.ts        |     100 |    98.96 |     668/675 |     100 |     100
   recipe.logic.ts             |     100 |    98.36 |     180/183 |     100 |     100
-  swap.logic.ts               |     100 |      100 |       79/79 |     100 |     100
+  swap.logic.ts               |     100 |      100 |       78/78 |     100 |     100
   targets.logic.ts            |     100 |      100 |     126/126 |     100 |     100
- utils                        |     100 |    99.24 |     131/132 |     100 |     100
-  featureFlags.ts             |     100 |      100 |       11/11 |     100 |     100
+ utils                        |     100 |    99.24 |     132/133 |     100 |     100
+  featureFlags.ts             |     100 |      100 |       12/12 |     100 |     100
   pagination.ts               |     100 |      100 |       39/39 |     100 |     100
   seededRandom.ts             |     100 |      100 |         0/0 |     100 |     100
   units.ts                    |     100 |    98.78 |       81/82 |     100 |     100
@@ -345,15 +404,16 @@ All files                     |   99.67 |    98.67 | 2,754/2,791 |     100 |   9
 Three things a reader comparing this against a fresh run needs, because each one
 reads as a disagreement when it is not:
 
-- **The two aggregate rows are different numbers.** `All files` is 98.67 % over
-  2,754 of 2,791 branches; the `services` group on its own is 98.64 % over 2,623
-  of 2,659, the difference being the four utilities. Quoting the group's
-  percentage against the whole run's denominator is the easy mistake here, which
-  is why both rows and both counts are printed.
-- **Istanbul floors its percentages at two decimals** rather than rounding them:
-  2,754/2,791 is 98.6742 %, and it prints as `98.67`. A reader who rounds
-  instead computes 98.68 and sees a mismatch that does not exist. The same
-  applies per file — 630/637 is 98.9010 %, printed `98.90`.
+- **The two aggregate rows are different numbers.** `All files` is 98.3 % over
+  2,904 of 2,954 branches; the `services` group on its own is 98.26 % over 2,772
+  of 2,821, the difference being the four utilities (132 of 133). Quoting the
+  group's percentage against the whole run's denominator is the easy mistake
+  here, which is why both rows and both counts are printed.
+- **Istanbul floors its percentages at two decimals** rather than rounding them,
+  and drops a trailing zero when it prints: 2,904/2,954 is 98.3073 %, and it
+  prints as `98.3`. A reader who rounds instead computes 98.31 and sees a
+  mismatch that does not exist. The same applies per file — 668/675 is
+  98.9629 %, printed `98.96`, and 466/474 is 98.3122 %, printed `98.31`.
 - **`seededRandom.ts` contains no branches at all** (0 of 0), which Istanbul
   reports as 100 %. Its branch threshold therefore passes vacuously; its
   statements, functions and lines are what its tests actually hold.
@@ -409,13 +469,15 @@ presented as a near-miss.
   token-verification path, since every handler behind it is exercised in process
   by the `src/__tests__/api/*` suites with the auth middleware mocked. Closing
   it needs a development Firebase project account and an identity token from it.
-- **Reaching the full published catalogue count depends on conditions outside
-  this checkout** — the vendor's hourly rate limit, model availability during
-  offline seeding, and identity evidence passing its checks. The aggregate
-  requirement is **not** met: 9,422 items against 10,000, and 13 of 21 categories
-  are short by 2,392 items in total. That shortfall is reported exactly by the catalogue report and
-  is to be treated as an **unmet requirement, never fabricated** and never
-  smoothed against the categories that over-deliver.
+- **Reaching the published catalogue counts depends on conditions outside this
+  checkout** — the vendor's hourly rate limit, model availability during offline
+  seeding, and identity evidence passing its checks. The aggregate requirement
+  **is** met, at 10,928 items against 10,000; the **per-category plan is not**,
+  with 13 of 21 categories short by 2,361 items in total, of which 2,174 exceed
+  every row the vendor returned for their category. That shortfall is reported
+  exactly by the catalogue report and is to be treated as an **unmet
+  requirement, never fabricated** and never smoothed against the categories that
+  over-deliver.
 - **Search relevance is met**, as measured, and is described
   [above](#the-search-benchmark-is-met-and-what-it-does-not-cover). The
   measurement is sound and reproducible across databases; the four queries that
@@ -462,6 +524,57 @@ presented as a near-miss.
   including the order in which the API precedes the app and the kill switches
   available at each step, is in
   [`release-and-recovery.md`](./release-and-recovery.md).
+
+## Dispositions awaiting a human ruling
+
+One item below is neither a verification gap nor a defect this work may fix: it
+is a **recorded disposition** on a known advisory, written down because the
+decision belongs to a human maintainer and nothing in this work has the
+authority to take it. It is **not** a resolved vulnerability, and it is stated
+here rather than left to `npm audit` output nobody reads.
+
+### `uuid@9.0.1` — GHSA-w5hq-g745-h8pq, accepted risk pending a ruling
+
+**The advisory.** `uuid` below 11.1.1 carries GHSA-w5hq-g745-h8pq (moderate,
+CWE-787/CWE-1285): *missing buffer bounds check in v3/v5/v6 when `buf` is
+provided.* The vulnerable path is the optional output-buffer form — a caller
+passing its own `buf` (and offset) to `v3()`, `v5()` or `v6()`, where a buffer
+too small for sixteen bytes is written past its end. The package is declared as
+`"uuid": "^9.0.1"` in `dependencies`, and `npm audit` reports this advisory
+today; a clean audit is not being claimed.
+
+**Why the path is unreachable in this repository, and how that was established.**
+Four modules import `uuid` — `src/services/workout.service.ts`,
+`record.service.ts`, `exercise.service.ts` and `run.service.ts` — each as
+`import { v4 as uuidv4 } from 'uuid'`, and all **seven** call sites are a
+zero-argument `uuidv4()`. No module in `src/` or `scripts/` imports `v3`, `v5`
+or `v6`, so no `buf` argument exists to overflow; a grep across the installed
+tree finds **no** `v3`/`v5`/`v6` call at all, including in the transitive
+consumers that resolve to this same copy — `gaxios` 6.7.1, `teeny-request`
+9.0.0 and `google-gax` 4.6.1 each call `v4` only, as does
+`@google-cloud/storage` 7.16.0 against its own `uuid` 8.3.2, while
+`firebase-admin`'s direct copy is `uuid` 11.1.1 and sits past the advisory
+range. The exposure is therefore an unreachable code path in an installed
+package, not a reachable weakness in this service.
+
+**Why the version is not simply raised.** The AAP freezes it. §0.4.1 lists the
+backend's `uuid` at 9.0.1 under versions that stay unchanged, §0.4.2 sanctions
+exactly one change to it — moving it from `devDependencies` to `dependencies` at
+the same pinned version, with `@types/uuid` staying dev-only — and §0.1.2
+forbids upgrading frameworks for this feature. That sanctioned move is what is
+delivered (`dependencies.uuid` `^9.0.1`, no `devDependencies.uuid`,
+`devDependencies["@types/uuid"]` `^9.0.8`), and check 19 above is the evidence
+that it resolves inside the `--omit=dev` production image. A bump to `^11.1.1`
+was attempted during this work and **withdrawn** in commit `360c765`, on the
+grounds that the AAP outranks a finding's suggested resolution.
+
+**What this disposition is, and what would close it.** It is an accepted risk
+awaiting a maintainer's ruling — one of two outcomes, neither of which an agent
+may choose: an **AAP amendment** authorising `uuid` at 11.1.1 or later, after
+which the bump, a fresh `npm ci` and a full suite run are the work; or a
+**recorded acceptance** of the unreachable path at the pinned version, which is
+what this section documents in the meantime. Until one of those is on record the
+version stays at 9.0.1 and the advisory stays open.
 
 ## The physical-device checklist — UNRUN
 
@@ -595,8 +708,8 @@ their descriptions and neither merged**:
 
 | Repository | Holds | Evidence a reviewer finds there |
 | --- | --- | --- |
-| **API** — `state-of-health-be` | Routes, controllers, the nine service triads and their pure logic modules, the wire types, the additive migration and its reference copy, the CLI scripts, the committed catalogue release and data manifests, the generated reports, the CI workflow, and this folder's six documents | Checks 1–19 above; the 51-suite run with its per-path coverage summary; the schema-drift and dual-ledger gates; the catalogue, validation, benchmark and recipe-coverage reports |
-| **App** — `state-of-health-tracker` | The 18 new screen folders and the plan tab, the shared components and icons, the data models, the query and mutation layer, the store, the utilities, the style tokens, and the navigation registration for all 18 routes | Checks 20–23 above; the 111-suite run; the lint comparison against the recorded baseline; the token-literal gate over the stylesheets the change touched |
+| **API** — `state-of-health-be` | Routes, controllers, the nine service triads and their pure logic modules, the wire types, the additive migration and its reference copy, the CLI scripts, the committed catalogue release and data manifests, the generated reports, the CI workflow, and this folder's six documents | Checks 1–19 above; the 56-suite run with its per-path coverage summary; the schema-drift and dual-ledger gates; the catalogue, validation, benchmark and recipe-coverage reports |
+| **App** — `state-of-health-tracker` | The 18 new screen folders and the plan tab, the shared components and icons, the data models, the query and mutation layer, the store, the utilities, the style tokens, and the navigation registration for all 18 routes | Checks 20–23 above; the 124-suite run; the lint comparison against the recorded baseline; the token-literal gate over the styled modules and component screens the change touched |
 
 Read them together: a reviewer checking a planner rule wants the API's logic
 suite, and a reviewer checking a screen wants the app's util and option-factory
