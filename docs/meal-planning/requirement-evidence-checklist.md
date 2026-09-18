@@ -188,6 +188,47 @@ reports an item whose record predates a check as an **unexplained gap** (a row t
 re-validate) rather than explaining the absence away; this release gives it none
 to report.
 
+#### One stage note in the import report was written by an earlier revision
+
+`import-report.json` is a document three stages merge into, and each stage
+records what its own write preserved, replaced and removed in a note of its own.
+Its `importStageWrite` note is the one thing in the committed reports that the
+**current** code would not write the same way, and it is called out here rather
+than left for a reader to trip over.
+
+That note reports `producedBy` among the keys the import write "left exactly as
+it found them" while also reporting `producedBy.aggregatedRunKinds` among the
+assertions it removed — both at once, because the revision that wrote it
+excluded removed keys from `preservedKeys` by exact name and a sub-key removal
+is recorded as a dotted path, which never matched the parent. Its reason
+sentence also credits `npm run catalog:report` with putting back
+`measurementGaps`, which that command writes into `validation-report.json`
+instead, and `producedBy.aggregatedRunKinds`, which no stage writes anywhere.
+Commit `3e4d165` fixed all three: a block a removal reached into is now named in
+`blocksModifiedByAssertionRemoval` and deliberately kept out of
+`preservedKeys`, the classification lists carry only what is true of this
+document, and `catalog-report.ts` prunes the sub-key through its own reviewed
+`SUPERSEDED_KEYS` so the removal is recorded in the artefact instead of
+happening silently. Measured against the delivered document, the corrected code
+writes `droppedAggregateAssertions: ["aggregateMeasurementGaps"]` and
+`blocksModifiedByAssertionRemoval: []` — the contradiction cannot recur, because
+the document no longer carries the sub-key at all.
+
+The note itself was **deliberately not regenerated**, and the reason is a
+straight trade rather than an oversight. Only an import run rewrites it. A
+cache-warm import on a replica reproduced every figure this section and checks 7
+to 16 state — planned 12,057, inserted 12,057, published 10,928, `requirementMet`
+true — so the numbers were never in question. What a rerun would cost is
+evidence: `usdaRequests` becomes `attempts 0, pauses 0, totalPausedMs 0` on a
+cache-served run, and that block is the acceptance evidence for
+`USDA_IMPORT_RATE_LIMIT_PER_HOUR` (AAP §0.7.3, §0.10) — 583 attempts, 522
+pauses, 1,226,117 ms spent waiting on the limiter. It would also move both stage
+timestamps off `2026-09-18T17:03:32Z` and `17:03:47Z`, which is what ties these
+reports to the run that cut release v1. Replacing real rate-limiter telemetry
+with an all-zero block to tidy one stage note would trade evidence for
+neatness, so the note stands as the historical record it is and this section
+says what it says and what the code says now.
+
 #### The search benchmark is met, and what it does not cover
 
 `npm run search:benchmark` **fails closed and exits non-zero** on any threshold
@@ -308,17 +349,31 @@ those artefacts are for, and why this table names them instead of copying them.
 So: headline outcome here, full measurement in the artefact that measured it,
 and neither in the policy documents.
 
-Provenance: every figure below was measured with the API submodule at `b4e0e27`
-and the app submodule at `487a66a` checked out — the last commits that changed
-executable code or catalogue data. Both are ancestors of the delivered heads;
-what came after them is this documentation and the two lineage merges recorded
-in check 24, neither of which changes a compiled file, a test or a committed
-artefact, which is why re-measuring at the head would return these same numbers.
+Provenance: every figure below was measured with the API submodule at `3e4d165`
+and the app submodule at `35f08bd` checked out. Those are the commits that carry
+every source, test and artefact change on this branch, and the claim to check is
+not an assertion that nothing came after them but a command that shows what did:
+in the API submodule `git diff --name-only 3e4d165..HEAD -- src scripts prisma
+data` is empty, so the only commit after it is this document.
+
+An earlier revision of this paragraph named `b4e0e27` and `487a66a` and asserted
+that what came after them changed no compiled file, no test and no committed
+artefact. That was **false**, and it is restated here rather than quietly
+corrected because a provenance claim is worth exactly what its weakest sentence
+is worth: `git diff --name-status b4e0e27..e0653bf -- src` returns
+`src/controllers/catalog.controller.ts` and
+`src/__tests__/setup/coverageInventory.test.ts`, and `3e4d165` then changed two
+scripts, a test file and two report artefacts. Every figure below was therefore
+**re-measured at `3e4d165`** rather than carried forward from the commit the old
+paragraph named — which is also why check 7 states 10,720 tests where an earlier
+revision stated 10,717: the three tests added with `3e4d165` are the difference.
+
 The runs were executed as the work landed, on 2026-09-17 and 2026-09-18, and
 every figure that the grown catalogue release, the suites or the lint baseline
-moved was **re-measured on those two commits** rather than carried forward:
-checks 7, 12, 13, 15, 16, 21, 22 and 23 state what a run on this tree returned. Where a row quotes a generated report, the report's
-own `generatedAt` is quoted beside the figures so the measurement dates itself.
+moved was re-measured rather than carried forward: checks 7, 12, 13, 15, 16, 21,
+22 and 23 state what a run on this tree returned. Where a row quotes a generated
+report, the report's own `generatedAt` is quoted beside the figures so the
+measurement dates itself.
 One row measures the release as it stood **before** it was re-cut and says so in
 place — check 14's byte-identical coverage report, whose full re-run would
 rewrite a committed artefact rather than re-read one. Environment: Linux
@@ -337,7 +392,7 @@ document.
 | 4 | API typecheck (scripts config) | `npm run typecheck:scripts` | **exit 0** |
 | 5 | API build | `npm run build` | **exit 0** |
 | 6 | Migration ledger applied | `npx prisma migrate deploy` on two freshly created databases | **exit 0** on both; all four of `20260706000000_init`, `20260908000000_meal_planning`, `20260909000000_usda_cache_http_status` and `20260910000000_catalog_prefix_fold_indexes` applied in that order, which is the whole of `prisma/migrations/` |
-| 7 | API suite with coverage | `NODE_ENV=test ALLOW_DB_TRUNCATE=true npm test` (the gate's own invocation: `jest --ci --runInBand --coverage`) | **56 of 56 suites passed.** 10,717 tests passed, 10,717 total, in 617 s, **nothing skipped** — a skip is not a pass, so the run carrying none is stated rather than left to be counted. **No coverage threshold was violated** — the per-file figures are [below](#per-file-branch-coverage-from-check-7) |
+| 7 | API suite with coverage | `NODE_ENV=test ALLOW_DB_TRUNCATE=true npm test` (the gate's own invocation: `jest --ci --runInBand --coverage`) | **56 of 56 suites passed.** 10,720 tests passed, 10,720 total, in 887 s, **nothing skipped** — a skip is not a pass, so the run carrying none is stated rather than left to be counted. **No coverage threshold was violated** — the per-file figures are [below](#per-file-branch-coverage-from-check-7) |
 | 8 | Test-database guard, wrong `NODE_ENV` | `NODE_ENV=development npm test` | **Refused, exit 1**, before any application module or Prisma client was imported: the guard reports that `NODE_ENV` must be exactly `test` |
 | 9 | Test-database guard, wrong database | `npm test` pointed at the development database | **Refused, exit 1**: the guard reports that the database name must end in `_test` or be exactly `ci` |
 | 10 | Schema-drift evidence gate | the workflow's own gate script, run locally against the migrated database | **PASS.** `prisma migrate diff` exited 2 as the gate requires, 1 statement compared and identical to the committed evidence; the catalogue extraction matched on all **23 lines** of the `pg-catalog-expected` payload — 1 generated column, 9 index rows and 13 `array_column` rows, 12 of which carry `not_null=true`. The **1 / 7 / 12** the gate script and [`schema-catalog-evidence.sql`](./schema-catalog-evidence.sql) both name are **floors**, not the measured counts: the section has carried nine indexes since the prefix-fold indexes landed, and a larger set passes while a smaller one cannot — which is why the two files state different numbers from the ones above without contradicting them |
@@ -369,7 +424,7 @@ rule to the URL. On a server with slots to spare no such parameter is needed.
 
 **Where these numbers come from:** check 7 above — `NODE_ENV=test
 ALLOW_DB_TRUNCATE=true npm test`, which runs `jest --ci --runInBand --coverage`
-— executed on the delivered tree (the API submodule at `b4e0e27`) on
+— executed on the delivered tree (the API submodule at `3e4d165`) on
 2026-09-18, in the environment stated at the top of this section, against the
 `*_test` database. Re-running that one command on that tree is what checks this
 table; the `coverage/` directory it writes is not committed.
@@ -459,7 +514,7 @@ summary. Counts were measured with the repository at the commits named under
 | 4 | `mobile-helper-functions` | Pure, typed, tested named exports under `src/utility/`; time-dependent helpers take their clock as a parameter; tests under `src/utility/__tests__` with describe-per-function; dependency injection over mocking | **PASS** | All six utilities this feature adds — `ServingsUtility`, `NutritionFormatUtility`, `UnitConversionUtility`, `MealPlanDateUtility`, `IdempotencyUtility`, `RevisionConflictUtility` — exist with a colocated test, **6 of 6**. `grep -rn 'new Date()' src/utility` → 3 hits, all in the pre-existing `RunUtility` and `DateUtility`; none in the six. `MealPlanDateUtility` takes `now` as a parameter and `IdempotencyUtility.mintKey` takes its UUID source, so neither reaches for a global — read at their signatures |
 | 5 | `mobile-state-management` | The server/device split; centralized keys; mutations owning cache updates in `onSuccess` while call sites own toasts and navigation; `useInfiniteQuery` driven by the API pagination block; the `PERSISTED_QUERY_KEYS` whitelist; one store per domain with `reset()`; React Context for flow drafts; `useState` for form inputs | **PASS** | 15 mutation option factories with **15** colocated `*.util.test.ts`, which is what makes each `onSuccess` invalidation set assertable without a renderer. `PERSISTED_QUERY_KEYS` holds 7 entries, `mealPlanCurrent` the only one this feature adds. `useMealPlanStore` declares `reset()` and `useAuthStore`'s logout calls it — three references. `MealPlanSetupProvider` is a `createContext` provider, not a store. `getNextPageParam` lives in `useCatalogSearchInfiniteQuery.util.ts:46` and is driven by the response's own `page`/`totalPages`, pinned by `useCatalogSearchInfiniteQuery.test.ts:176-180` |
 | 6 | `mobile-styling` | Styles in `index.styled.ts` through `StyleSheet.create`; `@styles` tokens for colour, spacing, radius, shadow, size, stroke, opacity and type metrics; no inline literals; no magic numbers; no hardcoded hex; migrate on touch | **PASS — and clean for the first time at this boundary** | The token gate over the widened scope: `node scripts/token-literal-scan.mjs $(git diff --name-only --diff-filter=ACMR master -- 'src/**/*.styled.*' 'src/**/*.tsx' ':(exclude)src/**/__tests__/**')` → **exit 0 over 213 files**. That scope is itself part of this remediation: the gate previously read only `index.styled.ts` and so could not see a style literal written as a JSX attribute, which is how `activeOpacity={0.7}` survived. Widening it surfaced twelve such literals, all migrated in the same change — one `0.5` to `Opacity.PRESSED_TARGET_ROW`, six `0.6` to `PRESSED` and five `0.7` to `PRESSED_SUBTLE` — changing no rendered value. Across the whole feature diff **17** numeric `activeOpacity` attributes have been replaced by tokens and **0** added, against 61 token-based ones now in place. `grep -rnE "'#[0-9A-Fa-f]{3,8}'"` and `grep -rn 'rgba('` outside `src/styles` → 4 hits, all in pre-existing modules (`GlobalBottomSheet`, `Skeleton`, `RunCountdownOverlay`); none in a file this feature authored |
-| 7 | `backend-architecture` | route → controller → service → pure `*.logic.ts` → mapper; `getUserId`, a pure parser, one service call and a typed error mapped to a status; `user_id` in every predicate including updates and deletes; 404 never 403; typed error classes; vendor boundaries as `<domain>.service.ts` with configuration read once and vendor errors wrapped; meter before spend; `ipv4first` before any network module; snake_case Prisma models; a real Jest suite replacing the stub | **PASS**, with the one AAP-frozen predicate stated in note 7a | 11 routers, 10 controllers, 11 pure logic modules with **11 of 11** colocated tests, 4 mappers. `getUserId` is imported by **10 of 10** controllers. `grep -rn 'status(403)'` across `src` → **0**. `mealPlanning.errors.ts` declares 21 typed error classes. The controller boundary is not asserted by inspection but by two suites: `controllerBoundary.test.ts` (37 cases, including "the parse happens at the boundary, before the service is called" and "a well-formed request reaches its service exactly once") and `requestParserWiring.test.ts` (63 cases, one per entry point). Three vendor boundaries exist as services, with `OpenRouterError` and `getOpenRouterConfig` in `openrouter.service.ts`; `scripts/lib/budget.ts` reserves before every model call; `ipv4first` is set in both `src/server.ts` and `scripts/lib/bootstrap.ts`; 32 snake_case Prisma models and **0** PascalCase; `npm test` is `jest --ci --runInBand --coverage`, a real run of 56 suites and 10,717 tests |
+| 7 | `backend-architecture` | route → controller → service → pure `*.logic.ts` → mapper; `getUserId`, a pure parser, one service call and a typed error mapped to a status; `user_id` in every predicate including updates and deletes; 404 never 403; typed error classes; vendor boundaries as `<domain>.service.ts` with configuration read once and vendor errors wrapped; meter before spend; `ipv4first` before any network module; snake_case Prisma models; a real Jest suite replacing the stub | **PASS**, with the one AAP-frozen predicate stated in note 7a | 11 routers, 10 controllers, 11 pure logic modules with **11 of 11** colocated tests, 4 mappers. `getUserId` is imported by **10 of 10** controllers. `grep -rn 'status(403)'` across `src` → **0**. `mealPlanning.errors.ts` declares 21 typed error classes. The controller boundary is not asserted by inspection but by two suites: `controllerBoundary.test.ts` (37 cases, including "the parse happens at the boundary, before the service is called" and "a well-formed request reaches its service exactly once") and `requestParserWiring.test.ts` (63 cases, one per entry point). Three vendor boundaries exist as services, with `OpenRouterError` and `getOpenRouterConfig` in `openrouter.service.ts`; `scripts/lib/budget.ts` reserves before every model call; `ipv4first` is set in both `src/server.ts` and `scripts/lib/bootstrap.ts`; 32 snake_case Prisma models and **0** PascalCase; `npm test` is `jest --ci --runInBand --coverage`, a real run of 56 suites and 10,720 tests |
 
 **Note 1a — the one axios import in feature code.** `src/queries/api/mealPlanning/fetchNutritionTargets.ts` imports `axios`, and eight other files in the repository do too. Eight are a pre-existing utility and its test, two pre-existing run-domain files, and test fixtures constructing an `AxiosError`. The ninth is this feature's, and it is not a request: the request is `httpGet(Endpoints.MealPlanTargets, TargetsResponse)` on line 31, and `axios.isAxiosError` on line 39 is used only as a type predicate to recognise the bare 404 that AAP §0.7.5 requires be mapped to "no server targets" rather than an error — the case a rolled-back backend produces. The rule forbids issuing requests outside `httpUtil`, which this does not do; narrowing the error `httpUtil` rethrows needs the vendor's own type guard.
 
