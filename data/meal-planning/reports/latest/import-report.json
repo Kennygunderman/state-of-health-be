@@ -122,6 +122,7 @@
       "dataProvenance.aiGenerationPolicy",
       "duplicatesRemoved.duplicateIdentityNote",
       "itemRecords.checksPerItem",
+      "producedBy.aggregatedRunKinds",
       "producedBy.databaseIndependence",
       "producedBy.itemRecordSource",
       "producedBy.regenerability",
@@ -37377,12 +37378,13 @@
     "dischargedFreshnessObligation": null,
     "outstandingFreshnessObligations": null,
     "droppedAggregateAssertions": [],
+    "blocksModifiedByAssertionRemoval": [],
     "droppedAggregateAssertionsReason": null,
     "compoundBlocks": [
       "duplicatesRemoved",
       "failuresByCheck"
     ],
-    "basis": "This stage replaced the keys it measured and preserved every other key in the document, because the import, generation and report stages all write into this file. The blocks named in compoundBlocks are co-written, so their sub-keys were merged instead of replaced and preservedSubKeys names the ones this write carried forward from another stage. The one class of key it does NOT preserve is an aggregate assertion about the whole document, which is only true as of the write that produced it: droppedAggregateAssertions names any this write removed."
+    "basis": "This stage replaced the keys it measured and preserved every other key in the document, because the import, generation and report stages all write into this file. The blocks named in compoundBlocks are co-written, so their sub-keys were merged instead of replaced and preservedSubKeys names the ones this write carried forward from another stage. The one class of key it does NOT preserve is an aggregate assertion about the whole document, which is only true as of the write that produced it: droppedAggregateAssertions names any this write removed. A block one of those removals reached into is named in blocksModifiedByAssertionRemoval and deliberately NOT in preservedKeys, because this write neither replaced it nor left it as it found it."
   },
   "requirementHeadroom": {
     "declared": true,

@@ -2731,14 +2731,18 @@ export const FRESHNESS_OBLIGATIONS_FIELD = 'outstandingStages';
 // THE RULE. A key named here lives in the document only while the write that
 // LANDS supplies it. A write that does not supply it removes it and records the
 // removal in its own note, so the assertion cannot stand unbacked and the gap
-// is visible rather than silent. For the keys the aggregate stage still writes,
-// re-deriving is one command (`npm run catalog:report`), which is why removal is
-// the conservative direction: the aggregate stage re-measures and re-writes them
-// from the catalog, while a preserved claim can only be checked by reading the
-// whole artefact against itself. For `aggregatedAt` and `usdaDataTypes`, which
-// no stage writes at all, removal is the only truthful direction available — and
-// if a later revision starts MEASURING one of them, the same rule hands it back:
-// the write that supplies it keeps it.
+// is visible rather than silent. For `aggregateMeasurementGaps` — the one key
+// on these lists the aggregate stage writes INTO THIS DOCUMENT — re-deriving is
+// one command (`npm run catalog:report`), which is why removal is the
+// conservative direction: the aggregate stage re-measures and re-writes it from
+// the catalog, while a preserved claim can only be checked by reading the whole
+// artefact against itself. For the other four, nothing in this pipeline puts
+// them back here, so removal is the only truthful direction available — and if a
+// later revision starts MEASURING one of them, the same rule hands it back: the
+// write that supplies it keeps it. Which key falls on which side is stated as
+// data below (`AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES`,
+// `AGGREGATE_ASSERTIONS_NO_STAGE_WRITES`) and the note's sentence is generated
+// from it, so a misclassification cannot hide in prose.
 //
 // WHY A NAMED LIST AND NOT A WIPE. Every other key in these documents belongs
 // to the stage that measured it — `counts`, `usdaRequests`, `modelSpend`,
@@ -2765,6 +2769,11 @@ export const AGGREGATE_OWNED_ASSERTION_KEYS: readonly string[] = [
  * `producedBy` is co-written — the aggregate stage merges its own
  * `aggregateFields*` entries into whatever attribution the artefact carries —
  * so the block itself must survive and only the named sub-key is removed.
+ *
+ * That same merge is why the aggregate stage names every sub-key here in its
+ * own `SUPERSEDED_KEYS` (`catalog-report.ts`): it carries the existing block's
+ * keys into its payload, so a sub-key it did not prune would reach the merge
+ * below as one this write SUPPLIES and be kept unmeasured.
  */
 export const AGGREGATE_OWNED_ASSERTION_SUB_KEYS: Readonly<Record<string, readonly string[]>> = {
     producedBy: ['aggregatedRunKinds'],
@@ -2774,20 +2783,111 @@ export const AGGREGATE_OWNED_ASSERTION_SUB_KEYS: Readonly<Record<string, readonl
 const AGGREGATE_ASSERTION_OWNER_COMMAND = 'npm run catalog:report';
 
 /**
- * The dropped assertions the owning command puts back, and the ones it cannot.
+ * The dropped assertions the owning command puts back INTO THIS DOCUMENT, and
+ * the ones nothing puts back at all.
  *
  * Stated as data rather than as prose inside the note so the two halves of the
  * sentence cannot drift from the lists above: a note promising re-derivation of
  * a key nothing measures would be the same defect the removal exists to close.
+ *
+ * WHICH DOCUMENT is the whole of the distinction, and it was measured rather
+ * than assumed. `mergeStageReport` is called only for `import-report.json`
+ * (`catalog-report.ts`, `catalog-import-usda.ts`, `catalog-generate-ai.ts`),
+ * so a key listed here is judged against THAT artefact: the owner command has
+ * to write it back into the very document the merge removed it from, or the
+ * note is promising a refresh that will not arrive.
+ *
+ * `aggregateMeasurementGaps` is the only one that clears that bar —
+ * `catalog-report.ts`'s `buildImportReportEntries` supplies it on every
+ * aggregate write.
  */
-const AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES: readonly string[] = [
-    'aggregateMeasurementGaps',
+export const AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES: readonly string[] = ['aggregateMeasurementGaps'];
+
+/**
+ * The assertions no write puts back into this document, so their removal is
+ * permanent until some stage starts measuring them here.
+ *
+ * `aggregatedAt` and `usdaDataTypes` are written by no stage at all, for the
+ * reasons given in the block comment above. The other two were once classified
+ * as re-derivable and are not:
+ *
+ *   * `producedBy.aggregatedRunKinds` — `grep -rn aggregatedRunKinds scripts src
+ *     --include=*.ts` finds it outside the tests only in this file. No stage
+ *     writes it into any artefact.
+ *   * `measurementGaps` — written by `catalog-report.ts:buildValidationReportEntries`
+ *     and therefore only ever into `validation-report.json`, a DIFFERENT
+ *     document, beside `recordFieldMismatchNote` and `aliasRecordsOnPublishedItems`.
+ *     Nothing writes it into `import-report.json`, which is the only artefact
+ *     this merge serves, so nothing restores it here. That difference is named
+ *     in {@link AGGREGATE_ASSERTIONS_OWNED_BY_ANOTHER_DOCUMENT} and stated in
+ *     the note, because the fix for "no stage writes it" — teach a stage to
+ *     measure it — would here mean teaching the IMPORT report to write a
+ *     validation-report key, which is the wrong repair.
+ */
+export const AGGREGATE_ASSERTIONS_NO_STAGE_WRITES: readonly string[] = [
+    'aggregatedAt',
     'measurementGaps',
     'producedBy.aggregatedRunKinds',
+    'usdaDataTypes',
 ];
 
-/** Named here for the same reason: no stage writes either one today. */
-const AGGREGATE_ASSERTIONS_NO_STAGE_WRITES: readonly string[] = ['aggregatedAt', 'usdaDataTypes'];
+/**
+ * The entries above that some stage DOES write — into another artefact.
+ *
+ * Kept as data beside the list rather than as a sentence inside the note, so
+ * an entry leaving {@link AGGREGATE_ASSERTIONS_NO_STAGE_WRITES} takes its
+ * clause with it: the note generator intersects the two.
+ */
+const AGGREGATE_ASSERTIONS_OWNED_BY_ANOTHER_DOCUMENT: Readonly<Record<string, string>> = {
+    measurementGaps: 'validation-report.json',
+};
+
+/**
+ * `a`, `a and b`, `a, b and c` — a key list that reads as English at any
+ * length, so the note's grammar follows the lists instead of being written for
+ * the length they happen to have today.
+ */
+const joinKeyNames = (keys: readonly string[]): string =>
+    keys.length < 2 ? keys.join('') : `${keys.slice(0, -1).join(', ')} and ${keys[keys.length - 1]}`;
+
+/**
+ * The sentence the note carries when a write removes an aggregate assertion.
+ *
+ * Every clause is generated from the two classification lists and omitted when
+ * its list is empty, so the note cannot claim a re-derivation for a key that
+ * has moved lists — the drift this whole mechanism exists to prevent, one
+ * level up.
+ */
+const droppedAggregateAssertionsReasonText = (): string => {
+    const owned = AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES;
+    const unwritten = AGGREGATE_ASSERTIONS_NO_STAGE_WRITES;
+    const elsewhere = Object.entries(AGGREGATE_ASSERTIONS_OWNED_BY_ANOTHER_DOCUMENT).filter(([key]) =>
+        unwritten.includes(key),
+    );
+
+    const clauses = [
+        'Each key named above asserts something about this document AS A WHOLE, and this write changed the state it ' +
+            'described, so it was removed instead of being carried forward unbacked.',
+        owned.length === 0
+            ? `No stage re-measures any of them, so ${AGGREGATE_ASSERTION_OWNER_COMMAND} restores none of them here.`
+            : `${AGGREGATE_ASSERTION_OWNER_COMMAND} re-measures and re-writes ${joinKeyNames(owned)} into this ` +
+              `document, which ${owned.length === 1 ? 'is the one aggregate assertion' : 'are the aggregate assertions'} ` +
+              'it owns here.',
+        unwritten.length === 0
+            ? null
+            : `${joinKeyNames(unwritten)} ${unwritten.length === 1 ? 'is' : 'are'} written into this document by no ` +
+              `stage today, so ${unwritten.length === 1 ? 'it stays' : 'they stay'} absent until one measures ` +
+              `${unwritten.length === 1 ? 'it' : 'them'} here.`,
+        ...elsewhere.map(
+            ([key, document]) =>
+                `${key} is written by ${AGGREGATE_ASSERTION_OWNER_COMMAND} into ${document}, a different artefact, ` +
+                'so nothing restores it in this one and a writer added here would be writing it into the wrong report.',
+        ),
+        'No counter belonging to another stage is ever removed this way.',
+    ];
+
+    return clauses.filter((clause): clause is string => clause !== null).join(' ');
+};
 
 export interface StageReportMergePolicy {
     /** The key under which the merge records what it preserved. */
@@ -2811,6 +2911,18 @@ export interface StageReportMerge {
      * carried none.
      */
     readonly droppedAggregateAssertions: readonly string[];
+    /**
+     * Top-level blocks this write pruned a sub-key out of, so a removal that
+     * happens one level down is legible AT BLOCK LEVEL and not merely absent.
+     *
+     * Such a block is in neither of the two lists above: the write did not
+     * supply it, so it is not replaced, and the write changed it, so it was
+     * not preserved either. Naming it here is what keeps `preservedKeys`
+     * literally true — `producedBy` appearing there while
+     * `producedBy.aggregatedRunKinds` sat in `droppedAggregateAssertions` is
+     * the contradiction this field closes.
+     */
+    readonly blocksModifiedByAssertionRemoval: readonly string[];
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -2861,6 +2973,10 @@ export const mergeStageReport = (
     // already landed it and keeps it: the rule is about a claim outliving its
     // write, not about which stage is allowed to make it.
     const droppedAggregateAssertions: string[] = [];
+    // The blocks the loop below prunes a sub-key out of. Collected because a
+    // pruned block is neither replaced nor preserved, and `preservedKeys` may
+    // only name keys this write left exactly as it found them.
+    const blocksModifiedByAssertionRemoval: string[] = [];
 
     for (const key of AGGREGATE_OWNED_ASSERTION_KEYS) {
         if (
@@ -2896,9 +3012,11 @@ export const mergeStageReport = (
         }
         if (pruned !== null) {
             document[blockName] = pruned;
+            blocksModifiedByAssertionRemoval.push(blockName);
         }
     }
     droppedAggregateAssertions.sort();
+    blocksModifiedByAssertionRemoval.sort();
 
     // Discharge this stage's own freshness obligation, and only its own. See
     // FRESHNESS_OBLIGATIONS_FIELD for why this is per stage: a measured write is
@@ -2962,12 +3080,22 @@ export const mergeStageReport = (
     // this write left alone. Cleared provisional markers and dropped aggregate
     // assertions are excluded too: they were removed, not carried forward, and
     // each is listed under its own name below.
+    //
+    // A BLOCK PRUNED ONE LEVEL DOWN IS EXCLUDED BY ITS OWN LIST, and needs
+    // one: a sub-key removal is recorded as the compound path
+    // `producedBy.aggregatedRunKinds`, which never equals the top-level key
+    // `producedBy`, and a compound block is not in `written` either, so the
+    // three tests above all pass it through. It would then be claimed as a key
+    // this write "left exactly as it found" in the same note that records
+    // pruning it — which is what `blocksModifiedByAssertionRemoval` both
+    // prevents and states.
     const preservedKeys = Object.keys(base)
         .filter(
             (key) =>
                 key !== policy.noteKey &&
                 !clearedProvisionalMarkers.includes(key) &&
                 !droppedAggregateAssertions.includes(key) &&
+                !blocksModifiedByAssertionRemoval.includes(key) &&
                 !Object.prototype.hasOwnProperty.call(written, key),
         )
         .sort();
@@ -2989,16 +3117,13 @@ export const mergeStageReport = (
         // tell "this document never had them" from "this write invalidated
         // them", which an absent key alone cannot say.
         droppedAggregateAssertions,
+        // The blocks a removal above reached into. Written on every merge for
+        // the same reason as the list before it: a sub-key that is simply gone
+        // is indistinguishable from one that was never there, and the block
+        // holding it is the level a reader diffs at.
+        blocksModifiedByAssertionRemoval,
         droppedAggregateAssertionsReason:
-            droppedAggregateAssertions.length === 0
-                ? null
-                : `Each key named above asserts something about this document AS A WHOLE, and this write changed ` +
-                  `the state it described, so it was removed instead of being carried forward unbacked. ` +
-                  `${AGGREGATE_ASSERTION_OWNER_COMMAND} re-measures and re-writes the ones it owns ` +
-                  `(${AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES.join(', ')}); ` +
-                  `${AGGREGATE_ASSERTIONS_NO_STAGE_WRITES.join(' and ')} are written by no stage today, so they ` +
-                  'stay absent until one measures them. No counter belonging to another stage is ever removed this ' +
-                  'way.',
+            droppedAggregateAssertions.length === 0 ? null : droppedAggregateAssertionsReasonText(),
         compoundBlocks: [...compound].sort(),
         basis:
             'This stage replaced the keys it measured and preserved every other key in the document, because the ' +
@@ -3006,7 +3131,9 @@ export const mergeStageReport = (
             'co-written, so their sub-keys were merged instead of replaced and preservedSubKeys names the ones this ' +
             'write carried forward from another stage. The one class of key it does NOT preserve is an aggregate ' +
             'assertion about the whole document, which is only true as of the write that produced it: ' +
-            'droppedAggregateAssertions names any this write removed.',
+            'droppedAggregateAssertions names any this write removed. A block one of those removals reached into is ' +
+            'named in blocksModifiedByAssertionRemoval and deliberately NOT in preservedKeys, because this write ' +
+            'neither replaced it nor left it as it found it.',
     };
 
     try {
@@ -3019,7 +3146,13 @@ export const mergeStageReport = (
         );
     }
 
-    return { document, preservedKeys, preservedSubKeys, droppedAggregateAssertions };
+    return {
+        document,
+        preservedKeys,
+        preservedSubKeys,
+        droppedAggregateAssertions,
+        blocksModifiedByAssertionRemoval,
+    };
 };
 
 /**

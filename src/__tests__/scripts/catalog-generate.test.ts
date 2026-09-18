@@ -113,6 +113,26 @@ import type { LogLevel } from '../../../scripts/lib/logger';
 import { makeCatalogFood } from '../setup/factories';
 import { truncateFeatureTables } from '../setup/testDb';
 
+/**
+ * The 21 `truncateFeatureTables()` hooks in this file, not its tests, are what
+ * needs this: each is a multi-table `TRUNCATE ... CASCADE` against the one test
+ * database every suite shares, and the generation cases fill it before the
+ * `afterAll` one runs. Under concurrent load a full-suite run observed that hook
+ * cross the 5 s default and fail the file — with all of its tests passing, since
+ * each of those is comfortably fast on its own.
+ *
+ * File-level rather than a budget on the offending hook because the exposure is
+ * every hook here, not that one: a truncate slow enough to break `afterAll` is
+ * slow enough to break the 20 `beforeEach` calls that precede it, and fixing
+ * only the hook that happened to fail first leaves the next slow run to fail
+ * somewhere else in the same file. The trade is the one `catalog-load.test.ts`
+ * and `concurrency.test.ts` already make: a genuinely hung case in this file now
+ * takes the budget to report instead of 5 s. `jest.config.ts` is deliberately
+ * left alone so the 5 s default keeps guarding every suite that does not share
+ * this cost.
+ */
+jest.setTimeout(120_000);
+
 /* -------------------------------------------------------------------------- *
  * Fixtures
  * -------------------------------------------------------------------------- */

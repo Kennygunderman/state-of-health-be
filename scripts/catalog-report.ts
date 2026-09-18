@@ -4100,6 +4100,26 @@ const SUPERSEDED_KEYS: Readonly<Record<string, readonly SupersededKey[]>> = {
         { key: 'databaseIndependence', supersededBy: 'producedBy.aggregateFieldsDerivedFrom and aggregateFieldsAccess' },
         { key: 'itemRecordSource', supersededBy: 'producedBy.aggregateFieldsDerivedFrom' },
         { key: 'regenerability', supersededBy: 'producedBy.aggregateFieldsDeterminism and aggregateFieldsPreserved' },
+        // THE AGGREGATE-OWNED SUB-KEY, REMOVED HERE FOR A SHARPER REASON THAN
+        // THE THREE ABOVE. `mergeStageReport` removes an aggregate-owned
+        // assertion (scripts/lib/manifest.ts, AGGREGATE-OWNED ASSERTIONS) from
+        // every write that does not SUPPLY it — and `mergeProducedBy` carries
+        // the existing block's keys into this stage's payload, so a preserved
+        // `aggregatedRunKinds` would arrive as a key this write supplies and be
+        // exempted from that removal without anyone having measured it. That is
+        // how the claim survived every report run up to commit `d0ad935`, where
+        // it still sat between the stage fields and the aggregate fields saying
+        // the generation run never ran, in a document whose own stage was that
+        // run. No stage measures it, so pruning it here — with the removal
+        // named in `aggregateFieldsSuperseded` like every other — is what makes
+        // the manifest's rule hold on the aggregate stage's own write too.
+        // `assertionSubKeysArePruned` in the suite pins the two lists together.
+        {
+            key: 'aggregatedRunKinds',
+            supersededBy:
+                'the per-stage merge notes (importStageWrite, generationStageWrite, reportStageWrite) and each ' +
+                'stage\u2019s own counters, which record what actually ran rather than asserting it',
+        },
     ],
 };
 

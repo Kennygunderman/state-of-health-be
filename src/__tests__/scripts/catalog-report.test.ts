@@ -78,6 +78,7 @@ import {
     CatalogReportError,
     assertRecognisedStoredValues,
     buildCoverageRows,
+    buildImportReportEntries,
     buildRequirementBlock,
     buildWithheldIdentityAudit,
     canonicalReportDirectory,
@@ -120,6 +121,8 @@ import { parseStoredAssumptions } from '../../../scripts/lib/nutritionAssumption
 import type { CatalogValidationVerdict } from '../../../src/services/catalog.logic';
 import type { CatalogValidationCheck } from '../../../src/types/catalog';
 import {
+    AGGREGATE_ASSERTIONS_NO_STAGE_WRITES,
+    AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES,
     AGGREGATE_OWNED_ASSERTION_KEYS,
     AGGREGATE_OWNED_ASSERTION_SUB_KEYS,
     ManifestError,
@@ -1386,6 +1389,26 @@ describe('supersededKeyPaths', () => {
             expect(path).not.toContain('atValidate');
         }
     });
+
+    // assertionSubKeysArePruned: the two removal lists have to agree.
+    //
+    // `mergeStageReport` drops an aggregate-owned SUB-KEY from any write that
+    // does not supply it, but `mergeProducedBy` merges the existing block into
+    // this stage's payload — so a sub-key this stage did not prune arrives as
+    // one it supplies and is exempted from that drop. Pinning every path in
+    // AGGREGATE_OWNED_ASSERTION_SUB_KEYS onto this stage's own prune list is
+    // what stops the aggregate stage from being the one writer that keeps a
+    // claim nothing measures alive.
+    it('prunes every aggregate-owned sub-key the stage merge would otherwise let it re-supply', () => {
+        const assertionSubKeyPaths = Object.entries(AGGREGATE_OWNED_ASSERTION_SUB_KEYS).flatMap(([block, keys]) =>
+            keys.map((key) => `${block}.${key}`),
+        );
+
+        expect(assertionSubKeyPaths.length).toBeGreaterThan(0);
+        for (const path of assertionSubKeyPaths) {
+            expect(supersededKeyPaths()).toContain(path);
+        }
+    });
 });
 
 /* ---------------------------------------------------------------------------
@@ -1636,6 +1659,137 @@ describe('aggregate-owned assertions do not outlive the write that produced them
 
         expect(merge.document.producedBy).toBe('npm run catalog:report');
         expect(merge.droppedAggregateAssertions).toEqual(['measurementGaps']);
+    });
+
+    /**
+     * THE CLASSIFICATION IS MEASURED, NOT DECLARED.
+     *
+     * The note's sentence promises that `npm run catalog:report` puts the keys
+     * in `AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES` back and that the ones in
+     * `AGGREGATE_ASSERTIONS_NO_STAGE_WRITES` stay absent. That promise is only
+     * true if the report stage's REAL write matches it, so the payload here is
+     * the one `buildImportReportEntries` produces rather than a hand-authored
+     * object: a key on the wrong list fails this case instead of shipping as a
+     * false promise inside the committed artefact. It was on the wrong list
+     * once — `measurementGaps` is written into `validation-report.json` and
+     * `producedBy.aggregatedRunKinds` into nothing at all, while the note
+     * claimed both were re-derived into this document.
+     */
+    it('puts back exactly the assertions its classification says it owns', () => {
+        const existing = aggregateAssertions();
+        const published = { produce_vegetable: 1400, spice_herb: 49 };
+        const shortfall = computeCoverageShortfall(policy(), published);
+        const measured = measurement({
+            publishedByCategory: published,
+            byPublicationStatus: { published: 1449 },
+        });
+        const rows = buildCoverageRows(policy(), plan(), measured, shortfall);
+        const written = Object.fromEntries(
+            buildImportReportEntries({
+                measurement: measured,
+                shortfall,
+                rows,
+                requirement: buildRequirementBlock({
+                    plan: plan(),
+                    measurement: measured,
+                    shortfall,
+                    rows,
+                    scopedTo: null,
+                }),
+                quarantine: { total: 0, perCategory: {} },
+                itemRecords: 1449,
+                publishedRowsMeasured: 1449,
+                validationReportRelativePath: 'data/meal-planning/reports/latest/validation-report.json',
+                scopedTo: null,
+                existing,
+            }),
+        );
+
+        const merge = mergeStageReport(existing, written, { noteKey: 'reportStageWrite', stage: 'catalog-report' });
+        const note = merge.document.reportStageWrite as Record<string, unknown>;
+
+        // Every key the note credits to the owner command survives the owner
+        // command's own write, because that write supplies it.
+        for (const key of AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES) {
+            expect(merge.document).toHaveProperty(key);
+            expect(merge.droppedAggregateAssertions).not.toContain(key);
+        }
+        // Every key the note says nothing writes here is gone after it —
+        // including the sub-key, which `mergeProducedBy` would otherwise carry
+        // into this write's payload and so exempt from removal.
+        // `toHaveProperty` reads the dotted entries as paths, which is exactly
+        // the shape a sub-key assertion is recorded under.
+        for (const key of AGGREGATE_ASSERTIONS_NO_STAGE_WRITES) {
+            expect(merge.document).not.toHaveProperty(key);
+        }
+        // And each removal is recorded, in whichever of the two audit trails
+        // performed it: the merge note for the top-level keys, and this
+        // stage's own aggregateFieldsSuperseded list for a sub-key it prunes
+        // out of a block it rewrites.
+        for (const key of AGGREGATE_ASSERTIONS_NO_STAGE_WRITES.filter((name) => !name.includes('.'))) {
+            expect(merge.droppedAggregateAssertions).toContain(key);
+        }
+        const producedBy = merge.document.producedBy as Record<string, unknown>;
+        expect(producedBy.aggregateFieldsSuperseded).toContain('producedBy.aggregatedRunKinds');
+        // Between them the two lists account for every assertion the merge can
+        // remove, so a sixth key cannot be added to the removal lists and left
+        // out of the sentence.
+        expect([...AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES, ...AGGREGATE_ASSERTIONS_NO_STAGE_WRITES].sort()).toEqual(
+            everyAssertionPath,
+        );
+        // And the sentence states the one reason that is not "no stage writes
+        // it": the document that does own `measurementGaps`.
+        expect(String(note.droppedAggregateAssertionsReason)).toContain('npm run catalog:report');
+        expect(String(note.droppedAggregateAssertionsReason)).toContain(
+            'measurementGaps is written by npm run catalog:report into validation-report.json',
+        );
+    });
+
+    /**
+     * A PARENT WHOSE CHILD WAS PRUNED IS NOT PRESERVED.
+     *
+     * `preservedKeys` is "top-level keys this write left exactly as it found
+     * them", and a sub-key drop is recorded as `producedBy.aggregatedRunKinds`,
+     * which never equals the top-level `producedBy`. The committed v1 artefact
+     * shows the consequence: `importStageWrite.preservedKeys` named
+     * `producedBy` in the same note whose `droppedAggregateAssertions` named
+     * its sub-key.
+     */
+    it('names a block it pruned as modified instead of claiming it preserved', () => {
+        const policy = { noteKey: 'importStageWrite', stage: 'catalog-import-usda' } as const;
+        const written = { stage: 'catalog-import-usda', counts: { planned: 12057 } };
+        const merge = mergeStageReport(aggregateAssertions(), written, policy);
+        const note = merge.document.importStageWrite as Record<string, unknown>;
+
+        expect(merge.droppedAggregateAssertions).toContain('producedBy.aggregatedRunKinds');
+        expect(merge.blocksModifiedByAssertionRemoval).toEqual(['producedBy']);
+        expect(note.blocksModifiedByAssertionRemoval).toEqual(['producedBy']);
+        expect(merge.preservedKeys).not.toContain('producedBy');
+        expect(note.preservedKeys).not.toContain('producedBy');
+        // The block is modified, not dropped: every sub-key another stage owns
+        // is still there, which is why the block-level name is needed at all.
+        expect(merge.document.producedBy).toEqual({
+            stageFieldsCommand: 'npm run catalog:import',
+            aggregateFieldsCommand: 'npm run catalog:report',
+        });
+
+        // A block with nothing to prune is still preserved, so the new
+        // exclusion narrows only what it should.
+        const untouched = mergeStageReport(
+            { producedBy: { stageFieldsCommand: 'npm run catalog:import' }, counts: { planned: 1 } },
+            { counts: { planned: 2 } },
+            policy,
+        );
+        expect(untouched.blocksModifiedByAssertionRemoval).toEqual([]);
+        expect(untouched.preservedKeys).toEqual(['producedBy']);
+
+        // And the property the removal rests on: once the prune has happened
+        // there is nothing left to remove, so a rerun of the same write
+        // produces a byte-identical document.
+        const rerun = mergeStageReport(merge.document, written, policy);
+        const again = mergeStageReport(rerun.document, written, policy);
+        expect(JSON.stringify(again.document, null, 2)).toBe(JSON.stringify(rerun.document, null, 2));
+        expect(rerun.blocksModifiedByAssertionRemoval).toEqual([]);
     });
 });
 
