@@ -2,29 +2,29 @@
   "release_id": "v1",
   "manifest_version": "v1",
   "coverage_plan_version": "v1",
-  "generated_at": "2026-09-18T08:46:23.469Z",
+  "generated_at": "2026-09-18T17:06:19.921Z",
   "produced_by": "pipeline",
   "files": [
     {
       "path": "foods.jsonl",
       "name": "foods.jsonl",
-      "sha256": "9ceef90ab990d5818210c282071bf80061e0ea6bbe9705f873e522818855abab",
-      "row_count": 9422,
-      "bytes": 11395433
+      "sha256": "7cfed09ff6e2c267ff618b0251ddc3e8ec72e77d19306ad884501b56c3ece134",
+      "row_count": 10928,
+      "bytes": 13249444
     },
     {
       "path": "aliases.jsonl",
       "name": "aliases.jsonl",
-      "sha256": "42c45714dec04739eb2d074289f44cc7633a9cf58ae5f9f4c1babee101301389",
-      "row_count": 13088,
-      "bytes": 762032
+      "sha256": "25e4f8233c83a5166dbd494f60a52e6a920a4284e8e515c1c634a0f142c4dc2e",
+      "row_count": 15777,
+      "bytes": 908946
     },
     {
       "path": "portions.jsonl",
       "name": "portions.jsonl",
-      "sha256": "cb0c65c365c65b780ad89f27bfd174e7e37d5ee302ec1e9f579dfcd6bfee752c",
-      "row_count": 27289,
-      "bytes": 4100730
+      "sha256": "5ba0126907e513f688e5bbb3230e209792b027b82fdc53cb1f3b568ba7900565",
+      "row_count": 31537,
+      "bytes": 4746200
     },
     {
       "path": "components.jsonl",
@@ -36,19 +36,19 @@
     {
       "path": "validation-records.jsonl",
       "name": "validation-records.jsonl",
-      "sha256": "b530873af36ae1afc15e497bf4e93c0c3a801be1c23358a51dd6d341c96eb9da",
-      "row_count": 9422,
-      "bytes": 58829717
+      "sha256": "81f9ee55332ae5b9ffab9e7100e6a64d0397ecd0a989c83ed986d4de77cbc3ac",
+      "row_count": 10928,
+      "bytes": 63991825
     }
   ],
   "counts": {
-    "foods": 9422,
-    "published_foods": 9422,
-    "aliases": 13088,
-    "portions": 27289,
+    "foods": 10928,
+    "published_foods": 10928,
+    "aliases": 15777,
+    "portions": 31537,
     "components": 0,
     "published_ingredient_derived": 0,
-    "validation_records": 9422
+    "validation_records": 10928
   },
   "source_datasets": [
     {
@@ -70,7 +70,7 @@
         "Foundation 2025-12",
         "Foundation 2026-04"
       ],
-      "retrieved_at": "2026-09-18T03:11:52.117Z",
+      "retrieved_at": "2026-09-18T16:19:05.638Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     },
@@ -80,7 +80,7 @@
       "versions_present": [
         "SR Legacy 2019-04"
       ],
-      "retrieved_at": "2026-09-18T03:28:20.434Z",
+      "retrieved_at": "2026-09-18T16:39:45.737Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     },
@@ -90,7 +90,7 @@
       "versions_present": [
         "Survey (FNDDS) 2024-10"
       ],
-      "retrieved_at": "2026-09-18T03:42:14.865Z",
+      "retrieved_at": "2026-09-18T16:56:28.080Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     }
@@ -111,10 +111,10 @@
   "coverage": {
     "coverage_plan_version": "v1",
     "published_target_total": 11010,
-    "published_actual_total": 9422,
-    "published_total": 9422,
-    "shortfall_total": 2392,
-    "published_gap_to_total": 1588,
+    "published_actual_total": 10928,
+    "published_total": 10928,
+    "shortfall_total": 2361,
+    "published_gap_to_total": 82,
     "categories": [
       {
         "category": "produce_vegetable",
@@ -132,8 +132,8 @@
       },
       {
         "category": "protein_meat",
-        "published": 858,
-        "published_actual": 858,
+        "published": 2181,
+        "published_actual": 2181,
         "published_target": 700,
         "shortfall": 0
       },
@@ -188,8 +188,8 @@
       },
       {
         "category": "bread_bakery",
-        "published": 613,
-        "published_actual": 613,
+        "published": 765,
+        "published_actual": 765,
         "published_target": 500,
         "shortfall": 0
       },
@@ -258,10 +258,10 @@
       },
       {
         "category": "other",
-        "published": 14,
-        "published_actual": 14,
+        "published": 45,
+        "published_actual": 45,
         "published_target": 200,
-        "shortfall": 186
+        "shortfall": 155
       }
     ],
     "by_category": [
@@ -281,8 +281,8 @@
       },
       {
         "category": "protein_meat",
-        "published": 858,
-        "published_actual": 858,
+        "published": 2181,
+        "published_actual": 2181,
         "published_target": 700,
         "shortfall": 0
       },
@@ -337,8 +337,8 @@
       },
       {
         "category": "bread_bakery",
-        "published": 613,
-        "published_actual": 613,
+        "published": 765,
+        "published_actual": 765,
         "published_target": 500,
         "shortfall": 0
       },
@@ -407,42 +407,43 @@
       },
       {
         "category": "other",
-        "published": 14,
-        "published_actual": 14,
+        "published": 45,
+        "published_actual": 45,
         "published_target": 200,
-        "shortfall": 186
+        "shortfall": 155
       }
     ]
   },
   "acceptance": {
-    "requirement_met": false,
+    "requirement_met": true,
     "required_published_items": 10000,
-    "published_items": 9422,
-    "shortfall_against_requirement": 578,
+    "published_items": 10928,
+    "shortfall_against_requirement": 0,
     "categories_below_target": 13,
-    "per_category_shortfall_total": 2392,
-    "statement": "THIS RELEASE DOES NOT MEET THE CATALOG REQUIREMENT. It publishes 9422 items against the required 10000 (578 short), and 13 of 21 categories are below their own published target by 2392 items in total; the per-category gaps are in coverage.by_category. It is exported so that it can be reviewed, loaded into a development database and benchmarked, and its evidence floor is enforced either way; it is not evidence that the catalog requirement is met, and the feature flag must not be enabled against it (AAP §0.7.5 verifies the published count before enablement)."
+    "per_category_shortfall_total": 2361,
+    "every_category_meets_its_target": false,
+    "statement": "This release meets the catalog requirement: it publishes 10928 items against the required 10000, every one of them validated and carrying its own validation record. 13 of 21 categories are below their own published target by 2361 items in total; the per-category gaps are in coverage.by_category, stated exactly and never netted against the categories that overshoot theirs. The coverage plan’s per-category targets total more than the requirement by design (AAP §0.7.3), so a per-category gap is a coverage statement rather than a size one: it does not put the required published count at risk, and AAP §0.7.5 verifies that count — not the per-category targets — before the feature flag is enabled."
   },
   "evidence": {
-    "published_foods": 9422,
-    "assessed_records": 9422,
-    "complete_records": 9422,
+    "published_foods": 10928,
+    "assessed_records": 10928,
+    "complete_records": 10928,
     "observed_status_min": 200,
     "observed_status_max": 200,
     "identity_sources": [
       {
         "identity_source": "usda",
-        "published_foods": 9422,
-        "assessed_records": 9422,
+        "published_foods": 10928,
+        "assessed_records": 10928,
         "observed_status_min": 200,
         "observed_status_max": 200
       }
     ],
     "gap_codes": [],
     "source_cache_resolution": {
-      "required_records": 9422,
-      "resolved_records": 9422,
-      "cache_rows_read": 501
+      "required_records": 10928,
+      "resolved_records": 10928,
+      "cache_rows_read": 604
     }
   }
 }

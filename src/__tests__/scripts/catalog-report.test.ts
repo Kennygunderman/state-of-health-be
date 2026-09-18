@@ -120,9 +120,12 @@ import { parseStoredAssumptions } from '../../../scripts/lib/nutritionAssumption
 import type { CatalogValidationVerdict } from '../../../src/services/catalog.logic';
 import type { CatalogValidationCheck } from '../../../src/types/catalog';
 import {
+    AGGREGATE_OWNED_ASSERTION_KEYS,
+    AGGREGATE_OWNED_ASSERTION_SUB_KEYS,
     ManifestError,
     loadCoveragePlan,
     loadEvidenceAllowlist,
+    mergeStageReport,
     physicalPathIdentity,
     withArtifactPublicationLock,
 } from '../../../scripts/lib/manifest';
@@ -1382,6 +1385,257 @@ describe('supersededKeyPaths', () => {
             expect(path).not.toContain('atImport');
             expect(path).not.toContain('atValidate');
         }
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * AGGREGATE-OWNED ASSERTIONS ACROSS A STAGE MERGE.
+ *
+ * THE DEFECT THESE PIN. `mergeStageReport` preserves every top-level key the
+ * writing stage does not write, which is right for another stage's COUNTER and
+ * wrong for a key that asserts something about the whole document. The
+ * committed v1 import report carried three such keys that had outlived the
+ * write that produced them and contradicted the figures beside them: an
+ * `aggregatedRunKinds` entry saying the generation run never ran, in a document
+ * whose own `stage` was that run with 502 processed batches and 159 metered
+ * calls; a `measurementGaps` entry saying the USDA counters were unmeasured and
+ * citing two keys that no longer exist, beside a block measuring 478 attempts
+ * and 426 pauses; and another saying the per-category quarantine split was
+ * unrecoverable, beside the measured split.
+ *
+ * `pruneSupersededKeys` above is the aggregate stage's mechanism for a claim it
+ * supersedes inside a block it rewrites. These cases are the other half: the
+ * merge itself must not carry an aggregate assertion past the write that
+ * produced it, whichever stage lands next.
+ * ------------------------------------------------------------------------- */
+
+describe('aggregate-owned assertions do not outlive the write that produced them', () => {
+    /** The five keys the committed artefact carried, in their real shapes. */
+    const aggregateAssertions = (): Record<string, unknown> => ({
+        producedBy: {
+            stageFieldsCommand: 'npm run catalog:import',
+            aggregateFieldsCommand: 'npm run catalog:report',
+            aggregatedRunKinds: [
+                { kind: 'catalog-import-usda', ran: true, runId: '914bb617' },
+                { kind: 'catalog-generate-ai', ran: false, runId: null, reason: 'No generation run exists.' },
+            ],
+        },
+        measurementGaps: [{ field: 'categories[].quarantined', value: null, reason: 'not recoverable' }],
+        aggregateMeasurementGaps: [{ field: 'per-run counters', value: null, reason: 'a run in progress' }],
+        // The two the regenerated pipeline surfaced: an aggregation timestamp
+        // no stage writes, and a data-type census contradicted by the very file
+        // it names as its source.
+        aggregatedAt: '2026-09-15T04:16:12.000Z',
+        usdaDataTypes: {
+            Foundation: 231,
+            'SR Legacy': 6246,
+            'Survey (FNDDS)': 4569,
+            Branded: 0,
+            measuredFrom: 'catalog/releases/v1/foods.jsonl usda_data_type',
+        },
+        counts: { planned: 10003, inserted: 10003 },
+        usdaRequests: { attempts: 478, pauses: 426 },
+    });
+
+    /** Every dropped path, in the sorted order the merge reports them. */
+    const everyAssertionPath = [
+        'aggregateMeasurementGaps',
+        'aggregatedAt',
+        'measurementGaps',
+        'producedBy.aggregatedRunKinds',
+        'usdaDataTypes',
+    ];
+
+    it('declares the keys it will not preserve, and names no counter among them', () => {
+        expect(AGGREGATE_OWNED_ASSERTION_KEYS).toEqual([
+            'aggregateMeasurementGaps',
+            'aggregatedAt',
+            'measurementGaps',
+            'usdaDataTypes',
+        ]);
+        expect(AGGREGATE_OWNED_ASSERTION_SUB_KEYS).toEqual({ producedBy: ['aggregatedRunKinds'] });
+
+        // The same guarantee `supersededKeyPaths` gives: a measurement no other
+        // stage can reproduce is never on a removal list.
+        const named = [
+            ...AGGREGATE_OWNED_ASSERTION_KEYS,
+            ...Object.entries(AGGREGATE_OWNED_ASSERTION_SUB_KEYS).flatMap(([block, keys]) =>
+                keys.map((key) => `${block}.${key}`),
+            ),
+        ];
+        for (const path of named) {
+            expect(path).not.toContain('counts');
+            expect(path).not.toContain('usdaRequests');
+            expect(path).not.toContain('modelSpend');
+            expect(path).not.toContain('aiGenerationCounts');
+        }
+    });
+
+    it('drops them on a generation write, which is the merge that stranded them', () => {
+        // The exact sequence that produced the committed artefact: the report
+        // stage ran, then the generation stage wrote its own stage fields and
+        // carried the aggregates forward verbatim.
+        const merge = mergeStageReport(
+            aggregateAssertions(),
+            { stage: 'catalog-generate-ai', processedBatches: 502, aiGenerationCounts: { modelCallsUsed: 159 } },
+            { noteKey: 'generationStageWrite', stage: 'catalog-generate-ai' },
+        );
+
+        expect(merge.document).not.toHaveProperty('measurementGaps');
+        expect(merge.document).not.toHaveProperty('aggregateMeasurementGaps');
+        expect(merge.document).not.toHaveProperty('aggregatedAt');
+        expect(merge.document).not.toHaveProperty('usdaDataTypes');
+        expect(merge.document.producedBy).not.toHaveProperty('aggregatedRunKinds');
+        expect(merge.droppedAggregateAssertions).toEqual(everyAssertionPath);
+
+        // Every other key survives byte for byte — the point of a named list
+        // rather than a wipe.
+        expect(merge.document.counts).toEqual({ planned: 10003, inserted: 10003 });
+        expect(merge.document.usdaRequests).toEqual({ attempts: 478, pauses: 426 });
+        expect(merge.document.producedBy).toEqual({
+            stageFieldsCommand: 'npm run catalog:import',
+            aggregateFieldsCommand: 'npm run catalog:report',
+        });
+        // And they are not also claimed as preserved: a key cannot be both.
+        expect(merge.preservedKeys).not.toContain('measurementGaps');
+        expect(merge.preservedKeys).not.toContain('aggregateMeasurementGaps');
+    });
+
+    it('drops them on an import write too, so the next report starts from measured ground', () => {
+        const merge = mergeStageReport(
+            aggregateAssertions(),
+            { stage: 'catalog-import-usda', counts: { planned: 11300 } },
+            { noteKey: 'importStageWrite', stage: 'catalog-import-usda' },
+        );
+
+        expect(merge.document).not.toHaveProperty('measurementGaps');
+        expect(merge.document.producedBy).not.toHaveProperty('aggregatedRunKinds');
+        // An import changes the very rows the aggregates describe, so the
+        // claim cannot survive it whatever it said.
+        expect(merge.document.counts).toEqual({ planned: 11300 });
+    });
+
+    it('records the removal and the one command that puts it back', () => {
+        const merge = mergeStageReport(
+            aggregateAssertions(),
+            { counts: { planned: 11300 } },
+            { noteKey: 'importStageWrite', stage: 'catalog-import-usda' },
+        );
+        const note = merge.document.importStageWrite as Record<string, unknown>;
+
+        expect(note.droppedAggregateAssertions).toEqual(everyAssertionPath);
+        expect(String(note.droppedAggregateAssertionsReason)).toContain('npm run catalog:report');
+        expect(String(note.basis)).toContain('aggregate assertion');
+    });
+
+    it('keeps the aggregate assertions the landing write supplies itself', () => {
+        // The report stage's own write: it measures these keys, so they are
+        // replaced by the fresh values and nothing is dropped. This is what
+        // makes the rule "only as of the write that produced it" rather than
+        // "the report stage may never state them".
+        const merge = mergeStageReport(
+            aggregateAssertions(),
+            {
+                aggregateMeasurementGaps: [{ field: 'the cause of any per-category shortfall', value: null }],
+                requirement: { publishedItems: 10461 },
+            },
+            { noteKey: 'reportStageWrite', stage: 'catalog-report' },
+        );
+
+        expect(merge.document.aggregateMeasurementGaps).toEqual([
+            { field: 'the cause of any per-category shortfall', value: null },
+        ]);
+        // The two it did not write are still gone: an unwritten aggregate
+        // assertion is unbacked whoever the writer is.
+        expect(merge.document).not.toHaveProperty('measurementGaps');
+        expect(merge.document.producedBy).not.toHaveProperty('aggregatedRunKinds');
+        expect(merge.droppedAggregateAssertions).toEqual([
+            'aggregatedAt',
+            'measurementGaps',
+            'producedBy.aggregatedRunKinds',
+            'usdaDataTypes',
+        ]);
+    });
+
+    it('says nothing about a document that never carried one', () => {
+        const merge = mergeStageReport(
+            { counts: { planned: 1 }, producedBy: { stageFieldsCommand: 'npm run catalog:import' } },
+            { counts: { planned: 2 } },
+            { noteKey: 'importStageWrite', stage: 'catalog-import-usda' },
+        );
+
+        expect(merge.droppedAggregateAssertions).toEqual([]);
+        const note = merge.document.importStageWrite as Record<string, unknown>;
+        expect(note.droppedAggregateAssertionsReason).toBeNull();
+        // The block is untouched, not rebuilt: a rerun still diffs as
+        // unchanged.
+        expect(merge.document.producedBy).toEqual({ stageFieldsCommand: 'npm run catalog:import' });
+        expect(merge.preservedKeys).toEqual(['producedBy']);
+    });
+
+    it('removes the two assertions no stage writes, because nothing can refresh them', () => {
+        // `aggregatedAt` and `usdaDataTypes` are not merely stale: no current
+        // stage emits either, so a merge that preserved them would carry a
+        // claim that can never be re-measured. The regenerated pipeline
+        // measured both contradictions directly — an aggregation timestamp
+        // three days older than the stage write beside it, and a data-type
+        // census of 11,046 rows naming a foods.jsonl that holds 10,928.
+        const merge = mergeStageReport(
+            aggregateAssertions(),
+            {
+                stage: 'catalog-import-usda',
+                generatedAt: '2026-09-18T16:56:31.888Z',
+                counts: { planned: 12057, inserted: 12057 },
+            },
+            { noteKey: 'importStageWrite', stage: 'catalog-import-usda' },
+        );
+
+        expect(merge.document).not.toHaveProperty('aggregatedAt');
+        expect(merge.document).not.toHaveProperty('usdaDataTypes');
+        expect(merge.droppedAggregateAssertions).toContain('aggregatedAt');
+        expect(merge.droppedAggregateAssertions).toContain('usdaDataTypes');
+        expect(merge.preservedKeys).not.toContain('aggregatedAt');
+        expect(merge.preservedKeys).not.toContain('usdaDataTypes');
+        // The write's own fields land, and the counters another stage measured
+        // are still untouched: removal is scoped to the named assertions.
+        expect(merge.document.generatedAt).toBe('2026-09-18T16:56:31.888Z');
+        expect(merge.document.usdaRequests).toEqual({ attempts: 478, pauses: 426 });
+    });
+
+    it('hands a removed assertion back to the stage that starts measuring it', () => {
+        // The rule is about a claim outliving its write, not about which stage
+        // may make it: a write that SUPPLIES `usdaDataTypes` keeps it, so a
+        // later revision can adopt the key by measuring it and nothing here
+        // has to change.
+        const merge = mergeStageReport(
+            aggregateAssertions(),
+            {
+                stage: 'catalog-import-usda',
+                usdaDataTypes: { Foundation: 231, 'SR Legacy': 6237, 'Survey (FNDDS)': 4460, Branded: 0 },
+            },
+            { noteKey: 'importStageWrite', stage: 'catalog-import-usda' },
+        );
+
+        expect(merge.document.usdaDataTypes).toEqual({
+            Foundation: 231,
+            'SR Legacy': 6237,
+            'Survey (FNDDS)': 4460,
+            Branded: 0,
+        });
+        expect(merge.droppedAggregateAssertions).not.toContain('usdaDataTypes');
+        // And the ones it did not supply are still removed.
+        expect(merge.droppedAggregateAssertions).toContain('aggregatedAt');
+    });
+
+    it('leaves a producedBy that is not an object alone rather than guessing at it', () => {
+        const merge = mergeStageReport(
+            { producedBy: 'npm run catalog:report', measurementGaps: [] },
+            { counts: { planned: 2 } },
+            { noteKey: 'importStageWrite', stage: 'catalog-import-usda' },
+        );
+
+        expect(merge.document.producedBy).toBe('npm run catalog:report');
+        expect(merge.droppedAggregateAssertions).toEqual(['measurementGaps']);
     });
 });
 

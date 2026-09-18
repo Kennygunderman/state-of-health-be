@@ -88,6 +88,7 @@ import {
     assertManifestMatchesCoveragePlan,
     buildImportPlan,
     buildRefusalBlock,
+    buildRequirementHeadroomBlock,
     checkManifestAgainstCoveragePlan,
     combineImportReportFigures,
     describeFailure,
@@ -754,6 +755,98 @@ describe('the USDA manifest is verified rather than cast', () => {
         expect(error.message).toContain('configuredRequestsPerHour');
     });
 
+    /**
+     * THE REQUIREMENT HEADROOM'S ARITHMETIC IS CHECKED, NOT TRUSTED.
+     *
+     * The block relaxes the per-category candidate-volume cap while a run is
+     * below a declared floor, so a malformed one is not a field a stage reads
+     * as `undefined` — it is a run that admits either nothing extra or
+     * everything, and publishes a count nobody can re-derive. The committed
+     * document must pass, each field must be required, and the two relations
+     * that make the floor an argument rather than an assertion must be
+     * enforced: the floor reaches the requirement, and it reaches what the
+     * requirement needs at the measured publish rate.
+     */
+    describe('the requirement headroom', () => {
+        it('accepts the committed block and narrows it', () => {
+            const accepted = assertUsdaManifestShape(clone(), USDA_MANIFEST_FILE);
+            const headroom = accepted.requirementHeadroom;
+
+            expect(headroom).toBeDefined();
+            expect(headroom?.requiredPublishedItems).toBe(10000);
+            // The floor has to reach the requirement at the rate beside it, so
+            // this is the relation the document itself must satisfy rather than
+            // a literal this test pins.
+            expect(headroom?.plannedVolumeFloor).toBeGreaterThanOrEqual(
+                Math.ceil((headroom?.requiredPublishedItems ?? 0) / (headroom?.measuredPublishRate ?? 1)),
+            );
+            expect(headroom?.countedAs).toBe('admittedByRequirementHeadroom');
+            expect(headroom?.rule.length).toBeGreaterThan(0);
+            expect(headroom?.arithmetic.length).toBeGreaterThan(0);
+        });
+
+        it('accepts a document that declares none, which is the previous behaviour', () => {
+            // Optional by design: without the block every sweep holds to the
+            // per-category volumes with no floor under the run's total, exactly
+            // as it did before the block existed.
+            const document = clone();
+            delete document.requirementHeadroom;
+
+            expect(assertUsdaManifestShape(document, USDA_MANIFEST_FILE).requirementHeadroom).toBeUndefined();
+        });
+
+        it('refuses a floor below the requirement it serves', () => {
+            // Not every planned record publishes, so a floor at or under the
+            // requirement cannot reach it even in the best case.
+            const error = refusal((document) => {
+                document.requirementHeadroom.plannedVolumeFloor = 9_000;
+            });
+
+            expect(error.message).toContain('plannedVolumeFloor');
+            expect(error.message).toContain('requiredPublishedItems');
+        });
+
+        it('refuses a floor the measured publish rate cannot carry to the requirement', () => {
+            // 10,100 planned records at 0.94192 publish about 9,513 — short of
+            // 10,000 — so the floor and the rate beside it contradict each
+            // other and the document is refused rather than run.
+            const error = refusal((document) => {
+                document.requirementHeadroom.plannedVolumeFloor = 10_100;
+            });
+
+            expect(error.message).toContain('below the 10617');
+            expect(error.message).toContain('measured publish rate');
+        });
+
+        it('refuses a publish rate above 1, which no run can measure', () => {
+            const error = refusal((document) => {
+                document.requirementHeadroom.measuredPublishRate = 1.2;
+            });
+
+            expect(error.message).toContain('measuredPublishRate');
+            expect(error.message).toContain('above 1');
+        });
+
+        it('refuses a block missing any of the fields that justify the floor', () => {
+            for (const field of [
+                'requiredPublishedItems',
+                'plannedVolumeFloor',
+                'measuredPublishRate',
+                'measuredOn',
+                'measuredFrom',
+                'rule',
+                'arithmetic',
+                'countedAs',
+            ]) {
+                const error = refusal((document) => {
+                    delete document.requirementHeadroom[field];
+                });
+
+                expect(error.message).toContain(`requirementHeadroom.${field}`);
+            }
+        });
+    });
+
     it('refuses the document through the loader, not only when asked directly', () => {
         // The narrowing has to be the LOADER's, or every caller is trusting the
         // cast again. Proven by handing the loader's own checker a document it
@@ -977,7 +1070,52 @@ describe('the manifest is checked against the coverage plan', () => {
 
         expect(agreement.filingMismatches).toEqual([]);
         expect(agreement.inertPolicyKeys).toEqual([]);
+        expect(agreement.volumeMismatches).toEqual([]);
         expect(warnings).toEqual([]);
+    });
+
+    it('bounds the requirement headroom by the coverage plan its floor sits inside', () => {
+        // THE UPPER BOUND THAT MAKES THE HEADROOM BOUNDED. The manifest's own
+        // shape check enforces the LOWER one (the floor reaches the requirement
+        // at the measured publish rate) and cannot see the plan. A floor at or
+        // above the plan's whole candidate volume could not be reached before
+        // the plan ran out of volume, so every category would admit records for
+        // the entire sweep and the per-category cap would stop applying
+        // altogether — the unconditional removal this rule exists to avoid,
+        // wearing a declared exception's clothes.
+        const planVolumeTotal =
+            coveragePlan.candidateVolumeTotal ??
+            coveragePlan.categories.reduce((total, row) => total + row.candidateVolume, 0);
+        expect(manifest.requirementHeadroom?.plannedVolumeFloor).toBeLessThanOrEqual(planVolumeTotal);
+
+        const overreaching: UsdaManifest = {
+            ...manifest,
+            requirementHeadroom: {
+                ...(manifest.requirementHeadroom as NonNullable<UsdaManifest['requirementHeadroom']>),
+                plannedVolumeFloor: planVolumeTotal + 1,
+            },
+        };
+
+        const agreement = checkManifestAgainstCoveragePlan(overreaching, coveragePlan);
+        expect(agreement.filingMismatches).toEqual([]);
+        expect(agreement.inertPolicyKeys).toEqual([]);
+        expect(agreement.volumeMismatches).toHaveLength(1);
+        expect(agreement.volumeMismatches[0]).toContain('plannedVolumeFloor');
+        expect(agreement.volumeMismatches[0]).toContain(String(planVolumeTotal));
+
+        // And it is as fatal as the other two halves: reported without being
+        // refused is how the previous inert-key drift survived thirty keys.
+        const failure = ((): unknown => {
+            try {
+                assertManifestMatchesCoveragePlan(overreaching, coveragePlan, silentLogger);
+            } catch (error) {
+                return error;
+            }
+            return null;
+        })();
+
+        expect(failure).toBeInstanceOf(CatalogImportError);
+        expect((failure as CatalogImportError).code).toBe('manifest_headroom_above_plan_volume');
     });
 
     it('stops a run on an inert derivation key, before the limiter and the first request', async () => {
@@ -2229,6 +2367,263 @@ describe('where a sweep stops, and why', () => {
         expect(plan.skipped.skippedCategoryVolumeReached).toBe(0);
     });
 
+    /**
+     * THE REQUIREMENT HEADROOM — THE FLOOR UNDER THE WHOLE RUN'S PLANNED VOLUME.
+     *
+     * THE DEFECT IT CLOSES. The per-category cap above is a distribution
+     * budget, and on the v1 catalog it refused 2,250 genuine generic USDA
+     * records while thirteen categories stayed short of their targets because
+     * the vendor's datasets do not hold their records at all. The run planned
+     * 10,003 records, published 9,422, and finished 578 items below the 10,000
+     * the feature requires (AAP §0.1.1 area 3) — with the refused records
+     * sitting in categories the cap had already filled.
+     *
+     * So `usda-manifest.v1.json` declares a `requirementHeadroom`: while the
+     * run's TOTAL planned count is below `plannedVolumeFloor`, a full category
+     * still admits a swept record. These cases pin the four properties that
+     * make that a bounded rule rather than a removed cap — it admits while the
+     * floor is unreached, it stops admitting the moment the floor is met, it
+     * counts admissions apart from the cap's refusals, and it does not apply to
+     * a `--category` run that could never reach a whole-catalog floor.
+     */
+    describe('the requirement headroom', () => {
+        /** The committed headroom block with the floor moved to `floor`. */
+        const withFloor = (floor: number): NonNullable<UsdaManifest['requirementHeadroom']> => ({
+            ...(manifest.requirementHeadroom as NonNullable<UsdaManifest['requirementHeadroom']>),
+            plannedVolumeFloor: floor,
+        });
+
+        const sweepWithHeadroom = (floor: number | null): UsdaManifest => ({
+            ...oneSweep({ maxPages: 10, observedLastNonEmptyPage: 10, stopWhenCategoryCandidateVolumeReached: true }),
+            requirementHeadroom: floor === null ? undefined : withFloor(floor),
+        });
+
+        /**
+         * The coverage plan reduced to the one category this listing's rows
+         * classify under, at `volume` candidates.
+         *
+         * The page-level stop asks whether EVERY in-scope budgeted category is
+         * full, and the headroom applies only to a run over the whole plan — so
+         * a 21-category plan and a listing of carrots can never reach that
+         * condition, and the page loop would run to `maxPages` for a reason
+         * that has nothing to do with the floor. One category is what lets
+         * these cases observe where the sweep stops while still running
+         * unrestricted, which is the shape the headroom is declared for.
+         */
+        const vegetableOnlyPlan = (volume: number): typeof coveragePlan => ({
+            ...coveragePlan,
+            categories: coveragePlan.categories
+                .filter((row) => row.category === 'produce_vegetable')
+                .map((row) => ({ ...row, candidateVolume: volume })),
+        });
+
+        it('admits a full category’s records while the run is below the declared floor', async () => {
+            const listing = pagedListing(10, 4);
+
+            // Volume 6 for every category and one category in scope by the
+            // classification the rows take, so the cap would refuse everything
+            // past the sixth record. The floor is 10, so four more are planned
+            // — and they are counted as admitted, never as refused.
+            const plan = await buildImportPlan(
+                sweepWithHeadroom(10),
+                vegetableOnlyPlan(6),
+                listing.listFoods,
+                options(),
+                silentLogger,
+            );
+
+            expect(plan.assignments.size).toBe(10);
+            expect(plan.admitted.admittedByRequirementHeadroom).toBe(4);
+            // The cap's counter keeps its original meaning: these records were
+            // not refused, so it counts only what it refused after the floor.
+            expect(plan.skipped.skippedCategoryVolumeReached).toBe(2);
+            expect(plan.headroom).toMatchObject({
+                plannedVolumeFloor: 10,
+                admitted: 4,
+                stillCapped: 2,
+                plannedTotal: 10,
+                floorReached: true,
+                appliedToThisRun: true,
+            });
+        });
+
+        it('stops admitting the moment the floor is reached, and the page loop stops with it', async () => {
+            const listing = pagedListing(10, 4);
+
+            // Floor 10 over pages of four: pages one, two and three are needed
+            // to reach it (4, 8, 12 → the twelfth record is refused), and the
+            // fourth page is never requested because nothing on it could be
+            // planned.
+            const plan = await buildImportPlan(
+                sweepWithHeadroom(10),
+                vegetableOnlyPlan(6),
+                listing.listFoods,
+                options(),
+                silentLogger,
+            );
+
+            expect(plan.assignments.size).toBe(10);
+            expect(plan.skipped.skippedCategoryVolumeReached).toBe(2);
+            expect(listing.requested).toEqual([1, 2, 3]);
+        });
+
+        it('keeps paging past a full category while the floor is unreached', async () => {
+            const listing = pagedListing(10, 4);
+            const logged: { event: string; fields: Record<string, unknown> }[] = [];
+            const recordingLogger: ScriptLogger = {
+                ...silentLogger,
+                info: (event: string, fields?: Record<string, unknown>) => {
+                    logged.push({ event, fields: fields ?? {} });
+                },
+                child: () => recordingLogger,
+            };
+
+            // Without the floor this sweep stopped after page two (the case
+            // above this describe block). With a floor of 20 it keeps going to
+            // page five, which is the whole point: the page-level stop and the
+            // per-record rule have to agree, or the sweep ends before the
+            // headroom can admit anything.
+            const plan = await buildImportPlan(
+                sweepWithHeadroom(20),
+                vegetableOnlyPlan(6),
+                listing.listFoods,
+                options(),
+                recordingLogger,
+            );
+
+            expect(plan.assignments.size).toBe(20);
+            expect(listing.requested).toEqual([1, 2, 3, 4, 5]);
+            expect(plan.admitted.admittedByRequirementHeadroom).toBe(14);
+            expect(plan.skipped.skippedCategoryVolumeReached).toBe(0);
+
+            const planned = logged.find((entry) => entry.event === 'sweep_planned');
+            expect(planned?.fields.admittedByRequirementHeadroom).toBe(14);
+            expect(planned?.fields.volumeStoppedAtPage).toBe(5);
+        });
+
+        it('does not apply to a --category run, which could never reach a whole-catalog floor', async () => {
+            const listing = pagedListing(10, 4);
+
+            const plan = await buildImportPlan(
+                sweepWithHeadroom(10_000),
+                planWithVolume(6),
+                listing.listFoods,
+                options({ categories: ['produce_vegetable'] }),
+                silentLogger,
+            );
+
+            // Exactly the unrestricted-cap behaviour: six planned, two refused,
+            // page three never requested. A floor a restricted run cannot reach
+            // would otherwise admit every leftover record of that one category.
+            expect(plan.assignments.size).toBe(6);
+            expect(plan.admitted.admittedByRequirementHeadroom).toBe(0);
+            expect(plan.skipped.skippedCategoryVolumeReached).toBe(2);
+            expect(listing.requested).toEqual([1, 2]);
+            expect(plan.headroom).toMatchObject({ appliedToThisRun: false, admitted: 0 });
+            expect(plan.headroom?.appliedToThisRunReason).toContain('--category');
+        });
+
+        it('leaves a manifest that declares no headroom on the previous behaviour exactly', async () => {
+            const listing = pagedListing(10, 4);
+
+            const plan = await buildImportPlan(
+                sweepWithHeadroom(null),
+                vegetableOnlyPlan(6),
+                listing.listFoods,
+                options(),
+                silentLogger,
+            );
+
+            expect(plan.assignments.size).toBe(6);
+            expect(plan.admitted.admittedByRequirementHeadroom).toBe(0);
+            expect(plan.skipped.skippedCategoryVolumeReached).toBe(2);
+            expect(plan.headroom).toBeNull();
+
+            // And the report block says which rule bounded the run rather than
+            // emitting nulls a reader has to interpret.
+            const block = buildRequirementHeadroomBlock(plan);
+            expect(block.declared).toBe(false);
+            expect(block.admittedByRequirementHeadroom).toBe(0);
+            expect(block.skippedCategoryVolumeReached).toBe(2);
+            expect(String(block.basis)).toContain('candidateVolume');
+        });
+
+        it('does not relax a sweep that never asked for the cap', async () => {
+            const listing = pagedListing(3, 4);
+
+            const plan = await buildImportPlan(
+                {
+                    ...oneSweep({
+                        maxPages: 10,
+                        observedLastNonEmptyPage: 10,
+                        stopWhenCategoryCandidateVolumeReached: false,
+                    }),
+                    requirementHeadroom: withFloor(10),
+                },
+                planWithVolume(6),
+                listing.listFoods,
+                options(),
+                silentLogger,
+            );
+
+            // There is no cap to relax, so every record is planned and none is
+            // attributed to the headroom — the counter has to mean "a record
+            // the cap would have refused" or it says nothing at all.
+            expect(plan.assignments.size).toBe(12);
+            expect(plan.admitted.admittedByRequirementHeadroom).toBe(0);
+            expect(plan.skipped.skippedCategoryVolumeReached).toBe(0);
+        });
+
+        it('reports the floor, what it admitted and what the cap still refused', async () => {
+            const listing = pagedListing(10, 4);
+            const plan = await buildImportPlan(
+                sweepWithHeadroom(10),
+                vegetableOnlyPlan(6),
+                listing.listFoods,
+                options(),
+                silentLogger,
+            );
+
+            const block = buildRequirementHeadroomBlock(plan);
+
+            expect(block).toMatchObject({
+                declared: true,
+                requiredPublishedItems: manifest.requirementHeadroom?.requiredPublishedItems,
+                plannedVolumeFloor: 10,
+                plannedTotal: 10,
+                floorReached: true,
+                admittedByRequirementHeadroom: 4,
+                skippedCategoryVolumeReached: 2,
+                appliedToThisRun: true,
+            });
+            // The block has to say what an admitted record IS, because nothing
+            // in the catalog distinguishes it: same checks, same validation
+            // record, same source-backed provenance.
+            expect(String(block.admittedRecordsAre)).toContain('source_backed');
+        });
+
+        it('states floorReached false when the vendor pool runs out before the floor does', async () => {
+            const listing = pagedListing(2, 4);
+
+            const plan = await buildImportPlan(
+                sweepWithHeadroom(100),
+                vegetableOnlyPlan(6),
+                listing.listFoods,
+                options(),
+                silentLogger,
+            );
+
+            // Eight records exist, the floor asks for a hundred: the sweep ends
+            // on the empty page with everything planned and nothing refused.
+            // That is a fact about the datasets, not a fault in the rule, and
+            // the block distinguishes it from "the floor is too low".
+            expect(plan.assignments.size).toBe(8);
+            expect(plan.skipped.skippedCategoryVolumeReached).toBe(0);
+            expect(plan.headroom).toMatchObject({ floorReached: false, admitted: 2 });
+            expect(String(buildRequirementHeadroomBlock(plan).floorReachedMeaning)).toContain('ran out of records');
+        });
+    });
+
     it('treats a category the plan states no volume for as unbudgeted, not as full', async () => {
         const listing = pagedListing(2, 3);
         const withoutVolumes: typeof coveragePlan = { ...coveragePlan, categories: [] };
@@ -3043,10 +3438,17 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
     // (must survive) and one it does (must be replaced by the fresher value).
     const SIBLING_ONLY_KEY = 'catalogRelease';
     const SHARED_KEY = 'counts';
+    // A third shape, and the one exception to preservation: a key that asserts
+    // something about the whole document rather than counting what its writer
+    // measured. `aggregatedAt` says when the aggregate sections were computed,
+    // so an import write landing after it makes it false — and no stage writes
+    // it, so nothing can refresh it. AGGREGATE_OWNED_ASSERTION_KEYS names it
+    // and the merge removes it instead of carrying it forward.
+    const AGGREGATE_ASSERTION_KEY = 'aggregatedAt';
 
     const existingDocument = (): Record<string, unknown> => ({
         [SIBLING_ONLY_KEY]: 'v1',
-        aggregatedAt: '2026-09-10T00:00:00.000Z',
+        [AGGREGATE_ASSERTION_KEY]: '2026-09-10T00:00:00.000Z',
         producedBy: 'catalog-report.ts',
         [SHARED_KEY]: { inserted: 999 },
     });
@@ -3084,13 +3486,19 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
 
         // The sibling's half is still the sibling's, byte-for-byte.
         expect(merged[SIBLING_ONLY_KEY]).toBe('v1');
-        expect(merged.aggregatedAt).toBe('2026-09-10T00:00:00.000Z');
         expect(merged.producedBy).toBe('catalog-report.ts');
         // This stage's half is this run's, not the stale aggregate's.
         expect(merged[SHARED_KEY]).toEqual({ inserted: 20 });
         expect(merged.usdaRequests).toEqual({ attempts: 1 });
-        // Nothing was dropped: every pre-existing key is still present.
+        // Every pre-existing key survives EXCEPT the aggregate-owned
+        // assertion, which this write did not supply and therefore cannot
+        // leave standing: it would state an aggregation time earlier than the
+        // write beside it.
+        expect(merged).not.toHaveProperty(AGGREGATE_ASSERTION_KEY);
         for (const key of Object.keys(existingDocument())) {
+            if (key === AGGREGATE_ASSERTION_KEY) {
+                continue;
+            }
             expect(merged).toHaveProperty(key);
         }
         expect(warnings).toEqual([]);
@@ -3108,8 +3516,12 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
         // preservedKeys names what this write left alone — sorted, and holding
         // only the keys the report did not carry, so a reader can tell the two
         // halves apart without diffing the file against a previous copy.
-        expect(note.preservedKeys).toEqual([SIBLING_ONLY_KEY, 'aggregatedAt', 'producedBy'].sort());
+        expect(note.preservedKeys).toEqual([SIBLING_ONLY_KEY, 'producedBy'].sort());
         expect(note.preservedKeys).not.toContain(SHARED_KEY);
+        // The dropped assertion is named in the same note, so the removal is
+        // visible to a reader of the artefact rather than silent.
+        expect(note.preservedKeys).not.toContain(AGGREGATE_ASSERTION_KEY);
+        expect(note.droppedAggregateAssertions).toEqual([AGGREGATE_ASSERTION_KEY]);
         // The co-written blocks are named in the note, so a reader can tell
         // which keys were merged by sub-key from those that were replaced.
         expect(note.compoundBlocks).toEqual(['duplicatesRemoved', 'failuresByCheck']);

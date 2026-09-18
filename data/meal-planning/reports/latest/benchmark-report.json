@@ -1,11 +1,11 @@
 {
   "stage": "search-benchmark",
   "reportVersion": "v1",
-  "generatedAt": "2026-09-18T08:58:36.329Z",
+  "generatedAt": "2026-09-18T17:13:18.728Z",
   "benchmarkVersion": "v1",
   "catalogRelease": "v1",
   "producedBy": "npm run search:benchmark",
-  "determinismFingerprint": "2faad08fc214de06704560f6976e76da2de4eb69d09b8331109a895cbd136911",
+  "determinismFingerprint": "363e2950d4f8a01fdfd0cf7c2dcfab0560279d9ee174083d677f14fef7fc0daf",
   "verdict": {
     "overall": "pass",
     "standing": "acceptance_evidence",
@@ -28,7 +28,7 @@
     "thisReportIsAcceptanceEvidence": true,
     "protocolDeviations": [],
     "statement": "This run took the committed protocol exactly: the query set's own timedPasses, the contract's connection count verified against the datasource rather than assumed, and the catalog graph's shared stage lock held for the whole run. It is therefore acceptance evidence for the corpus and conditions recorded above.",
-    "measuredAgainst": "the loaded catalog release v1, 9422 published foods",
+    "measuredAgainst": "the loaded catalog release v1, 10928 published foods",
     "nonAcceptanceSuite": {
       "path": "src/__tests__/api/benchmark.test.ts",
       "presentInThisCheckout": true,
@@ -45,19 +45,19 @@
   },
   "conditions": {
     "catalogReleaseChecksum": {
-      "manifestSha256": "03cc6f2be201d8d697f0153bd694a74d60a9e6aee44ac69d3675915b426eb736",
+      "manifestSha256": "711a8a5bcd41f1199eece6181de6c14c3287af43f08abfb096b7f2e80627ae0e",
       "files": [
         {
           "name": "foods.jsonl",
-          "sha256": "9ceef90ab990d5818210c282071bf80061e0ea6bbe9705f873e522818855abab"
+          "sha256": "7cfed09ff6e2c267ff618b0251ddc3e8ec72e77d19306ad884501b56c3ece134"
         },
         {
           "name": "aliases.jsonl",
-          "sha256": "42c45714dec04739eb2d074289f44cc7633a9cf58ae5f9f4c1babee101301389"
+          "sha256": "25e4f8233c83a5166dbd494f60a52e6a920a4284e8e515c1c634a0f142c4dc2e"
         },
         {
           "name": "portions.jsonl",
-          "sha256": "cb0c65c365c65b780ad89f27bfd174e7e37d5ee302ec1e9f579dfcd6bfee752c"
+          "sha256": "5ba0126907e513f688e5bbb3230e209792b027b82fdc53cb1f3b568ba7900565"
         },
         {
           "name": "components.jsonl",
@@ -65,7 +65,7 @@
         },
         {
           "name": "validation-records.jsonl",
-          "sha256": "b530873af36ae1afc15e497bf4e93c0c3a801be1c23358a51dd6d341c96eb9da"
+          "sha256": "81f9ee55332ae5b9ffab9e7100e6a64d0397ecd0a989c83ed986d4de77cbc3ac"
         }
       ]
     },
@@ -92,19 +92,19 @@
       },
       "activeReleaseAtStart": {
         "releaseId": "v1",
-        "loadedAt": "2026-09-18T08:56:10.876Z",
-        "runId": "c813a3cc-3d3a-44dd-83e5-e9b83f4e3f79"
+        "loadedAt": "2026-09-18T17:10:59.574Z",
+        "runId": "a868707b-2c47-477f-a8ab-a7a94b08e113"
       },
       "activeReleaseAfterRun": {
         "releaseId": "v1",
-        "loadedAt": "2026-09-18T08:56:10.876Z",
-        "runId": "c813a3cc-3d3a-44dd-83e5-e9b83f4e3f79"
+        "loadedAt": "2026-09-18T17:10:59.574Z",
+        "runId": "a868707b-2c47-477f-a8ab-a7a94b08e113"
       },
       "countsReverified": true,
       "statement": "This run held the catalog graph's shared stage lock for its whole lifetime, so no import, generation, validation or release load could change the corpus between one query and the next. In addition, the active-release pointer and all 6 release counts were read again after the timed passes and the pagination check and compared with the readings taken before the warm-up: they agreed, which is what makes every figure here a measurement of one committed catalog state. A disagreement refuses the run and writes no report at all."
     },
     "databaseIdentity": {
-      "databaseOid": 29876485,
+      "databaseOid": 37729971,
       "systemIdentifier": "7683701193617133602",
       "statement": "An opaque fingerprint of the database this run read, recorded so a cross-database comparison can establish that two reports describe two databases rather than one. It carries no name, host, port, user or connection string, and none may ever be added. The oid is the one PostgreSQL assigned this database in its own catalog. The system identifier is the cluster's own, from pg_control_system()."
     },
@@ -125,31 +125,31 @@
     "items": [
       "Over-HTTP latency. The stopwatch sits on the service function, so Express, JSON serialisation and network time are excluded by design and the figures are not end-to-end response times.",
       "Relevance beyond the committed query set. The hit rates describe these 426 queries against this release, not search quality in general.",
-      "Cross-database LATENCY identity. crossDatabaseReproduction compared the ranks and page sequences of this run with a report from a second database; latency is free to differ between hosts and was not compared.",
+      "Cross-database rank identity, which one run cannot establish — see crossDatabaseReproduction for the procedure that does.",
       "Concurrent-load behaviour. Execution was sequential on a single connection, so nothing here describes how the query behaves under parallel traffic."
     ]
   },
   "corpus": {
-    "publishedFoods": 9422,
-    "manifestPublishedFoods": 9422,
+    "publishedFoods": 10928,
+    "manifestPublishedFoods": 10928,
     "countsAgree": true,
     "countChecks": [
       {
         "name": "published_foods",
-        "expected": 9422,
-        "observed": 9422,
+        "expected": 10928,
+        "observed": 10928,
         "ok": true
       },
       {
         "name": "aliases",
-        "expected": 13088,
-        "observed": 13088,
+        "expected": 15777,
+        "observed": 15777,
         "ok": true
       },
       {
         "name": "portions",
-        "expected": 27289,
-        "observed": 27289,
+        "expected": 31537,
+        "observed": 31537,
         "ok": true
       },
       {
@@ -160,8 +160,8 @@
       },
       {
         "name": "validation_records",
-        "expected": 9422,
-        "observed": 9422,
+        "expected": 10928,
+        "observed": 10928,
         "ok": true
       },
       {
@@ -174,8 +174,8 @@
     "countsStatement": "All 6 counts the release manifest states were compared with the live ones before anything was measured, through the same published-parent relation filters `catalog-load.ts::verifyLoadedCounts` uses. A disagreement REFUSES the run with release_counts_disagree rather than being noted here, because figures measured over a corpus that is not release v1 are not weaker evidence for that release — they are evidence about something else.",
     "activeRelease": {
       "releaseId": "v1",
-      "loadedAt": "2026-09-18T08:56:10.876Z",
-      "runId": "c813a3cc-3d3a-44dd-83e5-e9b83f4e3f79",
+      "loadedAt": "2026-09-18T17:10:59.574Z",
+      "runId": "a868707b-2c47-477f-a8ab-a7a94b08e113",
       "matchesContract": true
     },
     "loadedBy": "npm run catalog:load -- --release v1",
@@ -197,9 +197,9 @@
         "contractKey": "topThreeHitRate",
         "bound": 0.9,
         "comparison": "measured >= bound",
-        "measured": 0.958,
-        "measuredExact": 0.9577464788732394,
-        "measuredAsCount": "408 of 426 queries",
+        "measured": 0.955,
+        "measuredExact": 0.9553990610328639,
+        "measuredAsCount": "407 of 426 queries",
         "verdict": "pass"
       },
       "topTenHitRate": {
@@ -224,8 +224,8 @@
         "contractKey": "p95LatencyMs",
         "bound": 150,
         "comparison": "measured <= bound",
-        "measured": 93.72,
-        "measuredExact": 93.720446,
+        "measured": 62.735,
+        "measuredExact": 62.73491,
         "measuredAsCount": "1278 timed samples at limit 25",
         "verdict": "pass"
       }
@@ -233,11 +233,11 @@
   },
   "rollups": {
     "queriesScored": 426,
-    "topThreeHitRate": 0.958,
+    "topThreeHitRate": 0.955,
     "topTenHitRate": 0.991,
-    "topThreeHitCount": 408,
+    "topThreeHitCount": 407,
     "topTenHitCount": 422,
-    "topThreeHitRateExact": 0.9577464788732394,
+    "topThreeHitRateExact": 0.9553990610328639,
     "topTenHitRateExact": 0.9906103286384976,
     "zeroResultRateExact": 0,
     "rateBasis": {
@@ -247,7 +247,7 @@
     },
     "zeroResultCount": 0,
     "zeroResultRate": 0,
-    "beyondMeasuredPageCount": 0,
+    "beyondMeasuredPageCount": 1,
     "notRetrievedCount": 0,
     "perKind": [
       {
@@ -262,11 +262,11 @@
       {
         "kind": "exact",
         "queries": 153,
-        "topThreeHitRate": 0.928,
+        "topThreeHitRate": 0.922,
         "topTenHitRate": 0.98,
-        "topThreeHitCount": 142,
+        "topThreeHitCount": 141,
         "topTenHitCount": 150,
-        "beyondMeasuredPage": 0
+        "beyondMeasuredPage": 1
       },
       {
         "kind": "misspelling",
@@ -316,12 +316,12 @@
     "timing": "in_process",
     "measuredUnit": "catalog.service.searchPublishedFoods",
     "samples": 1278,
-    "p50LatencyMs": 78.273,
-    "p95LatencyMs": 93.72,
-    "p95LatencyMsExact": 93.720446,
-    "p99LatencyMs": 102.468,
-    "minLatencyMs": 65.998,
-    "maxLatencyMs": 129.384,
+    "p50LatencyMs": 56.352,
+    "p95LatencyMs": 62.735,
+    "p95LatencyMsExact": 62.73491,
+    "p99LatencyMs": 70.345,
+    "minLatencyMs": 49.03,
+    "maxLatencyMs": 90.386,
     "percentileMethod": "nearest-rank over all timed samples, compared against the bound unrounded and rounded only for display",
     "contentionCaveat": "Latency was measured on whatever host ran this command. A figure taken on a host running other workloads against the same PostgreSQL instance is an upper bound on the query, not a clean measurement of it; the relevance figures and page sequences are unaffected by load."
   },
@@ -366,14 +366,14 @@
     "threePageTraversals": 17,
     "matchSetWidthRange": [
       16,
-      660
+      672
     ],
     "statement": "For 20 of 20 queries, pages 1..3 at limit 25 concatenated equal the first min(75, total) ids of one wide fetch of the same query, in the same order, with no id repeated and none missing.",
     "perQuery": [
       {
         "id": "q008",
         "q": "water",
-        "matchSetTotal": 179,
+        "matchSetTotal": 219,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -396,6 +396,7 @@
           "usda:2710712",
           "usda:2710711",
           "usda:2710709",
+          "usda:2708178",
           "usda:2710003",
           "usda:175103",
           "usda:175096",
@@ -407,12 +408,15 @@
           "usda:171986",
           "usda:173166",
           "usda:174831",
+          "usda:175299",
           "usda:174859",
           "usda:2709152",
           "usda:2707606",
           "usda:167769",
+          "usda:175300",
           "usda:174862",
           "usda:170174",
+          "usda:2708056",
           "usda:171591",
           "usda:174123",
           "usda:171894",
@@ -452,11 +456,7 @@
           "usda:172925",
           "usda:172913",
           "usda:171698",
-          "usda:173936",
-          "usda:174153",
-          "usda:175092",
-          "usda:174139",
-          "usda:173236"
+          "usda:173936"
         ],
         "referenceSourceKeys": [
           "usda:173647",
@@ -473,6 +473,7 @@
           "usda:2710712",
           "usda:2710711",
           "usda:2710709",
+          "usda:2708178",
           "usda:2710003",
           "usda:175103",
           "usda:175096",
@@ -484,12 +485,15 @@
           "usda:171986",
           "usda:173166",
           "usda:174831",
+          "usda:175299",
           "usda:174859",
           "usda:2709152",
           "usda:2707606",
           "usda:167769",
+          "usda:175300",
           "usda:174862",
           "usda:170174",
+          "usda:2708056",
           "usda:171591",
           "usda:174123",
           "usda:171894",
@@ -529,20 +533,16 @@
           "usda:172925",
           "usda:172913",
           "usda:171698",
-          "usda:173936",
-          "usda:174153",
-          "usda:175092",
-          "usda:174139",
-          "usda:173236"
+          "usda:173936"
         ]
       },
       {
         "id": "q020",
         "q": "whole wheat bread",
-        "matchSetTotal": 23,
-        "pagedIds": 23,
-        "referenceIds": 23,
-        "expectedIds": 23,
+        "matchSetTotal": 25,
+        "pagedIds": 25,
+        "referenceIds": 25,
+        "expectedIds": 25,
         "pagesTraversed": 1,
         "sequenceMatches": true,
         "duplicates": 0,
@@ -569,8 +569,10 @@
           "usda:2707711",
           "usda:2707712",
           "usda:2707733",
+          "usda:2707749",
           "usda:172794",
-          "usda:2707735"
+          "usda:2707735",
+          "usda:2707751"
         ],
         "referenceSourceKeys": [
           "usda:2707709",
@@ -594,8 +596,10 @@
           "usda:2707711",
           "usda:2707712",
           "usda:2707733",
+          "usda:2707749",
           "usda:172794",
-          "usda:2707735"
+          "usda:2707735",
+          "usda:2707751"
         ]
       },
       {
@@ -767,10 +771,10 @@
       {
         "id": "q099",
         "q": "oats",
-        "matchSetTotal": 61,
-        "pagedIds": 61,
-        "referenceIds": 61,
-        "expectedIds": 61,
+        "matchSetTotal": 63,
+        "pagedIds": 63,
+        "referenceIds": 63,
+        "expectedIds": 63,
         "pagesTraversed": 3,
         "sequenceMatches": true,
         "duplicates": 0,
@@ -793,10 +797,12 @@
           "usda:2708462",
           "usda:2708466",
           "usda:171661",
+          "usda:2707840",
           "usda:172769",
           "usda:172677",
           "usda:172682",
           "usda:2708490",
+          "usda:2707774",
           "usda:169705",
           "usda:175028",
           "usda:2705441",
@@ -856,10 +862,12 @@
           "usda:2708462",
           "usda:2708466",
           "usda:171661",
+          "usda:2707840",
           "usda:172769",
           "usda:172677",
           "usda:172682",
           "usda:2708490",
+          "usda:2707774",
           "usda:169705",
           "usda:175028",
           "usda:2705441",
@@ -1285,7 +1293,7 @@
       {
         "id": "q245",
         "q": "potato",
-        "matchSetTotal": 459,
+        "matchSetTotal": 488,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -1451,7 +1459,7 @@
       {
         "id": "q254",
         "q": "tomato",
-        "matchSetTotal": 312,
+        "matchSetTotal": 325,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -1501,6 +1509,7 @@
           "usda:170137",
           "usda:169384",
           "usda:170051",
+          "usda:2710198",
           "usda:2706370",
           "usda:2706459",
           "usda:2706469",
@@ -1533,8 +1542,7 @@
           "usda:2706509",
           "usda:2706577",
           "usda:2706559",
-          "usda:171587",
-          "usda:171591"
+          "usda:171587"
         ],
         "referenceSourceKeys": [
           "usda:170457",
@@ -1578,6 +1586,7 @@
           "usda:170137",
           "usda:169384",
           "usda:170051",
+          "usda:2710198",
           "usda:2706370",
           "usda:2706459",
           "usda:2706469",
@@ -1610,14 +1619,13 @@
           "usda:2706509",
           "usda:2706577",
           "usda:2706559",
-          "usda:171587",
-          "usda:171591"
+          "usda:171587"
         ]
       },
       {
         "id": "q260",
         "q": "egg",
-        "matchSetTotal": 293,
+        "matchSetTotal": 309,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -1636,7 +1644,9 @@
           "usda:2707167",
           "usda:2707152",
           "usda:173428",
+          "usda:2707177",
           "usda:173462",
+          "usda:2707178",
           "usda:174901",
           "usda:172673",
           "usda:2707343",
@@ -1698,9 +1708,7 @@
           "usda:2707319",
           "usda:2707332",
           "usda:169731",
-          "usda:169755",
-          "usda:169732",
-          "usda:173343"
+          "usda:169755"
         ],
         "referenceSourceKeys": [
           "usda:171287",
@@ -1713,7 +1721,9 @@
           "usda:2707167",
           "usda:2707152",
           "usda:173428",
+          "usda:2707177",
           "usda:173462",
+          "usda:2707178",
           "usda:174901",
           "usda:172673",
           "usda:2707343",
@@ -1775,9 +1785,7 @@
           "usda:2707319",
           "usda:2707332",
           "usda:169731",
-          "usda:169755",
-          "usda:169732",
-          "usda:173343"
+          "usda:169755"
         ]
       },
       {
@@ -1831,7 +1839,7 @@
       {
         "id": "q377",
         "q": "rice",
-        "matchSetTotal": 330,
+        "matchSetTotal": 352,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -1851,6 +1859,7 @@
           "usda:168897",
           "usda:169726",
           "usda:2707794",
+          "usda:2708163",
           "usda:2705685",
           "usda:2708162",
           "usda:2705411",
@@ -1913,8 +1922,7 @@
           "usda:2709097",
           "usda:2709030",
           "usda:2709001",
-          "usda:2708425",
-          "usda:168951"
+          "usda:2708425"
         ],
         "referenceSourceKeys": [
           "usda:169704",
@@ -1928,6 +1936,7 @@
           "usda:168897",
           "usda:169726",
           "usda:2707794",
+          "usda:2708163",
           "usda:2705685",
           "usda:2708162",
           "usda:2705411",
@@ -1990,8 +1999,7 @@
           "usda:2709097",
           "usda:2709030",
           "usda:2709001",
-          "usda:2708425",
-          "usda:168951"
+          "usda:2708425"
         ]
       },
       {
@@ -2163,7 +2171,7 @@
       {
         "id": "q379",
         "q": "cheese",
-        "matchSetTotal": 603,
+        "matchSetTotal": 628,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -2229,6 +2237,7 @@
           "usda:173431",
           "usda:2647440",
           "usda:2705762",
+          "usda:173869",
           "usda:2708811",
           "usda:2705770",
           "usda:2707806",
@@ -2237,16 +2246,15 @@
           "usda:2705808",
           "usda:2708150",
           "usda:174989",
+          "usda:2707842",
+          "usda:2708726",
+          "usda:2707660",
           "usda:2705772",
           "usda:2705765",
           "usda:2705767",
           "usda:2705705",
           "usda:2705710",
-          "usda:2705739",
-          "usda:2705717",
-          "usda:2705721",
-          "usda:2705723",
-          "usda:2705724"
+          "usda:2705739"
         ],
         "referenceSourceKeys": [
           "usda:172175",
@@ -2306,6 +2314,7 @@
           "usda:173431",
           "usda:2647440",
           "usda:2705762",
+          "usda:173869",
           "usda:2708811",
           "usda:2705770",
           "usda:2707806",
@@ -2314,22 +2323,21 @@
           "usda:2705808",
           "usda:2708150",
           "usda:174989",
+          "usda:2707842",
+          "usda:2708726",
+          "usda:2707660",
           "usda:2705772",
           "usda:2705765",
           "usda:2705767",
           "usda:2705705",
           "usda:2705710",
-          "usda:2705739",
-          "usda:2705717",
-          "usda:2705721",
-          "usda:2705723",
-          "usda:2705724"
+          "usda:2705739"
         ]
       },
       {
         "id": "q380",
         "q": "beans",
-        "matchSetTotal": 355,
+        "matchSetTotal": 357,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -2495,7 +2503,7 @@
       {
         "id": "q381",
         "q": "milk",
-        "matchSetTotal": 347,
+        "matchSetTotal": 350,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -2532,6 +2540,7 @@
           "usda:2705495",
           "usda:2705496",
           "usda:174980",
+          "usda:2708159",
           "usda:174650",
           "usda:172225",
           "usda:171275",
@@ -2544,6 +2553,7 @@
           "usda:2705387",
           "usda:170875",
           "usda:2705386",
+          "usda:2708125",
           "usda:2705500",
           "usda:2705517",
           "usda:2257045",
@@ -2576,9 +2586,7 @@
           "usda:2708086",
           "usda:2705507",
           "usda:2705510",
-          "usda:170883",
-          "usda:170884",
-          "usda:2705482"
+          "usda:170883"
         ],
         "referenceSourceKeys": [
           "usda:2705413",
@@ -2609,6 +2617,7 @@
           "usda:2705495",
           "usda:2705496",
           "usda:174980",
+          "usda:2708159",
           "usda:174650",
           "usda:172225",
           "usda:171275",
@@ -2621,6 +2630,7 @@
           "usda:2705387",
           "usda:170875",
           "usda:2705386",
+          "usda:2708125",
           "usda:2705500",
           "usda:2705517",
           "usda:2257045",
@@ -2653,15 +2663,13 @@
           "usda:2708086",
           "usda:2705507",
           "usda:2705510",
-          "usda:170883",
-          "usda:170884",
-          "usda:2705482"
+          "usda:170883"
         ]
       },
       {
         "id": "q382",
         "q": "chicken",
-        "matchSetTotal": 660,
+        "matchSetTotal": 672,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -2688,6 +2696,8 @@
           "usda:2708713",
           "usda:2708568",
           "usda:2708604",
+          "usda:171624",
+          "usda:2706154",
           "usda:2708580",
           "usda:2708593",
           "usda:2707134",
@@ -2701,6 +2711,7 @@
           "usda:172396",
           "usda:173641",
           "usda:2706538",
+          "usda:173873",
           "usda:2708560",
           "usda:2708543",
           "usda:171477",
@@ -2741,10 +2752,7 @@
           "usda:172395",
           "usda:172855",
           "usda:172400",
-          "usda:172403",
-          "usda:171111",
-          "usda:174608",
-          "usda:2706438"
+          "usda:172403"
         ],
         "referenceSourceKeys": [
           "usda:2706797",
@@ -2765,6 +2773,8 @@
           "usda:2708713",
           "usda:2708568",
           "usda:2708604",
+          "usda:171624",
+          "usda:2706154",
           "usda:2708580",
           "usda:2708593",
           "usda:2707134",
@@ -2778,6 +2788,7 @@
           "usda:172396",
           "usda:173641",
           "usda:2706538",
+          "usda:173873",
           "usda:2708560",
           "usda:2708543",
           "usda:171477",
@@ -2818,16 +2829,13 @@
           "usda:172395",
           "usda:172855",
           "usda:172400",
-          "usda:172403",
-          "usda:171111",
-          "usda:174608",
-          "usda:2706438"
+          "usda:172403"
         ]
       },
       {
         "id": "q383",
         "q": "oil",
-        "matchSetTotal": 248,
+        "matchSetTotal": 249,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -2993,10 +3001,10 @@
       {
         "id": "q384",
         "q": "whole wheat",
-        "matchSetTotal": 57,
-        "pagedIds": 57,
-        "referenceIds": 57,
-        "expectedIds": 57,
+        "matchSetTotal": 63,
+        "pagedIds": 63,
+        "referenceIds": 63,
+        "expectedIds": 63,
         "pagesTraversed": 3,
         "sequenceMatches": true,
         "duplicates": 0,
@@ -3015,18 +3023,22 @@
           "usda:2707709",
           "usda:172691",
           "usda:172742",
+          "usda:2707834",
           "usda:172762",
           "usda:171853",
           "usda:175010",
+          "usda:2707749",
           "usda:172794",
           "usda:2707730",
           "usda:2707710",
           "usda:2707745",
           "usda:790085",
+          "usda:2707741",
           "usda:2707735",
           "usda:2707716",
           "usda:168910",
           "usda:169738",
+          "usda:2707751",
           "usda:168916",
           "usda:168915",
           "usda:2707728",
@@ -3038,6 +3050,7 @@
           "usda:2707743",
           "usda:2708688",
           "usda:2708687",
+          "usda:2707750",
           "usda:174081",
           "usda:174085",
           "usda:2707729",
@@ -3047,6 +3060,7 @@
           "usda:171667",
           "usda:2708690",
           "usda:2708689",
+          "usda:174090",
           "usda:171359",
           "usda:2708692",
           "usda:2708691",
@@ -3074,18 +3088,22 @@
           "usda:2707709",
           "usda:172691",
           "usda:172742",
+          "usda:2707834",
           "usda:172762",
           "usda:171853",
           "usda:175010",
+          "usda:2707749",
           "usda:172794",
           "usda:2707730",
           "usda:2707710",
           "usda:2707745",
           "usda:790085",
+          "usda:2707741",
           "usda:2707735",
           "usda:2707716",
           "usda:168910",
           "usda:169738",
+          "usda:2707751",
           "usda:168916",
           "usda:168915",
           "usda:2707728",
@@ -3097,6 +3115,7 @@
           "usda:2707743",
           "usda:2708688",
           "usda:2708687",
+          "usda:2707750",
           "usda:174081",
           "usda:174085",
           "usda:2707729",
@@ -3106,6 +3125,7 @@
           "usda:171667",
           "usda:2708690",
           "usda:2708689",
+          "usda:174090",
           "usda:171359",
           "usda:2708692",
           "usda:2708691",
@@ -3123,7 +3143,7 @@
       {
         "id": "q386",
         "q": "nuts",
-        "matchSetTotal": 198,
+        "matchSetTotal": 199,
         "pagedIds": 75,
         "referenceIds": 75,
         "expectedIds": 75,
@@ -3289,37 +3309,13 @@
     ]
   },
   "crossDatabaseReproduction": {
-    "outcome": "identical",
-    "comparedWith": {
-      "path": "benchmark_waveb.json",
-      "pathKind": "name_only",
-      "sha256": "5e5a075d867d6af2964b72641d560a214c629e90cebd065cdbaeb4d5ec8698b7",
-      "generatedAt": "2026-09-18T08:54:47.282Z",
-      "determinismFingerprint": "2faad08fc214de06704560f6976e76da2de4eb69d09b8331109a895cbd136911",
-      "publishedFoods": 9422,
-      "postgresVersion": "PostgreSQL 16.15 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
-      "databaseDefaultCollation": "en_US.utf8",
-      "databaseOid": 29878482,
-      "systemIdentifier": "7683701193617133602",
-      "standing": "acceptance_evidence"
-    },
-    "identityRelationship": "distinct",
-    "ranks": {
-      "queriesCompared": 426,
-      "identical": 426,
-      "differingCount": 0,
-      "differing": [],
-      "queriesOnlyInThisRun": [],
-      "queriesOnlyInComparedReport": []
-    },
-    "pageSequences": {
-      "queriesCompared": 20,
-      "identical": 20,
-      "differingCount": 0,
-      "differing": []
-    },
-    "fingerprintsMatch": true,
-    "statement": "Every rank and every page sequence in this run equals the one recorded in benchmark_waveb.json, and the two determinism fingerprints are the same. Both databases read back their PostgreSQL system identifier and database oid and the pair was positively established as distinct, so that report describes a second database and the order is a property of release v1 rather than of either database. This establishes nothing about latency, which is free to differ between hosts, and nothing about any third database.",
+    "outcome": "not_evaluated_by_a_single_run",
+    "comparedWith": null,
+    "identityRelationship": null,
+    "ranks": null,
+    "pageSequences": null,
+    "fingerprintsMatch": null,
+    "statement": "Release determinism (AAP §0.9.3) is a property of two runs, not of one, so a single run cannot assert it. The ranks and page sequences here are computed from release-stable source_keys under an ordering whose final tiebreaker is the portable source_key, which is what makes them reproducible; the evidence is produced by running this same command against a second, independently loaded database and comparing the two reports with --compare-with.",
     "howToReproduce": [
       "Create a second database and apply the migrations.",
       "npm run catalog:load -- --release v1 (against that database)",
@@ -3329,9 +3325,16 @@
   },
   "diagnostics": {
     "beyondMeasuredPage": {
-      "queries": 0,
+      "queries": 1,
       "statement": "These queries do retrieve their expected food — it is ranked past the measured page rather than absent, which makes them a ranking observation and not a retrieval failure. The ten worst-ranked are listed as the starting point for a ranking review.",
-      "worstRanked": []
+      "worstRanked": [
+        {
+          "id": "q023",
+          "q": "crackers",
+          "rankInFullResultSet": 35,
+          "matchSetTotal": 108
+        }
+      ]
     },
     "notRetrieved": {
       "queries": 0,
@@ -3463,7 +3466,7 @@
       "matchedSourceKey": "usda:173647",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 179,
+      "matchSetTotal": 219,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3505,7 +3508,7 @@
       "matchedSourceKey": "usda:174987",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 8,
+      "matchSetTotal": 10,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3533,7 +3536,7 @@
       "matchedSourceKey": "usda:174987",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 8,
+      "matchSetTotal": 10,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3573,9 +3576,9 @@
         "usda:174916"
       ],
       "matchedSourceKey": "usda:174916",
-      "rank": 1,
-      "rankInFullResultSet": 1,
-      "matchSetTotal": 26,
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 28,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3589,7 +3592,7 @@
       "matchedSourceKey": "usda:2707825",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 41,
+      "matchSetTotal": 42,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3603,7 +3606,7 @@
       "matchedSourceKey": "usda:2707825",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 41,
+      "matchSetTotal": 42,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3631,7 +3634,7 @@
       "matchedSourceKey": "usda:172688",
       "rank": 2,
       "rankInFullResultSet": 2,
-      "matchSetTotal": 23,
+      "matchSetTotal": 25,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3670,11 +3673,11 @@
       "expectedSourceKeys": [
         "usda:172749"
       ],
-      "matchedSourceKey": "usda:172749",
-      "rank": 21,
-      "rankInFullResultSet": 21,
-      "matchSetTotal": 81,
-      "outcome": "in_measured_page",
+      "matchedSourceKey": null,
+      "rank": null,
+      "rankInFullResultSet": 35,
+      "matchSetTotal": 108,
+      "outcome": "beyond_measured_page",
       "rankStableAcrossPasses": true
     },
     {
@@ -3685,9 +3688,9 @@
         "usda:172749"
       ],
       "matchedSourceKey": "usda:172749",
-      "rank": 2,
-      "rankInFullResultSet": 2,
-      "matchSetTotal": 12,
+      "rank": 3,
+      "rankInFullResultSet": 3,
+      "matchSetTotal": 18,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3897,7 +3900,7 @@
       "matchedSourceKey": "usda:174277",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 45,
+      "matchSetTotal": 57,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -3953,7 +3956,7 @@
       "matchedSourceKey": "usda:171186",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 10,
+      "matchSetTotal": 11,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -4079,7 +4082,7 @@
       "matchedSourceKey": "usda:328637",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 20,
+      "matchSetTotal": 22,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -4107,7 +4110,7 @@
       "matchedSourceKey": "usda:328637",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 21,
+      "matchSetTotal": 23,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -4471,7 +4474,7 @@
       "matchedSourceKey": "usda:169704",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 12,
+      "matchSetTotal": 13,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -4737,7 +4740,7 @@
       "matchedSourceKey": "usda:173904",
       "rank": 2,
       "rankInFullResultSet": 2,
-      "matchSetTotal": 61,
+      "matchSetTotal": 63,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -4751,7 +4754,7 @@
       "matchedSourceKey": "usda:173904",
       "rank": 4,
       "rankInFullResultSet": 4,
-      "matchSetTotal": 51,
+      "matchSetTotal": 54,
       "outcome": "top10",
       "rankStableAcrossPasses": true
     },
@@ -5549,7 +5552,7 @@
       "matchedSourceKey": "usda:2710725",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 1,
+      "matchSetTotal": 10,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -5563,7 +5566,7 @@
       "matchedSourceKey": "usda:2710725",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 2,
+      "matchSetTotal": 11,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -5591,7 +5594,7 @@
       "matchedSourceKey": "usda:2710742",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 5,
+      "matchSetTotal": 9,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6305,7 +6308,7 @@
       "matchedSourceKey": "usda:170379",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 132,
+      "matchSetTotal": 184,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6389,7 +6392,7 @@
       "matchedSourceKey": "usda:170393",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 203,
+      "matchSetTotal": 255,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6403,7 +6406,7 @@
       "matchedSourceKey": "usda:170393",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 203,
+      "matchSetTotal": 255,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6627,7 +6630,7 @@
       "matchedSourceKey": "usda:169230",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 14,
+      "matchSetTotal": 15,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6655,7 +6658,7 @@
       "matchedSourceKey": "usda:169251",
       "rank": 13,
       "rankInFullResultSet": 13,
-      "matchSetTotal": 93,
+      "matchSetTotal": 99,
       "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
@@ -6669,7 +6672,7 @@
       "matchedSourceKey": "usda:169251",
       "rank": 13,
       "rankInFullResultSet": 13,
-      "matchSetTotal": 93,
+      "matchSetTotal": 99,
       "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
@@ -6739,7 +6742,7 @@
       "matchedSourceKey": "usda:170000",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 83,
+      "matchSetTotal": 86,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6753,7 +6756,7 @@
       "matchedSourceKey": "usda:170000",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 83,
+      "matchSetTotal": 86,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6781,7 +6784,7 @@
       "matchedSourceKey": "usda:170027",
       "rank": 2,
       "rankInFullResultSet": 2,
-      "matchSetTotal": 459,
+      "matchSetTotal": 488,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6795,7 +6798,7 @@
       "matchedSourceKey": "usda:170027",
       "rank": 2,
       "rankInFullResultSet": 2,
-      "matchSetTotal": 459,
+      "matchSetTotal": 488,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6907,7 +6910,7 @@
       "matchedSourceKey": "usda:170457",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 312,
+      "matchSetTotal": 325,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6921,7 +6924,7 @@
       "matchedSourceKey": "usda:170457",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 312,
+      "matchSetTotal": 325,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6935,7 +6938,7 @@
       "matchedSourceKey": "usda:170457",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 311,
+      "matchSetTotal": 324,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -6991,7 +6994,7 @@
       "matchedSourceKey": "usda:171287",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 293,
+      "matchSetTotal": 309,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7005,7 +7008,7 @@
       "matchedSourceKey": "usda:171287",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 281,
+      "matchSetTotal": 297,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7075,7 +7078,7 @@
       "matchedSourceKey": "usda:172184",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 12,
+      "matchSetTotal": 13,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7089,7 +7092,7 @@
       "matchedSourceKey": "usda:172184",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 12,
+      "matchSetTotal": 13,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7103,7 +7106,7 @@
       "matchedSourceKey": "usda:172184",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 12,
+      "matchSetTotal": 13,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7159,7 +7162,7 @@
       "matchedSourceKey": "usda:168277",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 31,
+      "matchSetTotal": 59,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7173,7 +7176,7 @@
       "matchedSourceKey": "usda:168277",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 2,
+      "matchSetTotal": 3,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7201,7 +7204,7 @@
       "matchedSourceKey": "usda:169451",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 3,
+      "matchSetTotal": 7,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7229,7 +7232,7 @@
       "matchedSourceKey": "usda:169451",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 13,
+      "matchSetTotal": 46,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7241,10 +7244,10 @@
         "usda:173110"
       ],
       "matchedSourceKey": "usda:173110",
-      "rank": 1,
-      "rankInFullResultSet": 1,
-      "matchSetTotal": 51,
-      "outcome": "top3",
+      "rank": 4,
+      "rankInFullResultSet": 4,
+      "matchSetTotal": 58,
+      "outcome": "top10",
       "rankStableAcrossPasses": true
     },
     {
@@ -7271,7 +7274,7 @@
       "matchedSourceKey": "usda:173110",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 2,
+      "matchSetTotal": 4,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7285,7 +7288,7 @@
       "matchedSourceKey": "usda:174421",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 1,
+      "matchSetTotal": 4,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7299,7 +7302,7 @@
       "matchedSourceKey": "usda:174421",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 1,
+      "matchSetTotal": 5,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7311,9 +7314,9 @@
         "usda:174421"
       ],
       "matchedSourceKey": "usda:174421",
-      "rank": 1,
-      "rankInFullResultSet": 1,
-      "matchSetTotal": 1,
+      "rank": 2,
+      "rankInFullResultSet": 2,
+      "matchSetTotal": 16,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7327,7 +7330,7 @@
       "matchedSourceKey": "usda:174370",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 1,
+      "matchSetTotal": 6,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7355,7 +7358,7 @@
       "matchedSourceKey": "usda:168249",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 2,
+      "matchSetTotal": 12,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7369,7 +7372,7 @@
       "matchedSourceKey": "usda:168249",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 3,
+      "matchSetTotal": 125,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7411,7 +7414,7 @@
       "matchedSourceKey": "usda:172448",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 18,
+      "matchSetTotal": 22,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7467,7 +7470,7 @@
       "matchedSourceKey": "usda:2709163",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 9,
+      "matchSetTotal": 13,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7677,7 +7680,7 @@
       "matchedSourceKey": "usda:172941",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 1,
+      "matchSetTotal": 3,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7691,7 +7694,7 @@
       "matchedSourceKey": "usda:172941",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 1,
+      "matchSetTotal": 3,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -7705,7 +7708,7 @@
       "matchedSourceKey": "usda:172941",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 4,
+      "matchSetTotal": 5,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8307,7 +8310,7 @@
       "matchedSourceKey": "usda:173468",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 594,
+      "matchSetTotal": 602,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8349,7 +8352,7 @@
       "matchedSourceKey": "usda:169655",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 156,
+      "matchSetTotal": 162,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8405,7 +8408,7 @@
       "matchedSourceKey": "usda:169640",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 28,
+      "matchSetTotal": 30,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8567,7 +8570,7 @@
       "matchedSourceKey": "usda:169704",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 87,
+      "matchSetTotal": 88,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8644,7 +8647,7 @@
       "matchedSourceKey": "usda:169704",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 330,
+      "matchSetTotal": 352,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8678,7 +8681,7 @@
       "matchedSourceKey": "usda:172175",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 603,
+      "matchSetTotal": 628,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8697,7 +8700,7 @@
       "matchedSourceKey": "usda:173800",
       "rank": 3,
       "rankInFullResultSet": 3,
-      "matchSetTotal": 355,
+      "matchSetTotal": 357,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8715,7 +8718,7 @@
       "matchedSourceKey": "usda:171267",
       "rank": 3,
       "rankInFullResultSet": 3,
-      "matchSetTotal": 347,
+      "matchSetTotal": 350,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8731,7 +8734,7 @@
       "matchedSourceKey": "usda:171077",
       "rank": 12,
       "rankInFullResultSet": 12,
-      "matchSetTotal": 660,
+      "matchSetTotal": 672,
       "outcome": "in_measured_page",
       "rankStableAcrossPasses": true
     },
@@ -8747,7 +8750,7 @@
       "matchedSourceKey": "usda:172336",
       "rank": 2,
       "rankInFullResultSet": 2,
-      "matchSetTotal": 248,
+      "matchSetTotal": 249,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8764,7 +8767,7 @@
       "matchedSourceKey": "usda:2707825",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 57,
+      "matchSetTotal": 63,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8779,7 +8782,7 @@
       "matchedSourceKey": "usda:171955",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 391,
+      "matchSetTotal": 392,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -8794,7 +8797,7 @@
       "matchedSourceKey": "usda:170162",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 198,
+      "matchSetTotal": 199,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -9018,7 +9021,7 @@
       "matchedSourceKey": "usda:174987",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 4,
+      "matchSetTotal": 6,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },
@@ -9228,7 +9231,7 @@
       "matchedSourceKey": "usda:173904",
       "rank": 1,
       "rankInFullResultSet": 1,
-      "matchSetTotal": 42,
+      "matchSetTotal": 45,
       "outcome": "top3",
       "rankStableAcrossPasses": true
     },

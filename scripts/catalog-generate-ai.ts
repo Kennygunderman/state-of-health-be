@@ -2799,6 +2799,10 @@ const mergeAndWriteGenerationReport = (target: string, report: unknown, log: Scr
         file: path.basename(target),
         preservedKeys: merged.preservedKeys.length,
         preservedSubKeys: Object.keys(merged.preservedSubKeys).length,
+        // Named rather than counted, for the reason the import stage states:
+        // a reader looking for one of these keys needs to know it was
+        // invalidated and by what.
+        droppedAggregateAssertions: merged.droppedAggregateAssertions.join(','),
     });
 };
 

@@ -4062,6 +4062,35 @@ const SUPERSEDED_KEYS: Readonly<Record<string, readonly SupersededKey[]>> = {
                 'the measured consequence and the standing refusal rule separately',
         },
     ],
+    siblingReconciliation: [
+        // THE ONE SUB-KEY THIS BLOCK CANNOT CARRY. This stage writes
+        // `validationReport` — the reconciliation it can actually make, because
+        // it writes both documents from one snapshot — and merges it over
+        // whatever the block already held. `releaseManifest` was written by an
+        // earlier producer and then carried by every later write, which made it
+        // assert agreement between two artefacts that had moved apart:
+        // measured on the regenerated pipeline it still read
+        // `publishedFoodsThere: 9422`, `publishedFoodsHere: 9422`,
+        // `publishedAgrees: true` and row counts 9,422 / 13,088 / 27,289,
+        // beside a release manifest on disk stating 10,928 / 15,777 / 31,537
+        // and this document's own `requirement.publishedItems: 10928`. An
+        // asserted agreement is the worst shape for a stale claim to take: a
+        // reader checking whether the release matches the report is answered
+        // "yes" by a figure from a previous release.
+        //
+        // It is removed rather than re-derived because this stage reads no
+        // release directory (producedBy.aggregateFieldsDerivedFrom names every
+        // input it has) and, in the documented order, runs BEFORE the release
+        // it would be reconciling against — so a release reconciliation here
+        // could only ever describe a PREVIOUS release.
+        {
+            key: 'releaseManifest',
+            supersededBy:
+                'the release manifest\u2019s own coverage, acceptance and counts blocks, which catalog:release ' +
+                'measures from the same catalog at export time, and search-benchmark\u2019s corpus.countChecks, ' +
+                'which compares those counts with a loaded database',
+        },
+    ],
     producedBy: [
         // All three describe how the AGGREGATE half was produced, and all three
         // assert it came from the committed release artefacts rather than from a
@@ -5386,6 +5415,12 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
                 path: importReportPath,
                 preservedKeys: merge.preservedKeys.join(','),
                 preservedSubKeys: JSON.stringify(merge.preservedSubKeys),
+                // Normally empty on this stage's own write: it supplies the
+                // aggregate assertions it owns, so they are replaced rather
+                // than dropped. A name here means this run did not write one
+                // it found — a scoped run, say — and the claim was removed
+                // instead of left standing over data it no longer describes.
+                droppedAggregateAssertions: merge.droppedAggregateAssertions.join(','),
             });
 
             // The publication: both documents are complete, both are reconciled

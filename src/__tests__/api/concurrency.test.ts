@@ -69,11 +69,12 @@
 // way. Each such case is still paired with a counter-proof that the same call
 // is NEVER OBSERVED WAITING and settles on its own when nothing holds its lock
 // ({@link settleWithoutLockWait}), because a wait observed without that pair
-// could belong to something incidental to the transaction. The two intervals
-// that remain — {@link LOCK_WAIT_POLL_MS} and {@link LOCK_WAIT_HANG_GUARD_MS} —
-// decide nothing: one is how often the wait state is sampled, the other is a
-// hang guard that turns a mechanism which never blocks into a named failure
-// instead of a suite that stalls.
+// could belong to something incidental to the transaction. The three intervals
+// that remain — {@link LOCK_WAIT_POLL_MS}, {@link LOCK_WAIT_HANG_GUARD_MS} and
+// the per-case Jest budget below — decide nothing: the first is how often the
+// wait state is sampled, the second a hang guard that turns a mechanism which
+// never blocks into a named failure instead of a suite that stalls, and the
+// third an outer bound that only ever fires when the second has not.
 //
 // WHAT IS ASSERTED IS WHAT THE DATABASE HOLDS. Every case re-reads
 // `meal_entries`, `meal_plan_actions`, `meal_plan_meals`, `meal_plan_days`,
@@ -166,6 +167,33 @@ import {
 } from '../setup/factories';
 import { asUser, request } from '../setup/testApp';
 import { truncateFeatureTables } from '../setup/testDb';
+
+/**
+ * Jest's default allowance is five seconds per case and, separately, per hook.
+ * It is the wrong bar for this file: every case here drives a genuine
+ * `Promise.all` race — or the same pair sequentially in both orders — against
+ * real PostgreSQL and its advisory locks, so a case's duration is dominated by
+ * lock waits, by the transactions its lock holders keep open and by the whole
+ * plan generations a race needs on both sides, not by its assertions. Idle, the
+ * slowest case here measures under a second; the three both-orderings cases
+ * (each running two full generations in sequence) were measured at between
+ * 5.3 s and 5.5 s on a loaded shared host, already past the default. The spread
+ * is the host, not the test, which is exactly what a default calibrated for
+ * pure-logic suites cannot express.
+ *
+ * File-level rather than a trailing argument on those cases: the `beforeEach`
+ * below truncates the feature tables and seeds a week for all of them and
+ * carries the same budget, so a per-case bound would leave the hook on the
+ * default and simply move the timeout it prevents from the case to the hook.
+ * The value sits above the holders' 20 s transactions and well above
+ * {@link LOCK_WAIT_HANG_GUARD_MS}, so a mechanism that has stopped blocking
+ * still fails with the guard's named diagnosis rather than anonymously here,
+ * and it is the bound the sibling database-backed API suites already use
+ * (`api/plans.test.ts`, `api/catalogCollation.test.ts`). It is set here and not
+ * as `testTimeout` in `jest.config.ts`, which would relax the bar for the pure
+ * logic suites where five seconds is a real signal.
+ */
+jest.setTimeout(120_000);
 
 /** The one user every case contends over: the advisory lock is per user. */
 const USER_ID = 'concurrency-suite-user';

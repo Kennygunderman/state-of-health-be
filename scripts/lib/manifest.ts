@@ -2680,6 +2680,115 @@ export const PROVISIONAL_REPORT_MARKER_KEYS: readonly string[] = ['staleness'];
 // else's.
 export const FRESHNESS_OBLIGATIONS_FIELD = 'outstandingStages';
 
+// ---------------------------------------------------------------------------
+// AGGREGATE-OWNED ASSERTIONS — the keys a merge must not carry forward.
+//
+// THE DEFECT THIS CLOSES. The merge below preserves every key the writing stage
+// does not write, which is exactly right for another stage's COUNTER — it is
+// that stage's measurement of its own run and nobody else may restate it — and
+// exactly wrong for a key that ASSERTS SOMETHING ABOUT THE WHOLE DOCUMENT. Such
+// a key is only true as of the write that produced it, because the next stage
+// changes the very state it describes. Measured on the committed v1 artefact,
+// three of them had outlived their write and contradicted the figures beside
+// them:
+//
+//   * `producedBy.aggregatedRunKinds` said the `catalog-generate-ai` run "ran:
+//     false, runId: null" while the document's own `stage` WAS
+//     `catalog-generate-ai` with 502 processed batches and 159 metered calls;
+//   * `measurementGaps[1]` said the USDA request counters were unmeasured and
+//     cited two keys (`usdaRequests.minimumPhysicalAttempts`,
+//     `usdaRequests.unmeasuredReason`) that no longer exist, beside a
+//     `usdaRequests` block measuring 478 attempts and 426 pauses;
+//   * `measurementGaps[0]` said the per-category quarantine split was "not
+//     recoverable from any committed artefact" and cited
+//     `quarantined.atImport`/`atValidate`, beside a populated
+//     `categories[].quarantined` and `quarantined.total: 915`.
+//
+// Re-running the whole pipeline with the three closed surfaced two more of the
+// same kind — keys that no stage writes and every stage preserved, asserting
+// figures the document had moved past:
+//
+//   * `aggregatedAt: 2026-09-15T04:16:12.000Z` asserts when the aggregate
+//     sections were computed, in a document whose own stage write was dated
+//     2026-09-18 and whose aggregates had just been re-measured that day.
+//     Aggregation is the LAST step of the pipeline, so an `aggregatedAt`
+//     earlier than the stage writes beside it cannot describe those sections.
+//     No stage can re-derive it either: `catalog-report` deliberately writes no
+//     wall-clock value, because a rerun against unchanged data has to produce a
+//     byte-identical artefact.
+//   * `usdaDataTypes` asserted Foundation 231 / SR Legacy 6,246 /
+//     Survey (FNDDS) 4,569 — 11,046 rows — and named its own source,
+//     `catalog/releases/v1/foods.jsonl usda_data_type`. Measured from that
+//     exact file after the release was regenerated: 231 / 6,237 / 4,460, i.e.
+//     10,928 rows. An assertion contradicted by the file it cites is worse than
+//     a missing one, and the branded-provenance policy its prose quoted is
+//     stated where it belongs — `usda-manifest.v1.json brandedDataTypePolicy`.
+//
+// None of the five is written by any current stage: each was written by an
+// earlier revision of `catalog-report` and then preserved, unread and
+// unrefreshed, by every later write.
+//
+// THE RULE. A key named here lives in the document only while the write that
+// LANDS supplies it. A write that does not supply it removes it and records the
+// removal in its own note, so the assertion cannot stand unbacked and the gap
+// is visible rather than silent. For the keys the aggregate stage still writes,
+// re-deriving is one command (`npm run catalog:report`), which is why removal is
+// the conservative direction: the aggregate stage re-measures and re-writes them
+// from the catalog, while a preserved claim can only be checked by reading the
+// whole artefact against itself. For `aggregatedAt` and `usdaDataTypes`, which
+// no stage writes at all, removal is the only truthful direction available — and
+// if a later revision starts MEASURING one of them, the same rule hands it back:
+// the write that supplies it keeps it.
+//
+// WHY A NAMED LIST AND NOT A WIPE. Every other key in these documents belongs
+// to the stage that measured it — `counts`, `usdaRequests`, `modelSpend`,
+// `aiGenerationCounts`, `failedChecks`, the per-stage notes — and a merge that
+// dropped what it does not own would delete measurements no other stage can
+// reproduce. So the list is reviewed and short, `catalog-report.ts`'s own
+// `SUPERSEDED_KEYS` remains the mechanism for a claim that stage supersedes
+// inside a block it rewrites, and anything not named here is preserved exactly
+// as it was found.
+// ---------------------------------------------------------------------------
+
+/** Top-level keys that assert something about the merged document as a whole. */
+export const AGGREGATE_OWNED_ASSERTION_KEYS: readonly string[] = [
+    'aggregateMeasurementGaps',
+    'aggregatedAt',
+    'measurementGaps',
+    'usdaDataTypes',
+];
+
+/**
+ * The same kind of key one level down, per block: a sub-key that makes a claim
+ * about the document rather than counting what its writer measured.
+ *
+ * `producedBy` is co-written — the aggregate stage merges its own
+ * `aggregateFields*` entries into whatever attribution the artefact carries —
+ * so the block itself must survive and only the named sub-key is removed.
+ */
+export const AGGREGATE_OWNED_ASSERTION_SUB_KEYS: Readonly<Record<string, readonly string[]>> = {
+    producedBy: ['aggregatedRunKinds'],
+};
+
+/** The command that re-derives the keys it owns, named in the note that drops one. */
+const AGGREGATE_ASSERTION_OWNER_COMMAND = 'npm run catalog:report';
+
+/**
+ * The dropped assertions the owning command puts back, and the ones it cannot.
+ *
+ * Stated as data rather than as prose inside the note so the two halves of the
+ * sentence cannot drift from the lists above: a note promising re-derivation of
+ * a key nothing measures would be the same defect the removal exists to close.
+ */
+const AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES: readonly string[] = [
+    'aggregateMeasurementGaps',
+    'measurementGaps',
+    'producedBy.aggregatedRunKinds',
+];
+
+/** Named here for the same reason: no stage writes either one today. */
+const AGGREGATE_ASSERTIONS_NO_STAGE_WRITES: readonly string[] = ['aggregatedAt', 'usdaDataTypes'];
+
 export interface StageReportMergePolicy {
     /** The key under which the merge records what it preserved. */
     readonly noteKey: string;
@@ -2695,6 +2804,13 @@ export interface StageReportMerge {
     readonly preservedKeys: readonly string[];
     /** Sub-keys another stage owns that survived inside a shared block. */
     readonly preservedSubKeys: Readonly<Record<string, readonly string[]>>;
+    /**
+     * Aggregate-owned assertions this write removed rather than carried
+     * forward, as `<key>` or `<block>.<key>` (see AGGREGATE-OWNED ASSERTIONS).
+     * Empty on a write that supplied every one of them and on a document that
+     * carried none.
+     */
+    readonly droppedAggregateAssertions: readonly string[];
 }
 
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
@@ -2739,6 +2855,50 @@ export const mergeStageReport = (
 
         document[key] = incoming;
     }
+
+    // Remove the aggregate-owned assertions this write does not itself supply.
+    // Done after the key loop above, so a write that DOES supply one has
+    // already landed it and keeps it: the rule is about a claim outliving its
+    // write, not about which stage is allowed to make it.
+    const droppedAggregateAssertions: string[] = [];
+
+    for (const key of AGGREGATE_OWNED_ASSERTION_KEYS) {
+        if (
+            !Object.prototype.hasOwnProperty.call(base, key) ||
+            Object.prototype.hasOwnProperty.call(written, key)
+        ) {
+            continue;
+        }
+        delete document[key];
+        droppedAggregateAssertions.push(key);
+    }
+
+    for (const [blockName, subKeys] of Object.entries(AGGREGATE_OWNED_ASSERTION_SUB_KEYS)) {
+        const block = document[blockName];
+        if (!isPlainObject(block)) {
+            continue;
+        }
+        const incomingBlock = written[blockName];
+        // Copied before the first removal and only then, so a block with
+        // nothing to drop is left as the identical object the merge produced
+        // and a rerun still diffs as unchanged.
+        let pruned: Record<string, unknown> | null = null;
+        for (const subKey of subKeys) {
+            if (!Object.prototype.hasOwnProperty.call(block, subKey)) {
+                continue;
+            }
+            if (isPlainObject(incomingBlock) && Object.prototype.hasOwnProperty.call(incomingBlock, subKey)) {
+                continue;
+            }
+            pruned = pruned ?? { ...block };
+            delete pruned[subKey];
+            droppedAggregateAssertions.push(`${blockName}.${subKey}`);
+        }
+        if (pruned !== null) {
+            document[blockName] = pruned;
+        }
+    }
+    droppedAggregateAssertions.sort();
 
     // Discharge this stage's own freshness obligation, and only its own. See
     // FRESHNESS_OBLIGATIONS_FIELD for why this is per stage: a measured write is
@@ -2799,13 +2959,15 @@ export const mergeStageReport = (
     // previous run of the same stage left it behind, and listing it as a key
     // preserved from another stage would be a false statement in the artefact.
     // Another stage's note key is not excluded — that one really is a field
-    // this write left alone. Cleared provisional markers are excluded too: they
-    // were removed, not carried forward.
+    // this write left alone. Cleared provisional markers and dropped aggregate
+    // assertions are excluded too: they were removed, not carried forward, and
+    // each is listed under its own name below.
     const preservedKeys = Object.keys(base)
         .filter(
             (key) =>
                 key !== policy.noteKey &&
                 !clearedProvisionalMarkers.includes(key) &&
+                !droppedAggregateAssertions.includes(key) &&
                 !Object.prototype.hasOwnProperty.call(written, key),
         )
         .sort();
@@ -2822,12 +2984,29 @@ export const mergeStageReport = (
         // while the report stage still owes its aggregates.
         dischargedFreshnessObligation,
         outstandingFreshnessObligations,
+        // Which aggregate-owned assertions this write removed, and the one
+        // command that puts them back. Written on every merge so a reader can
+        // tell "this document never had them" from "this write invalidated
+        // them", which an absent key alone cannot say.
+        droppedAggregateAssertions,
+        droppedAggregateAssertionsReason:
+            droppedAggregateAssertions.length === 0
+                ? null
+                : `Each key named above asserts something about this document AS A WHOLE, and this write changed ` +
+                  `the state it described, so it was removed instead of being carried forward unbacked. ` +
+                  `${AGGREGATE_ASSERTION_OWNER_COMMAND} re-measures and re-writes the ones it owns ` +
+                  `(${AGGREGATE_ASSERTIONS_THE_OWNER_REWRITES.join(', ')}); ` +
+                  `${AGGREGATE_ASSERTIONS_NO_STAGE_WRITES.join(' and ')} are written by no stage today, so they ` +
+                  'stay absent until one measures them. No counter belonging to another stage is ever removed this ' +
+                  'way.',
         compoundBlocks: [...compound].sort(),
         basis:
             'This stage replaced the keys it measured and preserved every other key in the document, because the ' +
             'import, generation and report stages all write into this file. The blocks named in compoundBlocks are ' +
             'co-written, so their sub-keys were merged instead of replaced and preservedSubKeys names the ones this ' +
-            'write carried forward from another stage.',
+            'write carried forward from another stage. The one class of key it does NOT preserve is an aggregate ' +
+            'assertion about the whole document, which is only true as of the write that produced it: ' +
+            'droppedAggregateAssertions names any this write removed.',
     };
 
     try {
@@ -2840,7 +3019,7 @@ export const mergeStageReport = (
         );
     }
 
-    return { document, preservedKeys, preservedSubKeys };
+    return { document, preservedKeys, preservedSubKeys, droppedAggregateAssertions };
 };
 
 /**
@@ -3454,6 +3633,72 @@ export interface UsdaImportLimits {
     readonly maxListPageSize: number;
 }
 
+/**
+ * THE DECLARED HEADROOM THAT LETS AN IMPORT REACH THE REQUIRED PUBLISHED COUNT.
+ *
+ * THE DEFECT THIS EXISTS FOR. The coverage plan's per-category `candidateVolume`
+ * is `ceil(1.25 × publishedTarget)`, and a sweep declaring
+ * `stopWhenCategoryCandidateVolumeReached` refuses every further record of a
+ * category that has reached it. Measured on the v1 catalog, that refused 2,250
+ * genuine generic USDA records while thirteen categories stayed short because
+ * the vendor's generic datasets do not hold their records at all — so the run
+ * planned 10,003 records, published 9,422 of them, and finished 578 items below
+ * the 10,000 the feature requires (Agent Action Plan §0.1.1 area 3) with the
+ * refused records sitting in crowded categories the cap had already filled.
+ * The per-category volumes are not the problem and are not touched: §0.7.3
+ * fixes them, `scripts/lib/budget.ts` sizes the model-call budget from them,
+ * and a category's target and its exact shortfall stay reported as they are.
+ * What was missing is a floor under the WHOLE run's planned volume, so a
+ * category that is full stops refusing records while the catalog as a whole is
+ * still below the volume the requirement needs.
+ *
+ * WHY IT IS DECLARED IN THE MANIFEST AND NOT PASSED AS A FLAG. A release has to
+ * be reproducible from committed data: an operator's ad-hoc `--admit-more` on
+ * one machine would make the published count an artefact of an invocation
+ * nobody can read back. Declared here, the floor, the requirement it serves and
+ * the measured publish rate that justifies it are reviewable in the diff,
+ * re-derivable by a reader, and checked below before the first vendor request.
+ *
+ * WHAT IT DOES NOT DO. It admits more REAL VENDOR RECORDS into the plan and
+ * nothing else: an admitted record is fetched, classified, validated and
+ * published — or quarantined — by exactly the checks every other swept record
+ * passes through, carries its own validation record, and is `source_backed`
+ * with `identity_source: usda` like the rest. No bound is relaxed, no row is
+ * synthesised, and a category's published target is neither moved nor met by it.
+ */
+export interface UsdaRequirementHeadroom {
+    /**
+     * The published-item count the feature requires (Agent Action Plan §0.1.1
+     * area 3). Declared rather than imported because this document is the one a
+     * reviewer reads the floor's justification in, and a floor whose stated
+     * requirement is invisible is a number with no argument behind it.
+     */
+    readonly requiredPublishedItems: number;
+    /**
+     * The floor under the run's TOTAL planned record count. While the plan holds
+     * fewer records than this, a swept record whose category has reached its
+     * `candidateVolume` is still planned; once the floor is reached the cap
+     * applies again exactly as before.
+     */
+    readonly plannedVolumeFloor: number;
+    /**
+     * Published rows ÷ planned records, measured on a completed run. The floor
+     * has to exceed `requiredPublishedItems ÷ this`, or it could not reach the
+     * requirement even if every record behaved like the measured average.
+     */
+    readonly measuredPublishRate: number;
+    /** When the rate above was measured, so a reader can date the arithmetic. */
+    readonly measuredOn: string;
+    /** The artefact and figures the rate was measured from. */
+    readonly measuredFrom: string;
+    /** The intake rule in prose, for a reader of the document alone. */
+    readonly rule: string;
+    /** The arithmetic from the requirement and the rate to this floor. */
+    readonly arithmetic: string;
+    /** The report counter an admitted record is counted under. */
+    readonly countedAs: string;
+}
+
 export interface UsdaManifest {
     readonly usdaManifestVersion: string;
     /**
@@ -3477,6 +3722,16 @@ export interface UsdaManifest {
      */
     readonly caloriesFallback: string;
     readonly importLimits: UsdaImportLimits;
+    /**
+     * Optional, and its absence is the previous behaviour exactly: without it
+     * every sweep that declares `stopWhenCategoryCandidateVolumeReached` holds
+     * to the per-category volume with no floor under the run's total. A
+     * manifest that declares it is checked in full by
+     * {@link assertUsdaManifestShape}, and the floor is additionally held below
+     * the coverage plan's own candidate-volume total by the importer's
+     * cross-file check before its first vendor request.
+     */
+    readonly requirementHeadroom?: UsdaRequirementHeadroom;
     readonly datasetSweeps: readonly UsdaDatasetSweep[];
     readonly foods: readonly UsdaManifestFood[];
     readonly sweepClassificationRules: UsdaSweepClassificationRules;
@@ -4322,6 +4577,74 @@ export const assertUsdaManifestShape = (value: unknown, relativePath: string): U
     }
     requireInteger(limits.detailBatchSize, relativePath, 'importLimits.detailBatchSize', 1);
     const maxListPageSize = requireInteger(limits.maxListPageSize, relativePath, 'importLimits.maxListPageSize', 1);
+
+    // THE HEADROOM'S OWN ARITHMETIC, CHECKED RATHER THAN TRUSTED.
+    //
+    // The block relaxes a budget, so a malformed one is not a field a stage
+    // reads as `undefined` — it is a run that imports either nothing extra or
+    // everything, and reports a number nobody can re-derive. Every field is
+    // therefore required when the block is present, and the two relations that
+    // make the floor an argument rather than an assertion are enforced here:
+    // the floor must at least reach the requirement, and it must exceed what
+    // the requirement divided by the measured publish rate needs. The upper
+    // bound is the coverage plan's candidate-volume total, which this module
+    // cannot see — `assertManifestMatchesCoveragePlan` in
+    // `scripts/catalog-import-usda.ts` owns that half, as it owns every other
+    // cross-file check.
+    optional(document.requirementHeadroom, (present) => {
+        const headroom = requireRecord(present, relativePath, 'requirementHeadroom');
+        const required = requireInteger(
+            headroom.requiredPublishedItems,
+            relativePath,
+            'requirementHeadroom.requiredPublishedItems',
+            1,
+        );
+        const floor = requireInteger(
+            headroom.plannedVolumeFloor,
+            relativePath,
+            'requirementHeadroom.plannedVolumeFloor',
+            1,
+        );
+        const rate = requirePositiveNumber(
+            headroom.measuredPublishRate,
+            relativePath,
+            'requirementHeadroom.measuredPublishRate',
+        );
+        requireNonEmptyString(headroom.measuredOn, relativePath, 'requirementHeadroom.measuredOn');
+        requireNonEmptyString(headroom.measuredFrom, relativePath, 'requirementHeadroom.measuredFrom');
+        requireNonEmptyString(headroom.rule, relativePath, 'requirementHeadroom.rule');
+        requireNonEmptyString(headroom.arithmetic, relativePath, 'requirementHeadroom.arithmetic');
+        requireNonEmptyString(headroom.countedAs, relativePath, 'requirementHeadroom.countedAs');
+
+        // A rate above 1 would publish more rows than were planned, which no
+        // run can do: every published row comes from a planned record.
+        if (rate > 1) {
+            throw shapeError(
+                relativePath,
+                `declares requirementHeadroom.measuredPublishRate ${rate}, which is above 1 — a run cannot publish ` +
+                    'more rows than it planned records, so the rate is published ÷ planned and at most 1',
+            );
+        }
+        if (floor < required) {
+            throw shapeError(
+                relativePath,
+                `declares requirementHeadroom.plannedVolumeFloor ${floor} below its own ` +
+                    `requiredPublishedItems ${required}: not every planned record publishes, so a floor under the ` +
+                    'requirement itself cannot reach it',
+            );
+        }
+        const minimumFloor = Math.ceil(required / rate);
+        if (floor < minimumFloor) {
+            throw shapeError(
+                relativePath,
+                `declares requirementHeadroom.plannedVolumeFloor ${floor}, below the ${minimumFloor} that ` +
+                    `requiredPublishedItems ${required} at the measured publish rate ${rate} needs ` +
+                    `(ceil(${required} / ${rate})). Raise the floor, or re-measure the rate on a completed run ` +
+                    'and state both — the floor is only as good as the arithmetic beside it',
+            );
+        }
+        return headroom;
+    });
 
     // Checked before `foods` and `datasetSweeps`, because both are validated
     // against vocabularies this block declares.

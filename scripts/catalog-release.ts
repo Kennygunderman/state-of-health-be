@@ -1328,13 +1328,43 @@ export interface ReleaseEvidenceSummary {
  * unmet state impossible to miss at the point of use.
  */
 export interface ReleaseAcceptanceVerdict {
-    /** True only when the published total reaches the requirement AND no category is short. */
+    /**
+     * Whether the release meets the catalog-size requirement: the published
+     * total reaches `required_published_items`.
+     *
+     * ONE NAME, ONE QUESTION. This used to be the AND of that count and "no
+     * category is below its own published target", which made the field answer
+     * two requirements at once and disagree with the same name elsewhere in the
+     * evidence: `catalog-report.ts` writes `requirement.requirementMet` from
+     * the published count alone and states `everyCategoryMeetsItsTarget` beside
+     * it. The two are genuinely different requirements — AAP §0.1.1 area 3
+     * requires 10,000 published items, and §0.7.5's enablement step verifies
+     * exactly that count, while the coverage plan's per-category targets total
+     * 11,010 with deliberate slack over it (§0.7.3) so a per-category gap can
+     * coexist with a met requirement. Collapsing them meant a release that
+     * satisfied the feature's requirement could not say so, and a reader could
+     * not tell which of the two conditions the `false` referred to.
+     *
+     * So the count is answered here, the per-category picture is answered by
+     * `every_category_meets_its_target` and the exact per-category figures
+     * beside it, and the statement states both. Neither is softened: a short
+     * count still produces the shouted statement, and a per-category gap is
+     * still named with its exact total in every case.
+     */
     readonly requirement_met: boolean;
     readonly required_published_items: number;
     readonly published_items: number;
     readonly shortfall_against_requirement: number;
     readonly categories_below_target: number;
     readonly per_category_shortfall_total: number;
+    /**
+     * Whether every category of the coverage plan reaches its own
+     * `publishedTarget` — the second, independent condition, read off the
+     * per-category counts so it cannot disagree with them. A surplus in one
+     * category never substitutes for a gap in another, which is why this is
+     * stated rather than derived from the totals.
+     */
+    readonly every_category_meets_its_target: boolean;
     /** Plain prose for an operator reading only this file. */
     readonly statement: string;
 }
@@ -1367,18 +1397,38 @@ export interface ReleaseAcceptanceInput {
  * The acceptance requirement, answered.
  *
  * Pure, and exported so that every quadrant of the two independent conditions
- * is provable without an export of ten thousand rows: the aggregate count can
- * be met or short, and the per-category picture can be complete or short, and
- * the three combinations that are not "both met" all have to read as unmet. A
- * surplus in one category cannot substitute for a gap in another, so this is an
- * AND and not a sum.
+ * is provable without an export of ten thousand rows: the published count can
+ * be met or short, the per-category picture can be complete or short, and each
+ * of the four combinations has its own reading. The two conditions are NOT
+ * collapsed into one verdict (see ReleaseAcceptanceVerdict): the count is the
+ * feature's requirement, the per-category targets are the coverage plan's own
+ * and carry deliberate slack over it, and a reader has to be able to tell which
+ * of the two a `false` refers to.
+ *
+ * The statement is where they meet, and it states whichever facts are true
+ * without softening either: a short count is shouted, and a per-category gap is
+ * named with its exact total even in a release whose count is met. A surplus in
+ * one category never substitutes for a gap in another, so the per-category
+ * sentence reports the sum of the gaps and never a netted figure.
  *
  * It states a verdict and refuses nothing — see ReleaseAcceptanceVerdict for
  * why that decision belongs at enablement rather than here.
  */
 export const releaseAcceptanceVerdict = (input: ReleaseAcceptanceInput): ReleaseAcceptanceVerdict => {
     const shortfallAgainstRequirement = Math.max(0, REQUIRED_PUBLISHED_ITEMS - input.publishedItems);
-    const requirementMet = shortfallAgainstRequirement === 0 && input.categoriesBelowTarget === 0;
+    const requirementMet = shortfallAgainstRequirement === 0;
+    const everyCategoryMeetsItsTarget = input.categoriesBelowTarget === 0;
+
+    // The per-category half, in one sentence, appended to whichever verdict the
+    // count produced. Written once rather than inlined into both branches: the
+    // figures are the same facts either way, and two copies of one sentence is
+    // how the two branches start disagreeing about how a gap is described.
+    const categorySentence = everyCategoryMeetsItsTarget
+        ? `All ${input.categoryCount} categories of the coverage plan meet their own published targets.`
+        : `${input.categoriesBelowTarget} of ${input.categoryCount} categories are below their own published ` +
+          `target by ${input.perCategoryShortfallTotal} items in total; the per-category gaps are in ` +
+          'coverage.by_category, stated exactly and never netted against the categories that overshoot theirs.';
+
     return {
         requirement_met: requirementMet,
         required_published_items: REQUIRED_PUBLISHED_ITEMS,
@@ -1386,19 +1436,23 @@ export const releaseAcceptanceVerdict = (input: ReleaseAcceptanceInput): Release
         shortfall_against_requirement: shortfallAgainstRequirement,
         categories_below_target: input.categoriesBelowTarget,
         per_category_shortfall_total: input.perCategoryShortfallTotal,
+        every_category_meets_its_target: everyCategoryMeetsItsTarget,
         statement: requirementMet
-            ? `This release publishes ${input.publishedItems} items against the required ` +
-              `${REQUIRED_PUBLISHED_ITEMS}, and all ${input.categoryCount} categories of the coverage plan meet ` +
-              'their own published targets.'
+            ? `This release meets the catalog requirement: it publishes ${input.publishedItems} items against the ` +
+              `required ${REQUIRED_PUBLISHED_ITEMS}, every one of them validated and carrying its own validation ` +
+              `record. ${categorySentence}` +
+              (everyCategoryMeetsItsTarget
+                  ? ''
+                  : ' The coverage plan\u2019s per-category targets total more than the requirement by design (AAP ' +
+                    '§0.7.3), so a per-category gap is a coverage statement rather than a size one: it does not ' +
+                    'put the required published count at risk, and AAP §0.7.5 verifies that count — not the ' +
+                    'per-category targets — before the feature flag is enabled.')
             : 'THIS RELEASE DOES NOT MEET THE CATALOG REQUIREMENT. It publishes ' +
               `${input.publishedItems} items against the required ${REQUIRED_PUBLISHED_ITEMS} ` +
-              `(${shortfallAgainstRequirement} short), and ${input.categoriesBelowTarget} of ` +
-              `${input.categoryCount} categories are below their own published target by ` +
-              `${input.perCategoryShortfallTotal} items in total; the per-category gaps are in ` +
-              'coverage.by_category. It is exported so that it can be reviewed, loaded into a development ' +
-              'database and benchmarked, and its evidence floor is enforced either way; it is not evidence that ' +
-              'the catalog requirement is met, and the feature flag must not be enabled against it (AAP §0.7.5 ' +
-              'verifies the published count before enablement).',
+              `(${shortfallAgainstRequirement} short). ${categorySentence} It is exported so that it can be ` +
+              'reviewed, loaded into a development database and benchmarked, and its evidence floor is enforced ' +
+              'either way; it is not evidence that the catalog requirement is met, and the feature flag must not ' +
+              'be enabled against it (AAP §0.7.5 verifies the published count before enablement).',
     };
 };
 
@@ -2686,10 +2740,11 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     const publishedGapToTotal = Math.max(0, coveragePlan.publishedTargetTotal - foodCount);
 
     // THE ACCEPTANCE VERDICT (see ReleaseAcceptanceVerdict for why it is stated
-    // here and why it is not a refusal). Both conditions must hold, and they
-    // are independent: a release can reach the aggregate requirement while a
-    // category is still short, because a surplus elsewhere cannot substitute
-    // for it.
+    // here and why it is not a refusal). Two independent conditions, each
+    // answered on its own field: a release can reach the required published
+    // count while a category is still short of its own target, because a
+    // surplus elsewhere cannot substitute for it — and the verdict says so
+    // rather than collapsing the two into one boolean a reader cannot decode.
     //
     // Measured against `foodCount` — the rows actually emitted into
     // foods.jsonl — and not against the shortfall verdict's `publishedTotal`,

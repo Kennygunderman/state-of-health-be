@@ -185,6 +185,19 @@ export type CatalogImportErrorCode =
      */
     | 'manifest_inert_policy_keys'
     /**
+     * The manifest's `requirementHeadroom.plannedVolumeFloor` sits above the
+     * coverage plan's own candidate-volume total, so nothing would bound it:
+     * the floor could not be reached before the plan ran out of volume, and
+     * every category would admit records for the whole sweep.
+     *
+     * Its own code because the remedy is a number in one document rather than a
+     * filing or a key: lower the floor to what the required published count
+     * needs at the measured publish rate. Refused with the other cross-file
+     * checks, before the limiter and the first request, for the same reason
+     * they are — the disagreement is between two committed files.
+     */
+    | 'manifest_headroom_above_plan_volume'
+    /**
      * A `foods` entry reached the planner without a verified FDC id.
      * `loadUsdaManifest` refuses that document outright (see
      * `assertUsdaManifestShape`), so this is reachable only from a caller that
@@ -2404,6 +2417,21 @@ export interface CoveragePlanAgreement {
      * across a taxonomy rename while every import kept succeeding.
      */
     readonly inertPolicyKeys: readonly string[];
+    /**
+     * The manifest's `requirementHeadroom.plannedVolumeFloor` sits above the
+     * volume the coverage plan itself aims for, so the floor would keep every
+     * category admitting records for the whole sweep and the per-category
+     * candidate volumes would stop binding at all.
+     *
+     * This is the UPPER bound that makes the headroom bounded: the lower one —
+     * that the floor can reach the requirement at the measured publish rate —
+     * is internal to the manifest and enforced by `assertUsdaManifestShape`,
+     * while this one needs the plan and is therefore checked here, with every
+     * other cross-file agreement, before the first vendor request. As fatal as
+     * the two lists above: a floor nothing bounds is the unconditional removal
+     * of a budget the plan states, wearing a declared rule's clothes.
+     */
+    readonly volumeMismatches: readonly string[];
 }
 
 /**
@@ -2423,6 +2451,31 @@ export const checkManifestAgainstCoveragePlan = (
 
     const filingMismatches: string[] = [];
     const inertPolicyKeys: string[] = [];
+    const volumeMismatches: string[] = [];
+
+    // THE HEADROOM'S UPPER BOUND. The floor is what keeps a full category
+    // admitting records while the catalog as a whole is short of the required
+    // published count; the plan's total candidate volume is what keeps that
+    // from becoming "sweep everything". A floor at or above the plan's own
+    // total would be satisfied by no run that the per-category volumes could
+    // ever bind, so the cap would stop applying rather than resume — which is
+    // the unconditional removal this rule exists to avoid. The plan's total is
+    // read from the document's declared `candidateVolumeTotal` where it has
+    // one, and otherwise summed from the categories, so an older plan without
+    // the field is still bounded rather than unbounded.
+    const headroom = manifest.requirementHeadroom;
+    if (headroom !== undefined) {
+        const planVolumeTotal =
+            coveragePlan.candidateVolumeTotal ??
+            coveragePlan.categories.reduce((total, row) => total + row.candidateVolume, 0);
+        if (headroom.plannedVolumeFloor > planVolumeTotal) {
+            volumeMismatches.push(
+                `requirementHeadroom.plannedVolumeFloor ${headroom.plannedVolumeFloor} is above the coverage ` +
+                    `plan's own candidate volume total ${planVolumeTotal}, so no run could reach the floor before ` +
+                    'the plan ran out of volume and every category would admit records for the whole sweep',
+            );
+        }
+    }
 
     // Before any heading is compared: every check below reads this plan as the
     // authority on what a category and a food group mean, so comparing against
@@ -2512,7 +2565,7 @@ export const checkManifestAgainstCoveragePlan = (
         }
     });
 
-    return { filingMismatches, inertPolicyKeys };
+    return { filingMismatches, inertPolicyKeys, volumeMismatches };
 };
 
 /** `a; b; c; and 20 more` — a list an operator can read, whatever its length. */
@@ -2576,11 +2629,29 @@ export const assertManifestMatchesCoveragePlan = (
         );
     }
 
+    if (agreement.volumeMismatches.length > 0) {
+        throw new CatalogImportError(
+            'manifest_headroom_above_plan_volume',
+            `data/meal-planning/${USDA_MANIFEST_FILE} (usdaManifestVersion ${manifest.usdaManifestVersion}) ` +
+                `declares a requirement headroom the coverage plan (coveragePlanVersion ` +
+                `${coveragePlan.coveragePlanVersion}) cannot bound: ` +
+                `${describeMismatchList(agreement.volumeMismatches)}. Lower plannedVolumeFloor to the volume the ` +
+                'required published count actually needs at the measured publish rate — the headroom is a bounded ' +
+                'floor under one run, and a floor the plan cannot bound is the removal of the per-category ' +
+                'candidate volumes rather than a declared exception to them.',
+            { manifestVersion: manifest.usdaManifestVersion },
+        );
+    }
+
     logger.info('manifest_coverage_plan_agreed', {
         stage: STAGE,
         usdaManifestVersion: manifest.usdaManifestVersion,
         coveragePlanVersion: coveragePlan.coveragePlanVersion,
         foodGroups: coveragePlan.foodGroups.length,
+        // Stated on the agreement line because it is the run's own record of
+        // the intake rule it is about to apply: a report read later can be
+        // checked against the floor the run started from.
+        plannedVolumeFloor: manifest.requirementHeadroom?.plannedVolumeFloor ?? null,
     });
 
     return agreement;
@@ -2604,6 +2675,42 @@ export interface ImportPlan {
     /** Identifies the plan, so a resume into a changed plan is refused rather than silently misaligned. */
     readonly fingerprint: string;
     readonly skipped: Readonly<Record<string, number>>;
+    /**
+     * Plan-time ADMISSIONS, kept apart from `skipped` for the same reason the
+     * refusal counters are kept apart from one another: a reader asking "how
+     * many records did a rule let in that the previous revision would have
+     * refused?" must not have to subtract two refusal counters to find out.
+     * One key today — `admittedByRequirementHeadroom` — and a map rather than a
+     * scalar so a second admission rule joins it without changing the four
+     * places that spread these counters into a report.
+     */
+    readonly admitted: Readonly<Record<string, number>>;
+    /** What the run's requirement headroom was, and what it did — null when the manifest declares none. */
+    readonly headroom: ImportHeadroomOutcome | null;
+}
+
+/**
+ * The requirement headroom's own record of itself, written into the import
+ * report so the extra rows in the catalog have a stated cause.
+ *
+ * `floorReached` is the field that matters to a reader: false means the vendor
+ * pool ran out before the floor did, which is a fact about the datasets and not
+ * a fault in the rule, and it is the difference between "the floor is too low"
+ * and "there are no more records to admit".
+ */
+export interface ImportHeadroomOutcome {
+    readonly requiredPublishedItems: number;
+    readonly plannedVolumeFloor: number;
+    readonly measuredPublishRate: number;
+    /** Records admitted past a full category's candidate volume under the floor. */
+    readonly admitted: number;
+    /** Records the cap still refused, i.e. after the floor was reached. */
+    readonly stillCapped: number;
+    readonly plannedTotal: number;
+    readonly floorReached: boolean;
+    /** False for a `--category` run, which cannot reach a whole-catalog floor. */
+    readonly appliedToThisRun: boolean;
+    readonly appliedToThisRunReason: string;
 }
 
 const chunk = <T>(items: readonly T[], size: number): T[][] => {
@@ -2647,8 +2754,20 @@ export const buildImportPlan = async (
         skippedUnresolvedEntry: 0,
         skippedDuplicateInPlan: 0,
         skippedCategoryFilter: 0,
-        /** A sweep record whose category had already reached its candidate volume. */
+        /**
+         * A sweep record the candidate-volume cap refused. Its meaning is
+         * exactly what it has always been — the category was full and the
+         * record was not planned — and the requirement headroom below does not
+         * borrow it: a record the floor admitted is counted under
+         * `admittedByRequirementHeadroom` instead, so this counter keeps
+         * answering "how many records did the plan's own volumes refuse?"
+         * across catalog versions with and without a declared floor.
+         */
         skippedCategoryVolumeReached: 0,
+    };
+    const admitted: Record<string, number> = {
+        /** A full category's record planned anyway, because the run was below the floor. */
+        admittedByRequirementHeadroom: 0,
     };
 
     const wantedCategories = new Set(options.categories);
@@ -2697,6 +2816,36 @@ export const buildImportPlan = async (
 
         return budgeted.length > 0 && budgeted.every((category) => !hasCategoryCapacity(category));
     };
+
+    // THE REQUIREMENT HEADROOM (usda-manifest.v1.json `requirementHeadroom`,
+    // and `UsdaRequirementHeadroom` in scripts/lib/manifest.ts for the defect
+    // it closes). The per-category volumes above are a distribution budget:
+    // they stop one category from consuming the request budget the others need.
+    // They are not a statement about the size of the catalog, and on the v1 run
+    // they refused 2,250 genuine generic USDA records while thirteen categories
+    // stayed short of their targets because the vendor's generic datasets do
+    // not hold those records at all — leaving the catalog 578 items below the
+    // 10,000 published items the feature requires.
+    //
+    // So the floor is a second budget over the run as a WHOLE: while fewer
+    // records are planned than `plannedVolumeFloor`, a full category still
+    // admits a record. It is bounded (a declared integer, held below the plan's
+    // own candidate-volume total by `assertManifestMatchesCoveragePlan`),
+    // declared in committed data rather than passed as a flag, and
+    // deterministic — admission depends only on how many records the walk has
+    // planned when it reaches this record, and the walk is the manifest's own
+    // `workListOrder`.
+    //
+    // WHY A `--category` RUN IS EXCLUDED. The floor is a whole-catalog number.
+    // A run restricted to one category can never reach it, so the headroom
+    // would never stop admitting and that category would absorb the entire
+    // sweep — a scoped run silently importing more than the canonical one.
+    // A restricted run therefore keeps the cap exactly as it is, and the report
+    // states that it did rather than leaving the reader to infer it.
+    const declaredHeadroom = manifest.requirementHeadroom ?? null;
+    const headroomApplies = declaredHeadroom !== null && wantedCategories.size === 0;
+    const headroomAvailable = (): boolean =>
+        headroomApplies && declaredHeadroom !== null && assignments.size < declaredHeadroom.plannedVolumeFloor;
 
     // `--limit` is documented as "stop after n manifest records", so it is one
     // budget over the whole work list in workListOrder — the curated entries
@@ -2800,7 +2949,13 @@ export const buildImportPlan = async (
             // Checked BEFORE the request, which is the point: once every
             // category this run can file under is full, each further page costs
             // a token from the same 900/hour budget and yields nothing.
-            if (honoursCategoryVolume && everyInScopeCategoryFull()) {
+            //
+            // `headroomAvailable()` is part of the same condition rather than a
+            // separate branch because the two halves have to agree: while the
+            // floor is unreached a full category still admits records, so a
+            // page of them yields something and the page-level stop would end
+            // the sweep before the per-record rule below could ever fire.
+            if (honoursCategoryVolume && everyInScopeCategoryFull() && !headroomAvailable()) {
                 volumeStoppedAtPage = page - 1;
                 break;
             }
@@ -2861,9 +3016,26 @@ export const buildImportPlan = async (
                 // overfill it. Other categories on this same page are still
                 // accepted, which is why this is a `continue` and the page loop
                 // above stops only when every one of them is full.
+                //
+                // Unless the run is below the declared requirement floor, in
+                // which case this record is planned and counted as admitted by
+                // the headroom rather than refused by the cap. It is admitted
+                // as an ORDINARY record from here on: the same brand screen and
+                // excluded-class screen above have already passed it, the same
+                // identity and food-state resolution below applies to it, and
+                // the same validation publishes or quarantines it.
+                //
+                // The admission is only COUNTED once the record is actually
+                // planned, below — the curated-identity screen after this can
+                // still refuse it, and counting here would credit the headroom
+                // with a record the plan does not hold.
+                let admittedByHeadroom = false;
                 if (honoursCategoryVolume && !hasCategoryCapacity(classification.category)) {
-                    skipped.skippedCategoryVolumeReached += 1;
-                    continue;
+                    if (!headroomAvailable()) {
+                        skipped.skippedCategoryVolumeReached += 1;
+                        continue;
+                    }
+                    admittedByHeadroom = true;
                 }
 
                 const foodState = resolveFoodState(description, sweep.dataType, manifest.sweepFoodStateRules);
@@ -2886,6 +3058,9 @@ export const buildImportPlan = async (
                     classified: classification.matched,
                 });
                 countPlanned(classification.category);
+                if (admittedByHeadroom) {
+                    admitted.admittedByRequirementHeadroom += 1;
+                }
                 sweepIds.push(row.fdcId);
             }
         }
@@ -2903,6 +3078,11 @@ export const buildImportPlan = async (
             volumeStoppedAtPage,
             observedLastNonEmptyPage: observedLastPage ?? null,
             grewBeyondObserved,
+            // Cumulative over the work list, not per sweep: the floor is one
+            // budget over the whole run, so the figure a reader needs beside a
+            // sweep's own planned count is how much of that floor has been
+            // spent by the time the sweep ended.
+            admittedByRequirementHeadroom: admitted.admittedByRequirementHeadroom,
         });
 
         for (const ids of chunk(sweepIds, batchSize)) {
@@ -2915,7 +3095,33 @@ export const buildImportPlan = async (
         .update(JSON.stringify(batches.map((batch) => [batch.source, batch.fdcIds])))
         .digest('hex');
 
-    return { batches, assignments, fingerprint, skipped };
+    return {
+        batches,
+        assignments,
+        fingerprint,
+        skipped,
+        admitted,
+        headroom:
+            declaredHeadroom === null
+                ? null
+                : {
+                      requiredPublishedItems: declaredHeadroom.requiredPublishedItems,
+                      plannedVolumeFloor: declaredHeadroom.plannedVolumeFloor,
+                      measuredPublishRate: declaredHeadroom.measuredPublishRate,
+                      admitted: admitted.admittedByRequirementHeadroom,
+                      stillCapped: skipped.skippedCategoryVolumeReached,
+                      plannedTotal: assignments.size,
+                      floorReached: assignments.size >= declaredHeadroom.plannedVolumeFloor,
+                      appliedToThisRun: headroomApplies,
+                      appliedToThisRunReason: headroomApplies
+                          ? 'This run covers the whole coverage plan, so the floor is the whole-catalog number the ' +
+                            'manifest declares it to be.'
+                          : 'Not applied: this run was restricted to named categories with --category, and a ' +
+                            'whole-catalog floor a restricted run can never reach would admit every leftover ' +
+                            'record of those categories. The per-category candidate volumes bound this run exactly ' +
+                            'as they did before the floor existed.',
+                  },
+    };
 };
 
 // ---------------------------------------------------------------------------
@@ -3154,6 +3360,12 @@ export const initialImportCounts = (plan: ImportPlan): Record<string, number> =>
     // already-completed scope found `undefined` where every other figure was 0.
     batchesProcessed: 0,
     ...plan.skipped,
+    // The plan-time ADMISSIONS belong in the zero shape for the same reason
+    // the skips do: a consumer reading counts.admittedByRequirementHeadroom
+    // must find the key whether or not this invocation did any work, and an
+    // absent key would read as "the rule does not exist here" rather than
+    // "it admitted nothing".
+    ...plan.admitted,
 });
 
 /**
@@ -3494,6 +3706,7 @@ const reportDryRun = async (
         rejected: 0,
         missingFromVendor: 0,
         ...plan.skipped,
+        ...plan.admitted,
     };
 
     deps.logger.info('dry_run_planned', {
@@ -3531,6 +3744,21 @@ const reportDryRun = async (
             counts,
             byCategory: {},
             failedChecks: {},
+            // THE INTAKE RULE THIS PLAN APPLIED, AS EVIDENCE. A plan-time fact,
+            // so a dry run states it in full — the floor is what decides how
+            // many records the canonical run would fetch.
+            //
+            // The extra rows a declared requirement headroom admits are
+            // ordinary vendor records, so nothing in the catalog itself says
+            // where they came from. This block does: the floor the run was held
+            // to, the requirement and the measured publish rate that justify
+            // it, how many records it admitted, how many the cap still refused
+            // once the floor was reached, and whether the floor was reached at
+            // all — which is the difference between "the pool ran out" and
+            // "the floor is too low". `null` is the honest value for a
+            // manifest that declares no headroom: the block is then a statement
+            // that the per-category volumes alone bounded the run.
+            requirementHeadroom: buildRequirementHeadroomBlock(plan),
             // A plan-time fact, so a dry run can state it: both mechanisms are
             // applied while the work list is built, before any fetch. The measured
             // blocks (categories, failuresByCheck, quarantined) are deliberately
@@ -3816,6 +4044,10 @@ export const writeImportReport = (target: string, report: unknown, log: ScriptLo
             file: path.basename(target),
             preservedKeys: merged.preservedKeys.length,
             preservedSubKeys: Object.keys(merged.preservedSubKeys).length,
+            // Named rather than counted: an aggregate assertion this write
+            // invalidated is a key a reader will look for and not find, and
+            // `npm run catalog:report` is what puts it back.
+            droppedAggregateAssertions: merged.droppedAggregateAssertions.join(','),
         });
     });
 };
@@ -3839,6 +4071,68 @@ const buildDuplicatesRemovedBlock = (plan: ImportPlan): Record<string, unknown> 
     basisAtImport:
         'Two import-stage mechanisms, both applied while the plan is built and before any fetch: a swept record whose normalised identity collides with a reviewed curated entry is never assigned, and an FDC id already in the plan is never assigned twice. The cross-table duplicate decision is deliberately NOT made here - it needs a view of the whole non-rejected table that a batch-at-a-time import cannot have - so dedupeIdentity runs in catalog:validate and its duplicate_identity counts appear in the validation report.',
 });
+
+/**
+ * The requirement headroom, as the report states it.
+ *
+ * Exported for its unit test and because it is the whole of the block: the
+ * three figures a reader checks the extra rows against — the floor, what it
+ * admitted and what the cap still refused — beside the requirement and the
+ * publish rate the floor was sized from, which are read off the manifest so
+ * the artefact states the numbers this run was actually held to.
+ *
+ * The prose here is this stage's own and is deliberately NOT copied from the
+ * manifest: the manifest argues the floor to a reviewer (`rule`, `arithmetic`,
+ * `measuredFrom`), while these sentences tell a reader of the artefact what the
+ * rule did to THIS run. `basis` names the document so the two can be read
+ * together, and no sentence is duplicated between them — a copied paragraph is
+ * how one of the two ends up describing a rule the other no longer states.
+ *
+ * `declared: false` is the shape for a manifest without the block, and it says
+ * what that means rather than emitting nulls a reader has to interpret.
+ */
+export const buildRequirementHeadroomBlock = (plan: ImportPlan): Record<string, unknown> => {
+    if (plan.headroom === null) {
+        return {
+            declared: false,
+            admittedByRequirementHeadroom: 0,
+            skippedCategoryVolumeReached: plan.skipped.skippedCategoryVolumeReached ?? 0,
+            basis:
+                'data/meal-planning/usda-manifest.v1.json declares no requirementHeadroom, so the coverage plan\u2019s ' +
+                'per-category candidateVolume values bounded this run on their own: every swept record of a category ' +
+                'that had reached its volume was refused, and skippedCategoryVolumeReached counts them.',
+        };
+    }
+
+    return {
+        declared: true,
+        requiredPublishedItems: plan.headroom.requiredPublishedItems,
+        plannedVolumeFloor: plan.headroom.plannedVolumeFloor,
+        measuredPublishRate: plan.headroom.measuredPublishRate,
+        plannedTotal: plan.headroom.plannedTotal,
+        floorReached: plan.headroom.floorReached,
+        admittedByRequirementHeadroom: plan.headroom.admitted,
+        skippedCategoryVolumeReached: plan.headroom.stillCapped,
+        appliedToThisRun: plan.headroom.appliedToThisRun,
+        appliedToThisRunReason: plan.headroom.appliedToThisRunReason,
+        floorReachedMeaning:
+            'False means the vendor\u2019s generic datasets ran out of records before the floor did \u2014 a fact about ' +
+            'the datasets, not a fault in the rule \u2014 so every record they hold that passed the brand, ' +
+            'excluded-class and curated-identity screens is in this plan and skippedCategoryVolumeReached is 0.',
+        admittedRecordsAre:
+            'Ordinary vendor records. Each was fetched, classified, validated and published or quarantined by the ' +
+            'same checks as every other swept record, carries its own validation record, and is identity_source ' +
+            'usda with nutrition_provenance source_backed. The rule changes which records are PLANNED and nothing ' +
+            'about how they are judged.',
+        basis:
+            'data/meal-planning/usda-manifest.v1.json requirementHeadroom, read at plan time: while the run\u2019s ' +
+            'total planned count was below plannedVolumeFloor, a swept record whose category had reached its ' +
+            'coverage-plan candidateVolume was planned anyway and counted under admittedByRequirementHeadroom; once ' +
+            'the floor was reached the cap applied again and skippedCategoryVolumeReached counts what it refused. ' +
+            'The per-category publishedTarget and candidateVolume values are untouched by it, and each category\u2019s ' +
+            'own shortfall is still reported exactly.',
+    };
+};
 
 /**
  * One refusal tier as the report states it: its own total, its own bounded
@@ -4025,6 +4319,9 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
             records: plan.assignments.size,
             fingerprint: plan.fingerprint.slice(0, 16),
             ...plan.skipped,
+            ...plan.admitted,
+            plannedVolumeFloor: plan.headroom?.plannedVolumeFloor ?? null,
+            requirementFloorReached: plan.headroom?.floorReached ?? null,
         });
 
         // A DRY RUN TOUCHES NO RUN STATE AT ALL. openOrResumeRun claims
@@ -4415,6 +4712,7 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
         const runOutcomeCounts: Record<string, number> = {
             planned: plan.assignments.size,
             ...plan.skipped,
+            ...plan.admitted,
             ...runFigures.counts,
         };
 
@@ -4443,6 +4741,19 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                 policy,
                 new Map(Object.entries(runFigures.byCategoryOutcome)),
             ),
+            // THE INTAKE RULE THIS RUN APPLIED, AS EVIDENCE.
+            //
+            // The extra rows a declared requirement headroom admits are
+            // ordinary vendor records, so nothing in the catalog itself says
+            // where they came from. This block does: the floor the run was held
+            // to, the requirement and the measured publish rate that justify
+            // it, how many records it admitted, how many the cap still refused
+            // once the floor was reached, and whether the floor was reached at
+            // all — which is the difference between "the pool ran out" and
+            // "the floor is too low". `null` is the honest value for a
+            // manifest that declares no headroom: the block is then a statement
+            // that the per-category volumes alone bounded the run.
+            requirementHeadroom: buildRequirementHeadroomBlock(plan),
             // How the figures above were arrived at, so a reader can tell a
             // single-attempt run from a resumed one instead of inferring it
             // from a batch count that does not add up.
@@ -4472,6 +4783,7 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                 countsExcludedFromCarry: [
                     'planned',
                     ...Object.keys(plan.skipped).sort(),
+                    ...Object.keys(plan.admitted).sort(),
                 ],
                 countsExcludedFromCarryReason:
                     'Plan-time figures, recomputed identically from the manifest by every attempt. They are applied once here; carrying them would double them on resume.',

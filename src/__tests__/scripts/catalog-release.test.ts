@@ -1406,32 +1406,47 @@ describe('the manifest states whether the release meets the catalog requirement 
                 perCategoryShortfallTotal,
             });
 
-        it('is met only when the aggregate is reached and no category is short', () => {
+        it('is met, on both counts, when the published count is reached and no category is short', () => {
             const verdict = at(10000, 0, 0);
 
             expect(verdict).toMatchObject({
                 requirement_met: true,
                 shortfall_against_requirement: 0,
                 categories_below_target: 0,
+                every_category_meets_its_target: true,
             });
-            expect(verdict.statement).toContain('all 21 categories');
+            expect(verdict.statement).toContain('All 21 categories');
             expect(verdict.statement).not.toContain('DOES NOT MEET');
         });
 
-        it('is unmet when a category is short even though the aggregate is reached', () => {
-            // The condition that makes this an AND: 11,010 published rows can
-            // satisfy a 10,000-item requirement while one category sits below
-            // its own target, and a surplus somewhere else is not a substitute
-            // for it.
+        it('separates the two conditions: the requirement is met while a category is still short', () => {
+            // The two are different requirements and the verdict answers each
+            // on its own field. AAP §0.1.1 area 3 requires 10,000 published
+            // items and §0.7.5 verifies exactly that count at enablement; the
+            // coverage plan's per-category targets total 11,010, deliberate
+            // slack over it (§0.7.3), so one category below its own target
+            // does not make the catalogue undersized. Collapsing the two into
+            // one boolean is what made a met requirement unsayable — and left
+            // a reader unable to tell which condition a false referred to.
             const verdict = at(11010, 1, 42);
 
-            expect(verdict.requirement_met).toBe(false);
-            expect(verdict.shortfall_against_requirement).toBe(0);
-            expect(verdict.statement).toContain('DOES NOT MEET THE CATALOG REQUIREMENT');
-            expect(verdict.statement).toContain('1 of 21 categories');
+            expect(verdict).toMatchObject({
+                requirement_met: true,
+                shortfall_against_requirement: 0,
+                every_category_meets_its_target: false,
+                categories_below_target: 1,
+                per_category_shortfall_total: 42,
+            });
+            expect(verdict.statement).not.toContain('DOES NOT MEET');
+            // Met is never stated bare: the gap is named with its exact total
+            // in the same sentence, and a surplus elsewhere never nets it off.
+            expect(verdict.statement).toContain('meets the catalog requirement');
+            expect(verdict.statement).toContain('1 of 21 categories are below their own published target by 42');
+            expect(verdict.statement).toContain('never netted');
+            expect(verdict.statement).toContain('coverage.by_category');
         });
 
-        it('is unmet when the aggregate is short even though every category is complete', () => {
+        it('is unmet when the published count is short even though every category is complete', () => {
             // The other direction, which a plan whose targets sum below the
             // requirement can produce: nothing is short per category, and the
             // catalogue is still 1,000 items below what is required of it.
@@ -1440,7 +1455,9 @@ describe('the manifest states whether the release meets the catalog requirement 
             expect(verdict.requirement_met).toBe(false);
             expect(verdict.shortfall_against_requirement).toBe(1000);
             expect(verdict.categories_below_target).toBe(0);
+            expect(verdict.every_category_meets_its_target).toBe(true);
             expect(verdict.statement).toContain('9000 items against the required 10000');
+            expect(verdict.statement).toContain('DOES NOT MEET THE CATALOG REQUIREMENT');
         });
 
         it('is unmet on both counts, and reports each gap under its own name', () => {
@@ -1452,7 +1469,10 @@ describe('the manifest states whether the release meets the catalog requirement 
                 shortfall_against_requirement: 578,
                 categories_below_target: 13,
                 per_category_shortfall_total: 2392,
+                every_category_meets_its_target: false,
             });
+            expect(verdict.statement).toContain('DOES NOT MEET THE CATALOG REQUIREMENT');
+            expect(verdict.statement).toContain('13 of 21 categories are below their own published target by 2392');
             // The aggregate gap and the per-category gap are different
             // measurements of different things, and neither is the other's
             // total — 578 is what the catalogue owes the requirement, 2,392 is
@@ -1462,6 +1482,17 @@ describe('the manifest states whether the release meets the catalog requirement 
 
         it('never reports a negative shortfall for a release that overshoots', () => {
             expect(at(12000, 0, 0).shortfall_against_requirement).toBe(0);
+        });
+
+        it('states the enablement gate reads the published count, not the per-category targets', () => {
+            // The one sentence an operator acts on: §0.7.5 checks
+            // publishedCount >= 10,000 before MEAL_PLANNING_ENABLED=true, so a
+            // release whose count is met and whose categories are not must say
+            // which of the two the gate reads.
+            const verdict = at(10461, 13, 2392);
+
+            expect(verdict.requirement_met).toBe(true);
+            expect(verdict.statement).toContain('§0.7.5 verifies that count');
         });
     });
 });
