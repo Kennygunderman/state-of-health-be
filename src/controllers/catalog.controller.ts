@@ -53,15 +53,43 @@ import { CatalogSearchResponse } from '../types/catalog';
 import { isMealPlanningEnabled } from '../utils/featureFlags';
 import { getUserId } from '../utils/getUserId';
 import { toPaginationBlock } from '../utils/pagination';
+import { describeErrorSafely, logSafeEvent } from '../utils/safeLogger';
 
 const FEATURE_DISABLED = 'feature_disabled';
 const RECIPE_NOT_FOUND = 'Recipe not found';
 
+/**
+ * The event name every unhandled catalogue failure is recorded under, matching
+ * `mealPlanning.controller.ts`'s `request_failed` so one query finds the 500s of
+ * both routers.
+ */
+const REQUEST_FAILED = 'request_failed';
+
+/**
+ * Why the throw is described rather than printed.
+ *
+ * This handler used to `console.error(fallback, error)`, which hands the whole
+ * error object to the log formatter: a stack, a Prisma `meta` carrying the
+ * failing statement's values, or a vendor response body all render in full, and
+ * a message containing newlines can forge a second log line after it
+ * (CWE-532/CWE-117). `describeErrorSafely` reduces the throw to a name and, when
+ * the runtime supplies one, a machine code, and `logSafeEvent` emits only
+ * declared scalar fields — the same treatment
+ * `mealPlanning.controller.ts::failRequest` applies, and what Rule
+ * backend-architecture §8 requires of every logged failure. The response body is
+ * unchanged: the caller still receives the fallback code with a 500.
+ */
 const handleCatalogError = (res: Response, error: unknown, fallback: string) => {
     if (error instanceof MealPlanningDisabledError) {
         return res.status(503).json({ error: FEATURE_DISABLED });
     }
-    console.error(fallback, error);
+
+    logSafeEvent('error', REQUEST_FAILED, {
+        status: 500,
+        code: fallback,
+        ...describeErrorSafely(error),
+    });
+
     return res.status(500).json({ error: fallback });
 };
 

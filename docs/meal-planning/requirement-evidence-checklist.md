@@ -308,12 +308,16 @@ those artefacts are for, and why this table names them instead of copying them.
 So: headline outcome here, full measurement in the artefact that measured it,
 and neither in the policy documents.
 
-Provenance: the delivered tree — the API submodule at `b4e0e27` and the app
-submodule at `487a66a`. The runs were executed as the work landed, on 2026-09-17
-and 2026-09-18, and every figure below that the grown catalogue release, the
-suites or the lint baseline moved was **re-measured on those two commits**
-rather than carried forward: checks 7, 12, 13, 15, 16, 21, 22 and 23 state what
-a run on this tree returned. Where a row quotes a generated report, the report's
+Provenance: every figure below was measured with the API submodule at `b4e0e27`
+and the app submodule at `487a66a` checked out — the last commits that changed
+executable code or catalogue data. Both are ancestors of the delivered heads;
+what came after them is this documentation and the two lineage merges recorded
+in check 24, neither of which changes a compiled file, a test or a committed
+artefact, which is why re-measuring at the head would return these same numbers.
+The runs were executed as the work landed, on 2026-09-17 and 2026-09-18, and
+every figure that the grown catalogue release, the suites or the lint baseline
+moved was **re-measured on those two commits** rather than carried forward:
+checks 7, 12, 13, 15, 16, 21, 22 and 23 state what a run on this tree returned. Where a row quotes a generated report, the report's
 own `generatedAt` is quoted beside the figures so the measurement dates itself.
 One row measures the release as it stood **before** it was re-cut and says so in
 place — check 14's byte-identical coverage report, whose full re-run would
@@ -350,6 +354,7 @@ document.
 | 21 | App suite | `CI=true npx jest --runInBand --ci` | **124 of 124 suites passed, 6,018 of 6,018 tests**, exit 0 (the pre-feature baseline was 42 suites and 577 tests) |
 | 22 | App lint against the recorded baseline | `npx eslint --no-fix -f json .` then the baseline comparison script | **Comparison exit 0 — 0 new findings** over the after report's 886 results. 38 findings remain in 20 files against a baseline of 49 in 31 files, so the pre-existing count fell and nothing was added. `eslint .` itself still exits non-zero while baseline findings remain, which is expected and is not this gate |
 | 23 | App token-literal gate | `node scripts/token-literal-scan.mjs $(git diff --name-only --diff-filter=ACMR master -- 'src/**/*.styled.*' 'src/**/*.tsx' ':(exclude)src/**/__tests__/**')` | **exit 0 — 213 files scanned, no hardcoded style value found.** That invocation is the documented one, and its scope is both file classes the scanner decides between — every styled module a change touches, `.tsx` ones included, and every component `.tsx`, so the JSX-attribute scan runs as well as the style-object scan, with `__tests__` excluded because a stylesheet test's numbers are the expectation it pins. The file list is derived from the diff rather than fixed, for the same reason the lint gate's is. The rationale for each pathspec term is in `app: docs/meal-planning.md` § "The literal scan" |
+| 24 | Branch lineage against the reference commits | `git merge-base --is-ancestor 6bfc66c HEAD` in the API repository, `git merge-base --is-ancestor 788a36f HEAD` in the app repository | **Both answer yes.** AAP §0.1.4 requires each feature branch to sit on its reference commit so that this plan's template edits build on the reference templates rather than conflicting with them. Measured before the fix, neither reference was an ancestor: both branches diverged at the reference's *parent* — `5cdd043` and `603718ee` — so the rebase the plan describes never happened. Each reference was brought in by **merge rather than rebase**, because a rebase would rewrite every commit on both branches and the shas it would invalidate are load-bearing: this document provenances its measurements to two of them, the uuid disposition cites the withdrawn bump `360c765`, and the report artefacts name the commits they were produced at. The API merge is provably content-neutral — the tree it commits hashes to `e318dac…`, byte-identical to its first parent's, because all 39 non-blank lines of `6bfc66c`'s `.env.example` were already present in this branch's superset of it, including the deliberate second `PORT` entry the file explains. The app merge reconciles the one file both sides rewrote, `.env.dist`: the value stays the non-production `http://localhost:3000` that AAP §0.3.1 requires of that template — the reference still points it at the production host, and a copied `.env` must not reach production by omission — while the two facts the branch's own rewrite had dropped are restored beside it, that `"/api"` is appended in `src/constants/endpoints.ts` and that local `expo run` reads the file while EAS builds take the value from EAS environment variables. Nothing under `src/` is touched by either merge, no code reads either template, and the diff-derived scopes of checks 22 and 23 are unchanged at 469 changed lintable files and 213 scanned, because those gates diff trees rather than histories |
 
 One reproduction note for check 7, because it is not a property of the code: the
 suite opens a Prisma client per worker, and on a PostgreSQL server shared with
@@ -430,6 +435,40 @@ Fifteen covered paths: the eleven pure domain modules and the four pure
 utilities. Service and mapper modules are absent from this table by design —
 Rule 7 §11 covers them by integration, which is what the `src/__tests__/api/*`
 suites are.
+
+## The seven user-specified rules, clause by clause
+
+Seven rules govern this work — six for the app and one for the API. The table
+below is one row per rule, each stating the clauses it was checked against, the
+verdict, and the evidence that establishes it: a command whose output was read,
+or a file and line that was read. Nothing here is carried from an earlier
+report. Where the delivered code departs from a clause's literal words, the row
+says so and the note beneath it gives the reason — a rule reported clean by
+omitting its awkward cases would be worth nothing.
+
+The rules themselves are summarised in the Agent Action Plan §0.10, which is
+what implementers are given, and the clause groupings below follow that
+summary. Counts were measured with the repository at the commits named under
+[Provenance](#what-was-verified-in-this-environment) plus this documentation.
+
+| # | Rule | Clauses checked | Verdict | Evidence read or command run |
+| --- | --- | --- | --- | --- |
+| 1 | `mobile-architecture` | TanStack for all server state through `queries/<domain>/` hooks and `queries/api/<domain>/` request functions; io-ts codecs with shared `decoder/` and `converter/`; Zustand for device state only; no direct axios; no Redux; no inline styles; copy from `@constants/strings`; typed navigation params | **PASS**, with one narrow deviation stated in note 1a | 22 hooks under `src/queries/mealPlanning` + `src/queries/catalog`, 21 request functions under `src/queries/api/{mealPlanning,catalog}`, 2 decoder modules and 9 converters. `grep -rn 'style={{' src --include='*.tsx'` → 6 hits, every one in `PreviousWorkoutEntries` or `debug/DebugScreen`, both pre-existing and both recorded in the lint baseline; zero in any file this feature authored. `grep -rln redux src` → 0. `useMealPlanStore` carries no plan, recipe or grocery payload — `grep -cE 'plan:\|recipes:\|groceries:\|items:'` → 0. `src/navigation/types.ts` declares 24 meal-planning route entries and 23 `RouteProp` aliases |
+| 2 | `mobile-component-structure` | `interface Props`, never `React.FC`, spread props or nested definitions; one component per file with a co-located styled module; pure `index.util.ts` with a colocated test; the util scope rule; reuse of the base components | **PASS**, with the `Props` shape of two components stated in note 2a | `grep -rn 'React\.FC' src` → **0**. Every `index.util.ts` in the repository has a colocated `__tests__/index.util.test.ts` — checked by iterating all of them, **0 without**. `grep -rn "from '[^']*/\(components\|screens\)/[^']*/index\.util'"` → **0**, so no component imports another's util. Five component directories carry no styled module: four are pre-existing (`TickerText`, `CreateTemplateModal`, `ExerciseOptionsBottomSheet`, `Register`) and the fifth is this feature's `GroceryList/components/GroceryRow`, which is a seven-line dispatcher returning `GroceryFlagRow` or `GroceryItemRow` and declares no style of its own — read in full |
+| 3 | `mobile-file-conventions` | PascalCase screen folders; camelCase query files; every key in `queries/keys.ts`; one API function per file; `decoder/` and `converter/` subfolders; the store path; navigation stacks plus `RouteProp` aliases; `__tests__/<name>.test.ts`; tokens under `src/styles` | **PASS** | No API file exports more than one function — checked file by file across both `queries/api` domains, **0 over one**. `grep -rn 'queryKey: \['` outside `keys.ts` → 2 hits, both inside test files constructing a literal key to assert against, which is the only way to assert one. `src/store/mealPlan/useMealPlanStore.ts` is at the prescribed path. `find src -path '*__tests__*' -name '*.ts' ! -name '*.test.ts'` → **0** misnamed test files. Six token modules under `src/styles` |
+| 4 | `mobile-helper-functions` | Pure, typed, tested named exports under `src/utility/`; time-dependent helpers take their clock as a parameter; tests under `src/utility/__tests__` with describe-per-function; dependency injection over mocking | **PASS** | All six utilities this feature adds — `ServingsUtility`, `NutritionFormatUtility`, `UnitConversionUtility`, `MealPlanDateUtility`, `IdempotencyUtility`, `RevisionConflictUtility` — exist with a colocated test, **6 of 6**. `grep -rn 'new Date()' src/utility` → 3 hits, all in the pre-existing `RunUtility` and `DateUtility`; none in the six. `MealPlanDateUtility` takes `now` as a parameter and `IdempotencyUtility.mintKey` takes its UUID source, so neither reaches for a global — read at their signatures |
+| 5 | `mobile-state-management` | The server/device split; centralized keys; mutations owning cache updates in `onSuccess` while call sites own toasts and navigation; `useInfiniteQuery` driven by the API pagination block; the `PERSISTED_QUERY_KEYS` whitelist; one store per domain with `reset()`; React Context for flow drafts; `useState` for form inputs | **PASS** | 15 mutation option factories with **15** colocated `*.util.test.ts`, which is what makes each `onSuccess` invalidation set assertable without a renderer. `PERSISTED_QUERY_KEYS` holds 7 entries, `mealPlanCurrent` the only one this feature adds. `useMealPlanStore` declares `reset()` and `useAuthStore`'s logout calls it — three references. `MealPlanSetupProvider` is a `createContext` provider, not a store. `getNextPageParam` lives in `useCatalogSearchInfiniteQuery.util.ts:46` and is driven by the response's own `page`/`totalPages`, pinned by `useCatalogSearchInfiniteQuery.test.ts:176-180` |
+| 6 | `mobile-styling` | Styles in `index.styled.ts` through `StyleSheet.create`; `@styles` tokens for colour, spacing, radius, shadow, size, stroke, opacity and type metrics; no inline literals; no magic numbers; no hardcoded hex; migrate on touch | **PASS — and clean for the first time at this boundary** | The token gate over the widened scope: `node scripts/token-literal-scan.mjs $(git diff --name-only --diff-filter=ACMR master -- 'src/**/*.styled.*' 'src/**/*.tsx' ':(exclude)src/**/__tests__/**')` → **exit 0 over 213 files**. That scope is itself part of this remediation: the gate previously read only `index.styled.ts` and so could not see a style literal written as a JSX attribute, which is how `activeOpacity={0.7}` survived. Widening it surfaced twelve such literals, all migrated in the same change — one `0.5` to `Opacity.PRESSED_TARGET_ROW`, six `0.6` to `PRESSED` and five `0.7` to `PRESSED_SUBTLE` — changing no rendered value. Across the whole feature diff **17** numeric `activeOpacity` attributes have been replaced by tokens and **0** added, against 61 token-based ones now in place. `grep -rnE "'#[0-9A-Fa-f]{3,8}'"` and `grep -rn 'rgba('` outside `src/styles` → 4 hits, all in pre-existing modules (`GlobalBottomSheet`, `Skeleton`, `RunCountdownOverlay`); none in a file this feature authored |
+| 7 | `backend-architecture` | route → controller → service → pure `*.logic.ts` → mapper; `getUserId`, a pure parser, one service call and a typed error mapped to a status; `user_id` in every predicate including updates and deletes; 404 never 403; typed error classes; vendor boundaries as `<domain>.service.ts` with configuration read once and vendor errors wrapped; meter before spend; `ipv4first` before any network module; snake_case Prisma models; a real Jest suite replacing the stub | **PASS**, with the one AAP-frozen predicate stated in note 7a | 11 routers, 10 controllers, 11 pure logic modules with **11 of 11** colocated tests, 4 mappers. `getUserId` is imported by **10 of 10** controllers. `grep -rn 'status(403)'` across `src` → **0**. `mealPlanning.errors.ts` declares 21 typed error classes. The controller boundary is not asserted by inspection but by two suites: `controllerBoundary.test.ts` (37 cases, including "the parse happens at the boundary, before the service is called" and "a well-formed request reaches its service exactly once") and `requestParserWiring.test.ts` (63 cases, one per entry point). Three vendor boundaries exist as services, with `OpenRouterError` and `getOpenRouterConfig` in `openrouter.service.ts`; `scripts/lib/budget.ts` reserves before every model call; `ipv4first` is set in both `src/server.ts` and `scripts/lib/bootstrap.ts`; 32 snake_case Prisma models and **0** PascalCase; `npm test` is `jest --ci --runInBand --coverage`, a real run of 56 suites and 10,717 tests |
+
+**Note 1a — the one axios import in feature code.** `src/queries/api/mealPlanning/fetchNutritionTargets.ts` imports `axios`, and eight other files in the repository do too. Eight are a pre-existing utility and its test, two pre-existing run-domain files, and test fixtures constructing an `AxiosError`. The ninth is this feature's, and it is not a request: the request is `httpGet(Endpoints.MealPlanTargets, TargetsResponse)` on line 31, and `axios.isAxiosError` on line 39 is used only as a type predicate to recognise the bare 404 that AAP §0.7.5 requires be mapped to "no server targets" rather than an error — the case a rolled-back backend produces. The rule forbids issuing requests outside `httpUtil`, which this does not do; narrowing the error `httpUtil` rethrows needs the vendor's own type guard.
+
+**Note 2a — two components declare `Props` as a union of interfaces.** `CatalogSearchField` and `SetupFooter` each declare `interface`s and then `type Props = A | B` rather than a single `interface Props`. Both are genuinely two-shaped: the search field is either the tap target of screen 06 or the controlled input of 06b, and the footer is either the stacked or the split Figma template. A discriminated union is the only way to type that contract, both take an explicitly typed `props: Props`, and neither uses `React.FC` or spreads props into JSX — so the clause's intent (a named props contract, declared, not inline) holds while its literal wording does not.
+
+**Note 7a — one pre-existing write predicate the AAP freezes.** Every write this feature authors carries its owner: the swap's meal update goes through `swapMealWhere` (`swap.logic.ts:937-946`), which returns `{id, user_id, meal_plan_id}`, and `updateMealEntry` was given an owner-bearing `where` during this work. Eleven update or delete calls in `src/services` have no `user_id` within three lines; nine are in pre-existing services this feature does not touch (`exercise`, `food`, `migration`, `run`, `user`, `workout`), one is the grep mis-reading a multi-line statement in `swap.service.ts:1407` whose predicate is the helper above, and the last is `nutrition.service.ts:183` — the `logMealEntry` dedupe branch, which updates by `existing.id` after finding the row through the caller's own `meal_id`. AAP §0.5.1 requires that branch to stay **byte-for-byte unchanged**, so it is frozen by instruction rather than overlooked, and the AAP outranks a rule's suggested treatment.
+
+**One violation was found by this pass and fixed rather than reported.**
+`catalog.controller.ts`'s 500 handler called `console.error(fallback, error)`, handing the whole throw to the log formatter — a stack, a Prisma `meta` carrying a failing statement's values, or a vendor response body all render in full, and a message containing newlines can forge a following log line (CWE-532/CWE-117). Its sibling `mealPlanning.controller.ts` had already replaced exactly that pattern with `logSafeEvent` plus `describeErrorSafely`, which emit a name, a machine code and declared scalar fields only; this handler had been left behind. It now takes the same treatment, with the response body unchanged. `grep -rn 'console\.'` across the feature's own files now returns only prose in comments describing what was removed.
 
 ## What is unrun or unverified
 
@@ -527,11 +566,12 @@ presented as a near-miss.
 
 ## Dispositions awaiting a human ruling
 
-One item below is neither a verification gap nor a defect this work may fix: it
-is a **recorded disposition** on a known advisory, written down because the
-decision belongs to a human maintainer and nothing in this work has the
-authority to take it. It is **not** a resolved vulnerability, and it is stated
-here rather than left to `npm audit` output nobody reads.
+Two items below are neither verification gaps nor defects this work may fix.
+Each is a **recorded disposition** — the first on a known advisory, the second on
+a set of colour pairs that ship below their accessibility thresholds — written
+down because the decision belongs to a human and nothing in this work has the
+authority to take it. Neither is resolved, and both are stated here rather than
+left to `npm audit` output nobody reads or to a code comment no designer opens.
 
 ### `uuid@9.0.1` — GHSA-w5hq-g745-h8pq, accepted risk pending a ruling
 
@@ -575,6 +615,65 @@ which the bump, a fresh `npm ci` and a full suite run are the work; or a
 **recorded acceptance** of the unreachable path at the pinned version, which is
 what this section documents in the meantime. Until one of those is on record the
 version stays at 9.0.1 and the advisory stays open.
+
+### Eight Figma-exact colour pairs below their WCAG 2.1 thresholds — pending a design ruling
+
+**What ships.** `app: src/styles/theme.ts` carries an accessible-colour register
+whose status is recorded in two parts, because the two halves have different
+owners: **engineering, complete** and **design, open**. Eight pairs render below
+the threshold their use would require. The four text pairs are `white` on
+`green` at **2.45:1** where button and pill labels need 4.5:1 (600/16px and
+600/13px are not large text), `textFaint` as a placeholder at **3.31:1** on
+`inset` and **3.28:1** on `dangerTint`, `textMuted` on `tile` at **4.40:1** —
+short by 0.10, the narrowest miss — and `danger` on `dangerTint` at **4.41:1** in
+the grocery delta pill. Four more are non-text UI component pairs needing 3:1:
+`textDisabled` as a hollow indicator or checkbox outline (2.23:1 on `card`),
+`inputBorder` on `inset` (**1.12:1**, so an unfocused field has no identifiable
+boundary), the clear-disc glyph pair (1.94:1 and 2.49:1), and `textFaint` /
+`textDisabled` as muted row text (3.81:1 and 2.23:1). Every ratio in the register
+was recomputed from the token values during this remediation and each one is
+exact to the second decimal as written.
+
+**Why they were not raised.** The AAP makes Figma the visual source of truth
+(§0.1.2) and orders precedence token compliance, then Figma fidelity, then
+accessibility (§0.6.5); every one of these colours is recorded there as an exact
+1:1 token match (§0.2.2, §0.6.3), and each pair was re-verified node by node
+against Figma file `ZytSsn2tKVpMCSoibMJ274` and is drawn there exactly as the app
+renders it. §0.6.5's accessibility rule is explicit about this case: where Figma
+specifies a value that computes below the minimum, match Figma **exactly**, emit
+the `BLITZY [A11Y]` marker for designer review, and never silently darken or
+lighten a rendered colour. Silently raising one would also reach far outside this
+feature — this is the app-wide palette, and `green` alone backs `accentGreen`,
+`success`, `secondaryLighter` and `barActive`, which paint shipped surfaces
+§0.8.2 holds out of scope, including the bottom tab bar.
+
+**What engineering did supply.** The accessibility work that needs no ruling is
+applied throughout: an `accessibilityRole` and an `accessibilityLabel` on every
+pressable (§0.7.2), 44px touch targets (§0.6.5), and `TextField` forwarding an
+`accessibilityLabel` to its input so assistive technology reads a field's purpose
+from the label and never from the low-contrast placeholder — which bounds pair 2
+to the sighted low-vision case. The register itself makes the ruling cheap rather
+than investigative: each entry names the Figma nodes that draw it, the measured
+ratio, the threshold it misses and a **pre-computed remedy** given as an existing
+palette token wherever one already clears it — `page` on `green` measures 7.67:1
+and `greenTint` on `green` 5.52:1 against the accent, `textSecondary` reaches
+6.01:1 on `inset`, 5.95:1 on `dangerTint` and 6.40:1 on `tile`, `textMuted` gives
+4.75:1 on `card` — so most require no new colour at all. Where only a new value
+would do, the register states the target instead: relative luminance at or below
+0.183 for text on the accent and 0.300 for glyphs, against the accent's measured
+0.3783. The marker is emitted at the register and at every point of use — 30
+occurrences across 23 files, listed by `grep -rn 'BLITZY \[A11Y\]' src` in the
+app repository — so the debt is findable from the code and not only from a report.
+
+**What this disposition is, and what would close it.** It is accepted, tracked
+accessibility debt awaiting a design decision, and the register does not make the
+palette compliant — it records the decision that has not been taken. One of two
+outcomes closes each entry, neither of which an agent may choose: **accept the
+Figma value** with the exception recorded, or **adopt the remedy named with it**,
+after which applying it is mechanical. Until one is on record the rendered values
+stay exactly as Figma draws them. The full register, with per-entry Figma node
+ids, is in `app: src/styles/theme.ts`; the app-side handoff note is `app:
+docs/meal-planning.md` § "Three gaps left open", item 3.
 
 ## The physical-device checklist — UNRUN
 
