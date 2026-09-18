@@ -58,12 +58,12 @@
  * tables are still empty.
  *
  * THE REAL ARTEFACT IS LOADED HERE, WHOLE. The last block applies the committed
- * 9,422-food release through `runLoad` and then applies it again, because
+ * 10,928-food release through `runLoad` and then applies it again, because
  * §0.9.1's gate — the release loaded twice, the second run reporting no insert
  * and no update — is the one claim no synthesized release can stand in for: it
  * is what says the bytes in this repository reconcile against a database, and
  * it is the acceptance signal §0.9.3 asks for. It is by far the longest-running
- * test in this file — it reconciles every row of an 11,046-food release against
+ * test in this file — it reconciles every row of a 10,928-food release against
  * PostgreSQL, twice — which is why it is ONE test rather than the vehicle for
  * every behavioural claim above it. No wall-clock figure is quoted: how long it
  * takes is a property of the runner and the database it is pointed at, and a
@@ -1440,7 +1440,7 @@ describe('loading the same release again', () => {
  *
  * `--dry-run` promises "the same reconciliation", and the usage block and the
  * runbook both say so, so the child rows are part of what it has to report: a
- * dry run that reported 9,422 foods and zero aliases would be describing a
+ * dry run that reported 10,928 foods and zero aliases would be describing a
  * load nobody is about to run.
  * ------------------------------------------------------------------------- */
 
@@ -4048,7 +4048,7 @@ describe('the committed v1 release', () => {
      * repository rather than bytes it wrote, and the identity-evidence floor is
      * the property those bytes have to satisfy. The release measured here was
      * cut by a pipeline pass that observes a real HTTP status per retrieval, so
-     * all 9,422 of its published records state an integer 2xx status and the
+     * all 10,928 of its published records state an integer 2xx status and the
      * floor holds across every one of them. The release it replaced stated
      * `http_status: null` on all 11,046 of its records — the exact condition the
      * import stage quarantines and the loader refuses — which is the defect
@@ -4145,7 +4145,7 @@ describe('the committed v1 release', () => {
         ).toEqual([]);
 
         // And the bytes on disk, measured through the loader's own verification
-        // on a path that writes nothing. The double load of 9,422 foods is
+        // on a path that writes nothing. The double load of 10,928 foods is
         // §0.9.1's operator check, not this suite's.
         const deps: LoadDeps = {
             db: prisma as unknown as LoadDb,

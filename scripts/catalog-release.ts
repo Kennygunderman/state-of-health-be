@@ -1265,7 +1265,7 @@ export interface ReleaseEvidenceIdentitySource {
  * identity source binds a cache key), so the loader re-measures it and refuses
  * a mismatch. `resolved_records` is not measurable from the release at all; it
  * is an attestation, and the loader can only check it covers what it measures.
- * Both are stated rather than one, because "9,422 of 9,422" and "9,422" are
+ * Both are stated rather than one, because "10,928 of 10,928" and "10,928" are
  * different claims and only the first is falsifiable.
  */
 export interface ReleaseSourceCacheResolution {
@@ -1465,7 +1465,7 @@ export type CatalogReleaseManifestWithEvidence = CatalogReleaseManifest & {
  * The evidence facts of the walk, accumulated one published row at a time.
  *
  * Bounded by the number of distinct identity sources (two today) and gap codes
- * (eleven), never by the catalog: a release of 9,422 rows adds nothing to this
+ * (eleven), never by the catalog: a release of 10,928 rows adds nothing to this
  * object beyond a few counters, which is what lets the measurement ride along
  * with the streamed export rather than needing a second pass over 59 MB.
  */
@@ -1957,11 +1957,12 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     // straight to their member, so what this function keeps alive is one page of
     // rows (~1.5 MB) plus the small per-food tallies below — not the catalog.
     // Buffering instead means three copies of it at once: every Prisma row
-    // (9,422 parents, whose validation records are 59 MB of JSON as JS
+    // (10,928 parents, whose validation records are 64 MB of JSON as JS
     // objects), every mapped line, and every joined member string, the largest
-    // of which the join transiently doubles. Measured on the committed v1
-    // release, replacing the descriptor writers with the buffering fallback
-    // costs ~59 MiB of peak RSS for the member strings alone, with the
+    // of which the join transiently doubles. Measured on the 9,422-row export
+    // this release superseded, replacing the descriptor writers with the
+    // buffering fallback cost ~59 MiB of peak RSS for the member strings
+    // alone — the current export is larger still — with the
     // Prisma-row copy excluded because the harness feeds rows a page at a time
     // in both modes; a release a few times larger is where that stops being a
     // number and becomes a heap failure on the machine cutting it.
@@ -2730,7 +2731,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     // gap between the two totals. Those are different numbers whenever one
     // category overshoots its target while another falls short, and the
     // aggregate hides exactly the fact a reader needs: this release publishes
-    // 9,422 foods against a plan total of 11,010, and 13 categories sit below
+    // 10,928 foods against a plan total of 11,010, and 13 categories sit below
     // their own targets while 8 others overshoot theirs.
     // Reporting 0 there would claim per-category coverage this release does
     // not have, which is the one thing the header forbids. The aggregate

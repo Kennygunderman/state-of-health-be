@@ -133,7 +133,7 @@
 // write beyond the run row. It is achieved by comparing the stored food and its
 // children against the release and skipping an unchanged food entirely — no
 // transaction at all — because `catalog_foods.updated_at` is `@updatedAt` and
-// 9,422 pointless transactions would both churn that column and turn the
+// 10,928 pointless transactions would both churn that column and turn the
 // release gate into a benchmark.
 //
 // A PARTIAL LOAD IS REPAIRED BY RERUNNING IT (AAP §0.7.5), which is a property
@@ -1247,7 +1247,7 @@ const parseValidationLine = (row: ReleaseRow, line: number): ValidationColumns =
 // a comparison that reported "unchanged" too readily would leave a stale row
 // behind, and one that reported "changed" too readily would churn
 // `catalog_foods.updated_at` on every load and turn the release gate into
-// 9,422 pointless transactions.
+// 10,928 pointless transactions.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1405,10 +1405,10 @@ const sameValidationRecord = (stored: StoredValidationRow, desired: ValidationCo
 // ---------------------------------------------------------------------------
 // Streaming the release.
 //
-// `validation-records.jsonl` is 59 MB across 9,422 rows, so no member is ever
+// `validation-records.jsonl` is 64 MB across 10,928 rows, so no member is ever
 // read into memory: each is streamed line by line, twice — once to verify it
 // and once to apply it — and the only thing held between the two passes is the
-// food key order, which is 9,422 strings.
+// food key order, which is 10,928 strings.
 // ---------------------------------------------------------------------------
 
 /** What one streaming pass measured, and what manifest.json is compared against. */
@@ -2623,7 +2623,7 @@ const verifyRelease = async (deps: LoadDeps): Promise<ReleaseVerification> => {
                         // first offender is kept and the refusal is raised below,
                         // after the digest, the size and the row count agree.
                         // Only the FIRST is kept: the whole member is streamed
-                        // once either way, and a refusal that accumulated 9,422
+                        // once either way, and a refusal that accumulated 10,928
                         // offenders would allocate a copy of the release to
                         // describe it.
                         firstEvidenceGap.push({
@@ -4405,7 +4405,7 @@ const applyDeferredFoods = async (
  * and "these are the published foods" is part of it.
  *
  * The diff is computed in memory from the local published keys rather than
- * pushed into the database as a 9,422-element `notIn`, and no statement is
+ * pushed into the database as a 10,928-element `notIn`, and no statement is
  * issued at all when nothing is absent — which is what keeps a rerun free of
  * writes beyond the run row.
  */

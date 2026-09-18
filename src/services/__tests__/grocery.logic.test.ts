@@ -731,9 +731,9 @@ describe('classifyQuantityChange', () => {
 /**
  * The density a volume row is rendered through.
  *
- * THE SHIPPED SHAPE these cases exist for: catalog release v1 publishes 9,422
+ * THE SHIPPED SHAPE these cases exist for: catalog release v1 publishes 10,928
  * foods, every one `nutrition_basis: per_100g` with `density_g_per_ml` NULL, and
- * 4,428 of them state their default portion in a volume unit. The committed
+ * 4,568 of them state their default portion in a volume unit. The committed
  * fixture carries the same shape in `ai:beverage:cold brew coffee
  * concentrate:prepared` (1 cup / 240 g / density null), so the derivation is
  * exercised against a row on disk and not only against a synthetic one.
@@ -876,7 +876,7 @@ describe('displayFamilyForPortion', () => {
             ['a container sized in a parenthesis', 'container (6 oz)', 18],
             ['a bare package', 'package', 15],
             ['a package sized in a parenthesis', 'package (10 oz)', 12],
-            ['a packet', 'packet', 9],
+            ['a packet', 'packet', 10],
             ['a branded jar', 'jar, Gerber (4 oz)', 4],
             ['a bottle', 'bottle', 2],
             ['a pouch', 'pouch', 1],
@@ -886,22 +886,22 @@ describe('displayFamilyForPortion', () => {
             ['a container qualified after the noun', 'container refrigerated 4 oz', 1],
             ['a package whose second vessel word is what it excludes', 'package without flavor packet', 3],
             // Servings and reference amounts — a tabulation unit, not an item.
-            ['a bare serving', 'serving', 92],
+            ['a bare serving', 'serving', 100],
             ['a serving whose vessel word leads the description', 'serving 1/2 cup', 10],
             ['a serving counted per package', 'serving 9 servings per 24 oz package', 1],
             ['a regulatory serving', 'NLEA serving', 3],
-            ['a bare regulatory reference amount', 'RACC', 173],
+            ['a bare regulatory reference amount', 'RACC', 172],
             ['a restaurant order', 'order', 4],
             ['a kids meal order', 'kids meal order', 3],
             ['a frozen meal', 'meal (11 oz)', 2],
             ['a branded frozen dinner', 'Swanson Salisbury Steak Dinner (11 oz)', 1],
-            ['an item of unstated size', 'item, any size', 26],
+            ['an item of unstated size', 'item, any size', 27],
             ['a unit stated through a yield', 'unit (yield from 1 lb ready-to-cook chicken)', 44],
             // Doses and single-serve references — an amount dispensed.
-            ['a bare scoop', 'scoop', 2],
+            ['a bare scoop', 'scoop', 4],
             ['a scoop written with its amount', '1 scoop', 1],
-            ['a scoop with no size stated', 'scoop, NFS', 0],
-            ['a branded scoop', 'scoop Gold Standard', 0],
+            ['a scoop with no size stated', 'scoop, NFS', 1],
+            ['a branded scoop', 'scoop Gold Standard', 1],
             ['a recipe\u2019s whole yield, matched as a phrase', 'recipe yield', 2],
             ['an individual serving sized in fluid ounces', 'individual (3.5 fl oz)', 4],
             ['an individual serving offered as a size', 'small/individual', 10],
@@ -936,20 +936,20 @@ describe('displayFamilyForPortion', () => {
          * of truthful count lines with it.
          */
         const ITEM_NOUN_FORMS: Array<[string, number]> = [
-            ['slice', 93],
-            ['piece', 137],
-            ['sandwich', 77],
+            ['slice', 103],
+            ['piece', 138],
+            ['sandwich', 79],
             ['fillet', 58],
-            ['patty', 15],
-            ['chop', 0],
-            ['link', 4],
-            ['sausage', 0],
+            ['patty', 34],
+            ['chop', 6],
+            ['link', 12],
+            ['sausage', 2],
             ['drumstick', 3],
             ['thigh', 2],
             ['wing, any size', 13],
             ['breast', 1],
             ['leg', 1],
-            ['egg', 112],
+            ['egg', 114],
             ['1 clove', 1],
             ['1 apple, medium', 1],
             ['1 avocado', 1],
@@ -967,10 +967,10 @@ describe('displayFamilyForPortion', () => {
             ['crackers', 5],
             ['waffle', 2],
             ['pancake', 1],
-            ['muffin', 8],
-            ['roll', 11],
+            ['muffin', 18],
+            ['roll', 16],
             ['bagel', 2],
-            ['bar', 41],
+            ['bar', 48],
             ['cone', 15],
             ['cube', 6],
             ['wedge (1.33 oz)', 2],
@@ -999,12 +999,12 @@ describe('displayFamilyForPortion', () => {
          * is a countable chop, rib, steak, pod, fruit or ear.
          */
         const YIELD_FORMS: Array<[string, number]> = [
-            ['chop without refuse (Yield from 1 cooked chop, with refuse, weighing 172g)', 0],
-            ['rib (yield after cooking, bone removed)', 0],
-            ['steak (yield from 181 g raw meat)', 0],
+            ['chop without refuse (Yield from 1 cooked chop, with refuse, weighing 172g)', 1],
+            ['rib (yield after cooking, bone removed)', 2],
+            ['steak (yield from 181 g raw meat)', 1],
             ['pod, yields', 1],
             ['fruit without refuse', 5],
-            ['ear (yield after cooking)', 0],
+            ['ear (yield after cooking)', 1],
         ];
 
         /**
@@ -1018,14 +1018,14 @@ describe('displayFamilyForPortion', () => {
          * descriptions alone it would silently re-unit 261 rows.
          */
         const SIZE_LABEL_FORMS: Array<[string, number]> = [
-            ['regular', 99],
-            ['miniature', 62],
+            ['regular', 104],
+            ['miniature', 75],
             ['miniature/bite size', 67],
             ['whole', 13],
-            ['bite size', 0],
-            ['slice, any size', 15],
-            ['cubic inch', 9],
-            ['small', 42],
+            ['bite size', 2],
+            ['slice, any size', 29],
+            ['cubic inch', 14],
+            ['small', 49],
             ['large', 11],
             ['medium', 4],
         ];
@@ -1087,7 +1087,7 @@ describe('displayFamilyForPortion', () => {
          * The corpus the two lists are closed against
          *
          * Read off disk, like every other release- or fixture-derived case in
-         * this file, and classified once: 3,022 default portions whose stored
+         * this file, and classified once: 3,454 default portions whose stored
          * unit token resolves to the count family, every one of them put
          * through the real predicate and the real family decision.
          *
@@ -1146,13 +1146,13 @@ describe('displayFamilyForPortion', () => {
 
             const wordsOf = (description: string): string[] => description.toLowerCase().match(/[a-z]+/g) ?? [];
 
-            it('holds 3,022 default portions in the count family', () => {
-                expect(countFamilyDefaults).toHaveLength(3022);
+            it('holds 3,454 default portions in the count family', () => {
+                expect(countFamilyDefaults).toHaveLength(3454);
             });
 
-            it('measures 702 of them and keeps 2,320 counting', () => {
-                expect(disqualified).toHaveLength(702);
-                expect(counted).toHaveLength(2320);
+            it('measures 776 of them and keeps 2,678 counting', () => {
+                expect(disqualified).toHaveLength(776);
+                expect(counted).toHaveLength(2678);
             });
 
             it('quotes every form of the tables above verbatim, at the row count each states', () => {
@@ -1168,23 +1168,25 @@ describe('displayFamilyForPortion', () => {
                 // tables are the closed set of description SHAPES the predicate
                 // must decide correctly, and which of them a given release
                 // happens to ship is a property of the catalog, not of the rule.
-                // Nine of these shapes are shipped by no row of the current
-                // release — a re-import draws a different slice of the vendor's
-                // portions — so they stay here as predicate cases at zero rows,
-                // still asserted exactly. Defaulting an absent description to 0
-                // is therefore the comparison, not a way of skipping one.
+                // Every shape below is shipped by at least one row of the
+                // current release, but that is this release's property rather
+                // than the rule's: the nine that shipped no row before the
+                // catalog grew stayed here as predicate cases at zero rows,
+                // asserted exactly as the rest are. Defaulting an absent
+                // description to 0 is therefore the comparison, not a way of
+                // skipping one.
                 for (const [description, rows] of quoted) {
                     expect(rowsPerDescription.get(description) ?? 0).toBe(rows);
                 }
             });
 
-            it('puts not one of the 702 in the count family', () => {
+            it('puts not one of the 776 in the count family', () => {
                 for (const row of disqualified) {
                     expect(displayFamilyForPortion({ density_g_per_ml: null, default_portion: row })).toBe('mass');
                 }
             });
 
-            it('counts every one of the 2,320, all of which state a positive gram weight', () => {
+            it('counts every one of the 2,678, all of which state a positive gram weight', () => {
                 for (const row of counted) {
                     expect(row.gram_weight).toBeGreaterThan(0);
                     expect(displayFamilyForPortion({ density_g_per_ml: null, default_portion: row })).toBe('count');
@@ -1193,15 +1195,15 @@ describe('displayFamilyForPortion', () => {
 
             /*
              * The phrase set's whole reason for existing: `yield` as a bare
-             * word would move all 21 of these onto the scales, so the two
+             * word would move all 52 of these onto the scales, so the two
              * "recipe yield" rows are matched as a run of two whole words
              * instead.
              */
-            it('keeps counting the 21 rows that describe an item through its yield', () => {
+            it('keeps counting the 52 rows that describe an item through its yield', () => {
                 const mentionsAYield = (row: ReleasePortion): boolean =>
                     wordsOf(row.description).includes('yield') || wordsOf(row.description).includes('yields');
 
-                expect(counted.filter(mentionsAYield)).toHaveLength(21);
+                expect(counted.filter(mentionsAYield)).toHaveLength(52);
                 expect(countFamilyDefaults.filter((row) => row.description === 'recipe yield')).toHaveLength(2);
                 expect(counted.filter((row) => row.description === 'recipe yield')).toHaveLength(0);
             });
@@ -1210,7 +1212,7 @@ describe('displayFamilyForPortion', () => {
                 const scoops = countFamilyDefaults.filter((row) => wordsOf(row.description).includes('scoop'));
                 const individuals = countFamilyDefaults.filter((row) => wordsOf(row.description).includes('individual'));
 
-                expect(scoops).toHaveLength(3);
+                expect(scoops).toHaveLength(7);
                 expect(individuals).toHaveLength(20);
                 expect(counted.filter((row) => wordsOf(row.description).includes('scoop'))).toHaveLength(0);
                 expect(counted.filter((row) => wordsOf(row.description).includes('individual'))).toHaveLength(0);
@@ -1221,7 +1223,7 @@ describe('displayFamilyForPortion', () => {
     describe('a row is only put in a family it can actually be rendered in', () => {
         // THE SHIPPED SHAPE, and the reason this function takes the facts rather
         // than the portion alone. A volume-unit default portion against a null
-        // `density_g_per_ml` is what all 4,428 volume-portion foods of release v1
+        // `density_g_per_ml` is what all 4,568 volume-portion foods of release v1
         // look like; 41 of the 42 seeded recipes carry at least one. It renders
         // as a volume because the portion itself states the density.
         it('chooses volume for a density-less food whose portion states one', () => {
@@ -1376,7 +1378,7 @@ describe('buildGroceryDisplay', () => {
 
         /**
          * The shipped shape: `nutrition_basis: per_100g`, `density_g_per_ml`
-         * NULL, and a volume-family default portion — all 4,428 volume-portion
+         * NULL, and a volume-family default portion — all 4,568 volume-portion
          * foods of catalog release v1, and the ingredient shape 41 of the 42
          * seeded recipes carry. The portion is the conversion source §0.1.4
          * names ("display … through stored portion conversions"), so these rows
