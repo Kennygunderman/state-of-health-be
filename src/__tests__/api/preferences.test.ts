@@ -1362,6 +1362,305 @@ describe('PUT /api/meal-planning/preferences', () => {
         });
     });
 
+    describe('the dislike list this endpoint handed the client, sent back', () => {
+        /* -------------------------------------------------------------------
+         * THE REQUEST BODY IS THE WHOLE LIST, NOT A DELTA. The preferences
+         * screen renders the `dislikedFoods` the read returned and re-sends the
+         * ids it holds with every save of that answer, so whatever the read
+         * hydrates the write must accept back unchanged.
+         *
+         * The read deliberately hydrates a dislike the catalog has since
+         * RETIRED ("a food that was published when the user declined it is
+         * still an answer they gave"), while the write validated every
+         * requested id as currently published — so the moment a release retired
+         * anything the user disliked, the only edit the screen could get
+         * accepted was removing that chip, and every other answer on it was
+         * held hostage. Re-sending a stored id is not a new selection, so it is
+         * judged as what it is; selecting an unpublished food still is one, and
+         * is still refused (§0.5.2, "≤ 100 distinct published ids").
+         * ----------------------------------------------------------------- */
+
+        /** A published food and a retired one the user disliked before it was retired. */
+        const retiredDislikeFixture = async (): Promise<{ published: string; retired: string }> => {
+            const published = await makeCatalogFood({
+                display_name: 'Mushrooms, white',
+                food_group: 'mushroom',
+            });
+            const retired = await makeCatalogFood({
+                display_name: 'Blue cheese',
+                food_group: 'cheese',
+                publication_status: 'retired',
+            });
+
+            await makePreferences(USER_ID, {
+                time_zone: TIME_ZONE,
+                revision: 1,
+                disliked_food_ids: [published.id, retired.id],
+                disliked_food_groups: ['cheese', 'mushroom'],
+            });
+
+            return { published: published.id, retired: retired.id };
+        };
+
+        it('accepts the list exactly as the read returned it', async () => {
+            const { published, retired } = await retiredDislikeFixture();
+            const read = await readPreferencesOk();
+
+            expect(read.dislikedFoods.map((food) => food.id)).toEqual([published, retired]);
+
+            const saved = await saveAllOk({
+                dislikedFoodIds: read.dislikedFoods.map((food) => food.id),
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            });
+
+            expect(saved.preferences.dislikedFoods.map((food) => food.id)).toEqual([
+                published,
+                retired,
+            ]);
+            expect((await storedRowOrThrow()).disliked_food_ids).toEqual([published, retired]);
+        });
+
+        it('keeps deriving the retired food\u2019s group, so its whole kind stays excluded', async () => {
+            // The group half is the rule as much as the id (§0.7.3): dropping it
+            // would leave the retired food excluded while every other cheese
+            // re-entered the user\u2019s plans.
+            const { published, retired } = await retiredDislikeFixture();
+
+            const saved = await saveAllOk({
+                dislikedFoodIds: [published, retired],
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            });
+
+            expect(saved.preferences.dislikedFoodGroups).toEqual(['cheese', 'mushroom']);
+        });
+
+        it('lets an unrelated answer be edited in the same body', async () => {
+            // The failure the user actually hit: a cooking-time or diet edit
+            // refused because the dislike list it re-sent contained a retired
+            // food they had no reason to touch.
+            const { published, retired } = await retiredDislikeFixture();
+
+            const saved = await saveAllOk({
+                dislikedFoodIds: [published, retired],
+                cookingTimeLimitMin: 45,
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            });
+
+            expect(saved.preferences.cookingTimeLimitMin).toBe(45);
+            expect(saved.preferences.dislikedFoods.map((food) => food.id)).toEqual([
+                published,
+                retired,
+            ]);
+        });
+
+        it('lets the user remove the retired food, which is the edit they can make', async () => {
+            const { published, retired } = await retiredDislikeFixture();
+
+            const saved = await saveAllOk({
+                dislikedFoodIds: [published],
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            });
+
+            expect(saved.preferences.dislikedFoods.map((food) => food.id)).toEqual([published]);
+            expect(saved.preferences.dislikedFoodGroups).toEqual(['mushroom']);
+            expect((await storedRowOrThrow()).disliked_food_ids).toEqual([published]);
+            // The retired id is gone from the row, so it can never be re-added:
+            // the next save would be selecting an unpublished food.
+            const readded = await saveAll({
+                dislikedFoodIds: [published, retired],
+                timeZone: TIME_ZONE,
+                expectedRevision: 2,
+            });
+
+            expect(readded.status).toBe(400);
+            expect(detailsOf(readded)).toEqual([
+                { field: 'dislikedFoodIds[1]', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ]);
+        });
+
+        it('still refuses a NEWLY selected food the catalog has not published', async () => {
+            // The published rule intact: storing an id nothing resolves would
+            // store an exclusion that excludes nothing, and the user would have
+            // declined an ingredient and still be served it.
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+            const candidate = await makeCatalogFood({
+                display_name: 'Anchovies',
+                food_group: 'fish',
+                publication_status: 'candidate',
+            });
+
+            const response = await saveAll({
+                dislikedFoodIds: [candidate.id],
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            });
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'dislikedFoodIds[0]', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ]);
+            expect((await storedRowOrThrow()).disliked_food_ids).toEqual([]);
+        });
+
+        it('refuses an id whose catalog row was deleted outright, which the read already drops', async () => {
+            // Not the retired case: there is no row left to derive a group from,
+            // so the exclusion could not work — and the read omits it, so a
+            // client sending it is working from a stale list and should re-read.
+            const deleted = await makeCatalogFood({ display_name: 'Anchovies', food_group: 'fish' });
+
+            await makePreferences(USER_ID, {
+                time_zone: TIME_ZONE,
+                revision: 1,
+                disliked_food_ids: [deleted.id],
+            });
+            await prisma.catalog_foods.delete({ where: { id: deleted.id } });
+
+            expect((await readPreferencesOk()).dislikedFoods).toEqual([]);
+
+            const response = await saveAll({
+                dislikedFoodIds: [deleted.id],
+                timeZone: TIME_ZONE,
+                expectedRevision: 1,
+            });
+
+            expect(response.status).toBe(400);
+            expect(fieldsOf(response)).toEqual(['dislikedFoodIds[0]']);
+        });
+
+        it('accepts the retired id through the dislikes STEP too, which sends the same list', async () => {
+            // The wizard\u2019s own save of the same answer: one rule for both
+            // endpoints, because `resolveDislikeWrites` is shared.
+            const { published, retired } = await retiredDislikeFixture();
+
+            const saved = await saveStepOk(
+                'dislikes',
+                dislikesPayload({ dislikedFoodIds: [published, retired], expectedRevision: 1 }),
+            );
+
+            expect(saved.preferences.dislikedFoods.map((food) => food.id)).toEqual([
+                published,
+                retired,
+            ]);
+        });
+    });
+
+    describe('the zone-only save that reconciles a moved device', () => {
+        /* -------------------------------------------------------------------
+         * `timeZone` is an ENVELOPE key and also a stored column, and this is
+         * the one body where those two facts disagree. The contract has the
+         * client re-send the device's zone on every full save so that a user
+         * who has moved sees plan days in the zone of their most recent edit
+         * (§0.5.2), and when nothing else changed that body carries the zone
+         * and the pinned revision alone —
+         * `mobile/src/screens/PlanSettings/index.util.ts::reconcilePreferencesTimeZone`
+         * sends exactly `{timeZone, expectedRevision}`.
+         *
+         * Reading the zone as pure envelope refused that body as editing
+         * nothing, so the stored calendar could never be refreshed by the only
+         * channel the contract provides: every date the server derives — the
+         * start-date window, the ended-plan boundary, `hasActivePlan` — stayed
+         * in a zone the user had left. Whether the body edits anything is the
+         * STORED zone's answer, so it is given where the row is in hand.
+         * ----------------------------------------------------------------- */
+
+        it('accepts it, stores the new zone and bumps the revision', async () => {
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const saved = await saveAllOk({ timeZone: OTHER_TIME_ZONE, expectedRevision: 1 });
+
+            expect(saved.preferences.timeZone).toBe(OTHER_TIME_ZONE);
+            expect(saved.preferences.revision).toBe(2);
+            expect((await storedRowOrThrow()).time_zone).toBe(OTHER_TIME_ZONE);
+        });
+
+        it('changes nothing else about the row it moves', async () => {
+            await makePreferences(USER_ID, {
+                time_zone: TIME_ZONE,
+                revision: 1,
+                goal: 'lose',
+                pace_lb_per_week: 1,
+                goal_weight_kg: GOAL_WEIGHT_KG,
+                weight_kg: CURRENT_WEIGHT_KG,
+                diet: 'vegetarian',
+                allergens: ['milk'],
+            });
+            const before = await storedRowOrThrow();
+
+            await saveAllOk({ timeZone: OTHER_TIME_ZONE, expectedRevision: 1 });
+
+            // Byte-identical but for the two columns this save is allowed to
+            // move: a zone-only body must not reach any other answer, and the
+            // revision bump is what tells other clients the row moved.
+            expect(await storedRowOrThrow()).toEqual({
+                ...before,
+                time_zone: OTHER_TIME_ZONE,
+                revision: 2,
+            });
+        });
+
+        it('stores the canonical spelling when the device reports an alias', async () => {
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+
+            const saved = await saveAllOk({ timeZone: 'Etc/UTC', expectedRevision: 1 });
+
+            expect(saved.preferences.timeZone).toBe(canonicalZone('Etc/UTC'));
+            expect((await storedRowOrThrow()).time_zone).toBe(canonicalZone('Etc/UTC'));
+        });
+
+        it('refuses it as empty when the row already holds that zone', async () => {
+            // The invariant the acceptance above must not cost: a save that
+            // changes nothing would still bump the revision and invalidate
+            // every other client's pinned value for no change at all. The
+            // client avoids sending it (`reconcilePreferencesTimeZone` answers
+            // `not_needed` when the zones already match), and the server says
+            // so independently.
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+            const before = await storedRowOrThrow();
+
+            const response = await saveAll({ timeZone: TIME_ZONE, expectedRevision: 1 });
+
+            expect(response.status).toBe(400);
+            expect(detailsOf(response)).toEqual([
+                { field: 'body', code: PREFERENCE_FIELD_CODES.REQUIRED },
+            ]);
+            expect(await storedRowOrThrow()).toEqual(before);
+        });
+
+        it('refuses an alias of the zone the row already holds', async () => {
+            // Compared after canonicalisation: `Etc/UTC` and `UTC` are one
+            // calendar, so an alias is not an edit and must not buy a revision.
+            await makePreferences(USER_ID, { time_zone: canonicalZone('UTC'), revision: 1 });
+
+            const response = await saveAll({ timeZone: 'Etc/UTC', expectedRevision: 1 });
+
+            expect(response.status).toBe(400);
+            expect(fieldsOf(response)).toEqual(['body']);
+        });
+
+        it('answers 409 rather than 400 when the zone moved but the revision has too', async () => {
+            // The deferral must not turn a lost race into a malformed request:
+            // the row decides both, and a real edit against a moved revision is
+            // the 409 the client's re-read-and-compare recovery resolves.
+            await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 3 });
+
+            const response = await saveAll({ timeZone: OTHER_TIME_ZONE, expectedRevision: 1 });
+
+            expect(response.status).toBe(409);
+            expect((await storedRowOrThrow()).time_zone).toBe(TIME_ZONE);
+        });
+
+        it('answers 409 for a user who has no row at all, which this endpoint never creates', async () => {
+            const response = await saveAll({ timeZone: TIME_ZONE, expectedRevision: 0 });
+
+            expect(response.status).toBe(409);
+            expect(await storedRow()).toBeNull();
+        });
+    });
+
     describe('a refused save is one transaction that wrote nothing', () => {
         // BOTH REFUSALS HERE ARE DECIDED BEFORE ANYTHING IS WRITTEN — one on a
         // revision that has moved, one on a field the parser rejects — which is
@@ -1407,30 +1706,32 @@ describe('PUT /api/meal-planning/preferences', () => {
 });
 
 /* ---------------------------------------------------------------------------
- * Validation the request alone decides, answered before any row is read
+ * One 400 per press, whichever stage decides its details
  *
  * Both saves parse the REQUEST first (§0.5.2, "validation applied before any
- * Prisma or planning work"). The bodies below are the ones that used to get
- * past that stage: each carries an error the request alone decides AND an
- * answer whose coherence rule reads the stored row, and the parsers took the
- * second as a reason to answer `ok` so the service read the row before
- * producing the 400 the request had already earned.
+ * Prisma or planning work"), and a body every rule of which the request alone
+ * decides is answered there, with no query at all — that part is
+ * `api/requestParserWiring.test.ts`'s claim, against a recording Prisma stub.
  *
- * WHAT IS ASSERTED HERE IS THE ANSWER, not the absence of the query — the
- * status, the code and the whole detail list, as the wire has always carried
- * them for the two cases where the stored row has nothing to add. That the
- * parse now happens with no I/O at all is `api/requestParserWiring.test.ts`'s
- * claim, against a recording Prisma stub. The third case states the one
- * observable consequence of the change: a detail the row WOULD have
- * contributed arrives on the client's next attempt instead of in the same 400.
+ * WHAT IS ASSERTED HERE IS THE ANSWER: the status, the code and the whole
+ * detail list as they reach the wire. AAP §0.7.4 makes that list the contract —
+ * validate-on-press "shows the inline errors for every offending control at
+ * once" — so a body carrying an error the request alone decides BESIDE an
+ * answer whose coherence rule reads the stored row must come back naming both.
+ * The request stage cannot see the second, so for exactly those bodies it
+ * defers, the row is read, and the authoritative parse answers. The cases below
+ * cover both shapes: the ones the row has nothing to add to, whose answer is
+ * unchanged and free, and the ones where it does, whose 400 now marks every
+ * control on the first attempt instead of the second.
  * ------------------------------------------------------------------------- */
 
-describe('a body the request alone refuses', () => {
-    it('answers the step save with every request-only field, though a row rule applies to it too', async () => {
-        // `goalPayload` carries `goalWeightKg`, which is judged against the
-        // STORED current weight — the applicable row rule that used to make
-        // this stage yield. The refusal is unchanged: a read-only key and a
-        // pace outside the closed set, in the order this endpoint reports them.
+describe('one 400 per press, whichever stage decides its details', () => {
+    it('answers the step save with every request-only field when the row has nothing to add', async () => {
+        // `goalPayload` carries `goalWeightKg`, so a row rule IS applicable and
+        // the request stage defers — but this user has no row, so no stored
+        // weight can contradict the target and the authoritative parse produces
+        // exactly the request's own list: a read-only key and a pace outside the
+        // closed set, in the order this endpoint reports them.
         const response = await saveStep(
             'goal',
             goalPayload({ paceLbPerWeek: 9, setupStatus: 'completed' }),
@@ -1447,11 +1748,12 @@ describe('a body the request alone refuses', () => {
         expect(await storedRow()).toBeNull();
     });
 
-    it('answers the full save with every request-only field, though a pair rule applies to it too', async () => {
+    it('answers the full save with every request-only field when the stored halves agree', async () => {
         // A lone `goalWeightKg` leaves the other two members of the coherence
-        // tuple to the row, so this body is one of the four the full save used
-        // to defer. The stored tuple is coherent with what it sends, so the
-        // detail list is exactly the one this request has always received.
+        // tuple to the row, so this body is one of the four the full save
+        // defers. The stored tuple is coherent with what it sends, so the row
+        // adds nothing and the detail list is exactly the one this request has
+        // always received.
         await makePreferences(USER_ID, {
             time_zone: TIME_ZONE,
             revision: 1,
@@ -1477,14 +1779,13 @@ describe('a body the request alone refuses', () => {
         expect(await storedRowOrThrow()).toEqual(before);
     });
 
-    it('reports a deferred coherence detail on the next attempt rather than reading the row for a refused one', async () => {
-        // The trade the two cases above make explicit. This body sends a
-        // current weight that contradicts the stored target — a rule only the
-        // row can apply — BESIDE an invalid diet. The first answer names the
-        // diet alone, because no stored value could have made `carnivore`
-        // storable; the incoherent weight is reported the moment the request is
-        // otherwise well formed, on the round trip the client was going to
-        // spend fixing the diet anyway.
+    it('names a request-only error and a coherence error in ONE 400, not across two attempts', async () => {
+        // The case AAP 0.7.4 governs. This body sends a current weight that
+        // contradicts the stored target — a rule only the row can apply —
+        // BESIDE an invalid diet. Answering with the diet alone sent the user
+        // back to a screen that marked one control, accepted their unchanged
+        // weight because nothing said otherwise, and was refused again. Both
+        // controls are named now, on the first press.
         await makePreferences(USER_ID, {
             time_zone: TIME_ZONE,
             revision: 1,
@@ -1503,21 +1804,80 @@ describe('a body the request alone refuses', () => {
         });
 
         expect(refused.status).toBe(400);
-        expect(fieldsOf(refused)).toEqual(['diet']);
+        expect(detailsOf(refused)).toEqual([
+            { field: 'goalWeightKg', code: PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT },
+            { field: 'diet', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+        ]);
 
+        // Fixing both in one edit is accepted, which is what makes the merged
+        // list actionable: the user is never told to change something that was
+        // already right.
         const retried = await saveAll({
-            weightKg: GOAL_WEIGHT_KG - 10,
+            weightKg: GOAL_WEIGHT_KG + 10,
             diet: 'vegan',
             timeZone: TIME_ZONE,
             expectedRevision: 1,
         });
 
-        expect(retried.status).toBe(400);
-        expect(detailsOf(retried)).toEqual([
-            { field: 'goalWeightKg', code: PREFERENCE_FIELD_CODES.NOT_BELOW_CURRENT_WEIGHT },
-        ]);
-        // Neither attempt wrote anything, which is what makes the second one a
-        // retry of the same edit rather than a follow-up to a partial save.
+        expect(retried.status).toBe(200);
+        // The refused attempt wrote nothing, which is what makes the second one
+        // a retry of the same edit rather than a follow-up to a partial save.
+        expect(before.revision).toBe(1);
+        expect((await storedRowOrThrow()).revision).toBe(2);
+    });
+
+    it('names a pace the stored goal forbids beside the request-only error, in ONE 400', async () => {
+        // The other orientation of the same pair, and the one a partial edit
+        // actually sends: a pace with no goal beside it. The stored goal decides
+        // it — `maintain` has no pace to set — so the request stage cannot see
+        // that control at all, and answering the diet alone would mark one of
+        // the two the user must fix. Both arrive together.
+        await makePreferences(USER_ID, {
+            time_zone: TIME_ZONE,
+            revision: 1,
+            goal: 'maintain',
+        });
+        const before = await storedRowOrThrow();
+
+        const response = await saveAll({
+            paceLbPerWeek: 1,
+            diet: 'carnivore',
+            timeZone: TIME_ZONE,
+            expectedRevision: 1,
+        });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: [
+                { field: 'paceLbPerWeek', code: PREFERENCE_FIELD_CODES.NOT_ALLOWED },
+                { field: 'diet', code: PREFERENCE_FIELD_CODES.UNKNOWN_VALUE },
+            ],
+        });
+        expect(await storedRowOrThrow()).toEqual(before);
+    });
+
+    it('answers an envelope-only body whose zone is unknown with the same 400 the row would give', async () => {
+        // The free half of the rule, seen from the wire. Only a usable zone can
+        // make an envelope-only body an edit, so an unknown one edits nothing
+        // whatever this row holds and the request stage answers alone — and the
+        // client must not be able to tell, so the body it reads is exactly the
+        // one the row-backed parse produces: the empty-save detail and the
+        // zone's own, in this endpoint's order. (`requestParserWiring` proves
+        // the same request touches no query.)
+        await makePreferences(USER_ID, { time_zone: TIME_ZONE, revision: 1 });
+        const before = await storedRowOrThrow();
+
+        const response = await saveAll({ timeZone: 'Mars/Phobos', expectedRevision: 1 });
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: 'invalid_request',
+            details: [
+                { field: 'body', code: PREFERENCE_FIELD_CODES.REQUIRED },
+                { field: 'timeZone', code: PREFERENCE_FIELD_CODES.INVALID_TIME_ZONE },
+            ],
+        });
         expect(await storedRowOrThrow()).toEqual(before);
     });
 });

@@ -824,6 +824,8 @@ interface CandidateOptions {
     recipeId?: string;
     version?: number;
     status?: string;
+    /** The slots the version declares. The factory's default is all three mains. */
+    meal_slots?: string[];
 }
 
 /**
@@ -870,6 +872,25 @@ const makeCandidateRecipe = async (slug: string, options: CandidateOptions = {})
     });
 };
 
+/**
+ * A recipe every `422 recipe_ineligible` case names: plannable in every respect
+ * — `current`, source-backed, allergen-known, inside the cooking-time limit —
+ * but declaring `breakfast` ALONE, so the lunch slot never offers it.
+ *
+ * SLOT MEMBERSHIP is deliberately the disqualifying property. §0.7.3's
+ * repetition rule is two clauses, and "some other meal of today holds this
+ * dish" is not one of them, so the day's own breakfast and dinner recipes are
+ * legitimate lunch alternatives and cannot stand in for an ineligible one. Slot
+ * membership is `recipe.logic.ts::evaluatePlanningEligibility`'s rule, which the
+ * generator and the swap share, so what is refused here is refused identically
+ * by both.
+ *
+ * Built per case rather than seeded into {@link SuiteFixture}, so the `beforeEach`
+ * that every one of this file's cases pays for stays the size it was.
+ */
+const makeLunchIneligibleRecipe = (): Promise<FixtureRecipeVersion> =>
+    makeCandidateRecipe('swap-suite-breakfast-only', { meal_slots: ['breakfast'] });
+
 const savePreference = (data: Prisma.meal_plan_preferencesUncheckedUpdateInput) =>
     prisma.meal_plan_preferences.update({ where: { user_id: USER_ID }, data });
 
@@ -883,14 +904,28 @@ const alternativeIdsOf = (response: SwapAlternativesResponse): string[] =>
 describe('GET the swap alternatives', () => {
     describe('when the slot has nothing to offer', () => {
         it('answers 200 with an empty array rather than an error', async () => {
-            // The two candidates leave the plannable set, so the only recipes
-            // left are the three this day already plans: the breakfast's and the
-            // dinner's are refused by the same-day repetition rule, and the
-            // lunch's own version is refused because a meal is not an
-            // alternative to itself. The slot's only eligible recipe is
-            // therefore the one already in it.
+            // Every version this world offers for the lunch slot leaves the
+            // PLANNABLE SET — `getRecipeVersionsForPlanning` admits `current`
+            // rows only — except the one the slot already holds. The two
+            // candidates and the day's other two meals are retired, so the
+            // lunch's own version is the last eligible recipe standing and it
+            // is refused because a meal is not an alternative to itself.
+            //
+            // Retirement rather than the rest of the day: §0.7.3 permits two
+            // uses of a recipe on one day in two different slots, so the
+            // breakfast's and the dinner's recipes ARE offered for this slot
+            // while they stay current (the generator would plant them here).
             await prisma.recipe_versions.updateMany({
-                where: { id: { in: [fixture.equalPortionCandidate.id, fixture.halfPortionCandidate.id] } },
+                where: {
+                    id: {
+                        in: [
+                            fixture.equalPortionCandidate.id,
+                            fixture.halfPortionCandidate.id,
+                            fixture.breakfastRecipe.id,
+                            fixture.dinnerRecipe.id,
+                        ],
+                    },
+                },
                 data: { status: 'retired' },
             });
 
@@ -908,7 +943,7 @@ describe('GET the swap alternatives', () => {
     });
 
     describe('the bound on how many it offers', () => {
-        it(`returns exactly ${String(SWAP_ALTERNATIVE_LIMIT)} of twelve eligible candidates, the best by slug`, async () => {
+        it(`returns exactly ${String(SWAP_ALTERNATIVE_LIMIT)} of the admissible candidates, the best by slug`, async () => {
             const slugs = Array.from({ length: OVER_LIMIT_CANDIDATE_COUNT }, (_, index) =>
                 `swap-suite-limit-${String(index + 1).padStart(2, '0')}`,
             );
@@ -920,15 +955,30 @@ describe('GET the swap alternatives', () => {
             const listed = await readAlternatives();
 
             // Truncation happens AFTER the ranking, so these are the eight best
-            // and not the first eight the catalog yielded. All ten extras land
-            // the day exactly on its calorie target and are closer than either
-            // seeded candidate on every macro, so they rank ahead of both and
-            // tie with each other — which leaves the portable `(slug, version)`
-            // key to order them.
+            // and not the first eight the catalog yielded. Twelve rows tie for
+            // best here: the ten extras plus the day's OWN breakfast and dinner
+            // recipes, which are admissible for this slot because §0.7.3's
+            // repetition rule is two clauses and "another meal of today holds
+            // it" is not one of them — the generator would plant either of them
+            // in this slot, so the sheet offers them. All twelve land the day
+            // exactly on its calorie target and are closer than either seeded
+            // candidate on every macro, so they rank ahead of both and tie with
+            // each other, which leaves the portable `(slug, version)` key to
+            // order them: `swap-suite-breakfast` and `swap-suite-dinner` before
+            // every `swap-suite-limit-NN`.
+            const bestBySlug = [
+                fixture.breakfastRecipe.name,
+                fixture.dinnerRecipe.name,
+                ...slugs.slice(0, SWAP_ALTERNATIVE_LIMIT - 2),
+            ];
+
             expect(listed.alternatives).toHaveLength(SWAP_ALTERNATIVE_LIMIT);
-            expect(listed.alternatives.map((alternative) => alternative.name)).toEqual(
-                slugs.slice(0, SWAP_ALTERNATIVE_LIMIT),
-            );
+            expect(listed.alternatives.map((alternative) => alternative.name)).toEqual(bestBySlug);
+            // The rows the truncation dropped, stated so the case fails if the
+            // cut were made before the sort instead of after it: the tail of the
+            // tie and both seeded candidates, which are further from the target.
+            expect(alternativeIdsOf(listed)).not.toContain(fixture.equalPortionCandidate.id);
+            expect(alternativeIdsOf(listed)).not.toContain(fixture.halfPortionCandidate.id);
         });
     });
 
@@ -1145,18 +1195,33 @@ describe('GET the swap alternatives', () => {
             const listed = await readAlternatives();
 
             // The half-sized candidate is admissible ONLY at ×1.75, so a row
-            // carrying ×1 here would mean the list never ran the portion
+            // carrying ×1 for it would mean the list never ran the portion
             // selection at all.
+            //
+            // The day's own breakfast and dinner recipes lead the list, at ×1
+            // each: §0.7.3's repetition rule is two clauses, and a dish another
+            // slot of today holds breaks neither, so both are admissible here
+            // and both land the day exactly on target — which is why they rank
+            // ahead of the two seeded candidates.
             expect(
                 listed.alternatives.map((alternative) => [
                     alternative.recipeVersionId,
                     alternative.portionMultiplier,
                 ]),
             ).toEqual([
+                [fixture.breakfastRecipe.id, 1],
+                [fixture.dinnerRecipe.id, 1],
                 [fixture.halfPortionCandidate.id, HALF_CANDIDATE_PORTION],
                 [fixture.equalPortionCandidate.id, 1],
             ]);
-            expect(listed.alternatives[0]).toEqual({
+            // The whole DTO for one row, located by id rather than by position:
+            // this is one of only two places the alternatives shape is served,
+            // so every member of it is pinned here.
+            expect(
+                listed.alternatives.find(
+                    (alternative) => alternative.recipeVersionId === fixture.halfPortionCandidate.id,
+                ),
+            ).toEqual({
                 recipeVersionId: fixture.halfPortionCandidate.id,
                 name: 'Candidate At Three Quarters Over',
                 iconKey: 'bowl',
@@ -1222,15 +1287,18 @@ const rounded = (totals: { calories: number; protein: number; carbs: number; fat
 describe('GET one swap preview', () => {
     describe('what it refuses', () => {
         it('answers 422 recipe_ineligible for a recipe this slot never offered, and writes nothing', async () => {
-            // The breakfast's recipe is eligible in every other respect and is
-            // refused only by the same-day repetition rule, so it is a recipe
-            // the sheet genuinely did not offer rather than a broken row.
+            // A good row in every respect except the one that matters here: it
+            // does not declare `lunch`, so this slot never offered it. The
+            // precondition is asserted rather than assumed, because a recipe
+            // the sheet DID offer would answer `200` and the case would pass
+            // for the wrong reason.
+            const ineligible = await makeLunchIneligibleRecipe();
             const listed = await readAlternatives();
 
-            expect(alternativeIdsOf(listed)).not.toContain(fixture.breakfastRecipe.id);
+            expect(alternativeIdsOf(listed)).not.toContain(ineligible.id);
 
             const mealBefore = await storedLunch();
-            const response = await getPreview(fixture.breakfastRecipe.id);
+            const response = await getPreview(ineligible.id);
 
             expectRefusal(response, 422, 'recipe_ineligible');
             expect(await storedLunch()).toEqual(mealBefore);
@@ -1677,8 +1745,12 @@ describe('the gates a swap commit passes', () => {
     });
 
     it('refuses a candidate this slot never offered', async () => {
+        // A recipe that declares `breakfast` alone: the commit resolves its
+        // candidate through the same `selectSwapCandidates` the sheet does, so
+        // a version the sheet could not list is not committable either.
+        const ineligible = await makeLunchIneligibleRecipe();
         const mealBefore = await storedLunch();
-        const response = await postSwap(swapBody(fixture.breakfastRecipe.id, 1));
+        const response = await postSwap(swapBody(ineligible.id, 1));
 
         expectRefusal(response, 422, 'recipe_ineligible');
         await expectNothingWritten(mealBefore);
@@ -2940,6 +3012,8 @@ describe('ownership and the capability gate', () => {
     });
 
     it('never answers 403, and never leaks an error object in any refusal', async () => {
+        const ineligible = await makeLunchIneligibleRecipe();
+
         jest.mocked(isMealPlanningEnabled).mockReturnValue(false);
         const gated = await postSwap(swapBody(fixture.equalPortionCandidate.id, 1));
 
@@ -2964,7 +3038,7 @@ describe('ownership and the capability gate', () => {
                 ),
                 status: 409,
             },
-            { response: await postSwap(swapBody(fixture.breakfastRecipe.id, 1)), status: 422 },
+            { response: await postSwap(swapBody(ineligible.id, 1)), status: 422 },
             { response: failed, status: 502 },
         ];
 

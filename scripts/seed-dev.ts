@@ -1,14 +1,16 @@
-// The development seed: the one command in scripts/ that acts.
+// The development seed: the user-owned rows a meal-planning session needs.
 //
-// It gives a developer machine the state a meal-planning session needs and
-// nothing else: a user row to own everything, that user's meal-planning
-// preferences ANSWERED AND COMPLETE, confirmed nutrition targets, and the four
-// diary buckets for one day. That is the whole point — reaching the Meal Plan
-// screens otherwise means hand-driving the seven-step wizard on every fresh
-// database, and a developer who does that fifty times learns nothing the
-// fiftieth time. Everything it needs is already in this repository — Prisma and
-// the migrated schema — so unlike the catalog stages this file is implemented
-// end to end and returns 0.
+// It gives a developer machine that state and nothing else: a user row to own
+// everything, that user's meal-planning preferences ANSWERED AND COMPLETE,
+// confirmed nutrition targets, and the four diary buckets for one day. That is
+// the whole point — reaching the Meal Plan screens otherwise means
+// hand-driving the seven-step wizard on every fresh database, and a developer
+// who does that fifty times learns nothing the fiftieth time. Everything it
+// needs is already in this repository — Prisma and the migrated schema: no
+// vendor API key, no network call beyond the database connection and no
+// reviewed release artefact. That is what separates it from `catalog-load` and
+// `recipes-seed`, the sanctioned installers of the shared reference data named
+// under WHAT IT DELIBERATELY DOES NOT SEED below.
 //
 // IT HOLDS NO BUSINESS RULE (Rule backend-architecture §1.2/§7/§7.1). It
 // computes no target, derives no plan and aggregates no grocery list. Every
@@ -84,9 +86,17 @@
 // removing an identity from text by substitution can only remove the spellings
 // it was handed. See `describeFailure` and `failureFields`.
 //
-// ITS DATABASE IS DEVELOPMENT ONLY, AND THERE IS NO DOOR. `seed-dev` is
-// `development_only` in scripts/lib/dbGuard.ts, which refuses a test, shadow or
-// unrecognised origin at module load. `--confirm-target` is deliberately absent:
+// ITS DATABASE IS DEVELOPMENT BY NAME, AND THERE IS NO DOOR. `seed-dev` is
+// `development_only` in scripts/lib/dbGuard.ts, which at module load refuses a
+// test, shadow or unrecognised origin — and refuses a local database whose own
+// NAME says nothing about development. That last case is the one that matters
+// here: the development class has a host arm, so every database answering on
+// loopback classifies `development`, a deployment database reached through an
+// SSH tunnel or a published container port included. This stage writes
+// user-scoped rows into the database it is given and `--reset-user` DELETES a
+// user and everything cascading from it, so a classification earned by a host
+// is not enough evidence: the name must end `_dev` (a clone index after it is
+// fine) on localhost, 127.0.0.1 or postgres. `--confirm-target` is deliberately absent:
 // that flag belongs to `catalog-load` and `recipes-seed`, which write SHARED
 // REFERENCE data and can be asked to populate a shared environment once a human
 // types the database name. This script writes USER-SCOPED rows, which is
@@ -110,9 +120,9 @@ import './lib/dbGuard';
 // id (see `userRef`).
 import { createHash } from 'node:crypto';
 
-import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
-import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
-import type { LogFields, LogLevel } from './lib/logger';
+import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
+import { createFatalLogger, createLogger, isThrownInstanceOf, safeError, scrubSecrets, writeLineSync } from './lib/logger';
+import type { LogFields, LogLevel, SafeErrorFields } from './lib/logger';
 import { prisma } from '../src/prisma/client';
 import { Prisma } from '../src/generated/prisma';
 import type { PrismaClient } from '../src/generated/prisma';
@@ -417,9 +427,10 @@ const HELP_FLAGS: readonly string[] = ['--help', '-h'];
 // consuming it would be the worse answer: an operator would come away believing
 // they had authorised a database this script will never write to. Note the
 // ordering that makes the rejection purely informative — the guard runs at
-// module load, so a non-development origin has already been refused and
-// exited(1) before this parser sees any argument; by the time the flag reaches
-// here the origin is `development`, where it means nothing in any case.
+// module load, so anything but a database whose own name says development has
+// already been refused and exited(1) before this parser sees any argument; by
+// the time the flag reaches here the target is a `_dev` database on a local
+// host, where it means nothing in any case.
 const CONFIRM_TARGET_FLAG = '--confirm-target';
 
 const RESET_USER_FLAG = '--reset-user';
@@ -645,10 +656,14 @@ export const describeUsage = (): string =>
         '  and any row written here would suppress it permanently.',
         '',
         'Environment:',
-        '  DATABASE_URL   required, and must be a development origin: this script is',
-        '                 development_only in scripts/lib/dbGuard.ts, so a test,',
-        '                 shadow or unrecognised database is refused and there is no',
-        '                 confirmation flag that overrides it.',
+        '  DATABASE_URL   required, and its database NAME must say development: a name',
+        '                 ending _dev, optionally with a clone index (soh_dev, soh_dev_46),',
+        '                 on host localhost, 127.0.0.1 or postgres. This script is',
+        '                 development_only in scripts/lib/dbGuard.ts, so a test, shadow or',
+        '                 unrecognised database is refused — and so is a local database',
+        '                 named anything else, which is development by its host alone and',
+        '                 indistinguishable from a deployment database reached over',
+        '                 loopback. There is no confirmation flag that overrides it.',
     ].join('\n');
 
 const writeUsage = (level: LogLevel): void => {
@@ -1240,7 +1255,25 @@ type MessageProvenance = 'first_party' | 'vendor';
 interface FailureDescription {
     readonly code: string;
     readonly provenance: MessageProvenance;
-    readonly error: { readonly name: string; readonly message: string };
+    /**
+     * The closed description logger.ts produces: a class name, and a machine
+     * code or HTTP status when the value carries one. It cannot carry a
+     * message, which is why the one message this stage MAY report travels in
+     * the separate field below.
+     */
+    readonly error: SafeErrorFields;
+    /**
+     * The message this FILE composed, when the narrowed class proves it did.
+     *
+     * Present only for {@link SeedDevError}, which is the one class whose text
+     * is written in this repository AND names nothing but this stage's own
+     * flags and day keys. `DatabaseOriginError` is first-party too and is
+     * deliberately absent: its refusal sentence names the database and the host
+     * it refused, which is the infrastructure disclosure every origin report in
+     * this pipeline now withholds (scripts/lib/dbGuard.ts::originLogFields), so
+     * that branch reports the origin's classification and digest instead.
+     */
+    readonly firstPartyMessage?: string;
 }
 
 /**
@@ -1260,25 +1293,44 @@ interface FailureDescription {
  * anything derived from the call — and `unexpected_error` remains the honest
  * answer for anything unrecognised.
  *
- * `safeError` is still what reads the name and message: it scrubs SECRETS
- * (connection-string userinfo, vendor keys) from both, which is orthogonal to
- * the identity question and wanted on either branch. The class name is taken
- * from it rather than from `constructor.name` for that reason.
+ * `safeError` supplies the CLOSED fields on either branch — the scrubbed and
+ * bounded class name, a machine `code` and an HTTP `status` where the value
+ * carries them — and cannot carry a message at all. So prose is not something
+ * this function forwards by default: only the `SeedDevError` branch reports any,
+ * as `firstPartyMessage`, and only because narrowing the class is what proves
+ * this repository wrote the text. `scrubSecrets` still runs over that one
+ * string, because provenance answers "may this be reported" and not "does this
+ * quote a credential". The class name is taken from `safeError` rather than from
+ * `constructor.name` so it is scrubbed and bounded like every other reported
+ * name.
  */
 const describeFailure = (error: unknown): FailureDescription => {
-    if (error instanceof SeedDevError) {
+    if (isThrownInstanceOf(error, SeedDevError)) {
+        // Read off the narrowed error rather than out of safeError, which no
+        // longer carries a message at all: the class is the proof of who wrote
+        // the text, and only a site that has narrowed the class holds that
+        // proof. scrubSecrets still runs over it, because provenance answers
+        // "may this be reported" and not "does this quote a credential".
+        return {
+            code: error.code,
+            provenance: 'first_party',
+            error: safeError(error),
+            firstPartyMessage: scrubSecrets(error.message),
+        };
+    }
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
+        // First-party text, and still withheld — see FailureDescription's
+        // `firstPartyMessage`. The origin fields failureFields adds for this
+        // branch are what replace it.
         return { code: error.code, provenance: 'first_party', error: safeError(error) };
     }
-    if (error instanceof DatabaseOriginError) {
-        return { code: error.code, provenance: 'first_party', error: safeError(error) };
-    }
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (isThrownInstanceOf(error, Prisma.PrismaClientKnownRequestError)) {
         return { code: error.code, provenance: 'vendor', error: safeError(error) };
     }
-    if (error instanceof Prisma.PrismaClientInitializationError) {
+    if (isThrownInstanceOf(error, Prisma.PrismaClientInitializationError)) {
         return { code: 'prisma_initialization_failed', provenance: 'vendor', error: safeError(error) };
     }
-    if (error instanceof Prisma.PrismaClientValidationError) {
+    if (isThrownInstanceOf(error, Prisma.PrismaClientValidationError)) {
         return { code: 'prisma_validation_failed', provenance: 'vendor', error: safeError(error) };
     }
     // Retained below `SeedDevError`, which is what this stage throws for a bad
@@ -1287,7 +1339,7 @@ const describeFailure = (error: unknown): FailureDescription => {
     // the same code is more useful than `unexpected_error`. Its message is the
     // runtime's, though, and `Invalid time zone specified: <value>` is an
     // argument echo, so it is `vendor`.
-    if (error instanceof RangeError) {
+    if (isThrownInstanceOf(error, RangeError)) {
         return { code: 'invalid_date', provenance: 'vendor', error: safeError(error) };
     }
     return { code: 'unexpected_error', provenance: 'vendor', error: safeError(error) };
@@ -1305,6 +1357,21 @@ const describeFailure = (error: unknown): FailureDescription => {
 const WITHHELD_VENDOR_MESSAGE =
     'withheld: a message composed outside this repository can echo the arguments of the call that failed, ' +
     'including the seeded user id and email. Report fields: code, remedy, phase.';
+
+/**
+ * The same refusal for the guard's own sentence, which is withheld for a
+ * different reason and says so.
+ *
+ * `DatabaseOriginError`'s message is composed in this repository, so it echoes
+ * no call argument — but it names the database and the host it refused, and a
+ * stage log is read in a terminal, retained by CI and copied into report
+ * artefacts. The fields that replace it are the classification, the rule that
+ * matched and the one-way target digest, which is the shape every origin report
+ * in this pipeline uses.
+ */
+const WITHHELD_ORIGIN_MESSAGE =
+    'withheld: the guard\u2019s refusal names the database and host it refused. Report fields: code, ' +
+    'originClass, match, reason, targetDigest, remedy.';
 
 /**
  * A remedy for every code whose MESSAGE IS WITHHELD, composed in this file.
@@ -1412,18 +1479,31 @@ export const failureFields = (
 ): LogFields => {
     const failure = describeFailure(error);
 
+    const withheld = isThrownInstanceOf(error, DatabaseOriginError) ? WITHHELD_ORIGIN_MESSAGE : WITHHELD_VENDOR_MESSAGE;
+
     const fields: LogFields = {
         stage: STAGE,
         code: failure.code,
         remedy: remedyFor(failure),
         error: {
             name: failure.error.name,
+            // The one message that may travel is the one this file composed,
+            // identified by its CLASS in describeFailure and carried in its own
+            // field — logger.ts's safeError cannot carry a message, precisely so
+            // that a foreign one cannot arrive here by default.
             message:
-                failure.provenance === 'first_party'
-                    ? redactIdentity(failure.error.message, identity)
-                    : WITHHELD_VENDOR_MESSAGE,
+                failure.firstPartyMessage === undefined
+                    ? withheld
+                    : redactIdentity(failure.firstPartyMessage, identity),
         },
     };
+
+    // The guard's refusal reports WHAT it refused the only way this pipeline
+    // permits: the classification, the rule that matched and the one-way
+    // digest, never the host or the database name.
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
+        Object.assign(fields, originLogFields(error.origin));
+    }
 
     if (phase !== null) {
         fields.phase = phase;
@@ -1481,10 +1561,7 @@ const main = async (): Promise<number> => {
     const origin = classifyDatabaseOrigin(process.env.DATABASE_URL);
     logger.info('database_origin_accepted', {
         stage: STAGE,
-        originClass: origin.originClass,
-        host: origin.host,
-        database: origin.database,
-        reason: origin.reason,
+        ...originLogFields(origin),
     });
 
     const identity = resolveIdentity(parsed.options);

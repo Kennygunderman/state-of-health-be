@@ -42,10 +42,7 @@ import {
     PreferencesResponse,
     PreferencesSaveResponse,
     PreferencesUpdatePayload,
-    SetupStatus,
-    SetupStep,
     SexForEstimate,
-    TargetRoute,
     WeightUnitPref,
 } from '../types/mealPlanning';
 import { ReadOnlyFieldError, StaleRevisionError } from './mealPlanning.errors';
@@ -76,8 +73,11 @@ import {
     reconcileSetupStateForRoute,
     resolveTargetRouteForBodyStep,
     resolveTargetRouteForUpdate,
-    SetupStateSnapshot,
+    SETUP_STATUSES,
+    SETUP_STEPS,
+    setupStateOf,
     SetupStepContext,
+    TARGET_ROUTES,
     PreferencesUpdateContext,
 } from './preferences.logic';
 import { startDateWindow } from './mealPlan.logic';
@@ -245,34 +245,19 @@ export const loadPreferencesRow = async (
  * service while there's one, promoted once two services need it").
  *
  * Each closed set below is keyed off the DTO's own union
- * (`Readonly<Record<SetupStatus, true>>` and friends), so it is exhaustive by
+ * (`Readonly<Record<Goal, true>>` and friends), so it is exhaustive by
  * construction: widening a union in `types/mealPlanning.ts` stops the literal
  * compiling until the new value is handled here. That is the same construction
- * `recipe.mapper.ts` uses, and for the same stated reason — `preferences.logic.ts`
- * exports no guard for these columns, and a hand-listed array of the same
- * strings would silently fall behind the contract.
+ * `recipe.mapper.ts` uses, and for the same stated reason — a hand-listed array
+ * of the same strings would silently fall behind the contract.
+ *
+ * THE THREE SERVER-OWNED VOCABULARIES ARE NOT AMONG THEM. `setup_status`,
+ * `setup_step` and `target_route` are read here for the response and in
+ * `preferences.logic.ts::setupStateOf` for the state machine, so their tables
+ * live with the projection and are imported (`SETUP_STATUSES`, `SETUP_STEPS`,
+ * `TARGET_ROUTES`): two readers of one column must not hold two lists of what
+ * that column may say.
  * ------------------------------------------------------------------------- */
-
-const SETUP_STATUSES: Readonly<Record<SetupStatus, true>> = {
-    not_started: true,
-    in_progress: true,
-    ready_for_review: true,
-    completed: true,
-};
-
-const SETUP_STEPS: Readonly<Record<SetupStep, true>> = {
-    goal: true,
-    body: true,
-    activity: true,
-    diet: true,
-    dislikes: true,
-    schedule: true,
-    cooking: true,
-    review: true,
-    targets_manual: true,
-};
-
-const TARGET_ROUTES: Readonly<Record<TargetRoute, true>> = { estimated: true, manual: true };
 
 const GOALS: Readonly<Record<Goal, true>> = { lose: true, maintain: true, gain: true };
 
@@ -1004,11 +989,13 @@ const recomputeActivePlanFlags = async (
  *    input at once. A mixed body therefore keeps travelling as a value: the
  *    read-only key and the out-of-range age come back together.
  *  * A BODY WHOSE ONLY PROBLEM IS SERVER-OWNED OR UNKNOWN KEYS IS THROWN as
- *    `ReadOnlyFieldError` by {@link refuseRequestStage}, which is the raise path
- *    the AAP's error inventory pairs with the controller's existing
- *    `read_only_field` mapping. The class carries the whole detail list, so the
- *    body on the wire is the same one the returned verdict produces — nothing
- *    is narrowed by throwing, which is what makes the class usable here at all.
+ *    `ReadOnlyFieldError` by {@link refuse}, which is the raise path the AAP's
+ *    error inventory pairs with the controller's existing `read_only_field`
+ *    mapping. The class carries the whole detail list, so the body on the wire
+ *    is the same one the returned verdict produces — nothing is narrowed by
+ *    throwing, which is what makes the class usable here at all. It is raised
+ *    from WHICHEVER stage judged the body, because which stage that is depends
+ *    on the other keys the body carried (see {@link refuse}).
  *  * A STALE REVISION IS THROWN as `StaleRevisionError`, in the one-counter
  *    form the preference routes own (`StaleRevisionCounterErrorData`); the
  *    two-counter form belongs to the plan routes, which pin two inputs at once.
@@ -1036,51 +1023,55 @@ export type SavePreferencesResult =
 /**
  * The pure layer's refusal, delivered the way its kind demands.
  *
- * One helper for all four refusal sites — the preflight parse and the
- * authoritative parse inside the lock, in both saves — so the two saves cannot
- * drift on which refusal throws and which returns.
+ * ONE HELPER FOR ALL SIX REFUSAL SITES — the request-stage preflight, the
+ * row-backed preflight, and the authoritative parse inside the lock, in both
+ * saves — so no two of them can drift on which refusal throws and which
+ * returns. That matters more than it reads: which STAGE answers a given body is
+ * not a fixed property of the body. A partial that a row-dependent rule is
+ * applicable to is carried to the row even when the request alone already has a
+ * verdict, precisely so the client gets one merged 400 naming every offending
+ * control (AAP §0.7.4) — so the same refusal can arrive here from either stage
+ * depending on which other keys the body happened to carry, and a classification
+ * that lived on only one of them would change an error's CLASS for a reason the
+ * client cannot see.
+ *
+ * A STALE REVISION is thrown as `StaleRevisionError`: it is a lost race rather
+ * than a malformed request, and throwing additionally aborts the transaction it
+ * is raised in, which releases the advisory lock at once and makes "nothing was
+ * written" a property of the mechanism rather than of this code.
+ *
+ * A VERDICT WHOSE DETAILS ARE EXCLUSIVELY `read_only_field` is precisely the
+ * condition {@link ReadOnlyFieldError} names — a body that tried to write
+ * server-owned or unknown keys (AAP §0.5.2) — so it leaves as that class rather
+ * than as a value. That is what gives the class a raise path to match the status
+ * mapping the controller already holds; before this, nothing constructed it. The
+ * class carries the WHOLE list, so the wire body is identical to the returned
+ * verdict's: a client sending three server-owned keys still learns about three
+ * in one round trip.
+ *
+ * A MIXED verdict is RETURNED — a read-only key beside an out-of-range age stays
+ * one 400 naming both (AAP §0.7.4). Throwing for the read-only half would either
+ * drop the field details or need a second class for "read-only and other
+ * things", and the returned verdict already answers exactly what the screen must
+ * show at once.
+ *
+ * Which refusals qualify is `readOnlyFieldRefusal`'s call, in the pure layer,
+ * because the HTTP boundary asks the same question of the same verdict before
+ * this service is reached: one predicate, so the route and every other caller of
+ * these saves cannot classify the same body differently.
  */
 const refuse = (refusal: PreferenceRefusal): PreferenceErrorVerdict => {
     if (refusal.kind === 'stale_revision') {
         throw new StaleRevisionError({ currentRevision: refusal.currentRevision });
     }
 
-    return refusal;
-};
-
-/**
- * The request stage's refusal, delivered as the error contract declares it.
- *
- * A verdict whose details are EXCLUSIVELY `read_only_field` is precisely the
- * condition {@link ReadOnlyFieldError} names — a body that tried to write
- * server-owned or unknown keys (AAP §0.5.2) — so it leaves as that class rather
- * than as a value. That is what gives the planned class a raise path to match
- * the status mapping the controller already holds; before this, nothing
- * constructed it. The class carries the WHOLE list, so the wire body is
- * identical to the returned verdict's: a client sending three server-owned keys
- * still learns about three in one round trip.
- *
- * A MIXED verdict is RETURNED — a read-only key beside an out-of-range age
- * stays one 400 naming both (AAP §0.7.4). Throwing for the read-only half would
- * either drop the field details or need a second class for "read-only and other
- * things", and the returned verdict already answers exactly what the screen
- * must show at once.
- *
- * Which refusals qualify is `readOnlyFieldRefusal`'s call, in the pure layer,
- * because the HTTP boundary asks the same question of the same request-stage
- * verdict before this service is reached: one predicate, so the route and every
- * other caller of these saves cannot classify the same body differently.
- *
- * Shared by both saves, so the two cannot drift on which refusal throws.
- */
-const refuseRequestStage = (verdict: PreferenceErrorVerdict): PreferenceErrorVerdict => {
-    const readOnlyDetails = readOnlyFieldRefusal(verdict);
+    const readOnlyDetails = readOnlyFieldRefusal(refusal);
 
     if (readOnlyDetails !== null) {
         throw new ReadOnlyFieldError(readOnlyDetails);
     }
 
-    return verdict;
+    return refusal;
 };
 
 /** The revision a freshly created row carries, so the client's next write can pin it. */
@@ -1192,20 +1183,35 @@ interface DislikeSelection {
  * VALIDATION IS DELIBERATELY ASYMMETRIC, because the two id sets answer
  * different questions:
  *
- *  * An id FROM THE REQUEST that no PUBLISHED food resolves is REFUSED, not
+ *  * A NEWLY SELECTED id that no PUBLISHED food resolves is REFUSED, not
  *    dropped. The contract admits "≤ 100 distinct published ids", and storing
  *    an id the catalog cannot resolve would store a dislike that excludes
  *    nothing — the user would have declined an ingredient and still be served
  *    it, which is the failure they notice. The refusal names every offending
  *    id's position, so the client can correct all of them at once.
+ *  * AN ID ALREADY ON THIS ROW IS ACCEPTED WHATEVER ITS STATUS NOW IS, which is
+ *    the whole of what "newly selected" adds above. It is not a relaxation of
+ *    the published rule but the other half of the read: this endpoint HYDRATES a
+ *    retired dislike into `dislikedFoods` on purpose ("a food that was published
+ *    when the user declined it is still an answer they gave"), so the client
+ *    holds it, shows it as a chip, and sends it back with every subsequent save
+ *    of that step — the request body IS the whole list, not a delta. Validating
+ *    it as a new selection made the preferences screen unsavable the moment a
+ *    release retired anything the user disliked: removing the chip was the only
+ *    accepted edit, and every other answer on the screen was held hostage to it.
+ *    Re-sending a stored id is not a new selection at all, so it is judged as
+ *    what it is — the user leaving an answer they already gave alone.
  *  * An id read FROM STORAGE never refuses, whatever its row now says: a
  *    release that retired a food the user disliked months ago must not block an
  *    unrelated schedule or budget edit. Its group is therefore derived from the
  *    row regardless of publication status — the asymmetry
  *    {@link PUBLISHED_CATALOG_STATUS} states — and the id itself stays stored,
- *    because only a request that carries ids rewrites that column. A stored id
+ *    whether this save omitted the ids key or re-sent it unchanged. A stored id
  *    whose row has been DELETED outright contributes no group: there is nothing
- *    left to derive one from, and the food itself remains excluded by id.
+ *    left to derive one from, and the food itself remains excluded by id while
+ *    the ids key is omitted. Re-sending THAT id is refused, and correctly — it
+ *    resolves to nothing, so it could only store an exclusion that excludes
+ *    nothing, and the read already drops it from the list the client holds.
  *
  * `knownFoodGroups` is deliberately not supplied: the controlled taxonomy lives
  * in `data/meal-planning/coverage-plan.v1.json`, which this module cannot import
@@ -1257,8 +1263,20 @@ const resolveDislikeWrites = async (
     let derivedGroups: readonly string[] = storedDerivation.foodGroups;
 
     if (requestedFoodIds !== null) {
+        // Selectable = published, OR already on this row. The second half is
+        // what lets the list this endpoint handed the client round-trip: a
+        // dislike the catalog has since retired is still hydrated into
+        // `dislikedFoods`, so the client sends it back with every save of the
+        // step, and judging it as a new selection would refuse the user's own
+        // unchanged answer. Anything NEITHER published NOR already stored is a
+        // new selection of an unselectable food and is still refused below.
+        const retainedFoodIds = new Set(storedFoodIds);
         const requested = deriveDislikedFoodGroups(requestedFoodIds, {
-            foods: foods.filter((food) => food.publication_status === PUBLISHED_CATALOG_STATUS),
+            foods: foods.filter(
+                (food) =>
+                    food.publication_status === PUBLISHED_CATALOG_STATUS ||
+                    retainedFoodIds.has(food.id),
+            ),
         });
 
         if (requested.unknownFoodIds.length > 0) {
@@ -1451,40 +1469,7 @@ const stepContext = (row: PreferencesRow | null): SetupStepContext => ({
     currentGoalWeightKg: row?.goal_weight_kg ?? null,
 });
 
-/**
- * The state-machine snapshot the step transition is computed from.
- *
- * A row that exists but whose status is unreadable is treated as `in_progress`,
- * the same cautious reading the DTO applies — and `nextSetupState` is monotonic,
- * so it can only move forward from there.
- *
- * EXPORTED for `targets.service.ts`, which advances the manual route's resume
- * marker when a manual target is confirmed (AAP §0.7.4): the manual target
- * screen saves through the targets endpoint rather than as a setup step, so
- * that transition is computed there and it must be computed from the SAME
- * snapshot this module builds. A second mapping of the row's columns would be a
- * second answer to "where does setup stand", and the two would drift the first
- * time a column's vocabulary changed.
- */
-export const setupStateOf = (row: PreferencesRow | null): SetupStateSnapshot => ({
-    setupStatus:
-        row === null ? 'not_started' : (asMember(SETUP_STATUSES, row.setup_status) ?? 'in_progress'),
-    setupStep: row === null ? null : asMember(SETUP_STEPS, row.setup_step),
-    targetRoute: row === null ? null : asMember(TARGET_ROUTES, row.target_route),
-    // Readiness reads the row's own answers as well as the resume marker, so a
-    // forward jump or a route change cannot promote a user whose required
-    // answers are absent (`nextSetupState`). Every member is coerced through its
-    // closed set: a column holding a value the vocabulary no longer contains
-    // reads as unanswered, which re-asks the step rather than planning from it.
-    answers: {
-        goal: row === null ? null : asMember(GOALS, row.goal),
-        activityLevel: row === null ? null : asMember(ACTIVITY_LEVELS, row.activity_level),
-        diet: row === null ? null : asMember(DIETS, row.diet),
-        mealSchedule: row === null ? null : asMember(MEAL_SCHEDULES, row.meal_schedule),
-        cookingTimeLimitMin:
-            row === null ? null : asNumericMember(COOKING_TIME_LIMITS, row.cooking_time_limit_min),
-    },
-});
+
 
 /**
  * The freshly stored revision, read for the one purpose of telling a client
@@ -1521,15 +1506,20 @@ const staleRevisionAfterLostWrite = async (
  *     malformed meal time — are answered as one `400 invalid_request` before
  *     Prisma is touched, which is what AAP §0.5.2's "validation applied before
  *     any Prisma or planning work" requires. Previously all of it reached the
- *     database first. A REFUSAL HERE ENDS THE REQUEST: `loadPreferencesRow` is
- *     below this guard and never runs for a body the request stage has already
- *     refused. It used to run even then, whenever a row-dependent coherence
- *     rule was also applicable, so that the 400 could carry that rule's detail
- *     too — an authenticated read per malformed attempt, for a body no stored
- *     row could make valid. The deferred detail arrives on the client's next
- *     attempt instead, once the request-only errors are fixed. `needs_context`
- *     marks the clean requests one of those rules still applies to, and reads
- *     the row exactly as `ok` does — see `parseSetupStepRequest`.
+ *     database first. A REFUSAL HERE ENDS THE REQUEST ONLY WHEN NO ROW-DEPENDENT
+ *     RULE WAS ALSO APPLICABLE, which is the whole of what this stage decides:
+ *     for such a body `loadPreferencesRow` never runs, so a client sending
+ *     nonsense cannot make the server read a row per malformed attempt. When a
+ *     rule whose other half lives in the stored row IS applicable, this stage
+ *     answers `needs_context` even holding a refusal of its own, the row is
+ *     read, and the authoritative parse below returns ONE 400 naming both its
+ *     details and that rule's — AAP §0.7.4 requires validate-on-press to mark
+ *     every offending control at once, and a body whose pace is unknown AND
+ *     whose target weight contradicts the stored current weight has two of them
+ *     of which this stage can see only one. Nothing is carried forward across
+ *     the two stages: the authoritative parse re-derives every detail from the
+ *     same body plus strictly more information — see `parseSetupStepRequest`
+ *     and `parsePreferencesUpdateRequest` for the exact applicability rules.
  *  2. THE UNLOCKED PARSE, against the row as it stands. This is what keeps a
  *     client sending nonsense from taking the user's advisory lock and
  *     serialising their real writes behind it, and it reports every field-level
@@ -1566,7 +1556,7 @@ export const saveSetupStep = async (
     const requestOnly: PreferenceRequestVerdict = parseSetupStepRequest(step, body);
 
     if (requestOnly.kind === 'error') {
-        return refuseRequestStage(requestOnly);
+        return refuse(requestOnly);
     }
 
     // `ok` and `needs_context` both continue: the revision comparison needs the
@@ -1779,6 +1769,12 @@ const updateContext = (row: PreferencesRow | null): PreferencesUpdateContext => 
     currentMealSchedule: row === null ? null : asMember(MEAL_SCHEDULES, row.meal_schedule),
     currentBudget: row === null ? null : readBudget(row),
     currentNoBudgetPreference: row?.no_budget_preference ?? false,
+    // A body carrying only the envelope edits this column or nothing at all, so
+    // the stored zone is what decides whether it is a save or a no-op. It is
+    // the contract's channel for reconciling a device that has moved (AAP
+    // §0.5.2), and the parser cannot tell a real zone change from a repeat of
+    // the stored one without it.
+    currentTimeZone: row?.time_zone ?? null,
 });
 
 /**
@@ -1796,21 +1792,23 @@ const updateContext = (row: PreferencesRow | null): PreferencesUpdateContext => 
  *
  * TWO SERVER-OWNED COLUMNS ARE DERIVED HERE, both from the row as it will be
  * once this save lands rather than from the body alone. `target_route` follows
- * the body answer ({@link resolveTargetRouteForUpdate}), because the settings
- * screens edit the very answers that decide whether an estimate can be
- * calculated and the DTO has no key for the route itself; and the setup state
- * is reconciled ({@link reconcileSetupStateForRoute}) when — and only when —
- * that route changed, because the two routes require different steps.
+ * the body answer ({@link resolveTargetRouteForUpdate}), because the four
+ * answers that decide whether an estimate can be calculated are all editable
+ * through this endpoint while the DTO has no key for the route itself; and the
+ * setup state is reconciled ({@link reconcileSetupStateForRoute}) when — and
+ * only when — that route changed, because the two routes require different
+ * steps.
  *
- * SERVER-OWNED KEYS LEAVE AS `ReadOnlyFieldError`, thrown by
- * {@link refuseRequestStage} the moment the request stage has judged the body —
- * before any Prisma work, exactly where the refusal is decided. The class
- * carries the whole `read_only_field` detail list, so throwing narrows nothing:
- * the controller maps it to the same `400 {error: 'invalid_request', details}`
- * the returned verdict produces, and a client sending three offending keys
- * learns about three at once. A body that gets a read-only key AND a field rule
- * wrong keeps travelling as the verdict, because that single 400 must name
- * every offending control (AAP §0.7.4).
+ * SERVER-OWNED KEYS LEAVE AS `ReadOnlyFieldError`, thrown by {@link refuse} from
+ * whichever stage judged the body. A partial no row-dependent rule applies to is
+ * refused before any Prisma work; one such rule IS applicable to is carried to
+ * the row so the 400 can name every offending control at once (AAP §0.7.4), and
+ * the same class is raised there. The class carries the whole `read_only_field`
+ * detail list, so throwing narrows nothing: the controller maps it to the same
+ * `400 {error: 'invalid_request', details}` the returned verdict produces, and a
+ * client sending three offending keys learns about three at once. A body that
+ * gets a read-only key AND a field rule wrong keeps travelling as the verdict,
+ * because that single 400 must name every offending control.
  *
  * THE SETUP STATE MACHINE IS NEVER ADVANCED, AND NO ROW IS CREATED. A full save
  * is a settings edit rather than a wizard step: it never moves `setupStep`
@@ -1837,7 +1835,7 @@ export const savePreferences = async (
     const requestOnly: PreferenceRequestVerdict = parsePreferencesUpdateRequest(body);
 
     if (requestOnly.kind === 'error') {
-        return refuseRequestStage(requestOnly);
+        return refuse(requestOnly);
     }
 
     // As in `saveSetupStep`: the row read sits BELOW the refusal, so a partial

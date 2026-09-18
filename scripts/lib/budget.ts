@@ -53,16 +53,17 @@
 // than per-row: scripts/lib/dbGuard.ts classifies DATABASE_URL and refuses an
 // unrecognised origin before Prisma is imported, so an unowned write can only
 // land in a database it recognises. Within that boundary the scoping key is
-// `run_id`: every aggregate is scoped by it alone, and every single-row write
-// pairs it with `batch_key` (`where: { batch_key, run_id }`). `batch_key` on its
-// own is UNIQUE (prisma/schema.prisma) but is NOT a sufficient scope: it is
-// deliberately stable across runs (see batchKeyFor), so it identifies a batch
-// while saying nothing about whose ledger the row is, and charging a reservation
-// to whatever run happens to own it would corrupt that run's totals while
-// leaving the reserving run's aggregate — the very sum that enforces the cap —
-// at zero. No statement below touches a batch row without `run_id` in its
-// predicate, except the two failure-path reads that address the key alone in
-// order to name the run that does own it.
+// `run_id`: the cap's aggregate spans the scope's run ids and every other
+// aggregate one of them, and every single-row write pairs `run_id` with
+// `batch_key` (`where: { batch_key, run_id }`). `batch_key` on its own is UNIQUE
+// (prisma/schema.prisma) but is NOT a sufficient scope: it is deliberately
+// stable across runs (see batchKeyFor), so it identifies a batch while saying
+// nothing about whose ledger the row is, and charging a reservation to whatever
+// run happens to own it would corrupt that run's totals — and, for a run
+// belonging to another coverage plan, would leave the reserving scope's
+// aggregate short of a call it paid for. No statement below touches a batch row
+// without `run_id` in its predicate, except the two failure-path reads that
+// address the key alone in order to name the run that does own it.
 //
 // The row this module inserts belongs to a run it does not own, so before any
 // insert it asks checkpoint.ts's requireOpenRun to prove, under a row lock, that
@@ -290,7 +291,7 @@ const readDecimalInteger = (raw: string): DecimalIntegerRead => {
 
     if (!/^[0-9]+$/.test(trimmed)) {
         // What `Number()` would have made of it is the useful half of the
-        // report — it is the cap the run would otherwise have enforced —
+        // report — it is the cap that would otherwise have been enforced —
         // whereas the raw string is never echoed: a misplaced paste can put a
         // credential on a line that reaches terminals, CI logs and committed
         // reports.
@@ -370,8 +371,11 @@ const requirePositiveIntegerEnv = (raw: string, label: string): number => {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves the hard per-run cap on paid model calls — the only place
- * `CATALOG_MODEL_CALL_BUDGET` is read.
+ * Resolves the hard cap on paid model calls for one budget scope — the only
+ * place `CATALOG_MODEL_CALL_BUDGET` is read. One coverage-plan version is one
+ * allowance, consumed by every run of it and by both spending stages (see this
+ * module's header and {@link budgetScopeOf}), so the number this returns is not
+ * a per-run figure and must never be compared against one.
  *
  * It has NO DEFAULT, deliberately parting company with
  * `entitlement.service.ts`'s `getDailyQuota()`, which silently falls back to 5.
@@ -646,7 +650,8 @@ export const assertModelCallBudget = (plan: BatchPlan, budgetLimit: number, logg
 
 // ---------------------------------------------------------------------------
 // The ledger itself (§1.2 — these orchestrate I/O; every decision they need is
-// above). Every aggregate is scoped by `run_id` and every write by `run_id` and
+// above). The cap's aggregate is scoped by the budget scope's run ids and every
+// reporting aggregate by one `run_id`; every write is scoped by `run_id` and
 // `batch_key` together, never by the key alone and never by row id.
 // ---------------------------------------------------------------------------
 
@@ -859,10 +864,11 @@ const batchRunMismatchError = (batchKey: string, ownerRunId: string, runId: stri
 //
 // Why this is not an upsert on `batch_key`: the key is stable across runs (see
 // batchKeyFor), so an upsert keyed on it alone takes its update branch on a row
-// a DIFFERENT run created — growing that run's `model_calls_reserved` while the
-// aggregate this module enforces the cap with, `SUM(model_calls_reserved) WHERE
-// run_id = <this run>`, stays at zero and the cap never binds. The predicate
-// therefore carries `run_id` as well, and the three outcomes are distinct:
+// a DIFFERENT run created — corrupting that run's totals, and, when that run
+// belongs to another budget scope, landing the increment outside the aggregate
+// this reservation was checked against, so this scope's allowance is never
+// charged for a call it paid for. The predicate therefore carries `run_id` as
+// well, and the three outcomes are distinct:
 //
 //   1. updateMany matched -> the row is this run's and the atomic increment
 //      landed. `batch_key` is UNIQUE, so a match is always exactly one row.
@@ -1065,11 +1071,12 @@ const claimModelCallReservation = async (
  * Reserves one paid model call. Call this IMMEDIATELY BEFORE `callOpenRouter`,
  * never after — that ordering is the rule this module exists to enforce (§9).
  *
- * Throws `budget_exhausted` when the run has spent its cap, before any
- * increment and before the vendor call, so the caller's stop reason is a value
- * rather than a surprise bill. Throws `batch_run_mismatch` when the batch key
- * belongs to another run, because charging that run's ledger would both corrupt
- * its totals and leave this run's cap unenforced. Throws checkpoint.ts's
+ * Throws `budget_exhausted` when the BUDGET SCOPE has consumed its cap, before
+ * any increment and before the vendor call, so the caller's stop reason is a
+ * value rather than a surprise bill. Throws `batch_run_mismatch` when the batch
+ * key belongs to another run, because charging that run's ledger would both
+ * corrupt its totals and, for a run in another scope, put the increment outside
+ * the aggregate this call was checked against. Throws checkpoint.ts's
  * `CheckpointError('run_not_found' | 'run_not_open')` — not a ModelBudgetError —
  * when the run id does not exist or has already been settled, since run identity
  * is that module's contract and this one asks it before writing anything.
@@ -1100,8 +1107,10 @@ export const reserveModelCall = async (
     // transaction client we run IN PLACE — Prisma does not support nesting —
     // and the caller's transaction supplies the boundary. Either way it is the
     // LOCK that serialises, not the transaction; but a caller that brings its
-    // own transaction holds this run's budget lock until IT commits, so such a
-    // caller must not make the paid model call inside that transaction.
+    // own transaction holds the budget-scope lock until IT commits — blocking
+    // every other run of the same coverage plan, this stage's and the advisory
+    // review's alike — so such a caller must not make the paid model call
+    // inside that transaction.
     const claimed = runner
         ? await runner.$transaction((tx) => claimModelCallReservation(tx, input, limit))
         : await claimModelCallReservation(db, input, limit);

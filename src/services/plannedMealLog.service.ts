@@ -19,8 +19,10 @@
 //    shape every other plan read produces. The READS are this module's own and
 //    owner-scoped (§5.1): a service does not borrow another service's I/O, and
 //    nothing here imports `mealPlan.service.ts`.
-//  * `nutrition.service.ts::insertPlannedMealEntry` owns the insert AND the
-//    single rounding in the planned-meal contract.
+//  * `nutrition.service.ts::insertPlannedMealEntry` owns the insert, and ONLY
+//    the insert: it stores the snapshot's four integers verbatim and refuses a
+//    fractional one. The single rounding belongs to `derivePlannedSnapshot`
+//    above.
 //  * `mealPlanningAction.service.ts` owns the keyed-write sequence.
 //
 // WHY A DOUBLE TAP IS SAFE, and why nothing here deduplicates. A second serving
@@ -42,11 +44,13 @@
 //
 // WHAT THIS FILE DOES NOT DO, each for a stated reason:
 //
-//  * NO ROUNDING. The planned portion is computed at full precision by
-//    `derivePlannedPortion`, rounded once into the snapshot, and the diary then
-//    shows `Math.round(snapshot × servings)`. A second rounding anywhere on this
-//    path is how the app's "This adds" card and the server's totals come to
-//    disagree (§0.7.3's rounding contract).
+//  * NO ROUNDING — here or in the writer. The planned portion is computed at
+//    full precision by `derivePlannedPortion`, rounded ONCE by
+//    `derivePlannedSnapshot`, stored verbatim by `insertPlannedMealEntry`, and
+//    the diary then shows `Math.round(snapshot × servings)`. A second rounding
+//    anywhere on this path is how the app's "This adds" card and the server's
+//    totals come to disagree (§0.7.3's rounding contract), so the one owner is
+//    named at every site rather than assumed.
 //  * NO `meal_plan_meals.revision` BUMP. No column of the meal row changes — the
 //    link lives on the diary entry — so bumping it would invalidate every
 //    client's pinned meal revision for a write that did not touch the meal.
@@ -360,9 +364,10 @@ export type LogPlannedMealResult = { kind: 'ok'; result: KeyedActionResult } | L
  *     filed under another day, and a date outside the plan's week alike. One
  *     class for all four, because a response that distinguished them would be an
  *     oracle for what exists in another user's diary (§0.5.2's 404).
- *  5. THE SNAPSHOT, from `derivePlannedSnapshot`, inserted through
- *     `insertPlannedMealEntry` with the servings the request asked for. That
- *     helper owns the single rounding, so nothing is rounded here.
+ *  5. THE SNAPSHOT, from `derivePlannedSnapshot` — which owns the single
+ *     rounding — inserted through `insertPlannedMealEntry` with the servings
+ *     the request asked for. The writer stores those integers verbatim, so
+ *     nothing on this path rounds a second time.
  *  6. `meal_plans.revision` incremented as a compare-and-swap on the pinned
  *     value; `meal_plan_meals.revision` deliberately untouched.
  *

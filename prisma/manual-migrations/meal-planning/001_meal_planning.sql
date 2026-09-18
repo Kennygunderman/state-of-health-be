@@ -5,6 +5,13 @@
 -- This file is that migration's DDL, statement for statement, rewritten so it can
 -- be re-run safely. No npm script, CI step or Prisma command runs this folder.
 --
+-- One statement carries a context guard as well as an idempotency guard, and it
+-- is the only place this copy is conditional on anything but its own prior
+-- application: the `idx_catalog_food_aliases_lower_alias` index, which a later
+-- ledger entry retires. The reasoning sits with the statement itself, and the
+-- equivalence it preserves is measured by the ledger-equivalence gate rather
+-- than claimed here.
+--
 -- Running it by hand is normally unnecessary, because the Prisma migration is
 -- applied automatically: the container's final command is
 -- `npx prisma migrate deploy && node dist/server.js` (see Dockerfile), and CI
@@ -30,7 +37,8 @@
 -- on catalog_foods.search_vector, the block of expression and partial indexes
 -- before the foreign keys, and NOT NULL on the twelve required TEXT[]/UUID[]
 -- columns. Prisma cannot express any of them, which is why the authoritative
--- migration writes them by hand and this copy repeats them verbatim. Of the
+-- migration writes them by hand and this copy repeats them - verbatim but for
+-- the one context-guarded index named above. Of the
 -- three, the generated expression is the one `prisma migrate diff` reports.
 -- The expression index, the partial indexes and the array NOT NULLs are
 -- invisible to that command - a recorded AAP-versus-tool divergence, with the
@@ -530,20 +538,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS "meal_entries_id_user_id_key" ON "meal_entries
 CREATE INDEX IF NOT EXISTS "idx_catalog_foods_search_vector" ON "catalog_foods" USING GIN ("search_vector");
 
 -- CreateIndex
--- The operator class is explicit, and it is the whole point of this index.
--- Its only caller is catalog.service.ts's prefix fallback, whose predicate is a
--- left-anchored `lower(alias) LIKE 'x%'`. A btree can turn a LIKE pattern into
--- a range scan only when the indexed column's comparison is byte order - that
--- is, under a `*_pattern_ops` operator class or a column collation of C - and
--- the databases this project creates are en_US.utf8. Under the default
--- `text_ops` the planner cannot derive the bounds and refuses the index even
--- with enable_seqscan off, so the predicate falls back to a sequential scan of
--- every alias. `text_pattern_ops` still serves `=`, and no caller compares
--- lower(alias) with `=`, `<` or `>`, so no second `text_ops` index is needed.
--- An operator class is part of `pg_indexes.indexdef`, which is what the
--- ledger-equivalence gate compares, so this line and the authoritative
--- migration's must stay identical in it as well as in the key expression.
-CREATE INDEX IF NOT EXISTS "idx_catalog_food_aliases_lower_alias" ON "catalog_food_aliases"(lower("alias") text_pattern_ops);
+-- THE ONE CONTEXT-GUARDED STATEMENT IN THIS FILE, and the guard is the only
+-- difference between it and the authoritative migration's line 509, which reads
+--   CREATE INDEX "idx_catalog_food_aliases_lower_alias"
+--     ON "catalog_food_aliases"(lower("alias") text_pattern_ops);
+-- unconditionally. Applied to a pre-feature schema - the only context this file
+-- is written for - the block below does exactly that, which is what keeps this
+-- copy the statement-for-statement equivalent the header claims. That is not
+-- asserted, it is measured: `describe('migration ledgers')` in
+-- src/__tests__/api/compat.test.ts brings one database up on
+-- 20260908000000_meal_planning alone and another on this file alone, compares
+-- the two catalogues, and pins this index's `lower(alias)` expression and
+-- `text_pattern_ops` class positively on both - so the index vanishing from
+-- both sides cannot buy a pass either.
+--
+-- WHY IT IS GUARDED AT ALL. 20260910000000_catalog_prefix_fold_indexes RETIRES
+-- this index: `lower()` resolves through the database's collation while the
+-- prefix branches in catalog.service.ts fold with a fixed A-Z map, so it could
+-- not serve the only predicate it was created for (that migration's header
+-- carries the portability defect and the measurements). Applied on top of an
+-- already-deployed ledger, an unguarded statement would resurrect a construct
+-- the ledger has already dropped, and this file would stop being the no-op the
+-- same gate asserts it is in that order. Skipping when the replacement fold
+-- index is present is therefore the same idempotency discipline as the
+-- IF NOT EXISTS guards elsewhere here, applied to the one statement whose later
+-- fate in the ledger is removal rather than repetition - and because a `DO`
+-- block that takes neither branch raises nothing, it does not disturb the
+-- notice-level evidence that gate collects either.
+--
+-- Both operator procedures still end with the three replacement indexes in
+-- place, because both reach 20260910000000 through `prisma migrate deploy`
+-- after `prisma migrate resolve --applied 20260908000000_meal_planning`.
+DO $$
+BEGIN
+    IF to_regclass('"idx_catalog_food_aliases_fold_alias"') IS NULL THEN
+        CREATE INDEX IF NOT EXISTS "idx_catalog_food_aliases_lower_alias" ON "catalog_food_aliases"(lower("alias") text_pattern_ops);
+    END IF;
+END $$;
 
 -- CreateIndex
 CREATE UNIQUE INDEX IF NOT EXISTS "unique_published_catalog_food_identity" ON "catalog_foods"("canonical_name", "food_state") WHERE "publication_status" = 'published';

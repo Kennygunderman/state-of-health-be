@@ -61,44 +61,58 @@ touching the difference fails inside Prisma instead. The schema-freshness gate
 names the database, the migration and the missing columns; recreating the test
 database is the fix.
 
-`psql` never reads `DATABASE_URL`: libpq takes its target from
-`PGHOST`/`PGPORT`/`PGUSER`/`PGDATABASE` or its own defaults, and neither
-`scripts/lib/dbGuard.ts` nor `src/__tests__/setup/testDb.ts` sees a raw `psql`
-call — both guard Node entry points. So the script below names its connection
-itself: an admin URI on the local, non-production server, pointed at the
-`postgres` **maintenance** database, because a database cannot be dropped from
-inside itself. `DROP DATABASE` deletes every row in the database it names and
-nothing here restores them, so only a test database you are prepared to lose
-belongs in `TEST_DB` — the name is held to the rule the suite's own guard
-applies (`isTestDatabaseName` in `scripts/lib/dbGuard.ts`: a name ending
-`_test`, optionally with a clone index, or exactly `ci`). Save it and run it
-with `bash`; each stop is an `exit 1`, which would close an interactive shell it
-was pasted into:
+Recreating it is one guarded command — the same module as the two gates above,
+with `--recreate` added. Do not do it by hand: a `DROP DATABASE` typed into
+`psql` is checked by nothing that knows **which server answers**. A name ending
+`_test` is a naming convention, and on an SSH tunnel or a forwarded container
+port that name resolves on `127.0.0.1` to a production server; this project's
+development environment also exports a production `DATABASE_URL` into every new
+shell that does not override it, which is the value a bare
+`npx prisma migrate deploy` would use.
 
 ```sh
-set -euo pipefail
+export DATABASE_URL=postgresql://USER:PASSWORD@127.0.0.1:5432/soh_test
 
-ADMIN_URL='postgresql://USER:PASSWORD@127.0.0.1:5432/postgres'
-TEST_DB='soh_test'
-
-printf '%s' "$TEST_DB" | grep -Eq '(_test(_[0-9]+)?|^ci)$' || {
-  echo "refusing to drop \"$TEST_DB\": not a test database name" >&2
-  exit 1
-}
-
-# Read this back before continuing — it is the server, port and account the
-# drop is about to run against.
-psql "$ADMIN_URL" -tAc \
-  'SELECT current_database(), current_user, inet_server_addr(), inet_server_port()'
-
-# The name reaches psql as a variable and psql quotes it as an identifier
-# (`:"target"`) rather than it being spliced into the statement. psql
-# interpolates variables only in input it reads as a script, never in a `-c`
-# string, so the two statements arrive on stdin.
-psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -v target="$TEST_DB" <<'SQL'
-DROP DATABASE IF EXISTS :"target";
-CREATE DATABASE :"target";
-SQL
-
-npx prisma migrate deploy
+NODE_ENV=test ALLOW_DB_TRUNCATE=true \
+  npx ts-node --project tsconfig.test.json src/__tests__/setup/testDb.ts \
+  --recreate --confirm-target soh_test
 ```
+
+`DROP DATABASE` deletes every row in the database it names and nothing restores
+them, so the command refuses unless all of the following hold. Each refusal
+exits 1, says which condition failed — naming the host and the database wherever
+it judged one — and reaches no server it has not already cleared:
+
+- **The suite's own identity gate passes** — `NODE_ENV`, `ALLOW_DB_TRUNCATE` and
+  the `DATABASE_URL` rules in the table above, unchanged and shared with
+  `scripts/lib/dbGuard.ts`: a local host, a name ending `_test` (optionally with
+  a clone index) or exactly `ci`, no query parameter that can move the
+  connection (`?host=`, `?dbname=`…) or the schema (`?schema=`, `?options=-c
+  search_path=…`), and no percent-encoded database name. A URL that fails any of
+  these is refused before a driver is even loaded.
+- **You named the target** — `--confirm-target` must spell the database the URL
+  points at. An inherited `DATABASE_URL` is a target nobody read, so it cannot
+  satisfy this.
+- **The database answered for itself** — the command opens a connection to the
+  target and refuses unless `current_database()` is the name the URL displays
+  and an unqualified statement in it resolves in `public`. That second check is
+  the one a string cannot make: `ALTER ROLE … SET search_path` and
+  `ALTER DATABASE … SET search_path` redirect where the replayed migrations
+  would create their tables, and no URL shows it.
+- **The drop reaches the server that was verified** — the `DROP`/`CREATE` pair is
+  issued from the `postgres` maintenance database on the same authority (a
+  database cannot be dropped from inside itself), and that session must report
+  the same server as the read-back did.
+
+Then, and only then, it drops and recreates the database, applies
+`prisma/migrations` with `prisma migrate deploy` against a `DATABASE_URL` it
+derives from the validated target rather than from your shell, and reads
+`public._prisma_migrations` back to confirm the fresh database carries the
+ledger. It prints the statements it issued. A database that does not exist yet is
+created without a drop.
+
+Two things it does not do for you: it will not close another session's
+connection (`DROP DATABASE` fails while one is open — stop any running suite or
+`npm run dev` first), and it will not guess the target — the `DATABASE_URL` and
+the `--confirm-target` name have to agree, which is where a mistyped one is
+stopped instead of executed.

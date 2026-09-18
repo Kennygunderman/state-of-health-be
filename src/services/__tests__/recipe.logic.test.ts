@@ -3030,8 +3030,9 @@ describe('the committed recipe graph', () => {
      * The chain is
      *
      *   1. `deriveRecipeNutrition` / `scalePlannedNutrition` — full precision;
-     *   2. `nutrition.service.ts::insertPlannedMealEntry` — `Math.round` per
-     *      value, ONCE, into the diary snapshot;
+     *   2. `plannedMealLog.logic.ts::derivePlannedSnapshot` — `Math.round` per
+     *      value, ONCE, into the diary snapshot that
+     *      `nutrition.service.ts::insertPlannedMealEntry` then stores verbatim;
      *   3. `nutrition.service.ts::asEaten` — `Math.round(snapshot × servings)`,
      *      the consumed total the mobile "This adds" card must agree with.
      *
@@ -3043,7 +3044,7 @@ describe('the committed recipe graph', () => {
      * either module read alone.
      */
     describe('the rounding contract', () => {
-        /** `nutrition.service.ts::insertPlannedMealEntry` — one round per value, on insert. */
+        /** `plannedMealLog.logic.ts::derivePlannedSnapshot` — one round per value. */
         const asSnapshot = (nutrition: RecipePerServingNutrition): RecipePerServingNutrition => ({
             calories: Math.round(nutrition.calories),
             protein: Math.round(nutrition.protein),
@@ -3173,13 +3174,25 @@ describe('the committed recipe graph', () => {
  *    unusual".
  *
  * A dedicated block for a mapper, where §11 covers mappers by integration,
- * because the behaviour above was ADDED at this checkpoint and the integration
- * suites that would cover it (`src/__tests__/api/recipes.test.ts`,
- * `api/plans.test.ts`, `api/swaps.test.ts`) are §0.7.1 Group 6 deliverables that
- * do not exist yet — leaving a new fail-closed rule with no evidence at all was
- * the worse of the two readings. It changes nothing about the coverage gate:
- * `jest.config.ts` derives its thresholds from `src/services/*.logic.ts` on
- * disk, which a test file cannot join.
+ * because the REFUSALS are unreachable from the HTTP boundary. Every
+ * fail-closed case hands `mapRecipeVersion` a value the row type forbids — the
+ * `unknown`-valued overrides below are that state, the one a `$queryRaw`
+ * projection or a row written around the migration can produce — and no route
+ * writes it. The route-facing paths that reach the mapper —
+ * `src/__tests__/api/recipes.test.ts` through
+ * `GET /api/recipes/:recipeVersionId`, and `api/swaps.test.ts` through the
+ * alternatives preview, the only other caller of
+ * `recipe.service.ts::getRecipeVersionDetail` — drive it over rows the schema
+ * and the seed path accept, as do the service-level reads in
+ * `api/ownership.test.ts` and `api/concurrency.test.ts`, which call
+ * `getRecipeVersionForUser` directly. Every one of them can therefore only
+ * present a well-formed snapshot, never one whose safety tags are absent.
+ * Injecting that row is a unit test's only privilege, which is why the
+ * refusals are pinned here and every shape a request can actually produce is
+ * pinned there.
+ * It changes nothing about the coverage gate: `jest.config.ts` derives its
+ * thresholds from `src/services/*.logic.ts` on disk, which a test file cannot
+ * join.
  *
  * Folded into this suite from a dedicated `recipe.mapper.test.ts`: the backend
  * test inventory (Agent Action Plan §0.3.3, §0.8.1) gives each domain exactly

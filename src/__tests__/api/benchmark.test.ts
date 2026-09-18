@@ -1103,8 +1103,8 @@ describe('the publication filter', () => {
 
     it('does not surface a non-published row through the prefix fallback either', async () => {
         // 'quarrow' heads the display_name of three non-published rows and of no
-        // generated row, so a prefix match on `lower(display_name)` would find
-        // them if the filter ran anywhere but first.
+        // generated row, so a prefix match on the folded `display_name` would
+        // find them if the filter ran anywhere but first.
         const { status, items, pagination } = await searchOverHttp({ q: 'quarrow' });
 
         expect(status).toBe(200);
@@ -1487,8 +1487,10 @@ describe('the rank a food takes from its best contribution', () => {
     it('collapses a food matched by its own name and by every one of its aliases to one row', async () => {
         const { items, pagination } = await searchOverHttp({ q: EVERY_BRANCH_TERM });
 
-        // Six contributions for one food: its own vector, three alias vectors,
-        // its name prefix and three alias prefixes.
+        // Eight contributions for one food, every arm of `catalogMatchSet`
+        // firing: its own name vector and name prefix, then a vector and a
+        // prefix for each of its three aliases. `COUNT(DISTINCT id)` is why the
+        // page still holds one row.
         expect(pagination.total).toBe(1);
         expect(idsOf(items)).toStrictEqual([probeId(EVERY_BRANCH)]);
     });
@@ -1866,15 +1868,19 @@ describe('the schema the search rests on', () => {
         expect((gin as IndexRow).indexdef).toMatch(/USING gin \("?search_vector"?\)/i);
     });
 
-    it('carries the lower(alias) index the alias prefix branch needs', async () => {
+    it('carries the ASCII-fold index the alias prefix branch needs', async () => {
         const indexes = await indexesOf('catalog_food_aliases');
-        const prefix = indexes.find((index) => index.indexname === 'idx_catalog_food_aliases_lower_alias');
+        const prefix = indexes.find((index) => index.indexname === 'idx_catalog_food_aliases_fold_alias');
 
         expect(prefix).toBeDefined();
         // `text_pattern_ops` is what lets a left-anchored LIKE become a range
         // scan; under the default operator class the planner cannot use the
-        // index at all. `catalogCollation.test.ts` owns the plan-level proof.
-        expect((prefix as IndexRow).indexdef).toMatch(/lower\(alias\) text_pattern_ops/i);
+        // index at all. The indexed expression is the ASCII fold both sides of
+        // the comparison now go through — `lower()` resolved through the
+        // collation and the JavaScript side did not, so a partial query over a
+        // non-ASCII capital matched on some servers only.
+        // `catalogCollation.test.ts` owns the plan-level proof.
+        expect((prefix as IndexRow).indexdef).toMatch(/translate\(alias, .*\) text_pattern_ops/i);
     });
 
     it('constrains published identity only, which is why the retired twin is legal', async () => {

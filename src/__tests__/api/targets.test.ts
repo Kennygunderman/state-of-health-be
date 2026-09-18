@@ -3903,17 +3903,28 @@ describe('PUT /api/meal-planning/targets', () => {
 /* ---------------------------------------------------------------------------
  * The flag that gates the rest of the router and not these three
  *
- * THIS SUITE'S UNIQUE CHARTER. `mealPlanning.controller.ts` calls
- * `assertMealPlanningEnabled()` in fifteen handlers and deliberately not in the
- * three target ones, because Account, Progress and the diary's target editor
- * read and write targets through them (AAP §0.3.1, §0.5.2, §0.7.5). All
+ * THIS SUITE'S UNIQUE CHARTER IS THE EXEMPTION. `mealPlanning.controller.ts`
+ * calls `assertMealPlanningEnabled()` in fifteen handlers and deliberately not
+ * in the three target ones, because Account, Progress and the diary's target
+ * editor read and write targets through them (AAP §0.3.1, §0.5.2, §0.7.5). All
  * eighteen are registered on ONE router, so the gate is per-handler and there is
  * no mount-level evidence for it.
  *
- * `src/utils/__tests__/featureFlags.test.ts` owns what the flag READS. What it
- * cannot show — and what nothing else in the repository shows — is WHICH
- * handlers consult it. Only a request does, and only against a module graph
- * built while the variable is off.
+ * `src/utils/__tests__/featureFlags.test.ts` owns what the flag READS. What no
+ * unit test can show is that a handler CONSULTS it: only a request does, and
+ * only against a module graph built while the variable is off. WHICH handlers
+ * consult it is inventoried by the `assertMealPlanningEnabled()` call sites in
+ * `mealPlanning.controller.ts`, and each domain suite asserts the 503 over the
+ * routes it owns — `api/preferences.test.ts` the three preference routes,
+ * `api/plans.test.ts` generation, current, day, affected-meals and regenerate,
+ * `api/swaps.test.ts` alternatives, preview and swap, `api/grocery.test.ts`
+ * list, toggle and uncheck-all, `api/log.test.ts` the planned log.
+ *
+ * What is proven HERE is the other side of that division: the three exempt
+ * handlers still answer with the flag off. `GATED_PATHS` supplies a
+ * REPRESENTATIVE contrast from the same router rather than the full fifteen,
+ * because an exemption asserted alone would pass just as well against a graph
+ * whose flag gated nothing at all.
  * ------------------------------------------------------------------------- */
 
 type AppModule = typeof import('../../app');
@@ -4075,8 +4086,10 @@ describe('with MEAL_PLANNING_ENABLED off', () => {
     it.each(GATED_PATHS)('refuses %s with 503 feature_disabled', async (path) => {
         // THE CONTRAST THAT MAKES THE EXEMPTION AN ASSERTION. These routes are
         // registered on the SAME router as the three above and handled in the
-        // same controller file, so this is the only evidence that the gate is
-        // per-handler rather than applied to the whole router — or to nothing.
+        // same controller file, so this is the evidence in this file that the
+        // gate is per-handler rather than applied to the whole router — or to
+        // nothing. The refusals of the remaining gated routes belong to the
+        // suites that own them, listed in this section's banner.
         await seedHttpConfirmedEstimate();
 
         await withPlanningDisabled(async ({ agent }) => {
@@ -4659,18 +4672,26 @@ describe('the shape of every refusal', () => {
         },
     );
 
-    it('never answers 403, for any of them', async () => {
-        // §1.5: cross-user and missing resources are 404 and an unauthenticated
-        // request is 401 — a 403 would confirm that something exists and that
-        // the caller is simply not allowed it.
-        for (const refusal of REFUSAL_CASES) {
+    // §1.5: cross-user and missing resources are 404 and an unauthenticated
+    // request is 401 — a 403 would confirm that something exists and that the
+    // caller is simply not allowed it. Driven as a TABLE OF TESTS rather than a
+    // loop inside one test because each case builds its own database world, and
+    // nine of those must not share a single test's timeout budget — a loop that
+    // overruns it is torn down with its requests still in flight, and that
+    // residue then collides with the tests that follow.
+    it.each(REFUSAL_CASES.map((refusal) => [refusal.label, refusal] as const))(
+        'never answers 403 to %s',
+        async (_label, refusal) => {
+            // The suite's `beforeEach` seeds the service-suite user, so each
+            // refusal world starts from an empty feature graph — as it did
+            // inside the loop this replaced.
             await truncateFeatureTables();
 
             const response = await refusal.run();
 
             expect(response.status).not.toBe(403);
-        }
-    });
+        },
+    );
 });
 
 describe('the closed sets these routes emit', () => {

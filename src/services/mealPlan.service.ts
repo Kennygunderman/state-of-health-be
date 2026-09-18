@@ -1,9 +1,14 @@
 // The I/O half of the weekly meal plan: the five `/meal-planning/plans*` use
 // cases — publish a week, replace one, read the current and upcoming weeks,
 // read one day, list the meals a preference change made incompatible — and
-// nothing else. Those five and the two typed values they answer with are the
-// whole export surface (§5, one use case per exported function); every read
-// below them is private to this file.
+// nothing else. One exported function per use case (§5). The four that parse
+// untrusted input answer a discriminated `{kind: 'ok'} | MealPlanRefusal`
+// result declared in this file, so the controller maps a refusal without
+// catching; `getCurrentMealPlan` parses nothing — it takes a user id and a
+// clock — so it has no refusal arm and returns the `CurrentMealPlanResponse`
+// DTO from `types/mealPlanning.ts` directly. Also exported: the generation
+// deadline and the data-integrity error the controllers map. Every read below
+// them is private to this file.
 //
 // THIS FILE IS IMPORTED BY NO OTHER SERVICE, deliberately. It once exported its
 // transaction-scoped loaders so `swap.service.ts` and
@@ -1417,17 +1422,51 @@ const raiseInjectedGenerationFault = (): void => {
  * §0.5.2's "Sets setupStatus to completed on success" for `POST /plans`, and
  * the one column of the preferences row a generation writes.
  *
- * `updateMany` with `{user_id}` rather than `update` by a unique key, so the
- * predicate carries the owner (§5.1); the row necessarily exists, because
- * `requireGeneratableSetup` read it. The write is idempotent — a second week
- * published from an already-completed setup stores the same value — so it needs
- * no branch on the current status.
+ * `updateMany` with the OWNER AND THE EXPECTED REVISION, never `update` by a
+ * unique key and never the owner alone (§0.5.1, §5.1). `preferencesRevision` is
+ * the revision {@link requirePinnedInputs} certified a few statements earlier in
+ * this same transaction — the value the published week was actually built
+ * against — so the predicate asserts that the row this writes to is still the
+ * row the publication rests on. Without it the status write is the one feature
+ * update to a revisioned row with no compare-and-set, and a row that had
+ * vanished or moved would leave a committed plan and a committed ledger entry
+ * behind a setup that never completed.
+ *
+ * `count !== 1` therefore ROLLS THE WHOLE PUBLICATION BACK rather than being
+ * logged and shrugged at, exactly as the supersede CAS in
+ * {@link regeneratePlan} does for the same class of fault. It cannot fire: every
+ * writer of this row takes the per-user advisory lock this transaction holds,
+ * and the revision was read under it. Reaching it means one of those two
+ * mechanisms has been broken by a later change, and half-publishing is the one
+ * outcome that must not survive it. An untyped `MealPlanDataError`, because
+ * there is no client action for it.
+ *
+ * `setup_status` IS THE ONLY COLUMN WRITTEN, and `revision` is deliberately not
+ * incremented: the revision counts EDITS TO THE PLANNING INPUTS, and completing
+ * setup changes none of them. Bumping it would make every pinned revision a
+ * client or a concurrent save holds instantly stale — `api/concurrency.test.ts`
+ * pins "a generation never moves the preferences revision" — so the row stays at
+ * the revision this predicate just matched, which is also what keeps the write
+ * idempotent for a second week published from an already-completed setup.
  */
-const markSetupCompleted = async (tx: Prisma.TransactionClient, userId: string): Promise<void> => {
-    await tx.meal_plan_preferences.updateMany({
-        where: { user_id: userId },
+const markSetupCompleted = async (
+    tx: Prisma.TransactionClient,
+    userId: string,
+    preferencesRevision: number,
+): Promise<void> => {
+    const updated = await tx.meal_plan_preferences.updateMany({
+        where: { user_id: userId, revision: preferencesRevision },
         data: { setup_status: COMPLETED_SETUP_STATUS },
     });
+
+    if (updated.count !== 1) {
+        throw new MealPlanDataError(
+            `Completing setup for user ${userId} at preferences revision ${String(preferencesRevision)} wrote ` +
+                `${String(updated.count)} rows instead of 1. The revision was certified under the per-user lock ` +
+                'this transaction holds, so it cannot have moved; refusing to publish a week behind a setup ' +
+                'that stayed incomplete.',
+        );
+    }
 };
 
 /**
@@ -1651,7 +1690,10 @@ export const generatePlan = async (
                 });
 
                 await writeGroceriesForNewPlan(lockedTx, userId, planId, null, now);
-                await markSetupCompleted(lockedTx, userId);
+                // The candidate's revision IS the certified one: the call above
+                // refuses to publish unless the locked row still carries it, so
+                // it is what the status write compares against.
+                await markSetupCompleted(lockedTx, userId, candidate.preferencesRevision);
 
                 return {
                     body: requirePublishedPlan(await loadMealPlanResponse(lockedTx, userId, planId), planId),

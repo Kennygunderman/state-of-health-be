@@ -171,8 +171,18 @@ to keep if the rest of the procedure is ever adapted.
    `confirmation_required` unless the flag names that URL's database exactly —
    the sole exception being a database whose own name says development — and
    with `confirmation_mismatch` when it names a different one.
-   `search:benchmark` is `any_recognised`, reads only, and takes no
-   confirmation flag.
+   `search:benchmark` is `read_only_recognised`, reads only, and takes no
+   confirmation flag, which is what lets it run here at all.
+
+   The other four catalog stages cannot be run here, by design.
+   `catalog:import`, `catalog:generate`, `catalog:validate` and
+   `catalog:release` are `development_or_test`: they mutate shared catalog data,
+   so they accept only a database whose own name says development or a `_test`
+   one, and they carry no confirmation flag. A deployment database reached over
+   loopback is refused with `development_only`. That is the same rule as the
+   paragraph below the fold — a catalog is built and reviewed on a development
+   machine, and a release is what travels — expressed where a run would
+   otherwise start.
 
    **What the guard enforces on this invocation.** A deployment database reached
    over loopback classifies `development` **on the host alone** — the guard
@@ -504,13 +514,16 @@ records the exact command that regenerates it:
   uniqueness, key expressions and predicate, and every array column's
   `NOT NULL` and default.
 
-The migration writes three things by hand that `prisma migrate diff` does not
-report at all — the `lower(alias)` expression index, the five partial indexes,
-and `NOT NULL` on the twelve required array columns. Prisma 6.9 still emits
+The migrations write three things by hand that `prisma migrate diff` does not
+report at all — the three ASCII-fold expression indexes the search prefix
+branches read (`translate(<column>, 'ABC…', 'abc…') text_pattern_ops` over
+`catalog_food_aliases.alias` and, partial on `publication_status`, over
+`catalog_foods.display_name` and `.canonical_name`), the partial indexes, and
+`NOT NULL` on the twelve required array columns. Prisma 6.9 still emits
 only the generated column, and both files' headers record that as an
 AAP-versus-tool divergence with the measurements behind it. What closes the two
-classes the tool omits is the second artefact: deleting the
-`lower(alias)` index, changing a partial index's predicate, or dropping
+classes the tool omits is the second artefact: deleting one of those expression
+indexes, changing a partial index's predicate, or dropping
 `NOT NULL` from a required array column each change the `pg_catalog` result and
 fail the gate.
 
@@ -519,11 +532,25 @@ Those sections read the database `npx prisma migrate deploy` builds from
 about the operator copy under `prisma/manual-migrations/meal-planning/`, which
 the gate never applies. What holds that copy to the authoritative migration is
 the ledger-equivalence gate (`describe('migration ledgers')` in
-`src/__tests__/api/compat.test.ts`), which applies both ledgers and compares the
-resulting columns, indexes and constraints. The two are complementary: the
-equivalence gate compares one ledger against the other and so cannot see a
-construct dropped from both, which is precisely what the `pg_catalog` sections
-catch.
+`src/__tests__/api/compat.test.ts`), which measures the copy in two places.
+
+- **Against the migration it copies, each alone.** One disposable database gets
+  the init schema plus `20260908000000_meal_planning`, another gets the init
+  schema plus the copy, and their columns, indexes and constraints are compared
+  before any later entry runs on either. This is where the copy's own
+  reproduction of a construct is visible, and it is the half that matters for
+  anything a later entry then removes — `idx_catalog_food_aliases_lower_alias`,
+  which `20260910000000_catalog_prefix_fold_indexes` retires, is pinned
+  positively on both sides here so its disappearance from both cannot pass.
+- **Against the ledger as a whole, in both orders.** Deploy-then-copy must leave
+  the schema unmoved, and copy-then-`resolve`-then-deploy must converge on the
+  same columns, indexes, constraints and normalised `pg_dump` — the two orders
+  §0.9.1 names.
+
+All three artefacts are complementary: a whole-ledger comparison sets one
+ledger against the other and so cannot see a construct missing from both, and
+the one-file comparison cannot see a construct a later entry breaks — which is
+what the `pg_catalog` sections catch.
 
 CI's `Schema-drift evidence gate` step polices both artefacts. It runs the
 migrate-diff command against a throwaway shadow database of its own, requires
@@ -555,15 +582,32 @@ command: loading reviewed catalog and recipe reference data into a deployment
 database is step 4 of that procedure, while pointing a development or test run
 at production data is what is out of bounds.
 
-Two habits keep that line honest during ordinary development, and one of them is
-narrower than it sounds. The database-origin guard described in
-[`README.md`](./README.md#the-database-origin-guard) refuses any database it
-cannot classify, and that half always holds — an unrecognised origin is refused
-before any policy is consulted. It makes `catalog:load` and `recipes:seed`
-demand the target's name aloud only **off** a development origin, and a loopback
-URL is a development origin by its host alone, so on the invocation step 4 can
-use the typed name is the operator's discipline rather than the guard's
-enforcement. The second habit is what covers that: naming the target URL
-explicitly in any command that writes, and reading it back before it does,
-because this project's development environment supplies a production
-`DATABASE_URL` to every new shell that does not override it.
+Two habits keep that line honest during ordinary development. The first is the
+database-origin guard described in
+[`README.md`](./README.md#the-database-origin-guard): it refuses any database it
+cannot classify — an unrecognised origin is rejected before any policy is
+consulted — and it makes `catalog:load` and `recipes:seed` demand the target's
+name aloud, exactly, after `--confirm-target` for every recognised origin except
+a database whose own **name** says development. A host-only loopback target is
+one of those: the `development` class it gets on its host alone buys it nothing
+here, which is the enforcement step 4 above describes and the shape a deployment
+database reached over a tunnel or a published port has. The second habit is not
+made redundant by it: name the target URL explicitly in any command that writes,
+and read it back before it does, because this project's development environment
+supplies a production `DATABASE_URL` to every new shell that does not override
+it.
+
+One destructive operation is routine rather than forbidden, and it is the only
+one: **recreating a test database** after the schema-freshness gate reports that
+its migration ledger has drifted. It has an executable form, and that form is
+the only sanctioned one — `src/__tests__/setup/testDb.ts --recreate
+--confirm-target <database>`, documented in
+[`../../README.md`](../../README.md#when-a-test-database-is-stale). It applies
+the second habit above as code rather than as discipline: the target must pass
+the suite's identity gate, be named on the command line, and answer for itself
+over a connection (`current_database()` and the schema an unqualified statement
+resolves in) before anything is dropped, and the `prisma migrate deploy` that
+follows runs against a URL derived from that verified target instead of the
+ambient one. A `DROP DATABASE` typed into `psql` has none of that: a `_test`
+name on a tunnelled or forwarded port is a production server wearing a test
+name, which is exactly the first item on the list above.

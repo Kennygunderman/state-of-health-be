@@ -2038,6 +2038,54 @@ describe('the plan DTO — targets, dates, portions, flags and counts', () => {
             ).toEqual([kept.id]);
         });
 
+        // §0.5.2 declares this response as fourteen members, and `generationKey`
+        // is not one of them: it is an additive extra this server sends so the
+        // screen that owns a pending generation can recognise its own result
+        // (§0.7.4), and a client may not require it — `MealPlanResponse` types
+        // it optional and the mobile codec admits a response without it, so a
+        // contract-conforming payload can never fail to decode over it. What is
+        // asserted here is the other half: this server does send it, and it is
+        // the key of the write that published the plan rather than anything
+        // rederived.
+        it('carries every member the contract declares, and the publishing key as an extra', async () => {
+            const idempotencyKey = '41414141-4141-4141-8141-414141414141';
+
+            await seedGeneratorWorld(USER_ID);
+
+            const published = asPlan(
+                (await postPlan(generateBody({ idempotencyKey, startDate: utcTodayDayKey() })).expect(201))
+                    .body,
+            );
+
+            expect(Object.keys(published).sort()).toEqual(
+                [
+                    'days',
+                    'endDate',
+                    'generationAttempt',
+                    'generationKey',
+                    'generationTargets',
+                    'hasIncompatibilities',
+                    'id',
+                    'preferencesRevision',
+                    'revision',
+                    'startDate',
+                    'status',
+                    'summary',
+                    'targets',
+                    'targetsRevision',
+                    'targetsStale',
+                ].sort(),
+            );
+            expect(published.generationKey).toBe(idempotencyKey);
+
+            // And on the read path too, which is where a client whose 201 was
+            // lost looks — though what retires its pending request is the
+            // answer to that key, never this read (§0.2.5).
+            const current = asCurrent((await getCurrent().expect(200)).body).current;
+
+            expect(current?.generationKey).toBe(idempotencyKey);
+        });
+
         it('states every planned recipe’s provenance as source-backed', async () => {
             const { plan } = await seedPlannedWeek(USER_ID);
             const current = asCurrent((await getCurrent().expect(200)).body).current;
@@ -2461,7 +2509,8 @@ describe('GET /api/meal-planning/plans/:planId/days/:date', () => {
  * member its lifecycle says it belongs to, and the envelope reports the week's
  * revision as it now stands. Neither can fail on an unlucky interleaving,
  * because neither stages one — so they would both stay green if the reads went
- * back to the autocommit client, which is precisely what `F01` and `F02` were.
+ * back to the autocommit client, which is precisely the defect
+ * `mealPlan.service.ts::readInPlanSnapshot` exists to prevent.
  *
  * What the two cases here pin is the MECHANISM, with no race to lose. The first
  * reads back the isolation level each read asks for, because `RepeatableRead` is
@@ -2540,9 +2589,9 @@ describe('the two lifecycle reads share one snapshot', () => {
     });
 
     it('describes the week it resolved even when a supersession commits mid-read', async () => {
-        // THE INTERLEAVING `F01` DESCRIBES, STAGED. The read's snapshot is open;
-        // then another connection supersedes the very plan it is about to
-        // resolve and describe. With one snapshot the answer is the week as it
+        // THE INTERLEAVING ONE SNAPSHOT RULES OUT, STAGED. The read's snapshot
+        // is open; then another connection supersedes the very plan it is about
+        // to resolve and describe. With one snapshot the answer is the week as it
         // stood — resolved as `current` AND reported `'active'`, one instant
         // throughout. Statement by statement it would not be: the resolution and
         // the hydration would straddle the commit and the body would claim a

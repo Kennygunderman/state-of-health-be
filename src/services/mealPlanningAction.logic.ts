@@ -109,8 +109,13 @@ export interface ActionFingerprintRecord {
  *
  * All three are nullable because a RESERVED row has not filled them yet. They
  * are typed `| null` to mirror the database exactly rather than to invite
- * optional handling — {@link readStoredResponse} is the one place that reads
- * them.
+ * optional handling: {@link readStoredResponse} is the one place that turns them
+ * into a response, and the only other consumer —
+ * `grocery.service.ts::loadLastSwapContext`, which needs the last COMPLETED swap
+ * of a plan and not a replay of it — asks {@link classifyActionCompletion} over
+ * this same shape rather than testing a column of its own choosing. Both
+ * therefore mean the same thing by "completed"; a third reading of these columns
+ * belongs behind one of those two functions.
  *
  * They are also ALL-OR-NOTHING. §0.5.1 fills `response_status`,
  * `response_snapshot` and `plan_revision_after` in the single statement that

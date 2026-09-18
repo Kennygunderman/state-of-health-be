@@ -76,7 +76,7 @@ import { truncateFeatureTables } from '../setup/testDb';
 import type { UsdaFoodDetail, UsdaFoodPortion, UsdaFoodSummary } from '../../services/usda.service';
 // The key builder itself, not a restatement of it: the cache-key scheme the
 // manifest documents is only checkable against the function that produces the
-// key (w012-F35). It is pure and reads no cache, so importing the value side
+// key. It is pure and reads no cache, so importing the value side
 // costs nothing here.
 import { cacheKeyForRequest } from '../../services/usda.service';
 import {
@@ -158,22 +158,35 @@ import {
     type UsdaRateReservation,
     type UsdaRequestStats,
 } from '../../../scripts/lib/rateLimiter';
-// The version decision and the persistence it feeds (DB-F08), plus the batch
-// accounting (DB-F11). `nextCatalogFoodVersions` is pure, so most of that
+// The version decision and the persistence it feeds, plus the batch
+// accounting. `nextCatalogFoodVersions` is pure, so most of that
 // contract is proven with no database at all; `persistPreparedFood` is where it
 // meets the write, and a fake `ImportDb` is how the write is observed.
 //
-// The version rule and its fact set come from `scripts/lib/catalogFoodFacts`,
-// the module both writers of `catalog_foods` share, rather than from the import
-// CLI that used to export them: a suite importing a CLI to reach a pure helper
-// is the same coupling the generation stage had, and this import is what keeps
-// the shared module the one place either stage reads it from.
-import { importPublicationStatus, persistPreparedFood } from '../../../scripts/catalog-import-usda';
+// The version rule and its fact set come from `src/services/catalog.logic`,
+// the catalog's own decision layer that both writers of `catalog_foods` call,
+// rather than from the import CLI that used to export them: a suite importing a
+// CLI to reach a pure rule is the same coupling the generation stage had, and
+// this import is what keeps the domain module the one place either stage reads
+// the rule from. The payload digest stays with the script library that both
+// commands share for it.
+import {
+    IMPORT_CHECK_MISSING_RETRIEVAL_STATUS,
+    importEvidenceAssessment,
+    importEvidenceCheckName,
+    importPublicationStatus,
+    persistPreparedFood,
+} from '../../../scripts/catalog-import-usda';
 import type { ImportDb, PreparedCatalogFood } from '../../../scripts/catalog-import-usda';
-import { canonicalJsonString, nextCatalogFoodVersions, sha256Hex } from '../../../scripts/lib/catalogFoodFacts';
-import type { StoredVersionedFacts } from '../../../scripts/lib/catalogFoodFacts';
-// The stage lock (DB-F09) and the run identity a validation pass claims
-// (DB-F10) both live with run state, which is what they are about.
+// The shared complete-evidence floor, imported here so the import stage's
+// disposition is asserted against the SAME predicate validation, the release
+// exporter and the release loader apply — not against a copy of its rules.
+import { evidenceGapCodes } from '../../../scripts/lib/catalogEvidence';
+import { canonicalJsonString, sha256Hex } from '../../../scripts/lib/catalogFoodFacts';
+import { nextCatalogFoodVersions } from '../../services/catalog.logic';
+import type { StoredVersionedFacts } from '../../services/catalog.logic';
+// The stage lock and the run identity a validation pass claims
+// both live with run state, which is what they are about.
 import {
     CATALOG_STAGE_LOCK_MODES,
     CheckpointError,
@@ -195,10 +208,11 @@ import {
     withCatalogStageLock,
 } from '../../../scripts/lib/checkpoint';
 import type { CatalogInputRunRow, CatalogStageLockConnection } from '../../../scripts/lib/checkpoint';
-// Validation's run identity and completed-run no-op (DB-F10) and its per-food
-// lock/re-read/CAS (DB-F09). Importing this module runs nothing: like the import
+// Validation's run identity, its completed-run no-op and its per-food
+// lock/re-read/CAS. Importing this module runs nothing: like the import
 // script it guards `main()` behind `require.main === module`.
 import {
+    DEFAULT_CURATOR_DECISIONS_PATH,
     appendValidationHistory,
     historyEntryBelongsToRun,
     identityGroupMoved,
@@ -218,7 +232,7 @@ import type {
 // The ledger error the advisory review's stop path is driven with: a refused
 // reservation is what an exhausted shared cap looks like to this stage.
 import { ModelBudgetError } from '../../../scripts/lib/budget';
-// The release's refusal rule (DB-F09, NEW-01), which is pure over the run
+// The release's refusal rule, which is pure over the run
 // ledger, and the read that decides which rows it gets to see.
 import { ReleaseIntegrityError, loadPipelineRuns, releaseStalenessReason, runRelease } from '../../../scripts/catalog-release';
 import type { ReleaseDb, ReleaseRunRow, RunReleaseDeps } from '../../../scripts/catalog-release';
@@ -472,7 +486,7 @@ const entryCarrying = (allergen: string): (UsdaManifestFood & { fdcId: number })
     ) ?? curatedEntries.find((entry) => entry.reviewedSafety?.allergenTags.includes(allergen));
 
 /**
- * THE MANIFEST IS VERIFIED BEFORE IT IS BELIEVED (SCRBLD-F18, SCRBLD-F31).
+ * THE MANIFEST IS VERIFIED BEFORE IT IS BELIEVED.
  *
  * `loadUsdaManifest` used to check one field — the version string — and cast
  * the rest. Everything downstream then read a fully-typed `UsdaManifest` that
@@ -494,7 +508,7 @@ const entryCarrying = (allergen: string): (UsdaManifestFood & { fdcId: number })
  * than to a hand-built fixture, so every case is one field away from a document
  * that works and cannot pass by being incomplete in some other way.
  */
-describe('the USDA manifest is verified rather than cast (SCRBLD-F18, SCRBLD-F31)', () => {
+describe('the USDA manifest is verified rather than cast', () => {
     /** A mutable deep clone of the committed document, as parsed JSON. */
     const clone = (): Record<string, any> =>
         JSON.parse(fs.readFileSync(dataPath(USDA_MANIFEST_FILE), 'utf8')) as Record<string, any>;
@@ -634,7 +648,7 @@ describe('the USDA manifest is verified rather than cast (SCRBLD-F18, SCRBLD-F31
         expect(error.message).toContain('coveragePlanVersion');
     });
 
-    it('refuses an entry that names its record by a rule instead of an id (SCRBLD-F31)', () => {
+    it('refuses an entry that names its record by a rule instead of an id', () => {
         // The form the plan used to SKIP in silence: an entry the contract
         // calls valid, describing a record by name for the import to resolve.
         // Nothing resolved it, so the record was never fetched and the category
@@ -698,7 +712,7 @@ describe('the USDA manifest is verified rather than cast (SCRBLD-F18, SCRBLD-F31
 
     it('refuses a sweep whose page bound contradicts its own measurement, or the vendor cap', () => {
         // `maxPages` is a backstop ABOVE the measured last page, which is what
-        // lets a grown dataset be imported (SCRBLD-F16). A document stating it
+        // lets a grown dataset be imported. A document stating it
         // below the measurement describes a truncation instead of a backstop.
         const truncating = refusal((document) => {
             document.datasetSweeps[1].maxPages = 3;
@@ -753,7 +767,7 @@ describe('the USDA manifest is verified rather than cast (SCRBLD-F18, SCRBLD-F31
 });
 
 /**
- * THE CROSS-DOCUMENT HALF, SPLIT BY WHAT IT COSTS (SCRBLD-F18).
+ * THE CROSS-DOCUMENT HALF, SPLIT BY WHAT IT COSTS.
  *
  * `assertUsdaManifestShape` can only check the manifest against itself. Whether
  * a category it files under is a category the coverage plan TARGETS, and
@@ -779,7 +793,7 @@ describe('the USDA manifest is verified rather than cast (SCRBLD-F18, SCRBLD-F31
  * below can require BOTH lists to be empty for the shipped pair and require a
  * refusal for either kind.
  */
-describe('the manifest is checked against the coverage plan (SCRBLD-F18)', () => {
+describe('the manifest is checked against the coverage plan', () => {
     it('finds no filing disagreement between the committed documents', () => {
         const agreement = checkManifestAgainstCoveragePlan(manifest, coveragePlan);
 
@@ -1225,7 +1239,7 @@ describe('reviewed allergen and diet metadata (N01)', () => {
     });
 });
 
-describe('nutrition method agrees with the assumptions (w043-F06)', () => {
+describe('nutrition method agrees with the assumptions', () => {
     const base = curatedEntries[0] as UsdaManifestFood;
 
     it('denies any derivation when the record stated its own energy', () => {
@@ -1261,7 +1275,7 @@ describe('nutrition method agrees with the assumptions (w043-F06)', () => {
     });
 });
 
-describe('identity evidence records the retrieval that happened (w043-F06)', () => {
+describe('identity evidence records the retrieval that happened', () => {
     const base = curatedEntries[0] as UsdaManifestFood;
 
     const prepared = (
@@ -1336,14 +1350,24 @@ describe('identity evidence records the retrieval that happened (w043-F06)', () 
         expect(one.evidence.http_status).toBeNull();
         expect(one.evidence.http_status_source).toContain('before that table carried http_status');
         expect(one.evidence.http_status_source).toContain('Not a substituted 200');
-        // And the record is flagged unpublishable at the same moment.
-        expect(one.retrievalStatusMissing).toBe(true);
+        // And the record is unpublishable at the same moment, judged from the
+        // record itself rather than from a separate boolean about one of its
+        // fields: `importEvidenceAssessment` reads what is about to be written.
+        const assessment = importEvidenceAssessment(one);
+        expect(assessment.complete).toBe(false);
+        expect(evidenceGapCodes(assessment)).toEqual(['retrieval_status_missing']);
     });
 
-    it('does not flag a record whose retrieval carried a status', () => {
-        expect(prepared('usda_api_cache', new Date('2026-09-13T09:11:40.243Z'), 'b'.repeat(64), 200)
-            .retrievalStatusMissing).toBe(false);
-        expect(prepared('import_run', null, 'c'.repeat(64), 201).retrievalStatusMissing).toBe(false);
+    it('finds no gap in a record whose retrieval carried a successful status', () => {
+        for (const one of [
+            prepared('usda_api_cache', new Date('2026-09-13T09:11:40.243Z'), 'b'.repeat(64), 200),
+            prepared('import_run', null, 'c'.repeat(64), 201),
+        ]) {
+            const assessment = importEvidenceAssessment(one);
+            expect(evidenceGapCodes(assessment)).toEqual([]);
+            expect(assessment.complete).toBe(true);
+            expect(assessment.status).toBe(one.evidence.http_status);
+        }
     });
 
     it('states the cache-key scheme beside the key, so the provenance is checkable', () => {
@@ -1364,8 +1388,225 @@ describe('identity evidence records the retrieval that happened (w043-F06)', () 
 });
 
 /**
+ * The import stage decides its own disposition with the SHARED complete-evidence
+ * predicate (SEC3-validator-publishes-no-evidence).
+ *
+ * WHAT WAS WRONG. `importPublicationStatus` used to read one boolean about one
+ * field — "did the retrieval carry an HTTP status" — while validation, the
+ * release exporter and the release loader each assessed the whole record with
+ * `assessIdentityEvidence`. So this stage could write a record the other three
+ * refuse: a 404 status, a malformed digest, a blank cache key, a blank snippet,
+ * an unparseable `fetched_at`, or two spellings of one field disagreeing. The
+ * disagreement surfaced only at the stage that had to reject work already done.
+ *
+ * WHAT THIS BLOCK IS AND IS NOT PROVING. It is defense in depth, not a live
+ * publication hole: this stage writes `candidate` or `quarantined` and never
+ * `published`. The claim is narrower and checkable — the disposition is now the
+ * shared floor's decision over the record that is about to be written, so every
+ * mandatory field is enforced at the stage that PRODUCES it, and under the name
+ * of the gap.
+ */
+describe('the import holds a record its own evidence cannot support (SEC3)', () => {
+    const base = curatedEntries[0] as UsdaManifestFood;
+    const policy: CatalogValidationPolicy = {
+        categories: coveragePlan.categories,
+        validationBounds: coveragePlan.validationBounds,
+    };
+    const fetchedAt = new Date('2026-09-14T08:30:00.000Z');
+
+    /** A prepared food whose retrieval evidence is complete, as this stage writes one. */
+    const soundRecord = (): PreparedCatalogFood =>
+        prepareCatalogFood(detailFor(base), { kind: 'curated', entry: base }, manifest, fetchedAt, {
+            requestedFdcIds: [base.fdcId as number],
+            cacheKey: 'POST /foods?#{"fdcIds":[' + String(base.fdcId) + '],"format":"full"}',
+            responseSha256: 'd'.repeat(64),
+            source: 'import_run',
+            httpStatus: 200,
+            cachedAt: null,
+        });
+
+    /**
+     * The same food with its evidence record edited.
+     *
+     * Edited rather than re-prepared, because the point is the RECORD: the
+     * candidate, the checks and the verdict are held constant, so a refusal can
+     * come from nothing but the evidence.
+     */
+    const withEvidence = (
+        overrides: Record<string, unknown>,
+        remove: readonly string[] = [],
+    ): PreparedCatalogFood => {
+        const one = soundRecord();
+        const evidence: Record<string, unknown> = { ...one.evidence, ...overrides };
+        for (const field of remove) {
+            delete evidence[field];
+        }
+        return { ...one, evidence: evidence as PreparedCatalogFood['evidence'] };
+    };
+
+    const verdictFor = (one: PreparedCatalogFood) => validateCatalogCandidate(one.candidate, policy);
+
+    it('writes a candidate when every mandatory field is present and usable', async () => {
+        const one = soundRecord();
+        const assessment = importEvidenceAssessment(one);
+
+        expect(evidenceGapCodes(assessment)).toEqual([]);
+        expect(assessment.complete).toBe(true);
+        expect(assessment.status).toBe(200);
+        expect(assessment.finalHost).toBe('api.nal.usda.gov');
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('candidate');
+    });
+
+    /**
+     * Every mandatory field of a USDA retrieval record (AAP §0.3.2), one per
+     * case. A USDA row is asked for two fields a generated row is not — the
+     * `usda_api_cache` key and the digest of its own record inside that payload
+     * — because that is what makes one batch response evidence for one food
+     * rather than for the twenty it carried.
+     */
+    it.each([
+        ['url', 'url', 'retrieval_url_missing'],
+        ['final_host', 'final_host', 'retrieval_host_missing'],
+        ['http_status', 'http_status', 'retrieval_status_missing'],
+        ['body_sha256', 'body_sha256', 'retrieval_body_digest_missing'],
+        ['record_sha256', 'record_sha256', 'retrieval_record_digest_missing'],
+        ['source_cache_key', 'source_cache_key', 'retrieval_source_cache_key_missing'],
+        ['matched_snippet', 'matched_snippet', 'retrieval_snippet_missing'],
+        ['fetched_at', 'fetched_at', 'retrieval_time_missing'],
+    ])('quarantines a record with no %s', (_what, field, code) => {
+        const one = withEvidence({}, [field]);
+
+        expect(evidenceGapCodes(importEvidenceAssessment(one))).toEqual([code]);
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('quarantined');
+    });
+
+    it.each([
+        ['a blank url', { url: '   ' }, 'retrieval_url_missing'],
+        ['a blank host', { final_host: '' }, 'retrieval_host_missing'],
+        ['a truncated body digest', { body_sha256: 'abc123' }, 'retrieval_body_digest_missing'],
+        ['a non-hex record digest', { record_sha256: 'z'.repeat(64) }, 'retrieval_record_digest_missing'],
+        ['a blank cache key', { source_cache_key: '  ' }, 'retrieval_source_cache_key_missing'],
+        ['a blank snippet', { matched_snippet: '' }, 'retrieval_snippet_missing'],
+        ['an unparseable retrieval time', { fetched_at: 'soon' }, 'retrieval_time_invalid'],
+        ['a retrieval time that is not a real day', { fetched_at: '2026-02-31T00:00:00Z' }, 'retrieval_time_invalid'],
+    ])('quarantines a record carrying %s, which a presence check would pass', (_what, overrides, code) => {
+        const one = withEvidence(overrides);
+
+        expect(evidenceGapCodes(importEvidenceAssessment(one))).toEqual([code]);
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('quarantined');
+    });
+
+    it.each([
+        ['a client error', 404],
+        ['a server error', 503],
+        ['a redirect', 302],
+    ])('quarantines a record whose retrieval answered %s, not just a null one', (_what, status) => {
+        // The gap the old one-field check could not see at all: the status was
+        // PRESENT, so `retrievalStatusMissing` was false and the record was
+        // written as a candidate — while the exporter and the loader both
+        // refuse it as `retrieval_status_invalid`.
+        const one = withEvidence({ http_status: status });
+
+        expect(evidenceGapCodes(importEvidenceAssessment(one))).toEqual(['retrieval_status_invalid']);
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('quarantined');
+    });
+
+    it('reads a record written in camelCase, which is the other stage\'s spelling', () => {
+        // `evidence.service.ts` writes camelCase and this stage writes
+        // snake_case; both are evidence, and the shared floor reads either. A
+        // record spelled the other way must therefore be judged complete, or
+        // the predicate would quarantine a sound record for its spelling.
+        const one = withEvidence(
+            {
+                finalHost: 'api.nal.usda.gov',
+                status: 200,
+                bodySha256: 'd'.repeat(64),
+                recordSha256: 'e'.repeat(64),
+                sourceCacheKey: 'POST /foods?#{"fdcIds":[1],"format":"full"}',
+                matchedSnippet: 'Carrots, raw',
+                fetchedAt: fetchedAt.toISOString(),
+            },
+            [
+                'final_host',
+                'http_status',
+                'body_sha256',
+                'record_sha256',
+                'source_cache_key',
+                'matched_snippet',
+                'fetched_at',
+            ],
+        );
+
+        expect(evidenceGapCodes(importEvidenceAssessment(one))).toEqual([]);
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('candidate');
+    });
+
+    it('holds a record whose two spellings of one field disagree, rather than picking one', () => {
+        // Neither value can be trusted once they disagree: a reader that took
+        // the first spelling it found would publish a row on a status the other
+        // half of the record contradicts.
+        const one = withEvidence({ status: 500 });
+
+        const assessment = importEvidenceAssessment(one);
+        expect(evidenceGapCodes(assessment)).toEqual(['evidence_malformed']);
+        expect(assessment.gaps[0].field).toBe('http_status/status');
+        expect(assessment.gaps[0].observed).toContain('http_status=200');
+        expect(assessment.gaps[0].observed).toContain('status=500');
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('quarantined');
+    });
+
+    it('accepts two spellings that agree, so a doubly-spelled record is not punished', () => {
+        const one = withEvidence({ status: 200 });
+
+        expect(evidenceGapCodes(importEvidenceAssessment(one))).toEqual([]);
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('candidate');
+    });
+
+    it('reports every gap of a record that is short of several fields', () => {
+        // One entry per gap, because the repairs differ: a missing digest needs
+        // the retrieval re-made, an unparseable time needs the clock that wrote
+        // it looked at. A single "evidence incomplete" would name neither.
+        const one = withEvidence({ fetched_at: '2026' }, ['body_sha256', 'matched_snippet']);
+
+        expect(evidenceGapCodes(importEvidenceAssessment(one))).toEqual([
+            'retrieval_body_digest_missing',
+            'retrieval_snippet_missing',
+            'retrieval_time_invalid',
+        ]);
+        expect(importPublicationStatus(one, verdictFor(one))).toBe('quarantined');
+    });
+
+    it('names the status gap under the key the report has always used', () => {
+        // The one name an operator greps for does not change; every other gap
+        // is reported under its own code behind the same prefix, so two records
+        // held for different reasons are never one count.
+        expect(importEvidenceCheckName('retrieval_status_missing')).toBe(IMPORT_CHECK_MISSING_RETRIEVAL_STATUS);
+        expect(importEvidenceCheckName('retrieval_status_invalid')).toBe(
+            `${IMPORT_CHECK_MISSING_RETRIEVAL_STATUS}:retrieval_status_invalid`,
+        );
+        expect(importEvidenceCheckName('retrieval_time_invalid')).toBe(
+            `${IMPORT_CHECK_MISSING_RETRIEVAL_STATUS}:retrieval_time_invalid`,
+        );
+    });
+
+    it('does not publish, whatever the evidence says, which is what this stage is for', () => {
+        // The honest bound on this whole block: a sound record becomes a
+        // CANDIDATE and not a published row, because publication needs the
+        // cross-table duplicate check only `catalog:validate` can make. The
+        // floor here holds bad records at the stage that produced them; it does
+        // not, and must not, promote good ones.
+        const one = soundRecord();
+        const verdict = verdictFor(one);
+
+        expect(verdict.publicationStatus).toBe('published');
+        expect(importPublicationStatus(one, verdict)).toBe('candidate');
+    });
+});
+
+
+/**
  * The cache-key scheme the manifest documents and the one the import writes are
- * one scheme or the provenance is unverifiable (w012-F35).
+ * one scheme or the provenance is unverifiable.
  *
  * The manifest used to describe `source_cache_key` as `/food/<fdcId>?format=full`
  * while every row carried the batch key of a `POST /foods` response. Nothing
@@ -1373,7 +1614,7 @@ describe('identity evidence records the retrieval that happened (w043-F06)', () 
  * following the documented key would look for a `usda_api_cache` row that has
  * never existed, because this pipeline makes no per-food detail request at all.
  */
-describe('the documented source_cache_key scheme is the one the import writes (w012-F35)', () => {
+describe('the documented source_cache_key scheme is the one the import writes', () => {
     const declared = (manifest as unknown as { sweepNamingPolicy: { sourceCacheKeyScheme?: unknown } })
         .sweepNamingPolicy.sourceCacheKeyScheme;
 
@@ -1415,14 +1656,14 @@ describe('the documented source_cache_key scheme is the one the import writes (w
 });
 
 /**
- * One batch fetch carries its own provenance (w012-F12).
+ * One batch fetch carries its own provenance.
  *
  * `toBatchRetrieval` is the only place the vendor client's vocabulary becomes
  * the vocabulary the evidence records publish, and it is pure — so the mapping
  * that decides `retrieval_source`, `cachedAt` and the digest is asserted with
  * no fetch, no cache and no clock.
  */
-describe('the retrieval facts a batch fetch reports (w012-F12)', () => {
+describe('the retrieval facts a batch fetch reports', () => {
     const payload = { foods: [{ fdcId: 1, description: 'Beans' }] };
 
     it('maps a live fetch to import_run, with this run having no vendor timestamp', () => {
@@ -1487,13 +1728,13 @@ describe('the retrieval facts a batch fetch reports (w012-F12)', () => {
 });
 
 /**
- * The count set an invocation starts from (w012-F04).
+ * The count set an invocation starts from.
  *
  * `initialImportCounts` is the one shape both the working path and the
  * already-completed path report, which is what keeps a no-op invocation's
  * counts a zeroed version of the real ones rather than a different set of keys.
  */
-describe('the counts an invocation starts from (w012-F04)', () => {
+describe('the counts an invocation starts from', () => {
     const planOf = (assignments: number, skipped: Record<string, number>) =>
         ({ assignments: new Map(Array.from({ length: assignments }, (_, index) => [index, index])), skipped }) as never;
 
@@ -1509,7 +1750,7 @@ describe('the counts an invocation starts from (w012-F04)', () => {
             rejected: 0,
             missingFromVendor: 0,
             // The durable batch counter is part of the shape: it is raised as
-            // the run goes rather than at the end (SCRBLD-F02), so leaving it
+            // the run goes rather than at the end, so leaving it
             // out gave an already-completed scope a counts object one key
             // shorter than the working path's — the very drift this shape
             // exists to prevent.
@@ -1520,13 +1761,13 @@ describe('the counts an invocation starts from (w012-F04)', () => {
 });
 
 /**
- * Preflight states the ceiling an operator can actually set (w012-F03).
+ * Preflight states the ceiling an operator can actually set.
  *
  * The remedy used to read "between 1 and 1000", which is the vendor's cap and
  * not this import's: an operator who followed it landed on a value the limiter
  * refuses at startup.
  */
-describe('the rate-limit prerequisite names the import ceiling (w012-F03)', () => {
+describe('the rate-limit prerequisite names the import ceiling', () => {
     const preflightDeps = (env: NodeJS.ProcessEnv): Parameters<typeof preflight>[0] => ({
         env: { USDA_API_KEY: 'test-key', ...env },
         loadUsdaManifest,
@@ -1784,33 +2025,34 @@ describe('--limit is one budget over the whole work list (N03)', () => {
 });
 
 /**
- * WHERE A SWEEP STOPS, AND WHY (SCRBLD-F16, SCRBLD-F17, SCRBLD-F31).
+ * WHERE A SWEEP STOPS, AND WHY.
  *
  * Three defects in one loop, each of which ends a sweep in the wrong place.
  *
- * F16: the bound was `min(maxPages, observedLastNonEmptyPage)`.
- * `observedLastNonEmptyPage` is a MEASUREMENT with an `observedOn` date beside
- * it, and using it as a bound turns it into a permanent ceiling — USDA adds
- * records to these datasets, and every record past the page someone measured
- * once would never be imported, with nothing in the output saying so because
- * the sweep ends normally. `maxPages` is the backstop the document says it is,
- * the measurement is an expectation, and exceeding it is reported as growth.
+ * THE PERMANENT PAGE CEILING: the bound was
+ * `min(maxPages, observedLastNonEmptyPage)`. `observedLastNonEmptyPage` is a
+ * MEASUREMENT with an `observedOn` date beside it, and using it as a bound
+ * turns it into a permanent ceiling — USDA adds records to these datasets, and
+ * every record past the page someone measured once would never be imported,
+ * with nothing in the output saying so because the sweep ends normally.
+ * `maxPages` is the backstop the document says it is, the measurement is an
+ * expectation, and exceeding it is reported as growth.
  *
- * F17: `stopWhenCategoryCandidateVolumeReached` was declared on all three
- * sweeps and read by nothing. Records past a category's `candidateVolume` cost
- * requests from a 900/hour budget the other categories need, and overfill the
- * category — which then publishes past the plan's target and reports a
- * shortfall against a number it has already passed.
+ * THE UNREAD CATEGORY STOP: `stopWhenCategoryCandidateVolumeReached` was
+ * declared on all three sweeps and read by nothing. Records past a category's
+ * `candidateVolume` cost requests from a 900/hour budget the other categories
+ * need, and overfill the category — which then publishes past the plan's target
+ * and reports a shortfall against a number it has already passed.
  *
- * F31: a curated entry the plan could not resolve was counted into
- * `skippedUnresolvedEntry` and stepped over, so reviewed curation was dropped
- * from the catalog and said so only in a counter nobody reads.
+ * THE DROPPED CURATION: a curated entry the plan could not resolve was counted
+ * into `skippedUnresolvedEntry` and stepped over, so reviewed curation was
+ * dropped from the catalog and said so only in a counter nobody reads.
  *
  * These cases drive `buildImportPlan` directly with a fake listing, so the page
  * numbers requested and the counters returned are both observable and no
  * request is made.
  */
-describe('where a sweep stops, and why (SCRBLD-F16, SCRBLD-F17, SCRBLD-F31)', () => {
+describe('where a sweep stops, and why', () => {
     /** The sweep the committed document measured furthest: maxPages 50, observed 39. */
     const sweep = manifest.datasetSweeps.find((candidate) => candidate.maxPages > candidate.pageSize / 10);
 
@@ -1863,7 +2105,7 @@ describe('where a sweep stops, and why (SCRBLD-F16, SCRBLD-F17, SCRBLD-F31)', ()
         }
     });
 
-    it('imports the pages a grown dataset added past the measurement (SCRBLD-F16)', async () => {
+    it('imports the pages a grown dataset added past the measurement', async () => {
         // The dataset now holds five pages; the document measured two. The old
         // bound stopped at two and silently dropped pages three to five.
         const listing = pagedListing(5, 3);
@@ -1940,7 +2182,7 @@ describe('where a sweep stops, and why (SCRBLD-F16, SCRBLD-F17, SCRBLD-F31)', ()
         categories: coveragePlan.categories.map((row) => ({ ...row, candidateVolume: volume })),
     });
 
-    it('stops a sweep once every category it can file under is full (SCRBLD-F17)', async () => {
+    it('stops a sweep once every category it can file under is full', async () => {
         const listing = pagedListing(10, 4);
         const logged: { event: string; fields: Record<string, unknown> }[] = [];
         const recordingLogger: ScriptLogger = {
@@ -2004,7 +2246,7 @@ describe('where a sweep stops, and why (SCRBLD-F16, SCRBLD-F17, SCRBLD-F31)', ()
         expect(plan.skipped.skippedCategoryVolumeReached).toBe(0);
     });
 
-    it('refuses a curated entry with no verified id instead of skipping it (SCRBLD-F31)', async () => {
+    it('refuses a curated entry with no verified id instead of skipping it', async () => {
         // A hand-built manifest object is the only way to reach this now — the
         // loader refuses such a document — and refusing is still the right
         // answer, because the alternative was dropping reviewed curation into a
@@ -2072,7 +2314,15 @@ describe('describeFailure', () => {
         const described = describeFailure(usdaError('USDA returned 403'));
 
         expect(described.code).toBe('usda_request_failed');
-        expect(described.error).toEqual({ name: 'UsdaError', message: 'USDA returned 403' });
+        // The NAME and the code, and no `message`. The vendor's sentence is not
+        // reported at all: `describeFailure` feeds the durable run log and the
+        // operator console, and a message from USDA's edge is prose this stage
+        // did not author — it can quote a request URL carrying `api_key`, or a
+        // fragment of an error document. `usda_request_failed` is what an
+        // operator acts on (re-run with `--resume`), and the status the vendor
+        // set arrives as a field when the error carries one.
+        expect(described.error).toEqual({ name: 'UsdaError' });
+        expect(described.error).not.toHaveProperty('message');
     });
 
     it('reports a vendor timeout under the same code', () => {
@@ -2092,6 +2342,92 @@ describe('describeFailure', () => {
 
     it('reports a non-Error value without throwing', () => {
         expect(describeFailure('something went wrong').code).toBe('unexpected_error');
+    });
+
+    /**
+     * THE REALM CASE, which is the one that actually bites this stage.
+     *
+     * `safeError` carries a closed field set and no `message`, so `code` is the
+     * only thing left that tells an operator WHAT went wrong at the filesystem
+     * — `ENOENT` versus `EACCES` versus `EISDIR` are three different remedies.
+     * An `instanceof Error` check answers `false` for an error thrown by a core
+     * module into a Jest sandbox (the sandbox has its own intrinsics; `fs` does
+     * not), which would silently report every one of them as a bare
+     * `UnknownError` and make the loss invisible to every suite in this folder.
+     *
+     * Driven with a REAL `fs` failure rather than a constructed cross-realm
+     * double, because the realm boundary is the thing under test and a double
+     * built in this file is in this file's realm by construction.
+     */
+    it('reports the machine code of a core-module failure, across the realm boundary', () => {
+        let thrown: unknown;
+        try {
+            fs.readFileSync(path.join(os.tmpdir(), 'soh-no-such-file-2c4f9a1b', 'absent.json'));
+        } catch (error) {
+            thrown = error;
+        }
+
+        // The precondition, asserted so this case cannot quietly stop testing
+        // what it is about: if `fs` ever starts throwing same-realm errors here,
+        // this line fails and the case is re-read rather than passing vacuously.
+        expect(thrown instanceof Error).toBe(false);
+        expect(Object.prototype.toString.call(thrown)).toBe('[object Error]');
+
+        const described = describeFailure(thrown);
+
+        expect(described.code).toBe('unexpected_error');
+        expect(described.error.name).toBe('Error');
+        expect(described.error.code).toBe('ENOENT');
+        // And still no prose: the path `fs` quoted in its message is exactly
+        // the kind of disclosure the closed field set exists to prevent.
+        expect(described.error).not.toHaveProperty('message');
+        expect(JSON.stringify(described)).not.toContain('absent.json');
+    });
+
+    /**
+     * THE HOSTILE-VALUE CASE, and why a logging path must be total.
+     *
+     * Classifying a thrown value across realms means inspecting it, and neither
+     * inspection is safe on an arbitrary value: `Object.prototype.toString.call`
+     * READS `Symbol.toStringTag`, and `instanceof` invokes
+     * `Error[Symbol.hasInstance]` and walks the prototype chain. `throw` accepts
+     * any value, so both can be made to throw.
+     *
+     * This matters far beyond the odd input, because `describeFailure` runs in
+     * the top-level catch and the run finalizer: an exception raised WHILE
+     * describing a failure replaces the failure being reported and suppresses
+     * the refusal, so the stage would exit with no usable account of why. The
+     * two values below are the two ways to provoke it.
+     */
+    it.each([
+        [
+            'a value whose Symbol.toStringTag getter throws',
+            (): unknown => ({
+                get [Symbol.toStringTag](): string {
+                    throw new Error('tag getter ran');
+                },
+            }),
+        ],
+        [
+            'a proxy whose getPrototypeOf trap throws',
+            (): unknown =>
+                new Proxy(
+                    {},
+                    {
+                        getPrototypeOf(): object {
+                            throw new Error('trap ran');
+                        },
+                    },
+                ),
+        ],
+    ])('describes %s without throwing, as a value it could not classify', (_label, build) => {
+        const hostile = build();
+
+        const described = describeFailure(hostile);
+
+        expect(described.code).toBe('unexpected_error');
+        expect(described.error.name).toBe('UnknownError');
+        expect(described.error).not.toHaveProperty('message');
     });
 
     it('reports the stage’s own error under the code it carries', () => {
@@ -2206,7 +2542,8 @@ describe('a vendor failure leaves this stage as its own error (§9)', () => {
             // Dry run so the failure is reached without a database: the plan
             // pass is where `listFoods` is called, and it runs before any
             // claim. The batch case is proven against the real client in the
-            // DB-F11 cases, which now assert the failed closure too.
+            // durable batch-ledger cases below, which assert the failed closure
+            // too.
             options: options({ dryRun: true }),
             logger: silentLogger,
             now: () => new Date('2026-09-13T11:00:00.000Z'),
@@ -2463,7 +2800,7 @@ describe('the import report states what the run measured (§0.7.3)', () => {
 
         // The block used to carry a sentence saying nobody counted these,
         // which stopped being true once the limiter read each response's
-        // status at the transport (w012-F07).
+        // status at the transport.
         expect(block).not.toHaveProperty('statusClassCountsUnavailable');
         expect(block.statusClassCounts).toEqual(measuredStats().statusClassCounts);
         expect(block.transportFailures).toBe(1);
@@ -2657,7 +2994,7 @@ describe('the measured half of the import report (§0.7.3)', () => {
         expect(quarantined.listLimit).toBeGreaterThan(0);
     });
 
-    it('is bound for the canonical artefact, because a real run measured rows it wrote (SCRBLD-F38)', async () => {
+    it('is bound for the canonical artefact, because a real run measured rows it wrote', async () => {
         const report = await runAndReadReport();
 
         // The counterpart of the dry-run routing above: this run claimed a run
@@ -2961,7 +3298,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
 });
 
 /**
- * THE ARTEFACT PUBLICATION HELPER (OBSEV-F04, SCRBLD-F39, SCRBLD-F24).
+ * THE ARTEFACT PUBLICATION HELPER.
  *
  * Every report this pipeline commits — the import report, the validation
  * report, the benchmark report, the recipe coverage report — is written through
@@ -2971,7 +3308,7 @@ describe('writeImportReport merges into the sibling artefact (§0.7.3)', () => {
  * holding when a publication is interrupted — precisely the thing a stubbed
  * `fs` would assume instead of prove.
  */
-describe('the artefact publication helper every report stage writes through (OBSEV-F04)', () => {
+describe('the artefact publication helper every report stage writes through', () => {
     let workspace: string;
 
     beforeEach(() => {
@@ -3253,7 +3590,7 @@ describe('the artefact publication helper every report stage writes through (OBS
 });
 
 /**
- * THE FAILURE PATHS OF PUBLICATION (SCRBLD-F24, SCRBLD-F39, NEW-F02).
+ * THE FAILURE PATHS OF PUBLICATION.
  *
  * The happy path proves the artefacts appear; only these prove they cannot
  * appear half-replaced. Each test drives a real filesystem and forces the exact
@@ -3283,7 +3620,7 @@ describe('publication under failure, contention and attack', () => {
 
     const visibleEntries = (): string[] => fs.readdirSync(workspace).sort();
 
-    describe('a failure part-way through promoting the set (SCRBLD-F24)', () => {
+    describe('a failure part-way through promoting the set', () => {
         it('rolls the whole set back, so no mixed generation is ever addressable', () => {
             const staged = [
                 stageJsonArtifact(validationPath, { generation: 2 }),
@@ -3367,7 +3704,7 @@ describe('publication under failure, contention and attack', () => {
         });
     });
 
-    describe('a publication a process was killed in the middle of (SCRBLD-F24)', () => {
+    describe('a publication a process was killed in the middle of', () => {
         // Reproduces the on-disk state a crash between the two renames leaves:
         // the journal, one artefact's previous content moved to its backup, and
         // the new document already in its place.
@@ -3420,7 +3757,7 @@ describe('publication under failure, contention and attack', () => {
         });
     });
 
-    describe('the publication lock under contention (SCRBLD-F39)', () => {
+    describe('the publication lock under contention', () => {
         it('makes two callers of one physical directory contend, even through a symlink', () => {
             // `path.resolve` leaves symlinks alone, so keying the lock on the
             // spelling let an `--out <symlink>` run publish beside the committed
@@ -3513,7 +3850,7 @@ describe('publication under failure, contention and attack', () => {
         });
     });
 
-    describe('a pre-placed staging path (NEW-F02, CWE-59)', () => {
+    describe('a pre-placed staging path (CWE-59)', () => {
         it('refuses to write through a symlink left at the staging name', () => {
             // `--out` accepts any directory, so on a shared one another local
             // principal can pre-place the staging name. Exclusive creation is
@@ -3545,7 +3882,7 @@ describe('publication under failure, contention and attack', () => {
         });
     });
 
-    describe('the streamed staged document (SCRBLD-F24)', () => {
+    describe('the streamed staged document', () => {
         it('is flushed to disk before it becomes promotable', async () => {
             // `end()` flushes to the OS, not the disk, and the completeness check
             // reads the document's tail — so without this the check could pass on
@@ -3583,7 +3920,7 @@ describe('publication under failure, contention and attack', () => {
 });
 
 /**
- * THE CROSS-STAGE REPORT MERGE (SCRBLD-F44).
+ * THE CROSS-STAGE REPORT MERGE.
  *
  * `import-report.json` is written by three stages, and the two kinds of key in
  * it merge differently: a stage-private key is replaced by its owner, and a
@@ -3591,7 +3928,7 @@ describe('publication under failure, contention and attack', () => {
  * place, used by all three writers — because a second copy of the rule is a
  * second rule that can drift from it while still looking right.
  */
-describe('the cross-stage report merge (SCRBLD-F44)', () => {
+describe('the cross-stage report merge', () => {
     const policy = { noteKey: 'importStageWrite', stage: 'catalog-import-usda' } as const;
 
     it('declares the blocks that are co-written, so all three writers share one list', () => {
@@ -3599,18 +3936,18 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
     });
 
     // A provisional marker is placed by hand on a committed artefact that predates
-    // these producers (OBSEV-F05), so a reader cannot mistake it for evidence of
+    // these producers, so a reader cannot mistake it for evidence of
     // them. A measured write IS evidence of its own run, so the marker has to be
     // self-clearing: were it preserved like any other sibling key, a freshly
     // regenerated artefact would declare itself stale, which is the same untruth
     // the marker exists to correct.
-    it('declares the provisional markers and the per-stage obligation field (OBSEV-F05)', () => {
+    it('declares the provisional markers and the per-stage obligation field', () => {
         expect(PROVISIONAL_REPORT_MARKER_KEYS).toEqual(['staleness']);
         expect(FRESHNESS_OBLIGATIONS_FIELD).toBe('outstandingStages');
     });
 
     // Freshness is per stage because the artefact is co-written. The failure this
-    // guards against (NEW-F01) is a stage that owes nothing clearing a warning
+    // guards against is a stage that owes nothing clearing a warning
     // about sections it never measured.
     const staleMarker = (stages: readonly string[]): Record<string, unknown> => ({
         staleness: { status: 'stale_relative_to_producers', outstandingStages: [...stages] },
@@ -3618,7 +3955,7 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
         requirement: { fromReportStage: true },
     });
 
-    it('discharges only the writing stage\'s own freshness obligation (NEW-F01)', () => {
+    it('discharges only the writing stage\'s own freshness obligation', () => {
         const merge = mergeStageReport(
             staleMarker(['catalog-import-usda', 'catalog-report']),
             { counts: { inserted: 20 } },
@@ -3634,7 +3971,7 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
         expect(note.clearedProvisionalMarkers).toEqual([]);
     });
 
-    it('removes the marker only once the last obligation is discharged (NEW-F01)', () => {
+    it('removes the marker only once the last obligation is discharged', () => {
         const afterImport = mergeStageReport(
             staleMarker(['catalog-import-usda', 'catalog-report']),
             { counts: { inserted: 20 } },
@@ -3652,7 +3989,7 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
         expect(note.outstandingFreshnessObligations).toEqual([]);
     });
 
-    it('lets a generation-only write clear nothing at all (NEW-F01)', () => {
+    it('lets a generation-only write clear nothing at all', () => {
         const merge = mergeStageReport(
             staleMarker(['catalog-import-usda', 'catalog-report']),
             { aiGenerationCounts: { generated: 3 } },
@@ -3671,7 +4008,7 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
         expect(note.clearedProvisionalMarkers).toEqual([]);
     });
 
-    it('discharges the validate obligation on the validation artefact (NEW-F01)', () => {
+    it('discharges the validate obligation on the validation artefact', () => {
         const merge = mergeStageReport(
             staleMarker(['catalog-validate', 'catalog-report']),
             { counts: { published: 11046 } },
@@ -3683,7 +4020,7 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
         expect(note.dischargedFreshnessObligation).toBe('catalog-validate');
     });
 
-    it('leaves a marker with no usable obligation list alone (NEW-F01)', () => {
+    it('leaves a marker with no usable obligation list alone', () => {
         // Conservative direction: an unusable list cannot say whose sections are
         // stale, and clearing a warning is the unrecoverable mistake.
         const merge = mergeStageReport(
@@ -3830,7 +4167,7 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
 });
 
 /**
- * WHERE A DRY RUN WRITES ITS REPORT (SCRBLD-F38).
+ * WHERE A DRY RUN WRITES ITS REPORT.
  *
  * A dry run measures what a real run WOULD do: it opens no run row, writes no
  * cursor, claims no completion and writes no catalog row. Its report is
@@ -3839,7 +4176,7 @@ describe('the cross-stage report merge (SCRBLD-F44)', () => {
  * figures with hypothetical ones, under no stage lock, and the file would give
  * a reviewer no way to tell which it was reading.
  */
-describe('where a dry run writes its report (SCRBLD-F38)', () => {
+describe('where a dry run writes its report', () => {
     it('names exactly two destinations, so the routing cannot fall through to a default', () => {
         expect([...IMPORT_REPORT_DESTINATIONS]).toEqual(['canonical', 'dry_run_preview']);
     });
@@ -3907,7 +4244,7 @@ describe('where a dry run writes its report (SCRBLD-F38)', () => {
 });
 
 /**
- * THE TWO REFUSAL TIERS, COUNTED APART (SCRBLD-F25).
+ * THE TWO REFUSAL TIERS, COUNTED APART.
  *
  * `quarantined` and `rejected` are different `publication_status` values with
  * different futures: a quarantined record is held until more data arrives and
@@ -3915,7 +4252,7 @@ describe('where a dry run writes its report (SCRBLD-F38)', () => {
  * check and is never publishable. Summing them overstates what a later pass
  * can recover, and listing them together makes the shortfall unreadable.
  */
-describe('the refusal tiers the import report states separately (SCRBLD-F25)', () => {
+describe('the refusal tiers the import report states separately', () => {
     const refusal = (sourceKey: string, publicationStatus: string, check: string): QuarantinedRecord => ({
         sourceKey,
         fdcId: Number(sourceKey.split(':')[1]),
@@ -4019,7 +4356,7 @@ describe('the refusal tiers the import report states separately (SCRBLD-F25)', (
 });
 
 /**
- * THE FIGURES A RESUMED RUN CARRIES (SCRBLD-F02).
+ * THE FIGURES A RESUMED RUN CARRIES.
  *
  * An import is resumable: the cursor names the batch to continue from, and the
  * upserts make a re-processed batch a no-op. Every report dimension, though, is
@@ -4029,7 +4366,7 @@ describe('the refusal tiers the import report states separately (SCRBLD-F25)', (
  * report states carried plus this attempt along with the basis it was arrived
  * at by.
  */
-describe('the report figures a resumed run carries (SCRBLD-F02)', () => {
+describe('the report figures a resumed run carries', () => {
     const snapshot = (overrides: Partial<ImportReportSnapshot> = {}): ImportReportSnapshot => ({
         attempts: 1,
         throughBatchIndex: 5,
@@ -4181,8 +4518,7 @@ describe('the report figures a resumed run carries (SCRBLD-F02)', () => {
 });
 
 /**
- * CATALOG-REPORT PUBLISHES ITS PAIR OR NOTHING (SCRBLD-F24, SCRBLD-F10,
- * SCRBLD-F11).
+ * CATALOG-REPORT PUBLISHES ITS PAIR OR NOTHING.
  *
  * The two evidence artefacts are only evidence together: the aggregate figures
  * in `import-report.json` are reconciled against the per-item records in
@@ -4195,7 +4531,7 @@ describe('the report figures a resumed run carries (SCRBLD-F02)', () => {
  * temporary directory and a fake `catalog_foods` reader, because what is under
  * test is what the filesystem holds afterwards.
  */
-describe('catalog-report publishes its pair or nothing (SCRBLD-F24, SCRBLD-F10)', () => {
+describe('catalog-report publishes its pair or nothing', () => {
     const evidenceAllowlist = loadEvidenceAllowlist();
     const reportedCategory = coveragePlan.categories[0].category;
 
@@ -4502,7 +4838,7 @@ describe('catalog-report publishes its pair or nothing (SCRBLD-F24, SCRBLD-F10)'
 });
 
 /**
- * A SCOPED REPORT CANNOT LAND ON THE COMMITTED ARTEFACTS (SCRBLD-F11).
+ * A SCOPED REPORT CANNOT LAND ON THE COMMITTED ARTEFACTS.
  *
  * `--category` measures one category: its coverage, requirement, shortfall and
  * per-item records cover that category alone. Written to the committed paths
@@ -4512,7 +4848,7 @@ describe('catalog-report publishes its pair or nothing (SCRBLD-F24, SCRBLD-F10)'
  * whether the flag was given: omitting `--out` and passing the committed
  * directory as `--out` produce the same artefacts in the same place.
  */
-describe('a scoped report cannot land on the committed artefacts (SCRBLD-F11)', () => {
+describe('a scoped report cannot land on the committed artefacts', () => {
     const canonical = path.join('/repo', 'data', 'meal-planning', 'reports', 'latest');
 
     const refusalFor = (out: string | null, resolvedOutDir: string): string | null =>
@@ -4818,14 +5154,17 @@ describe('the redaction contract of the script logger', () => {
     });
 
     describe('scrubSecrets — linear time on adversarial input', () => {
-        // The rule this file replaced was a regex, and a regex form of it either
-        // rescans from every offset (measured in the module's own comments at
-        // 19,758 ms for an unbounded scheme body on this length) or pays ~60 ms for
-        // one global pass. The scan measures single-digit milliseconds on all three
-        // inputs below. The assertion is deliberately two orders of magnitude
-        // looser than the measurement so a loaded CI runner cannot make it flap
-        // while a return to a rescanning form — seconds, not milliseconds — still
-        // fails it.
+        // The rule this file replaced was a regex, and a regex form of it
+        // rescans from every offset when its scheme body is unbounded — work
+        // quadratic in the input length, where the hand-written scan below is
+        // one linear pass. THIS ASSERTION IS THE EVIDENCE for that claim, and
+        // it is deliberately the only form of it here: no wall-clock figure is
+        // quoted, because a millisecond count is a property of the runner that
+        // produced it and reads as a guarantee on every other runner. The
+        // budget is set orders of magnitude above what a linear pass needs, so
+        // a loaded CI worker cannot make it flap, while a return to a
+        // rescanning form — whose cost grows with the square of LENGTH — fails
+        // it on any machine.
         const BUDGET_MS = 2_000;
         const LENGTH = 200_000;
 
@@ -4873,13 +5212,30 @@ describe('the redaction contract of the script logger', () => {
             expectNoCredentialFragment(JSON.stringify(sanitized));
         });
 
-        it('scrubs a DSN quoted by an error message', () => {
+        it('withholds an error message entirely, so a DSN it quotes cannot reach a log', () => {
             const rendered = safeError(new Error(`connect failed for ${DSN_WITH_AT_IN_PASSWORD}`));
 
-            expect(rendered).toEqual({ name: 'Error', message: `connect failed for ${DSN_REDACTED}` });
+            // STRONGER than scrubbing it: the message is not carried, so this
+            // route to a log line does not exist for ANY prose the error holds
+            // — a DSN the scrub rules match, and equally one they do not.
+            expect(rendered).toEqual({ name: 'Error' });
+            expect(rendered).not.toHaveProperty('message');
             // The rendered VALUES, not a serialization of them: the field name
             // `message` itself contains the two-character fragment `ss`.
-            expectNoCredentialFragment(`${rendered.name} ${rendered.message}`);
+            expectNoCredentialFragment(rendered.name);
+        });
+
+        it('still scrubs a DSN held by the one field it does carry', () => {
+            // The name is attacker-reachable too: a vendor SDK or a wrapped
+            // error can set it, so the field that survives is scrubbed rather
+            // than trusted.
+            const error = new Error('opening the connection failed');
+            error.name = `Error at ${DSN_WITH_AT_IN_PASSWORD}`;
+
+            const rendered = safeError(error);
+
+            expect(rendered.name).toContain(DSN_REDACTED);
+            expectNoCredentialFragment(rendered.name);
         });
 
         it('scrubs a DSN on its way to a serialized log line', () => {
@@ -6895,7 +7251,7 @@ main().then(
                 // 901-1,000 is legal for USDA and illegal here: the top 100/hour
                 // are the running API's share of the same key (AAP §0.7.1
                 // Group 1), so accepting them would remove the headroom this
-                // number exists to reserve (w012-F29 / w012-F03).
+                // number exists to reserve.
                 for (const raw of [
                     '0',
                     '-1',
@@ -6994,7 +7350,7 @@ main().then(
         });
 
         // -----------------------------------------------------------------------
-        // The status split the release request ledger quotes (w012-F07).
+        // The status split the release request ledger quotes.
         //
         // Two things needed direct cover. `usdaStatusClass` is a pure branching
         // rule whose boundaries decide what an operator reads about a run: 400,
@@ -7242,7 +7598,7 @@ main().then(
 });
 
 /**
- * THE TWO VERSION COUNTERS ON A CATALOG FOOD (DB-F08).
+ * THE TWO VERSION COUNTERS ON A CATALOG FOOD.
  *
  * `recipe_ingredients` freezes `snapshot_per_100g`, `snapshot_name`,
  * `snapshot_provenance`, `snapshot_allergen_tags` and `snapshot_diet_tags`
@@ -7283,7 +7639,7 @@ const versionedFacts = (overrides: Partial<StoredVersionedFacts> = {}): StoredVe
     ...overrides,
 });
 
-describe('nextCatalogFoodVersions (DB-F08)', () => {
+describe('nextCatalogFoodVersions', () => {
     it('starts a new source_key at 1 on both counters', () => {
         expect(nextCatalogFoodVersions(null, versionedFacts())).toEqual({
             nutritionVersion: 1,
@@ -7415,7 +7771,7 @@ describe('nextCatalogFoodVersions (DB-F08)', () => {
     });
 });
 
-describe('persistPreparedFood writes the counters the comparison decided (DB-F08)', () => {
+describe('persistPreparedFood writes the counters the comparison decided', () => {
     const policy: CatalogValidationPolicy = {
         categories: coveragePlan.categories,
         validationBounds: coveragePlan.validationBounds,
@@ -7525,7 +7881,7 @@ describe('persistPreparedFood writes the counters the comparison decided (DB-F08
 
     /**
      * A record whose retrieval carried no observed HTTP status is held, however
-     * clean its nutrient checks are (w012-F12).
+     * clean its nutrient checks are.
      *
      * The status is a mandatory field of a retrieval record (AAP §0.3.2) and
      * §0.7.3 classes missing identity evidence as quarantine-tier, so
@@ -7550,10 +7906,10 @@ describe('persistPreparedFood writes the counters the comparison decided (DB-F08
         // the refusal can come from nothing but the retrieval. The same food
         // with a status is not held; without one it is.
         expect(withoutStatus.candidate).toEqual(statusBearing.candidate);
-        expect(statusBearing.retrievalStatusMissing).toBe(false);
+        expect(importEvidenceAssessment(statusBearing).complete).toBe(true);
         expect(importPublicationStatus(statusBearing, verdict)).not.toBe('quarantined');
 
-        expect(withoutStatus.retrievalStatusMissing).toBe(true);
+        expect(evidenceGapCodes(importEvidenceAssessment(withoutStatus))).toEqual(['retrieval_status_missing']);
         expect(importPublicationStatus(withoutStatus, verdict)).toBe('quarantined');
 
         const write = await persist(null, withoutStatus);
@@ -7621,13 +7977,14 @@ describe('persistPreparedFood writes the counters the comparison decided (DB-F08
 
 
 /**
- * THE DURABLE BATCH LEDGER (DB-F11, and the checkpoint atomicity above it).
+ * THE DURABLE BATCH LEDGER (and the checkpoint atomicity above it).
  *
  * `catalog_import_runs.counts` is merged by ADDITION, and `cursor` names the
  * next batch to do. Three defects met here, and all three were silent.
  *
- * DB-F11: the checkpoint added the save INTERVAL — five — whatever the interval
- * had actually covered, so a seven-batch run recorded ten.
+ * THE INTERVAL WAS COUNTED INSTEAD OF THE WORK: the checkpoint added the save
+ * INTERVAL — five — whatever the interval had actually covered, so a
+ * seven-batch run recorded ten.
  *
  * The cursor and the counts were written by two separate transactions, neither
  * of them the one that wrote the batch's catalog rows, and only every fifth
@@ -7651,7 +8008,7 @@ describe('persistPreparedFood writes the counters the comparison decided (DB-F08
  * catalog writes are faked: an empty vendor response leaves the persistence path
  * with nothing to write, which keeps the cases about batch accounting alone.
  */
-describe('the durable batch ledger a checkpoint records (DB-F11)', () => {
+describe('the durable batch ledger a checkpoint records', () => {
     const FIXED_NOW = new Date('2026-09-14T09:00:00.000Z');
 
     /** Twenty ids per batch, so a limit is a batch count: 140 → 7, 60 → 3. */
@@ -7886,7 +8243,7 @@ describe('the durable batch ledger a checkpoint records (DB-F11)', () => {
 });
 
 /**
- * THE CHECKPOINT CONTRACT ITSELF (SCRBLD-F01, SCRBLD-F03, SCRBLD-F19).
+ * THE CHECKPOINT CONTRACT ITSELF.
  *
  * The cases above prove what the IMPORT does with the checkpoint. These prove
  * the checkpoint, because three other stages call the same module and the two
@@ -7905,7 +8262,7 @@ describe('the durable batch ledger a checkpoint records (DB-F11)', () => {
  * keep behaving exactly as they did. Only an explicit `false` — which the
  * import now passes from `--resume` — refuses.
  */
-describe('the checkpoint writes a cursor and its counts together (SCRBLD-F01, SCRBLD-F19)', () => {
+describe('the checkpoint writes a cursor and its counts together', () => {
     const SCOPE = 'v1+suite:checkpoint-contract';
     const FIXED_NOW = new Date('2026-09-14T09:00:00.000Z');
 
@@ -7963,8 +8320,7 @@ describe('the checkpoint writes a cursor and its counts together (SCRBLD-F01, SC
 
         // The ledger is a running total, which is what makes a resumed run's
         // row describe the whole run instead of its last attempt — and what
-        // makes merging an attempt's ABSOLUTE totals into it a double-count
-        // (SCRBLD-F03).
+        // makes merging an attempt's ABSOLUTE totals into it a double-count.
         expect(merged).toMatchObject({ inserted: 5, updated: 1 });
         expect((await runRow(run.id)).cursor).toEqual({ at: 2 });
     });
@@ -8039,9 +8395,9 @@ describe('the checkpoint writes a cursor and its counts together (SCRBLD-F01, SC
         expect(permitted.resumed).toBe(true);
         expect(permitted.run.cursor).toEqual({ at: 4 });
 
-        // EXPLICIT FALSE REFUSES, which is what `--resume` being off means
-        // (SCRBLD-F19): the flag was parsed and never reached the claim, so the
-        // usage line describing a default of "off" described no code.
+        // EXPLICIT FALSE REFUSES, which is what `--resume` being off means:
+        // the flag was parsed and never reached the claim, so the usage line
+        // describing a default of "off" described no code.
         const refused = await openOrResumeRun<{ at: number }>(prisma, {
             kind: 'usda_import',
             manifestVersion: scope,
@@ -8098,16 +8454,17 @@ describe('the checkpoint writes a cursor and its counts together (SCRBLD-F01, SC
 
 
 /**
- * VALIDATION'S RUN IDENTITY AND THE FACTS IT JUDGES FROM (DB-F10, DB-F09).
+ * VALIDATION'S RUN IDENTITY AND THE FACTS IT JUDGES FROM.
  *
- * Two defects met in one function. DB-F10: the claim's `alreadyCompleted` was
- * discarded, so re-running a succeeded pass rewrote every considered food's
- * `updated_at`, every record's `reviewed_at` and `history` and the report,
- * beneath a closed run whose counts never moved — and a `--category` pass shared
- * the canonical run key, so a partial pass could close it. DB-F09: the verdict
- * was computed from a set-wide read and written by id, so a concurrent import
- * could replace the nutrients and metadata in between and the row was
- * republished on checks derived from facts it no longer had.
+ * Two defects met in one function. THE DISCARDED CLAIM: the claim's
+ * `alreadyCompleted` was discarded, so re-running a succeeded pass rewrote every
+ * considered food's `updated_at`, every record's `reviewed_at` and `history` and
+ * the report, beneath a closed run whose counts never moved — and a `--category`
+ * pass shared the canonical run key, so a partial pass could close it. THE
+ * VERDICT ON FACTS IT NO LONGER HELD: the verdict was computed from a set-wide
+ * read and written by id, so a concurrent import could replace the nutrients
+ * and metadata in between and the row was republished on checks derived from
+ * facts it no longer had.
  *
  * The run ledger is real here, because the claim IS the thing under test. The
  * catalog side is an in-memory `ValidateDb`, which is what makes the races
@@ -8123,11 +8480,15 @@ const validateOptions = (overrides: Partial<ValidateOptions> = {}): ValidateOpti
     // the deterministic checks alone, with no model call and every write made.
     review: false,
     dryRun: false,
+    // The committed curator-decision artefact, which is what a bare
+    // `npm run catalog:validate` judges review-tier holds with and the only
+    // value that leaves the pass unrestricted (validationRunScope).
+    curatorDecisionsPath: DEFAULT_CURATOR_DECISIONS_PATH,
     ...overrides,
 });
 
 /**
- * WHICH CATALOG A VALIDATION RUN ANSWERS FOR (DB-F10).
+ * WHICH CATALOG A VALIDATION RUN ANSWERS FOR.
  *
  * The run key names two things and has to name both. Keyed on the coverage plan
  * alone, one successful pass answers "validation succeeded for v1" for ever, so
@@ -8136,7 +8497,7 @@ const validateOptions = (overrides: Partial<ValidateOptions> = {}): ValidateOpti
  * validation") and, worse, deadlocks the release: catalog-release asks for a
  * validation newer than the last ingest, and that run can no longer happen.
  */
-describe('catalogInputIdentity and the canonical run key (DB-F10)', () => {
+describe('catalogInputIdentity and the canonical run key', () => {
     const at = (iso: string): Date => new Date(iso);
 
     const ingest = (overrides: Partial<CatalogInputRunRow> = {}): CatalogInputRunRow => ({
@@ -8217,7 +8578,7 @@ describe('catalogInputIdentity and the canonical run key (DB-F10)', () => {
     });
 });
 
-describe('validationRunScope (DB-F10)', () => {
+describe('validationRunScope', () => {
     const version = coveragePlan.coveragePlanVersion;
     const INPUT = 'usda_import:v1:2026-09-14T08:00:00.000Z';
     const canonical = canonicalValidationRunKey(version, INPUT);
@@ -8291,14 +8652,14 @@ describe('validationRunScope (DB-F10)', () => {
 });
 
 /**
- * ONE HISTORY ENTRY PER RUN PER FOOD (DB-F10).
+ * ONE HISTORY ENTRY PER RUN PER FOOD.
  *
  * The status write and the history commit together; the cursor that says "done"
  * commits after them. Something has to be true in that window, and an
  * unconditional append would leave two entries claiming the same transition —
  * in the audit trail this stage exists to produce.
  */
-describe('appendValidationHistory is idempotent per run and food (DB-F10)', () => {
+describe('appendValidationHistory is idempotent per run and food', () => {
     const NOW = new Date('2026-09-14T10:15:00.000Z');
     const LATER = new Date('2026-09-14T10:16:00.000Z');
     const RUN = 'run-a';
@@ -8368,7 +8729,7 @@ describe('appendValidationHistory is idempotent per run and food (DB-F10)', () =
     });
 });
 
-describe('identityGroupMoved (DB-F09)', () => {
+describe('identityGroupMoved', () => {
     const facts = {
         source_key: 'usda:171077',
         canonical_name: 'chicken breast',
@@ -8394,7 +8755,7 @@ describe('identityGroupMoved (DB-F09)', () => {
     });
 });
 
-describe('runValidation (DB-F10, DB-F09)', () => {
+describe('runValidation', () => {
     const FIXED_NOW = new Date('2026-09-14T10:15:00.000Z');
     const CATEGORY = 'protein_poultry';
     const scopedOptions = validateOptions({ categories: [CATEGORY] });
@@ -8404,6 +8765,35 @@ describe('runValidation (DB-F10, DB-F09)', () => {
     // suite deletes its own run rows around every case (below), which keeps that
     // true whatever else has run.
     const runScope = validationRunScope(coveragePlan.coveragePlanVersion, scopedOptions, NO_CATALOG_INPUT);
+
+    /**
+     * One complete retrieval record, in the column vocabulary the importer
+     * writes it in.
+     *
+     * Present on every fixture below because publication depends on it:
+     * `judgeRow` holds a row whose validation record does not state a
+     * verifiable retrieval — a URL, the host, an OBSERVED 2xx status, a body
+     * digest, the snippet naming the food, the time, and for a USDA row the
+     * cache key and this food's own record digest (scripts/lib/catalogEvidence.ts).
+     * A fixture without one is a QUARANTINED row rather than a passing one, so
+     * these cases would be asserting the floor instead of the version predicate
+     * and the run accounting they are about.
+     */
+    const identityEvidence = (matchedSnippet: string): Record<string, unknown>[] => [
+        {
+            url: 'https://api.nal.usda.gov/fdc/v1/foods',
+            final_host: 'api.nal.usda.gov',
+            http_status: 200,
+            body_sha256: 'd'.repeat(64),
+            record_sha256: 'e'.repeat(64),
+            // The cache row the BATCH response is recorded under, which is what
+            // the column names; the per-food digest above is what makes it
+            // evidence for this food rather than for the twenty it carried.
+            source_cache_key: 'usda:foods:harness-batch',
+            matched_snippet: matchedSnippet,
+            fetched_at: FIXED_NOW.toISOString(),
+        },
+    ];
 
     /** A row every deterministic check passes, so its verdict is `published`. */
     const validationRow = (overrides: Partial<ValidationFoodRow> = {}): ValidationFoodRow => ({
@@ -8433,6 +8823,17 @@ describe('runValidation (DB-F10, DB-F09)', () => {
         catalog_food_portions: [
             { description: '1 breast', amount: 1, unit: 'each', gram_weight: 174, is_default: true, source: 'usda_food_portion' },
         ],
+        // READ AND EMPTY, which is not the same fact as unread. The component
+        // floor holds a row whose composition nobody looked at — an absent
+        // relation is assessed rather than assumed empty, so a caller that
+        // forgets to select it cannot publish a food on scalars nothing checked
+        // (scripts/lib/catalogEvidence.ts, and `componentDerivationFor`'s own
+        // comment). These fixtures are single-ingredient USDA records with no
+        // composition, so they state the empty set the way the stage's own
+        // `selection` returns it; without it every row here would quarantine
+        // and these cases would be asserting the floor instead of the version
+        // predicate and the run accounting they are about.
+        catalog_food_components: [],
         catalog_validation_records: {
             id: 'record-1',
             history: [],
@@ -8442,6 +8843,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
             // review was consulted", which is what reviewOwedByRun reads to
             // recover a stopped review's debt from the rows themselves.
             llm_review: null,
+            identity_evidence: identityEvidence('chicken breast, raw'),
         },
         ...overrides,
     });
@@ -8464,8 +8866,9 @@ describe('runValidation (DB-F10, DB-F09)', () => {
     interface FakeValidateHooks {
         /**
          * Commits a change between the set-wide read and the locked re-read,
-         * which is the window DB-F09 is about. Applied where the row lock is
-         * taken, so it lands on exactly the food being judged and on no other.
+         * which is the window the locked re-read exists to close. Applied where
+         * the row lock is taken, so it lands on exactly the food being judged
+         * and on no other.
          */
         readonly raceAfterSetRead?: (id: string, store: Map<string, ValidationFoodRow>) => void;
         /** Commits a change after the locked re-read and before the guarded write. */
@@ -8653,7 +9056,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
             select: { id: true, status: true, cursor: true, counts: true },
         });
 
-    describe('a succeeded run is a no-op (DB-F10)', () => {
+    describe('a succeeded run is a no-op', () => {
         it('reads nothing and writes nothing when the claim comes back completed', async () => {
             const settled = await openRun(prisma, { kind: 'validation', manifestVersion: runScope });
             await finishRun(prisma, settled.id, 'succeeded', { counts: { considered: 12, published: 9 } });
@@ -8700,7 +9103,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
         });
     });
 
-    describe('an interrupted pass resumes without judging a row twice (DB-F10)', () => {
+    describe('an interrupted pass resumes without judging a row twice', () => {
         it('picks up at the cursor and appends one history entry per food', async () => {
             const rows = [rowAt(1), rowAt(2), rowAt(3)];
 
@@ -8748,7 +9151,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
         });
     });
 
-    describe('the verdict is computed from the facts the write locked (DB-F09)', () => {
+    describe('the verdict is computed from the facts the write locked', () => {
         it('re-judges on nutrients a concurrent writer committed after the set-wide read', async () => {
             const row = rowAt(1);
             const fake = inMemoryValidateDb([row], {
@@ -8842,7 +9245,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
     });
 
     /**
-     * THE WINDOW BETWEEN THE JUDGEMENT AND THE CURSOR (DB-F10).
+     * THE WINDOW BETWEEN THE JUDGEMENT AND THE CURSOR.
      *
      * The status write, the validation record and the history commit in one
      * transaction; the cursor that says "this food is done" is a separate write
@@ -8852,7 +9255,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
      * one history entry for the run, because the entry is keyed by run and food
      * rather than appended blindly.
      */
-    describe('a row judged but not yet pointed past is not judged twice (DB-F10)', () => {
+    describe('a row judged but not yet pointed past is not judged twice', () => {
         it('leaves one history entry when the pass dies AFTER the judgement commits', async () => {
             const rows = [rowAt(1), rowAt(2)];
 
@@ -8963,14 +9366,14 @@ describe('runValidation (DB-F10, DB-F09)', () => {
     });
 
     /**
-     * A CATALOG REFRESH IS NEW WORK (DB-F10).
+     * A CATALOG REFRESH IS NEW WORK.
      *
      * AAP §0.5.1: "a refresh re-runs validation". Keyed on the coverage plan
      * alone, the pass that judged the catalog before the refresh would answer
      * for the one after it, and catalog-release — which wants a validation newer
      * than the last ingest — would wait on a run that could never happen.
      */
-    describe('a newer catalog input is judged rather than answered for (DB-F10)', () => {
+    describe('a newer catalog input is judged rather than answered for', () => {
         const fullOptions = validateOptions();
 
         it('no-ops a re-run against the same catalog, and judges again after an import', async () => {
@@ -9013,7 +9416,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
     });
 
     /**
-     * A ROW THAT PASSED, AND THEN CHANGED BEFORE THE PASS CAME BACK (DB-F10).
+     * A ROW THAT PASSED, AND THEN CHANGED BEFORE THE PASS CAME BACK.
      *
      * The judgement-skipping rule is "this run already judged this food", so on
      * its own it would let a row judged by attempt 1, then rewritten by an
@@ -9032,7 +9435,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
      * Both halves are asserted, because the safety of the second depends
      * entirely on the refusal and a test of the skip alone would read as a bug.
      */
-    describe('a row whose facts changed after it passed (DB-F10)', () => {
+    describe('a row whose facts changed after it passed', () => {
         const fullOptions = validateOptions();
 
         /** The nutrients an import would write back, with the version bump that goes with them. */
@@ -9142,7 +9545,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
     });
 
     /**
-     * THE DEADLOCK A KEY THAT NAMES ITS INPUT WOULD OTHERWISE CREATE (DB-F10).
+     * THE DEADLOCK A KEY THAT NAMES ITS INPUT WOULD OTHERWISE CREATE.
      *
      * Keying the run on the catalog input is what makes a refresh new work, and
      * it has one consequence that has to be handled rather than accepted: a
@@ -9158,7 +9561,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
      * CURRENT input would close a concurrent attempt's work, and settling one
      * under another coverage plan would reach into a deliberate policy change.
      */
-    describe('a pass settles validation runs that can never be resumed (DB-F10)', () => {
+    describe('a pass settles validation runs that can never be resumed', () => {
         const fullOptions = validateOptions();
         const currentKey = validationRunScope(coveragePlan.coveragePlanVersion, fullOptions, NO_CATALOG_INPUT);
         const currentInputPart = validationRunKeyInputPart(currentKey);
@@ -9199,9 +9602,16 @@ describe('runValidation (DB-F10, DB-F09)', () => {
             });
 
             // An operator meeting a 'failed' row with no explanation has no way
-            // to tell an abandoned pass from a settled one.
+            // to tell an abandoned pass from a settled one. The explanation is
+            // the CLASS and the CODE, which say exactly that and say it to a
+            // reader's tooling as well as to a reader: this run's catalog input
+            // was superseded, so it was closed rather than abandoned. The
+            // rendered sentence is not stored, because the same field would
+            // then carry a driver's or a vendor's prose on every failure that
+            // is not this one — see `safeError` in `scripts/lib/logger.ts`.
             expect(JSON.stringify(log)).toContain('ValidationRunSupersededError');
-            expect(JSON.stringify(log)).toContain('can never be resumed');
+            expect(JSON.stringify(log)).toContain('validation_run_superseded');
+            expect(JSON.stringify(log)).not.toContain('"message"');
         });
 
         it('leaves an open run for the CURRENT input alone, which is resumable work or a live attempt', async () => {
@@ -9283,10 +9693,9 @@ describe('runValidation (DB-F10, DB-F09)', () => {
     });
 
     /* ---------------------------------------------------------------------- *
-     * A STOPPED ADVISORY REVIEW LEAVES WORK THE SAME RUN KEY CAN FINISH
-     * (SCRBLD-F23).
+     * A STOPPED ADVISORY REVIEW LEAVES WORK THE SAME RUN KEY CAN FINISH.
      *
-     * Closing such a run `failed` is only half of what the finding asks for.
+     * Closing such a run `failed` is only half of what a stopped review needs.
      * The other half is that the work is RETRYABLE: `--review` is part of
      * validationRunScope, so this key is the review pass, and the rows it
      * passed over were judged into `quarantined` — which the default considered
@@ -9297,7 +9706,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
      * scope, so it claims a different run.
      * ---------------------------------------------------------------------- */
 
-    describe('a stopped review is worked off by the same run key (SCRBLD-F23)', () => {
+    describe('a stopped review is worked off by the same run key', () => {
         const reviewOptions = validateOptions({ categories: [CATEGORY], review: true });
         const reviewRunScope = validationRunScope(
             coveragePlan.coveragePlanVersion,
@@ -9330,6 +9739,7 @@ describe('runValidation (DB-F10, DB-F09)', () => {
                     },
                     nutrition_assumptions: null,
                     llm_review: null,
+                    identity_evidence: identityEvidence(`reviewable ${ordinal}`),
                 },
             });
 
@@ -9526,21 +9936,21 @@ describe('runValidation (DB-F10, DB-F09)', () => {
 
 /**
  * THE STAGE LOCK: WHAT ONE PROCESS MAY DO TO THE CATALOG GRAPH WHILE ANOTHER IS
- * WRITING IT (DB-F09).
+ * WRITING IT.
  *
  * The run claim already stopped two processes from sharing one run row, and
  * `checkpoint.ts`'s own THE CLAIM said what it could not do: the claim lock is
  * transaction-scoped, so it "does NOT grant exclusive processing for the run's
  * lifetime" — and no entry point took a lock that did. Two stages could
  * therefore write the graph at once under two different run rows, which is the
- * window every other part of DB-F09 is a symptom of.
+ * window this stage lock closes.
  *
  * The decisions are pure and are checked with no database at all. Exclusion
  * itself is not a decision but a PostgreSQL behaviour, so it is checked against
  * the real test database: a fake that returned `false` from `try_lock` would
  * prove only that the fake was written to.
  */
-describe('the stage lock (DB-F09)', () => {
+describe('the stage lock', () => {
     describe('the mode each stage takes the graph in', () => {
         it.each(['usda_import', 'ai_generation', 'validation', 'release_load'] as const)(
             '%s writes the graph, so it takes the lock exclusively',
@@ -10018,7 +10428,7 @@ describe('the stage lock (DB-F09)', () => {
 });
 
 /**
- * THE EXPORT'S OWN REFUSAL (DB-F09, NEW-01).
+ * THE EXPORT'S OWN REFUSAL.
  *
  * The shared lock keeps a live mutator from overlapping an export. It cannot
  * speak for two other situations, and both would ship a catalog nobody has
@@ -10037,7 +10447,7 @@ describe('the stage lock (DB-F09)', () => {
  * Pure over the ledger rows, so every rule is checkable with no database.
  */
 /**
- * WHICH ROWS THE REFUSAL GETS TO SEE (NEW-01).
+ * WHICH ROWS THE REFUSAL GETS TO SEE.
  *
  * The rules below are pure over the rows they are handed, so a row the query
  * filters out is a rule that cannot fire. A FAILED validation attempt of the
@@ -10045,7 +10455,7 @@ describe('the stage lock (DB-F09)', () => {
  * earlier success for the same key reads as "validation passed" — so the read
  * is asserted against the real table rather than assumed.
  */
-describe('loadPipelineRuns (NEW-01)', () => {
+describe('loadPipelineRuns', () => {
     const MARKER = 'load-pipeline-runs-test';
 
     const clear = async (): Promise<void> => {
@@ -10084,7 +10494,7 @@ describe('loadPipelineRuns (NEW-01)', () => {
     });
 });
 
-describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
+describe('releaseStalenessReason', () => {
     const at = (iso: string): Date => new Date(iso);
 
     const INPUT_AT = '2026-09-14T08:00:00.000Z';
@@ -10193,7 +10603,7 @@ describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
         expect(decide([ingestRow()])).toContain('no successful catalog:validate run is on record');
     });
 
-    describe('only the canonical validation for this catalog counts (NEW-01)', () => {
+    describe('only the canonical validation for this catalog counts', () => {
         it('refuses when the only validation is a category-restricted pass', () => {
             const ledger = [ingestRow()];
             const scopedKey = `${expectedKeyFor(ledger)}+scope:abc123abc123abc1`;
@@ -10281,7 +10691,7 @@ describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
         });
     });
 
-    describe('a later failed attempt of the canonical run is not hidden (NEW-01)', () => {
+    describe('a later failed attempt of the canonical run is not hidden', () => {
         it('refuses when the canonical run failed after succeeding', () => {
             const ledger = [ingestRow()];
             const key = expectedKeyFor(ledger);
@@ -10385,7 +10795,7 @@ describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
     });
 
     /**
-     * A GRAPH MUTATOR THAT FAILED AFTER THE VALIDATION (NEW-01).
+     * A GRAPH MUTATOR THAT FAILED AFTER THE VALIDATION.
      *
      * `catalogInputIdentity` counts SUCCEEDED runs only, and says why: a failed
      * ingest left a graph nobody vouched for, so naming it would mint a run key
@@ -10394,7 +10804,7 @@ describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
      * without it the delegation lands nowhere. A run that failed partway still
      * wrote back everything it reached before it died, as candidates.
      */
-    describe('a graph mutator that failed after the validation still blocks the release (NEW-01)', () => {
+    describe('a graph mutator that failed after the validation still blocks the release', () => {
         it.each(['usda_import', 'ai_generation', 'release_load'])(
             'refuses when a %s run FAILED after the canonical validation succeeded',
             (kind) => {
@@ -10507,10 +10917,10 @@ describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
 });
 
 /**
- * THE PAIRING INSIDE runRelease (NEW-01).
+ * THE PAIRING INSIDE runRelease.
  *
  * `releaseStalenessReason` is pure and exhaustively covered above, but it is
- * only as good as the key it is HANDED — and the defect NEW-01 named was
+ * only as good as the key it is HANDED — and the defect these cases pin was
  * precisely that the caller never worked out which run it should be looking
  * for. That pairing is three lines inside `runRelease`
  * (`canonicalValidationRunKey(plan, catalogInputIdentity(snapshot.pipelineRuns))`),
@@ -10519,7 +10929,7 @@ describe('releaseStalenessReason (DB-F09, NEW-01)', () => {
  * is driven: real ledger rows in the test database, a real Repeatable Read
  * snapshot, in-memory files, and the refusal read off what it throws.
  */
-describe('runRelease resolves the validation it demands from its own snapshot (NEW-01)', () => {
+describe('runRelease resolves the validation it demands from its own snapshot', () => {
     const RELEASE = 'v-newneg01';
     const INGEST_FINISHED = new Date('2026-09-14T08:00:00.000Z');
 
@@ -10631,7 +11041,7 @@ describe('runRelease resolves the validation it demands from its own snapshot (N
 });
 
 /**
- * THE SEAM ITSELF: EVERY CLI ENTRY POINT TAKES THE CLAIM (DB-F09).
+ * THE SEAM ITSELF: EVERY CLI ENTRY POINT TAKES THE CLAIM.
  *
  * The lock's behaviour is proven above, but a lock nothing calls excludes
  * nothing — and that was precisely the defect: `checkpoint.ts` said the run
@@ -10648,7 +11058,7 @@ describe('runRelease resolves the validation it demands from its own snapshot (N
  * produces. The four children cost about half a second each and make no vendor
  * call: every one of them refuses before reaching its work.
  */
-describe('every catalog CLI refuses to run while another stage holds the graph (DB-F09)', () => {
+describe('every catalog CLI refuses to run while another stage holds the graph', () => {
     /**
      * A child over one of the pipeline's CLI entry points, with the environment
      * it needs to reach `main()` and nothing more.
@@ -10798,13 +11208,22 @@ describe('every catalog CLI refuses to run while another stage holds the graph (
         // `--release v99` is deliberately an id that does not exist: the lock
         // refuses before the export reads or writes anything, so no release
         // directory is created by this test.
-        ['catalog-import-usda.ts', [], 'usda_import cannot take it exclusively'],
-        ['catalog-validate.ts', [], 'validation cannot take it exclusively'],
-        ['catalog-release.ts', ['--release', 'v99'], 'release cannot take it shared'],
-        ['catalog-load.ts', ['--release', 'v1', '--confirm-target'], 'release_load cannot take it exclusively'],
-    ] as [string, string[], string][])('%s refuses, and says which lock it could not take', async (
+        //
+        // The expectation is the STAGE and the MODE as typed log fields, not a
+        // clause of the refusal's rendered sentence. `stage_failed` carries no
+        // `message` \u2014 see `checkpointErrorFields` in `scripts/lib/checkpoint.ts`
+        // \u2014 because the same field would otherwise carry prose from a driver or
+        // a vendor on every other failure; the two facts this case is about are
+        // reported as data instead, which is also a stricter assertion than a
+        // substring of English.
+        ['catalog-import-usda.ts', [], 'usda_import', 'exclusive'],
+        ['catalog-validate.ts', [], 'validation', 'exclusive'],
+        ['catalog-release.ts', ['--release', 'v99'], 'release', 'shared'],
+        ['catalog-load.ts', ['--release', 'v1', '--confirm-target'], 'release_load', 'exclusive'],
+    ] as [string, string[], string, string][])('%s refuses, and says which lock it could not take', async (
         script,
         argTemplate,
+        expectedStage,
         expectedMode,
     ) => {
         // The loader is the one stage that must be told which database it is
@@ -10820,10 +11239,17 @@ describe('every catalog CLI refuses to run while another stage holds the graph (
         expect(outcome.status).not.toBe(0);
         // The machine-readable code an operator's tooling reads, not the prose.
         expect(output).toContain('"code":"catalog_stage_locked"');
-        // And the mode, because an export taking the lock exclusively would
-        // serialise two harmless reads while a mutator taking it shared would
-        // run beside another writer — the two mistakes this names apart.
-        expect(output).toContain(expectedMode);
+        // WHICH lock, and in which mode — because an export taking the lock
+        // exclusively would serialise two harmless reads while a mutator taking
+        // it shared would run beside another writer, and those are the two
+        // mistakes this case names apart. Read as typed fields of the
+        // `stage_failed` line, which is where they now live.
+        expect(output).toContain(`"lockStage":"${expectedStage}"`);
+        expect(output).toContain(`"lockMode":"${expectedMode}"`);
+        // And the line carries no free-form message for them to have come from,
+        // which is the property that keeps a driver's or a vendor's prose off
+        // this same field on every other failure.
+        expect(output).not.toContain('"message"');
 
         // AND IT SPENT NOTHING AT THE VENDOR GETTING THERE. Asserted from the
         // child's own deny log, whose `installed` line `vendorAttempts` checks
@@ -11368,7 +11794,12 @@ describe('a repeated import converges on the same rows', () => {
         // The stage does not publish, by design: a record every check accepts
         // is a `candidate`, because the duplicate-identity decision needs a
         // view of the whole table that a batch-at-a-time import cannot have.
-        // `catalog:validate` is the only stage that publishes.
+        // `catalog:validate` is the only stage that JUDGES a candidate and
+        // promotes it — publication as a decision belongs there and nowhere
+        // else. (`catalog:load` also writes published rows, and retires and
+        // restores them, but it applies the status a reviewed release artefact
+        // already states rather than deciding one, so nothing about this
+        // import's candidates reaches `published` without validation.)
         expect(outcome.counts.candidates).toBe(subjects.length);
         expect(outcome.counts.quarantined).toBe(0);
         expect(outcome.counts.rejected).toBe(0);
@@ -11568,9 +11999,10 @@ describe('a repeated import converges on the same rows', () => {
  *
  * The stage checkpoints so that "an interruption resumes rather than restarts",
  * and the durable arithmetic of that — which cursor index is saved and how the
- * batch totals accumulate — is pinned by the DB-F11 cases above, which run
- * against a vendor that returns no records and a database that refuses every
- * catalog write. This is the other half, and the half those cases cannot see:
+ * batch totals accumulate — is pinned by the durable batch-ledger cases above,
+ * which run against a vendor that returns no records and a database that
+ * refuses every catalog write. This is the other half, and the half those cases
+ * cannot see:
  * the batches that DID complete wrote rows inside their own transactions, and
  * those rows have to still be there afterwards. A stage that rolled them back
  * would make a twelve-thousand-record import an all-or-nothing operation, which
@@ -11703,9 +12135,10 @@ describe('an interrupted import keeps what it already wrote', () => {
         expect(resumed.batchCalls).toEqual([secondBatchIds]);
 
         // THE RETURNED COUNTS ARE THIS ATTEMPT'S, and the ledger's are the
-        // run's. The distinction is the whole of F03: the attempt inserted the
-        // eight records it processed, and the ROW says twenty-eight because the
-        // twenty from the first attempt were already durable when it stopped.
+        // run's. The distinction is what a merge-free closure buys: the attempt
+        // inserted the eight records it processed, and the ROW says twenty-eight
+        // because the twenty from the first attempt were already durable when
+        // it stopped.
         // A closure that merged this attempt's absolute totals into the row
         // instead would read forty-eight.
         expect(outcome.processedBatches).toBe(1);
@@ -11892,14 +12325,14 @@ describe('an interrupted import keeps what it already wrote', () => {
 });
 
 /**
- * A RESUMED RUN REPORTS THE RUN, NOT THE LAST ATTEMPT (SCRBLD-F02).
+ * A RESUMED RUN REPORTS THE RUN, NOT THE LAST ATTEMPT.
  *
  * The pure arithmetic is pinned above. What only a real resume can show is the
  * WIRING: that the figures were written into the cursor alongside the batch
  * index, that the resume read them back, and that the final artefact states
  * carried plus this attempt with the basis it was arrived at by.
  */
-describe('a resumed import reports the whole run (SCRBLD-F02)', () => {
+describe('a resumed import reports the whole run', () => {
     const subjects = IMPORT_SUBJECTS;
     const secondBatchIds = subjects.slice(DETAIL_BATCH_SIZE).map((entry) => entry.fdcId);
 
@@ -12842,10 +13275,14 @@ describe('what a failing run records and emits', () => {
         // line is a string and does keep its order; that is asserted below.
         expect(Object.keys(stored[0]).sort()).toEqual(['at', 'error', 'event']);
         expect(typeof stored[0].at).toBe('string');
-        // Exactly two members, which is what "never the raw error object" (§8)
-        // amounts to on the wire: a raw `Error` serialises to `{}` and a
-        // hand-rolled renderer keeping the stack would serialise three.
-        expect(Object.keys(stored[0].error ?? {})).toEqual(['name', 'message']);
+        // A CLOSED set of machine-readable members, which is what "never the
+        // raw error object" (§8) amounts to on the wire: a raw `Error`
+        // serialises to `{}`, a renderer keeping the stack would serialise it,
+        // and a renderer keeping the MESSAGE would put the vendor's sentence —
+        // here one quoting the request URL — into a JSONB column that outlives
+        // the run. The class and its code are what a later reader acts on.
+        expect(Object.keys(stored[0].error ?? {}).sort()).toEqual(['code', 'name']);
+        expect(stored[0].error).not.toHaveProperty('message');
 
         // The partial work survives the closure. A run closed `failed` with an
         // empty `counts` would say a run that planned work planned none.
@@ -12865,30 +13302,50 @@ describe('what a failing run records and emits', () => {
         const printed = emittedLine(captured, 'run_failed');
         expect(printed.level).toBe('error');
         expect(printed.code).toBe('usda_request_failed');
-        expect(Object.keys(printed.error as Record<string, unknown>)).toEqual(['name', 'message']);
+        expect(Object.keys(printed.error as Record<string, unknown>).sort()).toEqual(['code', 'name']);
+        expect(printed.error).not.toHaveProperty('message');
 
         // The two writers have to agree: an operator reading the terminal and
         // one reading the row months later must be reading the same failure,
-        // not two renderings that diverged.
-        expect((printed.error as { message: string }).message).toBe(
-            (stored[0].error as { message: string }).message,
-        );
+        // not two renderings that diverged. Compared as the whole rendered
+        // value rather than one field of it, so a member added to one writer
+        // and not the other fails here.
+        expect(printed.error).toEqual(stored[0].error);
 
         for (const line of captured.raw) {
             expect(line).not.toContain(FAKE_VENDOR_KEY);
         }
         expect(run.rawLog).not.toContain(FAKE_VENDOR_KEY);
 
-        // WHAT MUST STILL APPEAR. The host is not a secret and is the first
-        // thing an operator needs — "which service refused" is the difference
-        // between reading the vendor's status page and reading code. So the
-        // assertion is deliberately not "no URL survives": the path and the
-        // non-credential query stay legible, and only the credential is
-        // replaced. `hostOf` is what a field carries the host as.
-        const message = (stored[0].error as { message: string }).message;
-        expect(message).toContain(hostOf(VENDOR_REQUEST_URL));
-        expect(message).toContain('api_key=');
-        expect(message).not.toContain(`api_key=${FAKE_VENDOR_KEY}`);
+        // WHAT MUST STILL APPEAR, and where it now appears. "Which service
+        // refused" and "which work item stopped" are the two things an operator
+        // needs, and both survive — as TYPED FIELDS on the printed line rather
+        // than inside a rendered sentence. `usda_request_failed` names the
+        // service, and `batchIndex` is what `--resume` continues from.
+        expect(printed.code).toBe('usda_request_failed');
+        expect(printed.batchIndex).toBe(0);
+        expect(printed.fdcIds).toEqual([entry.fdcId]);
+
+        // THE ONE FACT THAT DOES NOT SURVIVE, asserted so the gap is visible
+        // rather than assumed. `importErrorFields` reports `vendorStatus`
+        // whenever the wrapped vendor error carries a typed status, and
+        // `src/services/usda.service.ts`'s `UsdaError` carries none — it holds
+        // the HTTP status only inside its message, which is the field withheld
+        // here. Giving that class a typed `status` belongs to the vendor
+        // boundary, not to this stage; the moment it has one, this expectation
+        // is what fails and tells the next reader the field now flows.
+        expect(printed).not.toHaveProperty('vendorStatus');
+
+        // AND THE REQUEST URL IS NOWHERE, which is the point of moving them
+        // there. The message that used to carry this failure quoted the URL
+        // `usda.service.ts` builds, and that URL's query string carries
+        // `api_key=`; the scrub rules reduced the credential but left the rest
+        // legible, so the channel existed. It no longer does: no line and no
+        // stored entry mentions the host, the query parameter or the key.
+        const everything = `${captured.raw.join('\n')}\n${run.rawLog}`;
+        expect(everything).not.toContain(hostOf(VENDOR_REQUEST_URL));
+        expect(everything).not.toContain('api_key=');
+        expect(everything).not.toContain(FAKE_VENDOR_KEY);
     });
 });
 

@@ -3,8 +3,8 @@
 The entry point for running the meal-planning backend: the prerequisites, the
 command order from a fresh checkout to a verified environment, the separate order
 in which the feature is switched on, the nine CLI entry points the feature has,
-the database guards those commands answer to, and the environment variables an
-operator sets.
+the guarded schema-drift wrapper beside them, the database guards all of those
+commands answer to, and the environment variables an operator sets.
 
 It documents only what the code cannot carry — the orders that are contracts and
 the reasons behind them. It is not an architecture overview: the layering, the
@@ -77,7 +77,7 @@ they point at and one refuses to run unless it may:
 | --- | --- | --- | --- |
 | `soh_dev` | `DATABASE_URL` | `npm run dev`, and the catalog, recipe and dev-seed scripts | Of the three, the only one `db:seed:dev` accepts, and the only one where `catalog:load` and `recipes:seed` need no confirmation flag |
 | `soh_test` | `DATABASE_URL` on the test command | `npm test` | **The name must end in `_test`** (a clone index after it is fine, as in `soh_test_7`). The guard also accepts a database named exactly `ci` on a local host, which is CI's shape. It additionally requires `NODE_ENV=test` and `ALLOW_DB_TRUNCATE=true` — see [Running the test suite](#running-the-test-suite) |
-| `soh_shadow` | `SHADOW_DATABASE_URL` | `npx prisma migrate dev --create-only`, `npx prisma migrate diff` | **Both reset it.** Nothing of value may live here, and no other command reads it |
+| `soh_shadow` | `SHADOW_DATABASE_URL` | `scripts/schema-diff.ts diff`, the guarded wrapper around `npx prisma migrate diff --from-migrations` — and the only thing that reads this variable | **It resets it.** Nothing of value may live here, no other command reads it, and the wrapper refuses to run when an ordinary or partitioned base table of its reached `public` schema holds a row — see [The schema-drift commands](#the-schema-drift-commands) |
 
 ```bash
 createdb --host=127.0.0.1 --port=5432 --maintenance-db=postgres \
@@ -266,21 +266,25 @@ loading a release.
 
 ## The nine CLI entry points
 
-These nine npm scripts are the complete set of CLI entry points for this
-feature; there is no tenth. Everything under `scripts/lib/` is a library the
-entry points import, not a command.
+These nine npm scripts are the complete set of pipeline entry points for this
+feature; there is no tenth stage. The one other command under `scripts/` is
+`scripts/schema-diff.ts`, the guarded schema-drift wrapper — it belongs to the
+migration ledger rather than to the pipeline, carries no npm script, and is
+described under [The schema-drift commands](#the-schema-drift-commands).
+Everything under `scripts/lib/` is a library these commands import, not a
+command.
 
 | npm script | Runs | What it is for | Requires |
 | --- | --- | --- | --- |
-| `catalog:import` | `scripts/catalog-import-usda.ts` | Stage 1 — imports USDA FoodData Central records as catalog **candidates** (it publishes nothing), upserting each on its source key with its aliases, portions and validation record, batched under the hourly rate limit and checkpointed as it goes | `DATABASE_URL`, `USDA_API_KEY`; optional `USDA_IMPORT_RATE_LIMIT_PER_HOUR` (1–1000, default 900); reads `data/meal-planning/usda-manifest.v1.json` and `coverage-plan.v1.json` |
-| `catalog:generate` | `scripts/catalog-generate-ai.ts` | Stage 2 — AI-assisted candidate expansion for the categories the coverage plan still needs, metered per batch against the model-call cap | `DATABASE_URL`, `OPENROUTER_API_KEY`, `CATALOG_MODEL_CALL_BUDGET` (required positive integer, no default); optional `CATALOG_BATCH_SIZE` (default 25); reads `coverage-plan.v1.json` and `evidence-allowlist.v1.json` |
-| `catalog:validate` | `scripts/catalog-validate.ts` | Stage 3 — resolves duplicate identities across the whole non-rejected table, runs the deterministic checks, and publishes, quarantines or rejects each row, writing one validation record per judged food | `DATABASE_URL`, `CATALOG_MODEL_CALL_BUDGET` (shared with `catalog:generate`); `OPENROUTER_API_KEY` only for the advisory review call; reads `coverage-plan.v1.json` and `evidence-allowlist.v1.json` |
+| `catalog:import` | `scripts/catalog-import-usda.ts` | Stage 1 — imports USDA FoodData Central records as catalog **candidates** (it publishes nothing), upserting each on its source key with its aliases, portions and validation record, batched under the hourly rate limit and checkpointed as it goes | `DATABASE_URL` that is development by name or a `_test` database (`development_or_test`), `USDA_API_KEY`; optional `USDA_IMPORT_RATE_LIMIT_PER_HOUR` (1–1000, default 900); reads `data/meal-planning/usda-manifest.v1.json` and `coverage-plan.v1.json` |
+| `catalog:generate` | `scripts/catalog-generate-ai.ts` | Stage 2 — AI-assisted candidate expansion for the categories the coverage plan still needs, metered per batch against the model-call cap | `DATABASE_URL` that is development by name or a `_test` database (`development_or_test`), `OPENROUTER_API_KEY`, `CATALOG_MODEL_CALL_BUDGET` (required positive integer, no default); optional `CATALOG_BATCH_SIZE` (default 25); reads `coverage-plan.v1.json` and `evidence-allowlist.v1.json` |
+| `catalog:validate` | `scripts/catalog-validate.ts` | Stage 3 — resolves duplicate identities across the whole non-rejected table, runs the deterministic checks, and publishes, quarantines or rejects each row, writing one validation record per judged food | `DATABASE_URL` that is development by name or a `_test` database (`development_or_test`), `CATALOG_MODEL_CALL_BUDGET` (shared with `catalog:generate`); `OPENROUTER_API_KEY` only for the advisory review call; reads `coverage-plan.v1.json` and `evidence-allowlist.v1.json` |
 | `catalog:report` | `scripts/catalog-report.ts` | Stage 4 — the coverage and quality report: published, candidate and quarantined counts, duplicate identities, quarantine reasons and the exact per-category shortfall, written to `data/meal-planning/reports/latest/validation-report.json` (`--out` overrides) | `DATABASE_URL`; reads `coverage-plan.v1.json` |
-| `catalog:release` | `scripts/catalog-release.ts` | Stage 5 — exports the published catalog as a versioned, checksummed release under `data/meal-planning/catalog/releases/<vN>/`. `--release <vN>` is required; `--force` is needed to overwrite an existing release directory | `DATABASE_URL`; reads `coverage-plan.v1.json` |
+| `catalog:release` | `scripts/catalog-release.ts` | Stage 5 — exports the published catalog as a versioned, checksummed release under `data/meal-planning/catalog/releases/<vN>/`. `--release <vN>` is required; `--force` is needed to overwrite an existing release directory | `DATABASE_URL` that is development by name or a `_test` database (`development_or_test`); reads `coverage-plan.v1.json` |
 | `catalog:load` | `scripts/catalog-load.ts` | Loads a reviewed release into an environment, verifying every manifest digest before writing. `--release <vN>` is required | `DATABASE_URL`; `--confirm-target <dbname>` unless the database name says development (`_dev`, with or without a clone index) on a local host; reads `data/meal-planning/catalog/releases/<vN>/` |
 | `recipes:seed` | `scripts/recipes-seed.ts` | Publishes the curated recipe files as versioned recipes, resolving each ingredient against the loaded catalog by `source_key`; idempotent by recipe slug. Every selected file is validated before the first write, so one bad file publishes nothing. `--only <slug>` (repeatable; `--slug` is an alias) narrows it and `--dry-run` validates without writing — neither rewrites `recipes/coverage-report.json`, which a full run derives from the seeded rows | `DATABASE_URL` with a loaded catalog; `--confirm-target <dbname>` unless the database name says development (`_dev`, with or without a clone index) on a local host; reads `data/meal-planning/recipes/*.json` and `coverage-plan.v1.json`; writes `data/meal-planning/recipes/coverage-report.json` |
 | `search:benchmark` | `scripts/search-benchmark.ts` | Measures the in-process catalog search against the committed query set and writes `data/meal-planning/reports/latest/benchmark-report.json` (`--out` overrides; `--passes <n>` defaults to 3, so a cold first pass can be separated from the steady state) | `DATABASE_URL` with a loaded catalog; reads `data/meal-planning/search-benchmark.v1.json` |
-| `db:seed:dev` | `scripts/seed-dev.ts` | Seeds a development database with **one plan-ready user** — defaults `--user-id dev-seed-user`, `--email dev-seed-user@soh.invalid` — whose meal-planning setup is **complete**, so reaching the Meal Plan screens needs no wizard run and `POST /api/meal-planning/plans` works immediately. It writes: `meal_plan_preferences` converged to `setup_status: 'completed'` with the development answers and a `confirmed_targets` snapshot matching the four `users.target_*` columns (1,709 kcal, 128 g protein / 171 g carbs / 57 g fat) **in the same transaction**, because the two disagreeing is exactly what makes the targets read report source `legacy`; one weigh-in, only where the user has none, so the About-you weight prefill has something to offer; and the four diary buckets `Breakfast`, `Lunch`, `Dinner`, `Snack` (`sort_order` 0–3) for one day — `--date`, default today in UTC. Rerunning **converges** rather than skipping: a second run with the same flags changes nothing and reports unchanged for every object, while a half-answered preferences row is completed rather than left alone. `--reset-user` deletes that one user and everything cascading from it — preferences, diary, weigh-ins, foods, plans — before seeding; it is scoped to that single user and never truncates a table. It writes no catalog, recipe, plan or grocery rows: those come from `catalog:load`, `recipes:seed` and calling the generator | `DATABASE_URL` that is a **development** origin — `development_only`, so there is no confirmation flag that overrides this |
+| `db:seed:dev` | `scripts/seed-dev.ts` | Seeds a development database with **one plan-ready user** — defaults `--user-id dev-seed-user`, `--email dev-seed-user@soh.invalid` — whose meal-planning setup is **complete**, so reaching the Meal Plan screens needs no wizard run and `POST /api/meal-planning/plans` works immediately. It writes: `meal_plan_preferences` converged to `setup_status: 'completed'` with the development answers and a `confirmed_targets` snapshot matching the four `users.target_*` columns (1,709 kcal, 128 g protein / 171 g carbs / 57 g fat) **in the same transaction**, because the two disagreeing is exactly what makes the targets read report source `legacy`; one weigh-in, only where the user has none, so the About-you weight prefill has something to offer; and the four diary buckets `Breakfast`, `Lunch`, `Dinner`, `Snack` (`sort_order` 0–3) for one day — `--date`, default today in UTC. Rerunning **converges** rather than skipping: a second run with the same flags changes nothing and reports unchanged for every object, while a half-answered preferences row is completed rather than left alone. `--reset-user` deletes that one user and everything cascading from it — preferences, diary, weigh-ins, foods, plans — before seeding; it is scoped to that single user and never truncates a table. It writes no catalog, recipe, plan or grocery rows: those come from `catalog:load`, `recipes:seed` and calling the generator | `DATABASE_URL` whose database **name** says development (`_dev`, optionally with a clone index) on a local host — `development_only`, so a local database named anything else is refused too and there is no confirmation flag that overrides this |
 
 ## The database-origin guard
 
@@ -299,15 +303,34 @@ interchangeable. **By name:** a `_dev` suffix, with or without a clone index
 named local database is development, while the same name on `postgres` — a
 container-network service that in CI or a compose stack need not be anyone's
 development box — is `unknown` and refused. Which of the two arms matched is
-what decides whether the two writers demand `--confirm-target` below. `test` and
-`shadow` have no host-only arm: they are reached by name only, so nothing
-becomes a test database by being local.
+what decides what every policy below allows: **development by host alone is a
+classification, not a licence.** It covers every database that happens to answer
+on loopback, a deployment database reached through an SSH tunnel or a published
+container port included, so only a database whose own NAME says development is
+treated as one by any policy that writes. `test` and `shadow` have no host-only
+arm: they are reached by name only, so nothing becomes a test database by being
+local.
+
+Two rules hold before any policy is consulted, and no flag reaches either. An
+origin the guard cannot classify is refused (`unrecognised_origin`). And **the
+shadow database is refused to every one of the nine scripts**
+(`shadow_database`): Prisma's schema tooling resets it — the diff was measured
+dropping an operator's table out of the database it was pointed at and still
+exiting 2 — so nothing of value may live there and nothing may write there. Its
+mirror is `scripts/schema-diff.ts`, the guarded wrapper that runs those Prisma
+commands, and that wrapper's policy is **per mode, because the two commands do
+not address the same variable**: `diff` validates the local shadow target it is
+handed on the command line and refuses every other origin, while `create-only`
+validates `DATABASE_URL` as development-by-name and does not consume
+`SHADOW_DATABASE_URL` at all. [The schema-drift
+commands](#the-schema-drift-commands) has the measurements behind that split.
 
 | Policy | Scripts | Rule |
 | --- | --- | --- |
-| `development_or_confirmed` | `catalog:load`, `recipes:seed` | The run is refused at module load with code `confirmation_required` unless `--confirm-target <dbname>` names that URL's database exactly. The one case that needs no flag is a database whose own **name** says development (`_dev`, with or without a clone index) on a local host; a local database named anything else is development by its host alone and is confirmed like a test or shadow one |
-| `development_only` | `db:seed:dev` | Only a development origin is accepted; a test, shadow or unrecognised database is refused and no flag opens the door, because this is the one script that writes user-scoped rows |
-| `any_recognised` | `catalog:import`, `catalog:generate`, `catalog:validate`, `catalog:report`, `catalog:release`, `search:benchmark` | Any origin the guard can classify is accepted; an unrecognised one is still refused |
+| `development_only` | `db:seed:dev` | Only a database whose own **name** says development (`_dev`, optionally with a clone index) on a local host. A test, shadow or unrecognised database is refused, and so is a local database named anything else — that is development by its host alone, and this is the one script that writes user-scoped rows and deletes them with `--reset-user`. No flag opens the door |
+| `development_or_test` | `catalog:import`, `catalog:generate`, `catalog:validate`, `catalog:release` | The same development-by-name rule, or a `_test` database on a local host. These four **mutate** shared catalog data, and a catalog is built on a development machine, reviewed as a release and installed elsewhere by `catalog:load` — so there is no confirmation door here either. A loopback database whose name says nothing about development is refused |
+| `development_or_confirmed` | `catalog:load`, `recipes:seed` | Development by name needs no flag. Every other recognised origin — a `_test` database, or a loopback database named anything else — is refused at module load with `confirmation_required` unless `--confirm-target <dbname>` names that URL's database exactly. This is the door a release uses |
+| `read_only_recognised` | `catalog:report`, `search:benchmark` | Any recognised origin, including one that is development by its host alone, because these two only READ — `catalog:report`'s Prisma surface declares `findMany` and nothing else, and `search:benchmark` issues SELECTs. That is what lets the release order run `search:benchmark` on the deployment host to record that environment's own report |
 
 The flag is never needed when the database's own name says development — `_dev`,
 with or without a clone index, on a local host — and against such an origin it
@@ -327,22 +350,28 @@ A name that does not match the one in `DATABASE_URL` is refused
 (`confirmation_required`), so the flag cannot be satisfied by habit — it has to
 be the name of the database actually being written.
 
-Two consequences are worth carrying into a deployment. A `DATABASE_URL` naming a
-remote host — a deployed environment's own database — is `unknown` whatever it
+Three consequences are worth carrying into a deployment. A `DATABASE_URL` naming
+a remote host — a deployed environment's own database — is `unknown` whatever it
 is called, so it is refused with `unrecognised_origin` before any policy runs
-and no flag reaches it; and a database reached over loopback is `development` on
-the host alone, which is a classification and not a licence — its name says
-nothing about it, so both writers refuse it with `confirmation_required` until
-`--confirm-target` names it exactly. Loading a release into a deployed
-environment therefore has one supported shape, and
-[`release-and-recovery.md`](./release-and-recovery.md#release-order) publishes
-it as step 4 — run on the deployment host, read the target back to learn which
-name to type, and pass `--confirm-target` to both writers, which is what the
-guard will hold you to.
+and no flag reaches it. A database reached over loopback is `development` on the
+host alone, which is a classification and not a licence — its name says nothing
+about it, so both writers refuse it with `confirmation_required` until
+`--confirm-target` names it exactly. And the four `development_or_test` build
+stages refuse it outright, with no flag to pass: `catalog:import`,
+`catalog:generate`, `catalog:validate` and `catalog:release` are development-
+machine stages, and the only sanctioned way catalog data reaches a shared
+environment is a reviewed release loaded by `catalog:load`.
 
-`SHADOW_DATABASE_URL` is needed only by `npx prisma migrate dev --create-only`
-and `npx prisma migrate diff`, both of which reset the database they point at.
-Give development, test and shadow three separate local databases.
+Loading a release into a deployed environment therefore has one supported shape,
+and [`release-and-recovery.md`](./release-and-recovery.md#release-order)
+publishes it as step 4 — run on the deployment host, read the target back to
+learn which name to type, and pass `--confirm-target` to both writers, which is
+what the guard will hold you to.
+
+`SHADOW_DATABASE_URL` belongs to the `diff` mode of the schema-drift wrapper
+below — the only command that reads it — and that command resets the database it
+points at; `create-only` resets `DATABASE_URL`'s database instead. Give
+development, test and shadow three separate local databases.
 
 The guard's siblings under `scripts/lib/` are libraries the entry points import,
 not commands:
@@ -356,6 +385,96 @@ not commands:
 | `checkpoint.ts` | Run state in `catalog_import_runs`, so an interrupted stage resumes instead of restarting |
 | `budget.ts` | The model-call ledger — reserve before spending, never released on failure ([`catalog-policy.md`](./catalog-policy.md)) |
 | `logger.ts` | Structured output that never prints a secret — not `DATABASE_URL`'s password, not USDA's `api_key` query parameter, not OpenRouter's bearer token |
+
+## The schema-drift commands
+
+Two Prisma commands **reset the database they are given**: `migrate diff
+--from-migrations`, which replays the migration ledger onto a throwaway database
+to compare it with `prisma/schema.prisma`, and `migrate dev --create-only`,
+which authors a new migration. Run raw, their target is whatever a shell
+variable happens to hold — and the loss is silent: measured against prisma
+6.9.0 on PostgreSQL 16.15, the diff **dropped an operator's table** out of the
+database it was pointed at and still exited 2, reporting success.
+
+So neither is run raw. `scripts/schema-diff.ts` is the only sanctioned caller —
+it is the mirror of the origin guard's shadow rule above, and the entry point
+that rule's refusal names. **One policy, stated per mode:** `diff` validates the
+local shadow target; `create-only` validates `DATABASE_URL` as
+development-by-name.
+
+```bash
+# The 0.9.1 schema-drift capture. Stdout is the SQL and nothing else.
+SHADOW_DATABASE_URL=postgresql://<user>@127.0.0.1:5432/soh_shadow \
+  npx ts-node --project tsconfig.scripts.json scripts/schema-diff.ts diff \
+  > /tmp/schema-diff.sql
+
+# Author a migration without applying it.
+npx ts-node --project tsconfig.scripts.json scripts/schema-diff.ts \
+  create-only --name <migration_name>
+```
+
+Before either command is spawned, the wrapper classifies the URL with
+`scripts/lib/dbGuard.ts` and then **reads the target back over a real
+connection**, because a string cannot answer the questions that matter: the
+database reached must be the one the URL names, an unqualified statement must
+resolve in `public` (a role or database default can move `search_path` where no
+URL shows it), and — for the database the command resets — **no ordinary or
+partitioned base table in the reached `public` schema may hold a row**. That
+last one is an occupancy statement about the tables of that one schema rather
+than a guarantee that the database is empty: a row sitting in another schema of
+the same database is outside what the check enumerates. Every refusal ends the
+run with **no Prisma verdict produced**. It also deletes `DATABASE_URL` from the
+diff's child environment, which that command does not need, so a deployment URL
+sitting in the shell cannot be reached by it.
+
+The occupancy certification **fails closed against row-level security**, which
+is the one way an occupied table can answer "empty". Measured on PostgreSQL
+16.15: a `NOSUPERUSER NOBYPASSRLS` role owning `public.operator_rows`, one row
+in it, `ENABLE` plus `FORCE ROW LEVEL SECURITY` and a `USING (false)` policy —
+`EXISTS (SELECT 1 FROM "public"."operator_rows")` answered **false**, and the
+replay dropped the relation and the row nobody could see. An owner can drop what
+a policy hides from it, so the check now runs with `row_security = off`, refuses
+a relation carrying `relrowsecurity` or `relforcerowsecurity` outright, and
+treats an occupancy question it cannot get an answer to as a refusal rather than
+as an empty target.
+
+**Which variable each mode guards is not symmetric, and it is measured.** The
+diff takes the shadow database on its command line, so `SHADOW_DATABASE_URL` is
+what it classifies. `migrate dev --create-only` has **no
+`--shadow-database-url` flag** and `prisma/schema.prisma` declares no
+`shadowDatabaseUrl`, so it does not read `SHADOW_DATABASE_URL` at all — it
+creates and drops a temporary shadow database on the `DATABASE_URL` server, and
+resets that database itself if it finds drift. That mode is therefore held to
+the strictest policy in the table above: a database whose own **name** says
+development, on a local host, with no confirmation flag.
+
+Exit codes — Prisma's own verdicts passed through unchanged, because
+[`expected-schema-diff.sql`](./expected-schema-diff.sql) and the CI gate both
+decide on them, plus the wrapper's own `3`. **They are the wrapper's codes, not
+the raw command's:** because the read-back runs first, the connection,
+authentication and missing-database failures that are raw Prisma's `1` are this
+wrapper's `3`, and it exits that way without invoking Prisma at all (measured:
+`SHADOW_DATABASE_URL` on an unreachable port exits 3 with no Prisma process).
+
+| Code | Meaning |
+| --- | --- |
+| `2` | Prisma ran and found differences. **The expected result**, what the committed capture records, and what the gate tests for |
+| `0` | Prisma ran and found none: the ledger and the datamodel agree, so the committed capture is stale or the construct it records is gone from the migration. (`create-only` reports success with this code) |
+| `1` | Prisma itself failed **after** the read-back had already succeeded: `P3006`, a migration that does not replay cleanly, or the target changing between the read-back and the run. A **non-empty** shadow database is not one of them — raw, that case exits 2 and destroys the content, which is why the wrapper refuses it first |
+| `3` | **Every wrapper refusal**, with no Prisma verdict produced: a URL the guard refused; a read-back that could not connect, authenticate or find the database (`P1001`, `P1003`, `P1000`); a database or schema that was not the one the URL names; the occupancy or row-security refusal; or a Prisma CLI that could not be started |
+
+Only the string-level refusals happen with nothing opened — a missing,
+unparsable, target-changing or percent-encoded URL, or one that is not a shadow
+origin. The read-back refusals, the occupancy and row-security refusals and a
+Prisma CLI that will not start all happen after a connection was opened and
+closed again. What every one of them shares is the claim worth relying on: **no
+Prisma verdict was produced.**
+
+The capture is compared as a whole file, comment and blank lines stripped from
+both sides, by the `Schema-drift evidence gate` step of
+`.github/workflows/ci.yml`, which invokes this wrapper against a shadow database
+it creates for the run. That file's own header carries the regeneration command
+and what the payload covers.
 
 ## `bootstrap.ts` and the DNS ordering
 

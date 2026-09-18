@@ -73,13 +73,34 @@ jobs:
       # the database the previous step applied the ledger to, and compares the
       # result with `pg-catalog-expected`. That comparison is not redundant:
       # Prisma's schema describer leaves expression indexes, index predicates
-      # and scalar-list NOT NULL out of both sides of its diff, so the
-      # lower(alias) index, the five partial-index predicates and the required
-      # array nullability are invisible to the first one.
+      # and scalar-list NOT NULL out of both sides of its diff, so the three
+      # ASCII-fold expression indexes the search prefix branches read, the
+      # partial-index predicates and the required array nullability are
+      # invisible to the first one.
       #
-      # Both comparisons fail on any difference in either direction. Each file's
-      # header documents its own command for local use; the node helpers below
-      # stand in for psql, which the runner does not have.
+      # Both comparisons fail on any difference in either direction, and each
+      # file's header documents its own command for local use.
+      #
+      # The two helpers below are node + `pg` rather than psql, and not for want
+      # of a client: `ubuntu-latest` ships the PostgreSQL 16 client tools. They
+      # are written this way because they depend on no image-provided tooling -
+      # only the `pg` package `npm ci` above already installs, so this gate
+      # cannot break on a runner image that drops or moves a binary - and
+      # because the second one ASSERTS ON THE SHAPE of what it reads, which
+      # `psql -tA` cannot. It runs the committed section inside `BEGIN
+      # TRANSACTION READ ONLY`, so a write introduced into that section fails
+      # instead of reaching the database, and it refuses the section unless all
+      # four of these hold: it is ONE statement (`pg` answers several with an
+      # array of results); the result carries EXACTLY ONE field descriptor; that
+      # descriptor is NAMED `line`; and its `dataTypeID` is PostgreSQL's `text`
+      # (OID 25). The last three are read off the result's own descriptors
+      # rather than inferred from the values, which is what makes them assertions
+      # about the query: `line` selected beside a second column is refused
+      # instead of rendered. The values are then checked too - a text column
+      # still yields null for a NULL - and every refusal names the condition it
+      # failed and what it found. The output is byte-identical to `psql -tA`, so
+      # the local command in each file's header and this gate compare the same
+      # bytes.
       - name: Schema-drift evidence gate
         run: |
           # Actions runs this under `bash -e`; set it here too so the script
@@ -94,7 +115,12 @@ jobs:
 
           BASE="${DATABASE_URL%%\?*}"
           ADMIN_URL="${BASE%/*}/postgres"
-          SHADOW_URL="${BASE}_schema_evidence"
+          # The name must END in `_shadow` (a clone index after it is allowed):
+          # scripts/schema-diff.ts classifies this URL with
+          # scripts/lib/dbGuard.ts, which recognises a shadow database by that
+          # suffix on a local host and refuses everything else. The older
+          # `_schema_evidence` name was refused with `shadow_required`.
+          SHADOW_URL="${BASE}_shadow"
 
           for evidence in "$DIFF_EVIDENCE" "$CATALOG_EVIDENCE"; do
             if [ ! -f "$evidence" ]; then
@@ -192,20 +218,42 @@ jobs:
           PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "DROP DATABASE IF EXISTS ${SHADOW_URL##*/}" || exit 1
           PGURL="$ADMIN_URL" node "$WORK/run-sql.js" <<< "CREATE DATABASE ${SHADOW_URL##*/}" || exit 1
 
+          # Through scripts/schema-diff.ts rather than as a raw `npx prisma
+          # migrate diff`, because that command RESETS the database it is given
+          # and this step hands it a URL derived from an environment variable.
+          # The wrapper classifies that URL with scripts/lib/dbGuard.ts, reads
+          # the target back over a connection - the database and schema reached
+          # must be the ones the URL names, and no ordinary or partitioned base
+          # table in the reached `public` schema may hold a row, which is an
+          # occupancy statement about the tables of that one schema rather than
+          # a guarantee that the database is empty - and only then spawns Prisma
+          # with the argument list above fixed in code. Its own diagnostics go
+          # to stderr, so stdout is the SQL and nothing else; it deletes
+          # DATABASE_URL from the child environment, which the diff does not
+          # need; and it passes Prisma's exit code through unchanged, so the
+          # requirement below is the same requirement.
+          #
           # --exit-code makes 2 the success case here: it means the datamodel
           # and the ledger differ, which is exactly what the evidence records.
           set +e
-          npx prisma migrate diff \
-            --from-migrations prisma/migrations \
-            --to-schema-datamodel prisma/schema.prisma \
-            --shadow-database-url "$SHADOW_URL" \
-            --exit-code --script > "$WORK/actual.sql"
+          SHADOW_DATABASE_URL="$SHADOW_URL" \
+            npx ts-node --project tsconfig.scripts.json scripts/schema-diff.ts diff \
+            > "$WORK/actual.sql"
           diff_exit=$?
           set -e
           if [ "$diff_exit" -ne 2 ]; then
-            echo "prisma migrate diff exited $diff_exit; the gate expects 2 (differences found)."
-            echo "0 means $DIFF_EVIDENCE is stale, or the construct it records is gone from the migration."
-            echo "1 means the command itself failed."
+            echo "scripts/schema-diff.ts diff exited $diff_exit; the gate expects 2 - Prisma ran and found"
+            echo "differences, which is what the committed evidence records."
+            echo "0 means Prisma ran and found none, so $DIFF_EVIDENCE is stale, or the construct it records"
+            echo "is gone from the migration."
+            echo "1 means Prisma itself failed AFTER the read-back had already succeeded: a migration that does"
+            echo "not replay onto the shadow database (P3006), or the target changing between the read-back and"
+            echo "the run."
+            echo "3 means the wrapper stopped the run and Prisma produced no verdict at all - EVERY refusal it"
+            echo "makes exits 3: SHADOW_DATABASE_URL refused by the guard; a read-back that could not connect,"
+            echo "authenticate or find the database; a database or schema that was not the one the URL names; a"
+            echo "reached schema this session cannot certify empty; or a Prisma CLI that could not be started."
+            echo "The reason is on stderr above."
             cat "$WORK/actual.sql"
             exit 1
           fi
@@ -227,6 +275,12 @@ jobs:
           // Resolved from the checkout, for the same reason as run-sql.js above.
           const { Client } = require(require('path').join(process.cwd(), 'node_modules', 'pg'));
 
+          // PostgreSQL's own OID for `text`, from pg_type: the value `pg`
+          // reports in each field descriptor's dataTypeID. Fixed by the catalog,
+          // so it is safe to compare against a literal.
+          const TEXT_TYPE_OID = 25;
+          const EVIDENCE_COLUMN = 'line';
+
           const sql = require('fs').readFileSync(0, 'utf8');
           const client = new Client({ connectionString: process.env.PGURL });
 
@@ -243,9 +297,61 @@ jobs:
               throw new Error('the extraction must be one SELECT, not several statements');
             }
 
-            const lines = result.rows.map((row) => row.line);
-            if (lines.some((line) => typeof line !== 'string')) {
-              throw new Error('the extraction must select exactly one text column, named "line"');
+            // THE SHAPE, off the result's own field descriptors rather than off
+            // the values. `pg` returns one descriptor per selected column with
+            // the column's name and PostgreSQL type OID, and reading them is
+            // what makes this an assertion about the QUERY: a section that
+            // selects `line` beside a second column, or renames the column, or
+            // returns something other than text under that name, would render
+            // rows that compare against the committed expectation while
+            // measuring something else. Each refusal names the condition that
+            // failed and what it found.
+            const fields = Array.isArray(result.fields) ? result.fields : [];
+            if (fields.length !== 1) {
+              throw new Error(
+                'the extraction must select exactly one column; this one returned ' +
+                  fields.length +
+                  ' (' +
+                  (fields.map((field) => field.name).join(', ') || 'no columns at all') +
+                  ')',
+              );
+            }
+            if (fields[0].name !== EVIDENCE_COLUMN) {
+              throw new Error(
+                'the extraction must name its single column "' +
+                  EVIDENCE_COLUMN +
+                  '"; this one named it "' +
+                  fields[0].name +
+                  '"',
+              );
+            }
+            if (fields[0].dataTypeID !== TEXT_TYPE_OID) {
+              throw new Error(
+                'the extraction must select "' +
+                  EVIDENCE_COLUMN +
+                  '" as PostgreSQL text (type OID ' +
+                  TEXT_TYPE_OID +
+                  '); this one selected type OID ' +
+                  fields[0].dataTypeID,
+              );
+            }
+
+            // And the values under that descriptor, which the shape check above
+            // does not cover: a text column still yields null for a NULL, and
+            // rendering that as the empty string would compare an absence as
+            // content.
+            const lines = result.rows.map((row) => row[EVIDENCE_COLUMN]);
+            const nullRow = lines.findIndex((line) => typeof line !== 'string');
+            if (nullRow !== -1) {
+              throw new Error(
+                'the extraction returned a non-string value in "' +
+                  EVIDENCE_COLUMN +
+                  '" at row ' +
+                  (nullRow + 1) +
+                  ' (' +
+                  (lines[nullRow] === null ? 'SQL NULL' : typeof lines[nullRow]) +
+                  '); every evidence line must be text the database really holds',
+              );
             }
 
             process.stdout.write(lines.join('\n') + '\n');

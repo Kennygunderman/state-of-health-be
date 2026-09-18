@@ -1024,6 +1024,13 @@ describe('migration ledgers', () => {
     // soh_test_<index> or CI's plainly named one.
     const ledgerADatabase = `${capability.ambientDatabase}_ledger_a_test`;
     const ledgerBDatabase = `${capability.ambientDatabase}_ledger_b_test`;
+    // The intermediate pair, and the reason there is one: the two orders above
+    // each run the WHOLE ledger, so a construct a later entry adds to or removes
+    // from both of them agrees on both whatever the operator copy did with it.
+    // These two hold the init schema plus exactly one file — the authoritative
+    // feature migration on one, the copy on the other — and nothing after it.
+    const authoritativeOnlyDatabase = `${capability.ambientDatabase}_ledger_c_test`;
+    const manualOnlyDatabase = `${capability.ambientDatabase}_ledger_d_test`;
     const connection = connectionOf(ambientUrl);
 
     const fixture = readFixture();
@@ -1060,6 +1067,8 @@ describe('migration ledgers', () => {
     let manualCopyNotices: string[] = [];
     let catalogueBeforeManualCopy: string[] = [];
     let catalogueAfterManualCopy: string[] = [];
+    let catalogueAfterAuthoritativeFeature: string[] = [];
+    let catalogueAfterManualCopyAlone: string[] = [];
     let dumpRunner: SchemaDumpRunner | null = null;
 
     const outcomeOf = (ledger: LedgerOutcome | null, label: string): LedgerOutcome => {
@@ -1097,6 +1106,21 @@ describe('migration ledgers', () => {
         return { url, loadedRows, fingerprints };
     };
 
+    // Brings a disposable database up on the init schema plus exactly ONE ledger
+    // file, applied directly rather than through `migrate deploy`, and returns
+    // its catalogue. No fixture and no `migrate resolve`: this measures what one
+    // file does to a schema, so anything that would let a second file run is
+    // deliberately absent.
+    const catalogueAfterLedgerFile = async (database: string, sqlPath: string): Promise<string[]> => {
+        await recreateDatabase(maintenanceUrl, database);
+        const url = databaseUrlFor(ambientUrl, database);
+
+        await applyLedgerFile(url, INIT_SQL);
+        await applyLedgerFile(url, sqlPath);
+
+        return readCatalogue(url);
+    };
+
     const finishLedger = async (
         url: string,
         database: string,
@@ -1126,7 +1150,7 @@ describe('migration ledgers', () => {
     beforeAll(async () => {
         // Refuse before creating anything if the derived names are not what this
         // suite is allowed to destroy. The ambient database is never a target.
-        for (const database of [ledgerADatabase, ledgerBDatabase]) {
+        for (const database of [ledgerADatabase, ledgerBDatabase, authoritativeOnlyDatabase, manualOnlyDatabase]) {
             if (database === capability.ambientDatabase) {
                 throw new Error(`refusing to use the ambient database '${database}' as a disposable ledger database`);
             }
@@ -1218,10 +1242,20 @@ describe('migration ledgers', () => {
             deployB,
             redeployB,
         );
+
+        // The intermediate comparison — the copy against the migration it copies,
+        // each alone. Both orders above finish on the whole ledger, which
+        // includes 20260910000000_catalog_prefix_fold_indexes, and that entry
+        // drops the alias index the copy is supposed to reproduce; on those two
+        // databases the index is therefore absent whatever the copy did with it,
+        // so their agreement about it says nothing. These two run one file each
+        // and stop, which is where that claim can still be measured.
+        catalogueAfterAuthoritativeFeature = await catalogueAfterLedgerFile(authoritativeOnlyDatabase, FEATURE_SQL);
+        catalogueAfterManualCopyAlone = await catalogueAfterLedgerFile(manualOnlyDatabase, MANUAL_SQL);
     }, 900_000);
 
     afterAll(async () => {
-        for (const database of [ledgerADatabase, ledgerBDatabase]) {
+        for (const database of [ledgerADatabase, ledgerBDatabase, authoritativeOnlyDatabase, manualOnlyDatabase]) {
             if (database !== capability.ambientDatabase && isTestDatabaseName(database)) {
                 await dropDatabase(maintenanceUrl, database);
             }
@@ -1336,6 +1370,63 @@ describe('migration ledgers', () => {
         });
     });
 
+    // What Agent Action Plan 0.1.4 C3 actually claims about
+    // prisma/manual-migrations/meal-planning/001_meal_planning.sql is that it is
+    // 20260908000000_meal_planning's DDL written idempotently — an equivalence
+    // between one file and one migration, which the two whole-ledger orders
+    // below cannot see on their own. They compare two databases that have each
+    // run every entry, so a construct a later entry adds to both, or removes
+    // from both, matches on both however the copy behaved. This pair is the
+    // direct measurement: the init schema plus one file, compared before
+    // anything later runs.
+    describe('the manual reference copy measured against the migration it copies', () => {
+        it('produces the same catalogue as the authoritative migration, before any later entry runs', () => {
+            expect(symmetricDifference(catalogueAfterAuthoritativeFeature, catalogueAfterManualCopyAlone)).toEqual({
+                onlyInFirst: [],
+                onlyInSecond: [],
+            });
+        });
+
+        it('creates the alias index the authoritative migration creates, so losing it from both cannot pass', () => {
+            const lowerAliasIndexLines = (catalogue: string[]): string[] =>
+                catalogue.filter((line) => line.includes('idx_catalog_food_aliases_lower_alias'));
+
+            const authoritative = lowerAliasIndexLines(catalogueAfterAuthoritativeFeature);
+            const copy = lowerAliasIndexLines(catalogueAfterManualCopyAlone);
+
+            // The non-vacuity guard for the case that made this describe
+            // necessary. The copy's statement for this index is the one place it
+            // is conditional on the schema it meets — it skips when
+            // 20260910000000_catalog_prefix_fold_indexes' replacement index is
+            // already there — and a guard that never took its creating branch
+            // would leave the catalogue comparison above perfectly happy, since
+            // neither of these databases would have the index. Asserting the
+            // expression and the operator class positively on BOTH sides is what
+            // distinguishes "the copy reproduced the migration" from "neither
+            // has it".
+            expect(authoritative).toHaveLength(1);
+            expect(copy).toHaveLength(1);
+            for (const line of [...authoritative, ...copy]) {
+                expect(line).toContain('lower(alias)');
+                expect(line).toContain('text_pattern_ops');
+            }
+            expect(copy).toEqual(authoritative);
+        });
+
+        it('does not create the replacement fold indexes, which are a later entry´s work', () => {
+            const foldIndexLines = (catalogue: string[]): string[] =>
+                catalogue.filter((line) => /INDEX \S+ idx_catalog_(food_aliases|foods)_fold_/.test(line));
+
+            // The other half of the guard's story: the copy must not reach
+            // forward either. If it created the fold indexes itself, its own
+            // guard would then skip the alias index on a pre-feature schema and
+            // the equivalence above would fail — so this pins the boundary
+            // rather than restating it.
+            expect(foldIndexLines(catalogueAfterAuthoritativeFeature)).toEqual([]);
+            expect(foldIndexLines(catalogueAfterManualCopyAlone)).toEqual([]);
+        });
+    });
+
     describe('the manual reference copy applied by hand and then resolved', () => {
         it('loads the whole fixture into a database holding only the init migration', () => {
             const outcome = outcomeOf(ledgerB, 'B');
@@ -1414,7 +1505,7 @@ describe('migration ledgers', () => {
 
         it('declares the alias index with the same text_pattern_ops class under both', () => {
             const aliasIndexLines = (catalogue: string[]): string[] =>
-                catalogue.filter((line) => line.includes('idx_catalog_food_aliases_lower_alias'));
+                catalogue.filter((line) => line.includes('idx_catalog_food_aliases_fold_alias'));
 
             const a = aliasIndexLines(outcomeOf(ledgerA, 'A').catalogue);
             const b = aliasIndexLines(outcomeOf(ledgerB, 'B').catalogue);
@@ -1426,9 +1517,9 @@ describe('migration ledgers', () => {
             // to the authoritative migration here — and the class is a
             // correctness property, not a preference: without
             // `text_pattern_ops` the index cannot serve the left-anchored
-            // `lower(alias) LIKE` predicate `catalog.service.ts` wrote it for,
-            // because the collation of a database created the ordinary way is
-            // not C. `pg_indexes.indexdef`, which `readCatalogue` records, does
+            // `translate(alias, …) LIKE` predicate `catalog.service.ts` wrote it
+            // for, because the collation of a database created the ordinary way
+            // is not C. `pg_indexes.indexdef`, which `readCatalogue` records, does
             // carry the class, so the comparison can see it; the pg_catalog
             // sections of `docs/meal-planning/schema-catalog-evidence.sql` are
             // what pin it against the ledger being wrong in the same way twice.

@@ -63,9 +63,14 @@ import {
     resolveTargetRouteForBodyStep,
     resolveTargetRouteForUpdate,
     routeStepOrder,
+    SETUP_STATUSES,
+    SETUP_STEPS,
     SetupAnswerFacts,
+    SetupStateRow,
+    setupStateOf,
     SetupStateSnapshot,
     SetupStepContext,
+    TARGET_ROUTES,
     slotsForSchedule,
     STONE_TO_KILOGRAMS,
     stoneToKilograms,
@@ -2557,6 +2562,8 @@ describe('parsePreferencesUpdate', () => {
         });
 
         it('refuses a save that edits nothing, which would bump the revision for no change', () => {
+            // `parseUpdate` supplies the required zone, and this context supplies
+            // no stored one — so nothing here can be established as a change.
             expect(codesFor(parseUpdate({ expectedRevision: 4 }, updateContext()), 'body')).toEqual([
                 PREFERENCE_FIELD_CODES.REQUIRED,
             ]);
@@ -2605,14 +2612,100 @@ describe('parsePreferencesUpdate', () => {
             });
         });
 
-        it('treats a zone-only body as the envelope rather than as an edit', () => {
-            // Refusing it is the point: the zone and the pinned revision are what
-            // every full save carries, so a body holding nothing else would bump
-            // the revision — invalidating every other client's pinned value — for
-            // no change at all.
-            const verdict = parsePreferencesUpdate({ timeZone: ZONE, expectedRevision: 4 }, updateContext());
+        // WHETHER A ZONE-ONLY BODY EDITS ANYTHING IS THE STORED ZONE'S ANSWER.
+        // The zone is a column like any other, and re-sending it on a full save
+        // is the only channel the contract gives a client for reconciling a
+        // device that has moved (AAP 0.5.2;
+        // `mobile/src/screens/PlanSettings/index.util.ts::reconcilePreferencesTimeZone`
+        // is the caller). Reading the key as pure envelope refused that save as
+        // empty, so the stored calendar could never be refreshed and every date
+        // the server derived stayed in a zone the user had left.
+        it('accepts a zone-only body whose zone differs from the stored one', () => {
+            const verdict = parsePreferencesUpdate(
+                { timeZone: 'Europe/Lisbon', expectedRevision: 4 },
+                updateContext({ currentTimeZone: ZONE }),
+            );
+
+            expect(payloadOf(verdict, normalizeTimeZone('Europe/Lisbon'))).toEqual({
+                expectedRevision: 4,
+            });
+        });
+
+        it('accepts a zone-only body when the row holds no zone at all', () => {
+            // A column that predates the contract's requirement: null is the row
+            // being empty, which any usable zone changes.
+            const verdict = parsePreferencesUpdate(
+                { timeZone: ZONE, expectedRevision: 4 },
+                updateContext({ currentTimeZone: null }),
+            );
+
+            expect(payloadOf(verdict)).toEqual({ expectedRevision: 4 });
+        });
+
+        it('refuses a zone-only body whose zone the row already holds', () => {
+            // The invariant the acceptance above must not cost: a body that
+            // changes nothing would still bump the revision and invalidate every
+            // other client's pinned value for no change at all.
+            const verdict = parsePreferencesUpdate(
+                { timeZone: ZONE, expectedRevision: 4 },
+                updateContext({ currentTimeZone: ZONE }),
+            );
 
             expect(codesFor(verdict, 'body')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+        });
+
+        it('compares the CANONICAL zone, so an alias of the stored zone is not an edit', () => {
+            // `Etc/UTC` and `UTC` are one calendar under two names. Comparing the
+            // raw strings would read the alias as a change and store a revision
+            // bump for a zone the row already held.
+            const verdict = parsePreferencesUpdate(
+                { timeZone: 'Etc/UTC', expectedRevision: 4 },
+                updateContext({ currentTimeZone: normalizeTimeZone('UTC') }),
+            );
+
+            expect(codesFor(verdict, 'body')).toEqual([PREFERENCE_FIELD_CODES.REQUIRED]);
+        });
+
+        it('refuses a zone-only body with no zone as both empty and missing its zone', () => {
+            // Nothing to compare and nothing to store: the two refusals travel
+            // together, and `body` leads — the order this endpoint has always
+            // produced, which a client's field-to-control mapping depends on.
+            const verdict = parsePreferencesUpdate({ expectedRevision: 4 }, updateContext({ currentTimeZone: ZONE }));
+
+            expect(fieldsOf(verdict)).toEqual(['body', 'timeZone']);
+        });
+
+        it('keeps `body` first when a malformed revision travels with it', () => {
+            const verdict = parsePreferencesUpdate(
+                { timeZone: ZONE, expectedRevision: '4' },
+                updateContext({ currentTimeZone: ZONE }),
+            );
+
+            expect(fieldsOf(verdict)).toEqual(['body', 'expectedRevision']);
+        });
+
+        it('leaves a zone-only body that names a server-owned key refused for that key alone', () => {
+            // The body plainly was not empty, so `body: required` on top of the
+            // `read_only_field` detail would be noise about a different problem.
+            const verdict = parsePreferencesUpdate(
+                { setupStatus: 'completed', timeZone: ZONE, expectedRevision: 4 },
+                updateContext({ currentTimeZone: ZONE }),
+            );
+
+            expect(fieldsOf(verdict)).toEqual(['setupStatus']);
+        });
+
+        it('judges a body that answers something on its answers, whatever the zone does', () => {
+            // The zone rule is scoped to bodies that answer NOTHING: an edit of a
+            // real preference is an edit whether or not the zone also moved.
+            expect(
+                payloadOf(
+                    parsePreferencesUpdate(
+                        { diet: 'vegan', timeZone: ZONE, expectedRevision: 4 },
+                        updateContext({ currentTimeZone: ZONE }),
+                    ),
+                ),
+            ).toEqual({ diet: 'vegan', expectedRevision: 4 });
         });
 
         it('reports a missing zone together with a field problem, in one refusal', () => {
@@ -2894,8 +2987,9 @@ describe('parsePreferencesUpdate', () => {
 
             it('leaves an incoherent stored row alone when the body touches no member of it', () => {
                 // A row written before this rule existed must not block an
-                // unrelated edit: the diet save has nothing to do with the
-                // target, and refusing it would strand the settings screen.
+                // unrelated edit: a diet answer has nothing to do with the
+                // target, and refusing it would leave every other answer on the
+                // row unsavable until the stored tuple was repaired.
                 const verdict = parseUpdate(
                     { diet: 'vegan', expectedRevision: 4 },
                     losing({ currentWeightKg: 70 }),
@@ -3124,8 +3218,7 @@ describe('parsePreferencesUpdate', () => {
         it('lets a stored amount stand in when no preference is switched off without one', () => {
             // The other half of the rule above: unchecking the box is an answer of
             // "an amount", and the amount the row already holds is that answer —
-            // so the settings screen does not have to re-send a figure the user
-            // never edited.
+            // so a partial body need not re-send a figure the user never edited.
             const verdict = parseUpdate(
                 { noBudgetPreference: false, expectedRevision: 4 },
                 updateContext({
@@ -3544,16 +3637,42 @@ describe('parseSetupStepRequest', () => {
         );
     });
 
-    it('refuses a known-bad body even where a rule that needs the row is also applicable', () => {
-        // The defect this pins: the stage used to answer `ok` for this body
-        // because `goalWeightKg` is judged against the STORED current weight, so
-        // the service read the row for a request no row could make storable.
-        // Nothing about a stored weight turns a pace of 9 into an accepted one
-        // (AAP 0.5.2 — validation before any Prisma work).
+    it('defers a known-bad body to the row where a coherence rule is also applicable', () => {
+        // The defect this pins: the stage used to RETURN its own refusal here,
+        // naming the pace, the server-owned key and the zone — but not the
+        // target weight, which is judged against the STORED current weight and
+        // which this stage cannot see. The client marked the three it was told
+        // about, left its target untouched because nothing said otherwise, and
+        // was refused again. AAP 0.7.4 requires validate-on-press to mark every
+        // offending control at once, so a body a stored value still has a
+        // verdict on is carried to the row however malformed it already is.
         const body = goalEnvelopeBody({
             goal: 'lose',
             paceLbPerWeek: 9,
             goalWeightKg: 70,
+            setupStatus: 'completed',
+            timeZone: 'Mars/Phobos',
+        });
+
+        expect(parseSetupStepRequest('goal', body)).toEqual({ kind: 'needs_context' });
+
+        // What the client receives instead: the request-only list AND the
+        // coherence detail, in one 400, in this endpoint's order. A stored
+        // weight of 60 kg makes a 70 kg target incoherent for `lose`.
+        expect(
+            fieldsOf(parseSetupStep('goal', body, stepContext({ currentRevision: 4, currentWeightKg: 60 }))),
+        ).toEqual(['setupStatus', 'timeZone', 'paceLbPerWeek', 'goalWeightKg']);
+    });
+
+    it('answers with the request-only list alone once no coherence rule is applicable', () => {
+        // The contrast that keeps the deferral narrow: the same malformed body
+        // WITHOUT a target weight has no stored half to wait for, so it is
+        // refused for free — AAP 0.5.2 puts validation before any Prisma work,
+        // and an authenticated caller must not be able to make the server read a
+        // row per malformed attempt.
+        const body = goalEnvelopeBody({
+            goal: 'lose',
+            paceLbPerWeek: 9,
             setupStatus: 'completed',
             timeZone: 'Mars/Phobos',
         });
@@ -3575,19 +3694,34 @@ describe('parseSetupStepRequest', () => {
         );
     });
 
-    it('reports the deferred coherence detail on the next attempt, not by reading the row for this one', () => {
-        // The trade the refusal above makes, stated exactly. With a stored
-        // weight of 60 kg a target of 70 is incoherent for `lose`, so the
-        // row-backed parse names three fields where the request stage names
-        // two. The client fixes the two it was told about and learns the third
-        // on the attempt it was going to make anyway — while a body that is
-        // malformed on every attempt never reaches the database at all.
+    it('names a request-only error and a coherence error in ONE 400 rather than across two attempts', () => {
+        // The case the AAP names, at its smallest: an invalid pace the request
+        // alone refuses, beside a target weight that only the stored current
+        // weight can refuse. This stage answered `['paceLbPerWeek']` and left
+        // the user to discover `goalWeightKg` on the next round trip; now it
+        // defers, and the single 400 the client renders marks both controls.
         const body = goalEnvelopeBody({ goal: 'lose', paceLbPerWeek: 9, goalWeightKg: 70 });
 
-        expect(fieldsOf(parseSetupStepRequest('goal', body))).toEqual(['paceLbPerWeek']);
+        expect(parseSetupStepRequest('goal', body)).toEqual({ kind: 'needs_context' });
         expect(
             fieldsOf(parseSetupStep('goal', body, stepContext({ currentRevision: 4, currentWeightKg: 60 }))),
         ).toEqual(['paceLbPerWeek', 'goalWeightKg']);
+    });
+
+    it('does not defer for the row-only `step` detail, which names no control', () => {
+        // `step: not_allowed` — a non-`goal` step as the first write a user ever
+        // makes — is the row-backed parse's own detail, and it is deliberately
+        // outside the deferral predicate. No screen can mark it and no answer
+        // the user changes clears it: the wizard cannot reach a non-goal step
+        // first and a resume always re-enters at the stored marker. Deferring
+        // for it would spend a read on every malformed save of every step but
+        // one, to add a detail the screen cannot act on.
+        const body = { activityLevel: 'sprinting', timeZone: ZONE, expectedRevision: 4 };
+
+        expect(fieldsOf(parseSetupStepRequest('activity', body))).toEqual(['activityLevel']);
+        expect(fieldsOf(parseSetupStep('activity', body, stepContext({ currentRevision: null })))).toEqual(
+            ['step', 'activityLevel'],
+        );
     });
 
     it.each([
@@ -3652,10 +3786,108 @@ describe('parsePreferencesUpdateRequest', () => {
         },
     );
 
-    it('refuses a body that edits nothing but the envelope', () => {
-        expect(codesFor(parsePreferencesUpdateRequest({ timeZone: ZONE, expectedRevision: 4 }), 'body')).toEqual(
-            [PREFERENCE_FIELD_CODES.REQUIRED],
-        );
+    it('defers a body that edits nothing but the envelope, because only the row knows the zone', () => {
+        // Whether this body edits anything is not a property of the body: a zone
+        // that differs from the stored one IS an edit of `time_zone`, and it is
+        // the contract's only channel for reconciling a device that has moved
+        // (AAP 0.5.2). Answering `body: required` here refused that save
+        // outright, so the stored calendar could never be refreshed.
+        expect(parsePreferencesUpdateRequest({ timeZone: ZONE, expectedRevision: 4 })).toEqual({
+            kind: 'needs_context',
+        });
+    });
+
+    // The envelope-only bodies whose verdict NO row can change, with the fields
+    // each earns. The zone is the only thing that can make such a body an edit,
+    // so one that is absent or not a name this runtime knows edits nothing
+    // whatever the row holds.
+    const UNUSABLE_ZONE_ENVELOPES: [Record<string, unknown>, string[]][] = [
+        [{ expectedRevision: 4 }, ['body', 'timeZone']],
+        [{}, ['body', 'timeZone']],
+        [{ timeZone: 'Mars/Phobos', expectedRevision: 4 }, ['body', 'timeZone']],
+        [{ expectedRevision: 'four' }, ['body', 'expectedRevision', 'timeZone']],
+    ];
+
+    it.each(UNUSABLE_ZONE_ENVELOPES)(
+        'refuses the envelope-only body %p here, with no row read at all',
+        (body, fields) => {
+            // The BOUND on the deferral above, and the reason it costs one read
+            // rather than one per malformed attempt. Deferring these would buy
+            // an authenticated read to arrive at a 400 this stage already holds
+            // in full, which is exactly what AAP 0.5.2's "validation before any
+            // Prisma work" exists to prevent. `needs_context` is the answer for
+            // a USABLE zone only, because that is the only case the stored value
+            // can settle either way.
+            expect(fieldsOf(parsePreferencesUpdateRequest(body))).toEqual(fields);
+        },
+    );
+
+    it.each(UNUSABLE_ZONE_ENVELOPES)(
+        'answers the envelope-only body %p exactly as the row-backed parse would',
+        (body) => {
+            // What makes answering here SAFE rather than merely cheap: both
+            // stages produce the same details, so the client reads the same 400
+            // whichever one decided it. A divergence would mean a control the
+            // screen learns about only on a later attempt — the defect the
+            // merged-400 rule exists to remove.
+            expect(fieldsOf(parsePreferencesUpdateRequest(body))).toEqual(
+                fieldsOf(parsePreferencesUpdate(body, updateContext({ currentTimeZone: ZONE }))),
+            );
+        },
+    );
+
+    it('defers a pace sent without a goal, whose verdict the stored goal decides', () => {
+        // The other orientation of the goal/pace pair. `effectiveGoal` falls
+        // back to the stored goal, so a numeric pace against a stored `maintain`
+        // is `not_allowed` — and only the row knows that. Answering the diet
+        // alone here would mark one control and leave the pace to a second
+        // refusal the user was never warned about (AAP 0.7.4).
+        const body = { paceLbPerWeek: 1, diet: 'carnivore', timeZone: ZONE, expectedRevision: 4 };
+
+        expect(parsePreferencesUpdateRequest(body)).toEqual({ kind: 'needs_context' });
+        expect(
+            fieldsOf(parsePreferencesUpdate(body, updateContext({ currentGoal: 'maintain' }))),
+        ).toEqual(['paceLbPerWeek', 'diet']);
+        expect(
+            codesFor(
+                parsePreferencesUpdate(body, updateContext({ currentGoal: 'maintain' })),
+                'paceLbPerWeek',
+            ),
+        ).toEqual([PREFERENCE_FIELD_CODES.NOT_ALLOWED]);
+    });
+
+    it('defers a pace cleared without a goal, which a stored direction makes required', () => {
+        // The same orientation with the opposite outcome: clearing the pace
+        // while the stored goal is directional leaves a goal no estimate can be
+        // computed from, so the row-backed parse reports it `required`. Both
+        // cases are why the pair is applicable whenever EITHER half arrives
+        // alone, not only when the goal does.
+        const body = { paceLbPerWeek: null, diet: 'carnivore', timeZone: ZONE, expectedRevision: 4 };
+
+        expect(parsePreferencesUpdateRequest(body)).toEqual({ kind: 'needs_context' });
+        expect(codesFor(parsePreferencesUpdate(body, updateContext({ currentGoal: 'lose' })), 'paceLbPerWeek')).toEqual([
+            PREFERENCE_FIELD_CODES.REQUIRED,
+        ]);
+    });
+
+    it('judges a body carrying both halves of every stored pair itself', () => {
+        // The boundary the two cases above sit against: with the goal, the pace,
+        // the current weight and the target weight all present, no rule here
+        // reads the row, so the diet is answered for free and the read is not
+        // bought.
+        expect(
+            fieldsOf(
+                parsePreferencesUpdateRequest({
+                    goal: 'lose',
+                    paceLbPerWeek: 1,
+                    weightKg: 80,
+                    goalWeightKg: 70,
+                    diet: 'carnivore',
+                    timeZone: ZONE,
+                    expectedRevision: 4,
+                }),
+            ),
+        ).toEqual(['diet']);
     });
 
     it('refuses a missing zone', () => {
@@ -3758,46 +3990,61 @@ describe('parsePreferencesUpdateRequest', () => {
     ];
 
     it.each(PAIR_RULE_EDITS)(
-        'still refuses a request-only error beside %s, whose other half the row holds',
+        'defers a request-only error beside %s, whose other half the row holds',
         (_label, edit) => {
             // Each of these bodies ALSO carries an invalid diet, and the stage
-            // used to answer `ok` for all four — sending the service to read a
-            // row for a partial `carnivore` makes unstorable whatever is in it.
-            // The diet is named now; the pair rule's own verdict follows on the
-            // next attempt (AAP 0.5.2 over 0.7.4's one-400 completeness).
+            // used to RETURN the diet alone — a 400 the screen could act on only
+            // partly, since the pair rule's own control was left unmarked and
+            // the next attempt was refused again. AAP 0.7.4 requires one 400 to
+            // mark every offending control, so a partial a stored half still
+            // bears on is carried to the row however malformed it already is.
             expect(
-                fieldsOf(
-                    parsePreferencesUpdateRequest({
-                        ...edit,
-                        diet: 'carnivore',
-                        timeZone: ZONE,
-                        expectedRevision: 4,
-                    }),
-                ),
-            ).toContain('diet');
+                parsePreferencesUpdateRequest({
+                    ...edit,
+                    diet: 'carnivore',
+                    timeZone: ZONE,
+                    expectedRevision: 4,
+                }),
+            ).toEqual({ kind: 'needs_context' });
         },
     );
 
-    it('answers exactly what the row-backed parse answers when the stored halves are coherent', () => {
-        // The HTTP contract, pinned where it is decidable: this is the body
-        // `api/preferences.test.ts` sends against a stored row whose goal,
-        // weight, pace and target agree with it, and the row-backed parse —
-        // which this change does not touch — produces the same verdict detail
-        // for detail. So the 400 the client receives did not move; only the
-        // Prisma read that used to precede it is gone.
+    it('names a request-only error and a pair-rule error in ONE 400, once the row is read', () => {
+        // What the deferral above buys, stated on the wire. A stored goal of
+        // `lose` against a stored weight of 60 kg makes a 70 kg target
+        // incoherent, and the diet is `carnivore`: both controls are named
+        // together, which is the answer the client renders. The order is this
+        // parse's own — the goal/weight/target tuple is judged before the diet —
+        // and is pinned rather than sorted, because it is what reaches the wire.
         const body = { goalWeightKg: 70, diet: 'carnivore', timeZone: ZONE, expectedRevision: 4 };
 
-        expect(parsePreferencesUpdateRequest(body)).toEqual(
-            parsePreferencesUpdate(
-                body,
-                updateContext({
-                    currentGoal: 'lose',
-                    currentWeightKg: 79,
-                    currentGoalWeightKg: 70,
-                    currentPaceLbPerWeek: 1,
-                }),
+        expect(parsePreferencesUpdateRequest(body)).toEqual({ kind: 'needs_context' });
+        expect(
+            fieldsOf(
+                parsePreferencesUpdate(
+                    body,
+                    updateContext({
+                        currentGoal: 'lose',
+                        currentWeightKg: 60,
+                        currentPaceLbPerWeek: 1,
+                        currentTimeZone: ZONE,
+                    }),
+                ),
             ),
+        ).toEqual(['goalWeightKg', 'diet']);
+    });
+
+    it('leaves a body no stored value bears on answered here, with no read at all', () => {
+        // The contrast that keeps the deferral narrow (AAP 0.5.2, validation
+        // before any Prisma work): an invalid diet on its own has no stored half
+        // to wait for, so the refusal is final and identical to what the
+        // row-backed parse would say, detail for detail.
+        const body = { diet: 'carnivore', timeZone: ZONE, expectedRevision: 4 };
+
+        expect(parsePreferencesUpdateRequest(body)).toEqual(
+            parsePreferencesUpdate(body, updateContext({ currentTimeZone: ZONE })),
         );
+        expect(fieldsOf(parsePreferencesUpdateRequest(body))).toEqual(['diet']);
     });
 
     it.each(PAIR_RULE_EDITS)(
@@ -3841,11 +4088,12 @@ describe('parsePreferencesUpdateRequest', () => {
  * The target route a full save leaves behind
  *
  * `target_route` is server-owned, and before this rule existed only a body-STEP
- * save could resolve it — so the settings screens, which edit the same answers
- * through the full save, could leave the column contradicting the answers: the
- * estimated route for a user who now declines to state a sex (whose targets
- * would then be calculated from an assumed one), or the manual route for a user
- * whose measurements are now complete.
+ * save could resolve it — yet the four answers it is derived from are all
+ * members of the full save's editable DTO, so a partial that moved one of them
+ * could leave the column contradicting the row's own answers: the estimated
+ * route for a user who now declines to state a sex (whose targets would then be
+ * calculated from an assumed one), or the manual route for a user whose
+ * measurements are now complete.
  * ------------------------------------------------------------------------- */
 
 describe('isBodyAnswerComplete', () => {
@@ -3946,8 +4194,8 @@ describe('resolveTargetRouteForUpdate', () => {
 describe('reconcileSetupStateForRoute', () => {
     it('pulls a ready-for-review user back to an answer their new route requires', () => {
         // The manual route never asks for an activity level, so a manual user who
-        // supplies a measured sex from the settings screen becomes an estimated
-        // user who is missing a required answer — and `ready_for_review` would
+        // supplies a measured sex through the full save becomes an estimated user
+        // who is missing a required answer — and `ready_for_review` would
         // otherwise promise a plan could be generated from it.
         expect(
             reconcileSetupStateForRoute(
@@ -4134,6 +4382,169 @@ describe('resolveTargetRouteForBodyStep', () => {
                 weightUnitPref: 'kg',
             }),
         ).toBe('estimated');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * setupStateOf — the stored row as the state machine reads it
+ *
+ * A pure projection with no I/O, so it belongs in this module rather than in
+ * `preferences.service.ts`, where it used to sit and be imported ACROSS service
+ * boundaries by `targets.service.ts` (Rule backend-architecture §5, §7). Two
+ * endpoints can advance the resume marker — a step save, and the manual target
+ * confirmation that AAP §0.7.4 routes through `PUT /meal-planning/targets` — and
+ * both must read the row through the same closed vocabularies. It had no test at
+ * all while it lived in the service; every branch of it is pinned here.
+ * ------------------------------------------------------------------------- */
+
+describe('setupStateOf', () => {
+    /** Every column answered, so a case can name only what it is about. */
+    const row = (overrides: Partial<SetupStateRow> = {}): SetupStateRow => ({
+        setup_status: 'in_progress',
+        setup_step: 'diet',
+        target_route: 'estimated',
+        goal: 'lose',
+        activity_level: 'lightly_active',
+        diet: 'none',
+        meal_schedule: 'three',
+        cooking_time_limit_min: 30,
+        ...overrides,
+    });
+
+    it('reads a fully answered row column for column', () => {
+        expect(setupStateOf(row())).toEqual({
+            setupStatus: 'in_progress',
+            setupStep: 'diet',
+            targetRoute: 'estimated',
+            answers: {
+                goal: 'lose',
+                activityLevel: 'lightly_active',
+                diet: 'none',
+                mealSchedule: 'three',
+                cookingTimeLimitMin: 30,
+            },
+        });
+    });
+
+    it('reads a missing row as a user who has answered nothing', () => {
+        // Not `in_progress`: there is no row to be in progress on, and
+        // `nextSetupState` creates the first state from this snapshot.
+        expect(setupStateOf(null)).toEqual({
+            setupStatus: 'not_started',
+            setupStep: null,
+            targetRoute: null,
+            answers: noAnswers(),
+        });
+    });
+
+    it.each([...Object.keys(SETUP_STATUSES)] as SetupStatus[])(
+        'reads the stored status %s as itself',
+        (setup_status) => {
+            expect(setupStateOf(row({ setup_status })).setupStatus).toBe(setup_status);
+        },
+    );
+
+    it.each([...Object.keys(SETUP_STEPS)] as SetupStep[])(
+        'reads the stored resume marker %s as itself',
+        (setup_step) => {
+            expect(setupStateOf(row({ setup_step })).setupStep).toBe(setup_step);
+        },
+    );
+
+    it.each([null, '', 'completd', 'COMPLETED', 'archived'])(
+        'reads the unreadable status %p as in progress, the cautious reading',
+        (setup_status) => {
+            // A row EXISTS, so the user has answered something; reading it as
+            // `not_started` would restart a setup that is under way, and
+            // `nextSetupState` is monotonic so it can only move forward from
+            // here. Case matters: the column is compared exactly.
+            expect(setupStateOf(row({ setup_status })).setupStatus).toBe('in_progress');
+        },
+    );
+
+    it.each([null, '', 'targets', 'Diet', 'weigh_in'])(
+        'reads the unreadable resume marker %p as no marker',
+        (setup_step) => {
+            expect(setupStateOf(row({ setup_step })).setupStep).toBeNull();
+        },
+    );
+
+    it.each([null, '', 'estimate', 'Manual', 'assumed'])(
+        'reads the unreadable route %p as no route',
+        (target_route) => {
+            // The route doubles as the record THAT the body step was answered
+            // (`PROVABLE_STEP_ANSWERS` proves it by `route !== null`), so an
+            // unrecognised value must read as unanswered rather than as a route.
+            expect(setupStateOf(row({ target_route })).targetRoute).toBeNull();
+        },
+    );
+
+    it.each([...Object.keys(TARGET_ROUTES)] as ('estimated' | 'manual')[])(
+        'reads the stored route %s as itself',
+        (target_route) => {
+            expect(setupStateOf(row({ target_route })).targetRoute).toBe(target_route);
+        },
+    );
+
+    it.each([
+        ['goal', 'shrink', 'goal'],
+        ['activity_level', 'sprinting', 'activityLevel'],
+        ['diet', 'carnivore', 'diet'],
+        ['meal_schedule', 'four', 'mealSchedule'],
+    ] as const)('reads the retired %s value %p as unanswered', (column, value, answer) => {
+        // The columns are plain TEXT with no enum and no CHECK constraint, so a
+        // value the vocabulary no longer contains is reachable. Reading it as
+        // unanswered RE-ASKS the step; carrying it forward would plan from a
+        // string nothing downstream understands.
+        expect(setupStateOf(row({ [column]: value })).answers[answer]).toBeNull();
+    });
+
+    it.each([0, 37, 29.9, 61, -30, Number.NaN, Number.POSITIVE_INFINITY])(
+        'reads the cooking limit %p, which the chips never offered, as unanswered',
+        (cooking_time_limit_min) => {
+            expect(setupStateOf(row({ cooking_time_limit_min })).answers.cookingTimeLimitMin).toBeNull();
+        },
+    );
+
+    it.each([15, 30, 45, 60])('reads the offered cooking limit %p as itself', (cooking_time_limit_min) => {
+        expect(setupStateOf(row({ cooking_time_limit_min })).answers.cookingTimeLimitMin).toBe(
+            cooking_time_limit_min,
+        );
+    });
+
+    it('reads a row whose answers are all null as answered-nothing but still in progress', () => {
+        // The shape a first `goal` save leaves an instant before its columns
+        // land, and the shape a route change reads when it newly requires a step
+        // the user was never asked.
+        expect(
+            setupStateOf(
+                row({
+                    setup_step: null,
+                    target_route: null,
+                    goal: null,
+                    activity_level: null,
+                    diet: null,
+                    meal_schedule: null,
+                    cooking_time_limit_min: null,
+                }),
+            ),
+        ).toEqual({
+            setupStatus: 'in_progress',
+            setupStep: null,
+            targetRoute: null,
+            answers: noAnswers(),
+        });
+    });
+
+    it('feeds nextSetupState directly, which is the only reason it exists', () => {
+        // The contract between the two: whatever this projection says, the
+        // transition is computed from it and nothing else, so a snapshot of a
+        // row mid-route resumes at the next required step of that route.
+        expect(nextSetupState(setupStateOf(row({ setup_step: 'diet' })), 'diet', null)).toEqual({
+            setupStatus: 'in_progress',
+            setupStep: 'dislikes',
+            targetRoute: 'estimated',
+        });
     });
 });
 

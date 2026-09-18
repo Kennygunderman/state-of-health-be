@@ -1477,12 +1477,6 @@ const CANDIDATE_IDENTITY_SAMPLE: Readonly<Record<string, string>> = {
 const MAX_READABLE_DIGEST_BYTES = 6;
 
 /**
- * The digest of `material` under the hash the document names.
- *
- * "SHA-1" as prose is `sha1` to node:crypto, and a hash node does not provide
- * fails here rather than further down as an unexplained seed mismatch.
- */
-/**
  * One code a document names, against the closed vocabulary that owns it.
  *
  * The comparison is membership rather than equality because the document names
@@ -1608,6 +1602,15 @@ const roundingNamedBy = (document: PolicyDocument, blockId: string, name: string
     return mode;
 };
 
+/**
+ * The digest of `material` under the hash the document names.
+ *
+ * The name is read, not assumed: it is lower-cased with its hyphens stripped, so
+ * the prose "SHA-1" a document writes becomes the `sha1` node:crypto answers to.
+ * A name node:crypto cannot provide raises a `gateError` naming the document,
+ * the block and the algorithm that was attempted, so the failure lands at the
+ * hash lookup rather than further down as an unexplained seed mismatch.
+ */
 const digestNamedBy = (document: PolicyDocument, blockId: string, hashName: string, material: string): Buffer => {
     const algorithm = hashName.toLowerCase().replace(/-/g, '');
 

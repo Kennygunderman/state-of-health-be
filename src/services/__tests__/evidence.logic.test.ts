@@ -62,7 +62,9 @@ import {
     EvidenceType,
     GloballyReachable,
     ParsedIpAddress,
+    REVIEWED_ALLOCATION_ROW_COUNT,
     REVIEWED_ALLOWLIST_VERSION,
+    REVIEWED_GLOBAL_UNICAST_ALLOCATIONS,
     REVIEWED_RANGE_ROW_COUNT,
     REVIEWED_RANGE_TABLE,
     REVIEWED_REGISTRY_ROW_COUNT,
@@ -88,6 +90,7 @@ import {
     hostMatchesEntry,
     isAllowedContentType,
     isEvidenceType,
+    isGloballyAllocatedUnicast,
     isGloballyRoutable,
     isHostAllowed,
     isIpLiteralHost,
@@ -102,6 +105,7 @@ import {
     resolveEvidenceFetchLimits,
     unwrapEmbeddedIpv4,
     validateEvidencePolicy,
+    validateEvidenceAllocationTable,
     validateEvidenceRangeTable,
 } from '../evidence.logic';
 
@@ -452,11 +456,39 @@ const oracleIsSpecialAddress = (address: ParsedIpAddress): boolean => {
 };
 
 /**
+ * Whether IANA has allocated the address's block to globally routable unicast —
+ * the question the special-purpose registries do not answer.
+ *
+ * Derived here from the registry pages in binary-prefix form, deliberately
+ * without reading the module's own block list or its CIDR parser, so that the
+ * neighbour sweep below compares two independent derivations of the rule rather
+ * than one implementation with itself.
+ *
+ * - IANA IPv6 Address Space (RFC 4291, formerly RFC 3513): `2000::/3` — the
+ *   addresses whose top three bits are `001` — is the only block designated
+ *   "Global Unicast". Everything else is "Reserved by IETF", unique-local
+ *   (`fc00::/7`), link-scoped (`fe80::/10`) or multicast (`ff00::/8`).
+ * - IANA IPv4 Address Space (RFC 5735, RFC 6890): unicast is everything below
+ *   `224.0.0.0`. The two blocks above it, `224.0.0.0/4` multicast and
+ *   `240.0.0.0/4` reserved, are together exactly the addresses whose top three
+ *   bits are `111`.
+ */
+const oracleIsAllocatedUnicast = (address: ParsedIpAddress): boolean => {
+    const prefix = bitsOf(address).slice(0, 3);
+    return address.version === 4 ? prefix !== '111' : prefix === '001';
+};
+
+/**
  * Whether the committed policy should consider an address routable.
  *
  * The embedded-IPv4 extraction is taken from the module (`unwrapEmbeddedIpv4`),
  * which is pinned independently with named expected values below; the *verdict*
  * on the wrapper and on every carried address is this oracle's own.
+ *
+ * A row wins wherever one covers the address, including a row the registries
+ * mark globally reachable — those are the reviewed exceptions, and `64:ff9b::/96`
+ * is one of them despite lying outside `2000::/3`. The allocation decides only
+ * the addresses no row covers.
  */
 const oracleIsRoutable = (address: ParsedIpAddress): boolean => {
     if (oracleIsSpecialAddress(address)) {
@@ -468,13 +500,17 @@ const oracleIsRoutable = (address: ParsedIpAddress): boolean => {
             return false;
         }
         const carriedRow = oracleMostSpecific(carried);
-        if (carriedRow !== null && carriedRow.globallyReachable !== true) {
+        if (carriedRow !== null) {
+            if (carriedRow.globallyReachable !== true) {
+                return false;
+            }
+        } else if (!oracleIsAllocatedUnicast(carried)) {
             return false;
         }
     }
 
     const row = oracleMostSpecific(address);
-    return row === null || row.globallyReachable === true;
+    return row !== null ? row.globallyReachable === true : oracleIsAllocatedUnicast(address);
 };
 
 const parseOrThrow = (text: string): ParsedIpAddress => {
@@ -1563,11 +1599,379 @@ describe('classifyIpAddress on addresses no registry row covers', () => {
         }
     });
 
-    it('accepts an fe00:: address, which is neither multicast nor inside fe80::/10', () => {
-        expect(isGloballyRoutable('fe00::1', committedRows)).toBe(true);
+    /**
+     * `fe00::/9` and `fec0::/10` are the case the special-purpose table cannot
+     * answer on its own: neither is multicast, neither is inside `fe80::/10`,
+     * and neither appears in either IANA special-purpose registry — so on the
+     * table alone they match nothing and read as routable. The IPv6 address
+     * space registry is what settles them: both are "Reserved by IETF", and
+     * `fec0::/10` is specifically the site-local prefix RFC 3879 deprecated,
+     * which is exactly the kind of address an internal resolver still answers
+     * with.
+     */
+    it('refuses fe00:: and fec0:: addresses, which no registry row covers and IANA has not allocated', () => {
+        expect(isGloballyRoutable('fe00::1', committedRows)).toBe(false);
+        expect(isGloballyRoutable('fec0::1', committedRows)).toBe(false);
+
+        // The neighbouring blocks that a row does cover keep answering from
+        // their rows, so the gate has not displaced the table.
         expect(isGloballyRoutable('fe80::1', committedRows)).toBe(false);
         expect(isGloballyRoutable('febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff', committedRows)).toBe(false);
-        expect(isGloballyRoutable('fec0::1', committedRows)).toBe(true);
+    });
+
+    it('names the allocation, not a row, when it refuses an unallocated address', () => {
+        const verdict = classifyIpAddress('fec0::1', committedRows);
+
+        expect(verdict.allowed).toBe(false);
+        if (!verdict.allowed) {
+            expect(verdict.reason).toBe('address_not_globally_routable');
+            expect(verdict.detail).toContain('no block IANA allocates to global unicast');
+            expect(verdict.detail).toContain('2000::/3');
+            // The verdict reports the address in the expanded form the module
+            // judged, not the text the caller wrote.
+            expect(verdict.address).toBe('fec0:0:0:0:0:0:0:1');
+        }
+    });
+
+    /**
+     * Every top-level IPv6 block the address-space registry marks "Reserved by
+     * IETF". None is covered by a special-purpose row, so before the allocation
+     * gate every one of these passed.
+     */
+    it.each([
+        // 0100::1 itself falls in the 100::/64 Discard-Only row, so a row
+        // answers it; 0101::1 is in the same reserved block and outside every row.
+        ['0101::1', '0100::/8'],
+        ['0200::1', '0200::/7'],
+        ['0400::1', '0400::/6'],
+        ['0800::1', '0800::/5'],
+        ['1000::1', '1000::/4'],
+        ['4000::1', '4000::/3'],
+        ['6000::1', '6000::/3'],
+        ['8000::1', '8000::/3'],
+        ['a000::1', 'a000::/3'],
+        ['c000::1', 'c000::/3'],
+        ['e000::1', 'e000::/4'],
+        ['f000::1', 'f000::/5'],
+        ['f800::1', 'f800::/6'],
+        ['fe00::1', 'fe00::/9'],
+        ['fec0::1', 'fec0::/10'],
+    ])('refuses %s, which sits in the reserved block %s', (address) => {
+        const verdict = classifyIpAddress(address, committedRows);
+
+        expect(verdict.allowed).toBe(false);
+        if (!verdict.allowed) {
+            expect(verdict.reason).toBe('address_not_globally_routable');
+            expect(verdict.detail).toContain('no block IANA allocates to global unicast');
+        }
+    });
+
+    it('still accepts an ordinary address inside the allocated 2000::/3', () => {
+        expect(isGloballyRoutable('2606:2800:220:1:248:1893:25c8:1946', committedRows)).toBe(true);
+        expect(isGloballyRoutable('2000::1', committedRows)).toBe(true);
+        expect(isGloballyRoutable('3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', committedRows)).toBe(true);
+    });
+
+    /**
+     * A row marked globally reachable is the reviewed exception and must survive
+     * the gate. `64:ff9b::/96` is the one that proves it: NAT64 lives in `::/8`,
+     * outside the allocated `2000::/3`, so a gate applied over the top of every
+     * row — rather than only where no row matched — would refuse the very block
+     * the registry went out of its way to declare reachable.
+     */
+    it.each([
+        ['64:ff9b::5db8:d822', '64:ff9b::/96, outside 2000::/3'],
+        ['2001:1::1', '2001:1::1/128'],
+        ['2001:3::1', '2001:3::/32'],
+        ['2620:4f:8000::1', '2620:4f:8000::/48'],
+        ['192.0.0.9', '192.0.0.9/32'],
+        ['192.175.48.1', '192.175.48.0/24'],
+    ])('keeps accepting %s, whose row (%s) the registries mark globally reachable', (address) => {
+        expect(isGloballyRoutable(address, committedRows)).toBe(true);
+    });
+});
+
+/**
+ * The allocation gate, asked directly.
+ *
+ * `validateEvidenceRangeTable` compares the table against the reviewed snapshot
+ * as a set, so a table with a row removed refuses before any address is judged.
+ * That makes `classifyIpAddress` the wrong instrument for proving the gate does
+ * not depend on the table — the proof has to ask the gate itself.
+ */
+/**
+ * The allocation as the document carries it.
+ *
+ * `globalUnicastAllocations` is the reviewed policy surface, so it gets the
+ * treatment the range table gets: its shape is validated, and it is
+ * counter-signed against the reviewed list in both directions. A document that
+ * widens the policy is the dangerous case — appending `4000::/3` restores
+ * exactly the hole the gate closes — and a document that narrows it is a
+ * reviewability failure, because the list a reviewer diffs against the registry
+ * pages would no longer be the list the classifier uses.
+ */
+describe('validateEvidenceAllocationTable', () => {
+    const committedAllocations = (): unknown[] =>
+        (cloneDocument().globalUnicastAllocations as unknown[]).slice();
+
+    it('accepts the committed allocation and returns its rows and blocks', () => {
+        const verdict = validateEvidenceAllocationTable(committedAllocations());
+
+        expect(verdict.ok).toBe(true);
+        if (verdict.ok) {
+            expect(verdict.rows.map((row) => row.cidr)).toStrictEqual([
+                '0.0.0.0/1',
+                '128.0.0.0/2',
+                '192.0.0.0/3',
+                '2000::/3',
+            ]);
+            expect(verdict.blocks).toHaveLength(REVIEWED_ALLOCATION_ROW_COUNT);
+            expect(verdict.rows.every((row) => row.registry.length > 0 && row.allocation.length > 0)).toBe(true);
+        }
+    });
+
+    it('refuses a document that widens the allocation', () => {
+        const widened = committedAllocations();
+        widened.push({ cidr: '4000::/3', allocation: 'Global Unicast', registry: 'ipv6-address-space' });
+
+        const verdict = validateEvidenceAllocationTable(widened);
+
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.detail).toContain('4000::/3');
+            expect(verdict.detail).toContain('did not allocate to global unicast');
+        }
+    });
+
+    it('refuses a document that drops a reviewed block', () => {
+        const narrowed = committedAllocations().filter(
+            (row) => (row as Record<string, unknown>).cidr !== '128.0.0.0/2',
+        );
+
+        const verdict = validateEvidenceAllocationTable(narrowed);
+
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.detail).toContain('missing the reviewed block');
+            expect(verdict.detail).toContain('128.0.0.0/2');
+        }
+    });
+
+    it('refuses a document that substitutes one block for another at the same count', () => {
+        const substituted = committedAllocations().map((row) =>
+            (row as Record<string, unknown>).cidr === '2000::/3'
+                ? { cidr: '4000::/3', allocation: 'Global Unicast', registry: 'ipv6-address-space' }
+                : row,
+        );
+
+        expect(substituted).toHaveLength(REVIEWED_ALLOCATION_ROW_COUNT);
+        expect(validateEvidenceAllocationTable(substituted).ok).toBe(false);
+    });
+
+    it.each([
+        ['not a list', 'not a list'],
+        ['an empty list', []],
+        ['a list of non-objects', ['2000::/3']],
+    ])('refuses %s', (_case, value) => {
+        expect(validateEvidenceAllocationTable(value).ok).toBe(false);
+    });
+
+    it.each([
+        ['a missing CIDR', { allocation: 'Global Unicast', registry: 'ipv6-address-space' }],
+        ['an unparsable CIDR', { cidr: 'nope/3', allocation: 'u', registry: 'r' }],
+        ['host bits set', { cidr: '2001::/3', allocation: 'u', registry: 'r' }],
+        ['a blank allocation wording', { cidr: '2000::/3', allocation: '   ', registry: 'r' }],
+        ['a blank registry name', { cidr: '2000::/3', allocation: 'u', registry: '' }],
+    ])('refuses a row with %s', (_case, row) => {
+        const rows = committedAllocations().filter(
+            (existing) => (existing as Record<string, unknown>).cidr !== '2000::/3',
+        );
+        rows.push(row);
+
+        expect(validateEvidenceAllocationTable(rows).ok).toBe(false);
+    });
+
+    /**
+     * The canonical-text check has to fire before set equality, or a hand-edited
+     * row would be reported as an unreviewed block rather than as the
+     * transcription error it is. No reviewed block contains a hex letter, so the
+     * case rule is isolated with a lettered block and asserted on its detail:
+     * reported as non-canonical text, not as a set mismatch.
+     */
+    it('refuses upper-case registry text as a transcription error, not a set mismatch', () => {
+        const rows = committedAllocations();
+        rows.push({ cidr: 'FEC0::/10', allocation: 'Reserved by IETF', registry: 'ipv6-address-space' });
+
+        const verdict = validateEvidenceAllocationTable(rows);
+
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.detail).toContain('canonical lower-case registry text');
+            expect(verdict.detail).not.toContain('did not allocate');
+        }
+    });
+
+    it('refuses a block declared twice', () => {
+        const duplicated = committedAllocations();
+        duplicated.push({ cidr: '2000::/3', allocation: 'Global Unicast', registry: 'ipv6-address-space' });
+
+        const verdict = validateEvidenceAllocationTable(duplicated);
+
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.detail).toContain('already declared');
+        }
+    });
+
+    it('refuses an allocation carrying only one family', () => {
+        const ipv6Only = committedAllocations().filter(
+            (row) => ((row as Record<string, unknown>).cidr as string).indexOf(':') !== -1,
+        );
+
+        const verdict = validateEvidenceAllocationTable(ipv6Only);
+
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            // Reported as the missing family rather than as a set mismatch: the
+            // operator needs to know no IPv4 address could be judged at all.
+            expect(verdict.detail).toContain('IPv4');
+        }
+    });
+});
+
+describe('validateEvidencePolicy on the allocation member', () => {
+    const policyWithout = (mutate: (document: Record<string, unknown>) => void): unknown => {
+        const document = cloneDocument();
+        mutate(document);
+        return document;
+    };
+
+    it('accepts the committed document and carries the validated allocation through', () => {
+        expect(committedPolicy.globalUnicastAllocationRowCount).toBe(REVIEWED_ALLOCATION_ROW_COUNT);
+        expect(committedPolicy.globalUnicastAllocations.map((row) => row.cidr)).toStrictEqual([
+            '0.0.0.0/1',
+            '128.0.0.0/2',
+            '192.0.0.0/3',
+            '2000::/3',
+        ]);
+    });
+
+    it.each([
+        [
+            'the allocation member is absent',
+            (document: Record<string, unknown>) => delete document.globalUnicastAllocations,
+        ],
+        [
+            'the allocation is widened',
+            (document: Record<string, unknown>) => {
+                (document.globalUnicastAllocations as unknown[]).push({
+                    cidr: '4000::/3',
+                    allocation: 'Global Unicast',
+                    registry: 'ipv6-address-space',
+                });
+            },
+        ],
+    ])('refuses the document when %s', (_case, mutate) => {
+        const verdict = validateEvidencePolicy(policyWithout(mutate));
+
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.reason).toBe('range_table_unclassifiable');
+        }
+    });
+
+    it.each([
+        [
+            'the declared count is absent',
+            (document: Record<string, unknown>) => delete document.globalUnicastAllocationRowCount,
+        ],
+        [
+            'the declared count disagrees with what is carried',
+            (document: Record<string, unknown>) => {
+                document.globalUnicastAllocationRowCount = REVIEWED_ALLOCATION_ROW_COUNT + 1;
+            },
+        ],
+    ])('refuses the document when %s', (_case, mutate) => {
+        const verdict = validateEvidencePolicy(policyWithout(mutate));
+
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) {
+            expect(verdict.reason).toBe('policy_invalid');
+            expect(verdict.detail).toContain('allocation');
+        }
+    });
+
+    it('leaves the range-table members it does not touch alone', () => {
+        // The allocation is a second, separate reviewed surface: adding it must
+        // not have moved the row counts or the snapshot the range table is
+        // attested by.
+        expect(committedPolicy.rowCount).toBe(REVIEWED_RANGE_ROW_COUNT);
+        expect(committedPolicy.registryRowCount).toBe(REVIEWED_REGISTRY_ROW_COUNT);
+        expect(committedPolicy.supplementalRowCount).toBe(REVIEWED_SUPPLEMENTAL_ROW_COUNT);
+        expect(committedPolicy.registrySnapshot).toBe(REVIEWED_REGISTRY_SNAPSHOT);
+    });
+});
+
+describe('isGloballyAllocatedUnicast', () => {
+    const address = (text: string): ParsedIpAddress => parseOrThrow(text);
+
+    it('carries a usable reviewed allocation, since a defect would refuse every address', () => {
+        const families = new Set<number>();
+
+        for (const entry of REVIEWED_GLOBAL_UNICAST_ALLOCATIONS) {
+            const parsed = parseCidr(entry.cidr);
+            expect(parsed).not.toBeNull();
+            expect(entry.allocation.length).toBeGreaterThan(0);
+            expect(entry.registry.length).toBeGreaterThan(0);
+            if (parsed !== null) {
+                families.add(parsed.version);
+            }
+        }
+
+        expect(new Set(REVIEWED_GLOBAL_UNICAST_ALLOCATIONS.map((entry) => entry.cidr)).size).toBe(
+            REVIEWED_GLOBAL_UNICAST_ALLOCATIONS.length,
+        );
+        expect([...families].sort()).toStrictEqual([4, 6]);
+    });
+
+    it.each([
+        ['240.0.0.1', 'the base of class E'],
+        ['255.255.255.254', 'the top of class E below the broadcast address'],
+        ['224.0.0.1', 'the base of the multicast block'],
+        ['239.255.255.255', 'the top of the multicast block'],
+    ])('refuses the IPv4 address %s (%s) without consulting the table', (text) => {
+        expect(isGloballyAllocatedUnicast(address(text))).toBe(false);
+    });
+
+    it.each([
+        ['0.0.0.1', 'the bottom of the unicast space'],
+        ['127.0.0.1', 'loopback, which is unicast space and refused by its row instead'],
+        ['169.254.169.254', 'link-local, which is unicast space and refused by its row instead'],
+        ['223.255.255.255', 'the top of the unicast space'],
+    ])('accepts the IPv4 address %s (%s), leaving the table to judge it', (text) => {
+        expect(isGloballyAllocatedUnicast(address(text))).toBe(true);
+    });
+
+    it('answers for IPv6 on the 2000::/3 boundary', () => {
+        expect(isGloballyAllocatedUnicast(address('1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'))).toBe(false);
+        expect(isGloballyAllocatedUnicast(address('2000::'))).toBe(true);
+        expect(isGloballyAllocatedUnicast(address('3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff'))).toBe(true);
+        expect(isGloballyAllocatedUnicast(address('4000::'))).toBe(false);
+    });
+
+    /**
+     * The gate answers "is this allocated to unicast", not "is this safe": a
+     * special-purpose block carved out of unicast space satisfies it, which is
+     * why the table's completeness check cannot be replaced by this one.
+     */
+    it('does not stand in for a table row', () => {
+        expect(isGloballyAllocatedUnicast(address('10.0.0.1'))).toBe(true);
+        expect(isGloballyAllocatedUnicast(address('192.168.1.1'))).toBe(true);
+        expect(isGloballyAllocatedUnicast(address('2001:db8::1'))).toBe(true);
+
+        expect(isGloballyRoutable('10.0.0.1', committedRows)).toBe(false);
+        expect(isGloballyRoutable('192.168.1.1', committedRows)).toBe(false);
+        expect(isGloballyRoutable('2001:db8::1', committedRows)).toBe(false);
     });
 });
 
@@ -1682,6 +2086,74 @@ describe('classifyAddressSet and areAllAddressesRoutable', () => {
     it('accepts parsed addresses as well as text', () => {
         expect(areAllAddressesRoutable([parseOrThrow('93.184.216.34')], committedRows)).toBe(true);
         expect(areAllAddressesRoutable([parseOrThrow('10.0.0.1')], committedRows)).toBe(false);
+    });
+
+    /**
+     * The transport-facing sentinel for the reserved-space gap.
+     *
+     * This is the function `evidence.service.ts` calls with the resolver's whole
+     * answer set, before it pins an address and before any socket is opened — a
+     * non-`allowed` verdict here is the no-connect decision. Covering the
+     * reserved blocks only through `classifyIpAddress` would leave the path that
+     * actually decides whether a request happens untested, so each
+     * representative is asserted here as well.
+     */
+    it.each([
+        ['4000::1', 'the base of the reserved 4000::/3'],
+        ['fec0::1', 'the deprecated site-local fec0::/10'],
+        ['fe00::1', 'the reserved fe00::/9'],
+    ])('refuses a lone reserved answer %s (%s), so no address is ever pinned', (address) => {
+        const verdict = classifyAddressSet([address], committedRows);
+
+        expect(verdict.allowed).toBe(false);
+        if (!verdict.allowed) {
+            expect(verdict.reason).toBe('address_not_globally_routable');
+            expect(verdict.detail).toContain('no block IANA allocates to global unicast');
+        }
+        expect(areAllAddressesRoutable([address], committedRows)).toBe(false);
+    });
+
+    /**
+     * The rebinding-shaped case: a name answering with one perfectly ordinary
+     * public address and one reserved address. The set must fail as a whole, and
+     * it must fail naming the reserved one — the service pins `addresses[0]`, so
+     * a set that passed on its first member would connect to the public address
+     * while the name stayed free to answer with the other.
+     */
+    it.each([
+        ['4000::1', 'a reserved IPv6 block'],
+        ['fec0::1', 'deprecated site-local space'],
+    ])('refuses a mixed answer set whose second address is %s (%s)', (reserved) => {
+        const verdict = classifyAddressSet(['93.184.216.34', reserved], committedRows);
+
+        expect(verdict.allowed).toBe(false);
+        if (!verdict.allowed) {
+            expect(verdict.reason).toBe('address_not_globally_routable');
+            expect(verdict.detail).toContain('no block IANA allocates to global unicast');
+        }
+
+        // ...and in the other order, so the refusal does not depend on position.
+        expect(areAllAddressesRoutable([reserved, '93.184.216.34'], committedRows)).toBe(false);
+    });
+
+    it('still accepts an answer set of ordinary public addresses', () => {
+        expect(
+            areAllAddressesRoutable(['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'], committedRows),
+        ).toBe(true);
+    });
+
+    /**
+     * The same verdicts when the caller hands in the document's own allocation
+     * rather than relying on the counter-signed reviewed list, which is the path
+     * a policy-holding caller takes.
+     */
+    it('reaches the same verdicts through the document-supplied allocation', () => {
+        const allocations = committedPolicy.globalUnicastAllocations;
+
+        expect(areAllAddressesRoutable(['4000::1'], committedRows, allocations)).toBe(false);
+        expect(areAllAddressesRoutable(['fec0::1'], committedRows, allocations)).toBe(false);
+        expect(areAllAddressesRoutable(['93.184.216.34'], committedRows, allocations)).toBe(true);
+        expect(areAllAddressesRoutable(['64:ff9b::5db8:d822'], committedRows, allocations)).toBe(true);
     });
 });
 
@@ -2743,6 +3215,59 @@ describe('parseEvidenceUrl', () => {
         });
     });
 
+    /**
+     * The policy refuses userinfo unconditionally, and an EMPTY userinfo
+     * component is the form that survives a check on the parsed fields: `URL`
+     * removes it, so every one of these arrives with `username` and `password`
+     * both `''` and a host of `nal.usda.gov`. The delimiter is what matters —
+     * it is what makes a reader or a differing parser take the wrong side of
+     * the `@` for the host — so the raw authority is what decides.
+     *
+     * The list walks the parser's own tolerances: a special scheme reaches its
+     * authority through none, one, two or many slashes and through backslashes,
+     * and WHATWG parsing strips surrounding C0 controls and spaces and removes
+     * tabs and newlines from anywhere in the input before reading any structure.
+     */
+    it.each([
+        ['an empty userinfo', 'https://@nal.usda.gov/a'],
+        ['an empty user and password', 'https://:@nal.usda.gov/a'],
+        ['a lone colon as userinfo', 'https://:@nal.usda.gov'],
+        ['no authority slashes', 'https:@nal.usda.gov/a'],
+        ['one authority slash', 'https:/@nal.usda.gov/a'],
+        ['three authority slashes', 'https:///@nal.usda.gov/a'],
+        ['backslashes for authority slashes', 'https:\\\\@nal.usda.gov/a'],
+        ['a backslash before the delimiter', 'https://nal.usda.gov\\@evil.com/a'],
+        ['surrounding whitespace', '  https://@nal.usda.gov/a  '],
+        ['an embedded tab', 'https://\t@nal.usda.gov/a'],
+        ['an embedded newline', 'https://\n@nal.usda.gov/a'],
+        ['an embedded carriage return', 'https://@nal.usda.gov\r/a'],
+    ])('refuses a URL with %s, which the parser would normalize away', (_case, rawUrl) => {
+        expect(urlRejection(parseEvidenceUrl(rawUrl))).toStrictEqual({
+            reason: 'credentials_present',
+            detail: 'the URL carries userinfo',
+        });
+    });
+
+    /**
+     * An `@` is ordinary text everywhere except authority position, and a
+     * reference page can perfectly well be at `/@handle`. Refusing those would
+     * be a false positive, so the scan stops at the first `/`, `?` or `#`.
+     */
+    it.each([
+        ['a path', 'https://nal.usda.gov/@handle'],
+        ['deeper in a path', 'https://nal.usda.gov/food/a@b'],
+        ['a query', 'https://nal.usda.gov/food?contact=a@b'],
+        ['a fragment', 'https://nal.usda.gov/food#a@b'],
+        ['a path containing a backslash', 'https://nal.usda.gov/food\\a@b'],
+    ])('accepts a URL whose @ is in %s', (_case, rawUrl) => {
+        const verdict = parseEvidenceUrl(rawUrl);
+
+        expect(verdict.allowed).toBe(true);
+        if (verdict.allowed) {
+            expect(verdict.host).toBe('nal.usda.gov');
+        }
+    });
+
     it.each([
         ['8080', 'https://nal.usda.gov:8080/a'],
         ['8443', 'https://nal.usda.gov:8443/a'],
@@ -2859,6 +3384,23 @@ describe('evaluateEvidenceUrl', () => {
             urlRejection(evaluateEvidenceUrl('https://user@nal.usda.gov/a', committedPolicy, 'canonical_identity'))
                 .reason,
         ).toBe('credentials_present');
+    });
+
+    /**
+     * The entry point the service actually calls, so the empty-userinfo refusal
+     * is pinned on the path a candidate URL really travels — not only on
+     * `parseEvidenceUrl` in isolation. The host here is allowlisted, so nothing
+     * else in the chain would have stopped it.
+     */
+    it.each([
+        ['an empty userinfo', 'https://@nal.usda.gov/a'],
+        ['an empty user and password', 'https://:@nal.usda.gov/a'],
+        ['a backslash before the delimiter', 'https://nal.usda.gov\\@evil.com/a'],
+    ])('refuses a candidate URL with %s', (_case, rawUrl) => {
+        expect(urlRejection(evaluateEvidenceUrl(rawUrl, committedPolicy, 'canonical_identity'))).toStrictEqual({
+            reason: 'credentials_present',
+            detail: 'the URL carries userinfo',
+        });
     });
 
     it('refuses the candidate when the policy document cannot be trusted', () => {
@@ -2984,6 +3526,43 @@ describe('evaluateEvidenceRedirect', () => {
         ).toBe('evidence_type_not_authorized');
     });
 
+    /**
+     * The raw `Location` is the only place a hop's userinfo is still visible:
+     * resolving it against the current URL normalizes an empty component away,
+     * so `//@nal.usda.gov/b` becomes `https://nal.usda.gov/b` and arrives at the
+     * URL checks with nothing left to refuse. The scheme-relative form is the
+     * one that matters — it needs no scheme and still replaces the authority.
+     */
+    it.each([
+        ['an absolute location with an empty userinfo', 'https://@nal.usda.gov/b'],
+        ['an absolute location with an empty user and password', 'https://:@nal.usda.gov/b'],
+        ['a scheme-relative location with an empty userinfo', '//@nal.usda.gov/b'],
+        ['a scheme-relative location naming another host as the user', '//nal.usda.gov@evil.com/b'],
+        ['a location with a backslash before the delimiter', 'https://nal.usda.gov\\@evil.com/b'],
+    ])('refuses %s', (_case, location) => {
+        expect(urlRejection(redirect('https://nal.usda.gov/a', location, 0))).toStrictEqual({
+            reason: 'credentials_present',
+            detail: 'the URL carries userinfo',
+        });
+    });
+
+    /**
+     * A path-relative `Location` has no authority at all, so an `@` in it is
+     * ordinary path text. Refusing `/@handle` would break legitimate hops.
+     */
+    it.each([
+        ['a path-relative location beginning with @', '/@handle'],
+        ['a path-relative location containing @', '/food/a@b'],
+        ['a relative location with no leading slash', '@handle'],
+    ])('follows %s', (_case, location) => {
+        const verdict = redirect('https://nal.usda.gov/a', location, 0);
+
+        expect(verdict.allowed).toBe(true);
+        if (verdict.allowed) {
+            expect(verdict.host).toBe('nal.usda.gov');
+        }
+    });
+
     it.each([
         ['an empty location', '', 'the redirect target is empty'],
         ['a whitespace location', '   ', 'the redirect target is empty'],
@@ -3071,6 +3650,8 @@ describe('validateEvidencePolicy on the committed document', () => {
             expect(Object.keys(verdict.policy).sort()).toStrictEqual([
                 'allowlistVersion',
                 'fetchLimits',
+                'globalUnicastAllocationRowCount',
+                'globalUnicastAllocations',
                 'hostClasses',
                 'registryRowCount',
                 'registrySnapshot',

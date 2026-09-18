@@ -371,25 +371,36 @@ const resolveLimit = (limit: number | undefined): number => {
  * Repetition — the week, with the meal being replaced removed
  * ------------------------------------------------------------------------- */
 
-/** The three backward-looking sets {@link violatesRepetitionRule} is asked for. */
+/**
+ * The two backward-looking sets {@link violatesRepetitionRule} is asked for —
+ * §0.7.3's two clauses and nothing else, so the swap accepts exactly the meals
+ * the generator accepts.
+ */
 interface RepetitionWindow {
     /** Remaining uses per recipe in the week, the meal being replaced excluded. */
     usesByRecipeId: ReadonlyMap<string, number>;
     /** Recipes planned on the day BEFORE or the day AFTER — see the note below. */
     adjacentDayRecipeIds: ReadonlySet<string>;
-    /** Recipes planned on the other meals of this same day. */
-    sameDayRecipeIds: ReadonlySet<string>;
 }
 
 /**
  * Derives the repetition window for this swap.
  *
- * THE REMOVAL is the rule: the meal being replaced is dropped from the week
- * before anything is counted, so it never counts against itself. Its slot is
- * about to be empty, and a recipe already planned twice in the week — where one
- * of those two uses IS this meal — is a perfectly legal choice for it. Without
- * the removal, the dish currently in the slot would also appear in the same-day
- * set and block its own republished version.
+ * TWO CLAUSES, THE SAME TWO THE GENERATOR APPLIES: at most
+ * `MAX_RECIPE_USES_PER_WEEK` uses in the week, and never on a day adjacent to
+ * one that already holds the recipe. Nothing else narrows the window — in
+ * particular the OTHER MEALS OF THIS DAY do not, because §0.7.3 permits two
+ * uses on one day in two different slots and `mealPlan.logic.ts`'s
+ * {@link violatesRepetitionRule} says so explicitly. That is what makes the
+ * list, the preview and the commit — all three of which funnel through
+ * {@link selectSwapCandidates} — incapable of disagreeing with generation: a
+ * dish the generator would place in this slot is offered for it.
+ *
+ * THE REMOVAL is the one thing this window does that the generator's does not:
+ * the meal being replaced is dropped from the week before anything is counted,
+ * so it never counts against itself. Its slot is about to be empty, and a
+ * recipe already planned twice in the week — where one of those two uses IS
+ * this meal — is a perfectly legal choice for it.
  *
  * BOTH NEIGHBOURS TRAVEL IN THE RULE'S `adjacentDayRecipeIds` ARGUMENT, and
  * which days that is differs by caller. The generator walks days forward, so
@@ -413,7 +424,6 @@ const repetitionWindow = (context: SwapSelectionContext): RepetitionWindow => {
 
     const usesByRecipeId = new Map<string, number>();
     const adjacentDayRecipeIds = new Set<string>();
-    const sameDayRecipeIds = new Set<string>();
     let removedCurrentMeal = false;
 
     for (const meal of context.weekMeals) {
@@ -434,10 +444,6 @@ const repetitionWindow = (context: SwapSelectionContext): RepetitionWindow => {
         if (meal.date === previousDay || meal.date === nextDay) {
             adjacentDayRecipeIds.add(meal.recipeId);
         }
-
-        if (meal.date === context.date) {
-            sameDayRecipeIds.add(meal.recipeId);
-        }
     }
 
     if (!removedCurrentMeal) {
@@ -448,7 +454,7 @@ const repetitionWindow = (context: SwapSelectionContext): RepetitionWindow => {
         );
     }
 
-    return { usesByRecipeId, adjacentDayRecipeIds, sameDayRecipeIds };
+    return { usesByRecipeId, adjacentDayRecipeIds };
 };
 
 /* ---------------------------------------------------------------------------
@@ -478,7 +484,17 @@ const repetitionWindow = (context: SwapSelectionContext): RepetitionWindow => {
  *     `allergen_status = 'known'` version that declares this slot can be a
  *     candidate. The verdict form is used rather than its boolean twin because
  *     both are the same implementation and nothing here needs a second rule.
- *  3. IT MUST NOT BREAK THE WEEK'S REPETITION RULE, against the window above.
+ *  3. IT MUST NOT BREAK THE WEEK'S REPETITION RULE, against the window above —
+ *     §0.7.3'S TWO CLAUSES AND NOTHING MORE. `violatesRepetitionRule` is called
+ *     with the same three arguments the generator calls it with, so the only
+ *     difference between the two verdicts is the window itself: the swap counts
+ *     the week WITHOUT the meal being replaced, and both neighbours of this day
+ *     rather than only the day before. A swap-only narrowing here would let the
+ *     sheet refuse a dish the generator would have planted in this very slot,
+ *     which is precisely the disagreement the one-function rule exists to
+ *     prevent — including the case that matters most, a NEW current version of
+ *     a recipe another slot of this day already holds, which after a catalog
+ *     refresh may be the only version still offered for that dish.
  */
 const isAdmissibleAlternative = (
     context: SwapSelectionContext,
@@ -498,7 +514,6 @@ const isAdmissibleAlternative = (
         recipe.recipe_id,
         repetition.usesByRecipeId.get(recipe.recipe_id) ?? 0,
         repetition.adjacentDayRecipeIds,
-        repetition.sameDayRecipeIds,
     );
 };
 

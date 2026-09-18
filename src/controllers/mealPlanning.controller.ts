@@ -229,23 +229,209 @@ const correlationFields = (context: EdgeContext): SafeLogFields => ({
     idempotencyKey: context.idempotencyKey,
 });
 
-/** At most this many offending field names travel in one event. */
+/** At most this many distinct offending field names travel in one event. */
 const MAX_LOGGED_FIELDS = 10;
 
 /**
- * The offending field names as one bounded string, beside their total count.
+ * What a field name is replaced by when it is not one of the names below.
  *
- * Bounded because a `read_only_field` or `unknown_field` detail's `field` is
- * CLIENT-SUPPLIED: a body carrying two hundred unknown keys would otherwise
- * write two hundred client-chosen names into the log. The count is what stays
- * truthful when the list is cut, and the logger bounds the joined string again
- * on its way out.
+ * Deliberately the spelling of the `unknown_field` detail CODE: an operator
+ * reading `fields: "unknown_field"` beside `unknownFieldCount: 200` learns
+ * exactly what happened — a body full of keys the contract does not have — and
+ * learns it without any of those keys being written down.
  */
-const offendingFields = (details: readonly InvalidRequestDetail[]): string =>
-    details
-        .slice(0, MAX_LOGGED_FIELDS)
-        .map((detail) => detail.field)
-        .join(',');
+const UNKNOWN_FIELD_NAME = 'unknown_field';
+
+/**
+ * The bound a candidate name is judged against BEFORE anything scans it.
+ *
+ * The longest name in the vocabulary is `expectedPreferencesRevision` at 27
+ * characters, so this is generous headroom; what it buys is that a megabyte-long
+ * object key is rejected by a length comparison rather than normalised first.
+ * It is the same bound `safeLogger.ts` puts on a field key, for the same reason.
+ */
+const MAX_FIELD_NAME_LENGTH = 64;
+
+/**
+ * An array subscript, collapsed so the POSITION drops out of the name.
+ *
+ * `preferences.logic.ts` builds `allergens[3]` and `mealTimes[1].time` itself,
+ * so the index is server-derived and the name is genuinely one of ours — but the
+ * index makes it a different string on every request, which a fixed vocabulary
+ * cannot hold and an operator's alert cannot match. `allergens[]` is the name;
+ * `detailCount` and the response's own `details` carry the rest.
+ */
+const ARRAY_SUBSCRIPT_PATTERN = /\[\d+\]/g;
+
+const COLLAPSED_SUBSCRIPT = '[]';
+
+/**
+ * Every field name the six parsers reachable from this edge AUTHOR, normalised,
+ * and the only strings this file will write into a log line.
+ *
+ * WHY A CLOSED SET AND NOT A SANITIZER. A detail's `field` is only sometimes
+ * ours. For the codes `unknown_field` and `read_only_field` it is a CLIENT-CHOSEN
+ * OBJECT KEY, copied out of the request body by the unaccepted-key arms of
+ * `preferences.logic.ts`, `targets.logic.ts`, `swap.logic.ts` and
+ * `plannedMealLog.logic.ts` — so without this gate arbitrary client text reaches
+ * an operator's log: an email address or a note a user typed into a key
+ * (CWE-532), or a bidi override that reorders the rendering of every character
+ * after it and makes one log line read as another (CWE-117). `logSafeEvent`
+ * collapses the C0 controls that could END a line, which is a different
+ * guarantee and not this one — it does not, and should not have to, know which
+ * of its callers' strings came from a client.
+ *
+ * MEMBERSHIP IS EXACT, not a pattern. A pattern for "looks like one of our
+ * field names" admits `secretToken` and `user@example.com`-shaped keys just as
+ * happily as `startDate`, which would leave the same hole with more code in it.
+ * A name absent here is not logged at all — it is counted instead.
+ *
+ * Derived by reading the `detail(…)` / `{ field: … }` sites and the `*_FIELD`
+ * constants of `{preferences,targets,mealPlan,swap,plannedMealLog,grocery}.logic.ts`.
+ * A parser that grows a field adds it here; until it does, the refusal is still
+ * recorded, still counted, and merely unnamed.
+ */
+const LOGGABLE_FIELD_NAMES: ReadonlySet<string> = new Set([
+    // Path ids and envelope members (mealPlan, swap, plannedMealLog, grocery)
+    'planId',
+    'mealId',
+    'itemId',
+    'date',
+    'startDate',
+    'step',
+    'body',
+    'idempotencyKey',
+    'expectedPlanRevision',
+    'expectedPreferencesRevision',
+    'expectedTargetsRevision',
+    'expectedRevision',
+    'estimateRevision',
+    // Swap, planned log and grocery payloads
+    'recipeVersionId',
+    'portionMultiplier',
+    'servings',
+    'diaryMealId',
+    'isChecked',
+    'timeZone',
+    // Targets
+    'source',
+    'calories',
+    'protein',
+    'carbs',
+    'fat',
+    // Preferences: setup answers and measurements
+    'goal',
+    'goalWeightKg',
+    'paceLbPerWeek',
+    'age',
+    'height',
+    'heightCm',
+    'weightKg',
+    'sexForEstimate',
+    'heightUnitPref',
+    'weightUnitPref',
+    'activityLevel',
+    'diet',
+    'allergens',
+    `allergens${COLLAPSED_SUBSCRIPT}`,
+    'dislikedFoodIds',
+    `dislikedFoodIds${COLLAPSED_SUBSCRIPT}`,
+    'dislikedFoodGroups',
+    `dislikedFoodGroups${COLLAPSED_SUBSCRIPT}`,
+    'mealSchedule',
+    'mealTimes',
+    `mealTimes${COLLAPSED_SUBSCRIPT}`,
+    `mealTimes${COLLAPSED_SUBSCRIPT}.slot`,
+    `mealTimes${COLLAPSED_SUBSCRIPT}.time`,
+    'cookingTimeLimitMin',
+    'budget',
+    'budget.amount',
+    'budget.currency',
+    'noBudgetPreference',
+    'skipped',
+    // The six server-owned members of `PreferencesResponse` (AAP §0.5.2's
+    // editable-DTO paragraph). A body carrying one of these is the documented
+    // cause of `read_only_field`, and naming it is the difference between "a
+    // client is trying to write onboarding state" and "some key was refused" —
+    // so these six spellings, and no near-miss of them, stay loggable. They
+    // arrive as client keys like any other, which is exactly why membership
+    // here is an equality test against a fixed literal.
+    'setupStatus',
+    'setupStep',
+    'revision',
+    'budgetTier',
+    'hasActivePlan',
+    'targetRoute',
+]);
+
+/**
+ * One detail's field name as it may be logged: itself when this edge authored
+ * it, and the fixed token otherwise.
+ *
+ * The order of the three steps is the whole function. The length bound runs
+ * first so an oversized key costs one comparison; the subscript collapse runs
+ * second so a server-built `mealTimes[2].time` is recognised; membership runs
+ * last and admits nothing else.
+ *
+ * The non-string arm is unreachable through the declared type and kept for the
+ * same reason `safeLogger.ts` keeps its own: a `field` originates in a parsed
+ * JSON body, and a value that arrives as something else must be replaced rather
+ * than have `.replace` called on it — a log call may never be the thing that
+ * fails the request it was describing.
+ */
+const loggableFieldName = (field: string): string => {
+    if (typeof field !== 'string' || field.length > MAX_FIELD_NAME_LENGTH) {
+        return UNKNOWN_FIELD_NAME;
+    }
+
+    const normalized = field.replace(ARRAY_SUBSCRIPT_PATTERN, COLLAPSED_SUBSCRIPT);
+
+    return LOGGABLE_FIELD_NAMES.has(normalized) ? normalized : UNKNOWN_FIELD_NAME;
+};
+
+/**
+ * What a refusal says about the fields it refused, for both log sites that
+ * report one — the returned verdicts and the `ReadOnlyFieldError` branch.
+ *
+ * Three fields, and each answers a question the other two cannot:
+ *
+ *  * `fields` — the distinct names, in the order the parser found them, bounded
+ *    at {@link MAX_LOGGED_FIELDS}. Deduplicated because the token collapses:
+ *    two hundred unknown keys are one `unknown_field`, not ten copies of it,
+ *    which is what keeps the real names beside it visible.
+ *  * `detailCount` — how many details the client was actually sent, which is
+ *    what stays truthful once the list is deduplicated and cut.
+ *  * `unknownFieldCount` — how many of those details named something this edge
+ *    will not write down, so the line never implies the list was complete.
+ *
+ * The RESPONSE is untouched by all of this: `details: [{field, code}]` still
+ * carries the client's own key, because §0.5.2 requires the client to be told
+ * which key to fix. Only the log line is closed-vocabulary.
+ */
+const refusalLogFields = (details: readonly InvalidRequestDetail[]): SafeLogFields => {
+    const named: string[] = [];
+    const seen = new Set<string>();
+    let unknownFieldCount = 0;
+
+    for (const detail of details) {
+        const name = loggableFieldName(detail.field);
+
+        if (name === UNKNOWN_FIELD_NAME) {
+            unknownFieldCount += 1;
+        }
+        if (seen.has(name)) {
+            continue;
+        }
+
+        seen.add(name);
+
+        if (named.length < MAX_LOGGED_FIELDS) {
+            named.push(name);
+        }
+    }
+
+    return { fields: named.join(','), detailCount: details.length, unknownFieldCount };
+};
 
 /**
  * The server-side kill switch, checked by every gated handler.
@@ -257,7 +443,7 @@ const offendingFields = (details: readonly InvalidRequestDetail[]): string =>
  * whether the `503 feature_disabled` event names the caller. A capability
  * refusal with no `userId` answers "someone was refused" and nothing an
  * operator can act on; with it, a support question about one account during a
- * rollout is answerable from the log (OBSBE-F02, AAP §0.7.5's kill switch).
+ * rollout is answerable from the log (AAP §0.7.5's kill switch).
  */
 const assertMealPlanningEnabled = (): void => {
     if (!isMealPlanningEnabled()) {
@@ -274,8 +460,7 @@ const refuseInvalidRequest = (
         ...correlationFields(context),
         status: 400,
         code: verdict.code,
-        fields: offendingFields(verdict.details),
-        detailCount: verdict.details.length,
+        ...refusalLogFields(verdict.details),
     });
 
     return res.status(400).json({ error: verdict.code, details: verdict.details });
@@ -356,12 +541,22 @@ const failRequest = (
  * mutually exclusive.
  *
  * The abort branch is the one place a client receives NOTHING for a write that
- * succeeded (the test-only `POST_COMMIT_ABORT_HEADER`, and the `log` fault a
- * developer drives from a device). Without this event the socket simply died:
- * the completed `meal_plan_actions` row proved the commit, but nothing said the
- * response had been withheld on purpose or tied the loss to that row. The
- * event carries the stored status and the post-write plan revision — never the
- * response snapshot, which is the plan itself.
+ * succeeded, and it is reached two ways: the test-only
+ * `POST_COMMIT_ABORT_HEADER`, honoured per request exactly as asked, and the
+ * `log` fault a developer drives from a device, which is ONE-SHOT. The
+ * distinction is `result.replayed`, which is why it is passed to the predicate:
+ * §0.9.4 arms that switch so the first tap reaches the unconfirmed-outcome
+ * state and "the same-key retry must return the committed 201", so the ambient
+ * switch must never swallow a stored replay — a device whose replay was also
+ * dropped could not resolve until the server's environment was edited.
+ * `postCommitAbort` owns which of the two is answering; this function only
+ * reports the fact.
+ *
+ * Without this event the socket simply died: the completed
+ * `meal_plan_actions` row proved the commit, but nothing said the response had
+ * been withheld on purpose or tied the loss to that row. The event carries the
+ * stored status and the post-write plan revision — never the response snapshot,
+ * which is the plan itself.
  *
  * BOTH EVENTS CARRY `replayed`, and it is the field that makes a retried write
  * readable. `201 generate` at revision 1 twice under one key is two very
@@ -381,7 +576,7 @@ const answerKeyedWrite = (
     actionType: MealPlanningActionType,
     result: KeyedActionResult,
 ) => {
-    if (postCommitAbort(actionType, req.header(POST_COMMIT_ABORT_HEADER))) {
+    if (postCommitAbort(actionType, req.header(POST_COMMIT_ABORT_HEADER), { replayed: result.replayed })) {
         logSafeEvent('warn', RESPONSE_ABORTED_AFTER_COMMIT, {
             ...correlationFields(context),
             status: result.status,
@@ -484,16 +679,18 @@ const handleMealPlanningError = (res: Response, error: unknown, context: EdgeCon
         return rejectRequest(res, context, error, 409, { error: 'preview_stale' });
     }
     if (error instanceof ReadOnlyFieldError) {
-        // Every offending key, in the order the parser found them — the same
-        // body a returned verdict produced, so the refusal stays one round trip
-        // however many server-owned keys the client sent.
+        // Every offending key travels in the BODY, in the order the parser found
+        // them — the same body a returned verdict produced, so the refusal stays
+        // one round trip however many server-owned keys the client sent. The
+        // event beside it says the same thing in the closed vocabulary
+        // `refusalLogFields` bounds it to, because these keys are the client's.
         return rejectRequest(
             res,
             context,
             error,
             400,
             { error: INVALID_REQUEST, details: error.details },
-            { fields: offendingFields(error.details), detailCount: error.details.length },
+            refusalLogFields(error.details),
         );
     }
     if (error instanceof TargetsMissingError) {

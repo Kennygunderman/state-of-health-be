@@ -24,7 +24,9 @@
  *
  * HOW IT DRIVES THE STAGE. Through the exported seams only — `runBenchmark`
  * with a fake `db`, a fake `search`, a fake `readActiveRelease`, injected
- * `now`/`hrtime`/`readRepoFile` and an `outPath` under `os.tmpdir()`, plus the
+ * `now`/`hrtime`/`readRepoFile`, an `outPath` under `os.tmpdir()` — and, where
+ * the artefact guard itself is under test, an `acceptanceArtifactPath` there
+ * too — plus the
  * pure decisions (`protocolDeviations`, `rateAtLeast`/`rateAtMost`,
  * `collectInvariantFailures`, `determinismFingerprint`, `parsePeerReport`,
  * `compareAcrossDatabases`, `pinPoolToSingleConnection`, `parseArgs`) called
@@ -32,13 +34,22 @@
  * backend-architecture §11 asks for the rules to be provable without one, and
  * every rule here is a decision over values rather than a query.
  *
- * The one file this suite reads from the repository is
- * `data/meal-planning/catalog/releases/v1/manifest.json`, because the runner
- * digests it as a measurement condition; the release version in every fixture
- * is therefore `v1`. NOTHING under `data/` is written. The committed report path
- * appears in exactly one test, which asserts the run REFUSES before writing,
- * and that test is built so a regression makes it fail on a different refusal
- * rather than overwrite the artefact — see its own comment.
+ * Two files are read from the repository, both through the runner's own
+ * loaders: `data/meal-planning/catalog/releases/v1/manifest.json`, because the
+ * runner digests it as a measurement condition (the release version in every
+ * fixture is therefore `v1`), and `data/meal-planning/search-benchmark.v1.json`,
+ * because `assertSearchBenchmarkShape`'s bounds have to be pinned against the
+ * document the plan actually cites — bounds that only ever see fixtures are
+ * bounds nobody has checked the committed artefact against.
+ * NOTHING under `data/` is written. The committed report path
+ * is named as an OUTPUT in exactly one test, which asserts the run REFUSES
+ * before writing, and that test is built so a regression makes it fail on a
+ * different refusal rather than overwrite the artefact — see its own comment. It
+ * is also the default `acceptanceArtifactPath` every other test inherits, which
+ * is an input to the guard and never a write target; the tests that exercise
+ * aliases of the artefact substitute a temporary stand-in for it, so a
+ * regression in the guard destroys a file under `os.tmpdir()` rather than the
+ * repository's acceptance evidence.
  *
  * WHAT IS DELIBERATELY NOT HERE. The relevance of the committed query set and
  * the behaviour of `catalog.service.searchPublishedFoods` belong to
@@ -64,7 +75,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { reportPath } from '../../../scripts/lib/manifest';
+import { ManifestError, loadSearchBenchmark, reportPath } from '../../../scripts/lib/manifest';
 import type {
     CatalogReleaseManifest,
     SearchBenchmark,
@@ -72,19 +83,26 @@ import type {
 } from '../../../scripts/lib/manifest';
 import {
     BenchmarkInputError,
+    assertSearchBenchmarkShape,
     collectInvariantFailures,
     compareAcrossDatabases,
     compareCorpusCounts,
     corpusMovement,
     databaseRelationship,
+    describeFailure,
     determinismFingerprint,
+    outputNameIsPublishable,
+    outputPathIdentityChanges,
     parseArgs,
     parsePeerReport,
+    peerReportDigest,
     peerReportLabel,
     pinPoolToSingleConnection,
+    preflight,
     protocolDeviations,
     rateAtLeast,
     rateAtMost,
+    readPeerReport,
     resolveOutPath,
     runBenchmark,
 } from '../../../scripts/search-benchmark';
@@ -95,12 +113,15 @@ import type {
     BenchmarkOutcome,
     BenchmarkReport,
     CorpusCounts,
+    OutputPathObservation,
     PaginationQueryOutcome,
     PeerReportSource,
     PoolPinOutcome,
     QueryResult,
+    SearchFn,
     SearchPage,
 } from '../../../scripts/search-benchmark';
+import { formatSafeError, opaqueDigest } from '../../../scripts/lib/logger';
 import type { LogFields, ScriptLogger } from '../../../scripts/lib/logger';
 
 // ---------------------------------------------------------------------------
@@ -328,13 +349,81 @@ interface DepsOverrides extends Partial<BenchmarkDeps> {
     readonly db?: FakeDb;
 }
 
+/**
+ * This package's root on disk — the prefix an absolute path would disclose, and
+ * the thing the log-line assertions below look for the absence of. Resolved the
+ * same way the script resolves it, from this file's own location, so it is
+ * correct in any checkout.
+ */
+const PACKAGE_ROOT = path.resolve(__dirname, '..', '..', '..');
+
 /** A temporary directory per test, removed by the suite's afterEach. */
 const tempDirectories: string[] = [];
 
-const tempOutPath = (): string => {
+const tempDirectory = (): string => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-benchmark-'));
     tempDirectories.push(directory);
-    return path.join(directory, 'benchmark-report.json');
+    return directory;
+};
+
+const tempOutPath = (): string => path.join(tempDirectory(), 'benchmark-report.json');
+
+/**
+ * The bytes a stand-in acceptance artefact is seeded with. A test that claims
+ * the committed report was left alone has to compare CONTENT: a run refused
+ * before it writes and a run that overwrote the file both leave a file there.
+ */
+const COMMITTED_ARTEFACT_BYTES = '{"standIn":"the committed acceptance report"}\n';
+
+/**
+ * A temporary directory holding a file that stands in for the committed
+ * acceptance artefact, plus the aliases a symlink attack would reach it
+ * through. Returned rather than asserted on so each test picks the alias it is
+ * about, and seeded with content so "untouched" is provable.
+ *
+ * The stand-in exists because the rule under test is "a diagnostic run may not
+ * write the acceptance artefact", and the only way to prove a rule about
+ * destroying a file is to let the destruction happen when the rule is absent.
+ * Pointing these tests at the real
+ * `data/meal-planning/reports/latest/benchmark-report.json` would make a
+ * regression in the runner delete the repository's committed evidence instead
+ * of failing a test — so `acceptanceArtifactPath` is injected and nothing under
+ * `data/` is ever the target.
+ */
+interface AcceptanceArtefactAliases {
+    /** The directory the artefact really lives in. */
+    readonly directory: string;
+    /** The artefact itself, canonically spelled. */
+    readonly canonicalPath: string;
+    /** A symlink to `directory`, so `<aliasDirectory>/<name>` is the artefact. */
+    readonly aliasDirectory: string;
+    /** `<aliasDirectory>/benchmark-report.json` — the symlinked-parent alias. */
+    readonly throughAliasDirectory: string;
+    /** A symlink AT a file name, pointing straight at `canonicalPath`. */
+    readonly aliasFile: string;
+}
+
+const makeAcceptanceArtefactAliases = (): AcceptanceArtefactAliases => {
+    const root = tempDirectory();
+    const directory = path.join(root, 'reports-latest');
+    fs.mkdirSync(directory);
+
+    const canonicalPath = path.join(directory, 'benchmark-report.json');
+    fs.writeFileSync(canonicalPath, COMMITTED_ARTEFACT_BYTES, 'utf8');
+
+    const aliasDirectory = path.join(root, 'reports-alias');
+    fs.symlinkSync(directory, aliasDirectory);
+
+    const aliasFile = path.join(root, 'benchmark-report-alias.json');
+    fs.symlinkSync(canonicalPath, aliasFile);
+
+    return {
+        directory,
+        canonicalPath,
+        aliasDirectory,
+        throughAliasDirectory: path.join(aliasDirectory, 'benchmark-report.json'),
+        aliasFile,
+    };
 };
 
 const makeDeps = (overrides: DepsOverrides = {}): BenchmarkDeps & { readonly db: FakeDb } => {
@@ -354,6 +443,10 @@ const makeDeps = (overrides: DepsOverrides = {}): BenchmarkDeps & { readonly db:
         releaseManifest: overrides.releaseManifest ?? makeManifest(MANIFEST_COUNTS),
         releaseVersion: overrides.releaseVersion ?? RELEASE,
         outPath: overrides.outPath ?? tempOutPath(),
+        // The runner's own default, so a test that does not name the artefact
+        // gets the same guard `main` installs; the alias tests pin it to a
+        // temporary stand-in instead (see makeAcceptanceArtefactAliases).
+        acceptanceArtifactPath: overrides.acceptanceArtifactPath ?? resolveOutPath(null),
         logger: overrides.logger ?? makeLogger(),
         now: overrides.now ?? (() => new Date('2026-02-02T12:00:00.000Z')),
         hrtime:
@@ -753,6 +846,100 @@ describe('acceptance standing', () => {
         expect(digestOf(committed)).toBe(before);
     });
 
+    /**
+     * NO LOG LINE NAMES AN ABSOLUTE PATH, which is the same disclosure the
+     * peer-report refusal was carrying and reaches the same CI logs. The
+     * artefact path is resolved absolutely because `writeJsonFile` needs it, so
+     * the logged value is deliberately a different thing from the written one:
+     * package-relative inside this package, the file name alone outside it.
+     *
+     * Driven twice, because the two branches leak differently. A temp-directory
+     * path discloses `os.tmpdir()` and the random suffix; the default artefact
+     * path discloses where this CHECKOUT lives, which for an agent clone is its
+     * whole identity.
+     */
+    it('names the artefact in a log line without disclosing where the filesystem puts it', async () => {
+        // The logger is held here rather than read back off `deps`, whose
+        // `logger` is typed as the plain `ScriptLogger` the runner consumes.
+        const logger = makeLogger();
+        const deps = makeDeps({ logger, timedPasses: 1, passesOverridden: true });
+
+        await runBenchmark(deps);
+
+        const diagnostic = logger.events.find((entry) => entry.event === 'diagnostic_run');
+        expect(diagnostic).toBeDefined();
+        // Outside the package, so the file name alone.
+        expect(diagnostic?.fields?.out).toBe('benchmark-report.json');
+
+        // Asserted over EVERY field of EVERY line, not just the one field that
+        // was fixed: a path added to a new line later is the regression this
+        // case exists to catch.
+        const serialised = JSON.stringify(logger.events);
+        expect(serialised).not.toContain(os.tmpdir());
+        expect(serialised).not.toContain(PACKAGE_ROOT);
+    });
+
+    it('names an in-package artefact package-relatively rather than absolutely', async () => {
+        // The sibling case above covers a path OUTSIDE the package, which is
+        // labelled by its file name alone. This one covers the other branch: a
+        // path inside the package keeps its package-relative form, which is
+        // both what the docs call the file and what an operator can act on,
+        // without the checkout root in front of it.
+        //
+        // The release pointer is absent so the run refuses at
+        // `bindRunToActiveRelease` — which happens AFTER `diagnostic_run` is
+        // logged — so the line under test is produced and NO FILE IS WRITTEN
+        // into the repository's report directory.
+        const logger = makeLogger();
+        const deps = makeDeps({
+            logger,
+            outPath: resolveOutPath('data/meal-planning/reports/latest/diagnostic-probe.json'),
+            timedPasses: 1,
+            passesOverridden: true,
+            readActiveRelease: async () => null,
+        });
+
+        await refusalOf(runBenchmark(deps));
+
+        const diagnostic = logger.events.find((entry) => entry.event === 'diagnostic_run');
+        expect(diagnostic?.fields?.out).toBe('data/meal-planning/reports/latest/diagnostic-probe.json');
+        expect(String(diagnostic?.fields?.out).startsWith('/')).toBe(false);
+        expect(JSON.stringify(logger.events)).not.toContain(PACKAGE_ROOT);
+
+        // The probe path was never written, because the run refused first.
+        expect(fs.existsSync(resolveOutPath('data/meal-planning/reports/latest/diagnostic-probe.json'))).toBe(
+            false,
+        );
+    });
+
+    it('keeps the checkout path out of everything an operator sees when the default-path refusal fires', async () => {
+        // The refusal that protects the acceptance artefact is the one place an
+        // absolute path is still COMPOSED — its authored sentence names the
+        // file it is protecting, because that sentence is what makes the remedy
+        // intelligible. What matters is that nothing operator-visible carries
+        // it: `describeFailure` reports the code and the closed error fields,
+        // and the runner prints `error.detail`, so those are asserted here.
+        // A future change that forwarded the message into a log field would
+        // fail this case.
+        const logger = makeLogger();
+        const deps = makeDeps({
+            logger,
+            outPath: resolveOutPath(null),
+            timedPasses: 1,
+            passesOverridden: true,
+        });
+
+        const refusal = await refusalOf(runBenchmark(deps));
+        expect(refusal.code).toBe('diagnostic_run_to_acceptance_path');
+
+        const described = describeFailure(refusal);
+        expect(JSON.stringify(described)).not.toContain(PACKAGE_ROOT);
+        expect(described.error).not.toHaveProperty('message');
+        // `detail` is what the runner prints as `input_detail.items`.
+        expect(refusal.detail.join(' ')).not.toContain(PACKAGE_ROOT);
+        expect(JSON.stringify(logger.events)).not.toContain(PACKAGE_ROOT);
+    });
+
     it('lets a deviating run write an explicit path', async () => {
         const deps = makeDeps({ timedPasses: 1, passesOverridden: true });
 
@@ -760,6 +947,637 @@ describe('acceptance standing', () => {
 
         expect(fs.existsSync(deps.outPath)).toBe(true);
         expect(outcome.report.acceptanceEvidence.thisReportIsAcceptanceEvidence).toBe(false);
+    });
+
+    /**
+     * THE ARTEFACT GUARD IS ABOUT A FILE, NOT ABOUT A SPELLING.
+     *
+     * A guard that compared `--out` with the canonical path as strings was
+     * satisfied by every alias of the artefact — a symlinked parent directory,
+     * a symlink at the file name — and the diagnostic report then landed on the
+     * committed §0.9.3 acceptance evidence, destroying it and leaving something
+     * that looks like it in its place (CWE-59). Each refusal case below
+     * therefore asserts BOTH that the run refused AND that the artefact's bytes
+     * are the ones it was seeded with: a refusal that came too late would leave
+     * the same file present but rewritten. The cases that DO write assert where
+     * the bytes went, because a guard that refused an alias while still writing
+     * through one would pass the first kind of case and fail nothing.
+     *
+     * Every path here is under `fs.mkdtempSync`, and the artefact the guard
+     * protects is injected (`acceptanceArtifactPath`). That is what makes these
+     * tests safe to write: if the refusal regresses, the run overwrites a
+     * temporary stand-in and the assertion fails, instead of overwriting the
+     * repository's committed report.
+     */
+    describe('the physical identity of the output path', () => {
+        const artefactBytes = (aliases: AcceptanceArtefactAliases): string =>
+            fs.readFileSync(aliases.canonicalPath, 'utf8');
+
+        it('refuses a deviating run reaching the artefact through a symlinked parent directory', async () => {
+            const aliases = makeAcceptanceArtefactAliases();
+
+            // Settled rather than asserted-on immediately, so the artefact's
+            // bytes are checked whichever way the run ended: a run that wrote
+            // the artefact and a run that refused both leave a file there, and
+            // the content is the only thing that tells them apart.
+            const settled = await runBenchmark(
+                makeDeps({
+                    outPath: aliases.throughAliasDirectory,
+                    acceptanceArtifactPath: aliases.canonicalPath,
+                    timedPasses: 1,
+                    passesOverridden: true,
+                }),
+            ).then(
+                () => null,
+                (error: unknown) => error,
+            );
+
+            expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+
+            expect(settled).toBeInstanceOf(BenchmarkInputError);
+            const refusal = settled as BenchmarkInputError;
+            expect(refusal.code).toBe('diagnostic_run_to_acceptance_path');
+            expect(refusal.detail).toEqual(['timed_passes_overridden']);
+            expect(refusal.message).toContain('--out');
+            // The alias is named back to the operator with what it resolves to,
+            // because "that path is the acceptance artefact" is not obvious from
+            // the spelling they typed.
+            expect(refusal.message).toContain(aliases.throughAliasDirectory);
+            expect(refusal.message).toContain(aliases.canonicalPath);
+        });
+
+        it('refuses a deviating run reaching the artefact through a symlink at its file name', async () => {
+            const aliases = makeAcceptanceArtefactAliases();
+
+            const refusal = await refusalOf(
+                runBenchmark(
+                    makeDeps({
+                        outPath: aliases.aliasFile,
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                        stageLockHeld: false,
+                    }),
+                ),
+            );
+
+            expect(refusal.code).toBe('diagnostic_run_to_acceptance_path');
+            expect(refusal.detail).toEqual(['stage_lock_not_held']);
+
+            expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+        });
+
+        // No symlink at all in this one: a `..` detour is enough to defeat a
+        // string comparison, and `path.join` would have normalised it away, so
+        // the spelling is assembled by hand to be the one an operator (or an
+        // attacker) could actually pass on the command line.
+        it('refuses a deviating run whose --out spells the artefact with a ".." detour', async () => {
+            const aliases = makeAcceptanceArtefactAliases();
+            const detour = [
+                aliases.directory,
+                '..',
+                path.basename(aliases.directory),
+                'benchmark-report.json',
+            ].join(path.sep);
+            expect(detour).not.toBe(aliases.canonicalPath);
+
+            const refusal = await refusalOf(
+                runBenchmark(
+                    makeDeps({
+                        outPath: detour,
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                        timedPasses: 1,
+                        passesOverridden: true,
+                    }),
+                ),
+            );
+
+            expect(refusal.code).toBe('diagnostic_run_to_acceptance_path');
+            expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+        });
+
+        // The guard refuses an alias of the ARTEFACT, and nothing else: a
+        // diagnostic run to any other file is the documented remedy the refusal
+        // itself recommends, so it has to keep working — including when the
+        // operator reaches that file through a link of their own.
+        it('lets a deviating run write a different file reached through a symlinked parent', async () => {
+            const aliases = makeAcceptanceArtefactAliases();
+            const diagnosticDirectory = path.join(tempDirectory(), 'diagnostics');
+            fs.mkdirSync(diagnosticDirectory);
+            const diagnosticAlias = path.join(path.dirname(diagnosticDirectory), 'diagnostics-alias');
+            fs.symlinkSync(diagnosticDirectory, diagnosticAlias);
+
+            const outcome = await runBenchmark(
+                makeDeps({
+                    outPath: path.join(diagnosticAlias, 'benchmark-report.json'),
+                    acceptanceArtifactPath: aliases.canonicalPath,
+                    timedPasses: 1,
+                    passesOverridden: true,
+                }),
+            );
+
+            // Written where the alias physically points, and reported as that
+            // path rather than as the spelling that was asked for.
+            expect(outcome.outPath).toBe(path.join(diagnosticDirectory, 'benchmark-report.json'));
+            expect(fs.existsSync(outcome.outPath)).toBe(true);
+            expect(outcome.report.acceptanceEvidence.thisReportIsAcceptanceEvidence).toBe(false);
+            expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+        });
+
+        it('lets an undeviating run write the artefact itself', async () => {
+            const aliases = makeAcceptanceArtefactAliases();
+
+            const outcome = await runBenchmark(
+                makeDeps({
+                    outPath: aliases.canonicalPath,
+                    acceptanceArtifactPath: aliases.canonicalPath,
+                }),
+            );
+
+            expect(outcome.outPath).toBe(aliases.canonicalPath);
+            expect(outcome.report.verdict.standing).toBe('acceptance_evidence');
+            // The acceptance run is the one run that MAY replace it. Compared
+            // against the report's own JSON form, which is what was written.
+            expect(artefactBytes(aliases)).not.toBe(COMMITTED_ARTEFACT_BYTES);
+            expect(JSON.parse(artefactBytes(aliases))).toEqual(JSON.parse(JSON.stringify(outcome.report)));
+        });
+
+        it('lets an undeviating run write the artefact through an alias of it', async () => {
+            const aliases = makeAcceptanceArtefactAliases();
+
+            const outcome = await runBenchmark(
+                makeDeps({
+                    outPath: aliases.throughAliasDirectory,
+                    acceptanceArtifactPath: aliases.canonicalPath,
+                }),
+            );
+
+            expect(outcome.outPath).toBe(aliases.canonicalPath);
+            expect(JSON.parse(artefactBytes(aliases))).toEqual(JSON.parse(JSON.stringify(outcome.report)));
+        });
+
+        /**
+         * The raced alias. Checking a path and then writing the spelling that
+         * was checked is two lookups of one name, and a local principal who can
+         * retarget the link between them chooses where the bytes land — the
+         * minutes this stage spends measuring are exactly that window. The run
+         * resolves the path once, before the guard, and writes THAT, so the
+         * retarget below has nothing left to redirect.
+         */
+        it('writes where the path resolved before the run, not where a link was retargeted during it', async () => {
+            const aliases = makeAcceptanceArtefactAliases();
+            const root = tempDirectory();
+            const resolvedDirectory = path.join(root, 'resolved-at-the-start');
+            const retargetedDirectory = path.join(root, 'retargeted-mid-run');
+            fs.mkdirSync(resolvedDirectory);
+            fs.mkdirSync(retargetedDirectory);
+            const movingAlias = path.join(root, 'moving-alias');
+            fs.symlinkSync(resolvedDirectory, movingAlias);
+
+            const benchmark = makeBenchmark();
+            const scoring = expectedFirst(benchmark, THREE_FOODS);
+            let retargeted = false;
+            const retargetOnFirstQuery = async (q: string): Promise<SearchPage> => {
+                if (!retargeted) {
+                    retargeted = true;
+                    fs.unlinkSync(movingAlias);
+                    fs.symlinkSync(retargetedDirectory, movingAlias);
+                }
+                return scoring(q);
+            };
+
+            const outcome = await runBenchmark(
+                makeDeps({
+                    benchmark,
+                    search: retargetOnFirstQuery,
+                    outPath: path.join(movingAlias, 'benchmark-report.json'),
+                    acceptanceArtifactPath: aliases.canonicalPath,
+                    timedPasses: 1,
+                    passesOverridden: true,
+                }),
+            );
+
+            expect(retargeted).toBe(true);
+            // Where the bytes are is asserted before what the outcome says
+            // about them: a redirected write is the failure this test exists
+            // for, and it should be what the failure message shows.
+            expect(fs.existsSync(path.join(resolvedDirectory, 'benchmark-report.json'))).toBe(true);
+            expect(fs.existsSync(path.join(retargetedDirectory, 'benchmark-report.json'))).toBe(false);
+            expect(outcome.outPath).toBe(path.join(resolvedDirectory, 'benchmark-report.json'));
+        });
+
+        /**
+         * THE WINDOW AFTER THE GUARD.
+         *
+         * Resolving the output path once defeats every alias the operator's
+         * spelling could carry, and the test above proves it. It does not
+         * defeat the directory that path names being REPLACED while the run
+         * measures: a resolved path is a name inside a directory, and a
+         * principal who can write that directory's parent can rename it aside
+         * mid-run and put a symbolic link to
+         * data/meal-planning/reports/latest in its place. Every check had
+         * already passed by then, and the diagnostic report would land on the
+         * §0.9.3 acceptance evidence (CWE-59/CWE-367).
+         *
+         * Each case below performs that replacement from inside the seam the
+         * run awaits — the first search call, i.e. the warm-up pass — which is
+         * the real window, and then asserts on the BYTES of the stand-in
+         * acceptance artefact before anything else: a run that published into
+         * the swapped directory and a run that refused both end with a file at
+         * that path, and only the content tells them apart. The stand-in is the
+         * injected `acceptanceArtifactPath`, never the committed report, so a
+         * regression fails these assertions instead of destroying the
+         * repository's evidence.
+         */
+        describe('the window between the guard and the publication write', () => {
+            /**
+             * Renames the resolved output directory aside on the run's first
+             * query and lets `replace` decide what, if anything, takes its
+             * place at that path.
+             */
+            const swapDirectoryOnFirstQuery = (
+                benchmark: SearchBenchmark,
+                resolvedDirectory: string,
+                replace: () => void,
+            ): { readonly search: SearchFn; readonly swapped: () => boolean } => {
+                const scoring = expectedFirst(benchmark, THREE_FOODS);
+                let swapped = false;
+                return {
+                    swapped: () => swapped,
+                    search: async (q: string): Promise<SearchPage> => {
+                        if (!swapped) {
+                            swapped = true;
+                            fs.renameSync(resolvedDirectory, `${resolvedDirectory}-moved-aside`);
+                            replace();
+                        }
+                        return scoring(q);
+                    },
+                };
+            };
+
+            const outputDirectory = (): string => {
+                const directory = path.join(tempDirectory(), 'diagnostics');
+                fs.mkdirSync(directory, { mode: 0o700 });
+                return directory;
+            };
+
+            it('refuses when the output directory becomes a link to the acceptance directory mid-run', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const directory = outputDirectory();
+                const benchmark = makeBenchmark();
+                const attack = swapDirectoryOnFirstQuery(benchmark, directory, () => {
+                    fs.symlinkSync(aliases.directory, directory);
+                });
+
+                const settled = await runBenchmark(
+                    makeDeps({
+                        benchmark,
+                        search: attack.search,
+                        outPath: path.join(directory, 'benchmark-report.json'),
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                        timedPasses: 1,
+                        passesOverridden: true,
+                    }),
+                ).then(
+                    () => null,
+                    (error: unknown) => error,
+                );
+
+                expect(attack.swapped()).toBe(true);
+                expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+                // No staging debris either: a partially published document in
+                // the acceptance directory is a redirected write that merely
+                // failed to finish.
+                expect(fs.readdirSync(aliases.directory)).toEqual(['benchmark-report.json']);
+
+                expect(settled).toBeInstanceOf(BenchmarkInputError);
+                const refusal = settled as BenchmarkInputError;
+                // The acceptance-path code, not the identity one: the run's
+                // output path now resolves ONTO the artefact, which is the
+                // refusal the pre-run guard would have given, and an operator
+                // needs the same diagnosis whichever side of the measurement it
+                // is discovered on.
+                expect(refusal.code).toBe('diagnostic_run_to_acceptance_path');
+                expect(refusal.detail).toEqual(['timed_passes_overridden']);
+                expect(refusal.message).toContain(aliases.canonicalPath);
+            });
+
+            it('refuses when the output directory becomes a link to an unrelated directory mid-run', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const directory = outputDirectory();
+                const elsewhere = path.join(tempDirectory(), 'elsewhere');
+                fs.mkdirSync(elsewhere, { mode: 0o700 });
+                const benchmark = makeBenchmark();
+                const attack = swapDirectoryOnFirstQuery(benchmark, directory, () => {
+                    fs.symlinkSync(elsewhere, directory);
+                });
+
+                // Undeviating on purpose: the identity check is not a
+                // consequence of being diagnostic. An acceptance run redirected
+                // into another directory is just as much a redirected write.
+                const settled = await runBenchmark(
+                    makeDeps({
+                        benchmark,
+                        search: attack.search,
+                        outPath: path.join(directory, 'benchmark-report.json'),
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                    }),
+                ).then(
+                    () => null,
+                    (error: unknown) => error,
+                );
+
+                expect(attack.swapped()).toBe(true);
+                expect(fs.readdirSync(elsewhere)).toEqual([]);
+                expect(fs.readdirSync(`${directory}-moved-aside`)).toEqual([]);
+                expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+
+                expect(settled).toBeInstanceOf(BenchmarkInputError);
+                const refusal = settled as BenchmarkInputError;
+                expect(refusal.code).toBe('output_path_identity_changed');
+                expect(refusal.detail).toContain('parent_no_longer_a_directory');
+                expect(refusal.detail.some((entry) => entry.startsWith('parent_inode_changed='))).toBe(true);
+                expect(refusal.message).toContain('NOT written');
+            });
+
+            // A real directory at the same path, so nothing about it is a
+            // symbolic link and only the captured inode can tell it is not the
+            // directory that was verified.
+            it('refuses when the output directory is replaced by a different real directory mid-run', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const directory = outputDirectory();
+                const benchmark = makeBenchmark();
+                const attack = swapDirectoryOnFirstQuery(benchmark, directory, () => {
+                    fs.mkdirSync(directory, { mode: 0o700 });
+                });
+
+                const settled = await runBenchmark(
+                    makeDeps({
+                        benchmark,
+                        search: attack.search,
+                        outPath: path.join(directory, 'benchmark-report.json'),
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                    }),
+                ).then(
+                    () => null,
+                    (error: unknown) => error,
+                );
+
+                expect(attack.swapped()).toBe(true);
+                expect(fs.readdirSync(directory)).toEqual([]);
+                expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+
+                expect(settled).toBeInstanceOf(BenchmarkInputError);
+                const refusal = settled as BenchmarkInputError;
+                expect(refusal.code).toBe('output_path_identity_changed');
+                expect(refusal.detail.some((entry) => entry.startsWith('parent_inode_changed='))).toBe(true);
+                expect(refusal.detail).not.toContain('parent_no_longer_a_directory');
+            });
+
+            it('refuses when the output directory is renamed away mid-run and nothing replaces it', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const directory = outputDirectory();
+                const benchmark = makeBenchmark();
+                const attack = swapDirectoryOnFirstQuery(benchmark, directory, () => undefined);
+
+                const settled = await runBenchmark(
+                    makeDeps({
+                        benchmark,
+                        search: attack.search,
+                        outPath: path.join(directory, 'benchmark-report.json'),
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                    }),
+                ).then(
+                    () => null,
+                    (error: unknown) => error,
+                );
+
+                expect(attack.swapped()).toBe(true);
+                expect(fs.existsSync(directory)).toBe(false);
+                expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+
+                expect(settled).toBeInstanceOf(BenchmarkInputError);
+                const refusal = settled as BenchmarkInputError;
+                expect(refusal.code).toBe('output_path_identity_changed');
+                expect(refusal.detail).toEqual(['output_parent_unreadable']);
+            });
+
+            // The measurement is not the only thing the window covers: a run
+            // that measured fine and published into a directory it could no
+            // longer identify would still be a redirected write, so the
+            // positive control belongs beside the refusals.
+            it('publishes normally when the output directory stays the one it verified', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const directory = outputDirectory();
+                const outPath = path.join(directory, 'benchmark-report.json');
+
+                const outcome = await runBenchmark(
+                    makeDeps({ outPath, acceptanceArtifactPath: aliases.canonicalPath }),
+                );
+
+                expect(outcome.outPath).toBe(outPath);
+                expect(JSON.parse(fs.readFileSync(outPath, 'utf8'))).toEqual(
+                    JSON.parse(JSON.stringify(outcome.report)),
+                );
+                expect(artefactBytes(aliases)).toBe(COMMITTED_ARTEFACT_BYTES);
+            });
+        });
+
+        /**
+         * The artefact's own NAME, `lstat`ed rather than followed.
+         *
+         * `physicalPathIdentity` resolves the final component, so a symbolic
+         * link there is answered with "which file it points at" instead of
+         * being refused — and the file it points at is chosen by whoever owns
+         * the link, which for an output artefact is the whole of the attack.
+         * Refusing the name outright is what makes the resolved path the
+         * operator's own file.
+         */
+        describe('a symbolic link at the artefact name', () => {
+            it('refuses an --out that is a link to another file', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const root = tempDirectory();
+                const target = path.join(root, 'someone-elses-report.json');
+                fs.writeFileSync(target, COMMITTED_ARTEFACT_BYTES, 'utf8');
+                const link = path.join(root, 'benchmark-report.json');
+                fs.symlinkSync(target, link);
+
+                const refusal = await refusalOf(
+                    runBenchmark(makeDeps({ outPath: link, acceptanceArtifactPath: aliases.canonicalPath })),
+                );
+
+                expect(refusal.code).toBe('output_path_name_unsafe');
+                expect(refusal.detail).toEqual(['spelled=symbolic_link', 'resolved=file']);
+                expect(fs.readFileSync(target, 'utf8')).toBe(COMMITTED_ARTEFACT_BYTES);
+            });
+
+            it('refuses an --out that is a dangling link', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const root = tempDirectory();
+                const link = path.join(root, 'benchmark-report.json');
+                fs.symlinkSync(path.join(root, 'not-created-yet.json'), link);
+
+                const refusal = await refusalOf(
+                    runBenchmark(makeDeps({ outPath: link, acceptanceArtifactPath: aliases.canonicalPath })),
+                );
+
+                expect(refusal.code).toBe('output_path_name_unsafe');
+                expect(refusal.detail).toContain('spelled=symbolic_link');
+                expect(fs.existsSync(path.join(root, 'not-created-yet.json'))).toBe(false);
+            });
+
+            it('refuses an --out that names a directory', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const directory = path.join(tempDirectory(), 'benchmark-report.json');
+                fs.mkdirSync(directory, { mode: 0o700 });
+
+                const refusal = await refusalOf(
+                    runBenchmark(makeDeps({ outPath: directory, acceptanceArtifactPath: aliases.canonicalPath })),
+                );
+
+                expect(refusal.code).toBe('output_path_name_unsafe');
+                expect(refusal.detail).toEqual(['spelled=other', 'resolved=other']);
+                expect(fs.readdirSync(directory)).toEqual([]);
+            });
+        });
+
+        /**
+         * The parent is held to the shared primitive rather than to a rule of
+         * this runner's own: a directory other local principals can plant a
+         * name in is one where the artefact's name can be pre-placed as a link
+         * before this run creates it, and `assertSafeArtifactParent` in
+         * `scripts/lib/manifest.ts` is where that rule lives for every
+         * publishing stage. This test pins that the benchmark actually calls
+         * it — and that it does so BEFORE the measurement, not after.
+         */
+        describe('the output directory other principals can write to', () => {
+            it('refuses a world-writable non-sticky output directory before measuring', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const directory = path.join(tempDirectory(), 'shared');
+                fs.mkdirSync(directory, { mode: 0o700 });
+                fs.chmodSync(directory, 0o777);
+                const benchmark = makeBenchmark();
+                let queries = 0;
+                const scoring = expectedFirst(benchmark, THREE_FOODS);
+
+                const settled = await runBenchmark(
+                    makeDeps({
+                        benchmark,
+                        search: async (q: string): Promise<SearchPage> => {
+                            queries += 1;
+                            return scoring(q);
+                        },
+                        outPath: path.join(directory, 'benchmark-report.json'),
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                    }),
+                ).then(
+                    () => null,
+                    (error: unknown) => error,
+                );
+
+                expect(settled).toBeInstanceOf(ManifestError);
+                expect((settled as ManifestError).code).toBe('unsafe_artifact_directory');
+                expect(queries).toBe(0);
+                expect(fs.readdirSync(directory)).toEqual([]);
+            });
+
+            it('creates a missing output directory owner-only and publishes into it', async () => {
+                const aliases = makeAcceptanceArtefactAliases();
+                const nested = path.join(tempDirectory(), 'nested', 'reports');
+
+                const outcome = await runBenchmark(
+                    makeDeps({
+                        outPath: path.join(nested, 'benchmark-report.json'),
+                        acceptanceArtifactPath: aliases.canonicalPath,
+                    }),
+                );
+
+                expect(fs.existsSync(outcome.outPath)).toBe(true);
+                // Owner-only, so the directory this stage made for its own
+                // artefact is not one another principal can plant a name in on
+                // the next run.
+                expect(fs.statSync(nested).mode & 0o777).toBe(0o700);
+            });
+        });
+    });
+
+    /**
+     * The post-guard decision as a decision over VALUES: two observations in,
+     * every difference between them out. Driven directly, with no filesystem at
+     * all, because that is what makes each difference enumerable — the run
+     * itself can only produce one of them per test, and a later edit dropping
+     * one of the fields from the comparison would silently reopen the window.
+     */
+    describe('outputPathIdentityChanges', () => {
+        const observed: OutputPathObservation = {
+            parentDevice: 2049,
+            parentInode: 424242,
+            parentIsDirectory: true,
+            nameKind: 'absent',
+        };
+
+        it('reports nothing when the target is still the place that was verified', () => {
+            expect(outputPathIdentityChanges(observed, { ...observed })).toEqual([]);
+        });
+
+        it('accepts the artefact name having appeared as a plain file', () => {
+            expect(outputPathIdentityChanges(observed, { ...observed, nameKind: 'file' })).toEqual([]);
+        });
+
+        it('names a parent on a different device, with both values', () => {
+            expect(outputPathIdentityChanges(observed, { ...observed, parentDevice: 2050 })).toEqual([
+                'parent_device_changed=2049->2050',
+            ]);
+        });
+
+        it('names a replaced parent inode, with both values', () => {
+            expect(outputPathIdentityChanges(observed, { ...observed, parentInode: 99 })).toEqual([
+                'parent_inode_changed=424242->99',
+            ]);
+        });
+
+        it('names a parent that is no longer a directory', () => {
+            expect(outputPathIdentityChanges(observed, { ...observed, parentIsDirectory: false })).toEqual([
+                'parent_no_longer_a_directory',
+            ]);
+        });
+
+        it('names a link that appeared at the artefact name', () => {
+            expect(outputPathIdentityChanges(observed, { ...observed, nameKind: 'symbolic_link' })).toEqual([
+                'output_name_not_publishable=symbolic_link',
+            ]);
+        });
+
+        it('treats an unreadable parent as a change rather than as no observation', () => {
+            expect(outputPathIdentityChanges(observed, null)).toEqual(['output_parent_unreadable']);
+        });
+
+        it('names every difference of a parent swapped for a link to somewhere else', () => {
+            expect(
+                outputPathIdentityChanges(observed, {
+                    parentDevice: 2050,
+                    parentInode: 7,
+                    parentIsDirectory: false,
+                    nameKind: 'unreadable',
+                }),
+            ).toEqual([
+                'parent_device_changed=2049->2050',
+                'parent_inode_changed=424242->7',
+                'parent_no_longer_a_directory',
+                'output_name_not_publishable=unreadable',
+            ]);
+        });
+    });
+
+    describe('outputNameIsPublishable', () => {
+        it('publishes to a name that does not exist yet and to a plain file', () => {
+            expect(outputNameIsPublishable('absent')).toBe(true);
+            expect(outputNameIsPublishable('file')).toBe(true);
+        });
+
+        it('refuses a link, a directory and a name whose kind could not be read', () => {
+            expect(outputNameIsPublishable('symbolic_link')).toBe(false);
+            expect(outputNameIsPublishable('other')).toBe(false);
+            expect(outputNameIsPublishable('unreadable')).toBe(false);
+        });
     });
 
     describe('protocolDeviations', () => {
@@ -2004,6 +2822,153 @@ describe('cross-database reproduction', () => {
         });
     });
 
+    /**
+     * `--compare-with` names a file the operator chose, normally outside this
+     * repository, and the two ways it can fail to be a report are the two
+     * places a path and a foreign message used to reach the durable log: the
+     * refusal quoted the absolute path it tried to open and the message `fs` or
+     * `JSON.parse` produced, which carries the path again and, for the parser, a
+     * fragment of the document (CWE-532/CWE-209).
+     *
+     * Every assertion below is made against the SERIALISED failure lines rather
+     * than against a single field, because a substring is how a path leaks: it
+     * only has to survive in one member of one line to be published to a
+     * terminal, to CI retention and to the run log a committed report is
+     * assembled from.
+     */
+    describe('readPeerReport', () => {
+        const STAGE = 'search-benchmark';
+
+        /** A peer file under os.tmpdir(), removed by the suite's afterEach. */
+        const peerFile = (fileName: string, contents: string | null): string => {
+            const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-peer-layout-'));
+            tempDirectories.push(directory);
+            const absolutePath = path.join(directory, fileName);
+            if (contents !== null) {
+                fs.writeFileSync(absolutePath, contents, 'utf8');
+            }
+            return absolutePath;
+        };
+
+        /**
+         * Both lines `main`'s top-level catch writes for a `BenchmarkInputError`,
+         * serialised as the logger serialises them. Built from `describeFailure`
+         * and `error.detail` themselves so this is the runner's own output and
+         * not a transcription of it.
+         */
+        const failureLinesOf = (error: BenchmarkInputError): string => {
+            const failure = describeFailure(error);
+            return JSON.stringify([
+                { event: 'stage_failed', stage: STAGE, code: failure.code, error: failure.error, ...failure.detail },
+                {
+                    event: 'input_detail',
+                    stage: STAGE,
+                    code: error.code,
+                    items: error.detail.slice(0, 25),
+                    itemCount: error.detail.length,
+                },
+            ]);
+        };
+
+        /**
+         * The value the platform threw, so a test can assert both halves of the
+         * rule against the same failure: that its MESSAGE does not appear, and
+         * that what does appear is exactly `formatSafeError`'s rendering of it.
+         *
+         * The rendering is taken from the helper rather than written out as a
+         * literal because it is realm-dependent under Jest and only under Jest:
+         * `fs` and `JSON` construct their errors in the parent realm, so
+         * `safeError`'s `instanceof Error` is false inside the sandbox and the
+         * clause reads `UnknownError`, while the same refusal from
+         * `npm run search:benchmark` — one realm — reads
+         * `Error (code ENOENT)`. Both are safe; asserting the helper's own
+         * answer is what makes this test pin the rule rather than the runtime.
+         */
+        const thrownBy = (call: () => unknown): unknown => {
+            try {
+                call();
+            } catch (error) {
+                return error;
+            }
+            throw new Error('expected the call to throw, but it returned');
+        };
+
+        const messageOf = (error: unknown): string =>
+            error instanceof Error ? error.message : String((error as { message?: unknown })?.message);
+
+        it('refuses a file it cannot open with the failing class and without the path', () => {
+            const absolutePath = peerFile('second-database-report.json', null);
+            const openFailure = thrownBy(() => fs.readFileSync(absolutePath));
+
+            const refusal = refusalFrom(() => readPeerReport(absolutePath));
+            const lines = failureLinesOf(refusal);
+
+            expect(refusal.code).toBe('compare_report_unreadable');
+            // The actionable half survives: the class and, in a single-realm
+            // runtime, its machine code.
+            expect(lines).toContain(`cause=${formatSafeError(openFailure)}`);
+            expect(lines).toContain(`peerReportDigest=${opaqueDigest(absolutePath)}`);
+            expect(lines).toContain('Produce the peer report by running this command against the second database');
+            // The disclosure does not: not the path, not any segment of it, and
+            // not the platform's own prose.
+            expect(lines).not.toContain(absolutePath);
+            expect(lines).not.toContain(path.dirname(absolutePath));
+            expect(lines).not.toContain(path.basename(path.dirname(absolutePath)));
+            expect(lines).not.toContain('second-database-report.json');
+            expect(lines).not.toContain(os.tmpdir());
+            expect(lines).not.toContain(messageOf(openFailure));
+            expect(lines).not.toContain('no such file or directory');
+        });
+
+        it('refuses a file that is not JSON without quoting the document or the parser', () => {
+            // The marker stands in for document content: a JSON SyntaxError
+            // quotes the bytes it choked on, so a forwarded parser message
+            // republishes a fragment of a file this stage did not author.
+            const contents = '{"peerMarkerThatMustNotBeLogged": ';
+            const absolutePath = peerFile('second-database-report.json', contents);
+            const parseFailure = thrownBy(() => JSON.parse(contents));
+
+            const refusal = refusalFrom(() => readPeerReport(absolutePath));
+            const lines = failureLinesOf(refusal);
+
+            expect(refusal.code).toBe('compare_report_unreadable');
+            expect(lines).toContain(`cause=${formatSafeError(parseFailure)}`);
+            expect(lines).toContain(`peerReportDigest=${opaqueDigest(absolutePath)}`);
+            expect(lines).not.toContain(absolutePath);
+            expect(lines).not.toContain(path.basename(path.dirname(absolutePath)));
+            expect(lines).not.toContain('peerMarkerThatMustNotBeLogged');
+            expect(lines).not.toContain(messageOf(parseFailure));
+        });
+
+        it('reads a well-formed peer report and narrows its path to the file name', () => {
+            const absolutePath = peerFile('second-database-report.json', '{"stage":"search-benchmark"}');
+
+            const source = readPeerReport(absolutePath);
+
+            expect(source).toEqual({
+                path: 'second-database-report.json',
+                pathKind: 'name_only',
+                sha256: crypto.createHash('sha256').update('{"stage":"search-benchmark"}').digest('hex'),
+                raw: { stage: 'search-benchmark' },
+            });
+            expect(JSON.stringify(source)).not.toContain(path.dirname(absolutePath));
+        });
+
+        it('digests the resolved path, so two spellings of one file correlate', () => {
+            const absolutePath = peerFile('second-database-report.json', '{}');
+            const packageRelative = path.relative(path.resolve(__dirname, '..', '..', '..'), absolutePath);
+
+            expect(peerReportDigest(absolutePath)).toBe(opaqueDigest(absolutePath));
+            expect(peerReportDigest(packageRelative)).toBe(peerReportDigest(absolutePath));
+            // Twelve hex characters and nothing that could be read as a path.
+            expect(peerReportDigest(absolutePath)).toMatch(/^[0-9a-f]{12}$/);
+        });
+
+        it('states the absence rather than a digest when no comparison was requested', () => {
+            expect(peerReportDigest(null)).toBe('none');
+        });
+    });
+
     it('refuses a same-database comparison before it costs a measurement', async () => {
         const db = makeDb({ foods: THREE_FOODS });
         const deps = makeDeps({
@@ -2183,6 +3148,333 @@ describe('the conditions a report records', () => {
 // ---------------------------------------------------------------------------
 // The command line.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The committed query set's shape.
+//
+// `loadSearchBenchmark` checks the document's version and declares the rest, so
+// every field below reaches a SQL `LIMIT`, a bound parameter, a loop bound, a
+// Map key or the committed report as whatever the file actually holds. These
+// tests pin the two halves of the gate: the committed artefact passes it
+// unchanged, and each field the runner consumes is refused — with no part of
+// the offending value in the refusal — before anything is measured.
+// ---------------------------------------------------------------------------
+
+describe('assertSearchBenchmarkShape', () => {
+    /** A mutable deep copy of a document that passes, to break one field of. */
+    const validDocument = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        ...(JSON.parse(JSON.stringify(makeBenchmark())) as Record<string, unknown>),
+        ...overrides,
+    });
+
+    /** The same, with one query replaced by a broken one. */
+    const withBrokenQuery = (overrides: Record<string, unknown>): Record<string, unknown> =>
+        validDocument({
+            queries: [
+                { ...query('q001', 'coffee', ['usda:1']) },
+                { ...query('q002', 'tea', ['usda:2']), ...overrides },
+            ],
+        });
+
+    const shapeRefusalFor = (document: unknown): BenchmarkInputError =>
+        refusalFrom(() => assertSearchBenchmarkShape(document));
+
+    it('accepts the committed query set exactly as committed', () => {
+        const committed = loadSearchBenchmark();
+
+        // Returned as parsed rather than rebuilt, so the curation notes beside
+        // the payload — `description`, `kinds`, `omittedFoods`, the per-field
+        // rationales — reach the report's own copy instead of being dropped by
+        // the check.
+        expect(assertSearchBenchmarkShape(committed)).toBe(committed);
+        const asRecord = committed as unknown as Record<string, unknown>;
+        expect(asRecord.kinds).toBeDefined();
+        expect(asRecord.omittedFoods).toBeDefined();
+        expect(asRecord.thresholdPolicy).toBeDefined();
+        // The bounds leave room for the query set the plan requires (≥ 250) and
+        // for the one committed today, so a reviewed expansion never has to
+        // touch the runner.
+        expect(committed.queries.length).toBeGreaterThanOrEqual(250);
+    });
+
+    it('tolerates unknown keys at every level it reads', () => {
+        const document = validDocument({
+            description: 'a curation note',
+            kinds: [{ kind: 'exact', definition: 'the food’s own name' }],
+            protocol: { ...makeBenchmark().protocol, measuredUnit: 'catalog.service.searchPublishedFoods' },
+            paginationCheck: { ...makeBenchmark().paginationCheck, referenceMode: 'in_process' },
+        });
+
+        expect(assertSearchBenchmarkShape(document)).toBe(document);
+    });
+
+    // Each row builds the whole document, so the case reads as the document a
+    // run would actually be handed rather than as a patch a helper applies.
+    it.each<[string, () => unknown, string]>([
+        ['a top level that is not an object', () => null, 'field=its top level'],
+        ['a top level that is an array', () => [], 'field=its top level'],
+        ['a top level that is a string', () => '{}', 'field=its top level'],
+        ['a missing thresholds block', () => validDocument({ thresholds: undefined }), 'field=thresholds'],
+        [
+            'a hit rate above one',
+            () => validDocument({ thresholds: { ...PERMISSIVE_THRESHOLDS, topThreeHitRate: 1.5 } }),
+            'field=thresholds.topThreeHitRate',
+        ],
+        [
+            'a hit rate that is not a number',
+            () => validDocument({ thresholds: { ...PERMISSIVE_THRESHOLDS, topTenHitRate: '0.97' } }),
+            'field=thresholds.topTenHitRate',
+        ],
+        [
+            'a rate finer than the scale every verdict is compared at',
+            () => validDocument({ thresholds: { ...PERMISSIVE_THRESHOLDS, maxZeroResultRate: 0.0300001 } }),
+            'field=thresholds.maxZeroResultRate',
+        ],
+        [
+            'a latency bound of zero',
+            () => validDocument({ thresholds: { ...PERMISSIVE_THRESHOLDS, p95LatencyMs: 0 } }),
+            'field=thresholds.p95LatencyMs',
+        ],
+        [
+            'a fractional measured page size',
+            () => validDocument({ thresholds: { ...PERMISSIVE_THRESHOLDS, latencyLimit: 25.5 } }),
+            'field=thresholds.latencyLimit',
+        ],
+        [
+            'a measured page size of zero',
+            () => validDocument({ thresholds: { ...PERMISSIVE_THRESHOLDS, latencyLimit: 0 } }),
+            'field=thresholds.latencyLimit',
+        ],
+        [
+            'a measured page size past the in-process ceiling',
+            () => validDocument({ thresholds: { ...PERMISSIVE_THRESHOLDS, latencyLimit: 5000 } }),
+            'field=thresholds.latencyLimit',
+        ],
+        ['an ordering that is not an array', () => validDocument({ ordering: 'ts_rank DESC' }), 'field=ordering'],
+        ['an ordering clause that is not a string', () => validDocument({ ordering: [1] }), 'field=ordering[0]'],
+        ['an empty reportedConditions list', () => validDocument({ reportedConditions: [] }), 'field=reportedConditions'],
+        [
+            'a negative warm-up pass count',
+            () => validDocument({ protocol: { ...makeBenchmark().protocol, warmupPasses: -1 } }),
+            'field=protocol.warmupPasses',
+        ],
+        [
+            'no timed passes',
+            () => validDocument({ protocol: { ...makeBenchmark().protocol, timedPasses: 0 } }),
+            'field=protocol.timedPasses',
+        ],
+        [
+            'a timed pass count that would never finish',
+            () => validDocument({ protocol: { ...makeBenchmark().protocol, timedPasses: 1_000_000 } }),
+            'field=protocol.timedPasses',
+        ],
+        [
+            'a sequential flag that is not a boolean',
+            () => validDocument({ protocol: { ...makeBenchmark().protocol, sequential: 'yes' } }),
+            'field=protocol.sequential',
+        ],
+        [
+            'a connection count of zero',
+            () => validDocument({ protocol: { ...makeBenchmark().protocol, connections: 0 } }),
+            'field=protocol.connections',
+        ],
+        [
+            'an empty timing name',
+            () => validDocument({ protocol: { ...makeBenchmark().protocol, timing: '' } }),
+            'field=protocol.timing',
+        ],
+        ['no queries at all', () => validDocument({ queries: [] }), 'field=queries'],
+        ['a queries member that is not an array', () => validDocument({ queries: {} }), 'field=queries'],
+        [
+            'more queries than a run could sweep',
+            () =>
+                validDocument({
+                    queries: Array.from({ length: 2001 }, (_unused, index) =>
+                        query(`q${index}`, 'coffee', ['usda:1']),
+                    ),
+                }),
+            'field=queries',
+        ],
+        [
+            'a query that is not an object',
+            () => validDocument({ queries: [{ ...query('q001', 'coffee', ['usda:1']) }, 'q002'] }),
+            'field=queries[1]',
+        ],
+        ['an id that is not a string', () => withBrokenQuery({ id: 42 }), 'field=queries[1].id'],
+        ['an id longer than an id', () => withBrokenQuery({ id: 'q'.repeat(17) }), 'field=queries[1].id'],
+        ['a q that is missing', () => withBrokenQuery({ q: undefined }), 'field=queries[1].q'],
+        ['a q that is not a string', () => withBrokenQuery({ q: ['tea'] }), 'field=queries[1].q'],
+        ['a kind that is not a string', () => withBrokenQuery({ kind: 42 }), 'field=queries[1].kind'],
+        ['a kind wider than a rollup label', () => withBrokenQuery({ kind: 'k'.repeat(33) }), 'field=queries[1].kind'],
+        ['an expected list that is empty', () => withBrokenQuery({ expected: [] }), 'field=queries[1].expected'],
+        ['an expected list that is not an array', () => withBrokenQuery({ expected: 'usda:2' }), 'field=queries[1].expected'],
+        [
+            'an expectation that is not a source_key string',
+            () => withBrokenQuery({ expected: ['usda:2', 17] }),
+            'field=queries[1].expected[1]',
+        ],
+        [
+            'an expectation carrying a control character',
+            () => withBrokenQuery({ expected: ['usda:\u00022'] }),
+            'field=queries[1].expected[0]',
+        ],
+        [
+            'a pagination limit that is not an integer',
+            () => validDocument({ paginationCheck: { ...makeBenchmark().paginationCheck, limit: 25.5, singlePageLimit: 76.5 } }),
+            'field=paginationCheck.limit',
+        ],
+        [
+            'more pagination pages than a check could walk',
+            () => validDocument({ paginationCheck: { ...makeBenchmark().paginationCheck, pages: 1000, singlePageLimit: 25_000 } }),
+            'field=paginationCheck.pages',
+        ],
+        [
+            'a reference page that is not the pages it is compared against',
+            () => validDocument({ paginationCheck: { ...makeBenchmark().paginationCheck, singlePageLimit: 50 } }),
+            'field=paginationCheck.singlePageLimit',
+        ],
+        [
+            'a pagination id that is not a string',
+            () => validDocument({ paginationCheck: { ...makeBenchmark().paginationCheck, queryIds: [7] } }),
+            'field=paginationCheck.queryIds[0]',
+        ],
+        [
+            'a pagination id the list already names',
+            () => validDocument({ paginationCheck: { ...makeBenchmark().paginationCheck, queryIds: ['q001', 'q001'] } }),
+            'field=paginationCheck.queryIds[1]',
+        ],
+    ])('refuses %s', (_description, buildDocument, expectedField) => {
+        const refusal = shapeRefusalFor(buildDocument());
+
+        expect(refusal.code).toBe('query_set_invalid');
+        expect(refusal.detail[0]).toBe(expectedField);
+        // Every refusal carries the rule and the fixed remedy beside the field,
+        // which is the whole of what the log line may say.
+        expect(refusal.detail).toHaveLength(3);
+        expect(refusal.detail[2]).toContain('search-benchmark.v1.json');
+    });
+
+    it('refuses a query the search layer would itself refuse, and says so', () => {
+        // One character matches most of a ten-thousand-item catalog, which is
+        // why `parseCatalogSearchQuery` refuses it for a request; a benchmark
+        // query it would refuse cannot be measured either.
+        const belowTheFloor = shapeRefusalFor(withBrokenQuery({ q: 'c' }));
+        expect(belowTheFloor.detail[0]).toBe('field=queries[1].q');
+        expect(belowTheFloor.detail[1]).toContain('a query the search layer itself accepts');
+
+        const aboveTheCeiling = shapeRefusalFor(withBrokenQuery({ q: 'c'.repeat(61) }));
+        expect(aboveTheCeiling.detail[0]).toBe('field=queries[1].q');
+
+        // Accepted at the search layer's own boundaries, so the bounds are
+        // ITS bounds rather than a second, stricter rule.
+        expect(assertSearchBenchmarkShape(withBrokenQuery({ q: 'co' }))).toBeDefined();
+        expect(assertSearchBenchmarkShape(withBrokenQuery({ q: 'c'.repeat(60) }))).toBeDefined();
+    });
+
+    it('refuses a query that is not exactly what would be searched', () => {
+        // The parser trims; `runPass` does not. A `q` that passes validation
+        // only after trimming would be sent to the service in its untrimmed
+        // form — a different query from the one that was checked.
+        expect(shapeRefusalFor(withBrokenQuery({ q: ' coffee' })).detail[0]).toBe('field=queries[1].q');
+        expect(shapeRefusalFor(withBrokenQuery({ q: 'coffee ' })).detail[0]).toBe('field=queries[1].q');
+        expect(shapeRefusalFor(withBrokenQuery({ q: 'ice\tcoffee' })).detail[0]).toBe('field=queries[1].q');
+    });
+
+    it('refuses a repeated query id, which would score a query nobody measured', () => {
+        const refusal = shapeRefusalFor(
+            validDocument({
+                queries: [{ ...query('q001', 'coffee', ['usda:1']) }, { ...query('q001', 'tea', ['usda:2']) }],
+            }),
+        );
+
+        expect(refusal.detail[0]).toBe('field=queries[1].id');
+        expect(refusal.detail[1]).toContain('repeats an id an earlier query already declares');
+    });
+
+    it('names the field and the rule but never the value it refused', () => {
+        // The value is the thing this check distrusts: a NUL cannot exist in a
+        // PostgreSQL text parameter at all, and echoing the string into a
+        // refusal would put it in the operator's terminal, in CI retention and
+        // in the durable run log (CWE-117/CWE-532).
+        const hostile = 'co\u0000ffee-MARKER-\u202edeifitsuj';
+        const refusal = shapeRefusalFor(withBrokenQuery({ q: hostile }));
+        const serialised = JSON.stringify({
+            code: refusal.code,
+            items: refusal.detail,
+            message: refusal.message,
+        });
+
+        expect(refusal.detail[0]).toBe('field=queries[1].q');
+        expect(serialised).not.toContain('MARKER');
+        expect(serialised).not.toContain('\\u0000');
+        expect(serialised).not.toContain('\\u202e');
+    });
+
+    it('reports a malformed query set as a prerequisite gap, before any connection is opened', () => {
+        // preflight is the first thing main does after parsing its flags, and a
+        // gap makes it return 1 — ahead of the release manifest, the pool pin,
+        // the dynamic Prisma import and the stage lock.
+        const gaps = preflight({
+            loadSearchBenchmark: () => withBrokenQuery({ q: 'c' }) as unknown as SearchBenchmark,
+            fileExists: () => true,
+        });
+
+        expect(gaps).toHaveLength(1);
+        expect(gaps[0].code).toBe('search_benchmark_invalid');
+        expect(gaps[0].detail).toContain('field=queries[1].q');
+        // The gap states the remedy in its own field, so the detail carries the
+        // fault alone rather than repeating it.
+        expect(gaps[0].remedy).toContain('search-benchmark.v1.json');
+        expect(gaps[0].detail).not.toContain('run the stage again');
+    });
+
+    it('reports a query set that passes as no gap at all', () => {
+        expect(
+            preflight({
+                loadSearchBenchmark: () => validDocument() as unknown as SearchBenchmark,
+                fileExists: () => true,
+            }),
+        ).toEqual([]);
+    });
+
+    it('stops a malformed query set before one query runs or one map is built', async () => {
+        // main's order, as main takes it: validate the loaded document, and only
+        // then measure with it. The spies are what prove the second step is
+        // unreachable — no search call, no statement, and no artefact.
+        const searched: string[] = [];
+        const db = makeDb({ foods: THREE_FOODS });
+        const outPath = tempOutPath();
+        const measureIfAccepted = async (document: unknown): Promise<BenchmarkOutcome> => {
+            const benchmark = assertSearchBenchmarkShape(document);
+            return runBenchmark(
+                makeDeps({
+                    db,
+                    benchmark,
+                    outPath,
+                    search: async (q: string): Promise<SearchPage> => {
+                        searched.push(q);
+                        return { items: [], total: 0 };
+                    },
+                }),
+            );
+        };
+
+        // A NUL in `q` reaches `plainto_tsquery` as a bound parameter and
+        // aborts the statement mid-measurement (SQLSTATE 22021) when nothing
+        // refuses it first.
+        const refusal = await refusalOf(measureIfAccepted(withBrokenQuery({ q: 'co\u0000ffee' })));
+
+        expect(refusal.code).toBe('query_set_invalid');
+        expect(searched).toEqual([]);
+        expect(db.statements).toEqual([]);
+        expect(fs.existsSync(outPath)).toBe(false);
+
+        // The same path with a document that passes does measure, so the test
+        // above is a gate rather than a broken harness.
+        await measureIfAccepted(validDocument());
+        expect(searched).toEqual(['coffee', 'tea', 'milk', 'coffee', 'tea', 'milk', 'coffee', 'tea', 'milk', 'coffee', 'tea', 'milk']);
+    });
+});
 
 describe('parseArgs', () => {
     it('accepts --compare-with with a path', () => {

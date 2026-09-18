@@ -92,15 +92,32 @@
 // `sleep`, `logger` and the ledger itself are injected so a test can drive an
 // hour of pacing instantly.
 //
-// Three Node builtins are imported — `fs` and `path` for the file ledger, and
-// `os` for the host-wide directory its default path sits in — and nothing
-// else. No dependency is added (AAP §0.4.2) and no timer runs in the
-// background (AAP §0.8.2): the file lock is held only for the read-modify-write
-// it protects and is never reasserted, so there is no lease to keep alive.
+// Four Node builtins are imported — `fs` and `path` for the file ledger, `os`
+// for the host-wide directory its default path sits in, and `crypto` for the
+// one name in this module that must be unguessable — and nothing else. No
+// dependency is added (AAP §0.4.2) and no timer runs in the background (AAP
+// §0.8.2): the file lock is held only for the read-modify-write it protects and
+// is never reasserted, so there is no lease to keep alive.
+//
+// WHY `crypto` EARNS ITS IMPORT. The ledger's state document is written to a
+// temp file in the ledger directory and renamed over the state file, and the
+// temp name used to be `<state>.<pid>.<sequence>.tmp` — derivable by anyone who
+// can read a process list. A local principal who can create a file in that
+// directory can therefore pre-place a symbolic link at the name the next write
+// will use and have the write land on its target. Exclusive creation is what
+// closes that (`O_CREAT | O_EXCL` fails outright on an existing name,
+// symbolic link included), and an unguessable name is what makes the attempt
+// itself impractical rather than merely unsuccessful: without it a loop can
+// keep re-planting the link every time a write refuses, which turns a defeated
+// attack into a ledger that never records an attempt and an import that stops.
+// `crypto.randomBytes` is the only source in the standard library fit for a
+// name an adversary must not be able to guess.
+//
 // Importing this module and constructing a limiter remain side-effect free —
 // the ledger directory and the state file are created on the first `reserve`,
 // not at construction.
 
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -325,11 +342,15 @@ export interface BucketState {
  * `throttled429` is the vendor saying the key is over its hourly cap, which is
  * the one number that tells an operator this module's ceiling was set too high
  * or shared with something it does not know about; `timeout408` is the vendor
- * being slow; and `retryable400` is USDA's documented habit of rejecting a
- * request that succeeds when retried verbatim, which would otherwise be
- * indistinguishable from a malformed request in `otherClientError`. Lumping
- * the three into "4xx" is what made the previous report unable to answer "how
- * many 429s".
+ * being slow; and `retryable400` is a 400 that the vendor boundary retries
+ * verbatim because a repeated identical request has been OBSERVED to succeed
+ * (`RETRYABLE_STATUSES` / `isRetryableUsdaStatus` in
+ * `src/services/usda.service.ts` is the authority for which statuses those are,
+ * its comment records the behaviour as observed rather than documented by the
+ * vendor, and `src/services/__tests__/usda.service.test.ts` pins the retry),
+ * which would otherwise be indistinguishable from a malformed request in
+ * `otherClientError`. Lumping the three into "4xx" is what made the previous
+ * report unable to answer "how many 429s".
  */
 export interface UsdaStatusClassCounts {
     /** 200-299. */
@@ -511,7 +532,19 @@ export interface UsdaRateLimiterOptions {
      */
     policyCapPerHour?: number;
     burstCapacity?: number;
-    /** A bare hostname or a base URL — `usda.service.ts` honours `USDA_BASE_URL`. */
+    /**
+     * The host to pace: a bare hostname or a base URL, both canonicalised the
+     * same way. Defaults to `getUsdaPacedHost()` — the effective
+     * `USDA_BASE_URL` host, which is where `usda.service.ts` will actually
+     * send the requests this limiter gates.
+     *
+     * Passing one is only for a caller whose traffic this module cannot infer
+     * from the environment (a stub transport in a test, a request path
+     * configured elsewhere). Passing the CONSTANT host while the request path
+     * is overridden is the misconfiguration the default exists to prevent: the
+     * host match would find nothing, and every request would go out unpaced
+     * and uncharged while the run still reported a ceiling.
+     */
     host?: string;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
@@ -531,6 +564,18 @@ export interface UsdaRateLimiterOptions {
      * host. It names the shared CREDENTIAL's hour, not this run, so every
      * importer spending the same key must use the same scope. It is reported
      * and logged, so it must not be, or be derived from, the key itself.
+     *
+     * THE PACED HOST IS THE RIGHT DEFAULT because a vendor's hourly allowance
+     * is per service: requests sent to an overridden `USDA_BASE_URL` are
+     * neither counted by nor counted against `api.nal.usda.gov`'s 1,000/hour,
+     * so keeping both in one ledger would pace a mirror run by the spend of a
+     * real one and vice versa. Defaulting to the host makes the durable budget
+     * per host, which is what this field's own wording has always claimed;
+     * with no override the resolved host IS
+     * `DEFAULT_USDA_RATE_LEDGER_SCOPE`, so the default state file is
+     * unchanged. Two different KEYS against one host are still two
+     * allowances this module cannot distinguish — it never sees a key — and
+     * remain the reason to pass an explicit scope.
      */
     ledgerScope?: string;
     /** Where the default file ledger keeps its state; see `defaultUsdaRateLedgerStateFilePath`. */
@@ -852,8 +897,12 @@ const canonicalHostname = (hostname: string): string => hostname.toLowerCase().r
 
 // `hostOf` reduces a URL to its hostname but answers 'invalid-url' for a bare
 // hostname, so which form arrived has to be decided first. Both are accepted
-// because `usda.service.ts` reads `USDA_BASE_URL`, and a caller wiring the
-// limiter to a mock server would naturally pass that base URL straight through.
+// because this reads `UsdaRateLimiterOptions.host` and `isUsdaRequestUrl`'s
+// expected host — values a CALLER hands over, documented as either spelling,
+// and a caller pointing the limiter at a stub transport has both forms to hand.
+// It is deliberately NOT the reader of `USDA_BASE_URL`: that variable is
+// concatenated into a request URL by `usda.service.ts`, so it has a narrower
+// contract, which `getUsdaPacedHost` enforces before anything reaches here.
 // Both branches canonicalise, so a configured host, a configured base URL and
 // an outgoing request URL are all compared in the same form.
 const normalizeHost = (host: string): string => {
@@ -863,6 +912,172 @@ const normalizeHost = (host: string): string => {
     }
     const parsed = hostOf(trimmed);
     return parsed === 'invalid-url' ? '' : canonicalHostname(parsed);
+};
+
+const BASE_URL_ENV_VAR = 'USDA_BASE_URL';
+
+/**
+ * The host the import's USDA traffic will ACTUALLY go to — the only place
+ * `USDA_BASE_URL` is read, and the limiter's default paced host.
+ *
+ * WHY THIS EXISTS RATHER THAN A CONSTANT. `usda.service.ts` sends every
+ * request to `process.env.USDA_BASE_URL || <the documented default>`, so an
+ * operator who points the pipeline at a mirror or a mock server moves the
+ * traffic to a different host. The limiter paces by host match
+ * (`isUsdaRequestUrl`), and a limiter installed with the CONSTANT host while
+ * the traffic leaves for an overridden one matches nothing: the requests go
+ * out neither paced nor charged to the durable hourly ledger, which is the
+ * same outcome as not installing a limiter at all except that the run reports
+ * a ceiling it was not held to. Resolving the effective host HERE rather than
+ * at each call site is what makes that unforgettable — a caller that passes no
+ * `host` gets the host its own requests will reach.
+ *
+ * WHAT COUNTS AS SET MIRRORS `usda.service.ts` EXACTLY, because the two must
+ * agree about where the traffic is going. That module writes
+ * `process.env.USDA_BASE_URL || DEFAULT_BASE_URL`
+ * (src/services/usda.service.ts:162), so the ONLY two values it reads as unset
+ * are `undefined` and the empty string — `||` tests truthiness — and both mean
+ * the documented default (`USDA_HOST`) here. The empty string has to match
+ * deliberately: a stray `USDA_BASE_URL=` in a `.env` file must not stop an
+ * import that the request path would have run perfectly well. Every other
+ * value is SET over there, so it is set over here, including one that is
+ * nothing but spaces.
+ *
+ * WHAT COUNTS AS USABLE IS ALSO `usda.service.ts`'s CONSTRAINT, not this
+ * module's. Line 162 CONCATENATES the value: the request URL is
+ * `${baseUrl}${path}?${query}`, handed to `fetch` with no base to resolve
+ * against. So only an absolute `http:`/`https:` URL produces a request at all,
+ * and an absolute `http:`/`https:` URL is therefore exactly what this accepts.
+ * A bare hostname (`api.example.com`) and a run of spaces both look
+ * reducible-to-a-host to a resolver that only wants a hostname, and both make
+ * the request path build a RELATIVE URL that `fetch` rejects outright — so
+ * accepting either would leave this function, whose whole job is to be the
+ * authority on which host is being paced, naming a host no request can ever
+ * reach. The request builder is the authoritative side of that agreement; this
+ * side refuses what it cannot use.
+ *
+ * AN OVERRIDE IS REFUSED RATHER THAN IGNORED, because ignoring it is precisely
+ * the silent no-pacing this resolver exists to prevent — and because a value
+ * the request path cannot use is a misconfiguration an operator needs to hear
+ * about before a multi-hour import starts. Five rejections:
+ *
+ *  - A value that is present but only WHITESPACE. It is not read as unset:
+ *   `||` sees a non-empty string and the request path builds every URL against
+ *   it, so reading it as unset here would report a ceiling on `USDA_HOST` for a
+ *   run whose requests all fail to parse.
+ *  - A value that is not an ABSOLUTE URL — a bare hostname, a protocol-relative
+ *   `//host/path`, a path, or text that is not a URL at all. None of them can be
+ *   concatenated into a fetchable URL, and none of them leaves a host this
+ *   limiter could honestly claim to pace.
+ *  - A SCHEME other than `http:`/`https:`. `file:` and `javascript:` parse
+ *   perfectly well and even yield an opaque path, but `usda.service.ts` speaks
+ *   HTTP to a REST API: no vendor request comes out of such a base, so there is
+ *   no vendor allowance to pace.
+ *  - A value carrying USERINFO. `https://user:secret@host/` is ambiguous to a
+ *   reader in the way that matters — `https://api.nal.usda.gov@elsewhere.test`
+ *   addresses `elsewhere.test` — and it also means a credential is sitting in a
+ *   variable this module would otherwise reduce to a hostname and hand to logs
+ *   and reports. The repository already refuses credentialed URLs outright at
+ *   its other outbound boundary (`evidence.logic.ts`, AAP §0.3.2), and this
+ *   holds the same line.
+ *  - An absolute URL whose authority canonicalises to NO host (`https://./x`),
+ *   which would leave the paced host empty and match nothing.
+ *
+ * NO MESSAGE ECHOES THE VALUE. A base URL can carry userinfo, so the raw
+ * string is a possible secret and the messages name the variable and the
+ * remedy instead — the same rule `readDecimalInteger` follows for the rate.
+ *
+ * @throws RateLimitConfigError when `USDA_BASE_URL` is set and unusable.
+ */
+export const getUsdaPacedHost = (env: NodeJS.ProcessEnv = process.env): string => {
+    const raw = env[BASE_URL_ENV_VAR];
+
+    // Exactly what `||` treats as unset at src/services/usda.service.ts:162,
+    // and nothing else: `undefined` and the empty string.
+    if (raw === undefined || raw.length === 0) {
+        return USDA_HOST;
+    }
+
+    // Trimmed only to tolerate padding around an otherwise absolute URL, which
+    // the WHATWG parser strips from a `fetch` argument anyway, so the request
+    // still reaches the host this resolves. A value that is NOTHING but
+    // padding is a different thing: the request path reads it as set and
+    // builds unfetchable relative URLs against it, so it is refused here
+    // rather than quietly read as unset.
+    const configured = raw.trim();
+
+    if (configured.length === 0) {
+        throw new RateLimitConfigError(
+            `${BASE_URL_ENV_VAR} is set to a value containing only whitespace, which is NOT read as unset: ` +
+                `usda.service.ts concatenates the raw value into every request URL ` +
+                `(src/services/usda.service.ts:162), and a non-empty run of spaces is a base URL as far as that ` +
+                `concatenation is concerned, so every request would be built against it and fail to parse. Set ` +
+                `${BASE_URL_ENV_VAR} to an absolute http(s) base URL of the FoodData Central service to use, or ` +
+                `remove the line entirely to use ${USDA_HOST}.`,
+        );
+    }
+
+    // Parsed with NO fallback base, because that is the condition the request
+    // path imposes: `usda.service.ts` concatenates this value and hands the
+    // result to `fetch` unresolved, so anything that is not an absolute URL on
+    // its own — a bare hostname, `//host/path`, a path, prose — cannot become
+    // a request at all, whatever this module would have made of its host.
+    const parsed = ((): URL | null => {
+        try {
+            return new URL(configured);
+        } catch {
+            return null;
+        }
+    })();
+
+    if (parsed === null) {
+        throw new RateLimitConfigError(
+            `${BASE_URL_ENV_VAR} is set to a value that is not an absolute URL, so the importer's USDA traffic ` +
+                `has no host to pace and would not leave the process: usda.service.ts concatenates the value with ` +
+                `the request path and fetches the result with no base URL to resolve against ` +
+                `(src/services/usda.service.ts:162), so a bare hostname or a path yields a relative URL that ` +
+                `fetch rejects. Set ${BASE_URL_ENV_VAR} to an absolute base URL INCLUDING the scheme, of the form ` +
+                `https://<host>/fdc/v1 (or unset it to use ${USDA_HOST}). The value is not echoed here because a ` +
+                `base URL can carry credentials.`,
+        );
+    }
+
+    if (parsed.username.length > 0 || parsed.password.length > 0) {
+        throw new RateLimitConfigError(
+            `${BASE_URL_ENV_VAR} carries userinfo (credentials) in its authority, which is refused: the host such ` +
+                `a URL addresses is not the one it appears to name, and the credential would travel into a ` +
+                `variable this module reduces to a hostname for logs and reports. Remove the credentials from ` +
+                `${BASE_URL_ENV_VAR} and pass the API key the way ${USDA_HOST} takes it, as the api_key query ` +
+                `parameter. The value is not echoed here because it contains a secret.`,
+        );
+    }
+
+    // Checked because `usda.service.ts` speaks HTTP to a REST API and this
+    // module gates HTTP transport: a `file:` or `javascript:` base parses, and
+    // may even carry an authority, but no vendor request is produced by it, so
+    // there is no vendor allowance to pace and the configuration is a mistake
+    // rather than an exotic deployment.
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new RateLimitConfigError(
+            `${BASE_URL_ENV_VAR} names a scheme other than http or https, which is refused: usda.service.ts ` +
+                `builds an HTTP request against this base (src/services/usda.service.ts:162), so no USDA traffic ` +
+                `can come out of another scheme and there is no host for the importer to pace. Set ` +
+                `${BASE_URL_ENV_VAR} to an http(s) base URL of the form https://<host>/fdc/v1 (or unset it to ` +
+                `use ${USDA_HOST}). The value is not echoed here because a base URL can carry credentials.`,
+        );
+    }
+
+    const host = normalizeHost(parsed.hostname);
+
+    if (host.length === 0) {
+        throw new RateLimitConfigError(
+            `${BASE_URL_ENV_VAR} is set to a value with no host, so there is no host for the importer to pace. ` +
+                `Set it to the base URL of the FoodData Central service to use (or unset it to use ${USDA_HOST}). ` +
+                `The value is not echoed here because a base URL can carry credentials.`,
+        );
+    }
+
+    return host;
 };
 
 // `fetch` accepts a string, a URL or a Request. The `url`/`href` duck-typing
@@ -1048,6 +1263,57 @@ const LEDGER_HOST_DIRECTORY_NAME = 'soh-usda-rate-ledger';
  */
 const LEDGER_DIRECTORY_MODE = 0o700;
 const LEDGER_FILE_MODE = 0o600;
+
+/**
+ * The permission bits that must be clear on the ledger directory: every group
+ * and other bit (`0o077`).
+ *
+ * It is a mask over the permission bits alone and not an equality test against
+ * `LEDGER_DIRECTORY_MODE`, because an equality test would refuse a directory
+ * that is genuinely owner-only. A temp root is commonly set-group-ID —
+ * `/tmp` is `drwxrwsrwt` on many distributions — and Linux gives every
+ * directory created beneath such a root that same bit, so a ledger directory
+ * this module itself created with mode 0700 legitimately reads back as 02700.
+ * With no group or other permission granted, set-user-ID, set-group-ID and
+ * sticky confer no access on any other principal, so they are not what the
+ * check is about.
+ */
+const LEDGER_DIRECTORY_FOREIGN_ACCESS_MASK = 0o077;
+
+/**
+ * How this ledger creates a file: `O_WRONLY | O_CREAT | O_EXCL`, plus
+ * `O_NOFOLLOW` where the platform defines it.
+ *
+ * `O_EXCL` is the load-bearing flag and it does two jobs. It is the atomic
+ * test-and-create the lock is built on, and it is what makes a create refuse a
+ * name that already exists — INCLUDING a name that is a symbolic link, which
+ * `open(2)` fails with `EEXIST` regardless of whether the link resolves. That
+ * is precisely the attack the lock file and the state file's temp file are
+ * exposed to: a local principal who can create a name in the ledger directory
+ * plants a link, and a create that followed it would write this run's state
+ * into a file somebody else chose.
+ *
+ * `O_NOFOLLOW` is therefore redundant against that attack and is still set:
+ * it costs one bit, it states the intent in the flags rather than only in this
+ * comment, and it holds the same posture if a future call here ever drops
+ * `O_EXCL`. It is read defensively because it is a platform constant — the
+ * type declarations promise it unconditionally while a runtime on a platform
+ * without the flag need not define it, and `undefined` in a bitwise OR would
+ * silently become a zero that looks deliberate.
+ */
+const LEDGER_EXCLUSIVE_OPEN_FLAGS =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    (typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0);
+
+/**
+ * How many random bytes name the state file's temp file. Twelve bytes are 96
+ * bits, written as 24 hex characters: far past what a local attacker can
+ * enumerate between two reservations, and short enough that
+ * `<state file>.<24 hex>.tmp` clears every filesystem's name limit.
+ */
+const LEDGER_TEMP_NAME_BYTES = 12;
 
 // Long enough for a hostname, short enough that prefix + scope + suffix clears
 // every filesystem's name limit with room to spare.
@@ -1259,6 +1525,21 @@ export interface FileUsdaRateLedgerOptions {
     lockRetryDelayMs?: number;
     /** Injected so a test does not really wait out lock contention. */
     sleep?: (ms: number) => Promise<void>;
+    /**
+     * Where the ONE thing this ledger has to say about itself goes: that the
+     * owner-and-mode half of the directory check was skipped because the
+     * platform exposes no POSIX uid semantics (see `ensureDirectory`).
+     *
+     * It is optional and nothing else is ever logged here. The ledger's
+     * failures travel as `UsdaRateLedgerError` instead, because a refusal a
+     * caller must act on belongs in the error it throws rather than in a log
+     * line the caller may not be reading; a check that could not be performed
+     * is the opposite case — it changes nothing about this run's outcome, so
+     * an operator can only learn it from a log. Paths are never logged (a
+     * path can carry a home directory and these lines reach CI output), so
+     * the line carries the scope and nothing more.
+     */
+    logger?: ScriptLogger;
 }
 
 /** The on-disk document. Small, versioned, and rewritten whole on every change. */
@@ -1330,6 +1611,7 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
     const lockAttempts = options.lockAttempts ?? DEFAULT_LEDGER_LOCK_ATTEMPTS;
     const lockRetryDelayMs = options.lockRetryDelayMs ?? DEFAULT_LEDGER_LOCK_RETRY_DELAY_MS;
     const sleep = options.sleep ?? defaultSleep;
+    const logger = options.logger;
 
     // Checked at construction, like every other rate configuration in this
     // module (§9): a non-finite staleness threshold would make every lock look
@@ -1372,20 +1654,49 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
     };
 
     let directoryReady = false;
+    let directoryIdentityUnchecked = false;
 
+    /**
+     * Creates the ledger directory and then CHECKS WHAT IS ACTUALLY THERE.
+     *
+     * Creating it is not what makes it trustworthy. `mkdirSync` with
+     * `recursive: true` accepts an existing directory, applies no mode to it,
+     * and is satisfied by a SYMLINK pointing at one — so on its own it hands
+     * the run whatever another local principal left at that name. The default
+     * directory sits directly under `os.tmpdir()`, which is world-writable,
+     * so "another local principal left something there" is not a hypothetical:
+     * any user on the host can create `soh-usda-rate-ledger` before the
+     * importer does, and a ledger whose directory somebody else can write is a
+     * ledger that can be made to say the hour is empty. That hands the run the
+     * vendor's full allowance against a key the running API shares and pushes
+     * it past USDA's 1,000/hour (AAP §0.7.1 Group 1) — the exact outcome this
+     * module exists to prevent, arrived at by pacing from state it should
+     * never have believed.
+     *
+     * So the identity of the directory is verified after creation, and every
+     * check below is a refusal rather than a repair: this module does not
+     * widen, narrow or re-own a directory it did not create, because silently
+     * taking over a path another user planted is how a refusal becomes a
+     * privilege. `lstat` and not `stat`, so a symlink is seen AS a symlink
+     * instead of being followed to whatever it addresses.
+     *
+     * The owner-and-mode half needs POSIX uid semantics, which Windows does
+     * not provide (`process.getuid` is absent there and `Stats.uid`/`mode`
+     * carry no comparable meaning). Where they are missing the real-directory
+     * check still stands and the stronger one is reported as skipped rather
+     * than faked — an operator reading the log learns the run leaned on
+     * filesystem permissions it could not verify, which is a different posture
+     * from one that was checked and passed.
+     */
     const ensureDirectory = (): void => {
         if (directoryReady) {
             return;
         }
 
         try {
-            // Owner-only, because the default directory sits in a
-            // world-writable temp root (`defaultUsdaRateLedgerDirectory`). An
-            // existing directory keeps whatever mode it already has —
-            // `mkdirSync` does not re-apply one, and this module will not
-            // widen or narrow a directory an operator or another user created;
-            // the files inside it are written owner-only regardless, and a
-            // directory this process cannot use fails closed below.
+            // Owner-only on creation, because the default directory sits in a
+            // world-writable temp root (`defaultUsdaRateLedgerDirectory`), and
+            // the files inside it are written owner-only regardless.
             fs.mkdirSync(stateDirectory, { recursive: true, mode: LEDGER_DIRECTORY_MODE });
         } catch (error) {
             fail(
@@ -1394,7 +1705,154 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
             );
         }
 
+        const directory = ((): fs.Stats => {
+            try {
+                return fs.lstatSync(stateDirectory);
+            } catch (error) {
+                return fail(
+                    'state_directory_unusable',
+                    `the ledger directory could not be inspected after it was created ` +
+                        `(${errorCodeOf(error) ?? 'unknown error'})`,
+                );
+            }
+        })();
+
+        if (directory.isSymbolicLink()) {
+            // Deliberately refused rather than followed: a symbolic link at
+            // this name is a redirection somebody chose, and the whole point of
+            // the owner-only directory is that nobody but this user chooses
+            // where the hour's record lives.
+            fail(
+                'state_directory_unusable',
+                'a symbolic link stands where the ledger directory belongs, so the hour\u2019s record would be ' +
+                    'written wherever that link points — remove the link and let the importer create a real ' +
+                    'directory it owns',
+            );
+        }
+
+        if (!directory.isDirectory()) {
+            fail(
+                'state_directory_unusable',
+                'the ledger directory path is not a directory — remove whatever stands at that name and let the ' +
+                    'importer create a real directory it owns',
+            );
+        }
+
+        const processUid = typeof process.getuid === 'function' ? process.getuid() : null;
+
+        if (processUid === null) {
+            if (!directoryIdentityUnchecked) {
+                directoryIdentityUnchecked = true;
+                logger?.warn('usda_rate_ledger_directory_identity_unchecked', {
+                    scope,
+                    ledgerKind: 'file',
+                    reason: 'posix_uid_semantics_unavailable',
+                });
+            }
+
+            directoryReady = true;
+
+            return;
+        }
+
+        if (directory.uid !== processUid) {
+            fail(
+                'state_directory_unusable',
+                `the ledger directory is owned by uid ${directory.uid} and this importer runs as uid ` +
+                    `${processUid}, so its hourly record would be kept in a directory another OS user controls — ` +
+                    `run every importer sharing the key as one service account, or point this one at a directory ` +
+                    `it owns`,
+            );
+        }
+
+        if ((directory.mode & LEDGER_DIRECTORY_FOREIGN_ACCESS_MASK) !== 0) {
+            // Only the group and other PERMISSION bits are examined. The
+            // set-user-ID, set-group-ID and sticky bits are deliberately not:
+            // a temp root is commonly set-group-ID (so every directory created
+            // beneath it inherits that bit), and with no group or other
+            // permission granted those bits confer no access on anyone.
+            fail(
+                'state_directory_unusable',
+                `the ledger directory's permissions are 0${(directory.mode & 0o7777).toString(8)}, which grants ` +
+                    `group or other access to the record of what the shared API key spent this hour — a second ` +
+                    `principal that can write here can make the hour read as empty and hand the next run a full ` +
+                    `allowance, so restrict it to 0${LEDGER_DIRECTORY_MODE.toString(8)} (owner only)`,
+            );
+        }
+
         directoryReady = true;
+    };
+
+    /**
+     * Refuses to go on when something other than a regular file stands at a
+     * path this ledger is about to READ.
+     *
+     * It answers nothing and decides nothing about ABSENCE: a path with
+     * nothing at it is each caller's own business — no state file is a first
+     * run, no lock file is an unheld lock — and each of them already learns
+     * that from the `ENOENT` its own read raises, which is also the reading
+     * that cannot be raced. This guard's single job is the impostor case,
+     * because that is the one the read itself cannot detect.
+     *
+     * TWO KINDS OF IMPOSTOR ARE REFUSED, for different reasons.
+     *
+     * A symbolic link is refused rather than followed. `readFileSync` follows
+     * one, so a link planted at the state file's name makes the ledger read
+     * whatever it addresses: point it at an empty document and the hour reads
+     * as unspent, which hands the run the vendor's full allowance against a key
+     * the running API shares. Nothing legitimate ever creates a link here —
+     * this module writes the state file by renaming a regular file over it —
+     * so a link is a redirection somebody chose and the answer is to stop.
+     *
+     * Anything else that is not a regular file is refused because it cannot be
+     * read as one. A FIFO is the sharp case: opening it blocks until a writer
+     * appears, so an importer that trusted it would hang inside its own lock
+     * until the lock went stale and another process broke it — the ledger
+     * silently out of the way rather than loudly refusing.
+     *
+     * `lstat` and not `stat`, so the link is seen AS a link. The check cannot
+     * be fused with the read that follows it (Node exposes no atomic
+     * open-if-regular for a path read), so it closes the PLANTED case rather
+     * than every interleaving; the directory it applies to is owner-only and
+     * verified as such by `ensureDirectory`, which is what makes a hostile
+     * interleaving there require a principal that could rewrite the state file
+     * outright.
+     */
+    const refuseNonRegularFile = (target: string, code: UsdaRateLedgerErrorCode, label: string): void => {
+        let observed: fs.Stats;
+
+        try {
+            observed = fs.lstatSync(target);
+        } catch (error) {
+            if (errorCodeOf(error) === 'ENOENT') {
+                // Nothing to refuse. The caller's read decides what an absent
+                // path means, and raises its own `ENOENT` if it is still absent
+                // a moment later.
+                return;
+            }
+
+            fail(code, `${label} could not be inspected (${errorCodeOf(error) ?? 'unknown error'})`);
+
+            return;
+        }
+
+        if (observed.isSymbolicLink()) {
+            fail(
+                code,
+                `${label} is a symbolic link, and this ledger refuses to read through one rather than trusting ` +
+                    `whatever it points at — remove the link; nothing this module writes ever creates one`,
+            );
+
+            return;
+        }
+
+        if (!observed.isFile()) {
+            fail(
+                code,
+                `${label} is not a regular file, so it cannot be read as the document this ledger writes — ` +
+                    `remove whatever stands at that name`,
+            );
+        }
     };
 
     // `force` absorbs the only expected failure — the file not being there —
@@ -1432,6 +1890,13 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
      * second allowance.
      */
     const readLockToken = (): string | null => {
+        // A lock file is a regular file this module created with
+        // `O_CREAT | O_EXCL`, so anything else at that name — a symbolic link
+        // above all — is not a lock whose token may decide who holds the
+        // critical section (`refuseNonRegularFile`). An absent lock is still
+        // the `ENOENT` of the read below.
+        refuseNonRegularFile(lockFilePath, 'lock_unavailable', 'the ledger lock');
+
         try {
             return fs.readFileSync(lockFilePath, 'utf8');
         } catch (error) {
@@ -1454,9 +1919,14 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
      * time and the random tail are there to distinguish successive
      * acquisitions by the same process, which is the case
      * `ledgerLockOwnership` is asked about most often. `Math.random` and not
-     * `crypto`: the token is an identity tag for a local file, never a secret
-     * and never a capability, so unpredictability buys nothing here and the
-     * module's "no builtin beyond fs/path/os" posture is worth more.
+     * the `crypto.randomBytes` this module imports for the state file's temp
+     * name: what a token has to be is UNIQUE among this ledger's own
+     * acquisitions, not unpredictable to an adversary. It is an identity tag
+     * for a file in a directory `ensureDirectory` has already established is
+     * owned by this user with no group or other access, so the principal who
+     * could act on a guessed token is the one who could rewrite the state file
+     * outright — the temp name is the opposite case, because the attack there
+     * is planting a symbolic link at a name that does not exist yet.
      */
     const mintLockToken = (): string =>
         `usda-rate-ledger.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 12)}`;
@@ -1500,7 +1970,14 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
         let ageMs: number;
 
         try {
-            ageMs = Date.now() - fs.statSync(lockFilePath).mtimeMs;
+            // `lstat`, so the age measured is the age of THIS NAME. `stat`
+            // would follow a symbolic link and report the age of its target,
+            // which is a file this module knows nothing about and which could
+            // be made arbitrarily old — an unlink decision taken on somebody
+            // else's timestamp. (`readLockToken` above has already refused a
+            // link outright; measuring the name keeps the two calls asking
+            // about the same object.)
+            ageMs = Date.now() - fs.lstatSync(lockFilePath).mtimeMs;
         } catch (error) {
             if (errorCodeOf(error) === 'ENOENT') {
                 return true;
@@ -1545,7 +2022,7 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
             let fd: number | null = null;
 
             try {
-                fd = fs.openSync(lockFilePath, 'wx', LEDGER_FILE_MODE);
+                fd = fs.openSync(lockFilePath, LEDGER_EXCLUSIVE_OPEN_FLAGS, LEDGER_FILE_MODE);
             } catch (error) {
                 const code = errorCodeOf(error);
                 if (code !== 'EEXIST') {
@@ -1656,6 +2133,13 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
     };
 
     const readStamps = (): number[] => {
+        // A symbolic link or a non-regular file at this name is refused rather
+        // than read as the hour's record (`refuseNonRegularFile`). Absence is
+        // still decided by the read below, whose `ENOENT` is the first-run
+        // case: the guard refuses impostors and leaves that reading to the one
+        // call that cannot be raced.
+        refuseNonRegularFile(stateFilePath, 'state_unreadable', 'the ledger state file');
+
         let raw: string;
 
         try {
@@ -1730,8 +2214,6 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
         return [...attempts];
     };
 
-    let writeSequence = 0;
-
     /** Returns the exact bytes left on disk, which is what the read-back after an admission compares against. */
     const writeStamps = (stamps: readonly number[]): string => {
         const document: UsdaRateLedgerStateDocument = {
@@ -1742,13 +2224,35 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
         const payload = `${JSON.stringify(document)}\n`;
 
         // Same directory as the state file, so the rename is within one
-        // filesystem and therefore atomic; pid and sequence keep two writers
-        // from colliding on the temp name even though the lock already
-        // serialises them.
-        const tempFilePath = `${stateFilePath}.${process.pid}.${(writeSequence += 1)}.tmp`;
+        // filesystem and therefore atomic.
+        //
+        // THE NAME IS UNGUESSABLE AND THE CREATE IS EXCLUSIVE, and those are
+        // two separate defences. The old name was `<state>.<pid>.<sequence>`,
+        // which anyone who can read a process list can derive; a local
+        // principal able to create a name in the ledger directory could plant
+        // a symbolic link there and have this write land on its target —
+        // truncating a file of their choosing with this run's document, with
+        // the importer's privileges. Creating the file exclusively refuses
+        // that, and the random name is what keeps the refusal from being
+        // retriable — an attacker who cannot predict the name cannot re-plant
+        // the link for the next write, so the ledger goes on recording instead
+        // of failing every reservation.
+        //
+        // `flag: 'wx'` IS that exclusive create: Node maps `wx` to
+        // `O_WRONLY | O_CREAT | O_EXCL`, the same three flags
+        // `LEDGER_EXCLUSIVE_OPEN_FLAGS` gives the lock file, so `open(2)`
+        // fails `EEXIST` on an existing name — symbolic link included,
+        // whether or not it resolves — and neither the link nor its target is
+        // ever written. `O_NOFOLLOW` is what the string form cannot carry, and
+        // it is redundant here for exactly that reason: under `O_EXCL` the
+        // create never follows a final-component link in the first place. The
+        // write goes through the path rather than a descriptor opened by hand
+        // because `writeFileSync` performs that open, write and close itself,
+        // with this mode, in one call that cannot leak a descriptor on a throw.
+        const tempFilePath = `${stateFilePath}.${crypto.randomBytes(LEDGER_TEMP_NAME_BYTES).toString('hex')}.tmp`;
 
         try {
-            fs.writeFileSync(tempFilePath, payload, { encoding: 'utf8', mode: LEDGER_FILE_MODE });
+            fs.writeFileSync(tempFilePath, payload, { encoding: 'utf8', mode: LEDGER_FILE_MODE, flag: 'wx' });
             fs.renameSync(tempFilePath, stateFilePath);
         } catch (error) {
             discard(tempFilePath);
@@ -1771,6 +2275,13 @@ export const createFileUsdaRateLedger = (options: FileUsdaRateLedgerOptions = {}
      * IS THE ATTEMPT RECORDED? — of the state file itself.
      */
     const requireRecorded = (payload: string): void => {
+        // The read-back only means something if it reads the file this
+        // reservation just renamed into place. A symbolic link or a
+        // non-regular file at that name is refused here as it is in
+        // `readStamps`; absence falls through to the read below, whose
+        // `ENOENT` is reported as the read-back failure it is.
+        refuseNonRegularFile(stateFilePath, 'state_unreadable', 'the ledger state file');
+
         let raw: string;
 
         try {
@@ -1981,7 +2492,14 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
         );
     }
 
-    const host = normalizeHost(options.host ?? USDA_HOST);
+    // DEFAULTED, the paced host is the host the traffic will actually reach:
+    // `getUsdaPacedHost` reads the effective `USDA_BASE_URL` the way
+    // `usda.service.ts` does, so a caller that passes no host cannot install a
+    // limiter that paces a host nothing is sent to. PASSED, the caller's host
+    // wins outright — a test wiring the limiter to a stub transport, or a
+    // pipeline whose request path is configured by something this module
+    // cannot see, is the case the option exists for.
+    const host = normalizeHost(options.host ?? getUsdaPacedHost());
     // An unusable host matches nothing, which would leave every USDA request
     // unpaced — the same outcome as not installing the limiter at all, but
     // silent. The raw value is not echoed: a base URL can carry userinfo.
@@ -2003,9 +2521,20 @@ export const createUsdaRateLimiter = (options: UsdaRateLimiterOptions): UsdaRate
     const ledger =
         options.ledger ??
         createFileUsdaRateLedger({
-            scope: options.ledgerScope ?? DEFAULT_USDA_RATE_LEDGER_SCOPE,
+            // The PACED host, which is what the hourly budget belongs to: a
+            // key spent against a different service is a different allowance,
+            // and charging both to one scope would pace each by the other's
+            // spend. With no override this resolves to
+            // `DEFAULT_USDA_RATE_LEDGER_SCOPE` — the same constant, the same
+            // default state file — so the ordinary path is unchanged.
+            scope: options.ledgerScope ?? host,
             stateFilePath: options.ledgerStateFilePath,
             sleep,
+            // So the one thing the ledger reports about itself — that the
+            // owner-and-mode half of its directory check could not be
+            // performed on this platform — reaches the same log the pacing
+            // lines do rather than nowhere.
+            logger,
         });
 
     // Keeps every downstream calculation finite even if an injected clock

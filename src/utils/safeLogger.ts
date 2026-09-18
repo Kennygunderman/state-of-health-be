@@ -1,7 +1,12 @@
-// Runtime-safe structured logging for the meal-planning HTTP edge.
+// Runtime-safe structured logging for the meal-planning runtime: the HTTP edge
+// that handles a request, and the services behind it that have something an
+// operator needs to know — `usda.service.ts` reports a cache write it could not
+// record through these helpers rather than printing the driver's error.
 //
-// The handling edge has to record WHAT happened to a request without recording
-// the request: AAP §0.3.2/§0.7.1 make the three configured credentials
+// Whoever calls it, the rule is the same: record WHAT happened without
+// recording the data it happened to.
+//
+// AAP §0.3.2/§0.7.1 make the three configured credentials
 // (DATABASE_URL's userinfo, USDA_API_KEY as `api_key=` in a request URL,
 // OPENROUTER_API_KEY as an `Authorization: Bearer` header) secrets the server
 // must never print, and Rule backend-architecture §8 requires a safe message

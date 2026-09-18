@@ -149,6 +149,41 @@ const COOKING_TIME_LIMITS: Readonly<Record<CookingTimeLimitMin, true>> = {
     60: true,
 };
 
+/* ---------------------------------------------------------------------------
+ * The three server-owned vocabularies
+ *
+ * Unlike every table above, these name no answer the client may send: the setup
+ * status, the resume marker and the target route are derived here and refused as
+ * `read_only_field` when a body carries them. They are declared alongside the
+ * answers because {@link setupStateOf} reads all eight columns through the same
+ * closed sets, and EXPORTED because the DTO mapper in `preferences.service.ts`
+ * reads the same three columns for the response. One vocabulary per column,
+ * wherever it is read — a second list of the same strings in the service is
+ * exactly the drift that leaves a stored value readable by one reader and
+ * unrecognised by the other.
+ * ------------------------------------------------------------------------- */
+
+export const SETUP_STATUSES: Readonly<Record<SetupStatus, true>> = {
+    not_started: true,
+    in_progress: true,
+    ready_for_review: true,
+    completed: true,
+};
+
+export const SETUP_STEPS: Readonly<Record<SetupStep, true>> = {
+    goal: true,
+    body: true,
+    activity: true,
+    diet: true,
+    dislikes: true,
+    schedule: true,
+    cooking: true,
+    review: true,
+    targets_manual: true,
+};
+
+export const TARGET_ROUTES: Readonly<Record<TargetRoute, true>> = { estimated: true, manual: true };
+
 /**
  * The four `meal_plan_meals.flags` codes.
  *
@@ -412,6 +447,25 @@ const isNumericMemberOf = <T extends number>(
     typeof value === 'number' &&
     Number.isFinite(value) &&
     Object.prototype.hasOwnProperty.call(table, String(value));
+
+/**
+ * A STORED value as a member of its closed set, or `null` when it is not one.
+ *
+ * The same two tables as the guards above, asked the other question. A parser
+ * judging a REQUEST needs the boolean, because an unrecognised value there is a
+ * refusal the client must see; a projection reading a COLUMN needs the value or
+ * `null`, because "not answered" is the only safe reading of a value the
+ * vocabulary no longer contains — it re-asks the step rather than planning from
+ * a string nothing understands.
+ */
+const asMember = <T extends string>(table: Readonly<Record<T, true>>, value: unknown): T | null =>
+    isMemberOf(table, value) ? value : null;
+
+/** The same reading for a numeric closed set. */
+const asNumericMember = <T extends number>(
+    table: Readonly<Record<T, true>>,
+    value: unknown,
+): T | null => (isNumericMemberOf(table, value) ? value : null);
 
 const isUuidV4 = (value: unknown): value is string =>
     typeof value === 'string' && UUID_V4_PATTERN.test(value);
@@ -1922,12 +1976,16 @@ const parseReviewStep = (
  * What the request stage establishes: the 400 the request earns with no row
  * read at all, or which of the two reasons it has for reading one.
  *
- * `needs_context` is not an acceptance. It says the request itself is clean AND
- * a rule whose other half lives in the stored row is applicable, so the answer
- * is not final until that row is read — as distinct from `ok`, where the
- * request stage has judged every rule the body can be judged by. Both go on to
- * the row (the revision comparison always needs it), and the distinction is
- * what stops a caller reading "no error" as "nothing left to check".
+ * `needs_context` is not an acceptance, AND IT DOES NOT MEAN THE REQUEST IS
+ * CLEAN. It says only that a rule whose other half lives in the stored row is
+ * applicable, so no answer is final until that row is read — the request stage
+ * may well have a refusal in hand, and returns this anyway so that refusal and
+ * the stored rule's own detail can arrive in ONE 400 (AAP §0.7.4's
+ * validate-on-press marks every offending control at once). `ok` is the
+ * distinct case where the request stage has judged every rule the body can be
+ * judged by and found nothing. Both go on to the row (the revision comparison
+ * always needs it), and the distinction is what stops a caller reading "no
+ * error" as "nothing left to check".
  */
 export type PreferenceRequestVerdict =
     | { kind: 'ok' }
@@ -2045,46 +2103,59 @@ const inspectSetupStepEnvelope = (step: unknown, body: unknown): StepEnvelopeIns
  * not the nine-item set, a malformed meal time. All of them come back in ONE
  * 400, in the order this endpoint has always produced.
  *
- * EVERY REQUEST-ONLY REFUSAL IS RETURNED IMMEDIATELY, whole. A body already
- * known to be unstorable does not earn a database read: AAP §0.5.2 puts
- * validation before any Prisma work, and an authenticated caller who can be
- * refused for free must not be able to make the server read a row per malformed
- * attempt. This stage previously withheld such a refusal whenever a
- * row-dependent rule was ALSO applicable, on the argument that its answer might
- * name fewer offending controls than the row-backed parse would (AAP §0.7.4) —
- * but that argument buys one extra detail with a read for a body that cannot be
- * stored under any row. The deferred detail is not lost: it is reported on the
- * client's next attempt, once the request-only errors it is mixed with are
- * fixed, which is the same round trip the client would have spent on them
- * anyway.
+ * A REQUEST-ONLY REFUSAL IS RETURNED IMMEDIATELY ONLY WHEN NO ROW-DEPENDENT
+ * FIELD RULE IS ALSO APPLICABLE. That condition is what reconciles the two
+ * requirements this stage sits between. AAP §0.5.2 puts validation before any
+ * Prisma work, so a body whose every problem the request alone can see is
+ * refused for free — an authenticated caller must not be able to make the server
+ * read a row per malformed attempt. But AAP §0.7.4 requires validate-on-press to
+ * mark EVERY offending control at once, and a body carrying an unknown pace
+ * beside a target weight that contradicts the stored current weight has two
+ * offending controls of which this stage can see only one. Answering with the
+ * one it can see would send the user back to a screen that marks the pace,
+ * accepts their unchanged target, and refuses again — so such a body is carried
+ * to the row and answered by the authoritative parse in a single merged 400.
  *
- * `needs_context` is the answer when the request is clean and a rule that reads
- * the row is applicable. The two goal-weight coherence rules are the only such
- * rules here, and each is applicable only when the body carries the answer that
- * can conflict with a stored one. Everything else clean is `ok`.
+ * `needs_context` is therefore the answer whenever a row-dependent field rule is
+ * applicable, whether or not this stage already has a refusal in hand. The
+ * details it saw are not carried forward and do not need to be: the
+ * authoritative parse runs the same rules over the same body with strictly more
+ * information, so it re-derives every one of them.
+ *
+ * THE TWO GOAL-WEIGHT COHERENCE RULES ARE THE ONLY SUCH RULES HERE, and each is
+ * applicable only when the body carries the answer that can conflict with a
+ * stored one — `goalWeightKg` on the goal step, `weightKg` on the body step.
+ *
+ * The row-backed parse has one further detail of its own, `step: not_allowed`
+ * for a non-`goal` step against a user who has no row, and it is DELIBERATELY
+ * not in the predicate below. It does not name a control: no screen can mark it,
+ * and no answer the user changes clears it — the wizard cannot reach a non-goal
+ * step first and a resume always re-enters at the stored marker, so it guards a
+ * client state the UI has no path to. Including it would spend a read on every
+ * malformed save of every step but one, to add a detail the screen cannot act
+ * on. Everything else clean is `ok`.
  */
 export const parseSetupStepRequest = (step: unknown, body: unknown): PreferenceRequestVerdict => {
     const verdict = parseSetupStep(step, body, { stage: 'request', currentRevision: null });
-
-    if (verdict.kind === 'error') {
-        // Every detail in it was produced with no row in hand, so it is exactly
-        // the request's own 400 — complete for what the request alone decides,
-        // and never a narrowing of some other verdict.
-        return verdict;
-    }
-
     const record = asRecord(body);
     // `goalWeightKg` is judged against the STORED current weight, and the body
-    // step's `weightKg` against the stored goal and target — so for a clean body
-    // carrying either, the row still has a verdict to add.
+    // step's `weightKg` against the stored goal and target — so for a body
+    // carrying either, the row still has a verdict to add, and it must arrive in
+    // the same 400 as whatever this stage found.
     const coherenceApplicable =
         record !== null &&
         ((step === 'goal' && Object.prototype.hasOwnProperty.call(record, 'goalWeightKg')) ||
             (step === 'body' && Object.prototype.hasOwnProperty.call(record, 'weightKg')));
 
-    // A stale revision is the row's verdict to give and never this stage's, so
-    // `verdict.kind` is 'ok' here by construction.
-    return coherenceApplicable ? { kind: 'needs_context' } : { kind: 'ok' };
+    if (coherenceApplicable) {
+        return { kind: 'needs_context' };
+    }
+
+    // No row can add a control to this body, so this stage's verdict is final:
+    // a refusal is exactly the request's own 400, complete for everything that
+    // decides it, and never a narrowing of some other verdict. A stale revision
+    // is the row's to give and never this stage's, so an `ok` here is `ok`.
+    return verdict.kind === 'error' ? verdict : { kind: 'ok' };
 };
 
 /**
@@ -2298,6 +2369,36 @@ export interface PreferencesUpdateContext {
     /** For judging the budget pair when the body changes only one half of it. */
     currentBudget?: BudgetPreference | null;
     currentNoBudgetPreference?: boolean;
+    /**
+     * The stored calendar zone, for deciding whether a body that carries only
+     * the envelope edits anything (see {@link UPDATE_ENVELOPE_KEYS}).
+     *
+     * `null` AND `undefined` MEAN DIFFERENT THINGS HERE, unlike every sibling
+     * member above, because this one is compared rather than substituted:
+     *
+     *  * `null` is the row holding no zone — a column that predates the
+     *    contract's requirement. Any usable zone the body carries is then a
+     *    change, and storing it is the save.
+     *  * `undefined` is the CALLER not saying, which is not the same as the row
+     *    being empty and must not be read as it. No change can be established
+     *    against a value nobody supplied, so the body is judged as editing
+     *    nothing — the same direction {@link SetupStepContext.stage} takes for
+     *    the same reason: a caller who forgets a context member gets the FULL
+     *    rule, never a reduced one. Reading it as "probably changed" would let
+     *    a forgotten member turn every zone-only body into an accepted save
+     *    that bumps the revision for no change at all.
+     *
+     * At the request stage the stored zone is not merely unsupplied but
+     * unknowable, so the comparison cannot run there. What happens instead
+     * depends on the zone the BODY carries, and only that:
+     *
+     *  * a usable name MIGHT be the edit, so the whole body is deferred to the
+     *    row-backed parse ({@link parsePreferencesUpdateRequest});
+     *  * an absent or unknown one cannot be, whatever the row holds, so the
+     *    request stage gives the "edits nothing" verdict itself — with the same
+     *    details this parse would produce — and earns no read.
+     */
+    currentTimeZone?: string | null;
 }
 
 export type ParsedPreferencesUpdate =
@@ -2339,18 +2440,59 @@ const parseFoodGroupList = (value: unknown, field: string): string[] | Preferenc
 };
 
 /**
- * The two keys a full save's envelope carries, which are therefore not an edit
- * of anything.
+ * The two keys a full save's envelope carries, which are therefore not ANSWERS
+ * to any of the preference screens.
  *
  * `expectedRevision` pins the row the edit applies to and `timeZone` refreshes
- * the user's stored calendar on every save (AAP §0.5.2). Neither is an answer,
- * so a body carrying nothing else edits nothing and is refused rather than
- * committed as a revision bump for no change.
+ * the user's stored calendar on every save (AAP §0.5.2). Neither is a
+ * preference the user chose, so neither counts towards "this body edits
+ * something" on the strength of being present.
+ *
+ * `timeZone` IS STILL A STORED COLUMN, though, so a body that carries only the
+ * envelope is not necessarily a body that changes nothing: a zone that differs
+ * from the stored one is a real edit of `meal_plan_preferences.time_zone`, and
+ * it is the only channel the contract gives a client for making that edit — the
+ * device's zone is reconciled by re-sending it on a full save (AAP §0.5.2, and
+ * `mobile/src/screens/PlanSettings/index.util.ts::reconcilePreferencesTimeZone`
+ * is the caller that does it). Deciding it therefore needs the STORED zone,
+ * which the context-free inspection has not read; see
+ * {@link PreferencesUpdateContext.currentTimeZone}.
  */
 const UPDATE_ENVELOPE_KEYS: Readonly<Record<'expectedRevision' | 'timeZone', true>> = {
     expectedRevision: true,
     timeZone: true,
 };
+
+/**
+ * The ANSWER keys a full-save body carries — every accepted key that is not
+ * envelope.
+ *
+ * One scan, shared by the envelope inspection and the request-stage preflight,
+ * so the two cannot disagree about whether a body answers anything.
+ */
+const editedUpdateKeys = (
+    record: Record<string, unknown>,
+): (keyof PreferencesUpdatePayload)[] =>
+    (Object.keys(ACCEPTED_UPDATE_KEYS) as (keyof PreferencesUpdatePayload)[]).filter(
+        (key) =>
+            !Object.prototype.hasOwnProperty.call(UPDATE_ENVELOPE_KEYS, key) &&
+            Object.prototype.hasOwnProperty.call(record, key),
+    );
+
+/**
+ * True when the body answers nothing and every key on it is one this endpoint
+ * accepts — the one shape whose "does this edit anything?" verdict needs the
+ * stored zone.
+ *
+ * One predicate for the envelope inspection and the request-stage preflight, so
+ * the stage that DEFERS the verdict and the stage that GIVES it cannot disagree
+ * about which bodies are deferred.
+ */
+const envelopeOnlyUpdate = (record: Record<string, unknown>): boolean =>
+    editedUpdateKeys(record).length === 0 &&
+    Object.keys(record).every((key) =>
+        Object.prototype.hasOwnProperty.call(ACCEPTED_UPDATE_KEYS, key),
+    );
 
 /** A full-save envelope whose body is usable, with every context-free problem in it. */
 interface InspectedUpdateEnvelope {
@@ -2365,6 +2507,17 @@ interface InspectedUpdateEnvelope {
      * this keeps it from also moving where it appears.
      */
     zoneDetail: InvalidRequestDetail | null;
+    /**
+     * True when the body carries NO answer key and nothing else about its key
+     * set is wrong — so whether it edits anything rests entirely on whether its
+     * zone differs from the stored one, which only the row can say.
+     *
+     * The "nothing else wrong" half is why a rejected key suppresses this: a
+     * body whose every key is server-owned already has one `read_only_field`
+     * detail per key explaining the refusal, and "the body is required" on top
+     * of them would be noise about a body that plainly was not empty.
+     */
+    envelopeOnly: boolean;
 }
 
 type UpdateEnvelopeInspection =
@@ -2384,6 +2537,13 @@ type UpdateEnvelopeInspection =
  * an omission as "keep the old zone" made that refresh optional in practice and
  * left `today` computed from a zone the user may have left months ago, which is
  * the whole of finding SVC-05.
+ *
+ * WHETHER THE BODY EDITS ANYTHING IS NOT DECIDED HERE. A body carrying only the
+ * envelope is reported as `envelopeOnly` and judged by
+ * {@link parseInspectedPreferencesUpdate}, which has the stored zone: a zone
+ * that differs from it IS the edit, and refusing such a body as empty would
+ * make the contract's own zone-refresh channel unusable (see
+ * {@link UPDATE_ENVELOPE_KEYS}).
  */
 const inspectPreferencesUpdateEnvelope = (body: unknown): UpdateEnvelopeInspection => {
     const record = asRecord(body);
@@ -2401,17 +2561,7 @@ const inspectPreferencesUpdateEnvelope = (body: unknown): UpdateEnvelopeInspecti
         details.push(detail(key, PREFERENCE_FIELD_CODES.READ_ONLY_FIELD));
     }
 
-    const editedKeys = (Object.keys(ACCEPTED_UPDATE_KEYS) as (keyof PreferencesUpdatePayload)[]).filter(
-        (key) =>
-            !Object.prototype.hasOwnProperty.call(UPDATE_ENVELOPE_KEYS, key) &&
-            Object.prototype.hasOwnProperty.call(record, key),
-    );
-
-    if (rejectedKeys.length === 0 && editedKeys.length === 0) {
-        // A save with nothing in it would still bump the revision and invalidate
-        // every other client's pinned value for no change at all.
-        details.push(detail('body', PREFERENCE_FIELD_CODES.REQUIRED));
-    }
+    const envelopeOnly = envelopeOnlyUpdate(record);
 
     const malformedRevision = revisionTokenShape(record.expectedRevision);
 
@@ -2430,7 +2580,7 @@ const inspectPreferencesUpdateEnvelope = (body: unknown): UpdateEnvelopeInspecti
               )
             : null;
 
-    return { kind: 'inspected', details, record, timeZone, zoneDetail };
+    return { kind: 'inspected', details, record, timeZone, zoneDetail, envelopeOnly };
 };
 
 /**
@@ -2440,57 +2590,86 @@ const inspectPreferencesUpdateEnvelope = (body: unknown): UpdateEnvelopeInspecti
  * with no row, so the envelope AND every field rule the body carries its own
  * inputs for are reported together in one 400.
  *
- * FOUR RULES READ A STORED VALUE AS THE OTHER HALF OF A PAIR, and each is
- * skipped here rather than judged against an unread row — otherwise a body that
- * changes only its goal would be refused for a pace that is already stored:
+ * FIVE RULES READ A STORED VALUE, and each is skipped here rather than judged
+ * against an unread row — otherwise a body that changes only its goal would be
+ * refused for a pace that is already stored:
  *
- *  * the goal/pace pair, when the body carries no pace;
+ *  * the goal/pace pair, in EITHER orientation — the row stands in for whichever
+ *    half is absent, so a goal without a pace is judged against the stored pace
+ *    and a pace without a goal against the stored goal;
  *  * the goal/current-weight/target-weight tuple, unless the body carries all
  *    three;
  *  * the schedule/meal-times pair, unless the body carries both;
- *  * the budget amount and its "no preference" checkbox, unless both are sent.
+ *  * the budget amount and its "no preference" checkbox, unless both are sent;
+ *  * whether a body carrying only the envelope edits anything, which is true of
+ *    exactly the zone-refresh save the contract defines and rests on the STORED
+ *    zone (see {@link UPDATE_ENVELOPE_KEYS}) — and ONLY when the submitted zone
+ *    is a name this runtime knows. An absent or unknown one cannot be the edit
+ *    whatever the row holds, so such a body is refused here, with the same
+ *    details the row-backed parse would give it, and earns no read.
  *
- * A REFUSAL IS STILL RETURNED IMMEDIATELY when one of those is applicable, and
- * that is the whole of the change this stage underwent. It used to answer `ok`
- * for such a body so that {@link parsePreferencesUpdate} could add the pair
- * rule's detail to the list (AAP §0.7.4) — at the cost of an authenticated
- * Prisma read for a partial that no stored row could make valid, which AAP
- * §0.5.2 puts validation ahead of. The pair rule's detail reaches the client on
- * its next attempt, once the request-only errors are fixed; the read it would
- * have cost does not happen at all.
+ * `needs_context` IS THE ANSWER WHENEVER ONE OF THOSE IS APPLICABLE — for a
+ * clean body and for one this stage already has a refusal for alike. A
+ * request-only refusal is NOT short-circuited in that case, because AAP §0.7.4
+ * requires the 400 to mark every offending control at once: a partial whose
+ * pace is unknown AND whose target weight contradicts the stored current weight
+ * must name both, and this stage cannot see the second. Deferring it to the
+ * row-backed parse costs one indexed read on a user-owned row and is the only
+ * way one round trip can carry the whole answer. The caller's contract makes
+ * that safe: it treats `needs_context` exactly as `ok` — read the row, parse
+ * again, deliver whatever that parse returns — so nothing is lost by not
+ * carrying the details forward, since the authoritative parse re-derives every
+ * one of them from the same body plus strictly more information.
  *
- * `needs_context` is the answer for a clean body one of those four rules is
- * applicable to. Everything else clean is `ok`.
+ * A BODY NO SUCH RULE APPLIES TO IS STILL ANSWERED FOR FREE, which is what AAP
+ * §0.5.2's "validation before any Prisma work" buys: an unknown diet, an
+ * out-of-range age, a server-owned key, a malformed revision token — none of
+ * them can acquire a second offending control from any row, so none of them
+ * earns a read.
+ *
+ * Everything else clean is `ok`.
  */
 export const parsePreferencesUpdateRequest = (body: unknown): PreferenceRequestVerdict => {
     const verdict = parsePreferencesUpdate(body, { stage: 'request', currentRevision: null });
-
-    if (verdict.kind === 'error') {
-        // Judged with no row in hand, so every detail in it is the request's
-        // own; a body this stage refuses is refused whatever the row holds.
-        return verdict;
-    }
-
     const record = asRecord(body);
 
     if (record === null) {
-        // Unreachable: a non-object body is the envelope's first refusal and has
-        // already returned above. Narrowing rather than asserting, so the key
-        // probes below cannot be written against a null.
-        return { kind: 'ok' };
+        // A non-object body has no key set for any rule to be applicable to, and
+        // the envelope's refusal of it is the whole answer. `verdict` is that
+        // refusal by construction; the fallback keeps this total rather than
+        // asserting.
+        return verdict.kind === 'error' ? verdict : { kind: 'ok' };
     }
 
     const has = (key: keyof PreferencesUpdatePayload): boolean =>
         Object.prototype.hasOwnProperty.call(record, key);
-    const pairApplicable =
-        (has('goal') && !has('paceLbPerWeek')) ||
+    const storedValueApplicable =
+        // The zone decides an envelope-only body's verdict only when it is a
+        // name this runtime knows: an absent or unknown one can never be the
+        // edit whatever the row holds, so that body is refused here for free
+        // (see {@link parseInspectedPreferencesUpdate}) rather than buying a
+        // read to reach the same answer.
+        (envelopeOnlyUpdate(record) && normalizeTimeZone(record.timeZone) !== null) ||
+        // BOTH ORIENTATIONS of the goal/pace pair, because the stored row stands
+        // in for whichever half is missing: an omitted pace is taken from
+        // `currentPaceLbPerWeek` (a direction with no pace is `required`), and an
+        // omitted goal from `currentGoal` (a pace against a stored `maintain` is
+        // `not_allowed`). Only a body carrying both halves is judgeable here.
+        ((has('goal') || has('paceLbPerWeek')) && !(has('goal') && has('paceLbPerWeek'))) ||
         ((has('goal') || has('weightKg') || has('goalWeightKg')) &&
             !(has('goal') && has('weightKg') && has('goalWeightKg'))) ||
         ((has('mealTimes') || has('mealSchedule')) && !(has('mealTimes') && has('mealSchedule'))) ||
         ((has('budget') || has('noBudgetPreference')) &&
             !(has('budget') && has('noBudgetPreference')));
 
-    return pairApplicable ? { kind: 'needs_context' } : { kind: 'ok' };
+    if (storedValueApplicable) {
+        return { kind: 'needs_context' };
+    }
+
+    // No row can add a detail to this body, so its verdict here is final — a
+    // refusal is the request's own and complete, and a clean body needs the row
+    // only for the revision comparison its caller performs anyway.
+    return verdict.kind === 'error' ? verdict : { kind: 'ok' };
 };
 
 /**
@@ -2555,7 +2734,7 @@ export const parsePreferencesUpdate = (
  * narrowed rather than being re-derived after the guard.
  */
 const parseInspectedPreferencesUpdate = (
-    { record, timeZone, zoneDetail, details: envelopeDetails }: InspectedUpdateEnvelope,
+    { record, timeZone, zoneDetail, envelopeOnly, details: envelopeDetails }: InspectedUpdateEnvelope,
     context: PreferencesUpdateContext,
 ): ParsedPreferencesUpdate => {
     const details: InvalidRequestDetail[] = [...envelopeDetails];
@@ -2564,6 +2743,40 @@ const parseInspectedPreferencesUpdate = (
     // against an unread row would refuse coherent requests: a body that changes
     // only the goal is not a body whose pace is missing.
     const requestStage = context.stage === 'request';
+
+    // A body carrying only the envelope edits something exactly when its zone
+    // differs from the stored one — the contract's channel for reconciling a
+    // moved device (AAP §0.5.2). Anything else really would bump the revision
+    // and invalidate every other client's pinned value for no change at all:
+    // an absent or unknown zone (whose own refusal is already travelling in
+    // `zoneDetail`), one the row already holds, or a stored zone the caller
+    // never supplied — see {@link PreferencesUpdateContext.currentTimeZone} for
+    // why the last of those is judged strictly.
+    //
+    // UNSHIFTED, not pushed, so the detail keeps the position this endpoint has
+    // always given it. It can only fire while no key was rejected, so `details`
+    // holds at most the malformed-revision entry at this point, and putting it
+    // first reproduces the `[body, expectedRevision]` order byte for byte.
+    //
+    // THE REQUEST STAGE GIVES THIS VERDICT TOO, for the bodies whose answer no
+    // row can change. A zone that is absent or not a name this runtime knows
+    // cannot be the edit whatever the row holds, so `{}`, `{expectedRevision}`
+    // and an invalid-zone envelope are complete refusals here and earn no read
+    // (AAP §0.5.2) — and they earn the SAME detail set the row-backed parse
+    // would return, which is what lets the preflight answer them directly. A
+    // USABLE zone is the one case only the row can settle, so that body's
+    // verdict is left to it: `zoneCouldBeTheEdit` is true at this stage, no
+    // `body` detail is added, and {@link parsePreferencesUpdateRequest} defers
+    // the whole body rather than acting on this parse.
+    const zoneCouldBeTheEdit = requestStage
+        ? timeZone !== null
+        : timeZone !== null &&
+          context.currentTimeZone !== undefined &&
+          timeZone !== context.currentTimeZone;
+
+    if (envelopeOnly && !zoneCouldBeTheEdit) {
+        details.unshift(detail('body', PREFERENCE_FIELD_CODES.REQUIRED));
+    }
 
     const has = (key: keyof PreferencesUpdatePayload): boolean =>
         Object.prototype.hasOwnProperty.call(record, key);
@@ -3059,8 +3272,10 @@ export const isBodyAnswerComplete = (facts: BodyAnswerFacts): boolean =>
  * `target_route` is server-owned — it is absent from the editable DTO, so a
  * client key for it is `read_only_field` — and until this rule existed only a
  * body-STEP save could resolve it ({@link resolveTargetRouteForBodyStep}).
- * That left two untruths reachable through the settings screens, which edit the
- * same answers through `PUT /meal-planning/preferences`:
+ * But `age`, `heightCm`, `weightKg` and `sexForEstimate` are all members of the
+ * full save's editable DTO (AAP §0.5.2), so the answers the route is derived
+ * FROM can move through this endpoint while the route itself cannot be sent —
+ * which left two untruths reachable by any caller that edits them here:
  *
  *  * a user on the estimated route who changed their sex answer to
  *    "prefer not to say" stayed on the estimated route, so the server would
@@ -3071,8 +3286,9 @@ export const isBodyAnswerComplete = (facts: BodyAnswerFacts): boolean =>
  *    so the estimate they had just made calculable remained unavailable.
  *
  * `undefined` rather than a value is Prisma's "do not write this column", the
- * same convention `nextEstimateInputsRevision` uses, so an unrelated save
- * leaves the route exactly where it stood.
+ * same convention `targets.service.ts::asStoredEstimateColumnValue` uses for
+ * `estimated_targets`, so an unrelated save leaves the route exactly where it
+ * stood — omission rather than a null, which would clear it.
  *
  * TWO GUARDS ARE LOAD-BEARING. The route doubles as the server's record THAT
  * the body step was answered ({@link PROVABLE_STEP_ANSWERS} proves that step by
@@ -3159,6 +3375,69 @@ export interface SetupStateSnapshot {
     /** The row's answers, for the readiness check in {@link nextSetupState}. */
     answers: SetupAnswerFacts;
 }
+
+/**
+ * The eight `meal_plan_preferences` columns a setup-state snapshot is read
+ * from, and nothing else.
+ *
+ * STRUCTURAL ON PURPOSE, and declared as loosely as the database is: every
+ * member is the column's own type, so the Prisma row satisfies it without a cast
+ * and without this module depending on Prisma at all. That is what keeps
+ * {@link setupStateOf} in the pure layer — the projection's whole job is to read
+ * eight raw column values through their closed vocabularies, which needs no
+ * client, no connection and no row type.
+ */
+export interface SetupStateRow {
+    setup_status: string | null;
+    setup_step: string | null;
+    target_route: string | null;
+    goal: string | null;
+    activity_level: string | null;
+    diet: string | null;
+    meal_schedule: string | null;
+    cooking_time_limit_min: number | null;
+}
+
+/**
+ * The state-machine snapshot a transition is computed from: the stored row, read
+ * through the closed vocabularies.
+ *
+ * A row that exists but whose status is unreadable is treated as
+ * `in_progress` — the same cautious reading the DTO applies — and
+ * {@link nextSetupState} is monotonic, so it can only move forward from there.
+ * Every other member is coerced through its own closed set: a column holding a
+ * value the vocabulary no longer contains reads as unanswered, which re-asks the
+ * step rather than planning from it.
+ *
+ * IT LIVES HERE BECAUSE IT IS A BUSINESS RULE, not orchestration. It performs no
+ * I/O, takes its row as data and is deterministic, so Rule
+ * backend-architecture §5 places it in the pure layer — and TWO services need
+ * the same answer. `preferences.service.ts` computes the transition of a step
+ * save, and `targets.service.ts` advances the manual route's resume marker when
+ * a manual target is confirmed (AAP §0.7.4), because the manual target screen
+ * saves through the targets endpoint rather than as a setup step. Neither may
+ * own it: a service importing another service couples two orchestration layers
+ * for a pure projection, and a second mapping of the same columns would be a
+ * second answer to "where does setup stand" that drifts the first time a
+ * column's vocabulary changes.
+ */
+export const setupStateOf = (row: SetupStateRow | null): SetupStateSnapshot => ({
+    setupStatus:
+        row === null ? 'not_started' : (asMember(SETUP_STATUSES, row.setup_status) ?? 'in_progress'),
+    setupStep: row === null ? null : asMember(SETUP_STEPS, row.setup_step),
+    targetRoute: row === null ? null : asMember(TARGET_ROUTES, row.target_route),
+    // Readiness reads the row's own answers as well as the resume marker, so a
+    // forward jump or a route change cannot promote a user whose required
+    // answers are absent ({@link nextSetupState}).
+    answers: {
+        goal: row === null ? null : asMember(GOALS, row.goal),
+        activityLevel: row === null ? null : asMember(ACTIVITY_LEVELS, row.activity_level),
+        diet: row === null ? null : asMember(DIETS, row.diet),
+        mealSchedule: row === null ? null : asMember(MEAL_SCHEDULES, row.meal_schedule),
+        cookingTimeLimitMin:
+            row === null ? null : asNumericMember(COOKING_TIME_LIMITS, row.cooking_time_limit_min),
+    },
+});
 
 /**
  * Which stored column proves each required step was answered.
@@ -3351,10 +3630,10 @@ const laterStep = (
  * required step is unanswered, the marker is pulled BACK to that step and the
  * status cannot be `ready_for_review`. Two consequences worth stating:
  *
- *  * A `completed` user is never regressed by this. They have a plan, their
- *    edits arrive from the plan settings screen rather than the wizard, and
- *    sending them back into onboarding is the failure the status rule exists to
- *    prevent; a `ready_for_review` user, who has no plan yet, is un-readied.
+ *  * A `completed` user is never regressed by this. They have a plan and the
+ *    save stays open to them, and sending them back into onboarding is the
+ *    failure the monotonic status rule exists to prevent; a `ready_for_review`
+ *    user, who has no plan yet, is un-readied.
  *  * Where a route switch happens LATE, the pull-back costs the user a walk
  *    back over screens they had already answered, because one marker cannot
  *    record both where they reached and which stops they answered. Every one of
@@ -3414,9 +3693,9 @@ export interface SetupStateReconciliation {
  * but a route change moves the set of REQUIRED steps under the user, and
  * `ready_for_review` then claims answers the row does not hold. The estimated
  * route requires `activity`, which the manual route never asks, so a manual
- * user who supplies a measured sex from the settings screen becomes an
- * estimated user with no activity level: readiness would be a statement about
- * screens answered on a route they are no longer on.
+ * user who supplies a measured sex through this endpoint becomes an estimated
+ * user with no activity level: readiness would be a statement about screens
+ * answered on a route they are no longer on.
  *
  * This is the same "a provably missing answer overrides progress" clause
  * {@link nextSetupState} applies to step saves, restricted to what a settings
@@ -3424,9 +3703,9 @@ export interface SetupStateReconciliation {
  *
  *  * it can only pull the marker BACK to a step the row proves is unanswered,
  *    and never promote — a full save cannot make anyone ready for review;
- *  * a `completed` user is never touched. They have a plan, their edits arrive
- *    from the plan settings screen, and sending them back into onboarding is
- *    the failure the monotonic status rule exists to prevent;
+ *  * a `completed` user is never touched. They have a plan and the save stays
+ *    open to them, and sending them back into onboarding is the failure the
+ *    monotonic status rule exists to prevent;
  *  * a `not_started` row is never touched either. That row exists for the
  *    legacy user whose first meal-planning write was a target save (which
  *    upserts the row without onboarding progress), and there is no progress

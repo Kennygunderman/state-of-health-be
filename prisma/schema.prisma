@@ -296,9 +296,25 @@ model meal_entries {
   @@index([recipe_version_id], map: "idx_meal_entries_recipe_version_id")
 }
 
-// Raw USDA responses keyed by normalized request (path + params). USDA data
-// is public domain with no retention restrictions; stale rows are served
-// immediately and refreshed in the background — see usda.service.
+// Raw USDA responses, keyed by the normalized request in one of TWO families —
+// both built in usda.service.ts, which owns cache_key end to end.
+//
+//  * `cacheKeyFor(path, params)` builds `path?sorted&params`: the parameters
+//    are sorted by name, and the `query` parameter is trimmed, lower-cased and
+//    whitespace-collapsed so two spellings of one search address one row. This
+//    is the GET family and the shape every already-stored row carries.
+//  * `cacheKeyForRequest(method, path, params, body)` builds
+//    `METHOD path?params#canonicalBody` for a request that carries a method and
+//    a body — the POST /foods batch path (`usdaPost`). The body is canonical
+//    key-sorted JSON, and an `fdcIds` list is normalized to a sorted,
+//    de-duplicated list of numbers, so the same set in any order addresses one
+//    row while a different set can never land on it. A GET with no body
+//    delegates to `cacheKeyFor`, so existing GET keys stay byte-identical, and
+//    no GET key can collide with a method-prefixed one because no path begins
+//    "POST ".
+//
+// USDA data is public domain with no retention restrictions; stale rows are
+// served immediately and refreshed in the background — see usda.service.
 model usda_api_cache {
   cache_key   String   @id(map: "usda_api_cache_pkey")
   payload     Json
@@ -369,10 +385,12 @@ model catalog_import_runs {
 // collapsed into one or the budget stops being enforceable.
 //
 // batch_key is unique ACROSS THE TABLE, not per run, and that constraint is
-// load-bearing rather than incidental: the spend cap is enforced as
-// SUM(model_calls_reserved) over one run's rows, so a batch's paid calls can only
-// ever be metered for the single run that owns its row. What makes that coherent
-// is the run lifecycle in scripts/lib/checkpoint.ts, and the two must be read
+// load-bearing rather than incidental: a batch's paid calls can only ever be
+// metered for the single run that owns its row, while the spend cap is enforced
+// one level up, as SUM(model_calls_reserved) over every run of the coverage
+// plan's budget scope (scripts/lib/budget.ts) — so the row says whose ledger a
+// call belongs to and the scope aggregate says whether it fits. What makes that
+// coherent is the run lifecycle in scripts/lib/checkpoint.ts, and the two must be read
 // together — openOrResumeRun never opens a competing run over work an earlier run
 // already owns: a stage interrupted mid-flight resumes its own running row, a
 // stage that was closed as 'failed' is retried by continuing that same row (its
@@ -398,17 +416,34 @@ model catalog_generation_batches {
   catalog_foods        catalog_foods[]
 
   @@unique([batch_key])
-  // Every run-scoped read leads with run_id: getReservedModelCalls sums
-  // model_calls_reserved over one run's rows before EVERY paid model call
-  // (scripts/lib/budget.ts) while holding that run's advisory lock, and
-  // catalog-generate-ai.ts loads the run's batch rows and their statuses to
-  // decide which batches a resumed run still has to execute
-  // (scripts/catalog-generate-ai.ts; scripts/lib/checkpoint.ts resumes the
-  // catalog_import_runs row itself, not these batches). Without this index both
-  // scan every batch ever generated — the sum inside the serialized section —
-  // and the batch ledger is never pruned. It is also the referencing side of the run
-  // foreign key above, so a cascading run delete stops scanning the table as
-  // well. Reads that also name batch_key are served by the unique index above.
+  // Every read of these rows selects them by run_id, in three shapes.
+  //
+  // The reservation gate reads them by run_id IN (…): before EVERY paid model
+  // call, getScopeReservedModelCalls sums model_calls_reserved over every run
+  // belonging to one coverage-plan BUDGET SCOPE — the run ids scopeRunIds
+  // resolves for the scope budgetScopeOf derives from manifest_version — and
+  // that sum, not a per-run one, is what the cap is enforced against. What
+  // serializes it is the budget-scope advisory lock
+  // pg_advisory_xact_lock(hashtext('catalog-budget:<scope>')), taken before the
+  // aggregate, so generation and the advisory review queue behind each other on
+  // one allowance rather than each holding a lock of its own
+  // (scripts/lib/budget.ts).
+  //
+  // The per-run aggregates read them by a single run_id: getReservedModelCalls
+  // and getModelCallTotals sum one run's reserved, used and token counters for
+  // its own reporting and resume, which is what a replayed run has to read
+  // because it executed no batch of its own.
+  //
+  // Resume reads the rows themselves: catalog-generate-ai.ts loads one run's
+  // batch rows and statuses to decide which batches a resumed run still has to
+  // execute (scripts/lib/checkpoint.ts resumes the catalog_import_runs row
+  // itself, not these batches).
+  //
+  // Without this index all three scan every batch ever generated — including
+  // the scope sum inside the serialized section — and the batch ledger is never
+  // pruned. It is also the referencing side of the run foreign key above, so a
+  // cascading run delete stops scanning the table as well. Reads that also name
+  // batch_key are served by the unique index above.
   @@index([run_id])
 }
 
@@ -420,6 +455,19 @@ model catalog_generation_batches {
 // versioned separately from metadata so a nutrient change and a name/allergen
 // change each invalidate a recipe snapshot on their own. A NULL nutrient means
 // UNKNOWN and is never coerced to 0.
+//
+// TWO INDEXES ON THIS TABLE CANNOT BE MIRRORED BY AN @@index AND ARE THEREFORE
+// NOT LISTED BELOW: idx_catalog_foods_fold_display_name and
+// idx_catalog_foods_fold_canonical_name, appended by
+// prisma/migrations/20260910000000_catalog_prefix_fold_indexes. Each indexes
+// translate(<column>, 'ABC…', 'abc…') text_pattern_ops — the locale-free fold
+// both sides of the name prefix comparison go through, for the reason the
+// catalog_food_aliases header below sets out — and each is PARTIAL on
+// publication_status = 'published', the prefix branch's own predicate, so the
+// index stays the size of the published catalog rather than of every candidate
+// and retired row. An expression index carrying a predicate is invisible to
+// `prisma migrate diff` on both sides, so what pins them is
+// docs/meal-planning/schema-catalog-evidence.sql.
 model catalog_foods {
   id                         String                      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   // Deterministic and portable — 'usda:<fdcId>' or
@@ -503,16 +551,31 @@ model catalog_foods {
 // which is why search aggregates to one row per food rather than joining these
 // out.
 //
-// The lower(alias) expression index is appended in the migration SQL, which
-// Prisma cannot express either as an expression or with its operator class, and
-// the operator class is load-bearing: the index is declared
-// `lower("alias") text_pattern_ops` because its only caller's predicate is a
-// left-anchored `lower(alias) LIKE 'x%'`, and a btree derives LIKE range bounds
-// only under a `*_pattern_ops` class or a C column collation — which the
-// en_US.utf8 databases this project creates do not have. With the default
-// `text_ops` the planner refuses the index outright, so this is a correctness
-// property of the index rather than a tuning preference. Equality is still
-// served, so the class replaces `text_ops` rather than joining it.
+// The ASCII-fold expression index over alias is appended in the migration SQL
+// (prisma/migrations/20260910000000_catalog_prefix_fold_indexes), which Prisma
+// cannot express either as an expression or with its operator class, and both
+// the expression and the class are load-bearing.
+//
+// THE EXPRESSION IS translate(alias, 'ABC…', 'abc…') AND NOT lower(alias).
+// Its only caller is the alias prefix branch of catalog.service.ts, whose
+// pattern is folded in JavaScript. lower() resolves through the database's
+// collation and String.prototype.toLowerCase does not, so the two sides of that
+// comparison were different functions outside A-Z and a partial query over a
+// name carrying a non-ASCII capital matched on one server and not on another —
+// and a prefix branch is the only branch a partial query can match, so the food
+// was absent rather than mis-ranked. translate() takes no locale input at all,
+// which is what makes the comparison a property of the release rather than of
+// the server (AAP §0.9.3). catalog_foods carries the matching pair over
+// display_name and canonical_name for the other prefix branch.
+//
+// THE CLASS IS text_pattern_ops because the predicate is a left-anchored
+// `translate(alias, …) LIKE 'x%'`, and a btree derives LIKE range bounds only
+// under a `*_pattern_ops` class or a C column collation — which the en_US.utf8
+// databases this project creates do not have. With the default `text_ops` the
+// planner refuses the index outright, so this is a correctness property of the
+// index rather than a tuning preference. Equality is still served, so the class
+// replaces `text_ops` rather than joining it.
+//
 // Unlike idx_catalog_foods_search_vector above, no @@index can mirror this one,
 // so the schema-diff gate is blind to it by design and
 // docs/meal-planning/schema-catalog-evidence.sql reads the class back out of

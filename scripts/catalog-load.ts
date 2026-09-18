@@ -30,8 +30,39 @@
 //      its manifest's internal consistency and the presence of every file that
 //      manifest lists, before a database client is even constructed;
 //   2. VERIFICATION — every member is streamed once for its SHA-256, its byte
-//      length and its row count, and compared against manifest.json. Nothing is
-//      written on this path, so a tampered release is refused with the target
+//      length and its row count, and compared against manifest.json. The same
+//      stream applies the IDENTITY-EVIDENCE FLOOR: every published food's
+//      validation record is assessed with `assessIdentityEvidence`
+//      (scripts/lib/catalogEvidence.ts — the one rule the import stage,
+//      validation and catalog-release.ts also apply), and a record with no
+//      observed 2xx status, no body digest, no matched snippet or — for a USDA
+//      row — no cache key and no per-food digest refuses the load with
+//      `release_evidence_incomplete`. When the manifest carries the
+//      `evidence` block catalog-release.ts measures, it is cross-checked
+//      against what this pass measured — including the exporter's attestation
+//      that it RESOLVED every published USDA row's digests against the
+//      `usda_api_cache` payload they cite, which has to cover every such row
+//      these bytes ship (`release_evidence_cache_unresolved`). That resolution
+//      is the one evidence rule this stage cannot re-make: the cache is a
+//      database table and no release member carries it, so a digest standing
+//      for nothing is indistinguishable here from one that recomputes. The
+//      same stream also applies the
+//      COMPOSITION CROSS-CHECK: every published food that carries a composition
+//      — or claims to have been derived from one — is recomputed from its own
+//      `components.jsonl` rows and the component foods `foods.jsonl` publishes,
+//      and a parent whose scalars, basis, provenance or version pins disagree
+//      with that recomputation refuses the load with
+//      `release_component_inconsistent` — because the loader applies a parent's
+//      nutrients and reconciles its composition in two separate steps, so
+//      without this nothing in the pipeline ever compared them. The
+//      recomputation is only possible over a CLOSED release, so the same pass
+//      first refuses one whose published composition names a component
+//      `foods.jsonl` does not publish (`release_components_not_closed`): such a
+//      reference states no component nutrition to recompute from and would be
+//      resolved against whatever the destination database holds under that key.
+//      Nothing is written on this path, so a tampered release, one whose
+//      published rows the pipeline itself would have quarantined, or one that
+//      contradicts itself about a derived food, is refused with the target
 //      database untouched;
 //   3. the run row — opened or resumed through scripts/lib/checkpoint.ts, which
 //      is the single owner of `catalog_import_runs`;
@@ -102,7 +133,7 @@
 // write beyond the run row. It is achieved by comparing the stored food and its
 // children against the release and skipping an unchanged food entirely — no
 // transaction at all — because `catalog_foods.updated_at` is `@updatedAt` and
-// 11,046 pointless transactions would both churn that column and turn the
+// 9,422 pointless transactions would both churn that column and turn the
 // release gate into a benchmark.
 //
 // A PARTIAL LOAD IS REPAIRED BY RERUNNING IT (AAP §0.7.5), which is a property
@@ -132,9 +163,9 @@ import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
 
-import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
-import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
-import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
+import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
+import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import {
     ManifestError,
     assertReleaseVersion,
@@ -148,17 +179,7 @@ import { RateLimitConfigError } from './lib/rateLimiter';
 // checkpoint.ts is the single owner of `catalog_import_runs`, including the
 // active-release pointer, so every run-state read and write below goes through
 // it and this file never queries that table itself.
-import {
-    CheckpointError,
-    RELEASE_LOAD_RUN_KIND,
-    finishRun,
-    getActiveReleaseLoad,
-    openOrResumeRun,
-    openRun,
-    recordCounts,
-    saveCursor,
-    withCatalogStageLock,
-} from './lib/checkpoint';
+import { CheckpointError, RELEASE_LOAD_RUN_KIND, checkpointErrorFields, finishRun, getActiveReleaseLoad, openOrResumeRun, openRun, recordCounts, saveCursor, withCatalogStageLock } from './lib/checkpoint';
 import type { CatalogRun, CatalogRunDb } from './lib/checkpoint';
 // The zero-component rule, imported rather than restated: it is the same pure
 // verdict catalog-release.ts asserts at export time, under unit test in
@@ -166,6 +187,30 @@ import type { CatalogRun, CatalogRunDb } from './lib/checkpoint';
 // Prisma client, no filesystem and no clock, so importing it costs this entry
 // point nothing at module load.
 import { assessComponentCoverage } from '../src/services/catalog.logic';
+// The identity-evidence floor, for the same reason and on the same terms: one
+// rule, applied by the import stage when it writes a row, by validation when it
+// judges the table, by catalog-release.ts when it exports and here before a
+// single row of a release is written.
+//
+// The component-derivation predicate arrives from the same module and is
+// applied in the same pass. `assessComponentCoverage` above answers only
+// whether a published `ingredient_derived` food HAS a composition; this answers
+// the question the pipeline never asked at all, which is whether the parent's
+// nutrient scalars are the ones that composition produces. Both halves matter
+// here because the loader decides what a database ends up holding: a release
+// whose components.jsonl and foods.jsonl disagree publishes, in this database,
+// numbers nothing in the release derives.
+import {
+    assessComponentDerivation,
+    assessIdentityEvidence,
+    cacheBindingRequired,
+    componentDerivationComponentOf,
+    componentGapCodes,
+    describeComponentGaps,
+    describeEvidenceGaps,
+    evidenceGapCodes,
+} from './lib/catalogEvidence';
+import type { ComponentDerivationComponent, ComponentFoodFacts, EvidenceGapCode } from './lib/catalogEvidence';
 
 const STAGE = 'catalog-load';
 
@@ -227,11 +272,70 @@ const INGREDIENT_DERIVED = 'ingredient_derived';
  * the member the apply pass opened, or the bytes it actually read, are not the
  * ones verification measured, so the load is refused rather than applying
  * unreviewed bytes (see THE TWO READS in this file's header).
- * `component_reference_unresolved` means a composition names a food neither
- * this database nor the release can ever supply — an absent target, or a cycle
- * the fixpoint pass cannot break — which the RESTRICT foreign key would refuse:
- * it is reported with both keys rather than silently skipped, because skipping
- * it would store a nutrient total with no composition behind it.
+ * `release_evidence_incomplete` means a PUBLISHED food's validation record does
+ * not meet the identity-evidence floor — no observed 2xx status, no body
+ * digest, no matched snippet, or for a USDA row no cache key and no per-food
+ * digest (scripts/lib/catalogEvidence.ts; AAP §0.3.2 makes those the fields of
+ * a retrieval record and §0.7.3 makes their absence a quarantine-tier hold). It
+ * is raised during verification, so nothing has been written, and the repair is
+ * not in this stage's hands: a retrieval record is observed, never
+ * reconstructed, so the release has to be cut again from a re-retrieved row.
+ * `release_evidence_summary_mismatch` means the manifest's `evidence` block
+ * states something the members do not — a different published count per
+ * identity source, a status range the records do not show, or gaps the records
+ * do not carry — so the block is not a measurement of these bytes and the
+ * release has to be reproduced.
+ * `release_evidence_cache_unresolved` means the manifest describes these
+ * members correctly and attests that the export did NOT resolve every published
+ * USDA row's digests against the `usda_api_cache` payload they cite. That
+ * resolution is the one evidence rule this stage cannot re-make — the cache is
+ * a database table and no release member carries it, so a digest that stands
+ * for nothing is indistinguishable here from one that recomputes — which is
+ * exactly why a release is only loadable when the exporter attests it covered
+ * every such row. The repair is to cut the release again with an exporter that
+ * performs the resolution, never to edit the manifest.
+ * `release_component_inconsistent` means a PUBLISHED `ingredient_derived`
+ * food's nutrient scalars in `foods.jsonl` are not the ones its own
+ * `components.jsonl` rows derive to, recomputed from the component foods this
+ * same release carries (scripts/lib/catalogEvidence.ts, over
+ * `catalog.logic.ts::deriveComponentNutrition`; AAP §0.5.1 makes that
+ * recomputation what such a row's nutrition IS). Three things raise it and all
+ * three are one fact — the release contradicts itself about one food: the
+ * parent carries no component rows at all, a component's pinned
+ * `component_nutrition_version` is not the `nutrition_version` the release
+ * states for that component food (so the parent's totals were taken from a
+ * version these bytes do not contain), or the parent's stored scalars and the
+ * recomputation are different numbers. It is raised during verification, so
+ * nothing has been written, and the repair is to re-derive the food and cut the
+ * release again — never to edit `foods.jsonl`, because a parent's nutrition
+ * moving must move its `nutrition_version` and therefore invalidate the recipe
+ * snapshots that cite it.
+ * What it does NOT mean: a composition naming a food the release does not
+ * publish. That is `release_components_not_closed`, the next code, which is a
+ * statement about the ARTEFACT rather than about a food's arithmetic.
+ * `release_components_not_closed` means a published food's composition names a
+ * component `foods.jsonl` does not publish, so the release is not closed over
+ * its own component references. Two things follow from such a reference and
+ * both are refusals: the recomputation above cannot be made at all — those
+ * bytes do not state what the component's nutrition or `nutrition_version` is,
+ * so the pinned version and the parent's scalars have nothing to be compared
+ * against — and the composition's MEANING would then depend on the destination,
+ * because the loader resolves the key against whatever food this database
+ * happens to hold under it, at whatever version and nutrition that row now
+ * carries. A release is a statement of desired state that every environment
+ * must read identically, so a reference outside it is refused rather than
+ * resolved locally: `catalog-release.ts` already refuses to EXPORT one (see A
+ * RELEASE'S COMPONENTS CLOSE OVER ITS OWN FOODS there, which also rejects a
+ * non-published target), and this is the same rule applied to the bytes in
+ * front of the loader, which may have been cut by an older build or edited
+ * after review. It is raised during verification, so nothing has been written,
+ * and the repair is to publish the component food and cut the release again.
+ * `component_reference_unresolved` means something narrower and later: a
+ * composition the LOAD could not satisfy — a cycle the fixpoint pass cannot
+ * break, or a target neither the release nor this database produced — which the
+ * RESTRICT foreign key would refuse. It keeps naming that defect on its own
+ * terms, with both keys, because skipping it would store a nutrient total with
+ * no composition behind it.
  * `count_verification_failed` and `component_coverage_failed` mean the load
  * applied but the result does not match what the release promised, so the run
  * is closed 'failed' and the active release pointer stays where it was.
@@ -254,6 +358,11 @@ export type CatalogLoadErrorCode =
     | 'release_member_out_of_order'
     | 'release_duplicate_validation_record'
     | 'release_validation_record_missing'
+    | 'release_evidence_incomplete'
+    | 'release_evidence_summary_mismatch'
+    | 'release_evidence_cache_unresolved'
+    | 'release_component_inconsistent'
+    | 'release_components_not_closed'
     | 'component_reference_unresolved'
     | 'count_verification_failed'
     | 'component_coverage_failed';
@@ -431,7 +540,18 @@ export const describeUsage = (): string =>
         '',
         'Applies a reviewed catalog release to the database DATABASE_URL names.',
         'Every file is checksum-verified against manifest.json before anything is',
-        'written; foods reconcile on source_key with their aliases, portions,',
+        'written and every published food\'s validation record must carry complete',
+        'identity evidence — an observed 2xx retrieval status, the body digest, the',
+        'matched snippet and, for a USDA row, its cache key and per-food digest —',
+        'or the load is refused with code "release_evidence_incomplete" and nothing',
+        'is written; every published food carrying a composition is recomputed from',
+        'the components the release states for it, and one whose stored nutrition,',
+        'basis, provenance or component version pins disagree with that',
+        'recomputation is refused with code "release_component_inconsistent" —',
+        'as is a release whose published composition names a component',
+        'foods.jsonl does not publish, with code',
+        '"release_components_not_closed" — both also before any write; foods',
+        'reconcile on source_key with their aliases, portions,',
         'components and validation record replaced wholesale; a published food the',
         'release does not carry is retired, never deleted; and the run is recorded',
         'as succeeded — which is what makes it the active release — only once the',
@@ -704,12 +824,16 @@ export const preflight = (deps: LoadPreflightDeps): readonly PrerequisiteGap[] =
     try {
         deps.assertReleaseVersion(deps.release);
     } catch (error) {
-        if (error instanceof ManifestError) {
+        if (isThrownInstanceOf(error, ManifestError)) {
             gaps.push({
                 code: 'release_id_invalid',
                 requirement: 'The --release value must be "v" followed by digits, and a single path segment',
                 remedy: 'Pass a release id such as --release v1.',
-                detail: `${error.code}: ${error.message}`,
+                // Closed code only, never the sentence: a ManifestError message can carry
+                // an absolute checkout path (manifest.ts `repo_root_not_found`) or a foreign
+                // JSON parser message (`invalid_merged_report`), and `requirement` and
+                // `remedy` beside it already carry everything an operator acts on.
+                detail: error.code,
             });
             return gaps;
         }
@@ -720,12 +844,16 @@ export const preflight = (deps: LoadPreflightDeps): readonly PrerequisiteGap[] =
     try {
         manifest = deps.loadReleaseManifest(deps.release);
     } catch (error) {
-        if (error instanceof ManifestError) {
+        if (isThrownInstanceOf(error, ManifestError)) {
             gaps.push({
                 code: 'release_manifest_unavailable',
                 requirement: `${describeReleaseFile(deps.release, 'manifest.json')} must load and declare the coverage-plan version this build understands`,
                 remedy: `Produce the release with "npm run catalog:release -- --release ${deps.release}" and commit data/meal-planning/catalog/releases/${deps.release}/ (AAP §0.7.1 Group 3).`,
-                detail: `${error.code}: ${error.message}`,
+                // Closed code only, never the sentence: a ManifestError message can carry
+                // an absolute checkout path (manifest.ts `repo_root_not_found`) or a foreign
+                // JSON parser message (`invalid_merged_report`), and `requirement` and
+                // `remedy` beside it already carry everything an operator acts on.
+                detail: error.code,
             });
             // Without the manifest there is no file list, so the per-file check
             // below has nothing to say. Returning here keeps the refusal to the
@@ -781,14 +909,18 @@ export const preflight = (deps: LoadPreflightDeps): readonly PrerequisiteGap[] =
         try {
             absolutePath = deps.releaseFilePath(deps.release, fileName);
         } catch (error) {
-            if (error instanceof ManifestError) {
+            if (isThrownInstanceOf(error, ManifestError)) {
                 // A name the path rule refuses — a separator, "..", an empty
                 // entry — is a defective manifest, not a missing file.
                 gaps.push({
                     code: 'release_file_name_invalid',
                     requirement: `Every "path" in ${describeReleaseFile(deps.release, 'manifest.json')} must be a single file name inside the release directory`,
                     remedy: `Reproduce the release with "npm run catalog:release -- --release ${deps.release} --force" so its manifest lists plain file names.`,
-                    detail: `${error.code}: ${error.message}`,
+                    // Closed code only, never the sentence: a ManifestError message can carry
+                    // an absolute checkout path (manifest.ts `repo_root_not_found`) or a foreign
+                    // JSON parser message (`invalid_merged_report`), and `requirement` and
+                    // `remedy` beside it already carry everything an operator acts on.
+                    detail: error.code,
                 });
                 continue;
             }
@@ -1115,7 +1247,7 @@ const parseValidationLine = (row: ReleaseRow, line: number): ValidationColumns =
 // a comparison that reported "unchanged" too readily would leave a stale row
 // behind, and one that reported "changed" too readily would churn
 // `catalog_foods.updated_at` on every load and turn the release gate into
-// 11,046 pointless transactions.
+// 9,422 pointless transactions.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1273,10 +1405,10 @@ const sameValidationRecord = (stored: StoredValidationRow, desired: ValidationCo
 // ---------------------------------------------------------------------------
 // Streaming the release.
 //
-// `validation-records.jsonl` is 50 MB across 11,046 rows, so no member is ever
+// `validation-records.jsonl` is 59 MB across 9,422 rows, so no member is ever
 // read into memory: each is streamed line by line, twice — once to verify it
 // and once to apply it — and the only thing held between the two passes is the
-// food key order, which is 11,046 strings.
+// food key order, which is 9,422 strings.
 // ---------------------------------------------------------------------------
 
 /** What one streaming pass measured, and what manifest.json is compared against. */
@@ -1291,9 +1423,14 @@ const openReadStream = (absolutePath: string, file: string): fs.ReadStream => {
     try {
         return fs.createReadStream(absolutePath);
     } catch (error) {
-        throw new CatalogLoadError('release_file_unreadable', `${file} could not be opened: ${safeError(error).message}`, {
-            file,
-        });
+        // `file` is the release member's own relative name, which this stage
+        // owns; the errno reaches the operator through formatSafeError while
+        // the absolute path inside the fs message does not.
+        throw new CatalogLoadError(
+            'release_file_unreadable',
+            `${file} could not be opened (${formatSafeError(error)})`,
+            { file },
+        );
     }
 };
 
@@ -1328,7 +1465,7 @@ const measureMemberIdentity = (absolutePath: string, file: string): MemberIdenti
     } catch (error) {
         throw new CatalogLoadError(
             'release_file_unreadable',
-            `${file} could not be inspected: ${safeError(error).message}`,
+            `${file} could not be inspected (${formatSafeError(error)})`,
             { file },
         );
     }
@@ -1367,7 +1504,9 @@ const parseReleaseLine = (text: string, file: string, line: number): ReleaseRow 
     } catch (error) {
         throw new CatalogLoadError(
             'release_line_invalid_json',
-            `${file} line ${line} is not valid JSON: ${safeError(error).message}`,
+            // The parser's text would quote the release bytes it choked on;
+            // the member name and the line number already locate the fault.
+            `${file} line ${line} is not valid JSON (${formatSafeError(error)})`,
             { file, line },
         );
     }
@@ -1531,6 +1670,641 @@ const openMemberCursor = (absolutePath: string, file: string, identity: MemberId
     };
 };
 
+/* ---------------------------------------------------------------------------
+ * The identity evidence the release ships, measured before anything is written.
+ *
+ * WHY THE LOADER MEASURES IT AGAIN. catalog-release.ts refuses to EXPORT a
+ * published row whose identity evidence is incomplete and writes what it
+ * measured into the manifest's `evidence` block — but this stage is the one that
+ * decides what a database ends up holding, and the release it is handed may
+ * predate that gate, may have been cut by an older build, or may have been
+ * edited after review. The bytes in front of the loader are the only thing it
+ * can be held to, so the predicate is re-applied to them: a published row whose
+ * mandatory retrieval status nobody observed is exactly what the import stage
+ * quarantines (AAP §0.3.2, §0.7.3), and loading it would publish, in this
+ * database, a row the pipeline that produced it declares ineligible.
+ *
+ * THE COUNTERS ARE LOCAL, THE RULE IS NOT. `assessIdentityEvidence` is imported
+ * — one rule, four stages — while the tallies below are this file's own, because
+ * the two entry points deliberately share no module graph (see the release
+ * format contract at the top of this file) and a counter is not a rule: what
+ * would be dangerous to state twice is the definition of complete evidence, and
+ * that is stated once.
+ * ------------------------------------------------------------------------- */
+
+/** What one identity source contributes, as the manifest's block states it. */
+interface EvidenceSourceMeasurement {
+    readonly identity_source: string;
+    readonly published_foods: number;
+    readonly assessed_records: number;
+    readonly observed_status_min: number | null;
+    readonly observed_status_max: number | null;
+}
+
+/** The loader's own measurement of the release's evidence, in the manifest's shape. */
+interface EvidenceMeasurement {
+    readonly published_foods: number;
+    readonly assessed_records: number;
+    readonly complete_records: number;
+    readonly observed_status_min: number | null;
+    readonly observed_status_max: number | null;
+    readonly identity_sources: readonly EvidenceSourceMeasurement[];
+    readonly gap_codes: readonly { readonly code: EvidenceGapCode; readonly foods: number }[];
+    /**
+     * Published rows whose identity source binds a `usda_api_cache` payload,
+     * counted from `foods.jsonl`.
+     *
+     * THE ONE NUMBER THIS PASS CAN MEASURE ABOUT THE RESOLUTION IT CANNOT
+     * PERFORM. The exporter resolves each such row's digests against the
+     * recorded vendor response and attests the result in the manifest
+     * (`evidence.source_cache_resolution`); the cache is a database table, no
+     * release member carries it, and this loader therefore cannot recompute a
+     * single one of those digests. What it can do is count the rows that needed
+     * it and refuse an attestation that covers fewer of them — which is exactly
+     * what `crossCheckEvidenceSummary` does, and no more than that.
+     */
+    readonly cache_binding_required: number;
+}
+
+/**
+ * Accumulates the evidence facts while the members stream past.
+ *
+ * Bounded by the number of distinct identity sources and gap codes, never by the
+ * release: the pass that fills it is the same one-pass stream that measures the
+ * digests, so verifying evidence costs no extra read of a 56 MB member.
+ */
+class EvidenceMeasurementTally {
+    private readonly bySource = new Map<
+        string,
+        { publishedFoods: number; assessedRecords: number; statusMin: number | null; statusMax: number | null }
+    >();
+
+    private readonly gapFoods = new Map<EvidenceGapCode, number>();
+
+    private assessedRecords = 0;
+
+    private completeRecords = 0;
+
+    private cacheBoundRecords = 0;
+
+    /** One published food of `foods.jsonl`, counted before its record is seen. */
+    public addPublishedFood(identitySource: string): void {
+        const source = this.source(identitySource);
+        source.publishedFoods += 1;
+        if (cacheBindingRequired(identitySource)) {
+            this.cacheBoundRecords += 1;
+        }
+    }
+
+    /** One published food's validation record, as assessed against the floor. */
+    public addAssessedRecord(identitySource: string, assessment: ReturnType<typeof assessIdentityEvidence>): void {
+        const source = this.source(identitySource);
+        source.assessedRecords += 1;
+        this.assessedRecords += 1;
+        if (assessment.complete) {
+            this.completeRecords += 1;
+        }
+        if (assessment.status !== null) {
+            source.statusMin = source.statusMin === null ? assessment.status : Math.min(source.statusMin, assessment.status);
+            source.statusMax = source.statusMax === null ? assessment.status : Math.max(source.statusMax, assessment.status);
+        }
+        // One food counts once per distinct code, so the histogram reads as "how
+        // many foods this gap held" — the same convention the exporter writes.
+        for (const code of evidenceGapCodes(assessment)) {
+            this.gapFoods.set(code, (this.gapFoods.get(code) ?? 0) + 1);
+        }
+    }
+
+    public measure(): EvidenceMeasurement {
+        const identitySources = Array.from(this.bySource.entries())
+            .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+            .map(([identitySource, measured]) => ({
+                identity_source: identitySource,
+                published_foods: measured.publishedFoods,
+                assessed_records: measured.assessedRecords,
+                observed_status_min: measured.statusMin,
+                observed_status_max: measured.statusMax,
+            }));
+        const statuses = identitySources
+            .flatMap((source) => [source.observed_status_min, source.observed_status_max])
+            .filter((status): status is number => status !== null);
+
+        return {
+            published_foods: identitySources.reduce((total, source) => total + source.published_foods, 0),
+            assessed_records: this.assessedRecords,
+            complete_records: this.completeRecords,
+            observed_status_min: statuses.length === 0 ? null : Math.min(...statuses),
+            observed_status_max: statuses.length === 0 ? null : Math.max(...statuses),
+            identity_sources: identitySources,
+            gap_codes: Array.from(this.gapFoods.entries())
+                .sort((left, right) => (left[0] < right[0] ? -1 : 1))
+                .map(([code, foods]) => ({ code, foods })),
+            cache_binding_required: this.cacheBoundRecords,
+        };
+    }
+
+    private source(identitySource: string): {
+        publishedFoods: number;
+        assessedRecords: number;
+        statusMin: number | null;
+        statusMax: number | null;
+    } {
+        const existing = this.bySource.get(identitySource);
+        if (existing !== undefined) {
+            return existing;
+        }
+        const created = { publishedFoods: 0, assessedRecords: 0, statusMin: null, statusMax: null };
+        this.bySource.set(identitySource, created);
+        return created;
+    }
+}
+
+/**
+ * Whether this manifest attests that the export resolved its source-cache
+ * bindings, for the verification log line.
+ *
+ * Read defensively, like every other field of a document whose own bytes
+ * nothing digests: a manifest with no `evidence` block, or one whose block is
+ * not an object, attests nothing — which is a fact worth logging rather than an
+ * error, because such a release is still loadable on its structural evidence
+ * (see `crossCheckEvidenceSummary`).
+ */
+const declaredCacheResolution = (manifest: CatalogReleaseManifest): unknown => {
+    const evidence = (manifest as unknown as Record<string, unknown>).evidence;
+    if (evidence === null || typeof evidence !== 'object' || Array.isArray(evidence)) {
+        return undefined;
+    }
+    return (evidence as Record<string, unknown>).source_cache_resolution;
+};
+
+/** A scalar of the manifest's block, read from a document that binds nothing. */
+const declaredScalar = (block: Record<string, unknown>, field: string): number | null | undefined => {
+    const value = block[field];
+    if (value === null || value === undefined) {
+        return value;
+    }
+    return typeof value === 'number' && Number.isFinite(value) ? value : NaN;
+};
+
+/**
+ * Refuses a manifest whose `evidence` block is not a measurement of these
+ * members.
+ *
+ * WHY AN ABSENT BLOCK IS ACCEPTED AND A WRONG ONE IS NOT. The row-level floor
+ * above is authoritative and complete on its own: it assesses every published
+ * food's record in the release, so a release with no `evidence` block is still
+ * fully checked and a reviewed release cut before the block existed stays
+ * loadable — refusing it would make this loader unable to apply artefacts it has
+ * no fault to find with. A block that is PRESENT, though, is a claim a reviewer
+ * read instead of streaming 56 MB of records; if it disagrees with the members
+ * it is not a summary of them, and whichever of the two is wrong, the release is
+ * not the one that was reviewed. Refused before any write, with both numbers, so
+ * the operator can see which side moved.
+ *
+ * Fields the loader does not know are ignored rather than refused, so a later
+ * manifest version can add one without stranding this loader; every field it
+ * does know must agree exactly.
+ *
+ * WHAT THIS PASS CANNOT CHECK, STATED EXACTLY RATHER THAN ROUNDED UP. One
+ * evidence rule is NOT re-made here and cannot be: the exporter resolves every
+ * published USDA row's `source_cache_key` against `usda_api_cache` and
+ * recomputes both digests from the stored payload, and this loader has no
+ * access to that table — it is a database the release does not carry, and
+ * `validation-records.jsonl` states digests rather than the bytes they were
+ * taken over. So a released record whose digests stand for nothing is
+ * structurally indistinguishable, to this stage, from one that resolves. The
+ * exporter therefore ATTESTS the resolution in
+ * `evidence.source_cache_resolution`, and what this function enforces is that
+ * attestation: the count of rows that required resolution must equal what these
+ * members carry, and the count resolved must cover it. A manifest claiming
+ * fewer resolved rows than the release ships published USDA rows is refused
+ * with `release_evidence_cache_unresolved`.
+ *
+ * A release whose block states no attestation at all is ACCEPTED, on the same
+ * terms as an absent block — it was cut before the exporter measured this, and
+ * nothing in the bytes can distinguish it from one that was resolved. That is a
+ * real limit of loading an artefact offline rather than a check being skipped,
+ * and `release_evidence_verified` logs whether the release attested it so an
+ * operator can see which of the two they applied.
+ */
+const crossCheckEvidenceSummary = (
+    release: string,
+    declared: unknown,
+    measured: EvidenceMeasurement,
+): void => {
+    if (declared === undefined) {
+        return;
+    }
+
+    const refuse = (what: string, expected: string | number, observed: string | number): never => {
+        throw new CatalogLoadError(
+            'release_evidence_summary_mismatch',
+            `${describeReleaseFile(release, 'manifest.json')} states an "evidence" block that does not describe the ` +
+                `release's members: ${what} is ${forDisplay(expected)} in the manifest and measures ` +
+                `${forDisplay(observed)} across ${FOODS_FILE} and ${VALIDATION_RECORDS_FILE}. The block is measured ` +
+                'from the exported rows by catalog-release.ts, so one of the two is not the reviewed artefact; ' +
+                `nothing has been written. Reproduce the release with "npm run catalog:release -- --release ${release} --force".`,
+            { file: 'manifest.json', expected, observed },
+        );
+    };
+
+    if (declared === null || typeof declared !== 'object' || Array.isArray(declared)) {
+        refuse('the block itself', 'an object', JSON.stringify(declared) ?? String(declared));
+        return;
+    }
+    const block = declared as Record<string, unknown>;
+
+    for (const field of ['published_foods', 'assessed_records', 'complete_records', 'observed_status_min', 'observed_status_max'] as const) {
+        const stated = declaredScalar(block, field);
+        if (stated === undefined) {
+            continue;
+        }
+        const actual = measured[field];
+        // `NaN` is what `declaredScalar` returns for a value that is neither a
+        // finite number nor null, so an unreadable field is a mismatch rather
+        // than something to interpret.
+        if (Number.isNaN(stated) || stated !== actual) {
+            refuse(
+                `evidence.${field}`,
+                Number.isNaN(stated) ? JSON.stringify(block[field]) ?? 'unreadable' : (stated as number | null) ?? 'null',
+                actual ?? 'null',
+            );
+        }
+    }
+
+    const statedSources = block.identity_sources;
+    if (Array.isArray(statedSources)) {
+        if (statedSources.length !== measured.identity_sources.length) {
+            refuse('the number of identity sources in evidence.identity_sources', statedSources.length, measured.identity_sources.length);
+        }
+        for (const entry of statedSources) {
+            if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+                refuse('an entry of evidence.identity_sources', 'an object', JSON.stringify(entry) ?? String(entry));
+                continue;
+            }
+            const stated = entry as Record<string, unknown>;
+            const identitySource = typeof stated.identity_source === 'string' ? stated.identity_source : '';
+            const actual = measured.identity_sources.find((source) => source.identity_source === identitySource);
+            if (actual === undefined) {
+                refuse(
+                    `the identity source "${identitySource}" in evidence.identity_sources`,
+                    'a source the members carry',
+                    measured.identity_sources.map((source) => source.identity_source).join(', ') || 'none',
+                );
+                continue;
+            }
+            for (const field of ['published_foods', 'assessed_records', 'observed_status_min', 'observed_status_max'] as const) {
+                const statedField = declaredScalar(stated, field);
+                if (statedField === undefined) {
+                    continue;
+                }
+                if (Number.isNaN(statedField) || statedField !== actual[field]) {
+                    refuse(
+                        `evidence.identity_sources["${identitySource}"].${field}`,
+                        Number.isNaN(statedField)
+                            ? JSON.stringify(stated[field]) ?? 'unreadable'
+                            : (statedField as number | null) ?? 'null',
+                        actual[field] ?? 'null',
+                    );
+                }
+            }
+        }
+    }
+
+    const statedGaps = block.gap_codes;
+    if (Array.isArray(statedGaps)) {
+        // A release that passes the row-level floor carries no gaps at all, so
+        // the measured histogram is empty and a block stating otherwise is
+        // describing rows these members do not hold.
+        const statedCodes = statedGaps
+            .map((gap) =>
+                gap !== null && typeof gap === 'object' && typeof (gap as { code?: unknown }).code === 'string'
+                    ? `${(gap as { code: string }).code}=${JSON.stringify((gap as { foods?: unknown }).foods ?? null)}`
+                    : JSON.stringify(gap),
+            )
+            .join(', ');
+        const measuredCodes = measured.gap_codes.map((gap) => `${gap.code}=${gap.foods}`).join(', ');
+        if (statedCodes !== measuredCodes) {
+            refuse('evidence.gap_codes', statedCodes || 'none', measuredCodes || 'none');
+        }
+    }
+
+    // THE ATTESTATION THIS PASS CANNOT RE-MAKE (see the contract above).
+    //
+    // `required_records` is a property of these bytes, so it is compared with
+    // what this stream measured and a disagreement is the same class of fault
+    // as any other wrong number in the block. `resolved_records` is not
+    // measurable here at all — the cache is a table the release does not carry
+    // — so the one thing that can be asked of it is whether it COVERS the rows
+    // these members ship. A release attesting fewer resolved bindings than it
+    // publishes USDA rows is a release whose remaining rows' digests nobody
+    // resolved, which is the defect the export gate exists to stop and the
+    // loader's last chance to refuse it.
+    //
+    // Its own code, not `release_evidence_summary_mismatch`: that one means the
+    // manifest does not describe these members and the remedy is to work out
+    // which of the two moved. This means the manifest describes them correctly
+    // and says the resolution was not completed, and the remedy is to cut the
+    // release again with an exporter that performs it.
+    const statedResolution = block.source_cache_resolution;
+    if (statedResolution !== undefined && statedResolution !== null) {
+        if (typeof statedResolution !== 'object' || Array.isArray(statedResolution)) {
+            refuse(
+                'the evidence.source_cache_resolution block itself',
+                'an object',
+                JSON.stringify(statedResolution) ?? String(statedResolution),
+            );
+            return;
+        }
+        const resolution = statedResolution as Record<string, unknown>;
+
+        const statedRequired = declaredScalar(resolution, 'required_records');
+        if (statedRequired !== undefined) {
+            if (
+                statedRequired === null ||
+                Number.isNaN(statedRequired) ||
+                statedRequired !== measured.cache_binding_required
+            ) {
+                refuse(
+                    'evidence.source_cache_resolution.required_records',
+                    statedRequired === null || Number.isNaN(statedRequired)
+                        ? JSON.stringify(resolution.required_records) ?? 'unreadable'
+                        : statedRequired,
+                    measured.cache_binding_required,
+                );
+            }
+        }
+
+        const statedResolved = declaredScalar(resolution, 'resolved_records');
+        if (statedResolved !== undefined) {
+            if (
+                statedResolved === null ||
+                Number.isNaN(statedResolved) ||
+                !Number.isInteger(statedResolved) ||
+                statedResolved < measured.cache_binding_required
+            ) {
+                throw new CatalogLoadError(
+                    'release_evidence_cache_unresolved',
+                    `${describeReleaseFile(release, 'manifest.json')} attests ${
+                        statedResolved === null || Number.isNaN(statedResolved)
+                            ? JSON.stringify(resolution.resolved_records) ?? 'an unreadable count of'
+                            : statedResolved
+                    } resolved source-cache binding(s), and ${FOODS_FILE} publishes ` +
+                        `${measured.cache_binding_required} food(s) whose identity evidence cites a usda_api_cache ` +
+                        'payload. Every one of them has to have been resolved — its cache row found, its recorded ' +
+                        'status matched and both digests recomputed from the stored payload — because this loader ' +
+                        'cannot do it: usda_api_cache is a database table and no release member carries it, so a ' +
+                        'digest that stands for nothing is indistinguishable here from one that resolves. Nothing ' +
+                        'has been written and the active release pointer has not moved. Cut the release again with ' +
+                        `"npm run catalog:release -- --release ${release} --force", which resolves every such row ` +
+                        'and refuses to produce a release where one does not.',
+                    {
+                        file: 'manifest.json',
+                        expected: measured.cache_binding_required,
+                        observed:
+                            statedResolved === null || Number.isNaN(statedResolved)
+                                ? 'unreadable'
+                                : statedResolved,
+                    },
+                );
+            }
+        }
+    }
+};
+
+/* ---------------------------------------------------------------------------
+ * The composition the release ships, cross-checked against the nutrient
+ * scalars it publishes — in the same pre-write pass, before anything is
+ * written.
+ *
+ * WHY THE LOADER HAS TO DO THIS ARITHMETIC AT ALL. A published
+ * `ingredient_derived` food's nutrient columns are not a source's statement:
+ * they are the output of `deriveComponentNutrition` over that food's
+ * composition (AAP §0.5.1). This loader applies the parent's scalars from
+ * `foods.jsonl` and reconciles `catalog_food_components` from
+ * `components.jsonl` in a SEPARATE step, and nothing compared the two — so a
+ * release whose parent scalars disagree with its own component rows published
+ * that disagreement into every environment that loaded it, silently, with the
+ * manifest's digests binding the contradiction as the reviewed artefact. The
+ * recomputation that would have caught it existed and was unit-tested the whole
+ * time with no production caller anywhere in the pipeline; this is one of its
+ * two callers.
+ *
+ * WHY IT IS SELF-CONTAINED IN THE BYTES. `components.jsonl` names its component
+ * by release `source_key`, and that component food's own line in `foods.jsonl`
+ * carries its `nutrition_version`, its five nutrients, its basis and its
+ * density — so the check needs nothing from the database and nothing from the
+ * exporter's process. `foods.jsonl` heads `RELEASE_MEMBERS`, so the facts below
+ * are complete before `components.jsonl` is read; that order is load-bearing,
+ * exactly as it is for `publishedIdentitySource`.
+ *
+ * WHAT IT COSTS. One small record per published food while `foods.jsonl`
+ * streams (~11k for the committed release, alongside the two key maps that pass
+ * already holds), released the moment `foods.jsonl` closes if the release
+ * publishes no derived food at all — which the committed release does not, so
+ * it retains nothing past that point and keeps not one component line.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * What one published food's line states about its nutrition, kept so a derived
+ * parent can be recomputed and so its components can be read as per-100 g
+ * values.
+ *
+ * `ComponentFoodFacts` is the shared shape a component is read under; the two
+ * extra fields are what the PARENT of a composition is judged on.
+ */
+interface ReleaseNutritionFacts extends ComponentFoodFacts {
+    readonly nutrition_provenance: string;
+    readonly line: number;
+}
+
+/** One `components.jsonl` line, reduced to what the recomputation needs. */
+interface ReleaseComponentLine {
+    readonly componentSourceKey: string;
+    readonly quantityGrams: number;
+    readonly yieldFactor: number;
+    readonly pinnedNutritionVersion: number;
+    readonly sortOrder: number;
+    readonly line: number;
+}
+
+/** The first published derived food whose release lines contradict each other. */
+interface ComponentInconsistency {
+    readonly sourceKey: string;
+    /** The `components.jsonl` line the disagreement is reported at, or the parent's own line when it has none. */
+    readonly file: string;
+    readonly line: number;
+    readonly codes: string;
+    readonly detail: string;
+}
+
+/** The first published food whose composition names a component the release does not publish. */
+interface ComponentReferenceOutsideRelease {
+    readonly sourceKey: string;
+    readonly componentSourceKey: string;
+    /** The `components.jsonl` line the reference is stated on. */
+    readonly line: number;
+}
+
+/**
+ * Refuses a release that is not CLOSED over its own component references.
+ *
+ * WHY THIS IS A RELEASE-LEVEL REFUSAL AND NOT A ROW THE CHECKS PASS OVER. The
+ * loader used to skip such a parent: the recomputation below needs the
+ * component food's nutrition and its current `nutrition_version`, and a
+ * reference outside `foods.jsonl` supplies neither, so the parent's scalars and
+ * its version pins were left unchecked. The apply pass then resolved that same
+ * key against the LOCAL catalog (`applyFood`), so the composition was written
+ * against whatever food this database happened to hold under it — at whatever
+ * version and nutrition that row carries now, which nothing had compared with
+ * the release's pin. The gap that leaves is exact: an externally-resolved
+ * component could activate a published parent whose stored totals were taken at
+ * a version of a food this database has since moved past, and the staleness
+ * detector compares COUNTERS, so it reports nothing — the parent's own counter
+ * never moved.
+ *
+ * WHY CLOSURE RATHER THAN READING THE LOCAL FOOD AND RECOMPUTING. Both would
+ * close the gap; closure is the one that is truthful about what a release IS.
+ * A release is a statement of desired state that every environment must read
+ * identically (see RETIRE, NEVER DELETE in this file's header), and a
+ * composition resolved against the destination has a different meaning in every
+ * database that loads it — the arithmetic would pass in one and fail in the
+ * next, on bytes the manifest's digests bind as one reviewed artefact. The
+ * exporter already refuses to cut such a release (`catalog-release.ts`'s A
+ * RELEASE'S COMPONENTS CLOSE OVER ITS OWN FOODS, which rejects a component
+ * target that is absent OR not published), so this is that stage's rule applied
+ * to bytes it did not necessarily produce, and a release cut by the current
+ * exporter can never hit it. Recomputing from the local row would instead keep
+ * a release form the pipeline refuses to produce, and would do it with a
+ * database read this pass deliberately does not make: verification answers from
+ * the bytes alone, which is what lets it refuse before a single row is written.
+ *
+ * Returns the FIRST offender, for the same reason the other two pre-write gates
+ * do: the members are streamed once either way, and a refusal that accumulated
+ * every offender would allocate a description of the release to report it.
+ */
+const firstComponentReferenceOutsideRelease = (
+    publishedFacts: ReadonlyMap<string, ReleaseNutritionFacts>,
+    componentsByParent: ReadonlyMap<string, readonly ReleaseComponentLine[]>,
+): ComponentReferenceOutsideRelease | null => {
+    // Iterated in `foods.jsonl` order, which the map preserves, so the offender
+    // a given release reports is the same one on every run of this loader.
+    for (const sourceKey of publishedFacts.keys()) {
+        for (const line of componentsByParent.get(sourceKey) ?? []) {
+            if (!publishedFacts.has(line.componentSourceKey)) {
+                return { sourceKey, componentSourceKey: line.componentSourceKey, line: line.line };
+            }
+        }
+    }
+
+    return null;
+};
+
+/**
+ * Recomputes every published `ingredient_derived` parent from the components
+ * the release states for it, and returns the FIRST that disagrees.
+ *
+ * Only the first, for the same reason the evidence floor keeps only the first
+ * offender: the members are streamed once either way, and a refusal that
+ * accumulated every offender would allocate a description of the release to
+ * report it. The one it returns names the whole repair for that food — the gap
+ * list covers every stale pin and every disagreeing nutrient of it.
+ *
+ * A PARENT WHOSE COMPOSITION NAMES A FOOD THE RELEASE DOES NOT PUBLISH IS
+ * PASSED OVER HERE, AND IS ALREADY REFUSED BEFORE THIS RUNS. Those bytes cannot
+ * state what that component's nutrition or version is, so there is nothing to
+ * recompute from — and reporting it as a disagreement would send an operator to
+ * re-derive a food whose composition is simply pointing outside the release.
+ * That is its own refusal, raised first:
+ * {@link firstComponentReferenceOutsideRelease} above, code
+ * `release_components_not_closed`, which names both keys. So in the verification
+ * pass the skip below is unreachable, and it is kept rather than replaced by an
+ * assertion because this predicate is also callable on its own — a caller that
+ * has not applied the closure rule gets "not reported" instead of a throw, which
+ * is this module's no-throw contract, never a silent pass for a published row.
+ */
+const firstComponentInconsistency = (
+    publishedFacts: ReadonlyMap<string, ReleaseNutritionFacts>,
+    componentsByParent: ReadonlyMap<string, readonly ReleaseComponentLine[]>,
+): ComponentInconsistency | null => {
+    // Iterated in `foods.jsonl` order, which the map preserves, so the offender
+    // a given release reports is the same one on every run of this loader.
+    for (const [sourceKey, parent] of publishedFacts) {
+        const lines = componentsByParent.get(sourceKey) ?? [];
+        // DECIDED BY WHAT THE RELEASE CARRIES, NOT BY WHAT THE ROW CLAIMS. A
+        // parent is assessed when it carries component lines OR when it claims
+        // to have been derived from some; skipping on the claimed provenance
+        // alone would let a release relabel a component-bearing row
+        // `source_backed` and carry wrong scalars past this gate. The
+        // assessment reports the contradiction itself as
+        // `parent_provenance_disagrees`.
+        if (parent.nutrition_provenance !== INGREDIENT_DERIVED && lines.length === 0) {
+            continue;
+        }
+
+        const components: ComponentDerivationComponent[] = [];
+        let unresolved = false;
+
+        for (const line of lines) {
+            const componentFood = publishedFacts.get(line.componentSourceKey);
+            if (componentFood === undefined) {
+                unresolved = true;
+                break;
+            }
+            components.push(
+                componentDerivationComponentOf({
+                    componentKey: line.componentSourceKey,
+                    quantityGrams: line.quantityGrams,
+                    yieldFactor: line.yieldFactor,
+                    pinnedNutritionVersion: line.pinnedNutritionVersion,
+                    sortOrder: line.sortOrder,
+                    componentFood,
+                }),
+            );
+        }
+
+        if (unresolved) {
+            continue;
+        }
+
+        const assessment = assessComponentDerivation({
+            parent: {
+                sourceKey,
+                nutritionBasis: parent.nutrition_basis,
+                basisAmount: parent.basis_amount,
+                // Checked by the assessment rather than used to gate it.
+                nutritionProvenance: parent.nutrition_provenance,
+                nutrition: {
+                    calories: parent.calories,
+                    protein_g: parent.protein_g,
+                    carbs_g: parent.carbs_g,
+                    fat_g: parent.fat_g,
+                    fiber_g: parent.fiber_g,
+                },
+            },
+            components,
+        });
+
+        if (assessment.consistent) {
+            continue;
+        }
+
+        // Reported at the first component line of the offending food, so an
+        // operator opens `components.jsonl` at the composition; a parent with no
+        // composition at all has no line there, and is reported at its own line
+        // in `foods.jsonl` instead — the only place that food appears.
+        return {
+            sourceKey,
+            file: lines.length === 0 ? FOODS_FILE : COMPONENTS_FILE,
+            line: lines.length === 0 ? parent.line : lines[0].line,
+            codes: componentGapCodes(assessment).join(', '),
+            detail: describeComponentGaps(assessment),
+        };
+    }
+
+    return null;
+};
+
 /** What the verification pass establishes before anything is written. */
 interface ReleaseVerification {
     readonly members: readonly MemberVerification[];
@@ -1623,6 +2397,75 @@ const verifyRelease = async (deps: LoadDeps): Promise<ReleaseVerification> => {
     const identities = new Map<string, MemberIdentity>();
     const foodOrder = new Map<string, number>();
     let publishedLines = 0;
+    /**
+     * Each PUBLISHED food's `identity_source`, kept from `foods.jsonl` so the
+     * validation records streamed afterwards can be assessed under the
+     * vocabulary their row uses — a USDA record must also name the
+     * `usda_api_cache` key and the per-food digest that make one batch response
+     * evidence for this food rather than for the twenty it carried.
+     *
+     * Keyed by `source_key`, which this pass already indexes in `foodOrder`, so
+     * it adds one short string per published row (~11k for the committed
+     * release) to a pass that is already holding that many keys.
+     *
+     * `foods.jsonl` is verified FIRST (it heads `RELEASE_MEMBERS`), so the map
+     * is complete before `validation-records.jsonl` is read — the order is not
+     * incidental and the refusal below depends on it.
+     */
+    const publishedIdentitySource = new Map<string, string>();
+    /**
+     * Each PUBLISHED food's own nutrition facts, kept from `foods.jsonl` so a
+     * derived parent can be recomputed from the components streamed afterwards
+     * and so each of those components can be read as per-100 g values (see the
+     * section above for why the loader recomputes at all, and what it costs).
+     *
+     * Insertion order is `foods.jsonl` order, which is what makes the offender
+     * a given release reports deterministic.
+     */
+    const publishedNutritionFacts = new Map<string, ReleaseNutritionFacts>();
+    /**
+     * Which published foods claim `ingredient_derived`, resolved while
+     * `foods.jsonl` streams.
+     *
+     * IT NO LONGER DECIDES WHAT IS RETAINED, and that change is the whole of
+     * the loader's half of the bypass. `components.jsonl` used to keep the
+     * lines of these parents and nothing else, so a release that relabelled a
+     * component-bearing row `source_backed` had its composition DISCARDED
+     * before the cross-check ran — and the check, however it was written, could
+     * not see a row whose lines had been thrown away. Every published parent's
+     * lines are retained now (see the retention callback), and the claim is
+     * kept only for the one thing it can still answer honestly: a parent that
+     * claims a derivation and carries no lines at all is assessed too, which is
+     * what reports `components_absent`.
+     *
+     * What it costs: `components.jsonl` is the smallest member of a release by
+     * design — 0 rows in the committed v1, 4 in the suite's fixture slice — and
+     * the exporter emits a component line only for a published food, so the
+     * bound is the member itself rather than anything derived from the catalog.
+     */
+    const publishedDerivedParents = new Set<string>();
+    const componentsByParent = new Map<string, ReleaseComponentLine[]>();
+    const evidence = new EvidenceMeasurementTally();
+    /**
+     * The first published record whose identity evidence is incomplete, held as
+     * a one-entry list because it is filled inside the stream callback and read
+     * back out here — a narrowed `let` is not something TypeScript's
+     * control-flow analysis follows across that boundary.
+     */
+    const firstEvidenceGap: {
+        readonly sourceKey: string;
+        readonly line: number;
+        readonly codes: string;
+        readonly detail: string;
+    }[] = [];
+    /**
+     * The first published derived food whose scalars and composition
+     * contradict each other, held as a one-entry list for the same reason as
+     * `firstEvidenceGap`: it is filled after `components.jsonl` has been
+     * measured and read back out below, and a narrowed `let` is not something
+     * TypeScript's control-flow analysis follows across that boundary.
+     */
+    const firstComponentGap: ComponentInconsistency[] = [];
 
     for (const member of RELEASE_MEMBERS) {
         const entry = declared.get(member.file);
@@ -1639,9 +2482,9 @@ const verifyRelease = async (deps: LoadDeps): Promise<ReleaseVerification> => {
         }
 
         const absolutePath = path.join(deps.releaseRoot, member.file);
-        const measured =
+        const onRow =
             member.file === FOODS_FILE
-                ? await streamMember(absolutePath, member.file, (row, line) => {
+                ? (row: ReleaseRow, line: number): void => {
                       const sourceKey = readText(row, 'source_key', FOODS_FILE, line);
                       if (foodOrder.has(sourceKey)) {
                           throw new CatalogLoadError(
@@ -1653,9 +2496,145 @@ const verifyRelease = async (deps: LoadDeps): Promise<ReleaseVerification> => {
                       foodOrder.set(sourceKey, foodOrder.size);
                       if (readText(row, 'publication_status', FOODS_FILE, line) === PUBLISHED) {
                           publishedLines += 1;
+                          const identitySource = readText(row, 'identity_source', FOODS_FILE, line);
+                          publishedIdentitySource.set(sourceKey, identitySource);
+                          evidence.addPublishedFood(identitySource);
+
+                          // Read through the same `read*` helpers the apply
+                          // pass parses these fields with, so a line the
+                          // cross-check accepts is a line the writer can
+                          // apply — a field this pass coerced differently
+                          // would make the two disagree about the numbers.
+                          const provenance = readText(row, 'nutrition_provenance', FOODS_FILE, line);
+                          publishedNutritionFacts.set(sourceKey, {
+                              nutrition_provenance: provenance,
+                              nutrition_version: readInteger(row, 'nutrition_version', FOODS_FILE, line),
+                              nutrition_basis: readText(row, 'nutrition_basis', FOODS_FILE, line),
+                              basis_amount: readNumber(row, 'basis_amount', FOODS_FILE, line),
+                              calories: readNullableNumber(row, 'calories', FOODS_FILE, line),
+                              protein_g: readNullableNumber(row, 'protein_g', FOODS_FILE, line),
+                              carbs_g: readNullableNumber(row, 'carbs_g', FOODS_FILE, line),
+                              fat_g: readNullableNumber(row, 'fat_g', FOODS_FILE, line),
+                              fiber_g: readNullableNumber(row, 'fiber_g', FOODS_FILE, line),
+                              density_g_per_ml: readNullableNumber(row, 'density_g_per_ml', FOODS_FILE, line),
+                              line,
+                          });
+                          if (provenance === INGREDIENT_DERIVED) {
+                              publishedDerivedParents.add(sourceKey);
+                          }
                       }
-                  })
-                : await streamMember(absolutePath, member.file);
+                  }
+                : member.file === COMPONENTS_FILE
+                  ? (row: ReleaseRow, line: number): void => {
+                        // RETAINED FOR EVERY PUBLISHED PARENT, WHATEVER IT
+                        // CLAIMS. `foods.jsonl` is verified first, so the
+                        // published set is already settled here, and retention
+                        // keys on membership in it alone.
+                        //
+                        // It used to key on the parent's claimed provenance —
+                        // `ingredient_derived` or nothing — which discarded the
+                        // composition of exactly the row the cross-check needs
+                        // to see: a release that relabelled a component-bearing
+                        // parent `source_backed` arrived at the assessment with
+                        // an empty composition and was passed over as a food
+                        // with nothing in play. The claim cannot be allowed to
+                        // decide whether the bytes that contradict it are even
+                        // read (the same rule, for the same reason, as
+                        // catalog-validate.ts's componentDerivationFor).
+                        //
+                        // A line whose parent the release does not publish is
+                        // still dropped: `release_child_without_food` reports a
+                        // child with no food of its own, and a non-published
+                        // parent is not a row this release asks anyone to
+                        // publish.
+                        const parentKey = readText(row, 'food_source_key', COMPONENTS_FILE, line);
+                        if (!publishedNutritionFacts.has(parentKey)) {
+                            return;
+                        }
+                        const retained = componentsByParent.get(parentKey);
+                        const component: ReleaseComponentLine = {
+                            componentSourceKey: readText(row, 'component_food_source_key', COMPONENTS_FILE, line),
+                            quantityGrams: readNumber(row, 'quantity_grams', COMPONENTS_FILE, line),
+                            yieldFactor: readNumber(row, 'yield_factor', COMPONENTS_FILE, line),
+                            pinnedNutritionVersion: readInteger(
+                                row,
+                                'component_nutrition_version',
+                                COMPONENTS_FILE,
+                                line,
+                            ),
+                            sortOrder: readInteger(row, 'sort_order', COMPONENTS_FILE, line),
+                            line,
+                        };
+                        if (retained === undefined) {
+                            componentsByParent.set(parentKey, [component]);
+                        } else {
+                            retained.push(component);
+                        }
+                    }
+                  : member.file === VALIDATION_RECORDS_FILE
+                  ? (row: ReleaseRow, line: number): void => {
+                        // THE EVIDENCE FLOOR, BEFORE A SINGLE ROW IS WRITTEN.
+                        //
+                        // A published food's record has to BE evidence: an
+                        // observed 2xx status, the host and URL the bytes came
+                        // from, the digest of those bytes, the snippet that
+                        // names this food, when it was fetched, and for a USDA
+                        // row the cache key and per-food digest. AAP §0.3.2
+                        // makes those the fields of a retrieval record and
+                        // §0.7.3 makes their absence a quarantine-tier hold, so
+                        // a record short of them describes a row the import
+                        // stage would not have published — and loading it here
+                        // would publish it in this database anyway, on evidence
+                        // nobody can re-fetch.
+                        //
+                        // Raised from the verification pass rather than from the
+                        // apply pass on purpose: this pass writes nothing, so
+                        // the refusal costs no row write, no retirement and no
+                        // run row, and the previous release stays active
+                        // untouched.
+                        const foodSourceKey = readText(row, 'food_source_key', VALIDATION_RECORDS_FILE, line);
+                        const identitySource = publishedIdentitySource.get(foodSourceKey);
+                        if (identitySource === undefined) {
+                            // A record whose food this release does not publish
+                            // is not gated here. A release exports the published
+                            // set and nothing else, so this is already a
+                            // contradiction — and it is the one
+                            // `release_published_count_mismatch` and
+                            // `release_child_without_food` report, each naming
+                            // the defect it actually is rather than reporting it
+                            // as an evidence gap.
+                            return;
+                        }
+
+                        const assessment = assessIdentityEvidence(row.identity_evidence, { identitySource });
+                        evidence.addAssessedRecord(identitySource, assessment);
+                        if (assessment.complete || firstEvidenceGap.length > 0) {
+                            return;
+                        }
+                        // RECORDED HERE, REFUSED AFTER THE DIGEST.
+                        //
+                        // Thrown from inside the stream, this would pre-empt the
+                        // member's own digest comparison — and an edited member
+                        // is a different fact from an unevidenced one: "these
+                        // are not the bytes that were reviewed" is what an
+                        // operator has to act on first, and the remedy for it
+                        // (restore the release) is not the remedy for this
+                        // (re-retrieve the evidence and cut a new one). So the
+                        // first offender is kept and the refusal is raised below,
+                        // after the digest, the size and the row count agree.
+                        // Only the FIRST is kept: the whole member is streamed
+                        // once either way, and a refusal that accumulated 9,422
+                        // offenders would allocate a copy of the release to
+                        // describe it.
+                        firstEvidenceGap.push({
+                            sourceKey: foodSourceKey,
+                            line,
+                            codes: evidenceGapCodes(assessment).join(', '),
+                            detail: describeEvidenceGaps(assessment),
+                        });
+                    }
+                  : undefined;
+        const measured = await streamMember(absolutePath, member.file, onRow);
 
         compareMeasurement(member.file, 'digest', 'release_file_digest_mismatch', entry.sha256, measured.sha256);
         compareMeasurement(member.file, 'size', 'release_file_size_mismatch', entry.bytes, measured.bytes);
@@ -1666,6 +2645,117 @@ const verifyRelease = async (deps: LoadDeps): Promise<ReleaseVerification> => {
             entry.row_count,
             measured.rowCount,
         );
+
+        // The evidence floor's refusal, raised once this member is known to be
+        // the reviewed one: the bytes match the manifest exactly, and it is the
+        // REVIEWED release that carries a published row nobody can evidence.
+        if (firstEvidenceGap.length > 0) {
+            const gap = firstEvidenceGap[0];
+            throw new CatalogLoadError(
+                'release_evidence_incomplete',
+                `${VALIDATION_RECORDS_FILE} line ${gap.line} carries the record for published food ` +
+                    `"${gap.sourceKey}", whose identity evidence is incomplete (${gap.codes}): ${gap.detail}. ` +
+                    'Loading it would publish a row the import stage refuses to publish, on evidence nobody can ' +
+                    're-fetch. Nothing has been written and the active release pointer has not moved. A retrieval ' +
+                    'record is observed, never reconstructed: re-run "npm run catalog:import" (a USDA row) or ' +
+                    '"npm run catalog:generate" (a generated one), then "npm run catalog:validate", and load a ' +
+                    'release cut from the result.',
+                {
+                    file: VALIDATION_RECORDS_FILE,
+                    line: gap.line,
+                    sourceKey: gap.sourceKey,
+                    expected: 'complete identity evidence',
+                    observed: gap.codes,
+                },
+            );
+        }
+
+        // THE COMPOSITION CROSS-CHECK, run once `components.jsonl` is known to
+        // be the reviewed member and skipped entirely for a release that
+        // publishes no derived food.
+        //
+        // It cannot be a per-line check the way the evidence floor is: a
+        // parent's recomputation needs ALL of its component rows, so the
+        // earliest it can be answered is when the member has finished
+        // streaming. Ordered after that member's digest, size and row count for
+        // exactly the reason wave 1 states for the evidence floor — "these are
+        // not the bytes that were reviewed" is a different fact from "the
+        // reviewed release contradicts itself", and it is the one an operator
+        // has to act on first, because restoring the artefact is not the same
+        // remedy as re-deriving a food.
+        //
+        // RUN WHENEVER EITHER HALF OF THE QUESTION EXISTS: a published parent
+        // that CLAIMS a derivation, or a published parent that CARRIES a
+        // composition. Gated on the claim alone, a release whose only
+        // composition sits on a relabelled row would skip the pass entirely —
+        // which is the second half of the same bypass the retention callback
+        // above describes. A release with neither (the committed v1, whose
+        // `components.jsonl` has no rows and which publishes no derived food)
+        // still runs nothing at all.
+        if (
+            member.file === COMPONENTS_FILE &&
+            (publishedDerivedParents.size > 0 || componentsByParent.size > 0)
+        ) {
+            // CLOSURE FIRST, because it is the more specific cause and because
+            // the recomputation cannot be made at all without it — the same
+            // order `catalog-release.ts` refuses in, where the closure rule is
+            // checked ahead of the emptiness rule for exactly this reason. A
+            // parent whose component the release does not publish would
+            // otherwise be passed over unchecked and then resolved against
+            // whatever this database holds under that key.
+            const outside = firstComponentReferenceOutsideRelease(publishedNutritionFacts, componentsByParent);
+            if (outside !== null) {
+                throw new CatalogLoadError(
+                    'release_components_not_closed',
+                    `${COMPONENTS_FILE} line ${outside.line} states that published food "${outside.sourceKey}" is ` +
+                        `derived from "${outside.componentSourceKey}", which ${FOODS_FILE} does not publish, so the ` +
+                        'release is not closed over its own component references. Nothing in these bytes states ' +
+                        "that component's nutrition or its nutrition_version, so the parent's stored totals and " +
+                        'version pins cannot be checked against the composition they came from, and loading it ' +
+                        'would resolve the reference against whatever food this database happens to hold under ' +
+                        'that key — giving the same reviewed release a different meaning in every environment. ' +
+                        'Nothing has been written and the active release pointer has not moved. Publish the ' +
+                        'component food, or remove the composition, and cut the release again with ' +
+                        '"npm run catalog:release"; the exporter refuses to produce a release with this reference ' +
+                        'in it.',
+                    {
+                        file: COMPONENTS_FILE,
+                        line: outside.line,
+                        sourceKey: outside.sourceKey,
+                        componentSourceKey: outside.componentSourceKey,
+                        expected: `a component ${FOODS_FILE} publishes`,
+                        observed: outside.componentSourceKey,
+                    },
+                );
+            }
+
+            const inconsistency = firstComponentInconsistency(publishedNutritionFacts, componentsByParent);
+            if (inconsistency !== null) {
+                firstComponentGap.push(inconsistency);
+            }
+        }
+
+        if (firstComponentGap.length > 0) {
+            const gap = firstComponentGap[0];
+            throw new CatalogLoadError(
+                'release_component_inconsistent',
+                `${gap.file} line ${gap.line} belongs to published ingredient-derived food "${gap.sourceKey}", ` +
+                    `whose stored nutrition is not what its own composition derives to (${gap.codes}): ${gap.detail}. ` +
+                    'Loading it would publish, in this database, nutrient values nothing in the release derives, and ' +
+                    'every recipe built on them would snapshot those values with a version counter saying they are ' +
+                    'current. Nothing has been written and the active release pointer has not moved. Re-derive the ' +
+                    'food from its components with "npm run catalog:validate" — or correct the composition — and cut ' +
+                    'a new release with "npm run catalog:release"; editing foods.jsonl is not the repair, because a ' +
+                    "parent's nutrition moving has to move its nutrition_version.",
+                {
+                    file: gap.file,
+                    line: gap.line,
+                    sourceKey: gap.sourceKey,
+                    expected: 'parent nutrition equal to the recomputation from components.jsonl',
+                    observed: gap.codes,
+                },
+            );
+        }
 
         // Taken AFTER the digest, and required to agree with the bytes just
         // hashed: a size that already disagrees means the file moved under the
@@ -1706,6 +2796,43 @@ const verifyRelease = async (deps: LoadDeps): Promise<ReleaseVerification> => {
             { file: FOODS_FILE, expected: expectedPublished, observed: publishedLines },
         );
     }
+
+    // THE EVIDENCE VERDICT, AND THE MANIFEST'S CLAIM ABOUT IT.
+    //
+    // Every published food's record has now been assessed by the stream above,
+    // and any gap has already refused the load. What is left is the manifest's
+    // own `evidence` block, when it carries one: it is the statement a reviewer
+    // read in place of streaming the records, so it has to be a measurement of
+    // these members and not of some other set. An absent block is accepted —
+    // the row-level floor is authoritative and complete without it — and the
+    // reasoning is written out at `crossCheckEvidenceSummary`.
+    const measuredEvidence = evidence.measure();
+    crossCheckEvidenceSummary(
+        deps.release,
+        (manifest as unknown as Record<string, unknown>).evidence,
+        measuredEvidence,
+    );
+    logger.info('release_evidence_verified', {
+        stage: STAGE,
+        release: deps.release,
+        publishedFoods: measuredEvidence.published_foods,
+        assessedRecords: measuredEvidence.assessed_records,
+        completeRecords: measuredEvidence.complete_records,
+        observedStatusMin: measuredEvidence.observed_status_min,
+        observedStatusMax: measuredEvidence.observed_status_max,
+        identitySources: measuredEvidence.identity_sources
+            .map((source) => `${source.identity_source}=${source.published_foods}`)
+            .join(', '),
+        manifestEvidenceDeclared:
+            (manifest as unknown as Record<string, unknown>).evidence !== undefined,
+        // Published rows whose digests are bound to a cached vendor response,
+        // and whether this release ATTESTS that the export resolved them. The
+        // loader cannot resolve them itself (see `crossCheckEvidenceSummary`),
+        // so an operator reading this line can tell which of the two kinds of
+        // release they just applied.
+        cacheBindingRequired: measuredEvidence.cache_binding_required,
+        manifestCacheResolutionAttested: declaredCacheResolution(manifest) !== undefined,
+    });
 
     const foods = members.find((member) => member.file === FOODS_FILE);
 
@@ -2951,13 +4078,20 @@ const applyFood = async (
     const desired: FoodColumns = { ...prepared.scalars, generation_batch_id: batchId };
 
     // Local resolution is tried FIRST, and release membership only decides what
-    // an unresolved reference means. A release can legitimately carry a
-    // composition pointing at a food it does not itself export — the exporter
-    // emits a component row whatever the component food's own publication
-    // status — and such a reference is perfectly loadable into a database that
-    // already holds that food. Only a reference that resolves to nothing local
-    // AND to nothing in the release can never resolve, and that is the hard
-    // refusal.
+    // an unresolved reference means: a component the release carries but has not
+    // loaded yet defers this food, while one that resolves to nothing local AND
+    // to nothing in the release can never resolve and is the hard refusal.
+    //
+    // WHAT LOCAL RESOLUTION IS NOT, since it used to be described as a feature.
+    // It is not a licence for a release to point outside itself. A published
+    // food's composition naming a component `foods.jsonl` does not publish is
+    // refused by verification before anything reaches here
+    // (`release_components_not_closed`), because resolving such a key against a
+    // food only this database holds would write a pinned version and a parent's
+    // totals that nothing ever compared — the release would mean something
+    // different in every environment. What local resolution does is make the
+    // ORDER of a closed release irrelevant: the component may already be
+    // stored from an earlier load, or may be loaded later in this one.
     const resolvedComponentIds = new Map<string, string>();
     const unresolved: ComponentSpec[] = [];
     for (const component of prepared.components) {
@@ -3271,7 +4405,7 @@ const applyDeferredFoods = async (
  * and "these are the published foods" is part of it.
  *
  * The diff is computed in memory from the local published keys rather than
- * pushed into the database as an 11,046-element `notIn`, and no statement is
+ * pushed into the database as a 9,422-element `notIn`, and no statement is
  * issued at all when nothing is absent — which is what keeps a rerun free of
  * writes beyond the run row.
  */
@@ -3903,27 +5037,35 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
 // than swallowed or printed raw.
-export const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
+// The reported `error` is `SafeErrorFields` — a scrubbed name plus an optional
+// machine code and status, and deliberately no `message`: this value reaches the
+// durable run log and the operator console, where foreign prose can carry a
+// connection URL, a key or a fragment of the document that failed (CWE-532).
+export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
     // This stage's own refusals first: they are the codes an operator acts on —
     // a digest mismatch means the artefact is not the reviewed one, a count
     // mismatch means the load did not produce what the release promised and the
     // pointer has not moved.
-    if (error instanceof CatalogLoadError) {
+    if (isThrownInstanceOf(error, CatalogLoadError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof DatabaseOriginError) {
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ManifestError) {
+    if (isThrownInstanceOf(error, ManifestError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ModelBudgetError) {
+    if (isThrownInstanceOf(error, ModelBudgetError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof CheckpointError) {
-        return { code: error.code, error: safeError(error) };
+    // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
+    // refusal names the stage holding the catalog graph and the mode it asked
+    // for, and those are what an operator acts on — see checkpointErrorFields
+    // for why they travel as data rather than inside the rendered sentence.
+    if (isThrownInstanceOf(error, CheckpointError)) {
+        return { code: error.code, error: safeError(error), detail: checkpointErrorFields(error) };
     }
-    if (error instanceof RateLimitConfigError) {
+    if (isThrownInstanceOf(error, RateLimitConfigError)) {
         return { code: 'rate_limit_misconfigured', error: safeError(error) };
     }
     return { code: 'unexpected_error', error: safeError(error) };
@@ -3950,10 +5092,7 @@ const main = async (): Promise<number> => {
     const origin = classifyDatabaseOrigin(process.env.DATABASE_URL);
     logger.info('database_origin_accepted', {
         stage: STAGE,
-        originClass: origin.originClass,
-        host: origin.host,
-        database: origin.database,
-        reason: origin.reason,
+        ...originLogFields(origin),
     });
     logger.info('stage_invoked', { stage: STAGE, release: parsed.options.release, dryRun: parsed.options.dryRun });
 
@@ -4026,6 +5165,13 @@ if (require.main === module) {
                 stage: STAGE,
                 code: failure.code,
                 error: failure.error,
+                // Spread, not nested: these are typed facts about the failure
+                // (a run id, the stage holding the catalog graph, the mode it
+                // asked for), and they read as fields of the failure rather
+                // than as one opaque member. Absent for every failure that is
+                // not a stage-lock refusal, which is the only branch that
+                // supplies them.
+                ...failure.detail,
             });
             process.exit(1);
         });

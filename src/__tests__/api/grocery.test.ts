@@ -56,6 +56,8 @@
 // `FIXTURE_ENDED_PLAN_START_DAY_KEY` for a plan whose week has passed, and a
 // `superseded` status with a successor for a plan that was replaced.
 
+import { randomUUID } from 'node:crypto';
+
 import { Prisma, catalog_foods } from '../../generated/prisma';
 import { prisma } from '../../prisma/client';
 import { loadPlannedMealsForGroceries, rebuildPlanGroceries } from '../../services/grocery.service';
@@ -797,6 +799,34 @@ describe('GET the grocery list', () => {
         });
 
         /**
+         * A COMPLETED swap in the keyed-write ledger, written directly.
+         *
+         * §0.5.1 completes a reserved row by filling `response_status`,
+         * `response_snapshot` AND `plan_revision_after` in one statement, so all
+         * three are set here: a row carrying only some of them is the ledger's
+         * `corrupt` state, which the case below is about, and a fixture that
+         * wrote one would be asserting the banner off a row no completion could
+         * have produced.
+         */
+        const completedSwapAction = (
+            slot: 'breakfast' | 'lunch' | 'dinner' | 'snack',
+            overrides: Partial<Prisma.meal_plan_actionsUncheckedCreateInput> = {},
+        ): Prisma.meal_plan_actionsUncheckedCreateInput => ({
+            user_id: USER_ID,
+            idempotency_key: randomUUID(),
+            action_type: 'swap',
+            request_fingerprint: `grocery-suite-swap-${slot}`,
+            meal_plan_id: fixture.planId,
+            response_status: 200,
+            response_snapshot: {
+                meal: { slot },
+                groceryChangeSummary: { added: 1, removed: 0, increased: 1 },
+            },
+            plan_revision_after: 2,
+            ...overrides,
+        });
+
+        /**
          * The swap notice is read from the keyed-write ledger, because the
          * grocery rows record amounts and not causes. The ledger row is written
          * here rather than by driving a real swap: what this case claims is that
@@ -808,20 +838,7 @@ describe('GET the grocery list', () => {
                 where: { meal_plan_id: fixture.planId },
                 data: { flagged_at: null },
             });
-            await prisma.meal_plan_actions.create({
-                data: {
-                    user_id: USER_ID,
-                    idempotency_key: '44444444-4444-4444-8444-444444444444',
-                    action_type: 'swap',
-                    request_fingerprint: 'grocery-suite-swap',
-                    meal_plan_id: fixture.planId,
-                    response_status: 200,
-                    response_snapshot: {
-                        meal: { slot: 'lunch' },
-                        groceryChangeSummary: { added: 1, removed: 0, increased: 1 },
-                    },
-                },
-            });
+            await prisma.meal_plan_actions.create({ data: completedSwapAction('lunch') });
 
             expect((await readList(fixture.planId)).banner).toEqual({
                 code: 'updated_after_swap',
@@ -829,21 +846,73 @@ describe('GET the grocery list', () => {
             });
         });
 
-        it('lets a flag outrank a swap notice', async () => {
+        /**
+         * A row with a status but no revision and no body is the `corrupt` state
+         * `mealPlanningAction.logic.ts::classifyActionCompletion` names — never
+         * produced by a completion, and never replayable. It must not pass for
+         * the last completed swap here either: predicating on `response_status`
+         * alone would let this NEWER row win `created_at desc`, carry no
+         * readable snapshot, and silently suppress the notice the older
+         * genuinely completed swap earned. The shopper would then be told
+         * nothing at all about a list that really had moved.
+         */
+        it('walks past a half-completed newer action to the last swap that actually completed', async () => {
+            await prisma.grocery_items.updateMany({
+                where: { meal_plan_id: fixture.planId },
+                data: { flagged_at: null },
+            });
+
+            const older = new Date(Date.now() - 10 * 60 * 1000);
+
+            await prisma.meal_plan_actions.create({
+                data: completedSwapAction('dinner', { created_at: older }),
+            });
+            // Status set, the other two completion columns absent — and newer,
+            // so it is the row the ordering reaches first.
             await prisma.meal_plan_actions.create({
                 data: {
                     user_id: USER_ID,
-                    idempotency_key: '55555555-5555-4555-8555-555555555555',
+                    idempotency_key: randomUUID(),
                     action_type: 'swap',
-                    request_fingerprint: 'grocery-suite-swap-outranked',
+                    request_fingerprint: 'grocery-suite-swap-half-completed',
                     meal_plan_id: fixture.planId,
                     response_status: 200,
-                    response_snapshot: {
-                        meal: { slot: 'dinner' },
-                        groceryChangeSummary: { added: 0, removed: 0, increased: 1 },
-                    },
+                    plan_revision_after: null,
                 },
             });
+
+            expect((await readList(fixture.planId)).banner).toEqual({
+                code: 'updated_after_swap',
+                mealSlot: 'dinner',
+            });
+        });
+
+        /**
+         * The pending half of the same rule: a swap still inside its own
+         * transaction has changed nothing yet, so a reserved row with none of
+         * the three completion columns announces nothing — and, being the newest
+         * row, must not hide the completed swap behind it either.
+         */
+        it('announces nothing from a reserved row that has not completed', async () => {
+            await prisma.grocery_items.updateMany({
+                where: { meal_plan_id: fixture.planId },
+                data: { flagged_at: null },
+            });
+            await prisma.meal_plan_actions.create({
+                data: {
+                    user_id: USER_ID,
+                    idempotency_key: randomUUID(),
+                    action_type: 'swap',
+                    request_fingerprint: 'grocery-suite-swap-reserved',
+                    meal_plan_id: fixture.planId,
+                },
+            });
+
+            expect((await readList(fixture.planId)).banner).toBeNull();
+        });
+
+        it('lets a flag outrank a swap notice', async () => {
+            await prisma.meal_plan_actions.create({ data: completedSwapAction('dinner') });
 
             // Once an amount has gone up on something already checked, that is
             // the thing the shopper needs to know.
@@ -1350,13 +1419,18 @@ describe('PUT one check mark', () => {
 
 describe('POST uncheck-all', () => {
     /**
-     * The one live registration-order hazard in the router: `/groceries/
-     * uncheck-all` is a LITERAL path sitting beside `/groceries/:itemId`, and a
-     * parameterized route declared first would swallow it with
-     * `itemId = "uncheck-all"` (Rule §3.1, with `foodRoutes` before
-     * `nutritionRoutes` as the shipped precedent). The methods differ, which
-     * helps, but the order is what is actually load-bearing, so it is asserted
-     * rather than assumed.
+     * The literal `/groceries/uncheck-all` sits beside the parameterized
+     * `/groceries/:itemId` in `mealPlanning.routes.ts`, and what is asserted
+     * here is that it reaches `uncheckAllGroceriesController`. Rule §3.1 —
+     * declare a literal before a parameterized sibling that COULD swallow it,
+     * as `foodRoutes` mounts before `nutritionRoutes` — holds here twice over:
+     * the literal is declared first, and the two declarations carry different
+     * methods (`POST` and `PUT`) in any case, which Express matches on as well
+     * as the path, so neither could capture the other whichever order they were
+     * declared in. The claim worth asserting is therefore the wiring and its
+     * contract: the answer is the uncheck-all body rather than the toggle's
+     * `{item, checkedCount}`, and no row was addressed as though the literal
+     * segment were an item id.
      */
     it('reaches its own handler rather than the single-item route', async () => {
         const response = await postUncheckAll(fixture.planId).expect(200);

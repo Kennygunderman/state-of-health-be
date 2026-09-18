@@ -16,12 +16,20 @@ assertTestDatabase();
 // observe the rate limiter wrapping it, and a deny installed here would be
 // either overwritten by them or in their way.
 //
-// It does not extend to a CHILD process, and two script suites launch real CLI
-// entry points as children that must carry keys to get past their own
-// `preflight`. Those children install `./vendorNetworkDeny` through `--require`
-// instead, which refuses every request channel and records that it did. The
-// split is deliberate: absent keys where nothing needs them, an enforced
-// refusal where something does.
+// It does not extend to a CHILD process. `scripts/catalog-import.test.ts` is
+// the one suite that launches a VENDOR-CONSUMING CLI entry point as a child:
+// its stage-lock cases run `catalog-import-usda.ts`, which reports a missing
+// `USDA_API_KEY` from its `preflight` and would never reach the lock behaviour
+// under test, so those children carry placeholder keys and install
+// `./vendorNetworkDeny` through `--require`, which refuses every request
+// channel and records that it did. The other suites that spawn children need no
+// key, because nothing they run reads one: `api/compat.test.ts` spawns `prisma`
+// and `pg_dump` for the migration-ledger equivalence check,
+// `scripts/recipes-seed.test.ts` spawns a Node child over `recipes-seed.ts` for
+// the zombie-lock case, and `setup/testDb.test.ts` spawns one to prove the
+// database guard aborts before Prisma is imported. The split is deliberate:
+// absent keys where nothing needs them, an enforced refusal where something
+// does.
 delete process.env.USDA_API_KEY;
 delete process.env.OPENROUTER_API_KEY;
 

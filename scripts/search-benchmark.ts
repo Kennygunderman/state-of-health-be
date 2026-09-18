@@ -72,21 +72,27 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import {
-    CATALOG_STAGE_LOCK_MODES,
-    CheckpointError,
-    getActiveReleaseLoad,
-    withCatalogStageLock,
-} from './lib/checkpoint';
+import { boundedModelText } from './lib/catalogFoodFacts';
+import { CATALOG_STAGE_LOCK_MODES, CheckpointError, checkpointErrorFields, getActiveReleaseLoad, withCatalogStageLock } from './lib/checkpoint';
 import type { CatalogStageLockMode, CatalogStageName } from './lib/checkpoint';
-import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
-import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
-import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
+import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
+import {
+    createFatalLogger,
+    createLogger,
+    formatSafeError,
+    isThrownInstanceOf,
+    opaqueDigest,
+    safeError,
+    writeLineSync,
+} from './lib/logger';
+import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import {
     EXPECTED_SEARCH_BENCHMARK_VERSION,
     ManifestError,
+    assertSafeArtifactParent,
     loadReleaseManifest,
     loadSearchBenchmark,
+    physicalPathIdentity,
     releaseFilePath,
     reportPath,
     writeJsonFile,
@@ -97,6 +103,17 @@ import type {
     SearchBenchmark,
     SearchBenchmarkQuery,
 } from './lib/manifest';
+
+// The `q` RULE, not a copy of it. `assertSearchBenchmarkShape` has to answer
+// "would the search layer accept this query", and the only honest way to answer
+// it is to ask the parser that decides for `GET /catalog/foods`: a benchmark
+// query the service would refuse cannot be measured, and a second length or
+// control-character rule written here would be free to drift from the one the
+// requests are held to (Rule backend-architecture §1.2/§7 — one authority per
+// rule). Pure and inert on import: `catalog.logic.ts` reaches only `src/types`
+// and `src/utils`, so nothing here constructs a Prisma client or reads the
+// environment ahead of dbGuard.
+import { MAX_SEARCH_QUERY_LENGTH, MIN_SEARCH_QUERY_LENGTH, parseCatalogSearchQuery } from '../src/services/catalog.logic';
 
 const STAGE = 'search-benchmark';
 
@@ -231,12 +248,30 @@ export type BenchmarkInputCode =
     | 'release_counts_disagree'
     | 'corpus_moved_during_run'
     | 'diagnostic_run_to_acceptance_path'
+    // The artefact's own name is not a name this run may publish to: an entry
+    // is already there and it is a symbolic link, a directory, or something
+    // whose kind could not be read. Distinct from the two codes below and from
+    // the acceptance-path refusal, because the remedy is to correct `--out`.
+    | 'output_path_name_unsafe'
+    // The write target stopped being the place this run verified: the resolved
+    // output directory was replaced, moved or made unreadable, or a symbolic
+    // link appeared at the artefact's name, at some point during the
+    // measurement. Deliberately separate from
+    // `diagnostic_run_to_acceptance_path` so an operator can tell "you aimed at
+    // the acceptance artefact" apart from "something moved underneath you".
+    | 'output_path_identity_changed'
     | 'compare_report_unreadable'
     | 'compare_report_mismatched_contract'
     | 'compare_report_same_database'
     | 'compare_report_identity_unverifiable'
     | 'compare_report_not_protocol_eligible'
-    | 'protocol_unusable';
+    | 'protocol_unusable'
+    // The committed query set does not honour the shape this stage measures
+    // against. Distinct from `protocol_unusable`, which is a query set this
+    // stage understands and cannot measure anything with (no queries, no
+    // latency limit): this one is a document whose fields are not what the
+    // declared type says they are, so nothing about it can be trusted yet.
+    | 'query_set_invalid';
 
 /**
  * An input the run cannot honestly measure against. Separate from a threshold
@@ -501,9 +536,197 @@ const writeUsage = (level: LogLevel): void => {
  * Where the report is written. `null` takes manifest.ts's validated artefact
  * path; an operator value is resolved against the backend package root so the
  * command is working-directory independent.
+ *
+ * This is the path as SPELLED, and a spelling is not an identity: `path.resolve`
+ * collapses `..` and leaves every symlink on the path alone, so two spellings of
+ * one file compare as two files. Nothing may decide "is this the acceptance
+ * artefact?" from this answer — that question is settled against
+ * `physicalPathIdentity` inside `runBenchmark`, which is also where the path the
+ * bytes go to is fixed, where the directory it names is verified and
+ * remembered, and where both are checked again immediately before the write
+ * (see the write-target section below).
  */
 export const resolveOutPath = (out: string | null): string =>
     out === null ? reportPath(DEFAULT_REPORT_FILE) : path.resolve(__dirname, '..', out);
+
+/**
+ * How an output path is NAMED in a log line: package-relative inside this
+ * package, its file name alone outside it, and never absolute.
+ *
+ * WHY THE LOGGED VALUE DIFFERS FROM THE WRITTEN ONE. `resolveOutPath` returns
+ * an absolute path because that is what `writeJsonFile` needs, and an absolute
+ * path in a structured log line discloses where this checkout lives — the same
+ * class of leak the peer-report refusal was carrying (CWE-532), and it reaches
+ * the same CI logs. The operator loses nothing: `data/meal-planning/reports/…`
+ * is how they refer to the artefact anyway, and it is how the report itself
+ * records its own peers.
+ *
+ * `peerReportLabel` is reused rather than reimplemented. Its name says "peer"
+ * because a peer report was its first caller, but its rule — relative inside
+ * the package, basename outside — is exactly the rule wanted here, and sharing
+ * it means the artefact and the log cannot start naming the same file
+ * differently.
+ */
+const outPathLabel = (absolutePath: string): string =>
+    peerReportLabel(absolutePath, path.resolve(__dirname, '..')).label;
+
+// ---------------------------------------------------------------------------
+// THE WRITE TARGET'S IDENTITY, AND THE WINDOW THIS STAGE CANNOT HOLD A
+// DESCRIPTOR ACROSS.
+//
+// Resolving `--out` to one physical path closes the alias an operator (or an
+// attacker) spelled, but it does not close the MINUTES between that resolution
+// and the write: a benchmark run resolves its output path, then takes a warm-up
+// pass, three timed passes, a pagination check and a corpus re-verification,
+// and only then publishes. A resolved path stops traversing a symbolic link
+// only for as long as the directory it names is still the directory that was
+// checked, so a principal who can write the resolved directory's PARENT can
+// rename that directory aside mid-run and put a link to
+// data/meal-planning/reports/latest in its place — after which a diagnostic
+// report lands on the §0.9.3 acceptance evidence (CWE-59/CWE-367).
+//
+// WHY REVALIDATION RATHER THAN A HELD CAPABILITY. The construction that would
+// remove the window is to open the output directory once and publish through a
+// descriptor-relative call, so the name is never resolved a second time. Node
+// exposes no such call — `fs` has no `openat`/`renameat`/`mkdirat`, and every
+// write primitive, `fs.promises.open` included, takes a path — so the strongest
+// instrument available here is to verify the parent, remember WHICH directory
+// it was, and re-observe the same facts immediately before the write, refusing
+// if they moved. What is left is the few microseconds between that last
+// observation and the rename, instead of the whole measurement.
+//
+// The decision itself is pure (Rule backend-architecture §1.2/§7): the caller
+// supplies two observations and the predicate names every way they differ, so
+// the rule is pinned by `src/__tests__/scripts/search-benchmark.test.ts`
+// without a filesystem.
+// ---------------------------------------------------------------------------
+
+/**
+ * Owner-only, for an output directory this run creates. A directory the stage
+ * makes for its own artefact starts private to the operator who ran it, which
+ * is also what keeps `assertSafeArtifactParent` from having to refuse it under
+ * a permissive `umask`. An existing directory's mode is left exactly as it is.
+ */
+const OUTPUT_DIRECTORY_MODE = 0o700;
+
+/**
+ * What kind of entry sits at the artefact's own name, read with `lstat` so a
+ * symbolic link is reported as one instead of as whatever it points at.
+ *
+ * `absent` is the ordinary first-run case and is publishable; `file` is the
+ * ordinary re-run case. Everything else is refused rather than written
+ * through.
+ */
+export type OutputNameKind = 'absent' | 'file' | 'symbolic_link' | 'other' | 'unreadable';
+
+/**
+ * One observation of the artefact's write target: which directory it is in,
+ * and what is at its name.
+ *
+ * `parentDevice`/`parentInode` are the identity — they change when the
+ * directory at that path is replaced, renamed aside or swapped for a symbolic
+ * link, which is exactly the mid-run attack — and `parentIsDirectory` records
+ * the swap directly for the sake of the message an operator reads.
+ */
+export interface OutputPathObservation {
+    readonly parentDevice: number;
+    readonly parentInode: number;
+    readonly parentIsDirectory: boolean;
+    readonly nameKind: OutputNameKind;
+}
+
+/**
+ * Whether the artefact may be published to a name of this kind.
+ *
+ * Pure and exported because it is half of the symlink rule: a link at the
+ * artefact's own name means the name this run was given stands for a file
+ * somewhere else, and publishing through it writes wherever the link's owner
+ * chose. A directory or an unreadable entry at that name is refused for the
+ * same reason the link is — the run cannot say what it would be overwriting.
+ */
+export const outputNameIsPublishable = (kind: OutputNameKind): boolean =>
+    kind === 'absent' || kind === 'file';
+
+/**
+ * Every way the write target stopped being the place a run verified — empty
+ * when it is still that place.
+ *
+ * Pure and exported because it is the whole of the post-guard rule (Rule
+ * backend-architecture §1.2/§11): the caller takes the two observations, and a
+ * test drives every difference with no filesystem at all. A missing `after` is
+ * a change rather than an absence of one: a parent that cannot be read after
+ * the measurement is a parent this run can no longer prove anything about, and
+ * publishing into it would be publishing into the unknown.
+ */
+export const outputPathIdentityChanges = (
+    before: OutputPathObservation,
+    after: OutputPathObservation | null,
+): readonly string[] => {
+    if (after === null) {
+        return ['output_parent_unreadable'];
+    }
+
+    const changes: string[] = [];
+    if (after.parentDevice !== before.parentDevice) {
+        changes.push(`parent_device_changed=${before.parentDevice}->${after.parentDevice}`);
+    }
+    if (after.parentInode !== before.parentInode) {
+        changes.push(`parent_inode_changed=${before.parentInode}->${after.parentInode}`);
+    }
+    if (!after.parentIsDirectory) {
+        changes.push('parent_no_longer_a_directory');
+    }
+    if (!outputNameIsPublishable(after.nameKind)) {
+        changes.push(`output_name_not_publishable=${after.nameKind}`);
+    }
+    return changes;
+};
+
+/** `lstat`s one name and classifies it; never follows what it finds. */
+const observeNameKind = (absolutePath: string): OutputNameKind => {
+    let stats: fs.Stats;
+    try {
+        stats = fs.lstatSync(absolutePath);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        // ENOENT and ENOTDIR both mean "nothing is at this name"; anything else
+        // (a permission wall on an ancestor, an I/O error) means the kind could
+        // not be read, which is not the same statement and is not publishable.
+        return code === 'ENOENT' || code === 'ENOTDIR' ? 'absent' : 'unreadable';
+    }
+    // Order matters: a symbolic link to a file reports `isFile()` false under
+    // `lstat`, but asking for the link first keeps that independent of platform.
+    if (stats.isSymbolicLink()) {
+        return 'symbolic_link';
+    }
+    return stats.isFile() ? 'file' : 'other';
+};
+
+/**
+ * Observes the write target, or `null` when its parent cannot be read.
+ *
+ * `lstat` on the parent rather than `stat`: a parent that has become a symbolic
+ * link is the case being detected, and `stat` would report the directory it
+ * points at — a different inode than the one captured, but reported as a
+ * directory, which loses the reason.
+ */
+const observeOutputPath = (physicalOutPath: string): OutputPathObservation | null => {
+    const parent = path.dirname(physicalOutPath);
+
+    let parentStats: fs.Stats;
+    try {
+        parentStats = fs.lstatSync(parent);
+    } catch {
+        return null;
+    }
+
+    return {
+        parentDevice: parentStats.dev,
+        parentInode: parentStats.ino,
+        parentIsDirectory: parentStats.isDirectory(),
+        nameKind: observeNameKind(physicalOutPath),
+    };
+};
 
 // ---------------------------------------------------------------------------
 // The seams the run is driven through.
@@ -581,8 +804,22 @@ export interface BenchmarkDeps {
     readonly benchmark: SearchBenchmark;
     readonly releaseManifest: CatalogReleaseManifest;
     readonly releaseVersion: string;
-    /** Absolute path of the report artefact. */
+    /**
+     * Absolute path of the report artefact AS THE OPERATOR SPELLED IT (`--out`,
+     * or the default). The run resolves it to its physical identity once and
+     * writes there — see `runBenchmark` — so this value is what log lines and
+     * refusals quote back, never what an output decision is taken from.
+     */
     readonly outPath: string;
+    /**
+     * The artefact §0.9.3 cites as the acceptance evidence, which a diagnostic
+     * run may not overwrite. `main` wires it to `resolveOutPath(null)`; it is a
+     * dep so that the rule can be PROVED — a suite pins it to a temporary file
+     * standing in for the committed report, and the test that proves an alias
+     * is refused then cannot be the test that destroys the committed report if
+     * the refusal ever regresses.
+     */
+    readonly acceptanceArtifactPath: string;
     readonly logger: ScriptLogger;
     readonly now: () => Date;
     /** Monotonic nanosecond clock; seamed so a driver can supply a fake one. */
@@ -2171,11 +2408,17 @@ export const determinismFingerprint = (
  * sits outside this package — in a scratch directory whose absolute path names
  * that machine's layout and opens nothing for anyone else. So a peer inside the
  * package is named by its package-relative path, and one outside it by its file
- * name alone (`pathKind` says which), while the absolute path stays in this
- * run's log lines and refusal messages where the operator needs it. Nothing is
- * lost by the narrowing: `sha256` and `determinismFingerprint` are what
- * identify the compared measurement, and the procedure that reproduces it is in
- * `howToReproduce`.
+ * name alone (`pathKind` says which).
+ *
+ * THE ABSOLUTE PATH IS NOT REPORTED ANYWHERE. It exists only in memory, for the
+ * filesystem read itself: the log lines carry `compareWithDigest` and a narrowed
+ * artefact label, and a refusal carries `peerReportDigest` with a fixed remedy
+ * (see {@link unreadablePeerFile}), because an operator-supplied path written
+ * into a durable line discloses that machine's layout to everyone who reads the
+ * line afterwards. Nothing is lost by the narrowing: `sha256` and
+ * `determinismFingerprint` are what identify the compared measurement, the
+ * digest correlates a refusal with the file the operator named, and the
+ * procedure that reproduces it is in `howToReproduce`.
  */
 export interface PeerReportSource {
     /** Package-relative path, or the file name alone for a peer outside it. */
@@ -3552,8 +3795,82 @@ export interface BenchmarkOutcome {
      * express one of the three invariants.
      */
     readonly invariantFailures: readonly InvariantFailure[];
+    /**
+     * Where the report was actually written: the physical identity of the
+     * requested path, not the spelling that was requested. A caller logging or
+     * citing this is naming a file that holds these bytes, which an alias is not
+     * guaranteed to still resolve to.
+     */
     readonly outPath: string;
 }
+
+/**
+ * The refusal a diagnostic run aimed at the §0.9.3 acceptance artefact gets.
+ *
+ * One function for the two moments it can be reached from — before the
+ * measurement, where the resolved path already IS that artefact, and
+ * immediately before the write, where the resolved path has BECOME it because
+ * the directory it named was swapped — so both produce the same code and the
+ * same words. An operator who hits the second case has to be told the same
+ * thing as one who hits the first, with the target they would have overwritten
+ * named.
+ */
+const refuseDiagnosticRunToAcceptancePath = (
+    deps: BenchmarkDeps,
+    deviations: readonly ProtocolDeviation[],
+    resolvedTarget: string,
+): never => {
+    throw new BenchmarkInputError(
+        'diagnostic_run_to_acceptance_path',
+        `This run deviates from the committed protocol (${deviations
+            .map((deviation) => deviation.code)
+            .join(', ')}), so it is diagnostic and may not be written to the default artefact path ` +
+            `${deps.acceptanceArtifactPath} — that path is the acceptance evidence for the §0.9.3 ` +
+            'search-quality requirement, and overwriting it with a diagnostic run would destroy the committed ' +
+            'report while leaving something that looks like it in its place. ' +
+            (deps.outPath === resolvedTarget
+                ? ''
+                : `The path given (${deps.outPath}) is that same file reached through a link: it resolves to ` +
+                  `${resolvedTarget}. `) +
+            'Re-run with `--out <path>` to keep the diagnostic beside it, or without the overrides to produce ' +
+            'acceptance evidence.',
+        deviations.map((deviation) => deviation.code),
+    );
+};
+
+/**
+ * Refuses unless the write target is still the place `atStart` observed.
+ *
+ * Called immediately before the publication write, which is the only place it
+ * can usefully be called: see this module's note on why the instrument is
+ * revalidation rather than a descriptor held across the measurement. It writes
+ * nothing and repairs nothing — a target that moved is an operator's
+ * environment to explain, and a report published into a directory this run
+ * cannot identify is worse than no report.
+ */
+const assertOutputPathUnchanged = (
+    deps: BenchmarkDeps,
+    atStart: OutputPathObservation,
+    physicalOutPath: string,
+): void => {
+    const changes = outputPathIdentityChanges(atStart, observeOutputPath(physicalOutPath));
+    if (changes.length === 0) {
+        return;
+    }
+
+    throw new BenchmarkInputError(
+        'output_path_identity_changed',
+        `The directory ${path.dirname(physicalOutPath)} is no longer the directory this run verified before it ` +
+            `began measuring (${changes.join(', ')}), so ${physicalOutPath} no longer names the file the output ` +
+            'path resolved to and the report was NOT written. ' +
+            (deps.outPath === physicalOutPath ? '' : `The path given was ${deps.outPath}. `) +
+            'A directory replaced, renamed or symlinked while a run measures is how a report is redirected onto ' +
+            'another file — the §0.9.3 acceptance artefact in particular — so this run refuses rather than ' +
+            'publishing into a place it cannot identify. Re-run with `--out <path>` under a directory only you ' +
+            'can write to, and establish what changed the previous one.',
+        changes,
+    );
+};
 
 /**
  * Runs the benchmark and writes the report. Returns the outcome rather than
@@ -3584,34 +3901,111 @@ export const runBenchmark = async (deps: BenchmarkDeps): Promise<BenchmarkOutcom
         stageLockHeld: deps.stageLockHeld,
     });
 
-    // Before anything is measured, and with no I/O of its own: a diagnostic run
-    // must not overwrite the artefact §0.9.3 cites. The report would say it is
-    // not acceptance evidence, but it would be sitting at the path everything
-    // else calls the acceptance report, and the next reader to open that path
-    // gets a one-pass diagnostic with the committed report gone.
-    if (deviations.length > 0 && deps.outPath === resolveOutPath(null)) {
-        throw new BenchmarkInputError(
-            'diagnostic_run_to_acceptance_path',
-            `This run deviates from the committed protocol (${deviations
-                .map((deviation) => deviation.code)
-                .join(', ')}), so it is diagnostic and may not be written to the default artefact path ` +
-                `${resolveOutPath(null)} — that path is the acceptance evidence for the §0.9.3 search-quality ` +
-                'requirement, and overwriting it with a diagnostic run would destroy the committed report while ' +
-                'leaving something that looks like it in its place. Re-run with `--out <path>` to keep the ' +
-                'diagnostic beside it, or without the overrides to produce acceptance evidence.',
-            deviations.map((deviation) => deviation.code),
-        );
+    // THE OUTPUT PATH IS RESOLVED TO ONE PHYSICAL IDENTITY, HERE, ONCE — and
+    // the acceptance guard below and the write at the end of this function both
+    // use that single answer.
+    //
+    // Both halves of that sentence are load-bearing. A path is checked as a
+    // SPELLING in vain: `--out` naming the committed artefact through a
+    // symlinked parent directory, through a symlink at the file name, or through
+    // any other alias spells something the canonical path does not, so a `===`
+    // comparison passes it, and the write then lands a DIAGNOSTIC report on
+    // data/meal-planning/reports/latest/benchmark-report.json — the §0.9.3
+    // acceptance evidence destroyed and something that looks like it left in its
+    // place (CWE-59). And resolving twice, once for the guard and once for the
+    // write, would leave the interval between them: a link retargeted in it
+    // sends the bytes somewhere the guard never examined. One resolution, used
+    // for both, closes that too — the resolved path no longer traverses the
+    // link, so retargeting it afterwards cannot redirect this report.
+    const physicalOutPath = physicalPathIdentity(deps.outPath);
+    const physicalAcceptancePath = physicalPathIdentity(deps.acceptanceArtifactPath);
+
+    // Before anything is measured, and with no I/O of its own beyond the
+    // resolution above: a diagnostic run must not overwrite the artefact §0.9.3
+    // cites. The report would say it is not acceptance evidence, but it would be
+    // sitting at the path everything else calls the acceptance report, and the
+    // next reader to open that path gets a one-pass diagnostic with the
+    // committed report gone.
+    if (deviations.length > 0 && physicalOutPath === physicalAcceptancePath) {
+        refuseDiagnosticRunToAcceptancePath(deps, deviations, physicalOutPath);
     }
 
     if (deviations.length > 0) {
         deps.logger.warn('diagnostic_run', {
             stage: STAGE,
-            out: deps.outPath,
+            out: outPathLabel(deps.outPath),
             deviations: deviations.map((deviation) => deviation.code).join(', '),
             consequence:
                 'The report will record standing diagnostic_only and thisReportIsAcceptanceEvidence false, so it ' +
                 'cannot be cited as evidence for the search-quality requirement.',
         });
+    }
+
+    // THE WRITE TARGET'S PARENT IS VERIFIED, AND ITS IDENTITY CAPTURED, BEFORE
+    // ANYTHING IS MEASURED — and re-checked immediately before the write.
+    //
+    // The guard above settles WHICH FILE this run is aiming at. It does not
+    // settle that the file will still be in the directory it was aimed at when
+    // the bytes move, and everything between this line and `writeJsonFile` at
+    // the end of this function is time an attacker has: see this module's
+    // section on the write target's identity for why the instrument is
+    // revalidation rather than a descriptor held open across the measurement.
+    //
+    // Three separate statements are established here, and each one is needed:
+    //
+    //   * The directory EXISTS and is safe to publish into.
+    //     `assertSafeArtifactParent` refuses a parent that is a symbolic link,
+    //     is not a directory, or is writable by other local principals without
+    //     the sticky bit — the condition under which the name this run is about
+    //     to create can be pre-placed by someone else. It is created first,
+    //     owner-only, because a stage that would fail on a missing output
+    //     directory should fail before it spends minutes measuring, and
+    //     because `writeJsonFile` would otherwise create it at the very end
+    //     with nothing checked about it.
+    //   * The artefact's NAME is not a link. `physicalPathIdentity` resolves
+    //     the final component, so it answers "which file" for a name that is a
+    //     symlink instead of refusing it; `observeNameKind` `lstat`s the name
+    //     and this refuses a link (or a directory, or an unreadable entry)
+    //     there. Both spellings are checked: the one the operator gave, so a
+    //     link they typed is named back to them, and the resolved one, so a
+    //     dangling link or an entry planted between the two lookups is caught.
+    //   * WHICH directory it is. The captured (device, inode) is what
+    //     `assertOutputPathUnchanged` compares against before the write, and it
+    //     is the only thing that can detect the parent being swapped for a link
+    //     to somewhere else after every check above has passed.
+    fs.mkdirSync(path.dirname(physicalOutPath), { recursive: true, mode: OUTPUT_DIRECTORY_MODE });
+    assertSafeArtifactParent(physicalOutPath);
+
+    const spelledNameKind = observeNameKind(deps.outPath);
+    const resolvedNameKind = observeNameKind(physicalOutPath);
+    if (!outputNameIsPublishable(spelledNameKind) || !outputNameIsPublishable(resolvedNameKind)) {
+        // Both kinds when they differ, because "the name you typed is a link"
+        // and "the name it resolves to is a directory" are different faults
+        // with different remedies.
+        const nameKinds =
+            spelledNameKind === resolvedNameKind
+                ? spelledNameKind
+                : `${spelledNameKind} as spelled and ${resolvedNameKind} once resolved`;
+        throw new BenchmarkInputError(
+            'output_path_name_unsafe',
+            `${deps.outPath} cannot be published to: the entry at the artefact's own name is ${nameKinds}` +
+                ', and this stage publishes only to a plain file or to a name that does not exist yet. A symbolic ' +
+                'link at the artefact name stands for a file somewhere else, so writing through it would put this ' +
+                'report wherever the link\'s owner chose — the §0.9.3 acceptance artefact included. Point `--out` ' +
+                'at a real path.',
+            [`spelled=${spelledNameKind}`, `resolved=${resolvedNameKind}`],
+        );
+    }
+
+    const outputPathAtStart = observeOutputPath(physicalOutPath);
+    if (outputPathAtStart === null) {
+        throw new BenchmarkInputError(
+            'output_path_identity_changed',
+            `${path.dirname(physicalOutPath)} could not be read back immediately after it was verified, so this ` +
+                'run cannot record which directory it is publishing into and cannot detect it being replaced while ' +
+                'the measurement runs. Point `--out` at a directory only you can write to.',
+            ['output_parent_unreadable'],
+        );
     }
 
     // Parsed before anything is measured: a peer report this run cannot read,
@@ -3806,14 +4200,460 @@ export const runBenchmark = async (deps: BenchmarkDeps): Promise<BenchmarkOutcom
     // of what it measured behind. The only paths that write nothing are the
     // ones where nothing was measured, or where what was measured describes a
     // corpus that moved underneath it.
-    writeJsonFile(deps.outPath, report);
+    //
+    // To the identity resolved at the top of this function, not to the spelling
+    // the operator gave: the spelling may traverse a link, and a link is exactly
+    // what a local principal can retarget during the minutes this run spends
+    // measuring. The resolved path does not traverse it, so the bytes go to the
+    // file the guard above examined and nowhere else.
+    //
+    // AND THE FACTS THAT DECISION RESTED ON ARE RE-ESTABLISHED FIRST, because
+    // by now they are minutes old. A resolved path names a file inside a
+    // DIRECTORY, and the directory at that path can be renamed aside and
+    // replaced — with a symbolic link to data/meal-planning/reports/latest, in
+    // the case that matters — by anyone who can write its parent. Two questions
+    // are therefore asked again, in the order an operator needs them answered:
+    //
+    //   1. Does this path resolve onto the acceptance artefact NOW? A swapped
+    //      parent makes it, and the answer is the refusal the guard above would
+    //      have given, with the same code and the same words.
+    //   2. Is the directory still the one that was verified? The captured
+    //      (device, inode) answers that for every other redirection, including
+    //      a swap onto a directory that is not the acceptance one.
+    //
+    // Both refuse without writing. Node has no descriptor-relative open to
+    // close the remaining microseconds with (see the write-target section
+    // above), so this pair of checks immediately before the rename is the
+    // narrowest window this runner can achieve.
+    const republishedIdentity = physicalPathIdentity(physicalOutPath);
+    if (deviations.length > 0 && republishedIdentity === physicalAcceptancePath) {
+        refuseDiagnosticRunToAcceptancePath(deps, deviations, republishedIdentity);
+    }
+    assertOutputPathUnchanged(deps, outputPathAtStart, physicalOutPath);
+
+    writeJsonFile(physicalOutPath, report);
 
     return {
         report,
         failures: checks.filter((check) => check.verdict === 'fail'),
         invariantFailures,
-        outPath: deps.outPath,
+        // The path the bytes actually went to, so `report_written` and
+        // `stage_completed` name the file a reader can open rather than an alias
+        // that may no longer point at it.
+        outPath: physicalOutPath,
     };
+};
+
+// ---------------------------------------------------------------------------
+// The committed query set's shape.
+//
+// WHY THIS EXISTS. `loadSearchBenchmark` (scripts/lib/manifest.ts) checks the
+// document's `benchmarkVersion` and then DECLARES the rest of it: the
+// `SearchBenchmark` type is a cast over parsed JSON, which is the trust that
+// module extends to the manifests whose fields nothing can misread. This
+// document is not one of them, because its fields are ARGUMENTS. `queries[].q`
+// becomes a bound parameter of `plainto_tsquery`; `thresholds.latencyLimit` and
+// `paginationCheck.{limit,singlePageLimit}` become SQL `LIMIT`s;
+// `protocol.warmupPasses`, `deps.timedPasses` and `paginationCheck.pages` are
+// loop bounds; `queries[].id` is a Map key AND a field of the committed report;
+// `queries[].expected[]` becomes a Prisma `IN` list; and `thresholds`'s rates
+// become the integer numerators every verdict is decided over.
+//
+// A document that disagrees with the declared type therefore does not fail as a
+// type error — nothing checks it — it reaches PostgreSQL, the in-memory rollups
+// and the acceptance artefact as whatever it actually holds (CWE-20). A `q` of
+// `null` binds as null and scores as a miss the report presents as a ranking
+// result; a fractional `limit` is an opaque driver error a third of the way
+// through a measurement; a repeated `id` silently overwrites another query's
+// observation, so the report's own `queriesScored` counts a query that was
+// never measured; a `warmupPasses` of 10^9 never returns; and a rate with seven
+// decimal places is compared as a slightly different bound than the one the
+// contract states.
+//
+// So the runner VERIFIES the document before it uses it, at both points it is
+// loaded — `preflight`, which reports it as a prerequisite gap, and `main`,
+// which is the point of use — and it REFUSES rather than coercing: a coerced
+// query set is a different query set measured under the committed one's name,
+// which is the one error a reader of the artefact cannot detect. Validation
+// sits at the LOAD points rather than inside `runBenchmark` because that
+// function takes its `benchmark` as a dependency the suite supplies as a value;
+// the document only exists at the boundary these two functions own.
+//
+// WHAT IT DELIBERATELY DOES NOT DO: reject unknown keys. This artefact carries
+// its curation notes beside its payload — `description`, `thresholdPolicy`,
+// `kinds`, `omittedFoods`, `authoringBasis`, and per-field rationales inside
+// `protocol` and `paginationCheck` — and those are why a reviewer can read the
+// contract at all. Every field the runner CONSUMES is checked; everything else
+// is left exactly as committed, and the document is returned as it was parsed
+// rather than rebuilt from the checked fields, so a reviewed addition still
+// reaches the report's own copy instead of being quietly dropped here.
+// ---------------------------------------------------------------------------
+
+/** The document this stage measures against, named in each refusal below. */
+const QUERY_SET_FILE = 'data/meal-planning/search-benchmark.v1.json';
+
+/** Invariant across every way the document can be wrong, so it is stated once. */
+const QUERY_SET_REMEDY = `Correct ${QUERY_SET_FILE} — or restore the committed copy — and run the stage again.`;
+
+/**
+ * THE CEILINGS, AND WHY A CEILING AT ALL. Each of these bounds a value that
+ * costs something when it grows: a loop iteration, a database round trip, a
+ * row in a `LIMIT`, or a byte of the committed report — and none of them is
+ * a taste judgement about curation. Every one is stated well above what the
+ * committed v1 document holds (426 queries, 4-character ids, `q` of 2–32
+ * characters, at most 6 expectations each, `usda:<digits>` keys of 12
+ * characters, 1 warm-up and 3 timed passes, pages of 25 and 75), so a reviewed
+ * expansion of the query set never has to touch this file; what they refuse is
+ * the order of magnitude that turns a benchmark run into an unbounded one.
+ */
+const MAX_BENCHMARK_QUERIES = 2000;
+
+/** An id is a Map key and a report field, never prose; four characters is the committed form. */
+const MAX_QUERY_ID_CHARS = 16;
+
+/** A kind is a rollup bucket, so its ceiling is the width of a label. */
+const MAX_QUERY_KIND_CHARS = 32;
+
+/**
+ * Expectations per query. Each one is scanned against every returned item of
+ * every pass, so the cost is per-query rather than amortised — and more than a
+ * handful of acceptable answers means the query is not discriminating enough to
+ * measure ranking with (the document's `expectedSemantics` says as much).
+ */
+const MAX_EXPECTED_PER_QUERY = 32;
+
+/** A `source_key` is `<dataset>:<id>`; 64 covers any dataset prefix this catalog could carry. */
+const MAX_SOURCE_KEY_CHARS = 64;
+
+/** Version ids, the timing name and one ordering clause: labels, not documents. */
+const MAX_CONTRACT_TEXT_CHARS = 128;
+
+/** `ordering` is three clauses and `reportedConditions` eight names today. */
+const MAX_CONTRACT_LIST_ENTRIES = 32;
+
+/**
+ * Warm-up and timed passes. Each pass is a full sweep of the query set, so this
+ * is the difference between a run that finishes and one that appears to hang:
+ * 25 passes over 2000 queries is already 50,000 searches.
+ */
+const MAX_PROTOCOL_PASSES = 25;
+
+/** The contract's declared connection count; reported and compared, never dialled. */
+const MAX_PROTOCOL_CONNECTIONS = 64;
+
+/**
+ * Any page size this document can ask the service for. Deliberately NOT the
+ * route's `MAX_LIMIT` (50): `searchPublishedFoods` accepts a wider page from an
+ * in-process caller by design, and the committed `singlePageLimit` of 75 is
+ * that exception — so the ceiling here is the point past which a "page" stops
+ * being a page and starts being a table scan held in memory.
+ */
+const MAX_SEARCH_PAGE_LIMIT = 1000;
+
+/** Pages per pagination-check query: one search call each, times every named id. */
+const MAX_PAGINATION_PAGES = 25;
+
+/**
+ * How far a rate bound may sit from an exact numerator at {@link RATE_SCALE}.
+ *
+ * `rateNumeratorOf` rounds `bound * RATE_SCALE` to recover the integer a
+ * decimal literal denotes, which is exact for a bound of at most six decimal
+ * places (0.97 → 969999.9999999999 → 970000) and silently wrong for one with
+ * more (0.9000001 → 900000.1 → 900000, a bound of 0.9). Binary representation
+ * error at this scale is around 10^-10, so the gap between the two cases is ten
+ * thousand times this tolerance.
+ */
+const RATE_NUMERATOR_TOLERANCE = 1e-6;
+
+/**
+ * A refusal naming the FIELD and the RULE, never the value.
+ *
+ * WHY THE VALUE IS WITHHELD. This function exists because the document is not
+ * trusted, and a refusal is a log line: quoting the offending value would put
+ * unvalidated file content — the very NUL, control, bidi or oversized string
+ * the check just rejected — into the operator's terminal, CI retention and the
+ * durable run log (CWE-117/CWE-532), which is the disclosure `safeError` and
+ * `boundedModelText` exist to prevent. The field path is document structure
+ * this repository authored, and it is what an operator opens the file at; the
+ * rule clause says what that field must be. Between them the refusal is fully
+ * actionable without republishing one byte of the document.
+ */
+const shapeRefusal = (field: string, rule: string): BenchmarkInputError =>
+    new BenchmarkInputError(
+        'query_set_invalid',
+        `${QUERY_SET_FILE} does not honour the shape this stage measures against: ${field} ${rule}. ` +
+            `${QUERY_SET_REMEDY}`,
+        // Third item is the remedy, so the fatal log line carries the next step
+        // as well as the fault; `preflight` states it in its gap's own field
+        // instead and takes only the first two.
+        [`field=${field}`, `rule=${rule}`, QUERY_SET_REMEDY],
+    );
+
+const requireDocumentRecord = (value: unknown, field: string): Record<string, unknown> => {
+    if (!isRecord(value)) {
+        throw shapeRefusal(field, 'is missing or is not a JSON object');
+    }
+    return value;
+};
+
+const requireDocumentArray = (
+    value: unknown,
+    field: string,
+    minimum: number,
+    maximum: number,
+): readonly unknown[] => {
+    if (!Array.isArray(value)) {
+        throw shapeRefusal(field, 'is missing or is not an array');
+    }
+    if (value.length < minimum || value.length > maximum) {
+        throw shapeRefusal(field, `must hold between ${minimum} and ${maximum} entries, and holds ${value.length}`);
+    }
+    return value;
+};
+
+/**
+ * One string this stage consumes, accepted only AS COMMITTED.
+ *
+ * {@link boundedModelText} is the shared fail-closed narrowing — it refuses a
+ * non-string, NUL, the rest of C0, C1, DEL, the bidi and zero-width format
+ * controls and an unpaired surrogate — and it also trims, collapses whitespace
+ * and truncates. Here the returned value must EQUAL the committed one, because
+ * this function validates rather than cleans: a truncated query is a different
+ * query, and a collapsed id is a different id, so a document that needed
+ * cleaning is refused instead of being quietly rewritten into one that passes.
+ */
+const requireCommittedText = (value: unknown, field: string, maxChars: number): string => {
+    const narrowed = boundedModelText(value, maxChars);
+    if (typeof value !== 'string' || narrowed === null || narrowed !== value) {
+        throw shapeRefusal(
+            field,
+            `must be a string of 1 to ${maxChars} characters, already trimmed and single-spaced, carrying no ` +
+                'control, bidi or zero-width character',
+        );
+    }
+    return narrowed;
+};
+
+const requireCommittedTextList = (value: unknown, field: string): readonly string[] => {
+    const entries = requireDocumentArray(value, field, 1, MAX_CONTRACT_LIST_ENTRIES);
+    return entries.map((entry, index) =>
+        requireCommittedText(entry, `${field}[${index}]`, MAX_CONTRACT_TEXT_CHARS),
+    );
+};
+
+const requireDocumentInteger = (
+    value: unknown,
+    field: string,
+    minimum: number,
+    maximum: number,
+): number => {
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) {
+        throw shapeRefusal(field, `must be an integer between ${minimum} and ${maximum}`);
+    }
+    return value;
+};
+
+const requireDocumentBoolean = (value: unknown, field: string): boolean => {
+    if (typeof value !== 'boolean') {
+        throw shapeRefusal(field, 'must be true or false');
+    }
+    return value;
+};
+
+/**
+ * A rate bound: finite, within 0 and 1, and exactly representable as an integer
+ * numerator at {@link RATE_SCALE} — which is the scale every rate verdict is
+ * decided at, so a bound this stage cannot represent is a bound it would
+ * silently test a different value against (see {@link RATE_NUMERATOR_TOLERANCE}).
+ */
+const requireRateBound = (value: unknown, field: string): number => {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+        throw shapeRefusal(field, 'must be a finite rate between 0 and 1');
+    }
+    const scaled = value * RATE_SCALE;
+    if (Math.abs(scaled - Math.round(scaled)) > RATE_NUMERATOR_TOLERANCE) {
+        throw shapeRefusal(
+            field,
+            `must be stated to at most six decimal places, so the verdict compares the bound the contract ` +
+                `states rather than its nearest multiple of 1/${RATE_SCALE}`,
+        );
+    }
+    return value;
+};
+
+/**
+ * One benchmark query, accepted only if the SEARCH LAYER would accept it.
+ *
+ * The bound and the control-character rule are `catalog.logic.ts`'s, reached
+ * through the parser `GET /catalog/foods` uses, and the parsed value must equal
+ * the committed one: the parser TRIMS, so a `q` with surrounding whitespace
+ * would otherwise pass validation here and then be sent to the service
+ * untrimmed — a different query from the one that was checked, because
+ * `runPass` calls the service with `query.q` and not with the parsed form.
+ */
+const requireSearchableQuery = (value: unknown, field: string): string => {
+    const q = requireCommittedText(value, field, MAX_SEARCH_QUERY_LENGTH);
+    const parsed = parseCatalogSearchQuery(q);
+
+    if (parsed.kind !== 'ok' || parsed.q !== q) {
+        throw shapeRefusal(
+            field,
+            `must be a query the search layer itself accepts: ${MIN_SEARCH_QUERY_LENGTH} to ` +
+                `${MAX_SEARCH_QUERY_LENGTH} characters, no control characters, and no leading or trailing ` +
+                'whitespace — a query GET /catalog/foods would refuse cannot be measured',
+        );
+    }
+
+    return q;
+};
+
+/**
+ * Verifies `search-benchmark.v1.json` against every field this stage consumes
+ * and returns it typed.
+ *
+ * Exported because it is the boundary itself: `main` and `preflight` both call
+ * it, and the tests drive it directly — including against the committed
+ * document, which is what pins that these bounds describe the artefact the plan
+ * cites rather than a stricter file nobody has.
+ */
+export const assertSearchBenchmarkShape = (value: unknown): SearchBenchmark => {
+    const document = requireDocumentRecord(value, 'its top level');
+
+    // The loader has already refused a document whose `benchmarkVersion` is not
+    // `v1`; both fields are re-read here as TYPES, because `main` compares the
+    // first against `--benchmark` and hands the second to
+    // `loadReleaseManifest`, where `manifest.ts::assertReleaseVersion` owns the
+    // path-segment rule that this stage must not restate.
+    requireCommittedText(document.benchmarkVersion, 'benchmarkVersion', MAX_CONTRACT_TEXT_CHARS);
+    requireCommittedText(document.catalogRelease, 'catalogRelease', MAX_CONTRACT_TEXT_CHARS);
+
+    const thresholds = requireDocumentRecord(document.thresholds, 'thresholds');
+    requireRateBound(thresholds.topThreeHitRate, 'thresholds.topThreeHitRate');
+    requireRateBound(thresholds.topTenHitRate, 'thresholds.topTenHitRate');
+    requireRateBound(thresholds.maxZeroResultRate, 'thresholds.maxZeroResultRate');
+    // A latency bound carries no cost when it is large — it is only compared —
+    // so it is bounded below rather than above: a non-positive or non-finite
+    // millisecond bound is a threshold no measurement can ever meet or miss.
+    if (
+        typeof thresholds.p95LatencyMs !== 'number' ||
+        !Number.isFinite(thresholds.p95LatencyMs) ||
+        thresholds.p95LatencyMs <= 0
+    ) {
+        throw shapeRefusal('thresholds.p95LatencyMs', 'must be a finite number of milliseconds above zero');
+    }
+    // The measured page size, which reaches the service as its `limit`.
+    requireDocumentInteger(thresholds.latencyLimit, 'thresholds.latencyLimit', 1, MAX_SEARCH_PAGE_LIMIT);
+
+    requireCommittedTextList(document.ordering, 'ordering');
+    requireCommittedTextList(document.reportedConditions, 'reportedConditions');
+
+    const protocol = requireDocumentRecord(document.protocol, 'protocol');
+    // Zero warm-up passes is a coherent protocol (measure cold); zero timed
+    // passes is not a protocol at all, which is why the two floors differ.
+    requireDocumentInteger(protocol.warmupPasses, 'protocol.warmupPasses', 0, MAX_PROTOCOL_PASSES);
+    requireDocumentInteger(protocol.timedPasses, 'protocol.timedPasses', 1, MAX_PROTOCOL_PASSES);
+    requireDocumentBoolean(protocol.sequential, 'protocol.sequential');
+    requireDocumentInteger(protocol.connections, 'protocol.connections', 1, MAX_PROTOCOL_CONNECTIONS);
+    requireCommittedText(protocol.timing, 'protocol.timing', MAX_CONTRACT_TEXT_CHARS);
+
+    const queries = requireDocumentArray(document.queries, 'queries', 1, MAX_BENCHMARK_QUERIES);
+    const declaredIds = new Set<string>();
+    queries.forEach((entry, index) => {
+        const query = requireDocumentRecord(entry, `queries[${index}]`);
+        const id = requireCommittedText(query.id, `queries[${index}].id`, MAX_QUERY_ID_CHARS);
+        // UNIQUENESS IS NOT COSMETIC. Every pass keys its observations by this
+        // id and `resolveExpectations` keys its expectation lists by it, so a
+        // repeated id makes the second query overwrite the first's observation
+        // while both are still counted in `queriesScored` — a report that
+        // scores a query nobody measured, which is exactly the claim this
+        // artefact exists to carry.
+        if (declaredIds.has(id)) {
+            throw shapeRefusal(
+                `queries[${index}].id`,
+                'repeats an id an earlier query already declares, and the per-pass observations are keyed by it',
+            );
+        }
+        declaredIds.add(id);
+
+        requireSearchableQuery(query.q, `queries[${index}].q`);
+
+        // The kind is bounded and printable rather than drawn from a closed
+        // list: `SearchBenchmarkQuery.kind` is deliberately a plain string so
+        // that a new query family is a reviewed DATA change, and a vocabulary
+        // restated here would make it a code change. What the bound protects is
+        // the rollup, where the value becomes a bucket label in the report.
+        requireCommittedText(query.kind, `queries[${index}].kind`, MAX_QUERY_KIND_CHARS);
+
+        // At least one expectation, because a query with none cannot be scored
+        // at all — the document's own `omittedFoods` note gives that as the
+        // reason such queries are omitted rather than carried unscored.
+        const expected = requireDocumentArray(
+            query.expected,
+            `queries[${index}].expected`,
+            1,
+            MAX_EXPECTED_PER_QUERY,
+        );
+        expected.forEach((sourceKey, position) => {
+            requireCommittedText(
+                sourceKey,
+                `queries[${index}].expected[${position}]`,
+                MAX_SOURCE_KEY_CHARS,
+            );
+        });
+    });
+
+    const pagination = requireDocumentRecord(document.paginationCheck, 'paginationCheck');
+    const limit = requireDocumentInteger(pagination.limit, 'paginationCheck.limit', 1, MAX_SEARCH_PAGE_LIMIT);
+    const pages = requireDocumentInteger(pagination.pages, 'paginationCheck.pages', 1, MAX_PAGINATION_PAGES);
+    const singlePageLimit = requireDocumentInteger(
+        pagination.singlePageLimit,
+        'paginationCheck.singlePageLimit',
+        1,
+        MAX_SEARCH_PAGE_LIMIT,
+    );
+    // An empty `queryIds` is a coherent contract — it checks no pagination —
+    // and the suite's fixtures use it; what it may not be is unbounded or
+    // repetitive.
+    const namedIds = new Set<string>();
+    requireDocumentArray(pagination.queryIds, 'paginationCheck.queryIds', 0, MAX_BENCHMARK_QUERIES).forEach(
+        (entry, index) => {
+            const id = requireCommittedText(
+                entry,
+                `paginationCheck.queryIds[${index}]`,
+                MAX_QUERY_ID_CHARS,
+            );
+            if (namedIds.has(id)) {
+                throw shapeRefusal(
+                    `paginationCheck.queryIds[${index}]`,
+                    'names a query the list already names, which would page it twice and count it twice',
+                );
+            }
+            namedIds.add(id);
+            // Membership in `queries` is NOT checked here on purpose:
+            // `runPaginationCheck` already refuses an unknown id under
+            // `pagination_query_unknown` and names every one of them, and one
+            // rule with two owners is a rule that can disagree with itself.
+        },
+    );
+
+    // THE ONE CROSS-FIELD INVARIANT THAT DECIDES WHETHER THE CHECK MEANS
+    // ANYTHING. The pagination invariant compares `pages` pages of `limit`
+    // against one page of `singlePageLimit`; if the two do not describe the same
+    // window, the two sequences differ in LENGTH for every query and the check
+    // fails everywhere — reported as a paging fault of the release rather than
+    // as the arithmetic mistake in this document that it is.
+    if (singlePageLimit !== limit * pages) {
+        throw shapeRefusal(
+            'paginationCheck.singlePageLimit',
+            `must equal paginationCheck.limit × paginationCheck.pages (${limit} × ${pages} = ${limit * pages}), ` +
+                'because the invariant compares those pages against one page of that width',
+        );
+    }
+
+    // Every field this stage reads has now been checked against the document
+    // itself, which is what makes the narrowing below a verified one rather
+    // than the declaration `loadSearchBenchmark` makes.
+    return value as SearchBenchmark;
 };
 
 // ---------------------------------------------------------------------------
@@ -3833,44 +4673,113 @@ const readRepoFile = (repoRelativePath: string): string =>
     fs.readFileSync(path.resolve(__dirname, '..', repoRelativePath), 'utf8');
 
 /**
+ * `--compare-with` resolved against the backend package root, exactly as
+ * `--out` is, so the command stays working-directory independent and one file
+ * has one resolved identity however the operator spelled the flag.
+ */
+const resolvePeerReportPath = (comparePath: string): string => path.resolve(__dirname, '..', comparePath);
+
+/**
+ * How a peer report is named in a LOG LINE: the digest of its resolved path,
+ * never the path.
+ *
+ * WHY THE PATH CANNOT BE LOGGED, EVEN RELATIVISED. `--compare-with` is an
+ * operator-supplied path to a file that is usually outside this repository —
+ * a second checkout, a scratch directory, a colleague's home — and every line
+ * this stage writes reaches a terminal, CI retention and, through
+ * `checkpoint.ts`'s run log, a JSONB column that committed reports are
+ * assembled from. Printing the path publishes filesystem layout into all three
+ * (CWE-532/CWE-209), and a repository-relative rendering is not a fix: a
+ * relative path still describes the layout, and one resolving outside the
+ * package would be rendered with `..` segments that describe it more precisely
+ * than the absolute form.
+ *
+ * The digest answers the only question a reader has to answer from the log —
+ * were these two runs pointed at the same peer report — and cannot answer
+ * "where is it" (see {@link opaqueDigest}). `'none'` when no comparison was
+ * requested, which is `opaqueDigest`'s own statement of absence rather than a
+ * digest that would read as an identity.
+ *
+ * Exported because the narrowing is the security property: a test pins that
+ * this and not the path is what a log line carries.
+ */
+export const peerReportDigest = (comparePath: string | null): string =>
+    opaqueDigest(comparePath === null ? '' : resolvePeerReportPath(comparePath));
+
+/**
+ * The remedy every peer-report refusal carries, written HERE rather than quoted
+ * from a filesystem or parser message.
+ *
+ * The operator invoked the command with the path, so they do not need to be
+ * told it back; what they need is the next step, and it is invariant across
+ * every way the file can fail to be a report of a run.
+ */
+const PEER_REPORT_REMEDY =
+    'Produce the peer report by running this command against the second database with --out, then point ' +
+    '--compare-with at that file.';
+
+/**
+ * A `--compare-with` file this stage could not turn into a peer report, in the
+ * one shape both refusals below take.
+ *
+ * WHAT IT SAYS, AND WHAT IT DELIBERATELY DOES NOT. `problem` is this file's own
+ * clause naming which step failed, and `cause` is {@link formatSafeError} — the
+ * failing class with its machine code, so an `ENOENT` still reaches the
+ * operator as `code ENOENT`. What is gone is the foreign prose: `fs` puts the
+ * absolute path it opened into its message, and a JSON `SyntaxError` quotes the
+ * bytes it choked on — a fragment of a document this stage is not the author of
+ * — so forwarding either would put a path and file content into the durable log
+ * that `safeError` exists to keep them out of (logger.ts::safeError).
+ *
+ * The three `detail` items are what the failure is ACTIONABLE on and are all
+ * values this repository owns: the correlation digest, the failing class, and
+ * the fixed remedy. They travel in `detail` because that is the channel the
+ * top-level catch already prints (`input_detail`); the thrown `message` is not
+ * logged anywhere, by design.
+ */
+const unreadablePeerFile = (comparePath: string, problem: string, cause: unknown): BenchmarkInputError =>
+    new BenchmarkInputError(
+        'compare_report_unreadable',
+        `The file named by --compare-with ${problem} (${formatSafeError(cause)}). ${PEER_REPORT_REMEDY}`,
+        [
+            `peerReportDigest=${peerReportDigest(comparePath)}`,
+            `cause=${formatSafeError(cause)}`,
+            PEER_REPORT_REMEDY,
+        ],
+    );
+
+/**
  * Reads the report named by `--compare-with` and digests its BYTES.
  *
  * The digest is taken over the bytes on disk rather than over the re-serialised
  * value, because it is recorded as the identity of the file that was compared:
  * a reader has to be able to run `sha256sum` on that path and get the same
- * string. A relative path resolves against the backend package root, exactly as
- * `--out` does, so the command stays working-directory independent.
+ * string.
+ *
+ * Exported for the canary tests: the two refusal paths are where a path and a
+ * parser message would leak, and asserting their absence needs the real
+ * filesystem read rather than a seam that stands in for it.
  */
-const readPeerReport = (comparePath: string): PeerReportSource => {
-    const absolutePath = path.resolve(__dirname, '..', comparePath);
+export const readPeerReport = (comparePath: string): PeerReportSource => {
+    const absolutePath = resolvePeerReportPath(comparePath);
 
     let bytes: Buffer;
     try {
         bytes = fs.readFileSync(absolutePath);
     } catch (error) {
-        throw new BenchmarkInputError(
-            'compare_report_unreadable',
-            `The report named by --compare-with could not be read from ${absolutePath}: ` +
-                `${error instanceof Error ? error.message : String(error)}. Produce it by running this command ` +
-                'against the second database with --out, then point --compare-with at that file.',
-            [absolutePath],
-        );
+        throw unreadablePeerFile(comparePath, 'could not be read', error);
     }
 
     let raw: unknown;
     try {
         raw = JSON.parse(bytes.toString('utf8'));
     } catch (error) {
-        throw new BenchmarkInputError(
-            'compare_report_unreadable',
-            `The report at ${absolutePath} is not valid JSON: ` +
-                `${error instanceof Error ? error.message : String(error)}.`,
-            [absolutePath],
-        );
+        throw unreadablePeerFile(comparePath, 'does not contain valid JSON', error);
     }
 
-    // The absolute path stays in the refusals above, where the operator needs
-    // it; what reaches the committed artefact is the narrowed label.
+    // Neither the refusals above nor this value carries the path: what reaches
+    // the committed artefact is the narrowed label, and what reaches a log line
+    // is the digest.
     const { label, pathKind } = peerReportLabel(absolutePath, path.resolve(__dirname, '..'));
 
     return {
@@ -3885,16 +4794,41 @@ export const preflight = (deps: BenchmarkPreflightDeps): readonly PrerequisiteGa
     const gaps: PrerequisiteGap[] = [];
 
     try {
-        deps.loadSearchBenchmark();
+        // Loaded AND verified: a document that parses and declares `v1` is
+        // still not a query set until every field this stage consumes is what
+        // the declared type says it is, and preflight is where a prerequisite
+        // that does not hold is reported as a gap rather than as a fault.
+        assertSearchBenchmarkShape(deps.loadSearchBenchmark());
     } catch (error) {
-        if (error instanceof ManifestError) {
+        if (isThrownInstanceOf(error, ManifestError)) {
             gaps.push({
                 code: 'search_benchmark_unavailable',
                 requirement:
                     'data/meal-planning/search-benchmark.v1.json must load and declare its benchmarkVersion: it ' +
                     'is the query set, the expected source_keys, the thresholds and the protocol',
                 remedy: 'Restore the benchmark query set at data/meal-planning/search-benchmark.v1.json (AAP §0.7.1 Group 3).',
-                detail: `${error.code}: ${error.message}`,
+                // The CODE, not the message. `ManifestError`'s text is mostly
+                // this repository's own prose, but not all of it: its
+                // `repo_root_not_found` names the absolute directory it
+                // searched from, and its `invalid_merged_report` quotes
+                // `JSON.stringify`'s own failure — so forwarding the message
+                // wholesale forwards a path and a foreign parser's words into a
+                // gap this stage reports to the operator and writes down. The
+                // `requirement` and `remedy` above already name the file and
+                // the fix in text written here, which is the actionable half.
+                detail: error.code,
+            });
+        } else if (isThrownInstanceOf(error, BenchmarkInputError) && error.code === 'query_set_invalid') {
+            gaps.push({
+                code: 'search_benchmark_invalid',
+                requirement:
+                    `${QUERY_SET_FILE} must honour the shape this stage measures against: the queries it runs, ` +
+                    'the expectations it scores, the bounds it compares and the protocol it takes them under',
+                remedy: `${QUERY_SET_REMEDY} (AAP §0.7.1 Group 3)`,
+                // The field and the rule, which are this repository's own
+                // words; the refusal's third detail item is the remedy and is
+                // already stated in the gap's own field above.
+                detail: error.detail.slice(0, 2).join('; '),
             });
         } else {
             // A permission fault or an unreadable path is an environment
@@ -3933,11 +4867,20 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
 // than swallowed or printed raw.
-const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
-    if (error instanceof DatabaseOriginError) {
+// The reported `error` is `SafeErrorFields` — a scrubbed name plus an optional
+// machine code and status, and deliberately no `message`: this value reaches the
+// durable run log and the operator console, where foreign prose can carry a
+// connection URL, a key or a fragment of the document that failed (CWE-532).
+// Exported, as catalog-load.ts, catalog-import-usda.ts and recipes-seed.ts
+// export theirs: the mapping from error class to reported code and fields is
+// the last thing this stage does before it exits, and a test that asserts what
+// a failure line may say has to build the line this function actually produces
+// rather than a hand-written copy of it.
+export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ManifestError) {
+    if (isThrownInstanceOf(error, ManifestError)) {
         return { code: error.code, error: safeError(error) };
     }
     // The stage lock's own refusal, which is an outcome rather than a fault: a
@@ -3945,13 +4888,17 @@ const describeFailure = (error: unknown): { code: string; error: { name: string;
     // because a mutator holds it, and `catalog_stage_locked` tells the
     // operator to re-run after that stage finishes. Reported under
     // `unexpected_error` it would read as a bug in this runner.
-    if (error instanceof CheckpointError) {
+    // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
+    // refusal names the stage holding the catalog graph and the mode it asked
+    // for, and those are what an operator acts on — see checkpointErrorFields
+    // for why they travel as data rather than inside the rendered sentence.
+    if (isThrownInstanceOf(error, CheckpointError)) {
+        return { code: error.code, error: safeError(error), detail: checkpointErrorFields(error) };
+    }
+    if (isThrownInstanceOf(error, BenchmarkInputError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof BenchmarkInputError) {
-        return { code: error.code, error: safeError(error) };
-    }
-    if (error instanceof BenchmarkThresholdError) {
+    if (isThrownInstanceOf(error, BenchmarkThresholdError)) {
         return { code: 'thresholds_missed', error: safeError(error) };
     }
     return { code: 'unexpected_error', error: safeError(error) };
@@ -4114,19 +5061,26 @@ const main = async (): Promise<number> => {
     const origin = classifyDatabaseOrigin(process.env.DATABASE_URL);
     logger.info('database_origin_accepted', {
         stage: STAGE,
-        originClass: origin.originClass,
-        host: origin.host,
-        database: origin.database,
-        reason: origin.reason,
+        ...originLogFields(origin),
     });
 
     const outPath = resolveOutPath(parsed.options.out);
     logger.info('stage_invoked', {
         stage: STAGE,
-        out: outPath,
+        out: outPathLabel(outPath),
         benchmarkVersion: parsed.options.benchmarkVersion,
         passes: parsed.options.passes,
-        compareWith: parsed.options.compareWith,
+        // The two facts this repository owns about the comparison — that one
+        // was requested, and which file it was against — stated without the
+        // path the operator typed. This line used to carry `--compare-with`
+        // verbatim, which put an absolute path to a file outside this
+        // repository into the terminal, CI retention and the durable run log
+        // (CWE-532); see peerReportDigest for why a relativised path is not a
+        // fix either. The digest is logged HERE, once per run and before the
+        // file is opened, so it is present for the run that goes on to refuse
+        // the file as well as for the run that reads it.
+        compareRequested: parsed.options.compareWith !== null,
+        compareWithDigest: peerReportDigest(parsed.options.compareWith),
     });
 
     const gaps = preflight({ loadSearchBenchmark, fileExists: repoFileExists });
@@ -4135,7 +5089,13 @@ const main = async (): Promise<number> => {
         return 1;
     }
 
-    const benchmark = loadSearchBenchmark();
+    // Verified at the point of USE as well as in preflight, and the repetition
+    // is deliberate: preflight takes its loader as a seam, so its verdict is
+    // about whatever loader it was handed, while this call is the one that
+    // decides what reaches the search, the maps and the artefact. The loader
+    // memoises by path, so the second verification costs a pass over a document
+    // already in memory.
+    const benchmark = assertSearchBenchmarkShape(loadSearchBenchmark());
     if (benchmark.benchmarkVersion !== parsed.options.benchmarkVersion) {
         logger.error('benchmark_version_mismatch', {
             stage: STAGE,
@@ -4207,6 +5167,10 @@ const main = async (): Promise<number> => {
                     releaseManifest,
                     releaseVersion,
                     outPath,
+                    // The artefact a diagnostic run may not overwrite, named
+                    // from the one resolver that owns the default path so the
+                    // guard and the default can never name two different files.
+                    acceptanceArtifactPath: resolveOutPath(null),
                     logger,
                     now: () => new Date(),
                     hrtime: () => process.hrtime.bigint(),
@@ -4224,7 +5188,7 @@ const main = async (): Promise<number> => {
 
         logger.info('report_written', {
             stage: STAGE,
-            out: outcome.outPath,
+            out: outPathLabel(outcome.outPath),
             standing: outcome.report.verdict.standing,
             queriesScored: outcome.report.rollups.queriesScored,
             topThreeHitRate: outcome.report.rollups.topThreeHitRate,
@@ -4248,7 +5212,7 @@ const main = async (): Promise<number> => {
                 logger.error('stage_failed', {
                     stage: STAGE,
                     code: invariantFailure.code,
-                    out: outcome.outPath,
+                    out: outPathLabel(outcome.outPath),
                     detail: invariantFailure.detail,
                 });
             }
@@ -4264,7 +5228,7 @@ const main = async (): Promise<number> => {
             stage: STAGE,
             verdict: outcome.report.verdict.overall,
             standing: outcome.report.verdict.standing,
-            out: outcome.outPath,
+            out: outPathLabel(outcome.outPath),
         });
         return 0;
     } finally {
@@ -4286,8 +5250,15 @@ if (require.main === module) {
                 stage: STAGE,
                 code: failure.code,
                 error: failure.error,
+                // Spread, not nested: these are typed facts about the failure
+                // (a run id, the stage holding the catalog graph, the mode it
+                // asked for), and they read as fields of the failure rather
+                // than as one opaque member. Absent for every failure that is
+                // not a stage-lock refusal, which is the only branch that
+                // supplies them.
+                ...failure.detail,
             });
-            if (error instanceof BenchmarkThresholdError) {
+            if (isThrownInstanceOf(error, BenchmarkThresholdError)) {
                 for (const missed of error.failures) {
                     fatal.error('threshold_missed', {
                         stage: STAGE,
@@ -4303,7 +5274,7 @@ if (require.main === module) {
                     });
                 }
             }
-            if (error instanceof BenchmarkInputError && error.detail.length > 0) {
+            if (isThrownInstanceOf(error, BenchmarkInputError) && error.detail.length > 0) {
                 fatal.error('input_detail', {
                     stage: STAGE,
                     code: error.code,

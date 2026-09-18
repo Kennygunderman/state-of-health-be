@@ -135,6 +135,7 @@ import {
     SEARCH_ASCII_UPPERCASE,
     SEARCH_HEAD_CONNECTORS,
     SEARCH_RELEVANCE,
+    foldSearchAscii,
     searchQueryHeadNoun,
 } from './catalog.logic';
 import {
@@ -242,8 +243,13 @@ const TEXT_SEARCH_CONFIG = 'english';
  * `canonical_name`, which can be shorter than `display_name`; without the clamp
  * such a row could score above the ceiling and break the band.
  *
- * Measured on the committed 426-query set: this alone lifts the `partial` kind
- * (a query that is a prefix of the intended name) from 0.575 to 0.950 top-3.
+ * What the delivered spread scores is recorded rather than restated here:
+ * `data/meal-planning/reports/latest/benchmark-report.json` carries the
+ * per-kind rollup, and the `partial` kind — a query that is a prefix of the
+ * intended name — is the one this score decides. That report, produced by
+ * `npm run search:benchmark` against a loaded release, is the only figure about
+ * this file anything may be read off; a number written here would be a copy
+ * with no run behind it.
  */
 const prefixCoverageScore = (queryLength: number, matchedText: Prisma.Sql): Prisma.Sql => Prisma.sql`
     (${SEARCH_RELEVANCE.prefixCeiling}::real
@@ -266,11 +272,17 @@ const LIKE_METACHARACTERS = /[\\%_]/g;
  * ------------------------------------------------------------------------- */
 
 /**
- * The two columns a match can be scored against, as fragments rather than
- * strings, so a column name appears once in this file and a branch cannot
- * accidentally score one column while filtering on another.
+ * The three columns a match can be scored against or matched on, as fragments
+ * rather than strings, so a column name appears once in this file and a branch
+ * cannot accidentally score one column while filtering on another.
+ *
+ * `CANONICAL_NAME` carries no score of its own — the prefix branch scores a
+ * name match against `DISPLAY_NAME`, which is the text the client is shown —
+ * but it is matched on, and it is folded by the same helper as the other two,
+ * so it belongs in this list rather than inline in the branch.
  */
 const DISPLAY_NAME = Prisma.sql`f.display_name`;
+const CANONICAL_NAME = Prisma.sql`f.canonical_name`;
 const ALIAS = Prisma.sql`a.alias`;
 
 /**
@@ -291,16 +303,18 @@ const nameVector = Prisma.sql`to_tsvector(${TEXT_SEARCH_CONFIG}::regconfig, f.di
  * much of a food's name is NOT the query.
  *
  * Counted by splitting on spaces rather than by counting the tsvector's
- * lexemes, for two reasons that happen to agree. It is cheaper — no tsvector is
+ * lexemes, for two reasons that happen to agree. It is cheaper: no tsvector is
  * built, so the alias branch does not tokenise each matched food's name a
- * second time, which measured on the widest query of the committed set
- * ("chicken", 674 matching foods and 849 matching aliases) is the difference
- * between roughly +35 ms and +10 ms of statement time. And it is a better
- * measure of verbosity: the lexeme count DROPS stopwords, so "Rice with
- * raisins" counted two words against "Brown rice, dry"'s three and a dish
- * outranked the ingredient. Measured over the committed 426-query set, the word
- * count also scores marginally better — top-3 0.948 against 0.944, with the
- * `exact` kind at 0.915 against 0.902.
+ * second time — which is per matched row, and the widest query of the committed
+ * set matches several hundred foods and several hundred aliases, so it is the
+ * one place in this statement where a per-row tsvector would be paid for twice.
+ * And it is a better measure of verbosity: the lexeme count DROPS stopwords, so
+ * "Rice with raisins" counted two words against "Brown rice, dry"'s three and a
+ * dish outranked the ingredient. The relevance the delivered divisor achieves is
+ * whatever `data/meal-planning/reports/latest/benchmark-report.json` records for
+ * the release and conditions it names; the latency it is measured under is that
+ * report's p50/p95 for the whole service, and neither is restated here, because
+ * a figure in a comment has no run behind it.
  *
  * `GREATEST(…, 1)` is not defensive padding: `array_length` returns NULL for an
  * empty array, and dividing by NULL would make that row's rank NULL and sort it
@@ -423,11 +437,11 @@ export interface CatalogSearchResult {
  * WHAT A CONTRIBUTION'S `rank` IS, AND WHY IT IS NOT `ts_rank` ALONE.
  * `ts_rank`'s default normalisation scores by term frequency and ignores
  * document length, and a catalog food mentions any one word about once — so an
- * unaided `ts_rank` returns THE SAME VALUE for an entire match set. Measured
- * against the v1 release, `q = 'salt'` matches 595 published foods and the
- * number of distinct `ts_rank` values over them is exactly one; the order then
- * came entirely from the `display_name` tiebreaker, i.e. alphabetically, which
- * is why "Salt" itself came 463rd. Each branch below therefore scores its
+ * unaided `ts_rank` returns THE SAME VALUE for an entire match set. On a bare
+ * category word such as `q = 'salt'` every published food that mentions it once
+ * shares a single `ts_rank`, so the order came entirely from the `display_name`
+ * tiebreaker — alphabetically, which put the food actually called "Salt" pages
+ * deep. Each branch below therefore scores its
  * contribution with the weights in `catalog.logic.ts`'s {@link
  * SEARCH_RELEVANCE} — field, specificity and head noun, documented in full
  * there — and `ORDER BY rank DESC, display_name, source_key` is unchanged: the
@@ -459,11 +473,11 @@ export interface CatalogSearchResult {
  *     "Aubergine" — and nothing guarantees a food's `search_text` repeats its
  *     aliases. An alias is an ALTERNATIVE NAME, so a hit here weighs as much as
  *     a name hit, and its divisor is the LEAST SPECIFIC of the two names the
- *     match went through — `GREATEST(alias words, name words)`. Both halves
- *     of that were measured against v1 and each fixes the other's failure.
- *     Dividing by the alias alone let the one-word alias "chickens" on
- *     "Chicken, NS as to part and cooking method, NS as to skin eaten" score
- *     0.06079 and outrank "Chicken breast" on its own name at 0.03040, so for
+ *     match went through — `GREATEST(alias words, name words)`. Each half fixes
+ *     the other's failure, and both failures were observed against the v1
+ *     release rather than imagined. Dividing by the alias alone let the
+ *     one-word alias "chickens" on "Chicken, NS as to part and cooking method,
+ *     NS as to skin eaten" outrank "Chicken breast" on its own name, so for
  *     every category word the survey placeholder rows took page one. Dividing
  *     by the food's name alone put "Egg" first for "chicken", because its alias
  *     "chicken egg" mentions the word while its own one-word name makes it look
@@ -473,48 +487,49 @@ export interface CatalogSearchResult {
  *  3. and 4. A prefix fallback over the food's names and over its aliases. A
  *     stemmed query has no prefix semantics at all, so a two-character `q` such
  *     as "mu" matches NOTHING through 1 or 2 while a user is still typing. The
- *     comparison is written `lower(col) LIKE pattern` rather than `col ILIKE`
- *     because `ILIKE` has no index support at all without `pg_trgm`, and
- *     left-anchored because a prefix is the only LIKE shape a btree can answer
- *     with a range scan; an interior whole word is already covered by 1 and 2,
- *     which tokenise every word of the text.
+ *     comparison is written `<folded column> LIKE pattern` rather than
+ *     `col ILIKE` because `ILIKE` has no index support at all without
+ *     `pg_trgm`, and left-anchored because a prefix is the only LIKE shape a
+ *     btree can answer with a range scan; an interior whole word is already
+ *     covered by 1 and 2, which tokenise every word of the text.
  *
- *     KNOWN, BOUNDED DIVERGENCE IN THESE TWO BRANCHES, stated rather than
- *     hidden. Their pattern is folded in JavaScript (`q.toLowerCase()`) and
- *     their columns in SQL (`lower(col)`), and those two folds are not the same
- *     function outside A-Z: `'İNCİR'.toLowerCase()` is `i` + U+0307 while
- *     `lower('İNCİR')` is `incir` under en_US and `İncİr` under C. The head-noun
- *     path had the same defect and was fixed by folding both sides through
- *     {@link asciiFoldOf} / `foldSearchAscii` over one shared alphabet; these
- *     two branches CANNOT take that fix here, because
- *     `idx_catalog_food_aliases_lower_alias` indexes the expression
- *     `lower(alias) text_pattern_ops`, so writing `translate(alias, …) LIKE …`
- *     instead would no longer match the indexed expression and would replace
- *     the range scan with a sequential read of every published alias — the
- *     opposite of what the index below exists for, and a change the collation
- *     suite's index-scan pin would (correctly) fail.
- *     What this costs today: nothing measurable. Across release v1 no alias and
- *     no canonical_name contains a non-ASCII character at all, and exactly 2 of
- *     11,046 display_names do — `usda:2710826` and `usda:2727573`, whose only
- *     non-ASCII byte is U+00A0 NO-BREAK SPACE, which is not an uppercase letter,
- *     so `lower()` and the ASCII fold return the same string for both rows. The
- *     branches are therefore fold-equivalent on the shipped catalog, which is
- *     why `npm run search:benchmark` reproduces rank-for-rank across two
- *     independently loaded databases.
- *     What it would cost if a future release carried a non-ASCII uppercase
- *     letter: a partial query over that text would miss these branches (and a
- *     partial query matches through NO other branch, since a stemmed query has
- *     no prefix semantics), so the food would be absent from results rather
- *     than merely mis-ranked, and which queries were affected would depend on
- *     the server's collation.
- *     THE FIX, and who owns it: add an expression index over the ASCII fold —
- *     `(translate(alias, 'ABC…', 'abc…') text_pattern_ops)` and the matching
- *     pair on `display_name`/`canonical_name` — and then fold both sides here
- *     as the head-noun path already does. The index lives in
- *     `prisma/schema.prisma`, `prisma/migrations/20260908000000_meal_planning/`
- *     and `docs/meal-planning/expected-schema-diff.sql`, which belong to the
- *     schema work unit, so the change is theirs to make and this comment is the
- *     request for it.
+ *     BOTH SIDES OF THAT COMPARISON FOLD THROUGH ONE ASCII MAP, and that is a
+ *     correctness property rather than tidiness. The pattern is folded with
+ *     `foldSearchAscii` and each column with {@link asciiFoldOf} — the same 26
+ *     letters, exported once from `catalog.logic.ts` so the JavaScript and SQL
+ *     halves cannot drift. The pairing this replaced folded the pattern with
+ *     `q.toLowerCase()` and the columns with `lower()`, which are different
+ *     functions outside A-Z: `'İNCİR'.toLowerCase()` is `i` + U+0307 while
+ *     `lower('İNCİR')` is `incir` under en_US and `İncİr` under C. Because a
+ *     partial query matches through NO other branch, a food whose name carried
+ *     a non-ASCII capital was ABSENT from the result rather than mis-ranked,
+ *     and which queries were affected depended on the server's collation —
+ *     which AAP §0.9.3's identical-ranks-and-page-sequences contract forbids.
+ *     The head-noun path was corrected the same way and for the same reason.
+ *
+ *     WHAT THE FOLD DOES AND DOES NOT NORMALISE. It maps A-Z onto a-z and
+ *     nothing else. Every non-ASCII character passes through unchanged on BOTH
+ *     sides, which is what makes the two halves byte-identical wherever the
+ *     release is loaded; case folding beyond A-Z is left to
+ *     `to_tsvector`/`plainto_tsquery`, which apply one text-search
+ *     configuration to both halves of the full-text comparison. So a query
+ *     typed `MÜSLI` reaches a food named `Müsli` through contributions 1 and 2,
+ *     not through the prefix branches, and no branch's answer depends on the
+ *     database's locale.
+ *
+ *     `translate` RATHER THAN `lower` IS WHAT MAKES THAT TRUE IN SQL: it is a
+ *     character-for-character map over two argument strings with no ctype and
+ *     no collation input, while `lower()` resolves through the collation and
+ *     therefore answers differently on two servers holding the same release.
+ *
+ *     THREE INDEXES SERVE THE THREE COLUMNS, all over that same expression,
+ *     from `prisma/migrations/20260910000000_catalog_prefix_fold_indexes`:
+ *     `idx_catalog_food_aliases_fold_alias`, and
+ *     `idx_catalog_foods_fold_display_name` /
+ *     `idx_catalog_foods_fold_canonical_name`, the latter two partial on
+ *     `publication_status = 'published'` — this branch's own predicate — so
+ *     they stay the size of the published catalog. The fold therefore costs the
+ *     branches no scan: the indexed expression is the one they compare on.
  *
  * WHAT AN INDEX SCAN ON THE ALIAS PREFIX ACTUALLY NEEDS — TWO CONDITIONS, BOTH
  * MEASURED, AND THE SECOND IS WHY THE PATTERN IS BOUND INTO THE BRANCHES BELOW
@@ -525,10 +540,11 @@ export interface CatalogSearchResult {
  *    byte order — a `*_pattern_ops` operator class, or a column collation of C.
  *    The databases this project creates are `en_US.utf8`, and the one this
  *    service's own suite runs against is ICU `und`, so neither gives that for
- *    free; `idx_catalog_food_aliases_lower_alias` is declared with the class in
- *    `prisma/migrations/20260908000000_meal_planning/migration.sql` for exactly
- *    this predicate. Under the default `text_ops` the planner refuses the index
- *    even with `enable_seqscan = off` — it is unusable, not merely unattractive.
+ *    free; all three fold indexes are declared with the class in
+ *    `prisma/migrations/20260910000000_catalog_prefix_fold_indexes/migration.sql`
+ *    for exactly these predicates. Under the default `text_ops` the planner
+ *    refuses the index even with `enable_seqscan = off` — it is unusable, not
+ *    merely unattractive.
  *  * The pattern must reach the planner as a CONSTANT. The bound-derivation only
  *    runs when the LIKE right-hand side is a plan-time `Const`; a value
  *    projected out of a CTE arrives as a `Var`, and PostgreSQL materialises this
@@ -539,12 +555,16 @@ export interface CatalogSearchResult {
  *
  * Both conditions are asserted, not asserted-to:
  * `src/__tests__/api/catalogCollation.test.ts` — the suite that provisions a
- * database whose default collation makes the class load-bearing —
- * pins the operator class out of `pg_opclass`, pins the plan under
- * `enable_seqscan = off`, and reads the `pg_stat_user_indexes.idx_scan` delta
- * across a real `searchPublishedFoods` call. The cost direction they protect,
- * measured on a 10,000-alias corpus at 1% selectivity: ~2.5-3.0 ms for the
- * sequential scan against ~0.1-0.2 ms for the index scan.
+ * database whose default collation makes the class load-bearing — pins the
+ * operator class out of `pg_opclass`, pins the plan of the folded predicate
+ * under `enable_seqscan = off` down to the `~>=~`/`~<~` range bounds, and then
+ * pins the PLAN OF THIS SERVICE'S OWN STATEMENT: it captures the SQL and the
+ * bound values a real `searchPublishedFoods` call issued and re-plans them
+ * under `EXPLAIN (ANALYZE, FORMAT JSON)`, asserting a node that read the index
+ * with the row and loop counters only an executed node reports. What is pinned
+ * is therefore the PLAN rather than a duration — the difference between a range
+ * scan and a sequential read of every published alias is a plan property, and a
+ * timing would put host load into the evidence.
  *
  * The alias branches still read the whole published alias set for the two
  * full-text contributions, because the schema declares no GIN index over aliases
@@ -553,7 +573,14 @@ export interface CatalogSearchResult {
  * is what `npm run search:benchmark` measures against the p95 threshold.
  */
 const catalogMatchSet = (q: string): Prisma.Sql => {
-    const prefixPattern = `${q.toLowerCase().replace(LIKE_METACHARACTERS, '\\$&')}%`;
+    // Folded with `foldSearchAscii` and not with `toLowerCase()`, because the
+    // columns this pattern is compared against are folded by `asciiFoldOf` —
+    // the SQL half of the same map. The fold comes first and the `LIKE`
+    // metacharacter escape second: the fold maps A-Z onto a-z and touches
+    // nothing else, so it can neither introduce nor consume a metacharacter,
+    // while escaping first would have the fold walk over the backslashes the
+    // escape just added.
+    const prefixPattern = `${foldSearchAscii(q).replace(LIKE_METACHARACTERS, '\\$&')}%`;
     // Code points, which is what PostgreSQL's `char_length` counts over UTF-8,
     // so the coverage ratio means the same thing on both sides. Computed here
     // rather than as `char_length($1)` only because the value is the same for
@@ -596,7 +623,8 @@ const catalogMatchSet = (q: string): Prisma.Sql => {
             SELECT f.id, ${prefixCoverageScore(queryLength, DISPLAY_NAME)} AS rank
             FROM catalog_foods f
             WHERE f.publication_status = ${PUBLISHED}
-                AND (lower(f.display_name) LIKE ${prefixPattern} OR lower(f.canonical_name) LIKE ${prefixPattern})
+                AND (${asciiFoldOf(DISPLAY_NAME)} LIKE ${prefixPattern}
+                    OR ${asciiFoldOf(CANONICAL_NAME)} LIKE ${prefixPattern})
 
             UNION ALL
 
@@ -626,7 +654,7 @@ const catalogMatchSet = (q: string): Prisma.Sql => {
             FROM catalog_food_aliases a
             JOIN catalog_foods f ON f.id = a.catalog_food_id
             WHERE f.publication_status = ${PUBLISHED}
-                AND lower(a.alias) LIKE ${prefixPattern}
+                AND ${asciiFoldOf(ALIAS)} LIKE ${prefixPattern}
         )
     `;
 };

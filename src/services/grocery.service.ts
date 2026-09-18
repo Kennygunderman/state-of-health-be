@@ -91,6 +91,13 @@ import {
 } from './grocery.logic';
 import { GroceryItemRow, toGroceryChangeSummary, toGroceryItem, toGroceryListResponse } from './grocery.mapper';
 import { PlanNotFoundError } from './mealPlanning.errors';
+import {
+    ActionLedgerIntegrityError,
+    IdentifiableRecord,
+    StoredResponseRecord,
+    classifyActionCompletion,
+    findMissingCompletionFields,
+} from './mealPlanningAction.logic';
 import { withUserLock } from './mealPlanningAction.service';
 import { resolveUserToday } from './preferences.service';
 import { isMealSlot } from './recipe.logic';
@@ -947,14 +954,72 @@ const readSwapContext = (snapshot: unknown): GrocerySwapContext | null => {
 };
 
 /**
+ * The three completion columns of a `meal_plan_actions` row, plus its id, in
+ * database spelling — the only part of that table this module reads.
+ *
+ * Declared locally and satisfied structurally by the Prisma row, as
+ * `nutrition.service.ts` and `mealPlanningAction.service.ts` declare their own
+ * row shapes.
+ */
+interface LedgerCompletionRow {
+    id: string;
+    response_status: number | null;
+    response_snapshot: unknown;
+    plan_revision_after: number | null;
+}
+
+/**
+ * One row, one mapper (§6): snake_case columns → the camelCase record the
+ * ledger's pure layer declared for exactly this question.
+ *
+ * The mapping is what lets this module ASK `mealPlanningAction.logic.ts` whether
+ * a row is completed instead of deciding it here. A second answer to "which
+ * columns make a row completed" is the drift the shared classifier exists to
+ * prevent, and the one thing that must stay in step is this projection — which
+ * is why the field list lives here once and is read by both the predicate above
+ * and the classifier below.
+ */
+const toStoredResponseRecord = (row: LedgerCompletionRow): StoredResponseRecord & IdentifiableRecord => ({
+    id: row.id,
+    responseStatus: row.response_status,
+    responseSnapshot: row.response_snapshot,
+    planRevisionAfter: row.plan_revision_after,
+});
+
+/**
  * The last COMPLETED swap of this plan, from the keyed-write ledger.
  *
  * The ledger is the only truthful source for "did a swap change this list, and
  * which slot was it?": the grocery rows themselves record amounts, not causes,
  * and `meal_plan_meals.swapped_at` records that a meal was swapped without
- * recording whether the shop moved. A reserved-but-pending row is excluded by
- * `response_status: { not: null }` — a swap still inside its own transaction has
- * not changed anything yet, and its rebuild is part of the same commit.
+ * recording whether the shop moved.
+ *
+ * COMPLETED MEANS ALL THREE COLUMNS, and this read applies the ledger's own
+ * definition rather than a cheaper approximation of it.
+ * `mealPlanningAction.logic.ts` fills `response_status`, `response_snapshot` and
+ * `plan_revision_after` in the ONE statement that completes a reserved row, so
+ * §0.5.1 leaves a row with either none of them (pending — a swap still inside
+ * its own transaction, which has changed nothing yet and whose rebuild is part
+ * of the same commit) or all three (completed). A row holding some but not
+ * others is the `corrupt` state that ledger names, and predicating on
+ * `response_status` alone would accept one: it would win `created_at desc`,
+ * yield no readable snapshot, and SUPPRESS the older genuinely completed swap
+ * whose notice the shopper should have seen. All three are therefore required
+ * here, so a partial row is not the last completed swap and the read walks past
+ * it to one that is.
+ *
+ * `Prisma.AnyNull` and not `DbNull` for the snapshot: the column is `jsonb`, so
+ * it can hold a SQL NULL or the JSON value `null`, and both read back as `null`
+ * — neither is a response body. `AnyNull` excludes both, which is what makes the
+ * database's answer and {@link classifyActionCompletion}'s verdict agree.
+ *
+ * The classifier is then asked anyway, over the same three columns the predicate
+ * filtered on. That is not distrust of the query but the one place the two
+ * definitions could drift: if a filter here ever stopped matching the ledger's
+ * contract, this read would start answering from a row the ledger would refuse
+ * to replay. It cannot fire as written, so it reports rather than defaults —
+ * `ActionLedgerIntegrityError` names the absent columns and the row an operator
+ * must look at, exactly as the replay path does.
  *
  * `created_at desc` with the primary key as a tiebreaker, so two swaps sharing a
  * timestamp still resolve to one deterministic answer rather than to whichever
@@ -976,14 +1041,26 @@ const loadLastSwapContext = async (
             user_id: userId,
             meal_plan_id: planId,
             action_type: SWAP_ACTION_TYPE,
-            response_status: { not: null },
             created_at: { lte: now },
+            response_status: { not: null },
+            response_snapshot: { not: Prisma.AnyNull },
+            plan_revision_after: { not: null },
         },
         orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
-        select: { response_snapshot: true },
+        select: { id: true, response_status: true, response_snapshot: true, plan_revision_after: true },
     });
 
-    return action === null ? null : readSwapContext(action.response_snapshot);
+    if (action === null) {
+        return null;
+    }
+
+    const record = toStoredResponseRecord(action);
+
+    if (classifyActionCompletion(record) !== 'completed') {
+        throw new ActionLedgerIntegrityError(findMissingCompletionFields(record), action.id);
+    }
+
+    return readSwapContext(record.responseSnapshot);
 };
 
 /**

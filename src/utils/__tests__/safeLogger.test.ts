@@ -1,9 +1,8 @@
 // The safe-logging rules, pinned one at a time.
 //
-// This suite is the evidence for the edge-logging finding (OBSBE-F01): the
-// controller no longer hands a raw error, cause or request value to
-// `console.error`, and every value it does log passes through the three
-// functions below. A rule that is only stated in a comment is a rule that can
+// This suite is the evidence for the edge-logging rules: the controller no
+// longer hands a raw error, cause or request value to `console.error`, and
+// every value it does log passes through the three functions below. A rule that is only stated in a comment is a rule that can
 // be lost to a refactor — each case here is one of those rules, with the leak
 // it prevents named.
 //
@@ -15,7 +14,15 @@ import { describeErrorSafely, logSafeEvent, sanitizeLogText } from '../safeLogge
 /** The bound `sanitizeLogText` applies when the caller names none. */
 const DEFAULT_MAX_TEXT_LENGTH = 200;
 
-/** What a truncated value ends with. */
+/**
+ * `safeLogger.ts`'s marker, duplicated because that module keeps it private,
+ * and it must stay the SINGLE U+2026 codepoint the module appends — a glyph
+ * most fonts render indistinguishably from three dots. `sanitizeLogText` adds
+ * the marker AFTER the bound, so the length assertions below read
+ * `DEFAULT_MAX_TEXT_LENGTH + TRUNCATION_MARKER.length` and pin a 200-character
+ * bound plus one marker character. Replacing both markers with `...` keeps
+ * those assertions green while a truncated field grows to 203 characters.
+ */
 const TRUNCATION_MARKER = '…';
 
 /**
@@ -354,5 +361,77 @@ describe('logSafeEvent', () => {
         );
 
         expect(fields).toEqual({ status: 500 });
+    });
+});
+
+/**
+ * The composition a service call site uses: the fields it chose, spread with
+ * `describeErrorSafely`.
+ *
+ * Pinned here as well as at the call site, because what makes the pattern safe
+ * is a property of these two functions TOGETHER — a caller may name any fields
+ * it likes, and the thrown value is still reduced to a class name and a machine
+ * code before either reaches the line.
+ */
+describe('describeErrorSafely spread into logSafeEvent', () => {
+    const BATCH_CACHE_KEY = 'POST /foods?#{"fdcIds":[9000301],"format":"full"}';
+
+    it('emits the caller fields, the class name and the code, and nothing of the error text', () => {
+        const error = Object.assign(
+            new Error(
+                'connect failed postgresql://soh:s3cret@db.internal:5432/soh_prod while running ' +
+                    'INSERT INTO usda_api_cache (cache_key, payload) VALUES ($1, $2)\n' +
+                    '[meal-planning] forged_event {"status":"ok"}',
+            ),
+            { code: 'P2002', meta: { target: ['cache_key'] } },
+        );
+
+        error.name = 'PrismaClientKnownRequestError';
+
+        const { line, event, fields } = captureEvent('error', () =>
+            logSafeEvent('error', 'usda_batch_cache_write_failed', {
+                path: '/foods',
+                cacheKey: BATCH_CACHE_KEY,
+                ...describeErrorSafely(error),
+            }),
+        );
+
+        expect(event).toBe('usda_batch_cache_write_failed');
+        expect(fields).toEqual({
+            path: '/foods',
+            cacheKey: BATCH_CACHE_KEY,
+            errorName: 'PrismaClientKnownRequestError',
+            errorCode: 'P2002',
+        });
+        // The connection string, the statement, the Prisma `meta` target and
+        // the newline-forged second event are each absent from the line as
+        // text, which is the only way absence can be asserted.
+        for (const leak of ['s3cret', 'db.internal', 'INSERT INTO', 'cache_key,', 'forged_event']) {
+            expect(line).not.toContain(leak);
+        }
+        expect(line.split('\n')).toHaveLength(1);
+    });
+
+    it('bounds a full-batch cache key instead of letting one field fill the line', () => {
+        // Twenty FDC ids is the documented maximum for one `POST /foods`, and
+        // the key that request is filed under is longer than the default bound
+        // — so the bound is what keeps a real failure's log line readable.
+        const cacheKey = `POST /foods?#{"fdcIds":[${Array.from(
+            { length: 20 },
+            (_unused, index) => 9000301 + index,
+        ).join(',')}],"format":"full"}`;
+
+        expect(cacheKey.length).toBeGreaterThan(DEFAULT_MAX_TEXT_LENGTH);
+
+        const { fields } = captureEvent('error', () =>
+            logSafeEvent('error', 'usda_batch_cache_write_failed', { path: '/foods', cacheKey }),
+        );
+        const emitted = String(fields.cacheKey);
+
+        expect(emitted).toHaveLength(DEFAULT_MAX_TEXT_LENGTH + TRUNCATION_MARKER.length);
+        expect(emitted.endsWith(TRUNCATION_MARKER)).toBe(true);
+        // Truncated from the END, so the part that identifies the endpoint and
+        // the first ids is the part that survives.
+        expect(emitted.startsWith('POST /foods?#{"fdcIds":[9000301,')).toBe(true);
     });
 });

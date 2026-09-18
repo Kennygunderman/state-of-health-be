@@ -1353,8 +1353,8 @@ measure: "227 g" is a plainer line than "1 tub", and it is the amount that was
 actually measured.
 
 **The boundary between the two lists and the rest of the catalogue is drawn
-deliberately, and it is this.** 788 of the 3,514 count-family default portions
-in the committed release match; the other 2,726 keep counting:
+deliberately, and it is this.** 702 of the 3,022 count-family default portions
+in the committed release match; the other 2,320 keep counting:
 
 - **A vessel, a tabulation unit or a dose is measured.** Cans, jars,
   containers, packages, packets, bags, pouches, envelopes and serving bowls;
@@ -1381,7 +1381,7 @@ in the committed release match; the other 2,726 keep counting:
 
 `grocery.logic.test.ts` pins this boundary as a corpus: one case per form family
 the release actually ships, on both sides, each quoted verbatim with its row
-count, plus a sweep that re-derives the 3,514 / 788 / 2,726 split from
+count, plus a sweep that re-derives the 3,022 / 702 / 2,320 split from
 `data/meal-planning/catalog/releases/v1/portions.jsonl`. Adding a word carelessly
 and leaving a form family out both fail it.
 

@@ -8,18 +8,35 @@
  * it is absent, so no request is ever built. That is the whole of the parent's
  * protection, and it does not extend to a child process that must carry keys.
  *
- * The script suites launch real CLI entry points as children, and those
- * children need the keys PRESENT: every stage runs a `preflight` before it
- * takes any lock, and a missing vendor key is reported there as a prerequisite
- * gap — so without the keys the child exits on `stage_prerequisites_unmet` and
- * never reaches the behaviour under test. The keys those harnesses set are
- * deliberately unusable placeholders, and the stage is expected to refuse
- * before opening a request. "Expected to" was the problem: nothing in the child
- * enforced it, so a regression in the very refusal being tested — a lock that
- * is not taken, a prerequisite that stops being checked — would let a real
- * `catalog:import` begin against `api.nal.usda.gov` from a unit test, spending
- * a rate budget the suite does not own and, with a real key in the environment
- * instead of a placeholder, spending money.
+ * The children that need a key PRESENT are the VENDOR-CONSUMING stages only:
+ * `catalog-import-usda.ts` requires `USDA_API_KEY`, `catalog-generate-ai.ts`
+ * requires `OPENROUTER_API_KEY`, and `catalog-validate.ts` requires
+ * `OPENROUTER_API_KEY` only with `--review`. Each reports the missing key from
+ * the `preflight` it runs before it takes any lock, so a child launched without
+ * it exits on `stage_prerequisites_unmet` and never reaches the behaviour under
+ * test. Three stages can therefore need a key — import, generation, and
+ * validation under `--review` — which is the split AAP §0.4.3 records where it
+ * makes `CATALOG_MODEL_CALL_BUDGET` the one cap that generation and review
+ * calls share across a single `catalog:generate` or `catalog:validate` run.
+ *
+ * `catalog-release.ts`, `catalog-load.ts`, `catalog-report.ts`,
+ * `search-benchmark.ts` and `recipes-seed.ts` read NEITHER key: they publish
+ * and load a checksummed release that vendor output has already been baked
+ * into. That is the offline half of the same split, and what §0.1.1's
+ * guarantee rests on — that after seeding nothing in planning, swapping,
+ * grocery aggregation, recipe viewing or internal catalog search makes a live
+ * USDA or model call. A child running one of those stages therefore carries no
+ * vendor key, and gives this hook nothing to protect.
+ *
+ * The keys the vendor-capable harnesses set (the stage-lock cases in
+ * `src/__tests__/scripts/catalog-import.test.ts`) are deliberately unusable
+ * placeholders, and the stage is expected to refuse before opening a request.
+ * "Expected to" was the problem: nothing in the child enforced it, so a
+ * regression in the very refusal being tested — a lock that is not taken, a
+ * prerequisite that stops being checked — would let a real `catalog:import`
+ * begin against `api.nal.usda.gov` from a unit test, spending a rate budget the
+ * suite does not own and, with a real key in the environment instead of a
+ * placeholder, spending money.
  *
  * WHY THIS FILE IS PLAIN COMMONJS JAVASCRIPT AND NOT TYPESCRIPT. It has to be
  * the FIRST `--require` the child loads, ahead of `ts-node/register`. A

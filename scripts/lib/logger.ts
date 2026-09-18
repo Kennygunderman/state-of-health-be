@@ -10,15 +10,18 @@
 // OPENROUTER_API_KEY (an `Authorization: Bearer` header that OpenRouter's own
 // error bodies can reflect).
 //
-// The module imports one Node builtin — `fs`, for the synchronous fatal write
+// The module imports two Node builtins — `fs`, for the synchronous fatal write
 // path at the bottom of the file, which is the only way a refusal can be
-// guaranteed to reach fd 2 before `process.exit()` — and nothing else. It reads
-// no environment variable and has no import-time side effect. It formats and
-// redacts, and decides nothing about the pipeline (§1.1); the log level is an
-// injected option rather than a new env key (§1.6/§9); and `write`/`now` are
+// guaranteed to reach fd 2 before `process.exit()`, and `crypto`, for the
+// one-way digest `opaqueDigest` below hands a caller that must correlate two
+// runs without naming the thing they were pointed at — and nothing else. It
+// reads no environment variable and has no import-time side effect. It formats
+// and redacts, and decides nothing about the pipeline (§1.1); the log level is
+// an injected option rather than a new env key (§1.6/§9); and `write`/`now` are
 // injected so the pure rules below are unit-testable from `src/__tests__`
 // (§11 — Jest's `roots` is `<rootDir>/src`, so no test file can live here).
 
+import crypto from 'crypto';
 import fs from 'fs';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -160,19 +163,22 @@ const hasSchemeBefore = (value: string, separatorIndex: number): boolean => {
  * WHY THIS IS SCANNED AND NOT MATCHED.
  *
  * A regex can express the rule, and both spellings of it are worse than a scan.
- * Measured on this runtime:
+ * The reasons are structural rather than measured, so they hold on any runtime
+ * and on any machine (no timing figure is quoted here: a millisecond count
+ * depends on the host, the load and the engine version, and none of those is
+ * recorded beside it — the reproducible assertion is the time BUDGET in
+ * `src/__tests__/scripts/catalog-import.test.ts`, which runs the real function
+ * on adversarial input):
  *
  *  - An unbounded scheme body — `([a-z][a-z0-9+.-]*:\/\/)` — is quadratic in the
- *    length of a scheme-legal run: 51 ms at 10,000 characters of `A-KEY-`,
- *    211 ms at 20,000 and 840 ms at 40,000, and 19,758 ms at 200,000. A vendor
- *    error body is caller-supplied input this module is expected to survive, so
- *    the bound is a security property. That is why `hasSchemeBefore` above is
- *    bounded too.
+ *    length of a scheme-legal run, because the engine retries the unbounded
+ *    quantifier from every offset in that run. A vendor error body is
+ *    caller-supplied input this module is expected to survive, so the bound is a
+ *    security property. That is why `hasSchemeBefore` above is bounded too.
  *  - A bounded greedy authority — `[^\/\s?#]*@` — is correct on the sample and
- *    costs 60 ms on `a://` followed by 200,000 delimiter-free characters,
- *    because a global regex retries the bounded scheme quantifier at every one
- *    of those offsets. The scan below is 8 ms on the same input and 0.1 ms on
- *    200,000 characters of prose carrying one DSN.
+ *    still rescans: a global regex retries the bounded scheme quantifier at
+ *    every offset of a delimiter-free run. The scan below reads each `://` once
+ *    and each authority once, so its cost is linear in the input.
  *  - A bounded authority — `[^\/\s?#]{0,N}@` — fails to match at all once the
  *    authority is longer than N, which does not shorten the leak but widens it:
  *    a 600-character password would go from partially redacted to printed whole.
@@ -274,10 +280,12 @@ type ScrubRule = { pattern: RegExp; replacement: string } | { scrub: (value: str
 
 const SCRUB_RULES: Array<ScrubRule> = [
     { pattern: /-----BEGIN[\s\S]*?-----END[^-\n]*-----/g, replacement: REDACTED },
-    // URL userinfo, scanned rather than matched, and third rather than first or
-    // last: a private key must already have been collapsed by the rule above,
-    // and this must run before the Bearer rule so a credential written as a URL
-    // is gone before anything else can claim part of it. `redactUrlUserinfo`
+    // URL userinfo, scanned rather than matched, and SECOND — after the PEM
+    // rule and before the Bearer rule, which are the two neighbours that fix
+    // its position: a private key must already have been collapsed by the rule
+    // above, and this must run before the Bearer rule so a credential written
+    // as a URL is gone before anything else can claim part of it.
+    // `redactUrlUserinfo`
     // carries the reasoning — the authority is read to its RFC 3986 end and the
     // LAST `@` in it is the userinfo delimiter, because an unescaped `@` is
     // legal in a URL password and stopping at the first one prints its suffix.
@@ -295,10 +303,11 @@ const SCRUB_RULES: Array<ScrubRule> = [
     // persisted by checkpoint.ts into `catalog_import_runs.log`, verbatim.
     //
     // Both quantifiers around the name are bounded for the same reason the URL
-    // rule above is. A lead-in written as the prefix loop `(?:[A-Za-z0-9]+[_-])*`
-    // measured 20,541 ms on `'api_key_'.repeat(25000)`, and relaxing the
-    // trailing-segment loop to `{0,32}` measured 19,900 ms; the forms below stay
-    // in single-digit milliseconds on those inputs. The trailing loop is what
+    // rule above is, and for the same structural reason rather than a measured
+    // one: a lead-in written as the prefix loop `(?:[A-Za-z0-9]+[_-])*`, or a
+    // trailing-segment loop relaxed to `{0,32}`, nests one unbounded-in-practice
+    // quantifier inside another and rescans a long name-shaped run from every
+    // offset in it. The bounded forms below cannot. The trailing loop is what
     // recognises a suffixed name (`API_KEY_ID`, `SERVICE_ACCOUNT_JSON`), and four
     // segments is more than any name this pipeline configures.
     {
@@ -440,17 +449,278 @@ export const isSecretBearingKey = (key: string): boolean => {
     return secretKeyWordsOf(key).some((word) => SECRET_BEARING_KEY_WORDS.has(word));
 };
 
-// The sanctioned way to render a thrown value (§8). `name` survives so the
-// typed errors this folder throws — DatabaseOriginError, ManifestError,
-// ModelBudgetError, CheckpointError — stay distinguishable in the log, while
-// the stack, the cause and the object itself never leave this function.
-export const safeError = (error: unknown): { name: string; message: string } => {
-    if (error instanceof Error) {
-        const name = typeof error.name === 'string' && error.name.length > 0 ? error.name : 'Error';
-        const message = typeof error.message === 'string' ? error.message : '';
-        return { name: scrubSecrets(name), message: scrubSecrets(message) };
+/**
+ * A MACHINE code carried by a thrown value — Prisma's `P2002`, Node's
+ * `ENOENT`, a typed error's own `code`. Bounded and alphanumeric, so a `code`
+ * that is really a message, a path, a SQL fragment or an echoed argument fails
+ * the test and is dropped rather than logged. The same pattern
+ * `src/utils/safeLogger.ts` applies at the HTTP edge, kept identical so the two
+ * halves of this codebase answer "what may a log say about a failure" the same
+ * way.
+ */
+const ERROR_CODE_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
+
+/** An error class name is a class name; 64 characters covers every class here and bounds a foreign one. */
+const MAX_ERROR_NAME_LENGTH = 64;
+
+const FALLBACK_ERROR_NAME = 'Error';
+const NON_ERROR_NAME = 'UnknownError';
+
+/** The closed description of a failure: no field of it can carry caller, vendor or model text. */
+export interface SafeErrorFields {
+    readonly name: string;
+    readonly code?: string;
+    readonly status?: number;
+}
+
+// A property read off a thrown value that cannot itself fail: `throw` accepts
+// any value, so a getter here may throw and the value may be a primitive or
+// null. A logging path must answer either way.
+const propertyOfThrown = (error: unknown, key: 'code' | 'status'): unknown => {
+    try {
+        return (error as Record<string, unknown> | null | undefined)?.[key];
+    } catch {
+        return undefined;
     }
-    return { name: 'UnknownError', message: 'Unknown error' };
+};
+
+/**
+ * Whether a thrown value is an `Error`, ACROSS REALMS.
+ *
+ * WHY `instanceof` ALONE IS NOT ENOUGH, and why this matters more than it looks.
+ * `instanceof` compares against one realm's `Error.prototype`, and a thrown
+ * value does not always come from the realm doing the checking. The case that
+ * bites here is Jest: each test file runs inside a sandboxed context with its
+ * own intrinsics, while `fs`, `JSON` and the other core modules throw errors
+ * built from the HOST realm's `Error` — so a bare `error instanceof Error` is
+ * `false` for the very failures these scripts report most often. The same is true of a
+ * value crossing a `vm` context or a worker boundary.
+ *
+ * Before this function existed the consequence was invisible, because
+ * {@link safeError} still carried a `message` and the `ENOENT` was inside it.
+ * It is not invisible now: the closed field set made `code` the ONLY carrier of
+ * what an operator acts on, so a realm mismatch silently downgraded a
+ * diagnosable `Error (code ENOENT)` to a bare `UnknownError`. Two engineers hit
+ * exactly that while writing assertions against a filesystem refusal, which is
+ * how it was found.
+ *
+ * `Object.prototype.toString` reads the value's internal tag rather than its
+ * prototype chain, so a native `Error` from any realm answers `[object Error]`
+ * — including subclasses and `AggregateError`, and excluding `DOMException`,
+ * which carries its own tag.
+ *
+ * A HOSTILE VALUE CAN SPOOF THE TAG by setting `Symbol.toStringTag`, and that
+ * buys it nothing: every field read afterwards is constrained independently —
+ * `name` is scrubbed and bounded to {@link MAX_ERROR_NAME_LENGTH}, `code` must
+ * match {@link ERROR_CODE_PATTERN}, `status` must be an integer in the HTTP
+ * range — so the worst a spoof achieves is being described as an error it
+ * resembles. The check decides which BRANCH runs, never what may be printed.
+ *
+ * WHY BOTH INSPECTIONS ARE CONTAINED. Neither operation is safe on an arbitrary
+ * value, and `throw` accepts any value at all:
+ *
+ *  * `Object.prototype.toString.call(value)` READS `Symbol.toStringTag`, so an
+ *    object defining that key as a throwing getter makes the tag check throw.
+ *  * `instanceof` invokes `Error[Symbol.hasInstance]` and walks the prototype
+ *    chain, so a `Proxy` with a `getPrototypeOf` trap makes even that throw.
+ *
+ * An exception here would escape {@link safeError}, which is called from the
+ * top-level catch and the run finalizer of every stage — so a hostile or merely
+ * exotic thrown value would REPLACE the failure being reported and suppress the
+ * refusal entirely. Both inspections are therefore contained and the value is
+ * treated as a non-error when either is untrustworthy, which is the safe
+ * default: {@link NON_ERROR_NAME} says only that the thrown value was not an
+ * error this module could classify, and that is exactly what an unreadable
+ * value is.
+ */
+const isErrorLike = (value: unknown): value is Error => {
+    try {
+        if (value instanceof Error) {
+            return true;
+        }
+    } catch {
+        return false;
+    }
+
+    try {
+        return Object.prototype.toString.call(value) === '[object Error]';
+    } catch {
+        return false;
+    }
+};
+
+/**
+ * `value instanceof ctor`, CONTAINED — for the one place it has to be: deciding
+ * what a THROWN value is.
+ *
+ * `instanceof` is not a safe operation on an arbitrary value. It consults
+ * `ctor[Symbol.hasInstance]` and walks the value's prototype chain, so a `Proxy`
+ * with a `getPrototypeOf` trap makes it throw. `throw` accepts any value, so a
+ * failure-classifying chain of bare `error instanceof X` checks is a chain of
+ * operations that can each raise — which is why every such check in `scripts/`
+ * now goes through this function.
+ *
+ * WHY THAT IS WORSE THAN IT SOUNDS. These chains run in `describeFailure`, which
+ * every stage calls from its top-level catch and its run finalizer. An exception
+ * raised WHILE classifying a failure replaces the failure being reported and
+ * escapes the handler, so the stage exits with no structured account of why —
+ * the single thing that handler exists to produce. `safeError` is already total
+ * for the same reason; this is the other half of it, because a chain that throws
+ * before reaching `safeError` never gets the chance to be described at all.
+ *
+ * A value this returns `false` for is reported as an unrecognised failure, which
+ * is the honest answer: a value whose type cannot be determined is not known to
+ * be any of the classes the chain was asking about.
+ */
+export const isThrownInstanceOf = <T>(
+    value: unknown,
+    ctor: abstract new (...args: never[]) => T,
+): value is T => {
+    try {
+        return value instanceof ctor;
+    } catch {
+        return false;
+    }
+};
+
+const machineCodeOf = (error: unknown): string | undefined => {
+    const code = propertyOfThrown(error, 'code');
+
+    return typeof code === 'string' && ERROR_CODE_PATTERN.test(code) ? code : undefined;
+};
+
+// An HTTP status, and only an integer in the HTTP range: a `status` holding
+// anything else is a field this module does not recognise and does not print.
+const statusOf = (error: unknown): number | undefined => {
+    const status = propertyOfThrown(error, 'status');
+
+    return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+        ? status
+        : undefined;
+};
+
+/**
+ * The sanctioned way to render a thrown value (§8), and a CLOSED one: the class
+ * name, a machine `code` when the value carries one, and an HTTP `status` when
+ * it carries one. Nothing else.
+ *
+ * WHY `message` IS NOT HERE, AND WHY REMOVING IT WAS THE FIX. Every line this
+ * module writes outlives the command that wrote it — an operator's terminal, a
+ * CI log, and (through checkpoint.ts's `sanitizeRunLogEntry`) the
+ * `catalog_import_runs.log` JSONB column that committed reports are assembled
+ * from. `SCRUB_RULES` removes credential PATTERNS, and an arbitrary
+ * `Error.message` carries no pattern to remove: Prisma prints the failing
+ * statement's values and the connection target, `fs` prints absolute paths,
+ * `Intl`/`Date` echo the argument that was rejected, a vendor body arrives
+ * verbatim, and a model-proposed name arrives as whatever the model wrote. A
+ * scrubbed message is therefore a message that has been checked for the three
+ * configured credentials and for nothing else, which is not the same as safe to
+ * persist (CWE-532). The three fields above are values this repository owns end
+ * to end, so the guarantee is a property of the TYPE rather than of each call
+ * site's judgement — no caller can reach a message through this function, and
+ * the compiler says so.
+ *
+ * WHAT REPLACES IT. The diagnosis lives in fields the caller composes: the
+ * stage's own `code` (every script's `describeFailure` maps each error class to
+ * one), the typed `context` its error classes carry, and the fixed remedy
+ * prose written in this repository. A stage that has narrowed a value to ITS
+ * OWN error class may still forward that error's message deliberately — the
+ * text is this repository's, so it echoes no foreign input — by reading
+ * `error.message` through `scrubSecrets` at the narrowed site, which is what
+ * `scripts/seed-dev.ts` does and documents. The distinction is provenance, and
+ * only the call site knows it.
+ *
+ * `name` survives so the typed errors this folder throws — DatabaseOriginError,
+ * ManifestError, ModelBudgetError, CheckpointError — stay distinguishable in
+ * the log, while the stack, the cause, the message and the object itself never
+ * leave this function.
+ */
+export const safeError = (error: unknown): SafeErrorFields => {
+    // `isErrorLike`, not `instanceof`: a core module's error reaching a Jest
+    // sandbox is not an instance of that sandbox's `Error`, and the closed field
+    // set makes `code` the only carrier of what an operator acts on — see the
+    // reasoning there.
+    if (!isErrorLike(error)) {
+        // Never `String(value)`: that prints the value this function exists to
+        // withhold.
+        return { name: NON_ERROR_NAME };
+    }
+
+    const rawName = typeof error.name === 'string' && error.name.length > 0 ? error.name : FALLBACK_ERROR_NAME;
+    const name = scrubSecrets(rawName).slice(0, MAX_ERROR_NAME_LENGTH) || FALLBACK_ERROR_NAME;
+    const code = machineCodeOf(error);
+    const status = statusOf(error);
+
+    // Assembled so an absent member is ABSENT rather than `undefined`: these
+    // objects are compared as key sets by the canary tests and serialised into
+    // a JSONB column, and `{name, code: undefined}` reads as a code that was
+    // lost rather than one that never existed.
+    return {
+        name,
+        ...(code === undefined ? {} : { code }),
+        ...(status === undefined ? {} : { status }),
+    };
+};
+
+/**
+ * {@link safeError} rendered as one clause, for a sentence this repository is
+ * composing about a failure it did not compose.
+ *
+ * `formatSafeError(new Error())` is `'Error'`; an `ENOENT` from `fs` is
+ * `'Error (code ENOENT)'`; a vendor failure carrying a status is
+ * `'UsdaError (status 503)'`. It exists because the alternative every caller
+ * reached for was `${safeError(error).message}`, and the eight sentences that
+ * did so are exactly the disclosure this module now makes unreachable: they
+ * kept their own actionable half ("Move or repair the file and run again") and
+ * lose only the foreign prose.
+ */
+export const formatSafeError = (error: unknown): string => {
+    const described = safeError(error);
+    const qualifiers: string[] = [];
+
+    if (described.code !== undefined) {
+        qualifiers.push(`code ${described.code}`);
+    }
+    if (described.status !== undefined) {
+        qualifiers.push(`status ${String(described.status)}`);
+    }
+
+    return qualifiers.length === 0 ? described.name : `${described.name} (${qualifiers.join(', ')})`;
+};
+
+/**
+ * How much of the digest is printed. Twelve hex characters is 48 bits: enough
+ * that two databases in one operator's hands do not collide, short enough that
+ * the last rule in SCRUB_RULES — which redacts any opaque run of 40 or more —
+ * leaves it intact.
+ */
+const OPAQUE_DIGEST_CHARS = 12;
+
+/**
+ * A one-way digest of a value a log line must be able to CORRELATE but not
+ * DISCLOSE.
+ *
+ * The case this exists for is the database a run was pointed at. An operator
+ * comparing two runs, or a report reader checking that a benchmark and a load
+ * describe the same target, needs to know whether the two targets were the
+ * same; neither needs the host or the database name, and a stage log carrying
+ * them publishes an organisation's internal topology into CI output and
+ * committed artefacts. The digest answers the first question and cannot answer
+ * the second: it is SHA-256 truncated, so it is not reversible, and an operator
+ * who wants to confirm which database a digest names computes it from their own
+ * `DATABASE_URL` rather than reading it out of a log.
+ *
+ * Not a substitute for redaction: a caller passes the identifying values here
+ * deliberately, and everything else about them stays out of the line.
+ */
+export const opaqueDigest = (value: string): string => {
+    if (typeof value !== 'string' || value.length === 0) {
+        // A digest of nothing would still be a fixed 12 characters and would
+        // read as an identity, so the absence is stated instead.
+        return 'none';
+    }
+
+    return crypto.createHash('sha256').update(value).digest('hex').slice(0, OPAQUE_DIGEST_CHARS);
 };
 
 // Evidence URLs are model-proposed, so they are attacker-influenced input and

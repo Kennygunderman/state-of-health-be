@@ -26,10 +26,11 @@
 //      `recipe.logic.ts::scalePlannedNutrition`, so the rule lives in one
 //      place; recipe detail and the plan cards round for DISPLAY through that
 //      module's `roundNutritionForDisplay`, which never reaches storage.)
-//   2. {@link derivePlannedSnapshot} — the SINGLE rounding step: each of the
-//      four values is rounded exactly once into the integer per-serving
-//      snapshot that `insertPlannedMealEntry` writes onto the `meal_entries`
-//      row (whose macro columns are `Int`).
+//   2. {@link derivePlannedSnapshot} — the SINGLE rounding step, and this
+//      module owns it: each of the four values is rounded exactly once into the
+//      integer per-serving snapshot that `insertPlannedMealEntry` then writes
+//      VERBATIM onto the `meal_entries` row (whose macro columns are `Int`).
+//      That writer rounds nothing and refuses a fractional value.
 //   3. {@link deriveConsumedTotals} — `Math.round(snapshot × eatenServings)`
 //      per value, computed from the ROUNDED snapshot and never from the
 //      full-precision planned figure.
@@ -447,13 +448,15 @@ export const derivePlannedServingText = (
  * The planned meal as a `meal_entries` snapshot: every value the row stores
  * about WHAT was eaten, with each of the four macros rounded exactly once.
  *
- * This is the only rounding step in the whole path. `insertPlannedMealEntry`
- * applies the identical `Math.round` per value as it writes, which is a no-op on
- * these integers, so the stored row is the same whether the service hands it
- * this snapshot or the full-precision planned portion — and the integers here
- * are what {@link deriveConsumedTotals} and the client's "This adds" card both
- * scale. That is what makes "1 serving" in the diary equal the planned portion
- * exactly, and what keeps the two sides agreeing to the integer.
+ * THIS IS THE ONLY ROUNDING STEP IN THE WHOLE PATH, and this function is its
+ * one owner. `nutrition.service.ts::insertPlannedMealEntry` stores these four
+ * integers VERBATIM and re-rounds nothing — it asserts they are integers and
+ * refuses a fractional value, naming the field, rather than rounding it into
+ * shape. So the row holds exactly what this function computed, and the same
+ * integers are what {@link deriveConsumedTotals} and the client's "This adds"
+ * card both scale. That is what makes "1 serving" in the diary equal the
+ * planned portion exactly, and what keeps the two sides agreeing to the
+ * integer.
  *
  * The three independent facts travel together and unmixed: the ORIGIN
  * (`input_method`), the PROVENANCE (`nutrition_provenance`), and the two links

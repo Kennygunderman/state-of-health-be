@@ -61,7 +61,13 @@ import {
 } from './mealPlanning.errors';
 import { MealPlanningTransactionClient, withUserLock } from './mealPlanningAction.service';
 import { updateTargets } from './nutrition.service';
-import { PreferencesRow, loadPreferencesRow, setupStateOf } from './preferences.service';
+import { PreferencesRow, loadPreferencesRow } from './preferences.service';
+// The setup-state projection is a pure business rule in the preferences LOGIC
+// module, not a function of its service: both endpoints that can advance the
+// resume marker must read the row through the same closed vocabularies, and a
+// service importing another service would couple two orchestration layers for
+// a projection that performs no I/O (Rule backend-architecture §5, §7).
+import { setupStateOf } from './preferences.logic';
 import {
     EstimatedSaveRequest,
     ManualSetupAdvance,
@@ -366,10 +372,11 @@ const asSnapshotColumnValue = (values: MealPlanMacroTotals): Prisma.InputJsonVal
  * `estimated_targets` exactly where it stood, and on the create arm falls
  * through to the column's own SQL default of NULL. It is NOT
  * `Prisma.JsonNull`, which would clear the column — the reasoning for
- * retaining rather than clearing is in {@link writeConfirmedTargets}. The same
- * semantics are what `preferences.service.ts::nextEstimateInputsRevision`
- * relies on for its own counter, so there is one reading of `undefined` across
- * both writers of this row.
+ * retaining rather than clearing is in {@link writeConfirmedTargets}. Omission
+ * is also why this column needs no coordination with the preference saves:
+ * `estimated_targets` is written by this endpoint alone, and every column a
+ * preference save writes is absent from the data this one builds, so the two
+ * update the same row without either having to know what the other left behind.
  *
  * The cast is unavoidable for the reason {@link asSnapshotColumnValue} gives —
  * `InputJsonValue` wants a string index signature a declared interface does not

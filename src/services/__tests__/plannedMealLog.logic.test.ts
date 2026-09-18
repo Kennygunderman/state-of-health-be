@@ -575,6 +575,30 @@ describe('derivePlannedSnapshot', () => {
         }
     });
 
+    it.each([0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2])(
+        'yields four INTEGERS at a multiplier of %s, which the writer depends on',
+        (multiplier) => {
+            // The invariant `nutrition.service.ts::insertPlannedMealEntry` now
+            // rests on: it stores these four values verbatim and REFUSES a
+            // fractional one rather than rounding it, because a second rounding
+            // site is what makes the client's "This adds" card — which only
+            // ever sees the stored integers — disagree with the server. Every
+            // multiplier §0.7.3 offers a slot is covered, so the invariant is
+            // pinned across the whole input domain the writer can be handed and
+            // not just at the portions other cases happen to use.
+            const snapshot = derivePlannedSnapshot(
+                plannedMeal({ portion_multiplier: multiplier }),
+                recipeVersion(),
+            );
+
+            expect(
+                [snapshot.calories, snapshot.protein_g, snapshot.carbs_g, snapshot.fat_g].every(
+                    Number.isInteger,
+                ),
+            ).toBe(true);
+        },
+    );
+
     it('carries the two links and the two independent facts, unmixed', () => {
         const snapshot = derivePlannedSnapshot(plannedMeal(), recipeVersion());
 
@@ -617,12 +641,17 @@ describe('derivePlannedSnapshot', () => {
         }).toEqual(expected);
     });
 
-    it('rounds a half up, as the diary does', () => {
-        // A planned portion landing exactly on .5 is the one input where a
-        // rounding mode is a visible decision: `Math.round` takes it up, and
-        // the diary's insert applies the identical `Math.round` to the same
-        // value, so a half-even or truncating variant here would store a
-        // different integer than the row the service writes.
+    it('rounds a half up, and is the only step that rounds the snapshot', () => {
+        // A planned portion landing exactly on .5 is the one input where the
+        // rounding mode is a visible decision, and this function is the only
+        // place that decision is ever taken: JavaScript's `Math.round` takes
+        // the half UP here, and nothing downstream rounds the snapshot again.
+        // `insertPlannedMealEntry` stores the integers it is handed and rounds
+        // nothing — a fractional value reaching it is refused, not corrected —
+        // and step 3 rounds the multiplication of an already-integer snapshot,
+        // not the snapshot. So a half-even or truncating variant HERE would
+        // put a different integer in the `meal_entries` row, with no second
+        // rounding site anywhere to mask or undo it.
         const halves = recipeVersion({
             per_serving_calories: 100.5,
             per_serving_protein_g: 20.5,

@@ -79,8 +79,8 @@
 //      counting the seeded recipes and loaded foods, and
 //      `GET /api/recipes/:recipeVersionId` answering a seeded current version
 //      from the snapshot columns rather than the live catalog row;
-//  11. a corpus file the seed REFUSES — nine defects, each reported with the
-//      recipe and the offending element, none of them published, and the
+//  11. a corpus file the seed REFUSES — thirteen defects, each reported with
+//      the recipe and the offending element, none of them published, and the
 //      already-seeded corpus left exactly as it stood;
 //  12. IMMUTABILITY BY VERSION, the claim this file exists for most: a changed
 //      payload, and separately a stale ingredient snapshot by each of the two
@@ -1093,11 +1093,16 @@ const requireBasis = (value: string, where: string): RecipeNutritionBasis => {
  * Publishing the recipes: the production stage
  *
  * The corpus is published by `scripts/recipes-seed.ts::runSeed` — the same
- * function `npm run recipes:seed` calls — with four seams supplied: the Prisma
- * client, the committed recipe directory, a pinned clock and a coverage-report
- * path under `os.tmpdir()`. Nothing about the publication is restated here, so
- * this suite cannot agree with a seeder that is wrong; what it asserts is what
- * the stage left in the database.
+ * function `npm run recipes:seed` calls, rather than its `main()`, which reads
+ * `process.argv`, classifies the ambient `DATABASE_URL` and calls
+ * `process.exit`. Every dependency `SeedDeps` in `scripts/recipes-seed.ts`
+ * requires is supplied and none of its optional seams are, so the stage takes
+ * its real locks and writes its real ledger; what this suite redirects is only
+ * what would otherwise reach committed state or drift per run — the COMMITTED
+ * recipe directory is read as-is, the clock is pinned so `published_at` is
+ * assertable, and the coverage report is written under `os.tmpdir()`. Nothing
+ * about the publication is restated here, so this suite cannot agree with a
+ * seeder that is wrong; what it asserts is what the stage left in the database.
  * ------------------------------------------------------------------------- */
 
 /** Where the emitted coverage report goes, so the committed artefact is only ever READ. */
@@ -2633,9 +2638,9 @@ describe('the corpus served through the API', () => {
 
 describe('a corpus file the seed refuses', () => {
     /**
-     * §0.7.3: the seed "fails loudly and nothing is published". Nine defects
-     * below, and each case settles the same three things, because any one of
-     * them alone would be a hollow pass:
+     * §0.7.3: the seed "fails loudly and nothing is published". Thirteen
+     * defects below, and each case settles the same three things, because any
+     * one of them alone would be a hollow pass:
      *
      *   1. the run REFUSES, with `recipes_invalid` and a problem naming the
      *      recipe and the element at fault — Rule backend-architecture §8's
@@ -2646,9 +2651,11 @@ describe('a corpus file the seed refuses', () => {
      *   3. the API still serves what it served before, so a refused seed is
      *      invisible to a signed-in user rather than half-applied.
      *
-     * Five of the nine are properties of a FILE and five of a catalog ROW, and
-     * the row cases mutate `catalog_foods` and put it back: the blocks after
-     * this one read the same slice.
+     * Eight of the thirteen are properties of a FILE — a declaration the
+     * ingredients contradict, a value outside a closed set, an ingredient the
+     * file does not account for — and five of a catalog ROW, and the row cases
+     * mutate `catalog_foods` and put it back: the blocks after this one read
+     * the same slice.
      */
     const REFUSED_AT = new Date('2026-09-13T18:00:00.000Z');
 

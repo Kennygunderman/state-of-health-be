@@ -1010,10 +1010,19 @@ A new catalogue version is produced on a development machine, reviewed as a new
 release directory in a pull request, and then loaded. No environment regenerates
 a catalogue from live vendor or model output, which is what makes two environments
 comparable at all and what keeps an unreviewed model response out of a database
-users read. Loading into anything the database guard does not classify as a
-development origin additionally requires the operator to name the target database
-on the command line, so it cannot happen by an inherited environment variable.
-The operator sequence lives in
+users read. Loading into anything but a database whose own NAME says development
+additionally requires the operator to name the target database on the command
+line, so it cannot happen by an inherited environment variable — and a local
+database that is development by its host alone counts as "anything but", because
+that classification covers every database answering on loopback, a deployment
+database among them.
+
+The four stages that produce a catalogue enforce the same rule from the other
+side: `catalog:import`, `catalog:generate`, `catalog:validate` and
+`catalog:release` are `development_or_test` in the database guard, so they run
+only against a development-by-name or `_test` database and carry no confirmation
+flag at all. Building a catalogue in a shared environment is therefore not a
+discouraged option, it is a refused one. The operator sequence lives in
 [`release-and-recovery.md`](release-and-recovery.md).
 
 ## Search benchmark — thresholds and protocol

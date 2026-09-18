@@ -21,8 +21,11 @@
 //     … assert these shapes end to end", so the whole `RecipeVersionResponse`
 //     projection, including the closed code sets, is this file's to pin.
 //  4. THE FLAG GATE. `/recipes/*` answers `503 feature_disabled` while meal
-//     planning is off, and it does so BEFORE the lookup — otherwise the refusal
-//     would still reveal what exists.
+//     planning is off. The handler resolves its caller first and checks the
+//     gate immediately after (Rule 7 §4's identity-first sequence), so the
+//     refusal still lands BEFORE the parser and BEFORE the lookup — otherwise
+//     it would reveal what exists — while authentication, being a mount-order
+//     concern rather than a handler one, still precedes both.
 //
 // WHAT IS DELIBERATELY NOT HERE. Every recipe RULE —
 // `deriveRecipeNutrition`, `deriveBadges`, `deriveDietTags`/

@@ -465,19 +465,17 @@ export const volumeDensityFor = (facts: GroceryConversionFacts): number | null =
  * The words that make a portion description a CONTAINER or a SERVING rather
  * than a countable item.
  *
- * Two groups, and both say the same thing about the data: the portion describes
- * the package the shop sells the food in, or a reference amount someone chose
- * to tabulate it against, and neither is a thing a shopper can be told to buy a
- * number of. "1 can, drained" (253 g of chickpeas) is a can of an unstated
- * size, and "RACC" is a regulatory reference amount — printing either as a
- * shopping unit produces exactly the unsized container line §0.1.4 rules out
- * ("container units are never generated") and the display contract of
+ * THREE GROUPS, and all three say the same thing about the data: the portion
+ * describes the PACKAGE the shop sells the food in, a REFERENCE AMOUNT someone
+ * chose to tabulate it against, or a DOSING OR SINGLE-SERVE measure somebody
+ * dispenses — and none of them is a thing a shopper can be told to buy a number
+ * of. "1 can, drained" (253 g of chickpeas) is a can of an unstated size, "RACC"
+ * is a regulatory reference amount, and "scoop" (the protein-powder scoop),
+ * "individual" and "recipe yield" name an amount rather than an item on a shelf
+ * and are just as unsized as the can. Printing any of them as a shopping unit
+ * produces exactly the unsized container line §0.1.4 rules out ("container units
+ * are never generated") and the display contract of
  * `docs/meal-planning/planning-policy.md` §6 repeats.
- *
- * THREE GROUPS, and the third is neither a package nor a tabulation unit: a
- * DOSING OR SINGLE-SERVE measure — "scoop" (the protein-powder scoop),
- * "individual", "recipe yield" — which names an amount somebody dispenses
- * rather than a thing on a shelf, and is just as unsized as a can.
  *
  * CLOSED AND CATALOG-DERIVED, like every other word list in this feature: 788
  * of the 3,514 count-family default portions in catalog release v1 match this

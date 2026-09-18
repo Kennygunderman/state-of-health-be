@@ -79,23 +79,28 @@ import {
     CatalogSourceKeyInput,
     CatalogValidationContext,
     CatalogValidationPolicy,
+    StoredVersionedFacts,
     assertUsableValidationPolicy,
     CORE_NUTRIENT_FIELDS,
     DEFAULT_BRAND_WORDS,
     DEFAULT_CATALOG_NUTRITION_BASIS_RULE,
+    DEFAULT_GENERIC_LEAD_WORDS,
     DEFAULT_PRODUCT_FORM_WORDS,
     GROCERY_CATEGORY_ORDER,
     MAX_SEARCH_QUERY_LENGTH,
     MIN_SEARCH_QUERY_LENGTH,
     PER_100G_BASIS_AMOUNT,
     assessComponentCoverage,
+    buildSearchText,
     buildSourceKey,
     catalogCheckTier,
     classifyCatalogTagSets,
     computeCoverageShortfall,
     dedupeIdentity,
+    dedupeSortedAliases,
     deriveComponentNutrition,
     findBrandPatternMatch,
+    nextCatalogFoodVersions,
     groceryCategorySortIndex,
     isCatalogAllergenStatus,
     isCatalogAllergenTag,
@@ -147,7 +152,7 @@ import {
 import { CatalogEntryFood, resolveCatalogEntrySnapshot } from '../nutrition.logic';
 // The allergen codes the USER's selection stores, imported rather than copied:
 // the two lists are compared to each other at planning time, so the parity
-// assertion below has to read the real one (F20). `preferences.logic.ts` is a
+// assertion below has to read the real one. `preferences.logic.ts` is a
 // pure module — no Prisma, no clock — so importing it costs this suite nothing.
 import { NAMED_ALLERGENS } from '../preferences.logic';
 
@@ -282,7 +287,7 @@ describe('closed value set guards', () => {
         // Both tag vocabularies are enforced here or nowhere for the same reason
         // as the statuses above: `allergen_tags` and `diet_tags` are `TEXT[]`
         // with no enum and no CHECK, and an off-vocabulary code matches nothing
-        // downstream rather than failing (F20).
+        // downstream rather than failing.
         ['allergen tag', isCatalogAllergenTag, CATALOG_ALLERGEN_TAGS],
         ['diet tag', isCatalogDietTag, CATALOG_DIET_TAGS],
     ];
@@ -392,7 +397,7 @@ describe('check tiers', () => {
         expect(catalogCheckTier(CATALOG_CHECK_NAMES.DEFAULT_PORTION_COUNT)).toBe('quarantine');
     });
 
-    // Reject, and not review or quarantine (F20). A record claiming `vegan`
+    // Reject, and not review or quarantine. A record claiming `vegan`
     // while carrying `milk` cannot be true as written, and an off-vocabulary
     // code matches nothing in the planner's exclusion — so neither is a fact
     // waiting for more data, and a reject-tier failure returns before the
@@ -933,6 +938,309 @@ describe('dedupeIdentity', () => {
 
     it('handles an empty candidate list', () => {
         expect(dedupeIdentity([])).toEqual({ survivors: [], merges: [], duplicateSourceKeys: [] });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * dedupeSortedAliases
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The stored alias list, which both writers of `catalog_foods` derive with this
+ * one rule. It is pinned here rather than only through a writer because what it
+ * decides is persisted: the aliases feed `search_text`, so a list that differed
+ * by case or order between two runs would be a spurious update on every rerun
+ * and a different search corpus on every release.
+ */
+describe('dedupeSortedAliases', () => {
+    it('lower-cases every alias it keeps', () => {
+        expect(dedupeSortedAliases(['Garbanzo Beans', 'CECI'], 'chickpeas')).toEqual([
+            'ceci',
+            'garbanzo beans',
+        ]);
+    });
+
+    it('trims the ends and collapses an internal whitespace run to one space', () => {
+        expect(dedupeSortedAliases(['  garbanzo\t\tbeans  '], 'chickpeas')).toEqual(['garbanzo beans']);
+    });
+
+    // The name is already indexed in its own right; storing it again as an alias
+    // would double its contribution to the score.
+    // The comparison is on the NORMALISED form, so a differently cased or
+    // punctuated spelling of the name is dropped as well.
+    it('drops a value that normalises to the canonical name', () => {
+        expect(dedupeSortedAliases(['Chick Peas', 'chick-peas', 'ceci'], 'chick peas')).toEqual(['ceci']);
+    });
+
+    it('keeps one of two aliases that agree after case and whitespace folding', () => {
+        expect(dedupeSortedAliases(['Ceci', 'ceci', 'ceci  '], 'chickpeas')).toEqual(['ceci']);
+    });
+
+    // Byte order over the folded names, the same comparator the release export
+    // and the `COLLATE "C"` tiebreakers use, so the order is a property of the
+    // data rather than of the host's locale.
+    it('sorts what it keeps in byte order', () => {
+        expect(dedupeSortedAliases(['ceci', 'Garbanzo beans', 'bengal gram', 'egyptian pea'], 'chickpeas')).toEqual([
+            'bengal gram',
+            'ceci',
+            'egyptian pea',
+            'garbanzo beans',
+        ]);
+    });
+
+    it('rejects a blank alias and accepts an empty list', () => {
+        expect(dedupeSortedAliases(['', '   ', '\t', 'ceci'], 'chickpeas')).toEqual(['ceci']);
+        expect(dedupeSortedAliases([], 'chickpeas')).toEqual([]);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * buildSearchText
+ * ------------------------------------------------------------------------- */
+
+/**
+ * `search_text` is the column the STORED `search_vector` is generated from, so
+ * this rule decides which words find a food. `to_tsvector` owns stemming and
+ * weighting; what is pinned here is that it receives plain words, once each, in
+ * a stable order.
+ */
+describe('buildSearchText', () => {
+    it('takes the name, then the aliases, then the state and the food group', () => {
+        expect(buildSearchText('brown rice', ['wholegrain rice'], 'cooked', 'grain_other')).toBe(
+            'brown rice wholegrain cooked grain other',
+        );
+    });
+
+    it('keeps the first occurrence of a repeated word and drops the rest', () => {
+        expect(buildSearchText('rice', ['rice', 'brown rice', 'rice brown'], 'dry', 'rice')).toBe(
+            'rice brown dry',
+        );
+    });
+
+    it('removes punctuation and diacritics instead of handing them to to_tsvector', () => {
+        expect(buildSearchText('Jalapeño, raw — sliced', [], 'raw', 'chili_pepper')).toBe(
+            'jalapeno raw sliced chili pepper',
+        );
+    });
+
+    // `as_purchased` and `bell_pepper` are codes; each half is a word a user
+    // might type, so the underscore becomes a space rather than one lexeme.
+    it('expands the underscores in the food state and the food group', () => {
+        expect(buildSearchText('bell pepper', [], 'as_purchased', 'bell_pepper')).toBe(
+            'bell pepper as purchased',
+        );
+    });
+
+    it('yields the state and group words alone for a name with no usable content', () => {
+        expect(buildSearchText('   ', [''], 'prepared', 'other')).toBe('prepared other');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * nextCatalogFoodVersions
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The two counters `recipe_ingredients` snapshots are checked for staleness
+ * against. `recipe.logic.ts::isIngredientSnapshotStale` compares them for
+ * INEQUALITY and never compares the values themselves, so a counter that is
+ * reset, or that fails to move when its facts did, is the difference between a
+ * published recipe noticing that an ingredient's nutrition or allergen set
+ * changed and going on claiming the old one — a safety fact in the allergen
+ * case (AAP §0.5.1, §0.7.3).
+ *
+ * Each counter answers for its own set and only its own: a spurious bump forces
+ * a needless new recipe version across every recipe using the food, so the
+ * per-fact cases below assert the OTHER counter stood still as well.
+ */
+describe('nextCatalogFoodVersions', () => {
+    const facts = (overrides: Partial<StoredVersionedFacts> = {}): StoredVersionedFacts => ({
+        nutrition_version: 1,
+        metadata_version: 1,
+        calories: 165,
+        protein_g: 31,
+        carbs_g: 0,
+        fat_g: 3.6,
+        fiber_g: null,
+        nutrition_basis: 'per_100g',
+        basis_amount: 100,
+        density_g_per_ml: null,
+        nutrition_provenance: 'source_backed',
+        usda_fdc_id: 171077,
+        usda_data_type: 'SR Legacy',
+        source_version: 'SR Legacy 2019-04',
+        canonical_name: 'chicken breast',
+        display_name: 'Chicken breast',
+        food_group: 'chicken',
+        allergen_status: 'known',
+        allergen_tags: [],
+        diet_tags: [],
+        ...overrides,
+    });
+
+    // Nothing has a snapshot of a new row yet, so nothing has moved and nothing
+    // can be stale — which is why both `changed` flags are false at version 1.
+    it('starts a new source key at 1 on both counters and reports no movement', () => {
+        expect(nextCatalogFoodVersions(null, facts())).toEqual({
+            nutritionVersion: 1,
+            metadataVersion: 1,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
+    });
+
+    it('preserves both stored counters when a rerun changes nothing', () => {
+        expect(nextCatalogFoodVersions(facts({ nutrition_version: 3, metadata_version: 2 }), facts())).toEqual({
+            nutritionVersion: 3,
+            metadataVersion: 2,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
+    });
+
+    describe('the nutrition set', () => {
+        const changes: ReadonlyArray<readonly [string, Partial<StoredVersionedFacts>]> = [
+            ['calories', { calories: 166 }],
+            ['protein_g', { protein_g: 30 }],
+            ['carbs_g', { carbs_g: 1 }],
+            ['fat_g', { fat_g: 3.7 }],
+            ['fiber_g', { fiber_g: 2 }],
+            ['nutrition_basis', { nutrition_basis: 'per_100ml' }],
+            ['basis_amount', { basis_amount: 50 }],
+            ['density_g_per_ml', { density_g_per_ml: 1.03 }],
+            ['nutrition_provenance', { nutrition_provenance: 'ingredient_derived' }],
+            ['usda_fdc_id', { usda_fdc_id: 171078 }],
+            ['usda_data_type', { usda_data_type: 'Foundation' }],
+            ['source_version', { source_version: 'SR Legacy 2021-10' }],
+        ];
+
+        it.each(changes)('bumps nutrition_version alone on a changed %s', (_fact, change) => {
+            expect(
+                nextCatalogFoodVersions(facts({ nutrition_version: 4, metadata_version: 2 }), facts(change)),
+            ).toEqual({
+                nutritionVersion: 5,
+                metadataVersion: 2,
+                nutritionChanged: true,
+                metadataChanged: false,
+            });
+        });
+    });
+
+    describe('the metadata set', () => {
+        const changes: ReadonlyArray<readonly [string, Partial<StoredVersionedFacts>]> = [
+            ['canonical_name', { canonical_name: 'chicken breast, skinless' }],
+            ['display_name', { display_name: 'Chicken breast, skinless' }],
+            ['food_group', { food_group: 'turkey' }],
+            ['allergen_status', { allergen_status: 'unknown' }],
+            ['allergen_tags', { allergen_tags: ['milk'] }],
+            ['diet_tags', { diet_tags: ['gluten_free'] }],
+        ];
+
+        it.each(changes)('bumps metadata_version alone on a changed %s', (_fact, change) => {
+            expect(
+                nextCatalogFoodVersions(facts({ nutrition_version: 4, metadata_version: 2 }), facts(change)),
+            ).toEqual({
+                nutritionVersion: 4,
+                metadataVersion: 3,
+                nutritionChanged: false,
+                metadataChanged: true,
+            });
+        });
+    });
+
+    // Versioning a reordered array would be versioning the vendor's array
+    // ordering, and a longer list is a real change rather than a reordering.
+    it('compares the two tag arrays as sets', () => {
+        const stored = facts({
+            nutrition_version: 2,
+            metadata_version: 2,
+            allergen_tags: ['milk', 'soy'],
+            diet_tags: ['gluten_free', 'vegetarian'],
+        });
+
+        expect(
+            nextCatalogFoodVersions(
+                stored,
+                facts({ allergen_tags: ['soy', 'milk'], diet_tags: ['vegetarian', 'gluten_free'] }),
+            ),
+        ).toEqual({
+            nutritionVersion: 2,
+            metadataVersion: 2,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
+        expect(
+            nextCatalogFoodVersions(stored, facts({ allergen_tags: ['milk', 'soy', 'egg'] })).metadataChanged,
+        ).toBe(true);
+    });
+
+    // `fiber_g` is written as `?? null` and a fact the caller has no value for
+    // arrives as `undefined`. Reading those as different would bump both
+    // counters on every rerun.
+    it('treats an absent fact and a stored NULL as one "no value"', () => {
+        const stored = facts({ nutrition_version: 7, metadata_version: 5, fiber_g: null, food_group: null });
+
+        expect(
+            nextCatalogFoodVersions(stored, { ...facts(), fiber_g: undefined, food_group: undefined }),
+        ).toEqual({
+            nutritionVersion: 7,
+            metadataVersion: 5,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
+        // The same normalisation on a tag array: an omitted list and a stored
+        // empty one are both "no tags".
+        expect(
+            nextCatalogFoodVersions(facts({ allergen_tags: [] }), { ...facts(), allergen_tags: undefined })
+                .metadataChanged,
+        ).toBe(false);
+    });
+
+    // The columns are NOT NULL, so this is a hand-loaded row or one from a
+    // release predating the column. Reading a missing counter as 0 would
+    // renumber a snapshot that already cites 1 and make it read as current.
+    it('reads a stored counter it never wrote as 1 rather than as zero', () => {
+        expect(
+            nextCatalogFoodVersions(
+                facts({ nutrition_version: null, metadata_version: undefined }),
+                facts({ calories: 200 }),
+            ),
+        ).toEqual({
+            nutritionVersion: 2,
+            metadataVersion: 1,
+            nutritionChanged: true,
+            metadataChanged: false,
+        });
+    });
+
+    it('moves both counters when both sets moved', () => {
+        expect(
+            nextCatalogFoodVersions(
+                facts({ nutrition_version: 2, metadata_version: 9 }),
+                facts({ calories: 180, display_name: 'Chicken breast, raw' }),
+            ),
+        ).toEqual({
+            nutritionVersion: 3,
+            metadataVersion: 10,
+            nutritionChanged: true,
+            metadataChanged: true,
+        });
+    });
+
+    // The caller passes the whole scalar set it is about to write, and a column
+    // outside both sets is not a staleness fact: `is_common_dislike` changing
+    // must not force a new version of every recipe using the food.
+    it('ignores a field outside both compared sets', () => {
+        const stored = { ...facts({ nutrition_version: 3, metadata_version: 3 }), is_common_dislike: false };
+
+        expect(
+            nextCatalogFoodVersions(stored, { ...facts(), is_common_dislike: true } as StoredVersionedFacts),
+        ).toEqual({
+            nutritionVersion: 3,
+            metadataVersion: 3,
+            nutritionChanged: false,
+            metadataChanged: false,
+        });
     });
 });
 
@@ -1676,6 +1984,53 @@ describe('findBrandPatternMatch', () => {
         });
     });
 
+    // The escape this check used to have: sentence case is how a food name is
+    // written AND how a fabricated product is written, so the product form's own
+    // casing never separated them. A leading word that names no food, plus a
+    // product form, is a product whatever case the form is in (AAP §0.7.3 states
+    // the rule with no condition on the form's casing).
+    it.each([
+        ['Acme bar', 'Acme bar'],
+        ['Nova drink', 'Nova drink'],
+        ['Zesta crisps', 'Zesta crisps'],
+        ['Acme protein bar', 'Acme bar'],
+        ['Zesta multigrain crisps, baked', 'Zesta crisps'],
+    ])('fires on the sentence-case %s', (name, token) => {
+        expect(findBrandPatternMatch([name])).toMatchObject({
+            value: name,
+            reason: 'proper_noun_product_form',
+            token,
+        });
+    });
+
+    // The reviewed exception vocabulary is what keeps the rule above from
+    // refusing the generic preparations generation exists to propose: these
+    // names all pair a leading capital with a product form.
+    it('does not fire on a name whose leading word is reviewed generic', () => {
+        for (const name of [
+            'Protein bar',
+            'Breakfast cereal',
+            'Trail mix',
+            'Vegetable barley soup cup',
+            'Smoked paprika blend',
+            'Seeded multigrain crisps',
+            'Rendered fat blend',
+            'Roasted chickpea snack',
+        ]) {
+            expect(findBrandPatternMatch([name])).toBeNull();
+        }
+    });
+
+    // Title case is not how this pipeline writes a generic name — the generator
+    // states a sentence-case display name and a lowercase canonical name — so
+    // the casing is the anomaly, and it is still reported with its token.
+    it('still fires on a title-cased generic, whose casing is the anomaly', () => {
+        expect(findBrandPatternMatch(['Rice Cereal'])).toMatchObject({
+            reason: 'proper_noun_product_form',
+            token: 'Rice cereal',
+        });
+    });
+
     // "Chicken Broth" is a preparation; only a brand attached to a product form
     // is a product. The sentence-case names below all pair a capitalised first
     // word with a product form and must NOT fire — their leading capital is
@@ -1716,8 +2071,8 @@ describe('findBrandPatternMatch', () => {
         expect(findBrandPatternMatch([])).toBeNull();
     });
 
-    // Vocabulary, not a threshold: the policy may replace both lists without a
-    // code change.
+    // Vocabulary, not a threshold: the policy may replace all three lists
+    // without a code change.
     it('honours replacement vocabularies', () => {
         expect(
             findBrandPatternMatch(['acme rolled oats'], { brandWords: ['acme'] }),
@@ -1727,11 +2082,28 @@ describe('findBrandPatternMatch', () => {
         expect(
             findBrandPatternMatch(['oats Kettle thing'], { productFormWords: ['thing'] }),
         ).toMatchObject({ reason: 'proper_noun_product_form' });
+        // A replacement generic vocabulary decides which leading words are
+        // read as food words: 'Zesta' becomes one, and 'Protein' stops being
+        // one, in both directions from the default.
+        expect(findBrandPatternMatch(['Zesta crisps'], { genericLeadWords: ['zesta'] })).toBeNull();
+        expect(
+            findBrandPatternMatch(['Protein bar'], { genericLeadWords: ['zesta'] }),
+        ).toMatchObject({ reason: 'proper_noun_product_form', token: 'Protein bar' });
     });
 
     it('exposes non-empty default vocabularies', () => {
         expect(DEFAULT_BRAND_WORDS.length).toBeGreaterThan(0);
         expect(DEFAULT_PRODUCT_FORM_WORDS.length).toBeGreaterThan(0);
+        expect(DEFAULT_GENERIC_LEAD_WORDS.length).toBeGreaterThan(0);
+    });
+
+    // The reviewed vocabulary admits food words only. A cookware or process
+    // noun a brand is built on must stay outside it, or the mid-name rule
+    // above would have nothing left to fire on.
+    it('keeps maker-shaped words out of the generic vocabulary', () => {
+        for (const word of ['kettle', 'classic', 'original', 'premium', 'select', 'signature']) {
+            expect(DEFAULT_GENERIC_LEAD_WORDS).not.toContain(word);
+        }
     });
 });
 
@@ -2280,7 +2652,7 @@ describe('mapCategoryToGroceryCategory', () => {
  * `allergen_tags` and `diet_tags` are the two safety lists a planner acts on —
  * the allergen list against the user's own selection, the diet list through
  * `recipe.logic.ts`'s ingredient derivation — and both were free strings
- * persisted verbatim before this module declared a vocabulary for them (F20).
+ * persisted verbatim before this module declared a vocabulary for them.
  * What follows pins the vocabulary, the contradiction rules, and the fact that
  * the classifier is usable at PARSE time: it takes `unknown[]`, because a model
  * payload and a `TEXT[]` column can each hand it a non-string.
@@ -3632,7 +4004,9 @@ describe('validateCatalogCandidate', () => {
     });
 
     /* -----------------------------------------------------------------------
-     * The tag vocabularies (F20)
+     * The tag vocabularies — `CATALOG_ALLERGEN_TAGS` and `CATALOG_DIET_TAGS`,
+     * judged by `CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE` and
+     * `CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET`
      *
      * Both lists are matched by CODE downstream, so the cases below are about
      * what reaches a plate: an off-vocabulary code excludes nothing, and a diet
@@ -4492,7 +4866,7 @@ interface CatalogFixtureFood {
     readonly allergen_tags: readonly string[];
     /**
      * The stored diet claims, read here because the validator now judges them
-     * against the allergen list (F20). Every fixture row carries the column.
+     * against the allergen list. Every fixture row carries the column.
      */
     readonly diet_tags: readonly string[];
     readonly nutrition_basis: CatalogNutritionBasis;
@@ -4791,7 +5165,9 @@ const validateFixtureRow = (sourceKey: string, overrides: Partial<CatalogFoodCan
     validateCatalogCandidate(fixtureCandidate(sourceKey, overrides), SHIPPED_POLICY, fixtureContext());
 
 /**
- * The two checks the committed fixture's stored records predate (F20).
+ * The two checks the committed fixture's stored records predate:
+ * `CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE` and
+ * `CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET`.
  *
  * Named once, here, so the two halves of the stored-verdict comparison below
  * cannot drift apart: whatever this set excludes from the byte-equal half is
@@ -5127,7 +5503,7 @@ describe('the shipped coverage plan, loaded as the validation policy', () => {
  * twice drifts silently — a code only one side knows is not rejected
  * downstream, it simply matches nothing in the planner's allergen exclusion and
  * diet derivation — so the two are compared here, in both directions and in
- * order (F20).
+ * order.
  * ------------------------------------------------------------------------- */
 
 describe('the tag vocabularies the shipped data declares', () => {
@@ -5610,7 +5986,9 @@ describe('the committed catalog fixture', () => {
     // and bounds, and the same outcome. A retuned constant, a reordered check
     // or a changed observation all surface here.
     //
-    // The two tag checks (F20) are asserted separately, in the test below,
+    // The two tag checks — `CATALOG_CHECK_NAMES.UNKNOWN_TAG_CODE` and
+    // `CATALOG_CHECK_NAMES.INCONSISTENT_TAG_SET`, collected above as
+    // `TAG_CHECK_NAMES` — are asserted separately, in the test below,
     // because the stored records PREDATE them: `catalog-foods.fixture.json` is
     // committed data this suite does not own, and its records will carry the
     // entries once the run that owns the fixture re-emits them. Splitting the

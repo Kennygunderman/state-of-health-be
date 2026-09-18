@@ -7,6 +7,29 @@
   "supplementalCidrs": [
     "::/96"
   ],
+  "globalUnicastAllocationRowCount": 4,
+  "globalUnicastAllocations": [
+    {
+      "cidr": "0.0.0.0/1",
+      "allocation": "unicast",
+      "registry": "ipv4-address-space"
+    },
+    {
+      "cidr": "128.0.0.0/2",
+      "allocation": "unicast",
+      "registry": "ipv4-address-space"
+    },
+    {
+      "cidr": "192.0.0.0/3",
+      "allocation": "unicast",
+      "registry": "ipv4-address-space"
+    },
+    {
+      "cidr": "2000::/3",
+      "allocation": "Global Unicast",
+      "registry": "ipv6-address-space"
+    }
+  ],
   "fetchLimits": {
     "schemes": [
       "https"

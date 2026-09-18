@@ -3,10 +3,12 @@
 -- of the database's own catalogs and compared against a reviewed expected
 -- result.
 --
--- Nothing applies this file. The executed ledger is
--- prisma/migrations/20260908000000_meal_planning/migration.sql; the captured
--- migrate-diff evidence of it is docs/meal-planning/expected-schema-diff.sql,
--- and this file is the second capture that one cannot make. Together they are
+-- Nothing applies this file. The executed ledger is prisma/migrations, whose
+-- meal-planning DDL is 20260908000000_meal_planning/migration.sql and whose
+-- catalog indexes are completed by 20260910000000_catalog_prefix_fold_indexes;
+-- the captured migrate-diff evidence of it is
+-- docs/meal-planning/expected-schema-diff.sql, and this file is the second
+-- capture that one cannot make. Together they are
 -- committed so that the ledger, prisma/schema.prisma and the applied database
 -- cannot drift apart unnoticed.
 --
@@ -29,14 +31,25 @@
 -- WHY THIS FILE EXISTS. Agent Action Plan 0.5.1 and 0.9.1 specify
 -- docs/meal-planning/expected-schema-diff.sql as the output of `prisma migrate
 -- diff` and expect that output to carry the three constructs the Prisma
--- datamodel cannot express: the generated search_vector expression, the
--- lower(alias) expression index on catalog_food_aliases, and the partial
--- indexes' predicates. Measured against prisma 6.9.0 it carries only the first.
+-- datamodel cannot express: the generated search_vector expression, the alias
+-- expression index on catalog_food_aliases, and the partial indexes'
+-- predicates. Measured against prisma 6.9.0 it carries only the first.
 -- Prisma's schema describer leaves expression indexes, index predicates and
--- scalar-list NOT NULL out of both sides of its comparison, so deleting the
--- lower(alias) index, changing a partial index's predicate, or dropping NOT
+-- scalar-list NOT NULL out of both sides of its comparison, so deleting an
+-- expression index, changing a partial index's predicate, or dropping NOT
 -- NULL from a required array column each leave that output and its exit code
--- untouched. That is a recorded AAP-versus-tool divergence, and the sections
+-- untouched.
+--
+-- The alias index the plan names as `lower(alias)` is now the ASCII fold
+-- `translate(alias, 'ABC...', 'abc...')`, and the same fold is indexed over
+-- catalog_foods.display_name and .canonical_name. That is not drift from the
+-- plan but the other half of it: 0.9.3 requires two independently loaded
+-- databases to produce identical ranks and page sequences, and `lower()`
+-- resolves through the database's collation while the JavaScript side of the
+-- same comparison does not, so the prefix branch of catalog.service.ts found a
+-- food carrying a non-ASCII capital on one server and not on another.
+-- prisma/migrations/20260910000000_catalog_prefix_fold_indexes carries the
+-- reasoning in full. That is a recorded AAP-versus-tool divergence, and the sections
 -- below are the mechanism that closes the two classes the tool omits: they pin
 -- the generated column's expression, every hand-managed index's access method,
 -- uniqueness, key expressions, OPERATOR CLASSES and predicate, and every array
@@ -54,18 +67,35 @@
 --
 -- The query only reads system catalogs - pg_attribute, pg_attrdef, pg_class,
 -- pg_index, pg_am, pg_opclass, pg_namespace and pg_type - and the pg_get_expr /
--- pg_get_indexdef functions that format their contents, and CI runs it inside
--- `BEGIN TRANSACTION READ ONLY` so a write introduced into the section cannot
--- execute. CI renders it with a small node + `pg` helper rather
--- than psql, which the runner does not have; that helper's output is
--- byte-identical to `psql -tA` - one row per line, one trailing newline.
+-- pg_get_indexdef functions that format their contents.
+--
+-- CI renders it with a small node + `pg` helper rather than with psql, and the
+-- reason is not availability: `ubuntu-latest` ships the PostgreSQL 16 client
+-- tools. The helper is the right instrument because it depends on no
+-- image-provided tooling at all - it uses the `pg` package this repository
+-- already installs, so the gate cannot break on a runner image that drops or
+-- moves a client binary - and because it can ASSERT ON THE SHAPE of the result,
+-- which `psql -tA` cannot: it runs the committed section inside
+-- `BEGIN TRANSACTION READ ONLY` so a write introduced into it fails instead of
+-- reaching the database, and it refuses the section unless it is ONE statement
+-- (`pg` answers several with an array of results) whose result carries exactly
+-- one field descriptor, named `line`, of PostgreSQL type `text` (OID 25) - read
+-- from the result's own descriptors, so selecting `line` beside a second column
+-- is refused rather than rendered - and unless every value under it really is
+-- text (a text column still yields null for a NULL). Each of those is a way the
+-- evidence could quietly stop measuring what it claims to, and each refusal
+-- names the condition that failed and what it found. Its output is
+-- byte-identical to `psql -tA` - one row per line, one trailing newline - so
+-- the regeneration command above and the gate compare the same bytes.
 --
 -- WHY THE OPERATOR CLASS IS READ SEPARATELY. `pg_get_indexdef(oid, k, ...)`
 -- renders the k-th key expression and OMITS its operator class - measured at
 -- both pretty=true and pretty=false - so an index's class is invisible in
--- key_text. That is not cosmetic here: idx_catalog_food_aliases_lower_alias is
--- declared `lower(alias) text_pattern_ops` because a btree derives LIKE range
--- bounds only under a `*_pattern_ops` class or a C column collation, and under
+-- key_text. That is not cosmetic here: idx_catalog_food_aliases_fold_alias is
+-- declared `translate(alias, 'ABC...', 'abc...') text_pattern_ops` - and so are
+-- the two catalog_foods indexes over the same fold - because a btree derives
+-- LIKE range bounds only under a `*_pattern_ops` class or a C column
+-- collation, and under
 -- the default `text_ops` the planner refuses the index for the only predicate
 -- the index exists to serve. Rendering key_text alone, this gate was measured to
 -- produce byte-identical output for a patched and an unpatched ledger, so the
@@ -80,10 +110,15 @@
 -- operator copy under prisma/manual-migrations/meal-planning/, which this gate
 -- never applies: what holds that copy to the authoritative migration is the
 -- ledger-equivalence gate, describe('migration ledgers') in
--- src/__tests__/api/compat.test.ts, which applies both and compares the
--- resulting columns, indexes and constraints. The two are complementary - that
--- gate compares one ledger against the other and so cannot see a construct
--- dropped from both, which is precisely what these sections catch.
+-- src/__tests__/api/compat.test.ts. That gate measures the copy twice - against
+-- 20260908000000_meal_planning alone, on a database carrying the init schema
+-- plus one file and nothing later, which is the only place the copy's own
+-- reproduction of a construct a later entry then retires can be seen; and
+-- against the whole ledger in both of 0.9.1's orders, on columns, indexes,
+-- constraints and a normalised pg_dump. All three artefacts are complementary -
+-- a ledger-against-ledger comparison cannot see a construct missing from both,
+-- and neither comparison can see a construct a later entry breaks, which is
+-- precisely what these sections catch.
 --
 -- A RED GATE is fixed in prisma/schema.prisma and the migration, never by
 -- editing this file to match - unless the DDL change was the intended one, in
@@ -97,10 +132,12 @@
 -- pg-catalog-expected with the result; and it requires that section to keep at
 -- least one generated column, seven hand-managed indexes and twelve NOT NULL
 -- array columns - the three classes the migration's own header names as
--- hand-edited - so deleting evidence lines cannot buy a pass either.
+-- hand-edited - so deleting evidence lines cannot buy a pass either. Those
+-- three counts are FLOORS: the section carries nine indexes since the prefix
+-- fold indexes landed, and a larger set passes while a smaller one cannot.
 --
 -- Captured against prisma and @prisma/client 6.9.0 on PostgreSQL 16.15, ledger
--- prisma/migrations through 20260908000000_meal_planning.
+-- prisma/migrations through 20260910000000_catalog_prefix_fold_indexes.
 
 -- >>> BEGIN pg-catalog-query
 WITH generated_columns AS (
@@ -166,10 +203,14 @@ SELECT line FROM normalised ORDER BY section, line COLLATE "C";
 -- >>> BEGIN pg-catalog-expected
 -- One generated column: the STORED search_vector expression.
 generated_column catalog_foods.search_vector tsvector stored to_tsvector('english'::regconfig, COALESCE(search_text, ''::text))
--- Seven hand-managed indexes: the lower(alias) expression index, the GIN
--- index over search_vector, and the five partial-index predicates.
-index catalog_food_aliases.idx_catalog_food_aliases_lower_alias am=btree unique=false keys=(lower(alias)) opclasses=(text_pattern_ops) predicate=-
+-- Nine hand-managed indexes: the three ASCII-fold expression indexes the
+-- prefix branches read (the two over catalog_foods partial on
+-- publication_status), the GIN index over search_vector, and the five other
+-- partial-index predicates.
+index catalog_food_aliases.idx_catalog_food_aliases_fold_alias am=btree unique=false keys=(translate(alias, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'::text, 'abcdefghijklmnopqrstuvwxyz'::text)) opclasses=(text_pattern_ops) predicate=-
 index catalog_food_portions.unique_default_catalog_food_portion am=btree unique=true keys=(catalog_food_id) opclasses=(uuid_ops) predicate=is_default
+index catalog_foods.idx_catalog_foods_fold_canonical_name am=btree unique=false keys=(translate(canonical_name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'::text, 'abcdefghijklmnopqrstuvwxyz'::text)) opclasses=(text_pattern_ops) predicate=publication_status = 'published'::text
+index catalog_foods.idx_catalog_foods_fold_display_name am=btree unique=false keys=(translate(display_name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'::text, 'abcdefghijklmnopqrstuvwxyz'::text)) opclasses=(text_pattern_ops) predicate=publication_status = 'published'::text
 index catalog_foods.idx_catalog_foods_search_vector am=gin unique=false keys=(search_vector) opclasses=(tsvector_ops) predicate=-
 index catalog_foods.unique_published_catalog_food_identity am=btree unique=true keys=(canonical_name, food_state) opclasses=(text_ops, text_ops) predicate=publication_status = 'published'::text
 index meal_entries.idx_meal_entries_meal_plan_meal_id am=btree unique=false keys=(meal_plan_meal_id) opclasses=(uuid_ops) predicate=deleted_at IS NULL

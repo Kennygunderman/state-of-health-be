@@ -1,6 +1,6 @@
 -- Retrieval evidence: record the upstream HTTP status of a cached USDA response.
 --
--- Review finding OBSEV-F12 (retrieval http_status null everywhere): the status
+-- The defect this closes (retrieval http_status null everywhere): the status
 -- of a USDA exchange was observed by `usda.service.ts` and then discarded,
 -- because `usda_api_cache` had no column able to hold it. Every identity
 -- evidence record the catalog import wrote therefore had to invent one, so all

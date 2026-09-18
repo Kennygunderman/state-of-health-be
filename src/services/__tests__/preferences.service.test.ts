@@ -10,14 +10,20 @@
 // then not written, is invisible to a unit test of the rule and visible in one
 // read of the stored row.
 //
-//   1. `target_route` FOLLOWS THE BODY ANSWER THROUGH THE FULL SAVE. The
-//      settings screens edit age, height, weight and sex through
-//      `PUT /meal-planning/preferences`, and the route is server-owned, so a
-//      save that changed the sex answer without re-deriving it left the row
-//      claiming a route its own answers contradict — an estimated route for a
-//      user who now declines to state a sex (whose target would then be
-//      calculated from an assumed one), or a manual route for a user whose
-//      measurements are now complete.
+//   1. `target_route` FOLLOWS THE BODY ANSWER THROUGH THE FULL SAVE. `age`,
+//      `heightCm`, `weightKg` and `sexForEstimate` are members of this
+//      endpoint's closed editable DTO (0.5.2), while `target_route` is
+//      server-owned and absent from it — a client key for it is
+//      `read_only_field` — so re-deriving the route when a body answer moves
+//      through `PUT /meal-planning/preferences` is the endpoint's obligation to
+//      whatever calls it, not a screen's. A save that changed the sex answer
+//      without re-deriving left the row claiming a route its own answers
+//      contradict — an estimated route for a user who now declines to state a
+//      sex (whose target would then be calculated from an assumed one), or a
+//      manual route for a user whose measurements are now complete. The cases
+//      below therefore drive `savePreferences` with the bodies the contract
+//      accepts rather than the body of any one caller: the full save's only
+//      client today sends the envelope alone, for the zone refresh of 2.
 //   2. THE STORED ZONE IS THE ONE THIS REQUEST CARRIED. The contract requires
 //      the zone on every full save and resolves the user's "today" from it, so
 //      a save that accepted its omission left every date rule reading a zone
@@ -156,10 +162,11 @@ describe('the target route a full save leaves behind', () => {
     });
 
     it('never sends a completed user back into onboarding to satisfy the new route', async () => {
-        // A completed user has a plan; their edits arrive from the plan settings
-        // screen, and regressing their setup state is the failure the monotonic
-        // status rule exists to prevent — even though the estimated route they
-        // are moving onto requires an activity level this row does not hold.
+        // A completed row belongs to a user who already has a plan, and the
+        // contract keeps the save open to it, so regressing their setup state is
+        // the failure the monotonic status rule exists to prevent — even though
+        // the estimated route they are moving onto requires an activity level
+        // this row does not hold.
         await makePreferences(USER_ID, { target_route: 'manual', activity_level: null });
 
         await saveFull(fullBody({ ...MEASUREMENTS, sexForEstimate: 'male' }, 1));
@@ -258,12 +265,32 @@ describe('the time zone a full save refreshes', () => {
         expect((await storedRow()).time_zone).toBe(TIME_ZONE);
     });
 
-    it('refuses a body that carries the envelope and nothing else', async () => {
+    it('accepts a body that carries the envelope and nothing else, when the zone is what moved', async () => {
+        // The zone is an envelope field AND a stored column, and this is the one
+        // body where those facts diverge. A user who travels without editing any
+        // answer sends exactly `{timeZone, expectedRevision}`, and that is a real
+        // edit of `time_zone` — the only channel the contract gives a client for
+        // the refresh this whole section is about. Refusing it as `body:
+        // required` left the stored calendar unreachable, and with it every
+        // "today" the cases below derive.
         await makePreferences(USER_ID);
 
         expect(
             await savePreferences(USER_ID, { timeZone: MOVED_TIME_ZONE, expectedRevision: 1 }),
-        ).toMatchObject({ kind: 'error', details: [{ field: 'body', code: 'required' }] });
+        ).toMatchObject({ kind: 'ok' });
+        expect(await storedRow()).toMatchObject({ revision: 2, time_zone: MOVED_TIME_ZONE });
+    });
+
+    it('refuses an envelope-only body whose zone the row already holds, which edits nothing', async () => {
+        // The invariant the acceptance above must not cost: a save that changes
+        // nothing would still bump the revision and invalidate every other
+        // client's pinned value.
+        await makePreferences(USER_ID);
+
+        expect(await savePreferences(USER_ID, { timeZone: TIME_ZONE, expectedRevision: 1 })).toMatchObject({
+            kind: 'error',
+            details: [{ field: 'body', code: 'required' }],
+        });
         expect(await storedRow()).toMatchObject({ revision: 1, time_zone: TIME_ZONE });
     });
 });

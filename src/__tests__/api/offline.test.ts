@@ -1287,9 +1287,10 @@ describe('metering is untouched by meal planning', () => {
     });
 
     /**
-     * Asserts the status while keeping the body in the failure output: the
-     * workload below drives sixteen endpoints, and "expected 200, received 409"
-     * without the machine code would not say which precondition had moved.
+     * Asserts the status while keeping the body in the failure output: a bare
+     * "expected 200, received 409" from somewhere inside the workload below
+     * would not say which precondition had moved, and the machine code in the
+     * body is what names it.
      */
     const expectOk = (response: { status: number; body: unknown }, expected = 200): void => {
         expect({ status: response.status, body: response.body }).toMatchObject({
@@ -1298,8 +1299,12 @@ describe('metering is untouched by meal planning', () => {
     };
 
     /**
-     * One pass over the whole feature: every read, plus the four writes that
-     * change state. Shared by both tests below so "still works" and "meters
+     * One pass over the feature's request surface: the planner reads, the
+     * catalog and recipe reads and the diary read, plus the five writes that
+     * change state — the publication itself, the grocery check, the
+     * uncheck-all, the swap and the log. The swap preview
+     * (`GET …/alternatives/:recipeVersionId/preview`) is the one read this pass
+     * does not drive. Shared by both tests below so "still works" and "meters
      * nothing" are measured over exactly the same workload.
      */
     const runFullPlanningWorkload = async (): Promise<void> => {
@@ -1333,9 +1338,9 @@ describe('metering is untouched by meal planning', () => {
             ),
         );
 
-        // A grocery check, then the swap, then the log — the three writes that
-        // touch a published week, in an order where each one's precondition is
-        // the previous one's result.
+        // A grocery check, the uncheck-all, then the swap and the log — the
+        // four writes that touch an already-published week, in an order where
+        // each one's precondition is the previous one's result.
         const groceries = await asUser(request.get(`${planBase}/groceries`), PLANNING_USER);
         const firstItem = (groceries.body.sections as Array<Record<string, any>>).flatMap(
             (section) => section.items as Array<Record<string, any>>,

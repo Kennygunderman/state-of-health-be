@@ -1,10 +1,12 @@
 /**
- * `usda.service.ts` is the USDA FoodData Central vendor boundary. Two shipped
- * endpoints reach it at request time — `GET /api/macros/search-branded-foods`
- * and the USDA grounding inside `POST /api/macros/estimate` — and the offline
- * catalog import (Agent Action Plan §0.7.1 Group 3) reaches it through the
- * three fetchers this feature added. Nothing else in the repository pins its
- * behaviour.
+ * `usda.service.ts` is the USDA FoodData Central vendor boundary. Three shipped
+ * request-time paths reach it — `GET /api/macros/search-branded-foods` and
+ * `GET /api/macros/branded-food/:foodId` (both mounted in
+ * `src/routes/food.routes.ts`), plus the USDA grounding inside
+ * `POST /api/macros/estimate` (`src/routes/nutrition.routes.ts`, through
+ * `estimate.service.ts`) — and the offline catalog import (Agent Action Plan
+ * §0.7.1 Group 3) reaches it through the three fetchers this feature added.
+ * Nothing else in the repository pins its behaviour.
  *
  * What this suite pins, and why each one is a decision someone could break:
  *
@@ -33,9 +35,21 @@
  *    row lives 90 days or 30: `/food/{id}` is the detail path, `/foods/list`
  *    is not. Both are asserted at their exact boundary.
  *  - **Stale-while-revalidate, including its failure posture.** A cached row is
- *    served at any age, a row past its TTL refreshes off the request path, two
- *    rapid calls issue one refresh, and a rejecting `findUnique` or `upsert`
- *    never fails the caller.
+ *    served at any age, a row past its TTL refreshes, two rapid calls on one
+ *    key issue a single refresh, and a rejecting `findUnique` never fails the
+ *    caller.
+ *  - **Which reader may leave work running.** The request-path readers refresh
+ *    a stale row and write a cold one in the background, because a client is
+ *    waiting; the import readers (`listFoods`, `getFoodDetail`) wait for both,
+ *    so a run leaves nothing in flight to outlive the `fetch` its rate limiter
+ *    wrapped or the counts it reported. Asserted from both sides, and
+ *    `awaitPendingUsdaRefreshes` is how the request-path side is drained.
+ *  - **What a cache write failure costs, per path.** A rejected write never
+ *    fails a request-path call and is not logged; it always fails a batch call
+ *    and emits exactly one sanitized event, because `cacheKey` is published as
+ *    the location of the raw retrieval evidence a validation record quotes. The
+ *    non-leak case asserts the driver's message, its connection string, its SQL
+ *    and a newline-forged second line are all absent from that event.
  *  - **The retrieval status ledger.** `usda_api_cache.http_status` records the
  *    status of the exchange that produced the row — the successful attempt, not
  *    a retried `400` — and `getFoodsBatchWithRetrieval` reports the *observed*
@@ -43,9 +57,14 @@
  *    row cached before the column existed reports `null`, never a substituted
  *    `200`: `catalog_validation_records.identity_evidence` quotes this value as
  *    a §0.3.2 retrieval record, and inventing a status nobody saw is the defect
- *    review finding OBSEV-F12 reports. The origin is asserted to say `network`
- *    *after* the live path's awaited cache write has already made the row
- *    readable, because row presence is exactly what cannot answer it.
+ *    these cases pin. The old schema had no column able to hold a status, so
+ *    the status was read off the `Response` and discarded; the migration
+ *    `20260909000000_usda_cache_http_status` adds `http_status` as NULLABLE
+ *    with no default and no backfill, which is why a row cached before the
+ *    column existed is represented as `NULL` rather than stamped with a status
+ *    nobody observed. The origin is asserted to say `network` *after* the live
+ *    path's awaited cache write has already made the row readable, because row
+ *    presence is exactly what cannot answer it.
  *  - **Every failure leaves as a `UsdaError`.** A raw `Response`, a bare
  *    `TypeError` from the network, or a `SyntaxError` from an unreadable body
  *    escaping this module would force callers to pattern-match a vendor error
@@ -65,13 +84,21 @@
 
 import { readFileSync } from 'fs';
 import { join } from 'path';
+// A second realm, to prove the recorded-payload check accepts objects built
+// outside this module's — which is what every parsed response is.
+import { runInNewContext } from 'vm';
 
+// The generated namespace, for `Prisma.JsonNull`: the boundary records a JSON
+// `null` document through that sentinel, because the column is NOT NULL and
+// Prisma reads a bare `null` as "clear the column".
+import { Prisma } from '../../generated/prisma';
 import { parseCanonicalFdcId } from '../catalog.logic';
 import {
     MAX_BATCH_FDC_IDS,
     MAX_LIST_PAGE_SIZE,
     USDA_REQUEST_CALL_BUDGET_MS,
     UsdaError,
+    awaitPendingUsdaRefreshes,
     cacheKeyFor,
     cacheKeyForRequest,
     clampListPageSize,
@@ -131,6 +158,17 @@ const ROTATED_API_KEY = 'test-usda-key-rotated';
 const DEFAULT_BASE_URL = 'https://api.nal.usda.gov/fdc/v1';
 const OVERRIDE_BASE_URL = 'https://usda.invalid/fdc/v1';
 
+/**
+ * The redirect policy every attempt is sent with, also private to the module.
+ *
+ * Named here because it is asserted as a literal on the outbound request: a
+ * boundary that talks to one fixed origin has no legitimate hop, and the
+ * default (`'follow'`) would let a 307 — which preserves method and body —
+ * carry the `api_key` in the query string, and a batch body, to whatever
+ * answered for the vendor's hostname.
+ */
+const REFUSE_REDIRECTS: RequestRedirect = 'error';
+
 /** `MAX_ATTEMPTS` and `RETRY_DELAY_MS`, which the module keeps private. */
 const MAX_ATTEMPTS = 4;
 const BACKOFF_SEQUENCE_MS = [250, 500, 750];
@@ -165,6 +203,9 @@ const PLACEHOLDER_MESSAGE = 'USDA request failed';
 
 const statusMessage = (status: number): string => `USDA returned ${status}`;
 const vendorFailureMessage = (cause: string): string => `USDA request failed: ${cause}`;
+const redirectStatusMessage = (status: number): string =>
+    `USDA answered with a redirect (${status}), which this boundary does not follow`;
+const REDIRECTED_MESSAGE = 'USDA response was redirected to another location, which this boundary does not follow';
 const timedOutMessage = (afterMs: number): string => `USDA request timed out after ${afterMs}ms`;
 const invalidFdcIdMessage = (value: string): string => `Invalid USDA FDC id: ${value}`;
 const overLengthBatchMessage = (received: number): string =>
@@ -176,6 +217,18 @@ const invalidRecordIdMessage = (context: string, value: string): string =>
 const detailIdentityMessage = (requested: number, returned: number): string =>
     `USDA detail for FDC id ${requested} returned fdcId ${returned}`;
 const unrequestedIdMessage = (returned: number): string => `USDA batch returned an unrequested fdcId: ${returned}`;
+/**
+ * What the batch path answers when the response could not be recorded.
+ *
+ * Asserted against the literal because the message is the whole of what leaves
+ * the module: the driver's own text is deliberately not in it, and not on a
+ * `cause` either.
+ */
+const CACHE_WRITE_FAILED_MESSAGE =
+    'USDA batch response could not be recorded in usda_api_cache, so the retrieval evidence its cache key names ' +
+    'does not exist';
+/** The event name that failure emits, at the `error` level. */
+const CACHE_WRITE_FAILED_EVENT = 'usda_batch_cache_write_failed';
 
 // ---------------------------------------------------------------------------
 // The in-memory usda_api_cache
@@ -188,7 +241,7 @@ interface UsdaCacheRow {
      * The upstream status of the exchange that produced `payload`. `null` is
      * the legacy case and is modelled rather than avoided: rows written before
      * the column existed carry no status, and the boundary must report that
-     * absence instead of substituting a 200 (review finding OBSEV-F12).
+     * absence instead of substituting a 200.
      */
     http_status: number | null;
     fetched_at: Date;
@@ -262,6 +315,41 @@ const writtenKeys = (): string[] => cache.upsert.mock.calls.map(([args]) => args
 const writtenStatuses = (): Array<[number, number]> =>
     cache.upsert.mock.calls.map(([args]): [number, number] => [args.create.http_status, args.update.http_status]);
 
+/** The payloads the module asked the table to record, in order. */
+const writtenPayloads = (): unknown[] => cache.upsert.mock.calls.map(([args]) => args.create.payload);
+
+// ---------------------------------------------------------------------------
+// The safe log line
+// ---------------------------------------------------------------------------
+
+interface SafeEvent {
+    line: string;
+    event: string;
+    fields: Record<string, unknown>;
+}
+
+/**
+ * Parses the ONE line a `logSafeEvent` call emits, the same way
+ * `src/utils/__tests__/safeLogger.test.ts` does: `[meal-planning] <event>
+ * <json>`, from exactly one call to the level's own console method.
+ *
+ * The whole line is returned alongside the parsed fields because the non-leak
+ * case below asserts about the line as TEXT — what is absent from a log line
+ * cannot be checked by reading the fields that are present in it.
+ */
+const safeEventFrom = (spy: jest.SpyInstance): SafeEvent => {
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    const line = String((spy.mock.calls as unknown[][])[0][0]);
+    const match = /^\[meal-planning] (\S+) (\{.*\})$/.exec(line);
+
+    expect(match).not.toBeNull();
+
+    const [, event, fields] = match as RegExpExecArray;
+
+    return { line, event, fields: JSON.parse(fields) as Record<string, unknown> };
+};
+
 // ---------------------------------------------------------------------------
 // The fetch stub
 // ---------------------------------------------------------------------------
@@ -284,6 +372,27 @@ const jsonResponse = (payload: unknown, status = 200): Response =>
     new Response(JSON.stringify(payload), { status, headers: { 'Content-Type': 'application/json' } });
 
 const failureResponse = (status: number): Response => new Response(`upstream said ${status}`, { status });
+
+/** A 3xx with somewhere else to go, as an unfollowed redirect arrives. */
+const redirectResponse = (status: number): Response =>
+    new Response('', { status, headers: { location: 'https://usda-mirror.invalid/fdc/v1' } });
+
+/**
+ * A 200 that a transport reached BY FOLLOWING a hop — the dangerous shape, and
+ * the one a policy on the init cannot rule out when the transport is a wrapper
+ * or a double rather than the platform's own `fetch`.
+ *
+ * `redirected` is a prototype getter that always answers `false` on a
+ * constructed `Response`, so it is shadowed with an own property: nothing else
+ * can produce this state in-process, and the boundary has to refuse it on the
+ * evidence the response itself carries.
+ */
+const followedRedirectResponse = (payload: unknown): Response => {
+    const response = jsonResponse(payload);
+    Object.defineProperty(response, 'redirected', { value: true, configurable: true });
+
+    return response;
+};
 
 /** Answers each request from the queue; an unqueued request is a test defect. */
 const respondWith = (...responses: Response[]): FetchStub => {
@@ -363,6 +472,27 @@ interface Deferred {
     settle: () => void;
 }
 
+/**
+ * A 200 whose DECODED body is the given value, whatever that value is.
+ *
+ * `Response.json()` cannot produce a non-JSON body — its result is the output
+ * of a JSON parse — so a body like that has to be constructed here, and the
+ * cases that use it are why the conversion into the cache column is a check
+ * rather than a cast. The module reads only `ok`, `status` and `json()`, so
+ * those three are all this stands up.
+ */
+const respondWithDecodedBody = (body: unknown): FetchStub =>
+    install(
+        jest.fn(
+            async (): Promise<Response> =>
+                ({
+                    ok: true,
+                    status: 200,
+                    json: async (): Promise<unknown> => body,
+                }) as unknown as Response,
+        ) as unknown as FetchStub,
+    );
+
 /** A stub whose single request stays in flight until `settle()` is called. */
 const respondWhenSettled = (payload: unknown): Deferred => {
     let release: (() => void) | undefined;
@@ -394,6 +524,12 @@ interface SentRequest {
     headers: unknown;
     body: unknown;
     signal: AbortSignal | null | undefined;
+    /**
+     * Captured because it is a security property of the request and not a
+     * formatting detail: `'error'` is what stops a 307 carrying this module's
+     * `api_key` — and a batch body — to an origin it never chose.
+     */
+    redirect: RequestRedirect | undefined;
 }
 
 const sentRequest = (index = 0): SentRequest => {
@@ -413,6 +549,7 @@ const sentRequest = (index = 0): SentRequest => {
         headers: init?.headers,
         body: typeof rawBody === 'string' ? (JSON.parse(rawBody) as unknown) : rawBody,
         signal: init?.signal,
+        redirect: init?.redirect,
     };
 };
 
@@ -433,6 +570,10 @@ const expectSignalOnlyGet = (request: SentRequest): void => {
     expect(request.headers).toBeUndefined();
     expect(request.body).toBeUndefined();
     expect(request.signal).toBeInstanceOf(AbortSignal);
+    // The other member of a GET's init, and the other one that is not a wire
+    // value: a client-side policy, so what USDA receives is still the request
+    // this module sent before either existed.
+    expect(request.redirect).toBe(REFUSE_REDIRECTS);
 };
 
 // ---------------------------------------------------------------------------
@@ -784,7 +925,7 @@ describe('cacheKeyFor', () => {
     /**
      * The keys the SHIPPED call sites actually read, asserted as the literal
      * strings the module produced before `http_status` was added to the table
-     * (review finding OBSEV-F12 touched every write on this path). These are
+     * (adding it touched every write on this path). These are
      * live `usda_api_cache.cache_key` primary-key values: a changed GET key
      * orphans every deployed row and pushes the running API back through
      * USDA's hourly limit, so the literals are captured from the previous
@@ -1340,6 +1481,103 @@ describe('fetchFromUsda', () => {
     });
 
     /**
+     * THE REDIRECT IT REFUSES.
+     *
+     * This boundary has one origin, so a hop away from it is never a
+     * destination this code chose — and the requests are exactly the ones worth
+     * stealing: every URL carries `api_key` in its query string, and the batch
+     * call carries a body. A 307 or 308 preserves method and body, and `fetch`
+     * follows redirects by DEFAULT, so before the policy below a redirect was
+     * followed silently and the credential went with it.
+     *
+     * Two things are therefore asserted, because they fail independently:
+     *
+     *  - the policy on the outbound request (`redirect: 'error'`), which is
+     *    what a conforming `fetch` enforces before any hop is made; and
+     *  - the refusal in this module, for a redirect that arrives anyway.
+     *    `globalThis.fetch` is deliberately read per attempt so
+     *    `scripts/lib/rateLimiter.ts` can wrap it, and a wrapper builds its own
+     *    init — so "the platform would have stopped it" is an assumption this
+     *    boundary does not get to make.
+     *
+     * A refusal is terminal, which is also rate accounting: an identical retry
+     * is redirected identically, so retrying would spend three more of the
+     * hour's 900 requests to learn the same thing.
+     */
+    describe('the redirect it refuses', () => {
+        it('sends the refuse-redirects policy on a GET', async () => {
+            respondWith(jsonResponse(searchSample('brandedComplete').payload));
+
+            await searchBrandedFoods('yogurt');
+
+            expectSignalOnlyGet(sentRequest());
+        });
+
+        it('sends it on the batch POST too, where the body is at stake', async () => {
+            respondWith(jsonResponse([]));
+
+            await getFoodsBatch([9000301]);
+
+            const request = sentRequest();
+
+            expect(request.method).toBe('POST');
+            expect(request.redirect).toBe(REFUSE_REDIRECTS);
+            expect(request.body).toEqual({ fdcIds: [9000301], format: 'full' });
+        });
+
+        it.each([301, 302, 303, 307, 308])('refuses an unfollowed %i and spends one request, not four', async (status) => {
+            alwaysRespond(() => redirectResponse(status));
+
+            // No timer is advanced: a refusal that waited out a backoff would
+            // be a retry, which is the accounting this test denies.
+            const error = await vendorFailure(searchBrandedFoods('yogurt'));
+
+            expect(error.message).toBe(redirectStatusMessage(status));
+            expect(requestCount()).toBe(1);
+            expect(writtenKeys()).toEqual([]);
+            expect(rows.size).toBe(0);
+        });
+
+        /**
+         * The status a hop ends on is not the question — this response is a
+         * perfectly good 200 whose body came from somewhere else, so it is
+         * refused before `response.ok` is consulted and its payload never
+         * becomes a result or a cached row.
+         */
+        it('refuses a 200 that was reached by following a hop, and caches nothing', async () => {
+            alwaysRespond(() => followedRedirectResponse(searchSample('brandedComplete').payload));
+
+            const error = await vendorFailure(searchBrandedFoods('yogurt'));
+
+            expect(error.message).toBe(REDIRECTED_MESSAGE);
+            expect(requestCount()).toBe(1);
+            expect(writtenKeys()).toEqual([]);
+            expect(rows.size).toBe(0);
+        });
+
+        it('refuses a followed hop on the batch path, so no retrieval facts are returned for it', async () => {
+            alwaysRespond(() => followedRedirectResponse([detailSample('brandedDetailComplete').payload]));
+
+            const error = await vendorFailure(getFoodsBatchWithRetrieval([9000301]));
+
+            expect(error.message).toBe(REDIRECTED_MESSAGE);
+            expect(requestCount()).toBe(1);
+            expect(writtenKeys()).toEqual([]);
+        });
+
+        it('refuses a hop on the import path without leaving a refresh behind', async () => {
+            alwaysRespond(() => redirectResponse(308));
+
+            const error = await vendorFailure(listFoods('Branded'));
+
+            expect(error.message).toBe(redirectStatusMessage(308));
+            expect(requestCount()).toBe(1);
+            await awaitPendingUsdaRefreshes();
+            expect(writtenKeys()).toEqual([]);
+        });
+    });
+
+    /**
      * The deadlines.
      *
      * `fetch` has no timeout of its own, so before these existed a stalled DNS
@@ -1535,36 +1773,55 @@ describe('fetchFromUsda', () => {
             expect(storedRow(listKey('Branded')).fetched_at.getTime()).toBe(FIXED_NOW);
         });
 
-        it('refreshes a row past its TTL off the request path and writes it back', async () => {
+        /**
+         * `listFoods` reads in the awaited posture, so its refresh has already
+         * written the row by the time the call answers — no tick is advanced
+         * between the two assertions below. The row it SERVES is still the one
+         * it read: waiting for the refresh is about not leaving work behind,
+         * not about serving fresher data mid-call.
+         */
+        it('refreshes a row past its TTL and writes it back before it answers', async () => {
             const key = listKey('Branded');
             seedRow(key, listPayload(), SEARCH_TTL_MS + DAY_MS);
             respondWith(jsonResponse([portionSample('fnddsPortions').payload]));
 
-            await listFoods('Branded');
+            const records = await listFoods('Branded');
 
             expect(requestCount()).toBe(1);
-
-            await jest.advanceTimersByTimeAsync(0);
-
             expect(writtenKeys()).toEqual([key]);
             expect(storedRow(key).fetched_at.getTime()).toBe(FIXED_NOW);
             expect((storedRow(key).payload as Array<{ fdcId: number }>).map((record) => record.fdcId)).toEqual([
                 fdcIdOf(portionSample('fnddsPortions')),
             ]);
+            expect(records.map((record) => record.fdcId)).toEqual([fdcIdOf(portionSample('srLegacyPortions'))]);
         });
 
+        /**
+         * One refresh per key, with the two reads STARTED CONCURRENTLY and the
+         * vendor released before either is awaited.
+         *
+         * The overlap is what the dedupe is about, and an awaited reader cannot
+         * be sequenced against a stub that settles later — awaiting the first
+         * call before starting the second would wait for a response that has
+         * not been released yet, and prove nothing about the second.
+         */
         it('issues one refresh for two rapid calls on the same key', async () => {
             const key = listKey('Branded');
             seedRow(key, listPayload(), SEARCH_TTL_MS + DAY_MS);
             const deferred = respondWhenSettled([portionSample('fnddsPortions').payload]);
 
-            await listFoods('Branded');
-            await listFoods('Branded');
+            const first = listFoods('Branded');
+            const second = listFoods('Branded');
+            // Both reads have found the stale row and joined one refresh by the
+            // time the vendor answers.
+            await jest.advanceTimersByTimeAsync(0);
+            deferred.settle();
+
+            await expect(first).resolves.toHaveLength(1);
+            await expect(second).resolves.toHaveLength(1);
 
             expect(deferred.stub).toHaveBeenCalledTimes(1);
-
-            deferred.settle();
-            await jest.advanceTimersByTimeAsync(0);
+            expect(writtenKeys()).toEqual([key]);
         });
 
         it('refreshes again once the in-flight refresh has released the key', async () => {
@@ -1572,24 +1829,37 @@ describe('fetchFromUsda', () => {
             seedRow(key, listPayload(), SEARCH_TTL_MS + DAY_MS);
             const deferred = respondWhenSettled([portionSample('fnddsPortions').payload]);
 
-            await listFoods('Branded');
-            deferred.settle();
+            const first = listFoods('Branded');
             await jest.advanceTimersByTimeAsync(0);
+            deferred.settle();
+            await first;
 
+            // A row that is stale again refreshes again: the key is released by
+            // the refresh that held it, so a finished refresh cannot dedupe a
+            // later one forever.
             seedRow(key, listPayload(), SEARCH_TTL_MS + DAY_MS);
             await listFoods('Branded');
 
             expect(deferred.stub).toHaveBeenCalledTimes(2);
         });
 
+        /**
+         * A failed refresh is still best-effort, whoever is waiting for it:
+         * awaiting the four attempts does not turn the vendor's `503` into the
+         * caller's failure, and the stale row is returned and left untouched.
+         */
         it('keeps serving the stale row when the refresh itself fails', async () => {
             const key = listKey('Branded');
             seedRow(key, listPayload(), SEARCH_TTL_MS + DAY_MS);
             alwaysRespond(() => failureResponse(503));
 
-            const records = await listFoods('Branded');
+            // Started, then driven through the whole backoff, because the
+            // awaited reader is waiting on those four attempts.
+            const call = listFoods('Branded');
             await jest.advanceTimersByTimeAsync(TOTAL_BACKOFF_MS);
+            const records = await call;
 
+            expect(requestCount()).toBe(MAX_ATTEMPTS);
             expect(records).toHaveLength(1);
             expect(writtenKeys()).toEqual([]);
             expect(storedRow(key).fetched_at.getTime()).toBe(FIXED_NOW - (SEARCH_TTL_MS + DAY_MS));
@@ -1603,21 +1873,280 @@ describe('fetchFromUsda', () => {
             expect(requestCount()).toBe(1);
         });
 
-        it('resolves normally when upsert rejects', async () => {
+        /**
+         * The GET path's write posture, and the deliberate opposite of the
+         * batch path's: a write the database refused does not fail a call whose
+         * response is already in hand, and is not logged either — a row that
+         * will be written again on the next call past its TTL is not an
+         * operator event on a request that was answered. `getFoodsBatch`
+         * rejects on the very same failure, because what depends on ITS row is
+         * a published evidence record.
+         *
+         * Asserted on both read postures, since the asymmetry is about the
+         * caller and not about who waits for the write.
+         */
+        it('resolves normally when upsert rejects, on either posture, and logs nothing', async () => {
+            const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
             cache.upsert.mockRejectedValue(new Error('read-only transaction'));
-            respondWith(jsonResponse(listPayload()));
+            respondWith(jsonResponse(listPayload()), jsonResponse(detailSample('brandedDetailComplete').payload));
 
+            // The awaited reader waits for the write, then answers anyway.
             await expect(listFoods('Branded')).resolves.toHaveLength(1);
+            // The request-path reader never waited for it in the first place.
+            await expect(getBrandedFood('9000301')).resolves.not.toBeNull();
             await jest.advanceTimersByTimeAsync(0);
+
+            expect(cache.upsert).toHaveBeenCalledTimes(2);
+            expect(logged).not.toHaveBeenCalled();
+
+            logged.mockRestore();
+        });
+
+        /**
+         * THE VALUE THAT REACHES THE PAYLOAD COLUMN, and the decision these
+         * cases record: a body that is not JSON DATA is refused rather than
+         * repaired, and what the refusal costs depends on which path is
+         * writing.
+         *
+         * `JSON.stringify` renders a non-finite number as `null` and drops a
+         * function outright, so a row written from such a value would not be
+         * the response it claims to hold — and the batch row is quoted as
+         * exactly that by every `catalog_validation_records.identity_evidence`
+         * record. On the request path the refusal is invisible: the payload is
+         * already in hand, so the call answers and the row is simply not
+         * written, to be written again by the next call past its TTL. On the
+         * batch path it fails the call, like any other write that could not be
+         * recorded.
+         *
+         * A real `response.json()` body reaches neither arm — it is the output
+         * of a JSON parse, so every node in it is already a JSON value — which
+         * is why these bodies are constructed rather than served.
+         */
+        describe('the value written to the payload column', () => {
+            const batchKeyFor = (fdcIds: number[]): string =>
+                cacheKeyForRequest('POST', '/foods', {}, { fdcIds, format: 'full' });
+
+            it('answers a request-path read whose body is not JSON data, and writes no row', async () => {
+                const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+                respondWithDecodedBody({ foods: [], totalHits: Number.NaN });
+
+                await expect(searchBrandedFoods('fixture')).resolves.toEqual([]);
+                await jest.advanceTimersByTimeAsync(0);
+
+                expect(rows.size).toBe(0);
+                // Silent, like every other request-path write failure.
+                expect(logged).not.toHaveBeenCalled();
+
+                logged.mockRestore();
+            });
+
+            it('fails a batch call whose body is not JSON data rather than recording it', async () => {
+                const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+                respondWithDecodedBody([{ fdcId: 9000301, description: 'Fixture', calories: Number.POSITIVE_INFINITY }]);
+
+                const error = await vendorFailure(getFoodsBatch([9000301]));
+
+                expect(error.message).toBe('USDA response holds a non-finite number, which JSON cannot represent');
+                expect(rows.has(batchKeyFor([9000301]))).toBe(false);
+                expect(cache.upsert).not.toHaveBeenCalled();
+                // The refusal is the caller's to see, so it needs no event of
+                // its own — nothing was caught and turned into a message here.
+                expect(logged).not.toHaveBeenCalled();
+
+                logged.mockRestore();
+            });
+
+            it('names the type it refused and never the value', async () => {
+                respondWithDecodedBody([{ fdcId: 9000301, secret: (): string => 'postgresql://soh:s3cret@db/soh' }]);
+
+                const error = await vendorFailure(getFoodsBatch([9000301]));
+
+                expect(error.message).toBe('USDA response holds a function, which JSON cannot represent');
+                expect(error.message).not.toContain('s3cret');
+            });
+
+            /**
+             * THE OBJECTS THAT SERIALISE WITHOUT ERROR INTO SOMETHING ELSE, and
+             * why "every value in it is JSON" is not the test.
+             *
+             * A `Date` nested in the body is the clearest of them: it walks
+             * cleanly, because it holds no own data properties at all, and
+             * `JSON.stringify` then turns it into an ISO STRING. Recording that
+             * row and handing the caller back the live `Date` would break the
+             * one promise this conversion makes — a batch caller digests the
+             * value it is given and publishes the digest beside the cache key
+             * naming the row (Agent Action Plan §0.3.2/§0.5.1), so the row and
+             * the digest would disagree the moment anyone read the row back. A
+             * `Map`, a class instance and an object with its own `toJSON` are
+             * the same failure in different clothes: `{}` or whatever `toJSON`
+             * decided, under a key that claims to hold the vendor's document.
+             *
+             * So the container itself is checked, not just its values, and the
+             * refusal names the KIND of object without naming the object.
+             */
+            const FAITHFULNESS_MESSAGE =
+                'USDA response holds an object JSON cannot represent faithfully, such as a Date, a class instance, or a property behind an accessor';
+
+            const unfaithfulContainers: ReadonlyArray<[string, () => unknown]> = [
+                ['a Date, which JSON.stringify would rewrite as a string', (): unknown => new Date(FIXED_NOW)],
+                ['a Map, which JSON.stringify would rewrite as {}', (): unknown => new Map([['gramWeight', 28]])],
+                ['a Set, which JSON.stringify would rewrite as {}', (): unknown => new Set([28])],
+                [
+                    'a class instance, which JSON.stringify would rewrite as {}',
+                    (): unknown => {
+                        class Portion {
+                            public constructor(public readonly gramWeight: number) {}
+                        }
+
+                        return new Portion(28);
+                    },
+                ],
+                [
+                    'an object whose own toJSON would decide for itself',
+                    (): unknown => {
+                        const portion: Record<string, unknown> = { gramWeight: 28 };
+                        // Non-enumerable, so it is not a function VALUE the walk
+                        // would reject on its own — the shape check is what
+                        // catches it.
+                        Object.defineProperty(portion, 'toJSON', { value: () => 'rewritten', enumerable: false });
+
+                        return portion;
+                    },
+                ],
+                [
+                    'an object whose value hides behind an accessor',
+                    (): unknown => {
+                        const portion: Record<string, unknown> = {};
+                        Object.defineProperty(portion, 'gramWeight', { get: () => 28, enumerable: true });
+
+                        return portion;
+                    },
+                ],
+                [
+                    'an object carrying a symbol key JSON.stringify would drop',
+                    (): unknown => ({ gramWeight: 28, [Symbol('marker')]: 'dropped' }),
+                ],
+            ];
+
+            it.each(unfaithfulContainers)('fails a batch call whose body holds %s', async (_label, build) => {
+                respondWithDecodedBody([{ fdcId: 9000301, foodPortions: [build()] }]);
+
+                const error = await vendorFailure(getFoodsBatch([9000301]));
+
+                expect(error.message).toBe(FAITHFULNESS_MESSAGE);
+                expect(rows.size).toBe(0);
+                expect(cache.upsert).not.toHaveBeenCalled();
+            });
+
+            /**
+             * An accessor is refused without being READ. A getter is free to
+             * throw, to answer differently on each call, or to reach out to
+             * something slow, and the walk that decides whether a value is
+             * recordable must do none of those on a document it did not build —
+             * so the shape is inspected through property descriptors, which
+             * never invoke anything.
+             */
+            it('refuses an accessor without invoking it', async () => {
+                const read = jest.fn((): never => {
+                    throw new Error('postgresql://soh:s3cret@db/soh');
+                });
+                const portion: Record<string, unknown> = {};
+                Object.defineProperty(portion, 'gramWeight', { get: read, enumerable: true });
+                respondWithDecodedBody([{ fdcId: 9000301, foodPortions: [portion] }]);
+
+                const error = await vendorFailure(getFoodsBatch([9000301]));
+
+                // The boundary's own refusal, not the getter's error escaping
+                // it as something other than a UsdaError.
+                expect(error).toBeInstanceOf(UsdaError);
+                expect(error.message).toBe(FAITHFULNESS_MESSAGE);
+                expect(error.message).not.toContain('s3cret');
+                expect(read).not.toHaveBeenCalled();
+            });
+
+            it('answers a request-path read whose body holds such an object, and writes no row', async () => {
+                const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+                respondWithDecodedBody({ foods: [], fetchedAt: new Date(FIXED_NOW) });
+
+                await expect(searchBrandedFoods('fixture')).resolves.toEqual([]);
+                await jest.advanceTimersByTimeAsync(0);
+
+                expect(rows.size).toBe(0);
+                expect(logged).not.toHaveBeenCalled();
+
+                logged.mockRestore();
+            });
+
+            /**
+             * The other side of the rule, and the reason nothing is normalised:
+             * a body that IS plain JSON data is recorded and returned as the
+             * very same value. One value is in play, so the row a published
+             * cache key names holds what the caller digested — not a repaired
+             * copy that happens to look like it.
+             */
+            /**
+             * THE CASE THAT FORBIDS COMPARING PROTOTYPES BY IDENTITY, named so
+             * that a future tightening of the shape check fails here with the
+             * reason rather than failing three hundred cases without one.
+             *
+             * A real body is parsed by the platform's `response.json()`, so its
+             * objects carry the prototypes of the realm the platform's parser
+             * runs in — under Jest the Node realm, not this module's. Such an
+             * object is ordinary JSON data and must be recorded: a check that
+             * asked `Object.getPrototypeOf(value) === Object.prototype` would
+             * refuse every response this service has ever cached. A foreign
+             * realm is built explicitly here to say so; the rest of this suite
+             * relies on the same property through `jsonResponse`.
+             */
+            it('records a body whose objects were built in another realm', async () => {
+                const body = runInNewContext('[{fdcId: 9000301, foodPortions: [{gramWeight: 28, modifier: null}]}]') as unknown[];
+                // Plain JSON data, and provably not this realm's objects.
+                expect(Object.getPrototypeOf(body)).not.toBe(Array.prototype);
+                expect(Object.getPrototypeOf(body[0] as object)).not.toBe(Object.prototype);
+                respondWithDecodedBody(body);
+
+                const { retrieval } = await getFoodsBatchWithRetrieval([9000301]);
+
+                expect(retrieval.payload).toBe(body);
+                expect(storedRow(retrieval.cacheKey).payload).toBe(body);
+            });
+
+            it('records and returns one and the same value for a plain JSON body', async () => {
+                const body: unknown[] = [{ fdcId: 9000301, description: 'Fixture', foodPortions: [{ gramWeight: 28, modifier: null }] }];
+                respondWithDecodedBody(body);
+
+                const { retrieval } = await getFoodsBatchWithRetrieval([9000301]);
+
+                expect(retrieval.payload).toBe(body);
+                expect(storedRow(retrieval.cacheKey).payload).toBe(body);
+                expect(writtenPayloads()).toEqual([body]);
+            });
+
+            /**
+             * A JSON `null` document is a valid response and the one JSON value
+             * the column cannot be handed literally: Prisma reads a JS `null`
+             * as "set this column to database NULL", which the NOT NULL column
+             * refuses. It is recorded through the sentinel that means the JSON
+             * document `null`, so the row holds what the vendor answered.
+             */
+            it('records a null document through Prisma JsonNull rather than a bare null', async () => {
+                respondWith(jsonResponse(null));
+
+                await expect(getBrandedFood('9000301')).resolves.toBeNull();
+                await jest.advanceTimersByTimeAsync(0);
+
+                expect(writtenPayloads()).toEqual([Prisma.JsonNull]);
+            });
         });
 
         /**
          * The upstream status is a mandatory field of a retrieval record
          * (Agent Action Plan §0.3.2) and the catalog import copies it onto
          * every `catalog_validation_records.identity_evidence` record, so this
-         * boundary has to persist what it observed. Before review finding
-         * OBSEV-F12 the status was read off the `Response` and discarded, and
-         * the import had nothing to quote but a hardcoded 200.
+         * boundary has to persist what it observed. The status used to be read
+         * off the `Response` and discarded, leaving `usda_api_cache.http_status`
+         * null everywhere, and the import had nothing to quote but a hardcoded
+         * 200.
          */
         describe('the status it records with the payload', () => {
             it('writes the observed status on both branches of the upsert', async () => {
@@ -1662,13 +2191,12 @@ describe('fetchFromUsda', () => {
              * too — a refreshed row carrying the status of the response it no
              * longer holds would be evidence about a payload that is gone.
              */
-            it('replaces a legacy row without a status when the background refresh writes it back', async () => {
+            it('replaces a legacy row without a status when the refresh writes it back', async () => {
                 const key = listKey('Branded');
                 seedRow(key, listPayload(), SEARCH_TTL_MS + DAY_MS, null);
                 respondWith(jsonResponse([portionSample('fnddsPortions').payload], 200));
 
                 await listFoods('Branded');
-                await jest.advanceTimersByTimeAsync(0);
 
                 expect(writtenKeys()).toEqual([key]);
                 expect(storedRow(key).http_status).toBe(200);
@@ -1749,6 +2277,15 @@ describe('fetchFromUsda', () => {
             const records = await getFoodsBatch([9000301]);
 
             expect(records).toHaveLength(1);
+            expect(requestCount()).toBe(0);
+            expect(writtenKeys()).toEqual([]);
+
+            // And nothing was started that a drain could still be waiting for:
+            // the batch path has no refresh at all, not a refresh that happens
+            // to be awaited.
+            await awaitPendingUsdaRefreshes();
+            await jest.advanceTimersByTimeAsync(TOTAL_BACKOFF_MS);
+
             expect(requestCount()).toBe(0);
             expect(writtenKeys()).toEqual([]);
         });
@@ -2053,12 +2590,27 @@ describe('the new fetchers', () => {
             expect(sentRequest().method).toBe('POST');
         });
 
-        it('resolves normally when upsert rejects, as the GET path does', async () => {
+        /**
+         * The opposite of the GET path, and deliberately so: the cache key this
+         * path files the response under is published as the location of the raw
+         * retrieval evidence a validation record quotes (Agent Action Plan
+         * §0.3.2/§0.5.1), so "the call succeeded but the row is not there" is a
+         * promise it cannot keep. The failure is the caller's to see rather than
+         * something the caller has to remember to check a flag for.
+         */
+        it('rejects with a UsdaError when the cache write fails, unlike the GET path', async () => {
+            // Spied only to keep the event out of the suite's output; what the
+            // event CONTAINS is asserted in the retrieval group below.
+            const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
             cache.upsert.mockRejectedValue(new Error('read-only transaction'));
             respondWith(batchResponse());
 
-            await expect(getFoodsBatch(BATCH_IDS)).resolves.toHaveLength(2);
-            await jest.advanceTimersByTimeAsync(0);
+            const error = await vendorFailure(getFoodsBatch(BATCH_IDS));
+
+            expect(error.message).toBe(CACHE_WRITE_FAILED_MESSAGE);
+            expect(logged).toHaveBeenCalledTimes(1);
+
+            logged.mockRestore();
         });
 
         it('throws when the payload is not an array, rather than degrading to no results', async () => {
@@ -2087,7 +2639,7 @@ describe('the new fetchers', () => {
     });
 
     /**
-     * The provenance half of the batch fetcher (review finding OBSEV-F12).
+     * The provenance half of the batch fetcher.
      *
      * `catalog_validation_records.identity_evidence` is a §0.3.2 retrieval
      * record and the upstream status is one of its mandatory fields, so the
@@ -2148,7 +2700,7 @@ describe('the new fetchers', () => {
         });
 
         /**
-         * The ordering root cause of OBSEV-F12's second half: this path used to
+         * The ordering root cause of the null-status rows: this path used to
          * fire the cache write and not await it, so the row a caller looked for
          * straight afterwards was usually not there yet — and a caller reading
          * provenance off the table concluded the response had come from cache.
@@ -2217,7 +2769,8 @@ describe('the new fetchers', () => {
          * status could never be observed for that batch and the published
          * evidence would stay null forever while this module looked correct.
          * Re-fetching is the only way the field can ever be obtained, and
-         * substituting a 200 instead is precisely the defect OBSEV-F12 reports.
+         * substituting a 200 instead is precisely the defect the migration
+         * `20260909000000_usda_cache_http_status` was added to end.
          */
         it('re-fetches a pre-ledger row rather than replaying it forever', async () => {
             seedRow(BATCH_KEY, [{ fdcId: 1, description: 'Stale' }], 40 * DAY_MS, null);
@@ -2252,9 +2805,13 @@ describe('the new fetchers', () => {
             expect(row.payload).toEqual(batchPayload());
             expect(row.fetched_at.getTime()).toBe(FIXED_NOW);
 
-            // And the condition is SELF-CLEARING: the row now carries a status,
-            // so the next call replays it and spends no request. One re-fetch
-            // per pre-ledger batch, once, rather than added steady-state load.
+            // And the condition clears once the response has been RECORDED:
+            // the row now carries a status, so the next call replays it and
+            // spends no request. One re-fetch per pre-ledger batch whose
+            // replacement was written. A write that FAILS clears nothing — the
+            // statusless row survives the failed upsert untouched and the next
+            // call re-fetches it again — but every such call raises rather
+            // than returning, which the rejection cases below pin.
             const replay = await retrievalOf();
 
             expect(requestCount()).toBe(1);
@@ -2262,20 +2819,89 @@ describe('the new fetchers', () => {
             expect(replay.httpStatus).toBe(203);
         });
 
-        it('does not fail the vendor call when the cache write rejects', async () => {
+        /**
+         * The retrieval facts are what makes the cache write mandatory here:
+         * `cacheKey` is handed to the import as the durable location of this
+         * raw response, and every `catalog_validation_records.identity_evidence`
+         * record quotes it. Returning facts about a row that was never written
+         * would publish evidence pointing at nothing, so the call fails and the
+         * import's own error handling stops the batch instead.
+         */
+        it('rejects rather than returning facts about a row it could not write', async () => {
             const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
             cache.upsert.mockRejectedValue(new Error('read-only transaction'));
             respondWith(jsonResponse(batchPayload()));
 
-            const { details, retrieval } = await getFoodsBatchWithRetrieval(BATCH_IDS);
+            const error = await vendorFailure(getFoodsBatchWithRetrieval(BATCH_IDS));
 
-            expect(details).toHaveLength(2);
-            expect(retrieval.origin).toBe('network');
-            expect(retrieval.httpStatus).toBe(200);
-            // The failure is reported, not swallowed: a cache that stopped
-            // accepting writes is an operational fact, and the import's next
-            // run would otherwise re-spend the hour's requests in silence.
-            expect(logged).toHaveBeenCalledWith('Failed to cache USDA batch response:', 'read-only transaction');
+            expect(error.message).toBe(CACHE_WRITE_FAILED_MESSAGE);
+            // A cache that stopped accepting writes is an operational fact, so
+            // it is reported — as ONE structured event through the sanctioned
+            // logger, carrying the endpoint, the key, and the error's class and
+            // machine code. Never the driver's own message.
+            const { event, fields } = safeEventFrom(logged);
+
+            expect(event).toBe(CACHE_WRITE_FAILED_EVENT);
+            expect(fields).toEqual({ path: '/foods', cacheKey: BATCH_KEY, errorName: 'Error' });
+
+            logged.mockRestore();
+        });
+
+        /**
+         * THE NON-LEAK CANARY, and the reason this test exists at all: the
+         * value this call site catches is a driver error, and a Prisma message
+         * carries the connection string it failed on, the statement it failed
+         * in, and the bound values of that statement. Any one of those in a log
+         * line is a disclosure (CWE-532), and the embedded newline is worse
+         * still — it forges a second line that reads exactly like a real event
+         * (CWE-117).
+         *
+         * Each substring below is one of those leaks, planted in the ONE field
+         * of the thrown value this module is allowed to read nothing of, and
+         * asserted absent from the emitted line as text. `code` is a machine
+         * code and is the one thing that must survive, because `P2002` is what
+         * makes the failure actionable.
+         */
+        it('logs the error class and code and none of the message, however the message is loaded', async () => {
+            const logged = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+            const LEAKS = [
+                'postgresql://soh:s3cret@db.internal:5432/soh_prod',
+                's3cret',
+                'INSERT INTO usda_api_cache',
+                'api_key=abcd1234',
+                'abcd1234',
+                'forged_event',
+            ];
+            const hostile = new Error(
+                `connect failed ${LEAKS[0]} while running ${LEAKS[2]} (cache_key, payload) with ` +
+                    `?${LEAKS[3]}\n[meal-planning] ${LEAKS[5]} {"status":"ok"}`,
+            );
+            hostile.name = 'PrismaClientKnownRequestError';
+            (hostile as Error & { code: string }).code = 'P2002';
+            cache.upsert.mockRejectedValue(hostile);
+            respondWith(jsonResponse(batchPayload()));
+
+            const error = await vendorFailure(getFoodsBatchWithRetrieval(BATCH_IDS));
+
+            // One call, so there is no second line for the forged one to hide
+            // in, and `safeEventFrom` fails if the line is not one whole event.
+            const { line, event, fields } = safeEventFrom(logged);
+
+            expect(event).toBe(CACHE_WRITE_FAILED_EVENT);
+            expect(fields).toEqual({
+                path: '/foods',
+                cacheKey: BATCH_KEY,
+                errorName: 'PrismaClientKnownRequestError',
+                errorCode: 'P2002',
+            });
+            for (const leak of LEAKS) {
+                expect(line).not.toContain(leak);
+            }
+            // And the error the caller receives carries none of it either — the
+            // driver error is not attached as a `cause`, so a caller that logs
+            // what it caught cannot reintroduce the leak.
+            expect(error.message).toBe(CACHE_WRITE_FAILED_MESSAGE);
+            expect((error as Error & { cause?: unknown }).cause).toBeUndefined();
 
             logged.mockRestore();
         });
@@ -2447,6 +3073,53 @@ describe('the new fetchers', () => {
             expect(error.message).toBe(notAnArrayMessage('list'));
         });
 
+        // ------------------------------------------------------------------
+        // The end-of-dataset marker, and the exactness of the exception made
+        // for it. `GET /foods/list` answers `{}` — not `[]` — for a page past
+        // the end of its dataType, measured against the live API on
+        // 2026-09-18 at pageSize 200 with HTTP 200 and a two-byte body, for
+        // Foundation page 3 and page 9, SR Legacy page 40 and Survey (FNDDS)
+        // page 29: the first page after each sweep's
+        // `observedLastNonEmptyPage` in data/meal-planning/usda-manifest.v1.json.
+        //
+        // Why these are here rather than in the importer's suite: the sweep in
+        // scripts/catalog-import-usda.ts stops on `rows.length === 0`, a
+        // condition the vendor's real answer could never reach while this
+        // boundary refused it, so the full import died with
+        // `usda_request_failed` on the first page after the data of its FIRST
+        // sweep and no environment could build a catalog from the manifest at
+        // all. Translating the marker is this module's job; the pair below is
+        // what keeps the translation from widening into "objects are tolerated
+        // here", which would hide the malformed-payload defect the case above
+        // exists to catch.
+        // ------------------------------------------------------------------
+
+        it('reads the empty object past the end of a dataset as an empty page', async () => {
+            respondWith(jsonResponse({}));
+
+            await expect(listFoods('Foundation', 200, 3)).resolves.toEqual([]);
+        });
+
+        it('still throws for a null payload, which marks no end of anything', async () => {
+            respondWith(jsonResponse(null));
+
+            const error = await vendorFailure(listFoods('Foundation', 200, 3));
+
+            expect(error.message).toBe(notAnArrayMessage('list'));
+        });
+
+        it('leaves the batch context refusing the same empty object', async () => {
+            respondWith(jsonResponse({}));
+
+            // Ids inline rather than borrowed: the batch describe blocks below
+            // hold their own `BATCH_IDS`, and this case asserts a property of
+            // the *list* exception — that it did not widen — so it belongs
+            // here beside the marker it is bounding.
+            const error = await vendorFailure(getFoodsBatch([9000302, 9000301]));
+
+            expect(error.message).toBe(notAnArrayMessage('batch'));
+        });
+
         it('throws when a record carries no usable fdcId', async () => {
             respondWith(jsonResponse([{ description: 'Fixture vegetable, leafy, raw' }]));
 
@@ -2486,8 +3159,12 @@ describe('the new fetchers', () => {
 
 
 /**
- * The three functions that were already in production. Everything asserted
- * here is behaviour the two shipped endpoints depend on, so it must survive the
+ * The three functions that were already in production, and the three
+ * request-time paths that reach them: `GET /api/macros/search-branded-foods`
+ * (`searchBrandedFoods`), `GET /api/macros/branded-food/:foodId`
+ * (`getBrandedFood`) and the USDA grounding inside `POST /api/macros/estimate`
+ * (`searchGenericFoods`, reached through `estimate.service.ts`). Everything
+ * asserted here is behaviour those paths depend on, so it must survive the
  * extraction unchanged.
  */
 describe('unchanged behaviour', () => {
@@ -2912,6 +3589,161 @@ describe('unchanged behaviour', () => {
 });
 
 /**
+ * WHAT A STALE READ LEAVES RUNNING — the difference between the two read
+ * postures, asserted from both sides.
+ *
+ * The import path must leave NOTHING behind. `scripts/lib/rateLimiter.ts` wraps
+ * `globalThis.fetch` for the length of a stage and restores it at the end, and
+ * the run then writes the counters the limiter kept: a request still in flight
+ * past that point is one nothing paced, nothing charged a token for, and no
+ * report mentions — and one that reaches the real vendor through a `fetch` the
+ * stage no longer controls.
+ *
+ * The request path keeps the opposite behaviour deliberately: a mobile client
+ * is waiting on those calls, and the detached refresh is the whole reason the
+ * stale row can be served immediately.
+ */
+describe('the lifecycle of a stale-row refresh', () => {
+    const listPayload = (): unknown[] => [portionSample('srLegacyPortions').payload];
+    const refreshedListPayload = (): unknown[] => [portionSample('fnddsPortions').payload];
+    const listKey = cacheKeyFor('/foods/list', { dataType: 'Branded', pageSize: '200', pageNumber: '1' });
+    const detailKey = cacheKeyFor('/food/9000301', { format: 'full' });
+    const detailPayload = (): unknown => detailSample('brandedDetailComplete').payload;
+    const brandedSearchKey = cacheKeyFor('/foods/search', {
+        query: 'fixture',
+        dataType: 'Branded',
+        pageSize: '20',
+        pageNumber: '1',
+    });
+    const brandedSearchPayload = (): unknown => searchSample('brandedComplete').payload;
+
+    /** A cache write that lands a few ticks later, so "awaited" is observable. */
+    const WRITE_LATENCY_MS = 5;
+
+    const installSlowUpsert = (): void => {
+        cache.upsert.mockImplementation(async ({ where, create }) => {
+            await new Promise<void>((resolve) => setTimeout(resolve, WRITE_LATENCY_MS));
+            const row: UsdaCacheRow = {
+                cache_key: create.cache_key,
+                payload: create.payload,
+                http_status: create.http_status,
+                fetched_at: new Date(Date.now()),
+            };
+            rows.set(where.cache_key, row);
+
+            return row;
+        });
+    };
+
+    it('leaves nothing in flight once listFoods has answered from a stale row', async () => {
+        seedRow(listKey, listPayload(), SEARCH_TTL_MS + DAY_MS);
+        respondWith(jsonResponse(refreshedListPayload()));
+
+        await listFoods('Branded');
+
+        // Both the request and its write are already on record — no tick is
+        // advanced between the call answering and this assertion.
+        const requestsWhenAnswered = requestCount();
+        const writesWhenAnswered = cache.upsert.mock.calls.length;
+
+        expect(requestsWhenAnswered).toBe(1);
+        expect(writesWhenAnswered).toBe(1);
+
+        // There is nothing to drain, and nothing lands afterwards however long
+        // the clock runs — which is what "the run's counters are the run's" and
+        // "the wrapped fetch can be restored" both rest on.
+        await awaitPendingUsdaRefreshes();
+        await jest.advanceTimersByTimeAsync(TOTAL_BACKOFF_MS);
+
+        expect(requestCount()).toBe(requestsWhenAnswered);
+        expect(cache.upsert.mock.calls.length).toBe(writesWhenAnswered);
+    });
+
+    it('leaves nothing in flight once getFoodDetail has answered from a stale row', async () => {
+        seedRow(detailKey, detailPayload(), DETAIL_TTL_MS + DAY_MS);
+        respondWith(jsonResponse(detailPayload()));
+
+        await getFoodDetail(9000301);
+
+        const requestsWhenAnswered = requestCount();
+        const writesWhenAnswered = cache.upsert.mock.calls.length;
+
+        expect(requestsWhenAnswered).toBe(1);
+        expect(writtenKeys()).toEqual([detailKey]);
+
+        await awaitPendingUsdaRefreshes();
+        await jest.advanceTimersByTimeAsync(TOTAL_BACKOFF_MS);
+
+        expect(requestCount()).toBe(requestsWhenAnswered);
+        expect(cache.upsert.mock.calls.length).toBe(writesWhenAnswered);
+    });
+
+    /**
+     * The other half of the same rule: a COLD read's cache write is the second
+     * piece of detached work a stale-read path used to leave behind, so the
+     * awaited posture waits for it too. Proven against a write that lands on a
+     * later tick, since a write that lands immediately cannot tell the two
+     * postures apart.
+     */
+    it('files a cold-path response before listFoods answers', async () => {
+        installSlowUpsert();
+        respondWith(jsonResponse(listPayload()));
+
+        let settled = false;
+        const call = listFoods('Branded');
+        void call.then(() => {
+            settled = true;
+        });
+
+        await jest.advanceTimersByTimeAsync(WRITE_LATENCY_MS - 1);
+
+        expect(rows.has(listKey)).toBe(false);
+        expect(settled).toBe(false);
+
+        await jest.advanceTimersByTimeAsync(1);
+
+        expect(settled).toBe(true);
+        expect(storedRow(listKey).http_status).toBe(200);
+        await call;
+    });
+
+    it('answers a cold request-path read without waiting for its cache write', async () => {
+        installSlowUpsert();
+        respondWith(jsonResponse(brandedSearchPayload()));
+
+        const foods = await searchBrandedFoods('fixture');
+
+        // Answered while the write is still pending: the request path must not
+        // pay the database's latency for a row nothing is waiting on.
+        expect(foods.length).toBeGreaterThan(0);
+        expect(rows.has(brandedSearchKey)).toBe(false);
+
+        await jest.advanceTimersByTimeAsync(WRITE_LATENCY_MS);
+
+        expect(rows.has(brandedSearchKey)).toBe(true);
+    });
+
+    it('still leaves a request-path refresh running after the call has answered', async () => {
+        seedRow(brandedSearchKey, brandedSearchPayload(), SEARCH_TTL_MS + DAY_MS);
+        const deferred = respondWhenSettled(brandedSearchPayload());
+
+        const foods = await searchBrandedFoods('fixture');
+
+        // Served from the stale row with the refresh still in flight — the
+        // behaviour a waiting client depends on, and the reason the drain
+        // above is exported rather than assumed unnecessary.
+        expect(foods.length).toBeGreaterThan(0);
+        expect(deferred.stub).toHaveBeenCalledTimes(1);
+        expect(writtenKeys()).toEqual([]);
+
+        deferred.settle();
+        await awaitPendingUsdaRefreshes();
+
+        expect(writtenKeys()).toEqual([brandedSearchKey]);
+    });
+});
+
+/**
  * `scripts/lib/rateLimiter.ts` wraps `globalThis.fetch` for
  * `api.nal.usda.gov` with a token bucket sized by
  * `USDA_IMPORT_RATE_LIMIT_PER_HOUR`, and charges one token per *physical*
@@ -2957,22 +3789,24 @@ describe('rate limiter accounting', () => {
         expect(requestCount()).toBe(0);
     });
 
-    it('charges a background refresh as its own token, on top of the served hit', async () => {
+    it('charges the refresh of a stale row as its own token, on top of the served hit', async () => {
         seedRow(listKey, listPayload(), SEARCH_TTL_MS + DAY_MS);
         respondWith(jsonResponse(listPayload()));
 
         await listFoods('Branded');
-        await jest.advanceTimersByTimeAsync(0);
 
         expect(requestCount()).toBe(1);
     });
 
-    it('charges a retrying background refresh once per attempt', async () => {
+    it('charges a retrying refresh once per attempt', async () => {
         seedRow(listKey, listPayload(), SEARCH_TTL_MS + DAY_MS);
         alwaysRespond(() => failureResponse(503));
 
-        await listFoods('Branded');
+        // The awaited reader is waiting on the retries, so the backoff is
+        // advanced while the call is in flight rather than after it.
+        const call = listFoods('Branded');
         await jest.advanceTimersByTimeAsync(TOTAL_BACKOFF_MS);
+        await call;
 
         expect(requestCount()).toBe(MAX_ATTEMPTS);
     });

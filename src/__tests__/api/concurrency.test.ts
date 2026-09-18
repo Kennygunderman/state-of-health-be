@@ -81,11 +81,13 @@
 // generation rows, `recipe_versions`, `recipe_ingredients` and `catalog_foods`
 // — and asserts ids, row counts, statuses, columns, orderings and revisions.
 // Two things are deliberately not asserted: the rounding of nutrition on plan
-// DTOs and the exact text of `portionText`. Both are open findings against
-// `mealPlan.mapper.ts` (F04, F05) being changed in another work unit, so an
-// assertion on either would pin a value that is about to move. A portion
-// MULTIPLIER is asserted where a preview binds one — it is the stored number
-// the binding is judged on, not the string either finding touches.
+// DTOs and the exact text of `portionText`. Both are `mealPlan.mapper.ts`'s
+// DISPLAY contract — `readPlannedTotals` and `formatPortionText` — and both are
+// pinned where a client reads them, by `api/plans.test.ts` and
+// `api/swaps.test.ts`, so re-pinning either here would duplicate a neighbour
+// rather than add coverage. A portion MULTIPLIER is asserted where a preview
+// binds one — it is the stored number the binding is judged on, not the display
+// string a neighbour owns.
 //
 // Determinism of the fixture: the week is pinned to a named day and every call
 // takes the same injected `now`, so nothing here depends on when the suite runs.
@@ -125,6 +127,7 @@ import {
 } from '../../services/grocery.service';
 import { PLAN_DAY_COUNT } from '../../services/mealPlan.logic';
 import {
+    MealPlanDataError,
     generatePlan,
     getMealPlanDay,
     regeneratePlan,
@@ -1704,12 +1707,13 @@ describe('two clients saving the same revisioned state', () => {
 describe('a response lost after the write committed', () => {
     it('replays the first client’s stored body although a second client has since logged the same meal', async () => {
         // The transport-loss seam §0.9.2 describes (`postCommitAbort` +
-        // `res.socket.destroy()`) lives in the handler, which does not exist at
-        // this checkpoint; `api/fault.test.ts` owns it. What a lost response
-        // leaves BEHIND is service state, and that is what this asserts: the
-        // action committed, the client never saw the answer, and its retry
-        // carries the same key and the same body — including the revision it
-        // pinned before any of this.
+        // `res.socket.destroy()`) lives one layer above this call, in
+        // `mealPlanning.controller.ts::answerKeyedWrite`, and is driven at the
+        // HTTP boundary by `api/fault.test.ts`, which owns it. What a lost
+        // response leaves BEHIND is service state, and that ledger half is this
+        // case's subject: the action committed, the client never saw the
+        // answer, and its retry carries the same key and the same body —
+        // including the revision it pinned before any of this.
         const firstClientBody = logBody(week.diaryMealId, 1);
         const committed = await logPlannedMeal(
             USER_ID,
@@ -2339,6 +2343,140 @@ describe('a preference save racing a generation', () => {
 
         expect((await savePreferences(PLANNING_USER_ID, savedPreferences(), NOW)).kind).toBe('ok');
         expect(await expectOneCoherentOutcome(generation)).toBe('published');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * A foreign write to the preferences row a publication is completing
+ *
+ * The pair above races two writers that BOTH take the per-user advisory lock,
+ * so one of them always observes settled state. This one removes that
+ * assumption. `PUT /api/user/targets` already writes without the lock by
+ * design, and a preferences row is one plain `UPDATE` away from being moved by
+ * anything that does the same — so the publication's last write to that row,
+ * `setup_status`, cannot rest on the lock alone.
+ *
+ * §0.5.1 answers that with a compare-and-set: the status write carries the
+ * owner AND the revision `requirePinnedInputs` certified earlier in the same
+ * transaction, and one affected row is required. What the pair below measures
+ * is the difference that makes — a publication whose pinned row moved after
+ * certification is ROLLED BACK IN FULL rather than committing a week behind a
+ * setup that stayed incomplete.
+ * ------------------------------------------------------------------------- */
+
+describe('a foreign write to the preferences row a publication is completing', () => {
+    /**
+     * Holds a row lock on one user's preferences row until released, then bumps
+     * ONLY that row's `revision` — no preference value, no status — and commits.
+     *
+     * The narrowest possible change, for the same reason the swap section's
+     * holder bumps only a meal's revision: it is what an unlocked writer that
+     * moved the planning inputs looks like, and it is the exact state no check
+     * before the status write can detect. `requirePinnedInputs` reads the row
+     * with a plain `SELECT`, which MVCC never blocks, so the generation passes
+     * its certification against revision 1 and meets this lock later, at the
+     * one statement that writes.
+     */
+    const holdPreferencesRowThenBumpRevision = async (
+        userId: string,
+    ): Promise<{ release: () => void; held: Promise<unknown> }> => {
+        const taken = deferred();
+        const releaseSignal = deferred();
+
+        const held = contendingClient.$transaction(
+            async (tx) => {
+                await tx.$queryRaw`SELECT revision FROM meal_plan_preferences WHERE user_id = ${userId} FOR UPDATE`;
+                taken.release();
+                await releaseSignal.promise;
+                await tx.$executeRaw`UPDATE meal_plan_preferences SET revision = revision + 1 WHERE user_id = ${userId}`;
+            },
+            { timeout: 20_000 },
+        );
+
+        await taken.promise;
+
+        return { release: releaseSignal.release, held };
+    };
+
+    const plannerSetup = () =>
+        prisma.meal_plan_preferences.findUniqueOrThrow({
+            where: { user_id: PLANNING_USER_ID },
+            select: { setup_status: true, revision: true },
+        });
+
+    /**
+     * `ready_for_review`, so the transition the status write performs is
+     * MEASURABLE. Left at the factory's `completed` every assertion below would
+     * hold whether the write matched a row or not, which is the one thing this
+     * pair exists to tell apart.
+     */
+    const seedSetupAwaitingCompletion = async (): Promise<void> => {
+        await seedPlannableWorld();
+        await prisma.meal_plan_preferences.update({
+            where: { user_id: PLANNING_USER_ID },
+            data: { setup_status: 'ready_for_review', setup_step: 'review' },
+        });
+    };
+
+    it('rolls the whole week back and leaves setup incomplete when the pinned revision moved', async () => {
+        await seedSetupAwaitingCompletion();
+
+        const foreignWriter = await holdPreferencesRowThenBumpRevision(PLANNING_USER_ID);
+        const generating = watch(generatePlan(PLANNING_USER_ID, generateBody(TODAY), NOW));
+
+        try {
+            await awaitLockWait(
+                'row',
+                'the publication waiting for the preferences row the foreign writer holds',
+            );
+
+            // Queued on the row it means to write, with the plan, its days, its
+            // meals and its grocery list already inserted by this transaction
+            // and its ledger reservation still open and invisible.
+            expect(generating.settled()).toBe(false);
+        } finally {
+            // Released in `finally`, and the holder's transaction awaited here:
+            // a failed expectation above would otherwise leave a 20 s
+            // transaction holding this row, and every later case that writes it
+            // would fail for a reason that is not its own.
+            foreignWriter.release();
+            await foreignWriter.held;
+        }
+
+        // The blocked statement re-evaluates its predicate against the row the
+        // holder committed, matches nothing at the certified revision, and
+        // refuses rather than reporting a completion it did not perform.
+        await expect(generating.done).rejects.toThrow(MealPlanDataError);
+
+        // NOTHING SURVIVED but the foreign bump. Without the revision term the
+        // status write would have matched this row by `user_id` alone, and the
+        // whole week — plan, days, meals, groceries and a completed ledger row
+        // — would be committed against inputs that moved after the publication
+        // certified them.
+        expect(await plansOf(PLANNING_USER_ID)).toEqual([]);
+        expect(await ledgerRows(PLANNING_USER_ID)).toHaveLength(0);
+        expect(await plannerSetup()).toEqual({ setup_status: 'ready_for_review', revision: 2 });
+    });
+
+    it('completes setup without ever waiting for the row when nothing holds it', async () => {
+        // The counter-proof. Without it the case above could pass because of
+        // something incidental to a blocked transaction rather than because of
+        // the revision term, and a build that had dropped the term would look
+        // exactly as correct. Uncontended, the same publication is never seen
+        // waiting, commits, and moves the status and nothing else.
+        await seedSetupAwaitingCompletion();
+
+        const generating = watch(generatePlan(PLANNING_USER_ID, generateBody(TODAY), NOW));
+
+        expect(await settleWithoutLockWait(generating, 'row', 'the uncontended publication')).toBe(0);
+
+        const published = await generating.done;
+
+        expect(published.kind).toBe('ok');
+        expect(await plansOf(PLANNING_USER_ID)).toHaveLength(1);
+        // The status moved; the revision it was pinned to did not, because
+        // completing setup is not an edit to the planning inputs.
+        expect(await plannerSetup()).toEqual({ setup_status: 'completed', revision: 1 });
     });
 });
 
@@ -3670,6 +3808,18 @@ describe('the catalog release load beside a real generation', () => {
      * to export a food without it, and `manifestConsistencyGaps` refuses a
      * manifest whose `counts.validation_records` disagrees with `counts.foods` —
      * so the fixture authors one per exported food and the load inserts them.
+     *
+     * And the record has to be COMPLETE, not merely present: `catalog-load.ts`
+     * assesses a published food's identity evidence in its pre-write
+     * verification pass (`scripts/lib/catalogEvidence.ts`, the one rule every
+     * catalog stage applies) and refuses the whole release with
+     * `release_evidence_incomplete` when a mandatory field of the retrieval
+     * record is missing — the floor that keeps a published row from resting on
+     * evidence nobody can check. This fixture's records therefore carry the
+     * fields a USDA retrieval states, digested from the food's own source key
+     * so the bytes are deterministic and each food's record is its own. The
+     * values describe a retrieval this test never made, which is what a fixture
+     * is; nothing here reaches a catalog a user reads.
      */
     const validationLine = (food: catalog_foods): Record<string, unknown> => ({
         food_source_key: food.source_key,
@@ -3683,7 +3833,20 @@ describe('the catalog release load beside a real generation', () => {
         nutrition_method: 'usda_sr_legacy_per_100g',
         nutrition_assumptions: [],
         portion_units: [],
-        identity_evidence: [],
+        identity_evidence: [
+            {
+                url: 'https://api.nal.usda.gov/fdc/v1/foods',
+                method: 'POST',
+                final_host: 'api.nal.usda.gov',
+                http_status: 200,
+                source_cache_key: `POST /foods?#{"fdcIds":["${food.source_key}"],"format":"full"}`,
+                retrieval_source: 'usda_api_cache',
+                body_sha256: createHash('sha256').update(`body:${food.source_key}`).digest('hex'),
+                record_sha256: createHash('sha256').update(`record:${food.source_key}`).digest('hex'),
+                matched_snippet: food.canonical_name,
+                fetched_at: NOW.toISOString(),
+            },
+        ],
         checks: [{ name: 'energy_vs_macros', pass: true, observed: 0, bound: 30 }],
         llm_review: null,
         outcome: 'accepted',
@@ -4860,6 +5023,90 @@ describe('a generation pinning inputs that have moved', () => {
 
         expect(await plansOf(REQUEST_PLANNING_USER_ID)).toEqual([]);
         expect(await ledgerRows(REQUEST_PLANNING_USER_ID)).toEqual([]);
+    });
+
+    /**
+     * The other half of the same pinning: what the publication WRITES to the row
+     * it pinned.
+     *
+     * §0.5.2 has `POST /plans` set `setupStatus` to `completed` on success, and
+     * §0.5.1 requires every update to a revisioned row to carry the owner AND
+     * the expected revision. `markSetupCompleted` therefore predicates on
+     * `{user_id, revision}` with the revision `requirePinnedInputs` certified a
+     * few statements earlier, and demands one affected row — otherwise a row
+     * that had vanished or moved would leave this committed plan and its ledger
+     * entry behind a setup that never completed.
+     *
+     * Two properties are reachable from outside the lock and are asserted here.
+     * The FAILURE branch is not: every writer of that row takes the same
+     * per-user advisory lock this transaction holds, so nothing can move the
+     * revision between the certification and the write — the same reason the
+     * supersede compare-and-set in `regeneratePlan` has no failure case either.
+     * Both refuse rather than default, and both roll the whole publication back.
+     */
+    const plannerPreferences = () =>
+        prisma.meal_plan_preferences.findUniqueOrThrow({
+            where: { user_id: REQUEST_PLANNING_USER_ID },
+            select: { setup_status: true, revision: true, targets_revision: true },
+        });
+
+    it('completes setup against the revision it certified, without moving that revision', async () => {
+        const fixture = await seedRequestWeek();
+
+        // `ready_for_review` so the transition is MEASURABLE: left at the
+        // factory's `completed`, the assertion below would hold whether the
+        // write matched a row or not.
+        await prisma.meal_plan_preferences.update({
+            where: { user_id: REQUEST_PLANNING_USER_ID },
+            data: { setup_status: 'ready_for_review', setup_step: 'review' },
+        });
+
+        const before = await plannerPreferences();
+
+        expect(before).toEqual({ setup_status: 'ready_for_review', revision: 1, targets_revision: 1 });
+
+        const published = await postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today));
+
+        expect(published.status).toBe(201);
+
+        // The status moved and NOTHING ELSE did. The revision counts edits to
+        // the planning INPUTS, and completing setup edits none of them: bumping
+        // it would strand every pinned revision a client or a concurrent save
+        // holds, which is why the predicate can safely match on it at all.
+        expect(await plannerPreferences()).toEqual({
+            setup_status: 'completed',
+            revision: before.revision,
+            targets_revision: before.targets_revision,
+        });
+    });
+
+    it('publishes a second week from an already-completed setup, because the pinned write is idempotent', async () => {
+        const fixture = await seedRequestWeek();
+
+        expect((await plannerPreferences()).setup_status).toBe('completed');
+
+        const first = await postGenerate(REQUEST_PLANNING_USER_ID, requestGenerateBody(fixture.today));
+
+        expect(first.status).toBe(201);
+
+        // The upcoming week §0.5.1 allows beside the current one. Its
+        // publication runs the same revision-pinned status write against a row
+        // already reading `completed`, and one row must still match: a
+        // predicate that also compared the status, or one that demanded a
+        // transition, would fail the second publication outright.
+        const second = await postGenerate(
+            REQUEST_PLANNING_USER_ID,
+            requestGenerateBody(addDaysToDayKey(fixture.today, 7)),
+        );
+
+        expect(second.status).toBe(201);
+
+        expect(await plannerPreferences()).toEqual({
+            setup_status: 'completed',
+            revision: 1,
+            targets_revision: 1,
+        });
+        expect((await plansOf(REQUEST_PLANNING_USER_ID)).map((plan) => plan.revision)).toEqual([1, 1]);
     });
 });
 

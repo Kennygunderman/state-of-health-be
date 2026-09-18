@@ -44,8 +44,15 @@
 //     request was never well formed in the first place.
 //
 // Each of those four failure modes is impossible while this suite is green, and
-// this file is the only place that is visible, because it is the only place that
-// exercises the entry points rather than the parsers.
+// what is unique here is the INSTRUMENT rather than the entry points. The same
+// entry points are driven in `src/__tests__/api/controllerBoundary.test.ts` at
+// the controller handlers, and over the shipped routes by the row-backed
+// `api/plans.test.ts`, `api/swaps.test.ts`, `api/log.test.ts`,
+// `api/preferences.test.ts` and `api/ownership.test.ts`. All of those answer
+// against a real PostgreSQL, where "the request never reached Prisma" cannot be
+// told apart from "it reached Prisma and found nothing"; only the recording stub
+// this file installs in place of the singleton makes "no database call was made"
+// an observation.
 //
 // HOW IT PROVES IT. The Prisma singleton every service imports is replaced by a
 // recording stub whose properties are all reachable and whose every CALL
@@ -72,7 +79,7 @@
 // current-plan and day reads open one because each RESOLVES a plan's lifecycle
 // and then describes it, and only a single `RepeatableRead` snapshot keeps the
 // two halves of such an answer describing the same instant
-// (`mealPlan.service.ts::readInPlanSnapshot`, `F01`/`F02`). Asserting the first
+// (`mealPlan.service.ts::readInPlanSnapshot`). Asserting the first
 // recorded call is that transaction pins "one consistent snapshot" with no race
 // to stage, and the refusal cases directly above prove the path parse still runs
 // in front of it.
@@ -416,7 +423,7 @@ beforeEach(() => {
     prismaCalls.length = 0;
 });
 
-describe('swap entry points parse before any I/O (F21)', () => {
+describe('swap entry points parse before any I/O', () => {
     it('refuses a malformed planId on the alternatives read', async () => {
         await expectRefusedBeforeIo(
             () => getSwapAlternatives(USER_ID, 'plan-1', MEAL_ID),
@@ -531,7 +538,7 @@ describe('swap entry points parse before any I/O (F21)', () => {
     });
 });
 
-describe('plan read entry points parse before any I/O (F22)', () => {
+describe('plan read entry points parse before any I/O', () => {
     it('refuses a malformed planId on the day read', async () => {
         await expectRefusedBeforeIo(() => getMealPlanDay(USER_ID, 'plan-1', DAY_KEY), 'planId', 'invalid_id');
     });
@@ -582,15 +589,15 @@ describe('plan read entry points parse before any I/O (F22)', () => {
 
     /**
      * The day read reports whether the plan may still be written to, which is a
-     * comparison against the caller's calendar day, so it takes a clock
-     * (`F14`). These two cases hold that clock to the same ordering the rest of
-     * this suite proves of the path parse.
+     * comparison against the caller's calendar day, so it takes a clock. These
+     * two cases hold that clock to the same ordering the rest of this suite
+     * proves of the path parse.
      *
      * An injected date must not pull any read forward: the parse still comes
      * first, so a malformed path is refused with no database call even though
      * "today" was supplied. And on the well-formed side the first recorded call
-     * must be `$transaction` — the read's own snapshot (`F01`/`F02`), which the
-     * parse still precedes. The ordering INSIDE that transaction (the
+     * must be `$transaction` — the read's own snapshot, which the parse still
+     * precedes. The ordering INSIDE that transaction (the
      * owner-scoped plan row, then the day, then the zone `resolveUserToday`
      * reads) is stated and reasoned in `mealPlan.service.ts` and is no longer
      * observable through this stub, because opening the transaction is the only
@@ -613,7 +620,7 @@ describe('plan read entry points parse before any I/O (F22)', () => {
     });
 });
 
-describe('planned-meal logging parses path and body before the ledger (F22, F09)', () => {
+describe('planned-meal logging parses path and body before the ledger', () => {
     it('refuses a malformed mealId', async () => {
         await expectRefusedBeforeIo(
             () => logPlannedMeal(USER_ID, PLAN_ID, 'meal-1', logBody()),
@@ -659,7 +666,7 @@ describe('planned-meal logging parses path and body before the ledger (F22, F09)
     });
 });
 
-describe('the recipe read parses in its controller, before any I/O (F22)', () => {
+describe('the recipe read parses in its controller, before any I/O', () => {
     // `jestSetup.ts` sets MEAL_PLANNING_ENABLED=true, so the handler's feature
     // gate passes and the parse is what these two cases are about.
     it('refuses a malformed recipeVersionId with no database call', async () => {
@@ -680,7 +687,7 @@ describe('the recipe read parses in its controller, before any I/O (F22)', () =>
     });
 });
 
-describe('the suggestions read parses in its controller, before any I/O (F22)', () => {
+describe('the suggestions read parses in its controller, before any I/O', () => {
     // The kind used to be coerced and checked inline in the handler, which left
     // the allowed-value rule untestable without HTTP. Both cases below are
     // refused by the same `unsupported` detail, because the contract defines
@@ -792,13 +799,44 @@ describe('preference saves parse their envelope before any I/O (SVC-09)', () => 
         );
     });
 
-    it('refuses a full save that edits nothing but its envelope', async () => {
-        await expectRefusedBeforeIo(
-            () => savePreferences(USER_ID, { timeZone: TIME_ZONE, expectedRevision: 1 }),
-            'body',
-            'required',
-        );
+    it('reads the row for a body that edits nothing but its envelope, because only the row knows the zone', async () => {
+        // `timeZone` is an envelope field AND a stored column, so whether this
+        // body edits anything is not a property of the body: a zone that differs
+        // from the stored one IS an edit of `time_zone`, and re-sending it on a
+        // full save is the only channel the contract gives a client for
+        // reconciling a device that has moved (AAP 0.5.2). Refusing it here as
+        // `body: required` made that save impossible, so the verdict is deferred
+        // to the row-backed parse, which has the stored zone to compare against.
+        expect(
+            await expectReachesDatabase(() =>
+                savePreferences(USER_ID, { timeZone: TIME_ZONE, expectedRevision: 1 }),
+            ),
+        ).toBe('meal_plan_preferences.findUnique');
     });
+
+    it.each([
+        ['an absent zone', { expectedRevision: 1 }],
+        ['an unknown zone', { timeZone: 'Mars/Phobos', expectedRevision: 1 }],
+    ])(
+        'refuses an envelope-only body with %s before any I/O, since no row could make it an edit',
+        async (_label, body) => {
+            // The bound on the deferral above. A zone is the only thing that can
+            // make such a body an edit, so one this runtime cannot resolve edits
+            // nothing WHATEVER the row holds — and the refusal is already
+            // complete here: `body: required` for the empty save plus the zone's
+            // own detail, identical to the row-backed parse's answer (pinned in
+            // `api/preferences.test.ts`). Reading the row to repeat it would be
+            // an authenticated query per malformed attempt, which is the cost
+            // AAP 0.5.2 puts this preflight in front of.
+            const verdict = await expectRefusedBeforeIo(
+                () => savePreferences(USER_ID, body),
+                'body',
+                'required',
+            );
+
+            expect(fieldsOf(verdict)).toEqual(['body', 'timeZone']);
+        },
+    );
 
     it('reports every envelope problem of one request in a single verdict', async () => {
         const verdict = await expectRefusedBeforeIo(
@@ -863,12 +901,26 @@ describe('preference saves parse their envelope before any I/O (SVC-09)', () => 
     it('reads the row for a body whose other half is stored, rather than answer short', async () => {
         // `goal: 'lose'` with no pace is judged against the STORED pace, so the
         // request stage cannot settle it and yields `needs_context`; the
-        // row-backed parse answers. The body carries no request-only error of
-        // its own, which is what makes the read here the deferral rather than an
-        // amplified refusal: a body that IS malformed is now answered before any
-        // read, whichever coherence rule was also applicable.
+        // row-backed parse answers.
         expect(
             await expectReachesDatabase(() => savePreferences(USER_ID, updateBody({ goal: 'lose' }))),
+        ).toBe('meal_plan_preferences.findUnique');
+    });
+
+    it('reads the row for a MALFORMED body a stored half also bears on, so the 400 names both', async () => {
+        // What the free-refusal rule above is scoped to, and what it is not.
+        // AAP 0.7.4 requires one press to mark every offending control, and a
+        // partial carrying an invalid diet BESIDE a goal whose pace only the row
+        // holds has two — of which the request stage can see one. So the read
+        // happens for this body although it is already known to be refused: the
+        // alternative is a 400 the screen can act on only partly, followed by a
+        // second refusal for the half it was never told about. The no-I/O cases
+        // above are the bodies no row can add a control to, which is every
+        // malformed body except this shape.
+        expect(
+            await expectReachesDatabase(() =>
+                savePreferences(USER_ID, updateBody({ goal: 'lose', diet: 'carnivore' })),
+            ),
         ).toBe('meal_plan_preferences.findUnique');
     });
 
@@ -885,7 +937,7 @@ describe('preference saves parse their envelope before any I/O (SVC-09)', () => 
     });
 });
 
-describe('generatePlan parses its request’s own syntax before any I/O (DB-F03)', () => {
+describe('generatePlan parses its request’s own syntax before any I/O', () => {
     /** A well-formed generate body, with the one override each case needs. */
     const generateBody = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
         startDate: DAY_KEY,
@@ -947,7 +999,7 @@ describe('generatePlan parses its request’s own syntax before any I/O (DB-F03)
         // syntactically valid generate request is supposed to reach the
         // database, and the FIRST thing it reaches is the idempotency ledger's
         // preflight transaction — not the preferences row the stateful half
-        // needs. That ordering is §0.5.1's and is what DB-F03 changed.
+        // needs. That ordering is §0.5.1's.
         expect(await expectReachesDatabase(() => generatePlan(USER_ID, generateBody()))).toBe(
             '$transaction',
         );
@@ -973,7 +1025,7 @@ describe('the entry points that already parsed first still do', () => {
         );
     });
 
-    it('regeneratePlan refuses a revision no Int column can hold (F09)', async () => {
+    it('regeneratePlan refuses a revision no Int column can hold', async () => {
         await expectRefusedBeforeIo(
             () =>
                 regeneratePlan(USER_ID, PLAN_ID, {
@@ -986,11 +1038,11 @@ describe('the entry points that already parsed first still do', () => {
         );
     });
 
-    it('saveTargets refuses an unusable source with no database call (F11)', async () => {
+    it('saveTargets refuses an unusable source with no database call', async () => {
         await expectRefusedBeforeIo(() => saveTargets(USER_ID, { source: 'guess' }), 'source');
     });
 
-    it('saveTargets refuses a key outside the declared arm with no database call (F11)', async () => {
+    it('saveTargets refuses a key outside the declared arm with no database call', async () => {
         // The estimated arm carries no numbers by contract: a client sending
         // `calories` believes it is confirming values the server never reads,
         // and silence there is the server agreeing to a request it did not
@@ -1002,7 +1054,7 @@ describe('the entry points that already parsed first still do', () => {
         );
     });
 
-    it('saveTargets refuses a revision no Int column can hold (F09)', async () => {
+    it('saveTargets refuses a revision no Int column can hold', async () => {
         await expectRefusedBeforeIo(
             () => saveTargets(USER_ID, { source: 'estimated', estimateRevision: 1e30 }),
             'estimateRevision',

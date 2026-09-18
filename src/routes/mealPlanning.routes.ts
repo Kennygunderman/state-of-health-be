@@ -32,8 +32,10 @@ router.get('/meal-planning/targets/estimate', getTargetEstimateController);
 router.get('/meal-planning/targets', getNutritionTargetsController);
 router.put('/meal-planning/targets', saveNutritionTargetsController);
 
-// Literal paths before parameterized ones (same rule as nutrition.routes.ts):
-// /plans/current is declared first so a later GET /plans/:planId cannot capture it.
+// Literal paths before parameterized ones (Rule backend-architecture §3.1), the
+// order nutrition.routes.ts depends on for /macros/history ahead of /macros/:date.
+// Nothing registered here depends on it: every parameterized path below carries a
+// further segment after :planId, so none of them can match /plans/current.
 router.post('/meal-planning/plans', generatePlanController);
 router.get('/meal-planning/plans/current', getCurrentPlansController);
 router.get('/meal-planning/plans/:planId/days/:date', getPlanDayController);

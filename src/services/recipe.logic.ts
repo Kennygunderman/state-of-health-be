@@ -28,11 +28,12 @@
 //    at full precision. The rounding contract rounds exactly once at each of
 //    two named points — `roundNutritionForDisplay` for recipe detail and plan
 //    cards, and the diary snapshot inside
-//    `nutrition.service.ts::insertPlannedMealEntry`, whose stored per-serving
-//    integers `nutrition.service.ts::asEaten` then multiplies by the servings
-//    eaten. An extra round anywhere in this module shifts every number
-//    downstream of it and is exactly why the mobile "This adds" card would stop
-//    agreeing with the server to the integer.
+//    `plannedMealLog.logic.ts::derivePlannedSnapshot`, whose per-serving
+//    integers `nutrition.service.ts::insertPlannedMealEntry` stores verbatim
+//    and `nutrition.service.ts::asEaten` then multiplies by the servings eaten.
+//    An extra round anywhere in this module shifts every number downstream of
+//    it and is exactly why the mobile "This adds" card would stop agreeing with
+//    the server to the integer.
 //
 //  * CLAIMS ARE DERIVED, NEVER ACCEPTED. Badges, diet tags, allergen tags, the
 //    allergen status, the nutrition provenance, the total time and the budget
@@ -1276,9 +1277,10 @@ export const scaleIngredients = (
  *   1. here — per-serving × `portion_multiplier`, unrounded;
  *   2. {@link roundNutritionForDisplay} — what recipe detail and the plan cards
  *      show;
- *   3. `nutrition.service.ts::insertPlannedMealEntry` — the diary snapshot,
- *      rounded ONCE on insert, which is what makes the stored entry equal the
- *      planned portion;
+ *   3. `plannedMealLog.logic.ts::derivePlannedSnapshot` — the diary snapshot,
+ *      rounded ONCE, which is what makes the stored entry equal the planned
+ *      portion; `nutrition.service.ts::insertPlannedMealEntry` writes those
+ *      integers verbatim and rounds nothing;
  *   4. `nutrition.service.ts::asEaten` — `Math.round(snapshot × servings)` per
  *      value, the consumed total.
  *

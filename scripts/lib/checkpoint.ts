@@ -78,7 +78,8 @@
 // FOR).
 import crypto from 'crypto';
 
-import { hostOf, isSecretBearingKey, safeError, scrubSecrets, ScriptLogger } from './logger';
+import { ScriptLogger, hostOf, isSecretBearingKey, isThrownInstanceOf, safeError, scrubSecrets } from './logger';
+import type { LogFields } from './logger';
 
 // Types only. Rule §12 forbids editing or reviewing src/generated/prisma, not
 // importing from it — this is the same module src/prisma/client.ts imports. The
@@ -126,10 +127,16 @@ export type CatalogStageLockMode = 'exclusive' | 'shared';
 // Four stages MUTATE the catalog graph and take the lock EXCLUSIVELY, so no two
 // of them ever run against one database at the same time:
 //   * usda_import    — upserts foods and their children by source_key;
-//   * ai_generation  — the same, for generated candidates. The script is still a
-//                      stage stub (catalog-generate-ai.ts writes nothing yet),
-//                      and it takes this exclusive lock when its body is wired:
-//                      that is this table's contract, not a future intention;
+//   * ai_generation  — the same, for generated candidates: it upserts
+//                      catalog_foods by source_key and replaces their aliases,
+//                      portions and validation records, reserving a paid model
+//                      call before each batch. Every invocation that writes
+//                      takes this lock at the entry point —
+//                      catalog-generate-ai.ts wraps runGeneration in
+//                      withCatalogStageLock({ stage: RUN_KIND }) (see THE
+//                      GENERATION STAGE'S CLAIM there) — and the one invocation
+//                      that does not is `--dry-run`, which writes nothing and
+//                      must stay answerable while a real run holds the lock;
 //   * validation     — re-judges rows and moves publication_status;
 //   * release_load   — reconciles a release into the graph and retires rows.
 // Two stages only READ it and take the lock SHARED:
@@ -503,6 +510,45 @@ export class CheckpointError extends Error {
     }
 }
 
+/**
+ * What a refusal from this module is worth REPORTING, as typed fields rather
+ * than as its rendered sentence.
+ *
+ * WHY THIS EXISTS. `safeError` carries a closed set of machine-readable members
+ * and deliberately no `message`, because a message reaching an operator log or
+ * the `catalog_import_runs.log` column is prose the reporting stage did not
+ * compose — from a driver, a vendor edge or a parser — and can quote a
+ * connection URL, a key, or the document that failed. That rule costs nothing
+ * for a foreign error and would cost something HERE: the sentence this module
+ * renders for `catalog_stage_locked` names the stage holding the graph and the
+ * mode it asked for, and those two are exactly what an operator needs to choose
+ * between waiting and stopping the other launch. An export taking the lock
+ * exclusively and a mutator taking it shared are different mistakes, and the
+ * mode is what tells them apart.
+ *
+ * So the facts travel as the DATA they already are — every value below is a
+ * constrained member of this module's own vocabulary (a `CatalogStageName`, a
+ * `CatalogStageLockMode`, a `CatalogRunStatus`, a run id this system minted, a
+ * number) — and the rendered sentence stays where it belongs, on the thrown
+ * error an operator reads at the terminal.
+ *
+ * Absent members are ABSENT rather than `undefined`, for the same reason
+ * `safeError` assembles itself that way: these fields are serialised into a
+ * JSONB column, where `{lockMode: undefined}` reads as a mode that was lost
+ * rather than one that never applied.
+ */
+export const checkpointErrorFields = (error: CheckpointError): LogFields => ({
+    runId: error.runId,
+    ...(error.storedStatus === undefined ? {} : { runStatus: error.storedStatus }),
+    ...(error.stageLock === undefined
+        ? {}
+        : {
+              lockStage: error.stageLock.stage,
+              lockMode: error.stageLock.mode,
+              lockWaitedMs: error.stageLock.waitedMs,
+          }),
+});
+
 export interface CatalogRun<TCursor = unknown> {
     id: string;
     kind: CatalogRunKind;
@@ -685,8 +731,15 @@ export const appendCappedLog = (
 //     logger.ts's isSecretBearingKey — one definition shared with the terminal
 //     path, not a second list maintained here (see the note above
 //     truncateForStorage for the two exclusions it turns on).
-//   * An Error becomes safeError's {name, message}: never the object, never the
-//     stack, never a `cause` (§8).
+//   * An Error becomes safeError's CLOSED fields — the class name, plus a
+//     machine `code` and an HTTP `status` when the value carries them: never
+//     the object, never the stack, never a `cause`, and never the message (§8).
+//     This column is the durable half of the pipeline's diagnostics and is
+//     copied into committed report artefacts, so it is the sink logger.ts's
+//     safeError was narrowed for — a foreign message carries the connection
+//     target, a failing statement's values or an absolute path, and no pattern
+//     list recognises those. What the entry says about the failure is the
+//     caller's own `event`, `code` and context fields beside it.
 //   * Anything URL-shaped is reduced to its HOST. Evidence URLs are
 //     model-proposed and therefore attacker-influenced input that the Agent
 //     Action Plan (§0.3.2) records at host level only, and a path or query
@@ -810,9 +863,14 @@ const sanitizeRunLogValue = (value: unknown, urlBearing: boolean, depth: number,
     }
     if (value instanceof Error) {
         const normalized = safeError(value);
+        // Rebuilt field by field rather than spread, so a member added to
+        // SafeErrorFields later cannot reach this column without being
+        // considered here. `code` and `status` are already bounded closed
+        // values, so neither needs truncating.
         return {
             name: truncateForStorage(normalized.name),
-            message: truncateForStorage(normalized.message),
+            ...(normalized.code === undefined ? {} : { code: normalized.code }),
+            ...(normalized.status === undefined ? {} : { status: normalized.status }),
         };
     }
     if (value instanceof Date) {
@@ -1261,13 +1319,14 @@ const findLatestRun = async <TCursor>(
 // closure, and `batch_key` is unique across catalog_generation_batches, so a new
 // run could never reserve a model call under a key the failed run opened —
 // budget.ts would refuse it, correctly, because charging another run's row would
-// leave this run's cap unenforced. Continuing the row is therefore not a
-// convenience: it is the only transition under which a retry can address its own
-// batches at all. It also carries the right budget semantics, which a fresh run
-// would get wrong in the expensive direction: `counts`, `cursor` and the batch
-// ledger are preserved, so the retry picks up at the recorded checkpoint and
-// spends against what is LEFT of CATALOG_MODEL_CALL_BUDGET rather than receiving
-// a second full allowance for money the failed attempt already spent.
+// corrupt that run's totals. Continuing the row is therefore not a convenience:
+// it is the only transition under which a retry can address its own batches at
+// all. What it does NOT have to buy back is the allowance: budget.ts caps spend
+// per coverage-plan BUDGET SCOPE, summed across every run in it, so the failed
+// attempt's reservations are not forgiven by reopening the row and would not
+// have been escaped by a fresh one either. `counts`, `cursor` and the batch
+// ledger are preserved so the retry picks up at the recorded checkpoint rather
+// than re-deriving one.
 //
 // This is the one transition out of a terminal status, and it is deliberately
 // not part of finishRun: THE TERMINAL-TRANSITION RULE forbids a teardown
@@ -1358,13 +1417,15 @@ const retryFailedRun = async <TCursor>(
 //
 // It guarantees exactly one run row per (kind, manifest_version), and therefore
 // that every concurrent invocation converges on the SAME run. That convergence
-// is load-bearing well beyond tidiness: budget.ts's spend cap is enforced as
-// SUM(model_calls_reserved) over one run's batch rows, so two competing run rows
-// would give an operator's single CATALOG_MODEL_CALL_BUDGET two independent
-// allowances and double the money it caps. Converged on one run, the cap binds
-// across every invocation, `counts` and `log` accumulate under the row lock
-// without loss, and the terminal transition (see THE TERMINAL-TRANSITION RULE)
-// settles the outcome once.
+// is load-bearing well beyond tidiness, though NOT because the spend cap
+// depends on it: budget.ts caps spend per coverage-plan BUDGET SCOPE, summed
+// across every run in it, so a second run row would draw on the same allowance
+// rather than on one of its own. What one row does buy is the rest of the run's
+// bookkeeping — `counts` and `log` accumulate under the row lock without loss
+// instead of being split across two histories of one stage, the terminal
+// transition (see THE TERMINAL-TRANSITION RULE) settles the outcome once, and
+// every batch key stays addressable by the run that opened it, which is what
+// lets a retry work its own batches (see retryFailedRun).
 //
 // It does NOT, ON ITS OWN, grant exclusive processing for the run's lifetime,
 // and the two promises are kept by two different mechanisms in this module. THE
@@ -1377,9 +1438,9 @@ const retryFailedRun = async <TCursor>(
 // it is what the CLI entry points now take, which is why a second launch of a
 // mutating stage is refused at its entry point instead of racing this one. Do
 // not merge the two descriptions: a caller that holds the stage lock still needs
-// the claim (to converge on one run row and one budget allowance), and a caller
-// that holds the claim still needs the lock (to be the only writer), so neither
-// subsumes the other.
+// the claim (to converge on one run row, and so on one ledger and one cursor),
+// and a caller that holds the claim still needs the lock (to be the only
+// writer), so neither subsumes the other.
 //
 // Why this claim cannot be the lock, which is also why the lock lives where it
 // does:
@@ -1414,23 +1475,24 @@ export const openOrResumeRun = async <TCursor>(
          * Whether continuing an unfinished run under this key is permitted.
          *
          * Optional, and an absent value permits it — which is this function's
-         * long-standing behaviour and what the three callers that do not expose
-         * a `--resume` flag (generation, validation, release load) rely on.
+         * long-standing behaviour and what the two callers that do not expose a
+         * `--resume` flag (validation, release load) rely on.
          *
          * `false` is the opt-out a caller that DOES expose the flag passes when
-         * the operator did not use it. Without this parameter the flag could
-         * not mean anything: `catalog-import-usda.ts` parsed `--resume`, and an
-         * unfinished run was continued either way, so its usage line ("Default:
-         * off") described behaviour no code implemented. Refusing is the only
-         * coherent reading of "not asked to resume" — see THE CLAIM: runs are
-         * keyed by (kind, manifestVersion) so that a repeat recognises completed
-         * work, so a second run row for the same key is not a thing this module
-         * can create, and silently continuing is what the flag was meant to make
-         * explicit.
+         * the operator did not use it, which is what `catalog-import-usda.ts`
+         * and `catalog-generate-ai.ts` both pass. Without this parameter the
+         * flag could not mean anything: those scripts parsed `--resume`, and an
+         * unfinished run was continued either way, so their usage lines
+         * ("Default: off") described behaviour no code implemented. Refusing is
+         * the only coherent reading of "not asked to resume" — see THE CLAIM:
+         * runs are keyed by (kind, manifestVersion) so that a repeat recognises
+         * completed work, so a second run row for the same key is not a thing
+         * this module can create, and silently continuing is what the flag was
+         * meant to make explicit.
          *
          * A run that already SUCCEEDED is unaffected: recognising it and doing
-         * no work is not a resume, and it is what makes a repeat import
-         * incapable of creating duplicates.
+         * no work is not a resume, and it is what makes a repeat import or
+         * generation incapable of creating duplicates.
          */
         resume?: boolean;
     },
@@ -1540,7 +1602,7 @@ export const openOrResumeRun = async <TCursor>(
 // would corrupt the record of what that run spent.
 //
 // Callers must be inside a transaction for the lock to mean anything — budget.ts
-// calls this inside the transaction that holds its per-run budget lock.
+// calls this inside the transaction that holds its budget-scope lock.
 export const requireOpenRun = async (db: CatalogRunDb, runId: string): Promise<void> => {
     assertWellFormedRunId(runId);
 
@@ -2251,7 +2313,7 @@ export const acquireCatalogStageLock = async (input: CatalogStageLockInput): Pro
             await sleep(Math.min(pollIntervalMs, remainingMs));
         }
     } catch (error) {
-        if (error instanceof CheckpointError && error.code === 'catalog_stage_locked') {
+        if (isThrownInstanceOf(error, CheckpointError) && error.code === 'catalog_stage_locked') {
             // Already closed on the refusal path above; closing twice would log
             // a driver complaint for no diagnostic gain.
             throw error;

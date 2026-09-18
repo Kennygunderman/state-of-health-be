@@ -18,9 +18,11 @@ import { domainToASCII } from 'url';
  *
  * - {@link validateEvidencePolicy} refuses a document that is not the reviewed
  *   one. A table with a row deleted is the dangerous case: an address matching
- *   no row is ordinary global unicast by design, so silently losing
- *   `169.254.0.0/16` would turn the cloud metadata address into a permitted
- *   fetch target. Completeness is therefore established by set equality against
+ *   no row is judged against {@link REVIEWED_GLOBAL_UNICAST_ALLOCATIONS}
+ *   instead, and every special-purpose block carved out of unicast space lies
+ *   inside an allocated block — so silently losing `169.254.0.0/16` would let
+ *   the cloud metadata address satisfy that gate and become a permitted fetch
+ *   target. Completeness is therefore established by set equality against
  *   the whole reviewed snapshot in {@link REVIEWED_RANGE_TABLE} — every reviewed
  *   block present with its reviewed reachability, and no block the review never
  *   saw — because a row count alone cannot tell a deletion from a substitution.
@@ -154,8 +156,9 @@ export interface EvidenceFetchLimits {
  * image, so a file under `data/` can be neither compiled into nor read by the
  * running API.
  *
- * `registrySnapshot` and the three row members are carried so a refresh of the
- * address table is a reviewed data change:
+ * `registrySnapshot`, the three row members and the allocation's own row count
+ * are carried so a refresh of either address registry is a reviewed data
+ * change:
  * {@link validateEvidencePolicy} compares every one of them against the
  * reviewed attestation in this module, and
  * `src/services/__tests__/evidence.logic.test.ts` asserts them three ways —
@@ -185,6 +188,20 @@ export interface EvidencePolicy {
     readonly supplementalRowCount: number;
     /** Which blocks those supplemental rows are, so the classification is reviewable per block. */
     readonly supplementalCidrs: readonly string[];
+    /** How many allocation blocks the document carries, as its own statement about them. */
+    readonly globalUnicastAllocationRowCount: number;
+    /**
+     * The address space IANA has allocated to globally routable unicast.
+     *
+     * The second half of the address policy, and the half the special-purpose
+     * registries cannot supply: they enumerate blocks carved out for a purpose
+     * and say nothing about space that was never allocated. Carried here, in the
+     * document, for the same reason the range rows are — a registry refresh is a
+     * reviewed data change — and counter-signed against
+     * {@link REVIEWED_GLOBAL_UNICAST_ALLOCATIONS} so a stale or tampered
+     * document can neither widen the policy nor quietly narrow it.
+     */
+    readonly globalUnicastAllocations: readonly GlobalUnicastAllocation[];
     readonly hostClasses: readonly EvidenceHostClass[];
     readonly specialPurposeRanges: readonly SpecialPurposeRange[];
     readonly fetchLimits: EvidenceFetchLimits;
@@ -350,11 +367,13 @@ export const EVIDENCE_HOST_PATTERN = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/;
 // *counter-signature* — the document must be the table that was reviewed, row
 // for row, and not merely a table that looks well formed.
 //
-// Why the whole table and not a chosen floor: an address matching no row is
-// ordinary global unicast, which is correct because the registries enumerate the
-// special-purpose blocks exhaustively. That makes an omission indistinguishable
-// from "nothing special here", so losing the `169.254.0.0/16` row would quietly
-// promote the cloud metadata address to a permitted fetch target. Neither a row
+// Why the whole table and not a chosen floor: an address matching no row falls
+// through to {@link REVIEWED_GLOBAL_UNICAST_ALLOCATIONS}, which answers only
+// whether the address is allocated to unicast at all. That makes an omission
+// indistinguishable from "nothing special here" — a special-purpose block
+// carved out of unicast space sits inside an allocated block, so losing the
+// `169.254.0.0/16` row would quietly promote the cloud metadata address to a
+// permitted fetch target. Neither a row
 // count nor a list of blocks somebody remembered to name catches that, because a
 // row can be *substituted* rather than dropped: delete one non-global block, add
 // any other canonical block in its place, and the count, the families and every
@@ -398,8 +417,9 @@ export interface ReviewedRange {
  * only the rows someone thought to list, and a document can then drop an
  * unlisted non-global row, add any other canonical row in its place, and keep
  * both the row count and every integrity property intact — after which
- * `192.88.99.0/24`, `100:0:0:1::/64` or `5f00::/16` matches nothing and is
- * classified as ordinary global unicast. Set equality is what closes that:
+ * `192.88.99.0/24`, `100:0:0:1::/64` or `5f00::/16` matches nothing, satisfies
+ * the allocation it sits inside, and is classified as routable. Set equality is
+ * what closes that:
  * {@link validateEvidenceRangeTable} refuses a table with a row missing, a row
  * added, or a reachability changed, so no same-count substitution survives.
  *
@@ -491,7 +511,9 @@ export const REVIEWED_RANGE_TABLE: readonly ReviewedRange[] = [
  * Special-Purpose Address Registry does not list. It is carried because
  * {@link unwrapEmbeddedIpv4} unwraps that form, so an attacker writing
  * `::a9fe:a9fe` must not outflank `169.254.0.0/16`, and because a block the
- * table does not carry matches nothing and reads as ordinary global unicast.
+ * table does not carry matches nothing and is then judged only on whether it is
+ * allocated to unicast — which `::/96` is not, but which the IPv4 address it
+ * carries generally is.
  *
  * Keeping it in the same table as the registry rows is what makes the
  * classifier's longest-prefix match see it at all; keeping it out of the
@@ -528,6 +550,101 @@ export const REVIEWED_SUPPLEMENTAL_ROW_COUNT = REVIEWED_RANGE_TABLE.length - REV
  * differ by {@link REVIEWED_SUPPLEMENTAL_ROW_COUNT}.
  */
 export const REVIEWED_RANGE_ROW_COUNT = REVIEWED_RANGE_TABLE.length;
+
+/**
+ * One block the IANA address-space registries allocate to globally routable
+ * unicast, as the review transcribed it.
+ *
+ * `allocation` is the registry's own wording for the block and `registry` names
+ * the page it was read from, so a reviewer can check the row against its source
+ * without leaving this file.
+ */
+export interface GlobalUnicastAllocation {
+    readonly cidr: string;
+    readonly allocation: string;
+    readonly registry: string;
+}
+
+/**
+ * The address space IANA has allocated to globally routable unicast — the outer
+ * gate for every address the special-purpose table says nothing about.
+ *
+ * It is an outer gate, not a universal one: a most-specific row marked
+ * `globallyReachable: true` is the reviewed exception and decides on its own,
+ * which is what keeps `64:ff9b::/96` reachable despite lying outside
+ * `2000::/3`. Rows win where they speak; this list answers where they are
+ * silent. {@link classifyIpAddress} is where that order is implemented.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM {@link REVIEWED_RANGE_TABLE}. That table
+ * transcribes the two IANA **special-purpose** registries, which enumerate
+ * blocks carved out *for a purpose*. They say nothing about space that has
+ * never been allocated at all, so "matches no special-purpose row" does not
+ * mean "globally routable" — it means "not special-purpose", and the majority
+ * of the IPv6 address space is neither. Judging an address on the table alone
+ * therefore admits every reserved and unallocated block: with the reviewed rows
+ * as they stand, `fe00::/9`, `fec0::/10`, `4000::/3`, `0100::/8`, `1000::/4`,
+ * `8000::/3`, `c000::/3`, `f000::/5` and the rest of the "Reserved by IETF"
+ * space match nothing and would pass. An operator's resolver can answer with
+ * such an address, and the connection then goes wherever the local routing
+ * table sends it.
+ *
+ * This list is the third registry that settles the question, and it is written
+ * as a POSITIVE list on purpose: an address is routable only if it falls inside
+ * one of these blocks, so a list that fails to parse, loses a family or is
+ * emptied refuses everything rather than admitting everything. The direction of
+ * the check is the fail-closed property.
+ *
+ * PROVENANCE, read at the {@link REVIEWED_REGISTRY_SNAPSHOT} snapshot.
+ * - IANA IPv6 Address Space (RFC 4291, formerly RFC 3513): `2000::/3` is the
+ *   one block designated "Global Unicast". Every other top-level block is
+ *   "Reserved by IETF" apart from `fc00::/7` (Unique Local Unicast),
+ *   `fe80::/10` (Link-Scoped Unicast) and `ff00::/8` (Multicast) — none of them
+ *   globally routable, and the first two are carried as table rows as well.
+ * - IANA IPv4 Address Space (RFC 5735, RFC 6890): unicast is everything below
+ *   the multicast block, `224.0.0.0/4` (RFC 5771) and `240.0.0.0/4` (RFC 1112)
+ *   being the two top-level carve-outs. `0.0.0.0/1 + 128.0.0.0/2 +
+ *   192.0.0.0/3` is exactly `0.0.0.0`–`223.255.255.255`, written as three
+ *   blocks because that is the range's CIDR form.
+ *
+ * WHAT THE IPv4 ROWS ADD, stated honestly: `240.0.0.0/4` is already a reviewed
+ * table row, so class E rejects through the table today and these three blocks
+ * close no open hole on their own. They earn their place by making the verdict
+ * independent of the table for the prior question of whether the address is
+ * allocated to unicast at all — a row deleted from the table cannot reopen
+ * class E — and by keeping one rule for both families instead of a gate that
+ * only ever fires on IPv6.
+ *
+ * WHERE THE POLICY LIVES. The allocation is carried by
+ * `data/meal-planning/evidence-allowlist.v1.json` as `globalUnicastAllocations`,
+ * the same reviewed data surface that carries the range rows and the host
+ * classes, and {@link validateEvidenceAllocationTable} validates it there. This
+ * list is the *counter-signature*: the document must be the allocation that was
+ * reviewed, block for block, so a stale or tampered document can neither widen
+ * the policy by appending a reserved block nor narrow it by dropping one. A
+ * refresh is therefore a reviewed data change — the document, this
+ * counter-signature and `docs/meal-planning/catalog-policy.md` — and any one of
+ * the three alone fails closed and loudly.
+ *
+ * KNOWN LIMITATION. RFC 3587 §3 warns implementations not to assume `2000::/3`
+ * is special, because IANA may be directed to delegate currently unassigned
+ * space to global unicast later. That is a reviewed data change of exactly the
+ * shape above, and until it happens refusing unallocated space is the only
+ * answer that fails closed: an address in it cannot be a public reference page,
+ * and it can very easily be an internal service.
+ */
+export const REVIEWED_GLOBAL_UNICAST_ALLOCATIONS: readonly GlobalUnicastAllocation[] = [
+    { cidr: '0.0.0.0/1', allocation: 'unicast', registry: 'ipv4-address-space' },
+    { cidr: '128.0.0.0/2', allocation: 'unicast', registry: 'ipv4-address-space' },
+    { cidr: '192.0.0.0/3', allocation: 'unicast', registry: 'ipv4-address-space' },
+    { cidr: '2000::/3', allocation: 'Global Unicast', registry: 'ipv6-address-space' },
+];
+
+/**
+ * How many allocation blocks were reviewed, derived from the list rather than
+ * written down so the two cannot disagree — the figure a reviewer checks against
+ * the registry pages is computed from the rows they are checking.
+ */
+export const REVIEWED_ALLOCATION_ROW_COUNT = REVIEWED_GLOBAL_UNICAST_ALLOCATIONS.length;
 
 const WILDCARD_PREFIX = '*.';
 const IPV4_BYTES = 4;
@@ -990,6 +1107,92 @@ const buildNormalizedUrl = (parsed: URL, host: string): string => {
     return normalized.href;
 };
 
+/** A WHATWG scheme: an ASCII letter followed by letters, digits, `+`, `-` or `.`. */
+const URL_SCHEME_PATTERN = /^[a-z][a-z0-9+\-.]*$/i;
+
+/** Where an authority ends. `\` is deliberately absent — see {@link rawUserinfoInAuthority}. */
+const AUTHORITY_TERMINATOR_PATTERN = /[/?#]/;
+
+/** Every ASCII tab and newline, which WHATWG parsing removes from anywhere in the input. */
+const TAB_OR_NEWLINE_PATTERN = /[\t\n\r]/g;
+
+/** The highest code point WHATWG strips from both ends of an input: C0 controls and space. */
+const C0_OR_SPACE_MAX = 0x20;
+
+/**
+ * Whether the reference carries a userinfo delimiter in the position where a
+ * host is named — read from the RAW text, before any parser normalizes it.
+ *
+ * WHY THE RAW TEXT. `URL` does not preserve an **empty** userinfo component: it
+ * removes it. `https://@host/`, `https://:@host/`, `https:@host/`,
+ * `https:/@host/`, `https:///@host/` and `https:\\@host/` all parse to
+ * `https://host/` with `username` and `password` both `''`, so a check that
+ * reads only those two fields accepts every one of them while the policy says
+ * userinfo is refused unconditionally. The delimiter is the whole point: it is
+ * what makes a reader — and a parser that disagrees with this one — take the
+ * wrong side of the `@` for the host, and it carries no legitimate meaning in a
+ * URL naming a public reference page.
+ *
+ * WHAT IT MIRRORS. The scan reproduces the front of WHATWG basic URL parsing so
+ * that it sees what the parser will see: leading and trailing C0 controls and
+ * spaces are stripped, every ASCII tab and newline is removed from anywhere in
+ * the input, an optional scheme is dropped, and the slashes introducing the
+ * authority are skipped. A special scheme's authority state tolerates none, one
+ * or many slashes — which is why `https:@host/` and `https:/@host/` still name
+ * `host` — so an absolute reference always has an authority, while a
+ * scheme-relative one needs the conventional two.
+ *
+ * A PATH-RELATIVE REFERENCE HAS NO AUTHORITY, and this is why the function
+ * takes a reference rather than a URL: a redirect to `/@handle` is an ordinary
+ * path whose first character happens to be `@`, and refusing it would refuse
+ * legitimate pages. Only text in authority position is scanned.
+ *
+ * `\` IS SCANNED, NOT TREATED AS A TERMINATOR. In `https://host\@evil.com/`
+ * this parser reads `host` and puts `\@evil.com/` in the path; others read
+ * `evil.com`. Rather than pick a side on model-proposed input, the whole run up
+ * to the first `/`, `?` or `#` is scanned, so that form is refused. It costs
+ * nothing: a backslash cannot appear in a real host, and one later in the path
+ * is never reached because the authority has already ended.
+ */
+const rawUserinfoInAuthority = (reference: string): boolean => {
+    if (typeof reference !== 'string') {
+        return false;
+    }
+
+    let start = 0;
+    let end = reference.length;
+    while (start < end && reference.charCodeAt(start) <= C0_OR_SPACE_MAX) {
+        start++;
+    }
+    while (end > start && reference.charCodeAt(end - 1) <= C0_OR_SPACE_MAX) {
+        end--;
+    }
+
+    let rest = reference.slice(start, end).replace(TAB_OR_NEWLINE_PATTERN, '');
+
+    // A colon only introduces a scheme when what precedes it is shaped like
+    // one, so the port colon in `//host:8080/` is not mistaken for a scheme.
+    const colon = rest.indexOf(':');
+    const hasScheme = colon > 0 && URL_SCHEME_PATTERN.test(rest.slice(0, colon));
+    if (hasScheme) {
+        rest = rest.slice(colon + 1);
+    }
+
+    let slashes = 0;
+    while (slashes < rest.length && (rest[slashes] === '/' || rest[slashes] === '\\')) {
+        slashes++;
+    }
+
+    if (!hasScheme && slashes < 2) {
+        return false;
+    }
+
+    const authority = rest.slice(slashes);
+    const terminator = authority.search(AUTHORITY_TERMINATOR_PATTERN);
+
+    return (terminator === -1 ? authority : authority.slice(0, terminator)).indexOf('@') !== -1;
+};
+
 /**
  * Applies the URL half of the policy and, on success, returns the **normalized
  * href the service must fetch**. Judging one string and opening a socket on
@@ -1032,7 +1235,14 @@ export const parseEvidenceUrl = (rawUrl: string, limits?: unknown): EvidenceUrlV
     // Credentials in a model-proposed URL are themselves a signal, and
     // `https://allowed.gov@evil.com/` is a classic parser-confusion payload —
     // so userinfo is refused outright rather than stripped and followed.
-    if (parsed.username !== '' || parsed.password !== '') {
+    //
+    // The policy is unconditional, so the RAW text decides it: the parser
+    // removes an *empty* userinfo component entirely, and a check on
+    // `username`/`password` alone therefore accepts `https://@host/` and every
+    // obfuscation of it (see {@link rawUserinfoInAuthority}). Both checks are
+    // kept — the parsed fields answer for anything the raw scan cannot see, and
+    // they are the reference this scan is written against.
+    if (rawUserinfoInAuthority(rawUrl) || parsed.username !== '' || parsed.password !== '') {
         return rejectUrl('credentials_present', 'the URL carries userinfo');
     }
 
@@ -1742,6 +1952,304 @@ const REVIEWED_ATTESTATION: ReviewedAttestation = (() => {
     return { rows, keys, supplementalBlocks, defects };
 })();
 
+/** {@link REVIEWED_GLOBAL_UNICAST_ALLOCATIONS} resolved to parsed blocks once at module load. */
+interface ReviewedAllocation {
+    /** Each reviewed block, parsed, carrying the reviewed text for refusal messages. */
+    readonly blocks: readonly { readonly cidr: ParsedCidr; readonly text: string }[];
+    readonly defects: readonly string[];
+}
+
+/**
+ * The reviewed global-unicast allocation, resolved once at module load for the
+ * same reason the table is: it cannot change at runtime, and re-parsing it per
+ * address would repeat the work on every candidate URL.
+ *
+ * A defect is recorded rather than thrown, matching
+ * {@link REVIEWED_ATTESTATION}: it could only be a typing mistake in this file,
+ * and the honest response is for every classification to refuse loudly through
+ * the ordinary verdict. A family with no block is a defect in its own right —
+ * without it, losing the IPv6 line would silently refuse every IPv6 address as
+ * "unallocated", which is the correct direction but the wrong reason, and an
+ * operator reading the refusal would go looking at the registries instead of at
+ * this list.
+ */
+const REVIEWED_ALLOCATION: ReviewedAllocation = (() => {
+    const blocks: { cidr: ParsedCidr; text: string }[] = [];
+    const keys = new Set<string>();
+    const families = new Set<number>();
+    const defects: string[] = [];
+
+    for (const reviewed of REVIEWED_GLOBAL_UNICAST_ALLOCATIONS) {
+        const cidr = parseCidr(reviewed.cidr);
+        if (cidr === null) {
+            defects.push(`the reviewed allocation entry "${reviewed.cidr}" is not a valid CIDR`);
+            continue;
+        }
+
+        const key = cidrKey(cidr);
+        if (keys.has(key)) {
+            defects.push(`the reviewed allocation entry "${reviewed.cidr}" names a block already allocated`);
+            continue;
+        }
+
+        blocks.push({ cidr, text: reviewed.cidr });
+        keys.add(key);
+        families.add(cidr.version);
+    }
+
+    for (const version of [4, 6]) {
+        if (!families.has(version)) {
+            defects.push(
+                `the reviewed allocation carries no IPv${version} block, so no IPv${version} address could be judged routable`,
+            );
+        }
+    }
+
+    return { blocks, defects };
+})();
+
+/**
+ * The defect message the reviewed allocation carries, or `null` when it is
+ * usable. Joined into one sentence so a refusal names every defect at once
+ * rather than one per run.
+ */
+const reviewedAllocationDefect = (): string | null =>
+    REVIEWED_ALLOCATION.defects.length === 0
+        ? null
+        : `the reviewed global-unicast allocation is unusable: ${REVIEWED_ALLOCATION.defects.join('; ')}`;
+
+/**
+ * Whether the address falls inside space IANA has allocated to globally
+ * routable unicast.
+ *
+ * Exported because it is the one part of the address policy that must be
+ * checkable without a table: {@link validateEvidenceRangeTable} compares the
+ * table against the reviewed snapshot as a set, so a test cannot reach this
+ * rule through {@link classifyIpAddress} while holding a table with a row
+ * removed — that table refuses first, for a different reason. Proving the gate
+ * is independent of the table means asking it directly.
+ *
+ * Fails closed on a defective allocation, so a direct caller reaches the same
+ * verdict as one going through {@link classifyIpAddress}, which reports the
+ * defect explicitly.
+ */
+export const isGloballyAllocatedUnicast = (
+    address: ParsedIpAddress,
+    allocations?: readonly GlobalUnicastAllocation[],
+): boolean => {
+    const resolved = resolveAllocationBlocks(allocations);
+    if (!resolved.ok) {
+        return false;
+    }
+
+    return isWithinAllocationBlocks(address, resolved.blocks);
+};
+
+/** An allocation block resolved for classification: the parsed block and the text it was written as. */
+interface ResolvedAllocationBlock {
+    readonly cidr: ParsedCidr;
+    readonly text: string;
+}
+
+/**
+ * The verdict on a document's allocation list. On success it carries the
+ * **resolved blocks**, for the reason {@link EvidenceRangeTableVerdict} carries
+ * normalized rows: an address is then only ever compared against blocks that
+ * passed every check, and a caller cannot accidentally classify against the raw
+ * input it handed in.
+ */
+export type EvidenceAllocationTableVerdict =
+    | {
+          readonly ok: true;
+          readonly blocks: readonly ResolvedAllocationBlock[];
+          /** The validated rows, so a caller can hand the checked data back in. */
+          readonly rows: readonly GlobalUnicastAllocation[];
+      }
+    | { readonly ok: false; readonly detail: string };
+
+/**
+ * The document's allocation list must be trustworthy **and** be the reviewed one
+ * before any address is judged against it.
+ *
+ * Integrity first: an empty list, a non-object row, an unparsable or
+ * non-canonical CIDR, a row missing its registry or allocation wording, a block
+ * declared twice, or a family with no block at all all reject.
+ *
+ * Then set equality with {@link REVIEWED_GLOBAL_UNICAST_ALLOCATIONS}, in both
+ * directions, because both failure modes are dangerous and they are dangerous in
+ * opposite ways. A document that ADDS a block widens the policy — appending
+ * `4000::/3` would restore exactly the hole this gate exists to close. A document
+ * that DROPS one narrows it, which is safe for traffic but means the code and the
+ * reviewed data no longer describe the same policy, and the next reviewer diffing
+ * the document against the registry pages would be checking a list the classifier
+ * is not using. Neither is accepted: the document must be the reviewed
+ * allocation, exactly.
+ *
+ * Blocks are compared by identity rather than by the text they are written in,
+ * the way the range table's own set equality compares them, so an equivalent
+ * spelling of the same block is accepted and a different block never is.
+ */
+export const validateEvidenceAllocationTable = (allocations: unknown): EvidenceAllocationTableVerdict => {
+    if (!Array.isArray(allocations)) {
+        return { ok: false, detail: `globalUnicastAllocations is ${describeValue(allocations)}, not a list` };
+    }
+    if (allocations.length === 0) {
+        return { ok: false, detail: 'globalUnicastAllocations is empty, so no address could be judged routable' };
+    }
+
+    const blocks: ResolvedAllocationBlock[] = [];
+    const rows: GlobalUnicastAllocation[] = [];
+    const seen = new Set<string>();
+    const families = new Set<number>();
+
+    for (const entry of allocations) {
+        if (!isRecord(entry)) {
+            return { ok: false, detail: `an allocation row is ${describeValue(entry)}, not an object` };
+        }
+
+        const { cidr: rawCidr, allocation, registry } = entry;
+        if (typeof rawCidr !== 'string' || rawCidr.trim() === '') {
+            return { ok: false, detail: `an allocation row declares the block ${describeValue(rawCidr)}` };
+        }
+
+        // Canonical registry text, checked the way `checkRangeRow` checks it and
+        // for the same reason: none of these is a classification hole on its
+        // own, but each is evidence the row was hand-edited rather than
+        // transcribed, and a list nobody can diff against the registry page is a
+        // list nobody can review.
+        if (rawCidr !== rawCidr.trim() || rawCidr !== rawCidr.toLowerCase()) {
+            return {
+                ok: false,
+                detail: `the allocation row "${rawCidr}" is not written in canonical lower-case registry text`,
+            };
+        }
+
+        const parsed = parseCidr(rawCidr);
+        if (parsed === null) {
+            return { ok: false, detail: `the allocation row "${rawCidr}" is not a valid CIDR` };
+        }
+
+        const slashIndex = rawCidr.indexOf('/');
+        const written = parseIpAddress(rawCidr.slice(0, slashIndex));
+        if (written === null || !bytesEqual(written.bytes, parsed.bytes)) {
+            return {
+                ok: false,
+                detail: `the allocation row "${rawCidr}" is not written on its own network address`,
+            };
+        }
+
+        if (typeof allocation !== 'string' || allocation.trim() === '') {
+            return {
+                ok: false,
+                detail: `the allocation row "${rawCidr}" declares the allocation ${describeValue(allocation)}`,
+            };
+        }
+        if (typeof registry !== 'string' || registry.trim() === '') {
+            return {
+                ok: false,
+                detail: `the allocation row "${rawCidr}" declares the registry ${describeValue(registry)}`,
+            };
+        }
+
+        const key = cidrKey(parsed);
+        if (seen.has(key)) {
+            return { ok: false, detail: `the allocation row "${rawCidr}" names a block already declared` };
+        }
+
+        blocks.push({ cidr: parsed, text: rawCidr });
+        rows.push({ cidr: rawCidr, allocation, registry });
+        seen.add(key);
+        families.add(parsed.version);
+    }
+
+    for (const version of [4, 6]) {
+        if (!families.has(version)) {
+            return {
+                ok: false,
+                detail:
+                    `globalUnicastAllocations carries no IPv${version} block, ` +
+                    `so no IPv${version} address could be judged routable`,
+            };
+        }
+    }
+
+    const reviewedDefect = reviewedAllocationDefect();
+    if (reviewedDefect !== null) {
+        return { ok: false, detail: reviewedDefect };
+    }
+
+    const reviewedKeys = new Map<string, string>();
+    for (const block of REVIEWED_ALLOCATION.blocks) {
+        reviewedKeys.set(cidrKey(block.cidr), block.text);
+    }
+
+    for (const [key, text] of reviewedKeys) {
+        if (!seen.has(key)) {
+            return {
+                ok: false,
+                detail: `globalUnicastAllocations is missing the reviewed block "${text}"`,
+            };
+        }
+    }
+
+    for (const block of blocks) {
+        if (!reviewedKeys.has(cidrKey(block.cidr))) {
+            return {
+                ok: false,
+                detail:
+                    `globalUnicastAllocations declares "${block.text}", which the ` +
+                    `${REVIEWED_REGISTRY_SNAPSHOT} review did not allocate to global unicast`,
+            };
+        }
+    }
+
+    return { ok: true, blocks, rows };
+};
+
+/**
+ * The blocks an address is judged against: the document's, once validated, or
+ * the counter-signed reviewed list when a caller supplies none.
+ *
+ * The parameter is optional so that every existing call site keeps compiling and
+ * keeps its behaviour, while a caller holding a validated policy document can
+ * have the classifier judge against the document's own data. Both paths resolve
+ * to the same blocks for the committed document, because the validator above
+ * refuses any other.
+ */
+const resolveAllocationBlocks = (
+    allocations: readonly GlobalUnicastAllocation[] | undefined,
+):
+    | { readonly ok: true; readonly blocks: readonly ResolvedAllocationBlock[] }
+    | { readonly ok: false; readonly detail: string } => {
+    if (allocations === undefined) {
+        const defect = reviewedAllocationDefect();
+        return defect === null ? { ok: true, blocks: REVIEWED_ALLOCATION.blocks } : { ok: false, detail: defect };
+    }
+
+    return validateEvidenceAllocationTable(allocations);
+};
+
+/** Whether the address falls inside one of the given allocation blocks. */
+const isWithinAllocationBlocks = (
+    address: ParsedIpAddress,
+    blocks: readonly ResolvedAllocationBlock[],
+): boolean => {
+    for (const block of blocks) {
+        if (cidrContains(block.cidr, address)) {
+            return true;
+        }
+    }
+
+    return false;
+};
+
+/** The blocks of one family, as they are written, for a refusal message. */
+const allocatedBlocksFor = (version: 4 | 6, blocks: readonly ResolvedAllocationBlock[]): string =>
+    blocks
+        .filter((block) => block.cidr.version === version)
+        .map((block) => block.text)
+        .join(', ');
+
 /**
  * The table itself must be trustworthy **and complete** before any address is
  * judged against it.
@@ -1754,10 +2262,13 @@ const REVIEWED_ATTESTATION: ReviewedAttestation = (() => {
  * the three permitted values and a block declared twice all reject.
  *
  * Completeness comes second, and it is the check whose absence is invisible.
- * "Matches no row" means global unicast, which is right because the registries
- * enumerate the special-purpose blocks — and it is also why a *missing* row
- * cannot be noticed by classification: deleting `169.254.0.0/16` makes
- * `169.254.169.254` match nothing and pass. So the table is compared with
+ * "Matches no row" sends an address on to
+ * {@link REVIEWED_GLOBAL_UNICAST_ALLOCATIONS}, and that gate cannot stand in
+ * for a missing row: every special-purpose block carved out of unicast space
+ * lies *inside* an allocated block, so deleting `169.254.0.0/16` makes
+ * `169.254.169.254` match no row, fall through to an allocation it satisfies,
+ * and pass. The allocation answers what the registries are silent about; only
+ * this check answers for a row that went missing. So the table is compared with
  * {@link REVIEWED_RANGE_TABLE} as a **set**, in both directions: every reviewed
  * block must be present with exactly the reachability the registries state, and
  * no block outside the reviewed snapshot may appear. A row deleted, a row
@@ -1911,19 +2422,42 @@ const classifySpecialAddress = (address: ParsedIpAddress): EvidenceAddressVerdic
  * address, a row marked `false` or `'n/a'`, or a bad embedded address all
  * reject. No branch returns "routable" because a check could not be performed.
  *
- * Matching no row *is* a positive answer rather than a skipped check: the
- * registries enumerate the special-purpose blocks, so an address outside all of
- * them is ordinary global unicast. The blocks they omit — the two multicast
- * ranges — are refused above, which is why that omission is not a hole. That
- * reading is only safe against a table known to still contain the blocks it
- * should, which is what {@link validateEvidenceRangeTable} establishes first and
- * why classification runs against the rows it returns rather than against the
- * argument. No range is hard-coded as a classification rule, so refreshing the
- * table stays a reviewed data change.
+ * Matching no row is **not** a positive answer. The special-purpose registries
+ * enumerate blocks carved out *for a purpose*; they say nothing about space
+ * that was never allocated, and most of the IPv6 address space is exactly that.
+ * So an address no row covers is judged against
+ * {@link REVIEWED_GLOBAL_UNICAST_ALLOCATIONS} — the third registry, which
+ * states what IANA has allocated to globally routable unicast — and an address
+ * outside every allocated block refuses. Without that gate `fe00::/9`,
+ * `fec0::/10`, `4000::/3` and the rest of the reserved space match nothing and
+ * pass, which is how a resolver answer can reach an internal service.
+ *
+ * A row the registries mark `globallyReachable: true` is the reviewed exception
+ * and is not re-judged against the allocation: `64:ff9b::/96` is such a row and
+ * lies outside `2000::/3`, so re-judging it would refuse the blocks the
+ * registries explicitly declare reachable. Rows win where they speak; the
+ * allocation answers only where they are silent.
+ *
+ * Both halves are only as good as the data behind them, so both are established
+ * before any address is judged. {@link validateEvidenceRangeTable} proves the
+ * table is the reviewed snapshot, and classification runs against the rows it
+ * returns rather than against the argument. The allocation is resolved the same
+ * way: `allocations` is validated by
+ * {@link validateEvidenceAllocationTable} when a caller supplies the document's
+ * own list, and falls back to the counter-signed reviewed list when none is
+ * given; either way an unusable list refuses every address through
+ * `range_table_unclassifiable`, and classification runs against the blocks the
+ * check returned.
+ *
+ * Neither half is a range hard-coded as a classification rule. Both are
+ * reviewed data in `data/meal-planning/evidence-allowlist.v1.json`,
+ * counter-signed in this module, so refreshing either registry stays a reviewed
+ * data change.
  */
 export const classifyIpAddress = (
     ip: ParsedIpAddress | string,
     ranges: readonly SpecialPurposeRange[],
+    allocations?: readonly GlobalUnicastAllocation[],
 ): EvidenceAddressVerdict => {
     const asText = typeof ip === 'string' ? ip : null;
 
@@ -1932,6 +2466,17 @@ export const classifyIpAddress = (
         return rejectAddress('range_table_unclassifiable', table.detail, asText);
     }
 
+    // The allocation is the other half of the policy, so it is established here
+    // for the same reason and reported with the same code: an address cannot be
+    // judged against half a policy, and a list that is unusable — whether it
+    // came from the document or from the reviewed constant — must refuse every
+    // address rather than quietly widen what counts as routable.
+    const allocation = resolveAllocationBlocks(allocations);
+    if (!allocation.ok) {
+        return rejectAddress('range_table_unclassifiable', allocation.detail, asText);
+    }
+
+    const allocatedBlocks = allocation.blocks;
     const rows = table.rows;
     const address = typeof ip === 'string' ? parseIpAddress(ip) : ip;
     if (address === null || !isWellFormedAddress(address)) {
@@ -1958,20 +2503,46 @@ export const classifyIpAddress = (
         }
 
         const carriedRow = findMostSpecificRange(carried, rows);
-        if (carriedRow !== null && carriedRow.globallyReachable !== true) {
+        if (carriedRow !== null) {
+            if (carriedRow.globallyReachable !== true) {
+                return rejectAddress(
+                    'embedded_address_not_globally_routable',
+                    `${wrapperText} carries ${carriedText}, which falls in ${carriedRow.cidr} (${carriedRow.name})`,
+                    wrapperText,
+                );
+            }
+        } else if (!isWithinAllocationBlocks(carried, allocatedBlocks)) {
             return rejectAddress(
                 'embedded_address_not_globally_routable',
-                `${wrapperText} carries ${carriedText}, which falls in ${carriedRow.cidr} (${carriedRow.name})`,
+                `${wrapperText} carries ${carriedText}, which falls in no block IANA allocates to global ` +
+                    `unicast (${allocatedBlocksFor(carried.version, allocatedBlocks)})`,
                 wrapperText,
             );
         }
     }
 
     const row = findMostSpecificRange(address, rows);
-    if (row !== null && row.globallyReachable !== true) {
+    if (row !== null) {
+        if (row.globallyReachable !== true) {
+            return rejectAddress(
+                'address_not_globally_routable',
+                `${wrapperText} falls in ${row.cidr} (${row.name}), globallyReachable ${String(row.globallyReachable)}`,
+                wrapperText,
+            );
+        }
+
+        // A row the registries mark globally reachable IS the reviewed
+        // exception, and it stands on its own: `64:ff9b::/96` is such a row and
+        // sits in `::/8`, outside the allocated `2000::/3`, so re-judging a
+        // `true` row against the allocation would refuse the very blocks the
+        // registries went out of their way to declare reachable. The allocation
+        // is the answer for the addresses the registries say nothing about,
+        // which is why it is reached only when no row matched.
+    } else if (!isWithinAllocationBlocks(address, allocatedBlocks)) {
         return rejectAddress(
             'address_not_globally_routable',
-            `${wrapperText} falls in ${row.cidr} (${row.name}), globallyReachable ${String(row.globallyReachable)}`,
+            `${wrapperText} falls in no block IANA allocates to global unicast ` +
+                `(${allocatedBlocksFor(address.version, allocatedBlocks)})`,
             wrapperText,
         );
     }
@@ -1980,8 +2551,11 @@ export const classifyIpAddress = (
 };
 
 /** {@link classifyIpAddress} as a predicate, for callers that need no reason. */
-export const isGloballyRoutable = (ip: ParsedIpAddress | string, ranges: readonly SpecialPurposeRange[]): boolean =>
-    classifyIpAddress(ip, ranges).allowed;
+export const isGloballyRoutable = (
+    ip: ParsedIpAddress | string,
+    ranges: readonly SpecialPurposeRange[],
+    allocations?: readonly GlobalUnicastAllocation[],
+): boolean => classifyIpAddress(ip, ranges, allocations).allowed;
 
 /**
  * Judges a host's whole answer set, which is the unit that matters: the service
@@ -1996,6 +2570,7 @@ export const isGloballyRoutable = (ip: ParsedIpAddress | string, ranges: readonl
 export const classifyAddressSet = (
     addresses: readonly (ParsedIpAddress | string)[],
     ranges: readonly SpecialPurposeRange[],
+    allocations?: readonly GlobalUnicastAllocation[],
 ): EvidenceAddressVerdict => {
     const entries = asList(addresses);
     if (entries.length === 0) {
@@ -2003,7 +2578,7 @@ export const classifyAddressSet = (
     }
 
     for (const entry of entries) {
-        const verdict = classifyIpAddress(entry as ParsedIpAddress | string, ranges);
+        const verdict = classifyIpAddress(entry as ParsedIpAddress | string, ranges, allocations);
         if (!verdict.allowed) {
             return verdict;
         }
@@ -2016,7 +2591,8 @@ export const classifyAddressSet = (
 export const areAllAddressesRoutable = (
     addresses: readonly (ParsedIpAddress | string)[],
     ranges: readonly SpecialPurposeRange[],
-): boolean => classifyAddressSet(addresses, ranges).allowed;
+    allocations?: readonly GlobalUnicastAllocation[],
+): boolean => classifyAddressSet(addresses, ranges, allocations).allowed;
 
 // ---------------------------------------------------------------------------
 // Policy document validation.
@@ -2344,8 +2920,9 @@ const tableCarriesBlock = (ranges: readonly unknown[], cidr: string, key: string
  *    *identity* of the hardening rows reviewable rather than just their number.
  * 5. **Every supplemental block is actually in the table.** A supplemental row
  *    the table does not carry is a hardening rule that stopped applying:
- *    nothing would match `::/96`, and an embedded link-local address would read
- *    as ordinary global unicast. Blocks are matched by identity and not by the
+ *    nothing would match `::/96`, and the longest-prefix answer for an embedded
+ *    address would come from whatever row covers it instead. Blocks are matched
+ *    by identity and not by the
  *    text they happen to be written in, the way the table's own set equality
  *    matches them.
  */
@@ -2487,10 +3064,11 @@ const checkReviewedRowSplit = (
  *   against the registry pages at a refresh.
  * - **The address table**, through {@link validateEvidenceRangeTable}: per-row
  *   integrity plus set equality with the complete reviewed snapshot, which is
- *   what makes "matches no row" a safe reading. Set equality is the check that
- *   matters here: a subset floor would accept a document that dropped a
- *   non-global block and replaced it with an unrelated one, keeping `rowCount`
- *   intact while promoting the dropped block to global unicast.
+ *   what keeps the fall-through to the allocation gate safe. Set equality is the
+ *   check that matters here: a subset floor would accept a document that dropped
+ *   a non-global block and replaced it with an unrelated one, keeping `rowCount`
+ *   intact while leaving the dropped block to be judged on allocation alone —
+ *   which it satisfies, because it was carved out of allocated unicast space.
  * - **The host classes.** Each needs an identifier, at least one usable host
  *   entry and at least one reviewed evidence type. Identifiers must be unique,
  *   and no host entry may appear in two classes — overlapping entries would make
@@ -2560,6 +3138,39 @@ export const validateEvidencePolicy = (policy: unknown): EvidencePolicyVerdict =
         return { ok: false, reason: 'range_table_unclassifiable', detail: table.detail };
     }
 
+    // The allocation half of the address policy. Checked here so a document that
+    // carries a stale, widened or missing allocation is refused as a document,
+    // before any candidate is judged against it — the same treatment the range
+    // table gets, and reported under the same code so an operator reading the
+    // refusal sees one class of "the address policy is not the reviewed one".
+    const allocations = policy.globalUnicastAllocations;
+    const allocationTable = validateEvidenceAllocationTable(allocations);
+    if (!allocationTable.ok) {
+        return { ok: false, reason: 'range_table_unclassifiable', detail: allocationTable.detail };
+    }
+
+    // The document's own statement about its allocation, compared with what it
+    // carries and with what was reviewed — a count that disagrees with either is
+    // a document nobody has actually checked against the registry pages.
+    const allocationRowCount = policy.globalUnicastAllocationRowCount;
+    if (!isPositiveInteger(allocationRowCount)) {
+        return invalidPolicy(
+            `the policy document declares the allocation row count ${describeValue(allocationRowCount)}`,
+        );
+    }
+    if (allocationRowCount !== allocationTable.blocks.length) {
+        return invalidPolicy(
+            `the policy document declares ${allocationRowCount} allocation rows and ` +
+                `carries ${allocationTable.blocks.length}`,
+        );
+    }
+    if (allocationRowCount !== REVIEWED_ALLOCATION_ROW_COUNT) {
+        return invalidPolicy(
+            `the allocation carries ${allocationRowCount} rows, not the ` +
+                `${REVIEWED_ALLOCATION_ROW_COUNT} reviewed at ${REVIEWED_REGISTRY_SNAPSHOT}`,
+        );
+    }
+
     const rawClasses = policy.hostClasses;
     if (!Array.isArray(rawClasses) || rawClasses.length === 0) {
         return invalidPolicy('the policy document declares no host classes');
@@ -2606,6 +3217,11 @@ export const validateEvidencePolicy = (policy: unknown): EvidencePolicyVerdict =
             registryRowCount: split.value.registryRowCount,
             supplementalRowCount: split.value.supplementalRowCount,
             supplementalCidrs: split.value.supplementalCidrs,
+            globalUnicastAllocationRowCount: allocationRowCount,
+            // The validated rows, for the reason `specialPurposeRanges` carries
+            // the normalized rows: a caller handing these back to the classifier
+            // is passing data that has already been through every check above.
+            globalUnicastAllocations: allocationTable.rows,
             hostClasses,
             specialPurposeRanges: table.rows,
             fetchLimits: fetchLimits.value,
@@ -2778,6 +3394,20 @@ export const evaluateEvidenceRedirect = (
 
     if (typeof location !== 'string' || location.trim() === '') {
         return rejectUrl('unparseable_url', 'the redirect target is empty');
+    }
+
+    // The raw `Location` is the only place a hop's userinfo is still visible.
+    // Resolving it against the current URL normalizes an empty userinfo
+    // component away — `//@host/x` resolves to `https://host/x` — so by the
+    // time the absolute href reaches {@link parseEvidenceUrl} there is nothing
+    // left to refuse. Scanning the header text is what keeps the redirect path
+    // held to the same unconditional rule as the first URL.
+    //
+    // It runs ahead of resolution deliberately, which means a hop that is both
+    // off-scheme and carries userinfo is reported as userinfo: the stronger
+    // statement about a target nobody should follow either way.
+    if (rawUserinfoInAuthority(location)) {
+        return rejectUrl('credentials_present', 'the URL carries userinfo');
     }
 
     let absolute: string;

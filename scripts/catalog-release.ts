@@ -36,6 +36,15 @@
 // components.jsonl is therefore a PROVEN consequence of publishing no
 // ingredient-derived food, and never an unexplained blank.
 //
+// The same invariant is asserted in the other direction, because both halves
+// are needed for the member to mean anything: a published row that CARRIES
+// component rows while declaring any other provenance states two incompatible
+// things about where its nutrition came from, and is refused with its offenders
+// named. Publishing it would put a release into review whose parent scalars
+// nothing has compared with its own composition — which is exactly what
+// catalog-load.ts then refuses (`parent_provenance_disagrees`), so the release
+// would be unloadable everywhere.
+//
 // WHAT THE EXPORTED BYTES ARE A SNAPSHOT OF. The published graph and the
 // pipeline run ledger are read in ONE Repeatable Read transaction, so the
 // manifest's counts and the prerequisite-order check describe the same database
@@ -49,7 +58,24 @@
 // A RELEASE IS REFUSED RATHER THAN SHIPPED INCOMPLETE. Every published food
 // must carry a validation record — that record is the machine-readable
 // evidence the feature requires — so a published row without one raises
-// ReleaseIntegrityError and nothing is written. The per-category coverage
+// ReleaseIntegrityError and nothing is written. The record also has to BE
+// evidence: `assessIdentityEvidence` (scripts/lib/catalogEvidence.ts, the rule
+// the import, validation and load stages apply to the same records) is run over
+// each published row's identity evidence as it is emitted, and a record missing
+// an observed 2xx status, a body digest, a matched snippet, a fetched-at or —
+// for a USDA row — its cache key and per-food digest refuses the export the
+// same way. This stage additionally RESOLVES what a USDA record's digests stand
+// for, which no other stage can: `assessSourceCacheBinding` reads the
+// `usda_api_cache` payload the record cites, recomputes both digests from it
+// and requires the record it hashed to belong to this food's `usda_fdc_id`, so
+// a well-formed digest of nothing is refused here or nowhere. The import stage already
+// quarantines exactly that row (AAP §0.3.2, §0.7.3), and this is the last point
+// at which the set being shipped is the set being examined, so a release can
+// never again freeze rows the pipeline itself declares unpublishable behind the
+// manifest's digests. The manifest's `evidence` block states the verdict —
+// published rows per identity source, the observed status range and the gap
+// histogram — so the property is readable without streaming 56 MB of records,
+// and catalog-load.ts cross-checks it. The per-category coverage
 // shortfall is reported exactly, never rounded and never omitted: a shortfall
 // is an unmet requirement, and a release that hides one is worse than a
 // release that states it.
@@ -58,6 +84,30 @@
 // release directory is a reviewed artefact: writing over one silently would
 // replace a checksummed release that another environment may already have
 // loaded. An existing directory is refused unless the operator passes --force.
+//
+// WHERE THE BYTES LIVE BEFORE THEY ARE A RELEASE, AND WHY THAT PATH IS NOT
+// GUESSABLE. --out accepts any directory, so the parent the six members are
+// staged in may be one another local principal can write names into. Every
+// member is therefore written into a staging directory this run CREATES: its
+// name carries 16 hex characters from the CSPRNG, it is created with a
+// non-recursive mkdir under a parent held to lib/manifest.ts's
+// `assertSafeArtifactParent`, and an entry already at that name — a symbolic
+// link most of all — fails the create instead of being adopted and written
+// through. Nothing is removed at a predictable name before the create, because
+// there is no longer a predictable name to remove. Member and manifest writes
+// are exclusive no-follow opens for the same reason.
+//
+// THE PATH IS PHYSICAL AND ITS IDENTITY IS RE-ESTABLISHED, NOT ASSUMED. Both
+// the repository's releases tree and an --out root are resolved through every
+// symbolic link on them once, in `resolveReleaseDir`, so no ancestor link
+// survives into the paths the guards below are applied to. The staging
+// directory's dev/ino identity is then captured when it is created and
+// re-verified immediately before EVERY path-based member operation — each
+// member open, each read-back, the manifest write — and again immediately
+// before the rename that publishes it. O_NOFOLLOW settles only a member's own
+// last component; only those re-checks settle the directory the member name is
+// resolved through, and they are what makes the directory that becomes the
+// release the one this run exported into.
 //
 // The two guard imports are ordered and load-bearing: Rule
 // backend-architecture §10's IPv4-first DNS ordering, then dbGuard's
@@ -69,15 +119,21 @@ import './lib/dbGuard';
 import fs from 'fs';
 import path from 'path';
 
-import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
-import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
-import type { LogFields, LogLevel } from './lib/logger';
+import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
+import { createFatalLogger, createLogger, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import type { LogFields, LogLevel, SafeErrorFields } from './lib/logger';
 import {
     ManifestError,
     assertReleaseVersion,
+    assertSafeArtifactParent,
     assertSafePathSegment,
+    createExclusiveDirectory,
     loadCoveragePlan,
+    openArtifactForWriteSync,
+    physicalPathIdentity,
+    readArtifactFileNoFollow,
     releaseDir,
+    unguessableSuffix,
 } from './lib/manifest';
 import type {
     CatalogReleaseManifest,
@@ -87,19 +143,33 @@ import type {
 } from './lib/manifest';
 import { ModelBudgetError } from './lib/budget';
 import { RateLimitConfigError } from './lib/rateLimiter';
-import {
-    CheckpointError,
-    GRAPH_MUTATING_RUN_KINDS,
-    VALIDATION_SCOPE_SEPARATOR,
-    canonicalValidationRunKey,
-    catalogInputIdentity,
-    isRestrictedValidationRunKey,
-    validationRunKeyInputPart,
-    validationRunKeyNamesInput,
-    withCatalogStageLock,
-} from './lib/checkpoint';
+import { CheckpointError, GRAPH_MUTATING_RUN_KINDS, VALIDATION_SCOPE_SEPARATOR, canonicalValidationRunKey, catalogInputIdentity, checkpointErrorFields, isRestrictedValidationRunKey, validationRunKeyInputPart, validationRunKeyNamesInput, withCatalogStageLock } from './lib/checkpoint';
 import type { CatalogRunKind } from './lib/checkpoint';
 import type { ScriptLogger } from './lib/logger';
+// The publication floor for identity evidence, imported rather than restated:
+// scripts/lib/catalogEvidence.ts is the one place the rule lives, so the import
+// stage, validation, this exporter and catalog-load.ts cannot come to disagree
+// about what a publishable retrieval record states. It is pure and reaches no
+// client, no filesystem and no clock, so importing it costs this entry point
+// nothing at module load.
+//
+// `COMPONENT_DERIVED_PROVENANCE` arrives from the same module and for the same
+// reason: it is `deriveComponentNutrition`'s own output value, and the rule
+// that a composition-bearing row must claim it is one this exporter, the
+// validator and the loader all apply. A string literal here would be a fourth
+// copy of the same statement.
+import {
+    COMPONENT_DERIVED_PROVENANCE,
+    assessIdentityEvidence,
+    assessSourceCacheBinding,
+    cacheBindingGapCodes,
+    cacheBindingRequired,
+    describeCacheBindingGaps,
+    describeEvidenceGaps,
+    evidenceGapCodes,
+    identityEvidenceSourceCacheKey,
+} from './lib/catalogEvidence';
+import type { EvidenceGapCode, SourceCacheRow } from './lib/catalogEvidence';
 import { assessComponentCoverage, computeCoverageShortfall } from '../src/services/catalog.logic';
 import crypto from 'crypto';
 
@@ -160,7 +230,9 @@ export interface PrerequisiteGap {
 const HELP_FLAGS: readonly string[] = ['--help', '-h'];
 
 // dbGuard's flag, not this parser's: skipped with its value, never rejected.
-// This stage's policy is `any_recognised`, so the flag changes nothing here —
+// This stage's policy is `development_or_test` — it mutates, so it runs only
+// against a database whose own name says development or a `_test` one, and
+// there is no confirmation door for it to open. The flag changes nothing here;
 // it is tolerated so an operator running the whole pipeline with one command
 // line still gets this stage's usage rather than a parse error.
 const CONFIRM_TARGET_FLAG = '--confirm-target';
@@ -203,6 +275,40 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         }
         index += 1;
         return next;
+    };
+
+    /**
+     * The reader for a switch that takes no value: the bare token turns it on
+     * and there is no spelling that turns it off.
+     *
+     * An inline value is REFUSED rather than ignored. `--force=false` reads to
+     * an operator as a request NOT to overwrite, and honouring it as the
+     * opposite is how a reviewed, checksummed release directory that other
+     * environments load gets replaced by a command line that asked for the
+     * safe thing — so is `--force=0`, and so is a trailing `=`. There is no
+     * value that could be accepted here either: reading `=true` would make the
+     * grammar look like it has an off switch when `=false` is exactly what
+     * cannot be honoured.
+     *
+     * A repeat is refused for the reason the release id's repeat is: a switch
+     * written twice is not a command line the operator meant to write, and
+     * this one authorizes a destructive overwrite. `alreadyGiven` is returned
+     * unchanged on both refusals, so a rejected token never leaves the switch
+     * enabled; the accumulated error makes the whole parse a refusal anyway.
+     */
+    const takeSwitch = (flag: string, inlineValue: string | null, alreadyGiven: boolean): boolean => {
+        if (inlineValue !== null) {
+            errors.push({
+                flag,
+                message: `${flag} takes no value, and ${flag}=false does not turn it off; omit ${flag} to leave it off`,
+            });
+            return alreadyGiven;
+        }
+        if (alreadyGiven) {
+            errors.push({ flag, message: `${flag} was given more than once; it takes no value, so pass it once or not at all` });
+            return alreadyGiven;
+        }
+        return true;
     };
 
     while (index < argv.length) {
@@ -256,7 +362,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         }
 
         if (flag === '--force') {
-            force = true;
+            force = takeSwitch(flag, inlineValue, force);
             continue;
         }
 
@@ -314,7 +420,8 @@ export const describeUsage = (): string =>
         '                   every digest are identical either way.',
         '  --force          Overwrite an existing release directory. Default: off, so',
         '                   an existing reviewed release is refused rather than',
-        '                   replaced.',
+        '                   replaced. Takes no value: --force=false is refused rather',
+        '                   than read as off — omit the flag to leave it off.',
         '  --help, -h       Print this usage block and exit 0.',
         '',
         'Inputs read:',
@@ -372,12 +479,43 @@ const directoryExistsOnDisk = (absolutePath: string): boolean => {
  * safe segment in both. An override is a choice about location, never a way
  * around containment — `--out /tmp --release ../../etc` must not resolve
  * anywhere but inside `/tmp`.
+ *
+ * RESOLVED PHYSICALLY, NOT LEXICALLY, and that is the difference between a
+ * path this stage can reason about and one it cannot. `path.resolve` collapses
+ * `.` and `..` and nothing else, so a symbolic link ANYWHERE above the release
+ * — `--out /srv/link-to-releases`, or a linked directory halfway up the
+ * repository's own tree — survived into every later path operation: the
+ * staging directory this stage creates is a sibling of this path, and
+ * `assertSafeArtifactParent` reads the immediate parent with `lstat`, which
+ * says nothing about an ancestor above it. `physicalPathIdentity` resolves
+ * every link on the chain ONCE, here, so the directory that is created, the
+ * parent that is held to the safe-parent rule, the staging directory whose
+ * `(dev, ino)` is captured and the path the release is renamed into are all
+ * spellings of one physical place.
+ *
+ * Resolving the chain does not freeze it — a link above the release can be
+ * re-pointed after this call, which is why the parent assertion, the exclusive
+ * create and the `(dev, ino)` re-checks in `runReleaseStage` and
+ * `publishRelease` all exist. What it removes is the case where those three
+ * guards are applied to a path whose ancestors were never resolved at all.
+ *
+ * THE RELEASE ID'S OWN COMPONENT IS LEFT AS IT WAS SPELLED in both branches.
+ * Only the ancestors are resolved, because an entry AT the release id is
+ * something this stage must DECIDE about rather than follow: publication
+ * refuses it without `--force` and moves it aside under a `.superseded-` name
+ * with it, which is what leaves an operator a link to look at. Resolving it
+ * would instead publish straight through it, into whatever it points at.
  */
 export const resolveReleaseDir = (outRoot: string | null): ((release: string) => string) =>
     outRoot === null
-        ? releaseDir
+        ? (release: string): string => {
+              // `releaseDir` validates the id and proves containment inside the
+              // repository's data root; only its parent chain is resolved here.
+              const canonical = releaseDir(release);
+              return path.join(physicalPathIdentity(path.dirname(canonical)), path.basename(canonical));
+          }
         : (release: string): string =>
-              path.join(path.resolve(outRoot), assertSafePathSegment(release, 'release id'));
+              path.join(physicalPathIdentity(outRoot), assertSafePathSegment(release, 'release id'));
 
 const defaultPreflightDeps = (
     release: string,
@@ -406,13 +544,17 @@ export const preflight = (deps: ReleasePreflightDeps): readonly PrerequisiteGap[
     try {
         deps.assertReleaseVersion(deps.release);
     } catch (error) {
-        if (error instanceof ManifestError) {
+        if (isThrownInstanceOf(error, ManifestError)) {
             releaseValid = false;
             gaps.push({
                 code: 'release_id_invalid',
                 requirement: 'The --release value must be "v" followed by digits, and a single path segment',
                 remedy: 'Pass a release id such as --release v1.',
-                detail: `${error.code}: ${error.message}`,
+                // Closed code only, never the sentence: a ManifestError message can carry
+                // an absolute checkout path (manifest.ts `repo_root_not_found`) or a foreign
+                // JSON parser message (`invalid_merged_report`), and `requirement` and
+                // `remedy` beside it already carry everything an operator acts on.
+                detail: error.code,
             });
         } else {
             throw error;
@@ -436,13 +578,17 @@ export const preflight = (deps: ReleasePreflightDeps): readonly PrerequisiteGap[
     try {
         deps.loadCoveragePlan();
     } catch (error) {
-        if (error instanceof ManifestError) {
+        if (isThrownInstanceOf(error, ManifestError)) {
             gaps.push({
                 code: 'coverage_plan_unavailable',
                 requirement:
                     'data/meal-planning/coverage-plan.v1.json must load and declare coveragePlanVersion v1: the release manifest records the plan version it was produced against and its per-category coverage',
                 remedy: 'Add the 21-category coverage plan at data/meal-planning/coverage-plan.v1.json (AAP §0.7.1 Group 3).',
-                detail: `${error.code}: ${error.message}`,
+                // Closed code only, never the sentence: a ManifestError message can carry
+                // an absolute checkout path (manifest.ts `repo_root_not_found`) or a foreign
+                // JSON parser message (`invalid_merged_report`), and `requirement` and
+                // `remedy` beside it already carry everything an operator acts on.
+                detail: error.code,
             });
         } else {
             throw error;
@@ -591,6 +737,21 @@ export interface ReleaseFoodRow {
  */
 export interface ReleaseDb {
     catalog_foods: { findMany(args: unknown): Promise<ReleaseFoodRow[]> };
+    /**
+     * The recorded USDA responses a published row's evidence digests were taken
+     * over, read so the export can RESOLVE them instead of trusting their
+     * shape (see THE SOURCE CACHE IS RESOLVED, NOT ASSUMED in the walk).
+     *
+     * Read-only, like every other member here except the ledger's `create`: a
+     * release reads the cache and never writes it. It carries no `user_id`
+     * either — `usda_api_cache` is a vendor response cache shared by the whole
+     * installation, so the paragraph above applies to it unchanged.
+     *
+     * `findMany` rather than `findUnique` per row: one batch response evidences
+     * up to twenty foods, so the keys of a page are looked up in chunks and a
+     * payload is read once for every row citing it.
+     */
+    usda_api_cache: { findMany(args: unknown): Promise<SourceCacheRow[]> };
     catalog_import_runs: {
         create(args: unknown): Promise<{ id: string }>;
         /**
@@ -655,6 +816,32 @@ export interface ReleaseFileWriter {
 }
 
 /**
+ * Which directory a path named, as the filesystem identifies one.
+ *
+ * A path is a name and names can be re-pointed; `(dev, ino)` is the directory
+ * itself. The pair is what lets this stage state that the directory it is
+ * about to publish is the one it exported into, rather than restating that the
+ * same string is still spelled the same way — which a swapped symlink or a
+ * replaced directory would also satisfy.
+ */
+export interface ReleaseDirectoryIdentity {
+    readonly dev: number;
+    readonly ino: number;
+}
+
+/**
+ * Whether two readings name one directory.
+ *
+ * `null` never matches anything, including another `null`: an unreadable path
+ * and an absent one are both "this is not the directory I identified", which is
+ * the answer that makes a caller refuse rather than proceed on an unknown.
+ */
+export const sameDirectoryIdentity = (
+    left: ReleaseDirectoryIdentity | null,
+    right: ReleaseDirectoryIdentity | null,
+): boolean => left !== null && right !== null && left.dev === right.dev && left.ino === right.ino;
+
+/**
  * Every filesystem effect this stage has, in one injected place.
  *
  * The export's four file operations were already deps; publication's were not —
@@ -669,6 +856,35 @@ export interface ReleaseFileSystem {
     readonly writeFile: (absolutePath: string, contents: string) => void;
     readonly readFileBytes: (absolutePath: string) => Buffer;
     readonly ensureDir: (absolutePath: string) => void;
+    /**
+     * Creates the LAST component of this path and nothing else at that name:
+     * an entry already there, of any kind including a symbolic link, is a
+     * refusal rather than a directory to adopt. The primitive the staging
+     * directory is created with, and the reason a pre-placed name cannot
+     * redirect a member write.
+     */
+    readonly createDirectoryExclusive: (absolutePath: string) => void;
+    /**
+     * The entry names directly inside this directory, in no promised order.
+     * An absent directory is an empty listing rather than an error: the sweep
+     * that reads it runs wherever a release is being cut, including the first
+     * time that parent is used.
+     */
+    readonly listDirectoryNames: (absolutePath: string) => readonly string[];
+    /**
+     * The identity of the REAL DIRECTORY at this path, or `null` when the path
+     * does not name one — a symbolic link (however it resolves), a file, or
+     * nothing at all. Never follows the last component, so what it answers
+     * about is the entry itself.
+     */
+    readonly directoryIdentity: (absolutePath: string) => ReleaseDirectoryIdentity | null;
+    /**
+     * Refuses unless the PARENT of this path is a real directory that no other
+     * local principal can plant a name in. The rule itself is
+     * lib/manifest.ts's `assertSafeArtifactParent`, so every publishing stage
+     * holds its output to one definition of a safe parent.
+     */
+    readonly assertSafeParent: (absolutePath: string) => void;
     /** Recursive, and absent is not an error: it is what discards staging. */
     readonly removeDir: (absolutePath: string) => void;
     readonly directoryExists: (absolutePath: string) => boolean;
@@ -704,6 +920,42 @@ export interface RunReleaseDeps {
      * descriptor-backed writer and never holds a member in memory.
      */
     readonly openWriter?: (absolutePath: string) => ReleaseFileWriter;
+    /**
+     * Refuses unless `releaseDir`'s directory is still the same directory it
+     * was when the caller identified it. Called by the export immediately
+     * before EVERY path-based operation on a member — the `ensureDir`, each
+     * member open, each read-back, and the manifest write — because a path is
+     * re-resolved from its root on every one of them.
+     *
+     * WHY THE EXPORT CALLS THIS AT ALL, given that every member open is
+     * already exclusive and `O_NOFOLLOW`. Those flags settle the member's LAST
+     * component only. Everything above it — the staging directory itself — is
+     * traversed by the kernel on each open, so a staging directory replaced by
+     * a symbolic link while the export was awaiting the database or a page of
+     * rows would send `path.join(directory, 'foods.jsonl')` through the
+     * replacement, and the member bytes with it. Publication's own `(dev, ino)`
+     * check would then refuse to publish, correctly — but the writes would
+     * already have happened, which is the whole of what the staging TOCTOU
+     * finding says must not be possible.
+     *
+     * Node exposes no descriptor-relative `openat`/`unlinkat`, so a member
+     * cannot be opened RELATIVE to a directory handle this run holds: there is
+     * no instrument here that removes the window between resolving a path and
+     * using it. Re-validating the directory's identity immediately before each
+     * path use is the available one, and it narrows that window from "the whole
+     * export" — minutes, on a full catalog — to the interval between one
+     * `lstat` and the syscall on the next line. The check is exact rather than
+     * probabilistic about what it covers: any replacement that happened before
+     * it is refused, and the residual is stated here rather than implied away.
+     *
+     * OPTIONAL, for the same reason `openWriter` is: the export can be driven
+     * against a directory the caller named outright, with no staged identity to
+     * compare — the prerequisite-pairing suites do exactly that — and there is
+     * nothing for this seam to assert in that case. `runReleaseStage`, which is
+     * the only caller that stages, always supplies it, so every release cut by
+     * `main()` is guarded on every member operation.
+     */
+    readonly assertReleaseDirectoryUnchanged?: () => void;
     /**
      * How many published foods are read per page. Optional; the default below
      * is what production uses. Present so a test can force several pages over a
@@ -888,9 +1140,20 @@ const bufferedWriter = (
  * complete one would truncate a member and — because the digest is measured
  * from the file afterwards — produce a manifest that verifies a truncated
  * release perfectly.
+ *
+ * THE OPEN IS EXCLUSIVE AND DOES NOT FOLLOW A LINK. `openSync(path, 'w')`
+ * follows a symbolic link at the member's own name and truncates whatever it
+ * points at, so a link pre-placed inside the staging directory would send a
+ * member — `manifest.json` included — anywhere the attacker chose, written with
+ * this process's privileges. `openArtifactForWriteSync` is
+ * `O_WRONLY|O_CREAT|O_EXCL` plus `O_NOFOLLOW`, which is the kernel's atomic
+ * "create this name or fail". Exclusive rather than truncating is correct here
+ * and not merely stricter: every member is created exactly once, inside a
+ * directory this run created for it, so an existing name at that path is
+ * someone else's doing.
  */
 const descriptorWriter = (absolutePath: string): ReleaseFileWriter => {
-    const handle = fs.openSync(absolutePath, 'w');
+    const handle = openArtifactForWriteSync(absolutePath);
     return {
         write: (chunk: string): void => {
             const bytes = Buffer.from(chunk, 'utf-8');
@@ -951,6 +1214,404 @@ class OffenderTally {
         return `${this.named.join(', ')}${this.count > this.named.length ? ', …' : ''}`;
     }
 }
+
+/* ---------------------------------------------------------------------------
+ * The identity evidence a release ships, measured while it is walked.
+ *
+ * WHY THE MANIFEST STATES THIS AT ALL. `validation-records.jsonl` is 56 MB of
+ * JSONL for the committed release, so "does every published row carry a
+ * retrieval record with an observed status" is a question no reviewer answers by
+ * reading the artefact — and the one time nobody answered it, a release of
+ * 11,046 rows whose mandatory `http_status` was null was frozen behind the
+ * manifest's digests and shipped as accepted evidence. The block below is that
+ * property written down: the published rows per identity source, the range of
+ * statuses actually observed, and the histogram of the gaps the floor found.
+ *
+ * EVERY NUMBER IS MEASURED HERE OR IT IS NOT WRITTEN, exactly as
+ * `model_versions` is (see `assertMeasuredModelVersions`): each one is counted
+ * from the rows this walk emitted, never from the coverage plan, the previous
+ * manifest or the row counts. The histogram is necessarily empty in a release
+ * that exists, because the refusal below stops an export that found any gap —
+ * which is the point: `gap_codes: []` is a measured statement that the floor
+ * was applied and found nothing, and it is what catalog-load.ts cross-checks its
+ * own streamed measurement against.
+ * ------------------------------------------------------------------------- */
+
+/** What the release carries for one `identity_source`, as the manifest states it. */
+export interface ReleaseEvidenceIdentitySource {
+    readonly identity_source: string;
+    readonly published_foods: number;
+    /** Published foods of this source whose validation record was assessed. */
+    readonly assessed_records: number;
+    /** The observed upstream statuses, or `null` when no record stated one. */
+    readonly observed_status_min: number | null;
+    readonly observed_status_max: number | null;
+}
+
+/**
+ * The exporter's attestation that it RESOLVED the source cache behind every
+ * published row that cites one.
+ *
+ * WHY THE MANIFEST HAS TO CARRY THIS AND NOT ONLY THE GAP HISTOGRAM. The
+ * resolution is the one evidence check that cannot be re-made from the release:
+ * `usda_api_cache` is a database table and no member carries it, so
+ * `catalog-load.ts` can re-assess every record's SHAPE and nothing about
+ * whether its digests stand for anything. This block is therefore the only
+ * thing a reader — or the loader — has to go on, and it says how many rows
+ * required resolution and how many were actually resolved, measured while the
+ * rows were walked.
+ *
+ * `required_records` is a property of these bytes (published rows whose
+ * identity source binds a cache key), so the loader re-measures it and refuses
+ * a mismatch. `resolved_records` is not measurable from the release at all; it
+ * is an attestation, and the loader can only check it covers what it measures.
+ * Both are stated rather than one, because "9,422 of 9,422" and "9,422" are
+ * different claims and only the first is falsifiable.
+ */
+export interface ReleaseSourceCacheResolution {
+    /** Published rows whose identity source binds a `usda_api_cache` payload. */
+    readonly required_records: number;
+    /** Of those, the rows whose cache row was found and whose two digests recomputed equal. */
+    readonly resolved_records: number;
+    /** Distinct `usda_api_cache` rows the resolution read: one batch response evidences up to twenty foods. */
+    readonly cache_rows_read: number;
+}
+
+/** The manifest's `evidence` block: the evidence floor's verdict over the release. */
+export interface ReleaseEvidenceSummary {
+    readonly published_foods: number;
+    readonly assessed_records: number;
+    readonly complete_records: number;
+    readonly observed_status_min: number | null;
+    readonly observed_status_max: number | null;
+    /** Sorted by `identity_source`, so the bytes are reproducible. */
+    readonly identity_sources: readonly ReleaseEvidenceIdentitySource[];
+    /** Foods per gap code, sorted by code. Empty for a release that was cut. */
+    readonly gap_codes: readonly { readonly code: EvidenceGapCode; readonly foods: number }[];
+    /** What the export resolved against `usda_api_cache` — see the type's own contract. */
+    readonly source_cache_resolution: ReleaseSourceCacheResolution;
+}
+
+/**
+ * The manifest this stage writes.
+ *
+ * `CatalogReleaseManifest` in scripts/lib/manifest.ts is the shape every READER
+ * is held to — the loader's preflight reads `files`, `counts` and the release
+ * identity from it — and it is deliberately left untouched: the `evidence`
+ * block is additive, a reviewed release cut before it existed must stay
+ * loadable, and a reader that does not know the block simply does not read it.
+ * Declared as an intersection here so the writer is type-checked against both
+ * halves and every existing field stays byte-identical in shape.
+ */
+/**
+ * Whether this release meets the catalog-size requirement, stated as a verdict
+ * rather than left to be computed.
+ *
+ * WHY IT IS HERE AND NOT ONLY IN THE REPORTS. `coverage` already carries every
+ * number a reader needs — the published total, the plan total, the aggregate
+ * shortfall and the per-category gaps — and `validation-report.json` carries an
+ * explicit `requirement.requirementMet`. But the manifest is the file that
+ * TRAVELS WITH THE BYTES: an operator handed a release directory has this and
+ * the five members, and nothing else. Leaving "does this meet the requirement"
+ * as an arithmetic exercise over two totals is how a shortfall gets loaded and
+ * enabled by someone who never opened the reports. So the export writes the
+ * verdict down.
+ *
+ * IT IS A STATEMENT, NOT A GATE. The export still produces a release while the
+ * requirement is unmet, deliberately: AAP §0.7.5 puts the fail-closed decision
+ * at ENABLEMENT — the operator verifies `GET /catalog/status` shows the
+ * required published count before setting `MEAL_PLANNING_ENABLED=true` — and
+ * §0.7.3 makes the shortfall a reporting obligation on this stage rather than a
+ * refusal. A release that cannot be cut also cannot be reviewed, loaded into a
+ * development database, or benchmarked, and the evidence integrity this stage
+ * does gate on would become unverifiable. What this block does is make the
+ * unmet state impossible to miss at the point of use.
+ */
+export interface ReleaseAcceptanceVerdict {
+    /** True only when the published total reaches the requirement AND no category is short. */
+    readonly requirement_met: boolean;
+    readonly required_published_items: number;
+    readonly published_items: number;
+    readonly shortfall_against_requirement: number;
+    readonly categories_below_target: number;
+    readonly per_category_shortfall_total: number;
+    /** Plain prose for an operator reading only this file. */
+    readonly statement: string;
+}
+
+/**
+ * The published-item count AAP §0.1.1 requires of the catalog.
+ *
+ * Declared here rather than imported because `catalog-report.ts` holds its copy
+ * as a private module constant, and this stage must not depend on that CLI to
+ * write its own manifest. The two are the same number by the same requirement;
+ * `validation-report.json` records it as `requirement.requiredPublishedItems`,
+ * so a disagreement between the two artefacts is visible in the committed
+ * evidence rather than hidden.
+ */
+const REQUIRED_PUBLISHED_ITEMS = 10000;
+
+/** What the export measured about coverage, as the verdict needs it. */
+export interface ReleaseAcceptanceInput {
+    /** Published rows actually emitted into foods.jsonl. */
+    readonly publishedItems: number;
+    /** How many categories the coverage plan declares. */
+    readonly categoryCount: number;
+    /** How many of those are below their own published target. */
+    readonly categoriesBelowTarget: number;
+    /** The sum of those categories' shortfalls. */
+    readonly perCategoryShortfallTotal: number;
+}
+
+/**
+ * The acceptance requirement, answered.
+ *
+ * Pure, and exported so that every quadrant of the two independent conditions
+ * is provable without an export of ten thousand rows: the aggregate count can
+ * be met or short, and the per-category picture can be complete or short, and
+ * the three combinations that are not "both met" all have to read as unmet. A
+ * surplus in one category cannot substitute for a gap in another, so this is an
+ * AND and not a sum.
+ *
+ * It states a verdict and refuses nothing — see ReleaseAcceptanceVerdict for
+ * why that decision belongs at enablement rather than here.
+ */
+export const releaseAcceptanceVerdict = (input: ReleaseAcceptanceInput): ReleaseAcceptanceVerdict => {
+    const shortfallAgainstRequirement = Math.max(0, REQUIRED_PUBLISHED_ITEMS - input.publishedItems);
+    const requirementMet = shortfallAgainstRequirement === 0 && input.categoriesBelowTarget === 0;
+    return {
+        requirement_met: requirementMet,
+        required_published_items: REQUIRED_PUBLISHED_ITEMS,
+        published_items: input.publishedItems,
+        shortfall_against_requirement: shortfallAgainstRequirement,
+        categories_below_target: input.categoriesBelowTarget,
+        per_category_shortfall_total: input.perCategoryShortfallTotal,
+        statement: requirementMet
+            ? `This release publishes ${input.publishedItems} items against the required ` +
+              `${REQUIRED_PUBLISHED_ITEMS}, and all ${input.categoryCount} categories of the coverage plan meet ` +
+              'their own published targets.'
+            : 'THIS RELEASE DOES NOT MEET THE CATALOG REQUIREMENT. It publishes ' +
+              `${input.publishedItems} items against the required ${REQUIRED_PUBLISHED_ITEMS} ` +
+              `(${shortfallAgainstRequirement} short), and ${input.categoriesBelowTarget} of ` +
+              `${input.categoryCount} categories are below their own published target by ` +
+              `${input.perCategoryShortfallTotal} items in total; the per-category gaps are in ` +
+              'coverage.by_category. It is exported so that it can be reviewed, loaded into a development ' +
+              'database and benchmarked, and its evidence floor is enforced either way; it is not evidence that ' +
+              'the catalog requirement is met, and the feature flag must not be enabled against it (AAP §0.7.5 ' +
+              'verifies the published count before enablement).',
+    };
+};
+
+export type CatalogReleaseManifestWithEvidence = CatalogReleaseManifest & {
+    readonly evidence: ReleaseEvidenceSummary;
+    readonly acceptance: ReleaseAcceptanceVerdict;
+};
+
+/**
+ * The evidence facts of the walk, accumulated one published row at a time.
+ *
+ * Bounded by the number of distinct identity sources (two today) and gap codes
+ * (eleven), never by the catalog: a release of 9,422 rows adds nothing to this
+ * object beyond a few counters, which is what lets the measurement ride along
+ * with the streamed export rather than needing a second pass over 59 MB.
+ */
+class EvidenceTally {
+    private readonly bySource = new Map<
+        string,
+        { publishedFoods: number; assessedRecords: number; statusMin: number | null; statusMax: number | null }
+    >();
+
+    private readonly gapFoods = new Map<EvidenceGapCode, number>();
+
+    private publishedFoods = 0;
+
+    private assessedRecords = 0;
+
+    private completeRecords = 0;
+
+    /**
+     * Counts one published row. `assessment` is `null` for a row whose
+     * validation record is absent altogether — that row is refused by
+     * `withoutValidationRecord`, and counting it here as a published food of its
+     * source without an assessed record keeps the two numbers honest rather
+     * than making the absent record look like a complete one.
+     */
+    public add(identitySource: string, assessment: ReturnType<typeof assessIdentityEvidence> | null): void {
+        this.publishedFoods += 1;
+        const source = this.bySource.get(identitySource) ?? {
+            publishedFoods: 0,
+            assessedRecords: 0,
+            statusMin: null,
+            statusMax: null,
+        };
+        source.publishedFoods += 1;
+
+        if (assessment !== null) {
+            this.assessedRecords += 1;
+            source.assessedRecords += 1;
+            if (assessment.complete) {
+                this.completeRecords += 1;
+            }
+            if (assessment.status !== null) {
+                source.statusMin = source.statusMin === null ? assessment.status : Math.min(source.statusMin, assessment.status);
+                source.statusMax = source.statusMax === null ? assessment.status : Math.max(source.statusMax, assessment.status);
+            }
+            // One food counts once per distinct code, so the histogram reads as
+            // "how many foods this gap held" rather than "how many fields".
+            for (const code of evidenceGapCodes(assessment)) {
+                this.gapFoods.set(code, (this.gapFoods.get(code) ?? 0) + 1);
+            }
+        }
+
+        this.bySource.set(identitySource, source);
+    }
+
+    public summarise(): ReleaseEvidenceSummary {
+        const identitySources = Array.from(this.bySource.entries())
+            .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0))
+            .map(([identitySource, measured]) => ({
+                identity_source: identitySource,
+                published_foods: measured.publishedFoods,
+                assessed_records: measured.assessedRecords,
+                observed_status_min: measured.statusMin,
+                observed_status_max: measured.statusMax,
+            }));
+
+        const statuses = identitySources
+            .flatMap((source) => [source.observed_status_min, source.observed_status_max])
+            .filter((status): status is number => status !== null);
+
+        return {
+            published_foods: this.publishedFoods,
+            assessed_records: this.assessedRecords,
+            complete_records: this.completeRecords,
+            observed_status_min: statuses.length === 0 ? null : Math.min(...statuses),
+            observed_status_max: statuses.length === 0 ? null : Math.max(...statuses),
+            identity_sources: identitySources,
+            gap_codes: Array.from(this.gapFoods.entries())
+                .sort((left, right) => (left[0] < right[0] ? -1 : 1))
+                .map(([code, foods]) => ({ code, foods })),
+            source_cache_resolution: {
+                required_records: this.cacheRequired,
+                resolved_records: this.cacheResolved,
+                cache_rows_read: this.cacheRowsRead.size,
+            },
+        };
+    }
+
+    /** One published row whose identity source binds a `usda_api_cache` payload. */
+    public addCacheRequired(): void {
+        this.cacheRequired += 1;
+    }
+
+    /** One such row whose payload was found and whose two digests recomputed equal. */
+    public addCacheResolved(cacheKey: string): void {
+        this.cacheResolved += 1;
+        this.cacheRowsRead.add(cacheKey);
+    }
+
+    private cacheRequired = 0;
+
+    private cacheResolved = 0;
+
+    /**
+     * The distinct cache rows behind the resolved records. A set, because a
+     * batch response evidences up to twenty foods and counting it once per food
+     * would make the manifest overstate how many vendor exchanges the release
+     * rests on. Bounded by the number of batches the import made (~471 for the
+     * committed release), which is the one thing here that grows with the
+     * catalog — a key string each, and the payloads themselves are never
+     * retained.
+     */
+    private readonly cacheRowsRead = new Set<string>();
+}
+
+/** One row awaiting cache resolution, as the walk collected it. */
+interface PendingCacheBinding {
+    readonly sourceKey: string;
+    readonly usdaFdcId: number | null;
+    /** The evidence as the EMITTED line carries it — the bytes the manifest will bind. */
+    readonly identityEvidence: unknown;
+    readonly cacheKey: string | null;
+}
+
+/**
+ * Distinct `usda_api_cache` keys per lookup.
+ *
+ * A payload is a whole `POST /foods` response — up to twenty full USDA records,
+ * tens of kilobytes each — so this is the one query in the stage whose result
+ * size is worth bounding explicitly: twenty keys is a few hundred records in
+ * flight, read and dropped before the next chunk, while one key per query would
+ * make ~471 round trips for the committed release and a whole page of keys at
+ * once would hold megabytes of vendor JSON for no gain.
+ */
+const SOURCE_CACHE_LOOKUP_CHUNK = 20;
+
+/**
+ * Resolves one page's worth of pending cache bindings and records the outcome.
+ *
+ * WHAT IT READS AND WHY ONCE PER KEY. The rows of a page routinely share a
+ * batch response — the import fetched twenty foods per call — so the keys are
+ * de-duplicated first and every row citing a payload is assessed against the
+ * one copy that was read. Nothing is retained after the chunk: the map is
+ * scoped to it, so the peak is a chunk of payloads rather than a page of them.
+ *
+ * The assessment itself is not made here: {@link assessSourceCacheBinding} owns
+ * the rule (the two digests, the status agreement and the record-belongs-to-
+ * this-food test), under unit test, so this function is the I/O recipe around
+ * it — which is the same division the evidence floor is applied under (Rule
+ * backend-architecture §1.2/§7).
+ */
+const resolvePendingCacheBindings = async (
+    tx: ReleaseDb,
+    pending: readonly PendingCacheBinding[],
+    sink: {
+        readonly tally: EvidenceTally;
+        readonly offenders: OffenderTally;
+        readonly firstOffender: { sourceKey: string; detail: string }[];
+    },
+): Promise<void> => {
+    if (pending.length === 0) {
+        return;
+    }
+
+    const keys = Array.from(
+        new Set(pending.map((entry) => entry.cacheKey).filter((key): key is string => key !== null)),
+    );
+
+    const rowsByKey = new Map<string, SourceCacheRow>();
+    for (let index = 0; index < keys.length; index += SOURCE_CACHE_LOOKUP_CHUNK) {
+        const chunk = keys.slice(index, index + SOURCE_CACHE_LOOKUP_CHUNK);
+        const rows = await tx.usda_api_cache.findMany({
+            where: { cache_key: { in: chunk } },
+            select: { cache_key: true, payload: true, http_status: true },
+        });
+        for (const row of rows) {
+            rowsByKey.set(row.cache_key, row);
+        }
+    }
+
+    for (const entry of pending) {
+        const assessment = assessSourceCacheBinding({
+            identityEvidence: entry.identityEvidence,
+            usdaFdcId: entry.usdaFdcId,
+            cacheRow: entry.cacheKey === null ? null : rowsByKey.get(entry.cacheKey) ?? null,
+        });
+
+        if (assessment.resolved && assessment.cacheKey !== null) {
+            sink.tally.addCacheResolved(assessment.cacheKey);
+            continue;
+        }
+
+        sink.offenders.add(`${entry.sourceKey} (${cacheBindingGapCodes(assessment).join(', ')})`);
+        if (sink.firstOffender.length === 0) {
+            sink.firstOffender.push({
+                sourceKey: entry.sourceKey,
+                detail: `${entry.sourceKey}: ${describeCacheBindingGaps(assessment)}`,
+            });
+        }
+    }
+};
 
 /**
  * The published graph and every child the release carries, in the order the
@@ -1108,6 +1769,11 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     const directory = deps.releaseDir(deps.release);
     const openWriter = deps.openWriter ?? ((absolutePath: string) => bufferedWriter(absolutePath, deps.writeFile));
     const pageSize = deps.pageSize ?? RELEASE_PAGE_SIZE;
+    // A caller that staged this directory supplies the check; one that named
+    // the directory outright has no identity to compare and supplies none. See
+    // `assertReleaseDirectoryUnchanged` on RunReleaseDeps for why the export
+    // asks before every path-based member operation rather than once.
+    const assertDirectoryUnchanged = deps.assertReleaseDirectoryUnchanged ?? ((): void => undefined);
 
     const rowCounts: Record<string, number> = {
         'foods.jsonl': 0,
@@ -1118,9 +1784,63 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     };
 
     const withoutValidationRecord = new OffenderTally();
+    /**
+     * Published rows whose validation record does not meet the identity-evidence
+     * floor — see the assessment in the walk. Each entry names the food and its
+     * gap codes, because the repair differs per code: a null status needs the
+     * retrieval made again, a missing digest needs the export that dropped it
+     * re-cut.
+     */
+    const withoutCompleteIdentityEvidence = new OffenderTally();
+    /**
+     * The first offender's key and the field-by-field sentence for its gaps,
+     * held as a one-entry list because the walk that fills it runs inside the
+     * transaction callback and a narrowed `let` read back out here is not
+     * something TypeScript's control-flow analysis can follow across that
+     * boundary. The key is carried separately from the tally's decorated
+     * entries so the refusal's `sourceKey` context is the food's own key, which
+     * is what a programmatic caller looks the row up by.
+     */
+    const firstEvidenceOffender: { readonly sourceKey: string; readonly detail: string }[] = [];
+    /**
+     * The first component-bearing row whose provenance denies it, held as a
+     * one-entry list for the same reason as `firstEvidenceOffender`: it is
+     * filled inside the transaction callback, and the refusal's `sourceKey`
+     * context has to be the food's own key rather than the tally's decorated
+     * entry, because that is what a programmatic caller looks the row up by.
+     */
+    const firstComponentProvenanceOffender: string[] = [];
+    /**
+     * Published rows whose evidence digests could not be RESOLVED against the
+     * `usda_api_cache` payload they cite — see THE SOURCE CACHE IS RESOLVED,
+     * NOT ASSUMED in the walk. Decorated with the binding gap codes, because
+     * the repair differs: an absent cache row needs the batch re-imported, a
+     * digest that does not recompute means the record does not describe the
+     * payload behind it.
+     */
+    const withoutResolvedSourceCache = new OffenderTally();
+    /** The first such row's key and its field-by-field sentence, held for the same reason. */
+    const firstCacheBindingOffender: { readonly sourceKey: string; readonly detail: string }[] = [];
+    /**
+     * The rows of the CURRENT page awaiting cache resolution, cleared at the end
+     * of every page. Bounded by one page (250 rows) times four small fields,
+     * never by the catalog, and it holds no payload: the payloads are fetched,
+     * assessed and dropped inside `resolvePendingCacheBindings`.
+     */
+    const pendingCacheBindings: PendingCacheBinding[] = [];
+    /** The evidence facts the manifest states, measured as the walk emits rows. */
+    const evidenceTally = new EvidenceTally();
     const withoutUsableDefaultPortion = new OffenderTally();
     /** Compositions naming a food this release does not export — see the walk. */
     const componentTargetOutsideRelease = new OffenderTally();
+    /**
+     * Published rows that CARRY a composition while claiming their nutrition
+     * came from somewhere else — see the refusal after the walk. Each entry
+     * names the provenance claimed and how many component rows contradict it,
+     * in the same decorated shape the evidence tally uses, because the repair
+     * depends on which of the two the row got wrong.
+     */
+    const componentBearingWithoutDerivedProvenance = new OffenderTally();
     /** Published AI-generated foods with no batch to attribute them to. */
     const withoutGenerationBatch = new OffenderTally();
     /**
@@ -1183,7 +1903,7 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     // straight to their member, so what this function keeps alive is one page of
     // rows (~1.5 MB) plus the small per-food tallies below — not the catalog.
     // Buffering instead means three copies of it at once: every Prisma row
-    // (11,046 parents, whose validation records are 50 MB of JSON as JS
+    // (9,422 parents, whose validation records are 59 MB of JSON as JS
     // objects), every mapped line, and every joined member string, the largest
     // of which the join transiently doubles. Measured on the committed v1
     // release, replacing the descriptor writers with the buffering fallback
@@ -1235,8 +1955,21 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                     throw new ReleaseIntegrityError(staleReason);
                 }
 
+                // The first path use of the run, and the first of the awaited
+                // window the ledger read above opened: the directory this is
+                // about to write into is re-established as the one the caller
+                // identified before `ensureDir` touches it, because
+                // `mkdir -p` over a symbolic link to a directory succeeds
+                // silently and would say nothing about what it adopted.
+                assertDirectoryUnchanged();
                 deps.ensureDir(directory);
                 for (const fileName of RELEASE_DATA_FILES) {
+                    // Per member, not once for the loop: each open resolves
+                    // `directory` again from the root, so each one needs the
+                    // directory to still be the identified one at the moment it
+                    // runs. The exclusive no-follow open settles only
+                    // `fileName` itself.
+                    assertDirectoryUnchanged();
                     writers[fileName] = openWriter(path.join(directory, fileName));
                 }
                 const emit = (fileName: string, line: Record<string, unknown>): void => {
@@ -1407,6 +2140,44 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                             emit('components.jsonl', line);
                         }
 
+                        // A COMPOSITION IS NOT SOMETHING A ROW MAY CARRY WHILE
+                        // DENYING IT.
+                        //
+                        // `deriveComponentNutrition` fixes the provenance of
+                        // anything derived from a composition to
+                        // `ingredient_derived` (src/services/catalog.logic.ts),
+                        // so a published row that emits component lines while
+                        // claiming `source_backed` or `ai_estimated` states two
+                        // incompatible things about where its numbers came
+                        // from: either the scalars are a source's statement and
+                        // the composition is not theirs, or the composition is
+                        // real and the provenance is wrong.
+                        //
+                        // WHY THE EXPORTER REFUSES IT AND NOT ONLY THE
+                        // VALIDATOR. It is the same argument the evidence floor
+                        // is exported with: validation judges the TABLE, and
+                        // between the two a row can be relabelled out of band,
+                        // restored by a `catalog:load` of an older release, or
+                        // published by a build that predates the rule — while
+                        // this walk is the last point at which the set being
+                        // shipped is the set being examined. Left unchecked, a
+                        // one-column edit produces a release whose parent
+                        // scalars nothing compares with its own components:
+                        // catalog-load.ts refuses exactly that
+                        // (`release_component_inconsistent`,
+                        // `parent_provenance_disagrees`), so a release carrying
+                        // it is one no environment can load — a refusal an
+                        // operator should get here, before the bytes are
+                        // reviewed, and not after the release is published.
+                        if (componentLines.length > 0 && row.nutrition_provenance !== COMPONENT_DERIVED_PROVENANCE) {
+                            componentBearingWithoutDerivedProvenance.add(
+                                `${row.source_key} (${row.nutrition_provenance}, ${componentLines.length} component row(s))`,
+                            );
+                            if (firstComponentProvenanceOffender.length === 0) {
+                                firstComponentProvenanceOffender.push(row.source_key);
+                            }
+                        }
+
                         componentFacts.push({
                             source_key: row.source_key,
                             nutrition_provenance: row.nutrition_provenance,
@@ -1423,10 +2194,116 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
                         const validation = toReleaseValidationLine(row);
                         if (validation === null) {
                             withoutValidationRecord.add(row.source_key);
+                            evidenceTally.add(row.identity_source, null);
                         } else {
                             emit('validation-records.jsonl', validation);
+
+                            // THE EVIDENCE FLOOR, APPLIED TO THE SET BEING
+                            // SHIPPED.
+                            //
+                            // The record is assessed against the fields a
+                            // publishable retrieval record states (AAP §0.3.2;
+                            // §0.7.3 classes missing identity evidence as a
+                            // quarantine-tier hold), under the row's own
+                            // identity source, because a USDA record must also
+                            // name the cache key and the per-food digest that
+                            // make one batch response evidence for THIS food.
+                            //
+                            // It is applied here because the exporter is the
+                            // last point at which the set being shipped is the
+                            // set being examined: after this walk the rows are
+                            // bytes behind a digest, and a reader of the
+                            // artefact can no longer ask the database anything.
+                            // A published row whose record is incomplete is
+                            // exactly what the import stage refuses to publish
+                            // — `importPublicationStatus` derives its
+                            // disposition from THIS predicate over the record
+                            // it is about to write — so a release that carried
+                            // one would ship rows the same pipeline declares
+                            // ineligible, and the manifest's digests would then
+                            // bind them as accepted evidence.
+                            //
+                            // Read off the LINE that was just emitted rather
+                            // than off the Prisma row: those are the bytes the
+                            // manifest's digest will bind and the loader will
+                            // read, so assessing anything else would be
+                            // checking a value the release does not carry.
+                            const assessment = assessIdentityEvidence(validation.identity_evidence, {
+                                identitySource: row.identity_source,
+                            });
+                            evidenceTally.add(row.identity_source, assessment);
+                            if (!assessment.complete) {
+                                withoutCompleteIdentityEvidence.add(
+                                    `${row.source_key} (${evidenceGapCodes(assessment).join(', ')})`,
+                                );
+                                if (firstEvidenceOffender.length === 0) {
+                                    // The full field-by-field sentence for ONE
+                                    // offender, so the refusal says which field
+                                    // of which record is missing and what it
+                                    // must carry. Naming every offender that
+                                    // way would put 56 MB of prose in an error.
+                                    firstEvidenceOffender.push({
+                                        sourceKey: row.source_key,
+                                        detail: `${row.source_key}: ${describeEvidenceGaps(assessment)}`,
+                                    });
+                                }
+                            }
+
+                            // THE SOURCE CACHE IS RESOLVED, NOT ASSUMED.
+                            //
+                            // The floor above checks that a USDA record STATES
+                            // a cache key and two 64-hex digests. That is a
+                            // statement about the record's shape, and a record
+                            // can satisfy it while standing for nothing: a key
+                            // no `usda_api_cache` row answers to, or sixty-four
+                            // hex characters that are not the digest of any
+                            // payload, ships exactly as cleanly as a real one.
+                            // The reason those fields are stored at all is that
+                            // a reader can look the payload up and recompute —
+                            // so this export does it, over every published USDA
+                            // row, while the cache is still reachable. After
+                            // this walk nothing can: `usda_api_cache` is a
+                            // table, no release member carries it, and
+                            // catalog-load.ts therefore has no way to perform
+                            // this check at all (see the manifest's
+                            // `source_cache_resolution`, which is what the
+                            // loader is left to enforce).
+                            //
+                            // Deferred to the end of the PAGE rather than done
+                            // per row: one batch response evidences up to
+                            // twenty foods, so the keys are looked up in chunks
+                            // and each payload is read once for every row
+                            // citing it.
+                            //
+                            // Skipped for a row whose structural assessment
+                            // already failed: it has been recorded above and
+                            // the export is refused for it either way, and
+                            // resolving a record with no cache key would add a
+                            // second description of one defect.
+                            if (cacheBindingRequired(row.identity_source) && assessment.complete) {
+                                evidenceTally.addCacheRequired();
+                                pendingCacheBindings.push({
+                                    sourceKey: row.source_key,
+                                    usdaFdcId: row.usda_fdc_id,
+                                    identityEvidence: validation.identity_evidence,
+                                    // Read through the shared reader, so the key
+                                    // this looks up is the key the assessment
+                                    // will read out of the same record.
+                                    cacheKey: identityEvidenceSourceCacheKey(validation.identity_evidence),
+                                });
+                            }
                         }
                     }
+
+                    // The page's cache bindings, resolved before the next page
+                    // is read so the payloads of one page are released before
+                    // the payloads of the next are fetched.
+                    await resolvePendingCacheBindings(tx, pendingCacheBindings, {
+                        tally: evidenceTally,
+                        offenders: withoutResolvedSourceCache,
+                        firstOffender: firstCacheBindingOffender,
+                    });
+                    pendingCacheBindings.length = 0;
 
                     cursor = page[page.length - 1].source_key;
                     if (page.length < pageSize) {
@@ -1461,6 +2338,76 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         throw new ReleaseIntegrityError(
             `${withoutValidationRecord.total} published food(s) carry no validation record, so the release would ship unevidenced rows: ${withoutValidationRecord.describe()}. Run catalog:validate before catalog:release.`,
             { file: 'validation-records.jsonl', sourceKey: withoutValidationRecord.first },
+        );
+    }
+
+    // AND THE RECORD IT CARRIES HAS TO BE EVIDENCE.
+    //
+    // A record that exists but states no observed status, no body digest or —
+    // for a USDA row — no cache key and no per-food digest is not evidence of
+    // the food: nobody can re-fetch the bytes it claims, and nothing ties one
+    // batch response to this row rather than to the twenty it carried. The
+    // import stage already refuses to PUBLISH such a row
+    // (`importPublicationStatus` quarantines a retrieval that carried no
+    // observed status, AAP §0.3.2; §0.7.3 makes missing identity evidence a
+    // quarantine-tier hold), so a release carrying one ships rows the same
+    // pipeline declares ineligible — and freezes them behind the manifest's
+    // digests as the accepted evidence, which is how 11,046 rows with a null
+    // `http_status` came to be a reviewed artefact.
+    //
+    // WHY THE EXPORTER AND NOT ONLY THE VALIDATOR. The validator judges the
+    // TABLE; this stage decides what leaves it. Between the two, a row can be
+    // published by a stage that predates the floor, restored by a `catalog:load`
+    // of an older release, or edited out of band — and the export is the last
+    // point at which the set being shipped is the set being examined. The
+    // refusal is raised here, after the walk, for the same reason the other
+    // post-walk refusals are: every byte written so far is in a staging
+    // directory main() deletes rather than promotes, so nothing reaches the
+    // reviewed path.
+    //
+    // The floor itself is not restated here: `assessIdentityEvidence` in
+    // scripts/lib/catalogEvidence.ts is the single rule, under unit test, that
+    // the import stage, validation and the loader all apply (Rule
+    // backend-architecture §1.2/§7 — a rule someone could get wrong lives in a
+    // pure module, not in the script that reports it).
+    if (withoutCompleteIdentityEvidence.total > 0) {
+        throw new ReleaseIntegrityError(
+            `${withoutCompleteIdentityEvidence.total} published food(s) carry a validation record whose identity evidence is incomplete, so the release would ship published rows the import stage refuses to publish: ${withoutCompleteIdentityEvidence.describe()}. First gap: ${
+                firstEvidenceOffender.length === 0 ? 'none recorded' : firstEvidenceOffender[0].detail
+            }. A retrieval record's fields are observed, never reconstructed — re-run "npm run catalog:import" (a USDA row) or "npm run catalog:generate" (a generated one) so the retrieval is made again, then "npm run catalog:validate", and cut the release from the result. Filling a status or a digest by hand would fabricate the evidence this floor exists to keep out of a published row.`,
+            {
+                file: 'validation-records.jsonl',
+                sourceKey: firstEvidenceOffender.length === 0 ? undefined : firstEvidenceOffender[0].sourceKey,
+            },
+        );
+    }
+
+    // AND THE DIGESTS IT CARRIES HAVE TO STAND FOR SOMETHING.
+    //
+    // The refusal above is about the record's SHAPE; this one is about whether
+    // that shape resolves. A `source_cache_key` no `usda_api_cache` row answers
+    // to, a `body_sha256` that is not the digest of the payload behind it, a
+    // `record_sha256` that is some other food's record, or a status the cache
+    // row contradicts — each of those is a record that looks like evidence and
+    // cannot be re-derived by anyone, which is the whole reason the key and the
+    // digests are stored next to each other. This is the last stage that can
+    // tell the difference: `usda_api_cache` is a table, no release member
+    // carries it, and catalog-load.ts can only re-check the shape (it enforces
+    // the manifest's `source_cache_resolution` instead, and says so).
+    //
+    // The remedy is the import, not an edit: a digest is recomputed from a
+    // payload or it is nothing, and writing one by hand would fabricate exactly
+    // the evidence this gate exists to keep out of a reviewed release.
+    if (withoutResolvedSourceCache.total > 0) {
+        throw new ReleaseIntegrityError(
+            `${withoutResolvedSourceCache.total} published food(s) carry identity evidence whose digests do not resolve against the usda_api_cache payload they cite, so the release would ship evidence nobody can re-derive: ${withoutResolvedSourceCache.describe()}. First gap: ${
+                firstCacheBindingOffender.length === 0 ? 'none recorded' : firstCacheBindingOffender[0].detail
+            }. The cache key and the two digests are recomputed from the recorded response (sha256 of its key-sorted JSON, and of this food's own record inside it): re-run "npm run catalog:import" for those rows so the retrieval and its digests are written together, then "npm run catalog:validate", and cut the release from the result. Filling a digest by hand would fabricate the evidence this floor exists to keep out of a published row.`,
+            {
+                file: 'validation-records.jsonl',
+                sourceKey:
+                    firstCacheBindingOffender.length === 0 ? undefined : firstCacheBindingOffender[0].sourceKey,
+            },
         );
     }
 
@@ -1563,6 +2510,33 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
             { file: 'components.jsonl', sourceKey: missing[0] },
         );
     }
+    // AND THE DUAL OF THAT RULE: A COMPOSITION WHOSE PARENT DENIES DERIVING
+    // FROM IT.
+    //
+    // `assessComponentCoverage` above answers "does every published
+    // `ingredient_derived` food have a composition". This answers the other
+    // direction — "does every published composition belong to a food that says
+    // its numbers came from one" — and the two together are what make the
+    // member's contents meaningful in both directions. Collected during the
+    // walk (see the emission site for why the exporter is the right place to
+    // refuse it) and raised here, after it, for the same reason as the other
+    // post-walk refusals: every byte written so far is in a staging directory
+    // main() deletes rather than promotes.
+    //
+    // Refused in the same shape as the evidence gap it is a sibling of: the
+    // count, the named offenders with what each one claims, one offender's own
+    // key on the error's context, and the operator's next command. The repair
+    // is a re-derivation or a corrected composition — never an edit to
+    // `foods.jsonl`, because a parent's nutrition moving has to move its
+    // `nutrition_version` and therefore invalidate the recipe snapshots citing
+    // it.
+    if (componentBearingWithoutDerivedProvenance.total > 0) {
+        throw new ReleaseIntegrityError(
+            `${componentBearingWithoutDerivedProvenance.total} published food(s) carry component rows while declaring a nutrition_provenance other than '${COMPONENT_DERIVED_PROVENANCE}', so the release would state two incompatible things about where their nutrition came from and catalog:load would refuse it with release_component_inconsistent (parent_provenance_disagrees): ${componentBearingWithoutDerivedProvenance.describe()}. A composition's totals are the output of deriveComponentNutrition, which calls them '${COMPONENT_DERIVED_PROVENANCE}': re-derive those foods with "npm run catalog:validate", or remove the composition from a food whose numbers really are its source's statement, before cutting a release. Editing foods.jsonl is not the repair — a parent's nutrition moving has to move its nutrition_version.`,
+            { file: 'components.jsonl', sourceKey: firstComponentProvenanceOffender[0] },
+        );
+    }
+
     logger.info('components_asserted', {
         components: rowCounts['components.jsonl'],
         published_ingredient_derived: componentCoverage.derivedCount,
@@ -1608,6 +2582,34 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
         reviewPromptVersions: sortedValues(reviewPromptVersions).join(', '),
     });
 
+    // The evidence verdict, measured over the rows this walk emitted and logged
+    // beside the manifest it is written into. Every published row has been
+    // assessed by now and the refusal above has already fired for any gap, so
+    // this line is the run's own statement that the floor was applied: a reader
+    // sees the assessed count, the status range and an empty gap histogram
+    // without opening a 56 MB member.
+    const evidence = evidenceTally.summarise();
+    assertMeasuredEvidence(evidence);
+    logger.info('release_evidence_measured', {
+        stage: STAGE,
+        publishedFoods: evidence.published_foods,
+        assessedRecords: evidence.assessed_records,
+        completeRecords: evidence.complete_records,
+        observedStatusMin: evidence.observed_status_min,
+        observedStatusMax: evidence.observed_status_max,
+        identitySources: evidence.identity_sources
+            .map((source) => `${source.identity_source}=${source.published_foods}`)
+            .join(', '),
+        gapCodes: evidence.gap_codes.map((gap) => `${gap.code}=${gap.foods}`).join(', '),
+        // The resolution the loader cannot re-make, in the run's own output as
+        // well as in the manifest: an operator reading the log sees how many
+        // rows were bound to a cached payload and how many vendor exchanges
+        // those bindings rest on, without opening the artefact.
+        cacheBindingsRequired: evidence.source_cache_resolution.required_records,
+        cacheBindingsResolved: evidence.source_cache_resolution.resolved_records,
+        cacheRowsRead: evidence.source_cache_resolution.cache_rows_read,
+    });
+
     // Every member has been written and closed by now, including
     // components.jsonl when it has no rows. An empty member is still a member:
     // the six-file contract requires the file to exist so the loader verifies
@@ -1620,6 +2622,12 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     // the manifest has to describe the file a loader will actually read, and a
     // digest taken from memory would not catch a write that failed halfway.
     const files = RELEASE_DATA_FILES.map((fileName) => {
+        // The read-backs are path uses too, and they are the ones the manifest
+        // is MEASURED from: a directory swapped between the last member write
+        // and this read would have the manifest describe six files this
+        // pipeline never wrote, which is precisely the artefact a digest check
+        // afterwards cannot distinguish from a real release.
+        assertDirectoryUnchanged();
         const bytes = deps.readFileBytes(path.join(directory, fileName));
         return {
             path: fileName,
@@ -1668,8 +2676,8 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     // gap between the two totals. Those are different numbers whenever one
     // category overshoots its target while another falls short, and the
     // aggregate hides exactly the fact a reader needs: this release publishes
-    // 11,046 foods against a plan total of 11,010, yet a dozen categories sit
-    // below their own targets because the overshoot in others covers them.
+    // 9,422 foods against a plan total of 11,010, and 13 categories sit below
+    // their own targets while 8 others overshoot theirs.
     // Reporting 0 there would claim per-category coverage this release does
     // not have, which is the one thing the header forbids. The aggregate
     // comparison is still reported, under its own name, so neither fact is
@@ -1677,7 +2685,29 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
     const shortfallTotal = coverageShortfall.shortfallTotal;
     const publishedGapToTotal = Math.max(0, coveragePlan.publishedTargetTotal - foodCount);
 
-    const manifest: CatalogReleaseManifest = {
+    // THE ACCEPTANCE VERDICT (see ReleaseAcceptanceVerdict for why it is stated
+    // here and why it is not a refusal). Both conditions must hold, and they
+    // are independent: a release can reach the aggregate requirement while a
+    // category is still short, because a surplus elsewhere cannot substitute
+    // for it.
+    //
+    // Measured against `foodCount` — the rows actually emitted into
+    // foods.jsonl — and not against the shortfall verdict's `publishedTotal`,
+    // which deliberately excludes any category the plan does not declare. The
+    // requirement is a statement about the published catalog, so a row must not
+    // drop out of it for having an unplanned category. The refusal on
+    // `unknownCategories` above means the two numbers are in fact equal in any
+    // release that is cut, so this choice cannot silently disagree with
+    // coverage.published_total; it is written this way so that it reads as the
+    // same measurement catalog-report.ts calls `publishedItems`.
+    const acceptance = releaseAcceptanceVerdict({
+        publishedItems: foodCount,
+        categoryCount: coverageShortfall.categories.length,
+        categoriesBelowTarget: coverageShortfall.categories.filter((category) => category.shortfall > 0).length,
+        perCategoryShortfallTotal: shortfallTotal,
+    });
+
+    const manifest: CatalogReleaseManifestWithEvidence = {
         release_id: deps.release,
         manifest_version: 'v1',
         coverage_plan_version: coveragePlan.coveragePlanVersion,
@@ -1750,8 +2780,39 @@ export const runRelease = async (deps: RunReleaseDeps): Promise<ReleaseOutcome> 
             categories: byCategory,
             by_category: byCategory,
         },
+        // THE ACCEPTANCE REQUIREMENT, ANSWERED RATHER THAN LEFT TO BE COMPUTED.
+        //
+        // Every number here is derivable from the `coverage` block above, which
+        // is exactly why it is written: a consumer that has to compare
+        // published_actual_total against a threshold it holds privately, and
+        // scan by_category for positive shortfalls, is a consumer that can
+        // reach the wrong verdict quietly. Stated once, by the stage that
+        // measured the rows, it travels with the bytes the manifest's digests
+        // bind.
+        acceptance,
+        // THE EVIDENCE FLOOR'S VERDICT, WRITTEN DOWN.
+        //
+        // Measured while the rows were walked (see EvidenceTally): the published
+        // rows per identity source, the range of statuses those retrievals
+        // actually returned, and the histogram of the gaps the floor found —
+        // which is empty in any release that was cut, because the refusal above
+        // fires on the first gap. That empty list is the statement a reviewer
+        // cannot otherwise make without reading 56 MB of JSONL, and
+        // catalog-load.ts cross-checks it against its own streamed measurement
+        // of the same members, so a hand-edited block is caught before a row is
+        // written.
+        //
+        // Deterministic by construction: sorted keys, integer counts, and no
+        // wall-clock value beyond `generated_at` above. Nothing here is read
+        // from the coverage plan or from a previous manifest.
+        evidence,
     };
 
+    // The last member written and the one that turns five files into a release,
+    // so it is held to the same check as the five: a manifest written through a
+    // replaced directory would be a complete, self-consistent release document
+    // sitting somewhere nobody asked for.
+    assertDirectoryUnchanged();
     deps.writeFile(
         path.join(directory, RELEASE_MANIFEST_FILE_NAME),
         `${JSON.stringify(manifest, null, 2)}\n`,
@@ -1900,6 +2961,93 @@ const modelVersionsFor = (input: {
         ai_generated_foods: input.aiGeneratedFoods,
         reviewed_foods: input.reviewedFoods,
     };
+};
+
+/**
+ * Refuses an `evidence` block whose own parts disagree.
+ *
+ * The counterpart of `assertMeasuredModelVersions`, and there for the same
+ * reason: a manifest is EVIDENCE, so the last thing done before writing one is
+ * to assert that what it states about itself holds. Every number here is a
+ * counter incremented while the walk emitted rows, which is exactly why the
+ * check is worth making — a future change to where a row is counted would
+ * otherwise write a block that reads plausibly and describes a set nobody
+ * measured. Three invariants cover it: the per-source counts sum to the totals,
+ * a release that was cut has an assessed record per published row and no gap,
+ * and every observed status sits in the successful range the floor requires.
+ *
+ * It is a refusal rather than a log line because the block's only purpose is to
+ * let a reviewer trust it without streaming 56 MB of records.
+ */
+const assertMeasuredEvidence = (evidence: ReleaseEvidenceSummary): void => {
+    const refuse = (problem: string): never => {
+        throw new ReleaseIntegrityError(
+            `the manifest's evidence block would state ${problem}, so it is not a measurement of the rows this ` +
+                `release carries: ${JSON.stringify(evidence)}. Every number in that block is counted while the ` +
+                'published rows are walked; a release is not cut from one that cannot be reconciled with itself.',
+            { file: RELEASE_MANIFEST_FILE_NAME },
+        );
+    };
+
+    const summed = evidence.identity_sources.reduce(
+        (totals, source) => ({
+            published: totals.published + source.published_foods,
+            assessed: totals.assessed + source.assessed_records,
+        }),
+        { published: 0, assessed: 0 },
+    );
+    if (summed.published !== evidence.published_foods || summed.assessed !== evidence.assessed_records) {
+        refuse(
+            `per-identity-source counts (${summed.published} published, ${summed.assessed} assessed) that do not sum to its own totals (${evidence.published_foods} published, ${evidence.assessed_records} assessed)`,
+        );
+    }
+    // Reached only after the refusals above have cleared, so every published row
+    // has a record and every record is complete; a block saying otherwise would
+    // contradict the release's own existence.
+    if (evidence.assessed_records !== evidence.published_foods) {
+        refuse(
+            `${evidence.assessed_records} assessed record(s) for ${evidence.published_foods} published food(s), although a release carries one record per published food`,
+        );
+    }
+    if (evidence.complete_records !== evidence.assessed_records || evidence.gap_codes.length > 0) {
+        refuse(
+            `${evidence.assessed_records - evidence.complete_records} incomplete record(s) and ${evidence.gap_codes.length} gap code(s), although a release is only cut when every published row's evidence is complete`,
+        );
+    }
+    for (const status of [evidence.observed_status_min, evidence.observed_status_max]) {
+        if (status !== null && (!Number.isInteger(status) || status < 200 || status > 299)) {
+            refuse(`an observed HTTP status of ${String(status)}, which is outside the successful range`);
+        }
+    }
+    if (evidence.published_foods > 0 && (evidence.observed_status_min === null || evidence.observed_status_max === null)) {
+        refuse('no observed status range at all, although every published row it counted carries an observed status');
+    }
+
+    // THE ATTESTATION IS THE ONE THE LOADER CANNOT RE-MAKE, so it is the one
+    // most worth asserting before it is written. Reached only after the
+    // resolution refusal has cleared, which means every row that required
+    // resolution got it — a block saying otherwise would be a manifest
+    // contradicting the release's own existence, and it is what
+    // catalog-load.ts refuses a release on.
+    const resolution = evidence.source_cache_resolution;
+    for (const [field, value] of Object.entries(resolution)) {
+        if (!Number.isInteger(value) || value < 0) {
+            refuse(`a source_cache_resolution.${field} of ${String(value)}, which is not a count`);
+        }
+    }
+    if (resolution.resolved_records !== resolution.required_records) {
+        refuse(
+            `${resolution.resolved_records} resolved source-cache binding(s) for ${resolution.required_records} that required one, although a release is only cut when every one of them resolved`,
+        );
+    }
+    if (resolution.required_records > evidence.published_foods) {
+        refuse(
+            `${resolution.required_records} row(s) requiring a source-cache binding among ${evidence.published_foods} published food(s)`,
+        );
+    }
+    if (resolution.required_records > 0 && resolution.cache_rows_read === 0) {
+        refuse('no usda_api_cache row read at all, although it counted rows whose digests were resolved against one');
+    }
 };
 
 /**
@@ -2435,16 +3583,17 @@ export class ReleaseIntegrityError extends CatalogReleaseError {
 
 /**
  * The finished export was not allowed to take its reviewed path — the
- * destination already holds a release and `--force` was not given, or another
- * publication holds the lock on that path.
+ * destination already holds a release and `--force` was not given, another
+ * publication holds the lock on that path, or the staging directory the export
+ * wrote is no longer the directory those bytes went into.
  *
- * Its own class, and its own code per refusal, because these two are the only
- * failures of this stage that are about the DESTINATION rather than about the
+ * Its own class, and its own code per refusal, because these are the failures
+ * of this stage that are about WHERE the release goes rather than about the
  * catalog: nothing is wrong with the bytes that were exported, and an operator
  * reading `release_directory_exists` has a different next action from one
  * reading `release_integrity_failed`. The code is a constructor argument rather
- * than a per-class constant so the two refusals stay one concept with one
- * recovery path (the staging directory is discarded either way) while still
+ * than a per-class constant so those refusals stay one concept with one
+ * recovery path (the staging directory is discarded in every case) while still
  * reporting distinguishably.
  */
 export class ReleasePublicationError extends CatalogReleaseError {
@@ -2471,16 +3620,203 @@ export class ReleasePublicationError extends CatalogReleaseError {
 // ---------------------------------------------------------------------------
 
 /**
- * The staging directory for a release: a hidden SIBLING of the final one.
+ * The shared head of every staging name for one final release path.
+ *
+ * Exported as one definition because two things depend on it agreeing: the
+ * name a run creates, and the pattern the orphan sweep recognises. Two
+ * spellings of "this release's staging directory" would leave a killed run's
+ * directory behind forever, or sweep something that is not one.
+ */
+export const stagingPrefixFor = (finalDirectory: string): string =>
+    `.${path.basename(finalDirectory)}.staging-`;
+
+/**
+ * The staging directory for a release: a hidden SIBLING of the final one, named
+ * so that no other local principal can predict it.
  *
  * Sibling, not a temp directory: `rename` is only atomic within one
  * filesystem, and `os.tmpdir()` is routinely a different mount, where the move
  * would fail with `EXDEV` after the whole export had been written. Dot-prefixed
- * and pid-suffixed so it cannot be mistaken for a release id and two runs
+ * so it cannot be mistaken for a release id, and pid-suffixed so two runs
  * cannot stage over each other.
+ *
+ * WHY THE NAME CARRIES A NONCE. The parent is whatever `--out` named, so it can
+ * be a directory another local principal may create names in, and a name that
+ * principal can compute is a name they can pre-place as a symbolic link before
+ * this run creates it. Sixteen hex characters from the CSPRNG make pre-placing
+ * it a guess against 2^64 rather than a plan, and the exclusive create this
+ * name is brought into existence with refuses the guess that lands. The suffix
+ * is a defaulted parameter, not a hidden read: a caller that must KNOW the path
+ * — a suite asserting where a member was written — passes one, and every other
+ * caller gets an unguessable one it does not have to think about.
  */
-export const stagingDirFor = (finalDirectory: string, pid: number = process.pid): string =>
-    path.join(path.dirname(finalDirectory), `.${path.basename(finalDirectory)}.staging-${pid}`);
+export const stagingDirFor = (
+    finalDirectory: string,
+    pid: number = process.pid,
+    suffix: string = unguessableSuffix(),
+): string => path.join(path.dirname(finalDirectory), `${stagingPrefixFor(finalDirectory)}${pid}-${suffix}`);
+
+/** The 16 lowercase hex characters `unguessableSuffix` emits. */
+const STAGING_NONCE_PATTERN = /^[0-9a-f]{16}$/;
+
+const DIGITS_PATTERN = /^[0-9]+$/;
+
+/**
+ * The pid in a staging directory's name, or `null` when the name is not one of
+ * this release's staging directories at all.
+ *
+ * The sweep's whole authority to delete something rests on this predicate, so
+ * it is exact rather than a `startsWith`: the tail after the prefix must be a
+ * pid, optionally followed by the nonce, and nothing else. `.v1.publish.lock`,
+ * `.v1.superseded-900`, `v1` itself and a name whose nonce is the wrong shape
+ * all answer `null` and are left alone.
+ *
+ * The nonce is OPTIONAL because both spellings name the same thing on disk: a
+ * staging directory whose name carries no nonce is one this stage created
+ * before the name was made unguessable, and a run killed then left an orphan
+ * that is no less an orphan for being predictably named. A non-positive pid
+ * answers `null` too — see `pidIsRunning` for why a 0 or a negative is never
+ * asked about.
+ */
+export const orphanStagingPid = (entryName: string, finalDirectory: string): number | null => {
+    const prefix = stagingPrefixFor(finalDirectory);
+    if (!entryName.startsWith(prefix)) {
+        return null;
+    }
+
+    const parts = entryName.slice(prefix.length).split('-');
+    if (parts.length > 2) {
+        return null;
+    }
+    const [pidPart, noncePart] = parts;
+    if (!DIGITS_PATTERN.test(pidPart)) {
+        return null;
+    }
+    if (noncePart !== undefined && !STAGING_NONCE_PATTERN.test(noncePart)) {
+        return null;
+    }
+
+    const pid = Number(pidPart);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+};
+
+/**
+ * Whether a process with this pid exists on THIS machine.
+ *
+ * `kill(pid, 0)` sends no signal and only asks the kernel about the target, and
+ * each of its three answers is decisive: success and `EPERM` both mean a
+ * process with that pid exists — `EPERM` is one belonging to another user —
+ * while `ESRCH` means none does. Any other errno is answered "live", because
+ * the sweep's consequence for a wrong answer is asymmetric: a lingering orphan
+ * directory is housekeeping an operator can do, and a deleted live staging
+ * directory is a running export's work destroyed.
+ *
+ * A pid that is not a positive safe integer is answered "live" WITHOUT asking:
+ * `process.kill` reads 0 and negative values as process GROUPS, so signalling
+ * one would reach processes this stage has no business touching. That is also
+ * why `orphanStagingPid` refuses such a name before this function ever sees it
+ * — two independent guards, because the failure mode is not recoverable.
+ */
+export const pidIsRunning = (pid: number): boolean => {
+    if (!Number.isSafeInteger(pid) || pid <= 0) {
+        return true;
+    }
+
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+    }
+};
+
+export interface SweepOrphanStagingInput {
+    /** The reviewed path whose siblings are searched. */
+    readonly finalDirectory: string;
+    /** The staging directory THIS run created, which is never swept. */
+    readonly keep: string;
+    readonly fileSystem: ReleaseFileSystem;
+    /** Seamed so a suite can state which pids are live; defaults to the kernel. */
+    readonly pidIsRunning?: (pid: number) => boolean;
+    readonly logger: ScriptLogger;
+}
+
+/**
+ * Removes the staging directories of runs that were killed before they could
+ * clean up, and returns what it removed.
+ *
+ * WHY A SWEEP RATHER THAN ONE REMOVE. This housekeeping used to be a single
+ * `removeDir` of the name this run was about to create, which only worked
+ * because that name was derived from the pid and therefore predictable — the
+ * same property that let another principal pre-place a symlink there. With the
+ * name carrying a nonce, a killed run's directory is a name nobody will compute
+ * again, so it is found by listing the parent instead.
+ *
+ * WHAT IT WILL NOT TOUCH, each refusal load-bearing:
+ *
+ *   * anything whose name is not exactly one of this release's staging
+ *     directories (`orphanStagingPid`), so the release directory, the
+ *     publication lock and a `.superseded-` directory are never candidates;
+ *   * the staging directory this run created, which it is still writing into;
+ *   * a candidate whose pid is a live process, which is a CONCURRENT export's
+ *     staging directory: two releases of one database are meant to be able to
+ *     run at once, and a blind sweep would delete one run's members from under
+ *     it;
+ *   * anything that is not a real directory under `lstat`. A symbolic link
+ *     bearing a staging name is reported and left exactly where it is:
+ *     following it would delete a tree somewhere else entirely, and removing
+ *     the link would quietly repair a filesystem an operator needs to see.
+ */
+export const sweepOrphanStagingDirectories = (input: SweepOrphanStagingInput): readonly string[] => {
+    const { finalDirectory, keep, fileSystem, logger } = input;
+    const isRunning = input.pidIsRunning ?? pidIsRunning;
+    const parent = path.dirname(finalDirectory);
+    const keepName = path.basename(keep);
+    const removed: string[] = [];
+
+    for (const entryName of fileSystem.listDirectoryNames(parent)) {
+        const pid = orphanStagingPid(entryName, finalDirectory);
+        if (pid === null || entryName === keepName) {
+            continue;
+        }
+
+        const candidate = path.join(parent, entryName);
+        if (isRunning(pid)) {
+            logger.info('release_staging_in_use_retained', {
+                stage: STAGE,
+                directory: candidate,
+                holdingPid: pid,
+                reason: 'a process with this pid is running, so the directory belongs to an export still writing into it',
+            });
+            continue;
+        }
+
+        if (fileSystem.directoryIdentity(candidate) === null) {
+            logger.warn('release_staging_name_not_a_directory', {
+                stage: STAGE,
+                path: candidate,
+                consequence:
+                    'An entry bearing a staging name is not a directory — a symbolic link, most likely — so it was ' +
+                    'left untouched. Nothing this stage wrote is there; inspect it and remove it by hand.',
+            });
+            continue;
+        }
+
+        // The contents describe nothing: the manifest that would make them a
+        // release was never written, since a completed run renames its staging
+        // directory away instead of leaving it here.
+        fileSystem.removeDir(candidate);
+        removed.push(candidate);
+        logger.info('release_staging_orphan_discarded', {
+            stage: STAGE,
+            directory: candidate,
+            holdingPid: pid,
+            reason: 'no process with this pid is running, so the run that staged here was killed before it finished',
+        });
+    }
+
+    return removed;
+};
 
 /**
  * The lock a publication holds over ONE final release path.
@@ -2492,8 +3828,65 @@ export const stagingDirFor = (finalDirectory: string, pid: number = process.pid)
 export const publicationLockFor = (finalDirectory: string): string =>
     path.join(path.dirname(finalDirectory), `.${path.basename(finalDirectory)}.publish.lock`);
 
+/**
+ * The question `assertStagingIdentityUnchanged` answers, as its two callers
+ * ask it. Module-private: the check is an internal invariant of this stage's
+ * publication path, pinned through `publishRelease` and `runReleaseStage`
+ * rather than called directly.
+ */
+interface StagingIdentityCheck {
+    readonly stagingDirectory: string;
+    /** The reading taken when this run CREATED that directory. */
+    readonly stagingIdentity: ReleaseDirectoryIdentity;
+    /** The directory an operator is sent to look at; the release's parent. */
+    readonly parentDirectory: string;
+    /**
+     * What did not happen because of the refusal, in the operator's terms —
+     * "nothing was published to …", "no member was written …". The caller
+     * states it because only the caller knows which act was being authorised.
+     */
+    readonly consequence: string;
+    readonly directoryIdentity: (absolutePath: string) => ReleaseDirectoryIdentity | null;
+}
+
+/**
+ * Refuses unless `stagingDirectory` still names the directory whose identity
+ * was captured when this run created it.
+ *
+ * ONE DEFINITION, TWO CALL SITES, because the two are the same question asked
+ * at different moments and a second spelling of it would be a second place to
+ * get the comparison wrong. The export asks immediately before every path-based
+ * member operation (`assertReleaseDirectoryUnchanged` on RunReleaseDeps) and
+ * publication asks immediately before each move of the directory, so nothing
+ * separates a check from the act it authorises. The comparison is `(dev, ino)`
+ * rather than the spelling: a replaced directory has the same name by
+ * construction, which is exactly why the attack works at all.
+ *
+ * `null` — no directory at that name, or an entry that is not one — never
+ * matches, so a staging path that became a symbolic link is refused however it
+ * resolves.
+ */
+const assertStagingIdentityUnchanged = (check: StagingIdentityCheck): void => {
+    const current = check.directoryIdentity(check.stagingDirectory);
+    if (sameDirectoryIdentity(current, check.stagingIdentity)) {
+        return;
+    }
+
+    throw new ReleasePublicationError(
+        'release_staging_identity_changed',
+        `${check.stagingDirectory} is no longer the directory this run exported into, so ${check.consequence}. The name now refers to ${current === null ? 'no directory at all' : `a different directory (dev ${current.dev}, inode ${current.ino} rather than dev ${check.stagingIdentity.dev}, inode ${check.stagingIdentity.ino})`}. Something replaced it while the export was running: check who can write to ${check.parentDirectory}, then re-run catalog:release.`,
+    );
+};
+
 export interface PublishReleaseInput {
     readonly stagingDirectory: string;
+    /**
+     * The identity of the staging directory as it was CREATED, carried from
+     * there to here so publication can establish that the path still names that
+     * same directory. Required rather than re-read here: a reading taken at
+     * publication time could only be compared with itself.
+     */
+    readonly stagingIdentity: ReleaseDirectoryIdentity;
     readonly finalDirectory: string;
     /** The operator's `--force`. Publication enforces it; preflight only warns early. */
     readonly force: boolean;
@@ -2538,14 +3931,57 @@ export interface PublishReleaseInput {
  * under its `.superseded-` name, where an operator can see it and move it back,
  * whereas deleting first would destroy a reviewed artefact to make room for one
  * that might never arrive.
+ *
+ * TWO THINGS ARE ESTABLISHED ABOUT THE PATHS BEFORE ANYTHING MOVES, because an
+ * export takes minutes and every check made before it is a statement about a
+ * filesystem that has had minutes to change:
+ *
+ *   * the parent of the final directory is still one no other local principal
+ *     can plant a name in. Three things land in it — the lock file, the
+ *     `.superseded-` directory and the release itself — and a parent that
+ *     became group-writable during the export is one where the lock can be
+ *     created by someone else and the reviewed release moved aside by someone
+ *     else;
+ *   * the staging directory is still the directory this run exported into,
+ *     compared by `(dev, ino)` and not by its spelling. Without that, a
+ *     staging path re-pointed at a tree an attacker prepared would be renamed
+ *     into the reviewed release path by this function, and the result would
+ *     carry a manifest whose digests describe files nobody in this pipeline
+ *     wrote. This is the LAST of those checks rather than the only one: the
+ *     export has already made the same one immediately before each member
+ *     open, read-back and manifest write, so a replacement is refused where it
+ *     would have redirected bytes and not merely where it would have published
+ *     them.
  */
 export const publishRelease = (input: PublishReleaseInput): void => {
-    const { stagingDirectory, finalDirectory, force, pid, fileSystem, logger } = input;
+    const { stagingDirectory, stagingIdentity, finalDirectory, force, pid, fileSystem, logger } = input;
 
     // The lock is a sibling of the destination, so its parent has to exist
     // before it can be taken. With --out that parent may be a directory only
     // this run has any reason to create.
     fileSystem.ensureDir(path.dirname(finalDirectory));
+
+    // Held to the same rule the staging directory's creation was held to, and
+    // re-established here rather than trusted from then: this is the last
+    // moment before a lock file is created and a reviewed release is moved in
+    // that parent.
+    fileSystem.assertSafeParent(finalDirectory);
+
+    /**
+     * The identity check, bound to this publication's paths. Called immediately
+     * before each move of the staging directory, so nothing separates the check
+     * from the act it authorises; the export has already made the same check
+     * before each of its own path uses.
+     */
+    const assertStagingUnmoved = (): void => {
+        assertStagingIdentityUnchanged({
+            stagingDirectory,
+            stagingIdentity,
+            parentDirectory: path.dirname(finalDirectory),
+            consequence: `nothing was published to ${finalDirectory}`,
+            directoryIdentity: fileSystem.directoryIdentity,
+        });
+    };
 
     const lockPath = publicationLockFor(finalDirectory);
     const owner = `${JSON.stringify({ pid, at: input.now().toISOString(), staging: stagingDirectory })}\n`;
@@ -2570,6 +4006,7 @@ export const publishRelease = (input: PublishReleaseInput): void => {
         }
 
         if (!replacing) {
+            assertStagingUnmoved();
             fileSystem.rename(stagingDirectory, finalDirectory);
             logger.info('release_published', { stage: STAGE, directory: finalDirectory, replaced: false });
             return;
@@ -2582,6 +4019,10 @@ export const publishRelease = (input: PublishReleaseInput): void => {
         fileSystem.removeDir(supersededDirectory);
         fileSystem.rename(finalDirectory, supersededDirectory);
         try {
+            // Inside this try, so an identity that changed under the export is
+            // refused with the reviewed release put back rather than left aside
+            // under a name nothing loads.
+            assertStagingUnmoved();
             fileSystem.rename(stagingDirectory, finalDirectory);
         } catch (error) {
             // The new release could not take the path, so the old one is put back
@@ -2627,6 +4068,21 @@ export interface RunReleaseStageDeps {
     readonly fileSystem: ReleaseFileSystem;
     readonly pageSize?: number;
     /**
+     * The unguessable component of the staging directory's name. Optional and
+     * generated per run: a caller that has to KNOW the staging path — a suite
+     * asserting which member was written where — fixes it, and every other
+     * caller gets 16 hex characters from the CSPRNG, which is what stops the
+     * name from being pre-placed by another local principal.
+     */
+    readonly stagingSuffix?: string;
+    /**
+     * Whether a pid names a live process, which is how the orphan sweep tells a
+     * killed run's staging directory from one a concurrent export is still
+     * writing into. Optional, defaulting to the kernel's answer; seamed because
+     * a suite cannot arrange for a pid to be dead.
+     */
+    readonly pidIsRunning?: (pid: number) => boolean;
+    /**
      * The export step. Optional, defaulting to `runRelease`: the orchestration
      * is what this function owns, and a caller proving the ledger and
      * publication behaviour should not have to build a catalog to do it.
@@ -2657,15 +4113,101 @@ const RELEASE_LEDGER_KIND = 'release';
  * re-cuts. No rule reads a 'release' row (MUTATING_RUN_KINDS and
  * GRAPH_MUTATING_RUN_KINDS both exclude it), so an open or failed row here
  * blocks nothing and is purely the audit trail an operator reads.
+ *
+ * THE STAGING DIRECTORY EXISTS BEFORE THE FIRST AWAIT, and that ordering is a
+ * security property rather than a preference. The name used to be predictable
+ * and was REMOVED here, after which this function awaited a database round
+ * trip before the export created it: inside that window — which is as long as
+ * the database takes to answer — another local principal who can write to the
+ * parent could create that computable name as a symbolic link, or as a
+ * directory holding symlinked member names, and every member write, manifest
+ * included, would have landed wherever those links pointed. So the directory is
+ * created FIRST, atomically, at a name carrying a nonce (`stagingDirFor`), and
+ * the ledger row that follows records the path that already exists. There is
+ * nothing left to remove before an await, because the create refuses an
+ * existing name instead of clearing it.
+ *
+ * AND ITS IDENTITY IS RE-ASKED, NOT CARRIED, FOR THE WHOLE OF THE EXPORT.
+ * Creating the directory first closes the window before the export and nothing
+ * more: the ledger row is awaited, then the snapshot, then a page of rows per
+ * member, and every member open resolves the staging PATHNAME again. A staging
+ * directory replaced inside that window by a symbolic link — the parent may be
+ * a directory another principal can create names in, which is why the nonce
+ * exists — would have each `path.join(staging, member)` traverse the
+ * replacement, and the member bytes would land wherever it pointed; the
+ * exclusive no-follow open settles the member's own last component and says
+ * nothing about the directory above it. So the `(dev, ino)` reading taken here
+ * is threaded into the export as `assertReleaseDirectoryUnchanged` and re-asked
+ * immediately before each of its path uses, and asked again immediately before
+ * each rename publication performs. Node offers no descriptor-relative
+ * `openat`, so this narrows the window to one `lstat`-to-syscall interval per
+ * operation rather than removing it — which is stated here because a reader
+ * deciding whether to add a guard elsewhere needs the residual, not a claim
+ * that the race is gone.
  */
 export const runReleaseStage = async (deps: RunReleaseStageDeps): Promise<ReleaseOutcome> => {
     const { logger, fileSystem } = deps;
-    const stagingDirectory = stagingDirFor(deps.finalDirectory, deps.pid);
+    const stagingDirectory = stagingDirFor(deps.finalDirectory, deps.pid, deps.stagingSuffix ?? unguessableSuffix());
 
-    // A staging directory left by a run that was killed before it could clean
-    // up. Its contents describe nothing — the manifest that would make them a
-    // release was never written — so it is discarded rather than resumed.
-    fileSystem.removeDir(stagingDirectory);
+    // THE PARENT IS ESTABLISHED BEFORE THE NAME IS CREATED, and stated here
+    // rather than left to the create. `createDirectoryExclusive` holds its
+    // argument to the same rule, so on the real filesystem this is the check
+    // twice; that redundancy is the point. The rule this stage depends on is
+    // "the directory the six members are staged in sits in a parent no other
+    // local principal can plant a name in", and the export — not the primitive
+    // — is what that rule protects, so it is asserted where the export begins
+    // and not only inside a helper a future refactor could reach past. It is
+    // also the first filesystem effect of the stage, so a hostile parent is a
+    // refusal before a directory exists or a ledger row is opened.
+    fileSystem.assertSafeParent(stagingDirectory);
+
+    // The atomic test-and-create, and the only thing that brings this name into
+    // existence: an entry of any kind already at this name — a symbolic link
+    // above all — fails the create rather than being written through.
+    fileSystem.createDirectoryExclusive(stagingDirectory);
+
+    // Captured now, while the directory is one this call just brought into
+    // existence, and carried to publication so the rename that publishes a
+    // release can establish that it is moving THIS directory.
+    const stagingIdentity = fileSystem.directoryIdentity(stagingDirectory);
+    if (stagingIdentity === null) {
+        throw new ReleasePublicationError(
+            'release_staging_unidentifiable',
+            `${stagingDirectory} was created for this release but does not read back as a directory, so nothing can establish later that the release being published is the one this run exported. Nothing was written. Check ${path.dirname(deps.finalDirectory)} and re-run catalog:release.`,
+        );
+    }
+
+    // Staging directories left behind by runs that were killed before they
+    // could clean up. Swept after this run's own directory exists, so the sweep
+    // reads a parent whose safety the create above has just established, and
+    // never the moment before it.
+    sweepOrphanStagingDirectories({
+        finalDirectory: deps.finalDirectory,
+        keep: stagingDirectory,
+        fileSystem,
+        pidIsRunning: deps.pidIsRunning,
+        logger,
+    });
+
+    /**
+     * The identity check the export makes before every path-based member
+     * operation, closed over the reading taken above.
+     *
+     * Everything from here to publication happens after an `await` — the ledger
+     * row, then the snapshot, then a page of rows per member write — and a
+     * pathname is re-resolved from the filesystem root on every use. So the
+     * captured identity is not a fact established once and carried; it is a
+     * question re-asked at each use, which is what `runRelease` does with this.
+     */
+    const assertStagingUnchanged = (): void => {
+        assertStagingIdentityUnchanged({
+            stagingDirectory,
+            stagingIdentity,
+            parentDirectory: path.dirname(deps.finalDirectory),
+            consequence: `no member was written through it and nothing was published to ${deps.finalDirectory}`,
+            directoryIdentity: fileSystem.directoryIdentity,
+        });
+    };
 
     const startedAt = deps.now();
     const ledgerRunId = await openReleaseLedgerRow(deps, startedAt, stagingDirectory);
@@ -2688,11 +4230,18 @@ export const runReleaseStage = async (deps: RunReleaseStageDeps): Promise<Releas
             readFileBytes: fileSystem.readFileBytes,
             ensureDir: fileSystem.ensureDir,
             openWriter: fileSystem.openWriter,
+            // Supplied by the only caller that STAGES, which is the only caller
+            // with an identity to compare. Without it the export would write
+            // through whatever the staging pathname resolved to at the moment
+            // of each open, and publication's refusal afterwards would come
+            // after the bytes had already left the process.
+            assertReleaseDirectoryUnchanged: assertStagingUnchanged,
             pageSize: deps.pageSize,
         });
 
         publish({
             stagingDirectory,
+            stagingIdentity,
             finalDirectory: deps.finalDirectory,
             force: deps.force,
             pid: deps.pid,
@@ -2774,7 +4323,7 @@ const closeReleaseLedgerRow = async (
         readonly startedAt: Date;
         readonly event: string;
         readonly counts?: Readonly<Record<string, number>>;
-        readonly detail?: { readonly code: string; readonly error: { name: string; message: string } };
+        readonly detail?: { readonly code: string; readonly error: SafeErrorFields };
     },
 ): Promise<void> => {
     const finishedAt = deps.now();
@@ -2830,14 +4379,75 @@ const closeReleaseLedgerRow = async (
  * primitive — the same one lib/rateLimiter.ts takes its cross-process ledger
  * lock with — and an `existsSync` check followed by a write is not: two runs
  * can both see nothing and both write.
+ *
+ * Four members are `lib/manifest.ts` primitives rather than `fs` calls —
+ * `createDirectoryExclusive`, `assertSafeParent`, and the no-follow halves of
+ * `writeFile` and `readFileBytes`. That is still the smallest faithful wrapper
+ * of each operation: the rule for what a safe parent is, and for what an
+ * exclusive no-follow create is, belongs to the module every publishing stage
+ * shares, so this stage cannot drift into a second definition of it.
  */
 export const nodeReleaseFileSystem: ReleaseFileSystem = {
+    // Through the same writer every member takes, so the manifest — the one
+    // file written by this member rather than by `openWriter` — is created
+    // exclusively and without following a link at its own name, exactly like
+    // the five members beside it. `fs.writeFileSync` would follow such a link
+    // and truncate whatever it pointed at.
     writeFile: (absolutePath, contents) => {
-        fs.writeFileSync(absolutePath, contents, 'utf-8');
+        const writer = descriptorWriter(absolutePath);
+        try {
+            writer.write(contents);
+        } finally {
+            writer.close();
+        }
     },
-    readFileBytes: (absolutePath) => fs.readFileSync(absolutePath),
+    // No-follow, and a regular file or nothing: this read is what the
+    // manifest's SHA-256, row count and size are measured from, so a link at a
+    // member's name would produce a manifest describing a file this pipeline
+    // never wrote.
+    readFileBytes: (absolutePath) => readArtifactFileNoFollow(absolutePath),
     ensureDir: (absolutePath) => {
         fs.mkdirSync(absolutePath, { recursive: true });
+    },
+    createDirectoryExclusive: (absolutePath) => {
+        createExclusiveDirectory(absolutePath);
+    },
+    listDirectoryNames: (absolutePath) => {
+        try {
+            return fs.readdirSync(absolutePath);
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === 'ENOENT' || code === 'ENOTDIR') {
+                // The parent of the first release cut into this tree. Nothing
+                // is listed because nothing is there, which is not a failure.
+                return [];
+            }
+            throw error;
+        }
+    },
+    directoryIdentity: (absolutePath) => {
+        try {
+            // `lstat`, not `stat`: a symbolic link must answer "not a
+            // directory" however it resolves, because the entry AT this name is
+            // what a caller is deciding about.
+            const stats = fs.lstatSync(absolutePath);
+            return stats.isDirectory() ? { dev: stats.dev, ino: stats.ino } : null;
+        } catch (error) {
+            // Absent, unreadable, or a path component that is not a directory.
+            // All three are "this path does not name a directory I can
+            // identify", which is what both callers need: the sweep skips it
+            // and publication refuses. Reported so an unexpected errno is not
+            // silently read as absence.
+            logger.debug('release_directory_unidentified', {
+                stage: STAGE,
+                path: absolutePath,
+                error: (error as Error).message,
+            });
+            return null;
+        }
+    },
+    assertSafeParent: (absolutePath) => {
+        assertSafeArtifactParent(absolutePath);
     },
     removeDir: (absolutePath) => {
         fs.rmSync(absolutePath, { recursive: true, force: true });
@@ -2887,26 +4497,34 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
 // than swallowed or printed raw.
-const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
+// The reported `error` is `SafeErrorFields` — a scrubbed name plus an optional
+// machine code and status, and deliberately no `message`: this value reaches the
+// durable run log and the operator console, where foreign prose can carry a
+// connection URL, a key or a fragment of the document that failed (CWE-532).
+const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
     // The base type, not each subclass: every CatalogReleaseError reports its
     // own `code`, so a refusal added later is mapped here without this function
     // being touched — and none of them can fall through to `unexpected_error`.
-    if (error instanceof CatalogReleaseError) {
+    if (isThrownInstanceOf(error, CatalogReleaseError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof DatabaseOriginError) {
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ManifestError) {
+    if (isThrownInstanceOf(error, ManifestError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ModelBudgetError) {
+    if (isThrownInstanceOf(error, ModelBudgetError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof CheckpointError) {
-        return { code: error.code, error: safeError(error) };
+    // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
+    // refusal names the stage holding the catalog graph and the mode it asked
+    // for, and those are what an operator acts on — see checkpointErrorFields
+    // for why they travel as data rather than inside the rendered sentence.
+    if (isThrownInstanceOf(error, CheckpointError)) {
+        return { code: error.code, error: safeError(error), detail: checkpointErrorFields(error) };
     }
-    if (error instanceof RateLimitConfigError) {
+    if (isThrownInstanceOf(error, RateLimitConfigError)) {
         return { code: 'rate_limit_misconfigured', error: safeError(error) };
     }
     return { code: 'unexpected_error', error: safeError(error) };
@@ -2931,10 +4549,7 @@ const main = async (): Promise<number> => {
     const origin = classifyDatabaseOrigin(process.env.DATABASE_URL);
     logger.info('database_origin_accepted', {
         stage: STAGE,
-        originClass: origin.originClass,
-        host: origin.host,
-        database: origin.database,
-        reason: origin.reason,
+        ...originLogFields(origin),
     });
     logger.info('stage_invoked', {
         stage: STAGE,
@@ -3026,6 +4641,13 @@ if (require.main === module) {
                 stage: STAGE,
                 code: failure.code,
                 error: failure.error,
+                // Spread, not nested: these are typed facts about the failure
+                // (a run id, the stage holding the catalog graph, the mode it
+                // asked for), and they read as fields of the failure rather
+                // than as one opaque member. Absent for every failure that is
+                // not a stage-lock refusal, which is the only branch that
+                // supplies them.
+                ...failure.detail,
             });
             process.exit(1);
         });

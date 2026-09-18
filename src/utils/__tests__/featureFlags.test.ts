@@ -12,6 +12,19 @@ const MANAGED_KEYS: (keyof FlagEnv)[] = ['MEAL_PLANNING_ENABLED', 'MEAL_PLANNING
 
 const ACTION_TYPES: MealPlanningActionType[] = ['generate', 'regenerate', 'swap', 'log'];
 
+/**
+ * The answer a write that has just committed produces, and the shape every case
+ * in this file that is not about a replay passes.
+ *
+ * Spelt as two named constants rather than inline literals because the third
+ * argument is the whole content of one of this predicate's two rules: the
+ * ambient switch withholds a fresh answer and never a stored one.
+ */
+const FRESH_COMMIT = { replayed: false } as const;
+
+/** The answer a same-key retry produces, served from the stored ledger row. */
+const STORED_REPLAY = { replayed: true } as const;
+
 const INVALID_FAULT_MESSAGE = 'MEAL_PLANNING_FAULT must be one of off | generation | swap | log; received';
 
 // Every case below rewrites the environment this module reads at import, and
@@ -175,18 +188,18 @@ describe('mealPlanningFault', () => {
 
 describe('postCommitAbort — the log fault', () => {
     it.each(['test', 'development'])(
-        'aborts a log write whenever the fault is log, including under NODE_ENV=%s',
+        'aborts a freshly committed log write whenever the fault is log, including under NODE_ENV=%s',
         (nodeEnv) => {
             const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: nodeEnv });
 
-            expect(flags.postCommitAbort('log', undefined)).toBe(true);
+            expect(flags.postCommitAbort('log', undefined, FRESH_COMMIT)).toBe(true);
         },
     );
 
     it('is inert in production even when the fault says log', () => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: 'production' });
 
-        expect(flags.postCommitAbort('log', undefined)).toBe(false);
+        expect(flags.postCommitAbort('log', undefined, FRESH_COMMIT)).toBe(false);
     });
 
     it.each<[MealPlanningActionType]>([['generate'], ['regenerate'], ['swap']])(
@@ -194,28 +207,45 @@ describe('postCommitAbort — the log fault', () => {
         (actionType) => {
             const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: 'test' });
 
-            expect(flags.postCommitAbort(actionType, undefined)).toBe(false);
+            expect(flags.postCommitAbort(actionType, undefined, FRESH_COMMIT)).toBe(false);
         },
     );
 
     it('does not abort a log write when another fault is selected', () => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'generation', NODE_ENV: 'test' });
 
-        expect(flags.postCommitAbort('log', undefined)).toBe(false);
+        expect(flags.postCommitAbort('log', undefined, FRESH_COMMIT)).toBe(false);
     });
+
+    it.each(['test', 'development'])(
+        'is ONE-SHOT under NODE_ENV=%s: it withholds the fresh commit and delivers the stored replay',
+        (nodeEnv) => {
+            // The pair, asserted together, because either half alone is
+            // satisfied by a predicate that ignores the answer. AAP §0.9.4 arms
+            // this switch so a device reaches the unconfirmed-outcome state on
+            // the first tap AND resolves it on the retry — "the same-key retry
+            // must return the committed 201" — so a switch that also dropped
+            // the replay would leave that device stuck until the server's
+            // environment was edited.
+            const flags = loadFlags({ MEAL_PLANNING_FAULT: 'log', NODE_ENV: nodeEnv });
+
+            expect(flags.postCommitAbort('log', undefined, FRESH_COMMIT)).toBe(true);
+            expect(flags.postCommitAbort('log', undefined, STORED_REPLAY)).toBe(false);
+        },
+    );
 });
 
 describe('postCommitAbort — the request header', () => {
     it.each(ACTION_TYPES)('honours a header naming the %s action under NODE_ENV=test', (actionType) => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
 
-        expect(flags.postCommitAbort(actionType, actionType)).toBe(true);
+        expect(flags.postCommitAbort(actionType, actionType, FRESH_COMMIT)).toBe(true);
     });
 
     it('trims the header before comparing it, unlike the MEAL_PLANNING_ENABLED opt-in', () => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
 
-        expect(flags.postCommitAbort('log', ' log ')).toBe(true);
+        expect(flags.postCommitAbort('log', ' log ', FRESH_COMMIT)).toBe(true);
     });
 
     it.each<[string, MealPlanningActionType, string]>([
@@ -226,7 +256,7 @@ describe('postCommitAbort — the request header', () => {
     ])('refuses a header that %s, even under NODE_ENV=test', (_case, actionType, headerValue) => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
 
-        expect(flags.postCommitAbort(actionType, headerValue)).toBe(false);
+        expect(flags.postCommitAbort(actionType, headerValue, FRESH_COMMIT)).toBe(false);
     });
 
     it.each([
@@ -239,7 +269,7 @@ describe('postCommitAbort — the request header', () => {
     ])('ignores %s, so only a string can trip the seam', (_case, headerValue) => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
 
-        expect(flags.postCommitAbort('log', headerValue)).toBe(false);
+        expect(flags.postCommitAbort('log', headerValue, FRESH_COMMIT)).toBe(false);
     });
 
     it.each(['development', 'production'])(
@@ -247,16 +277,39 @@ describe('postCommitAbort — the request header', () => {
         (nodeEnv) => {
             const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: nodeEnv });
 
-            expect(flags.postCommitAbort('log', 'log')).toBe(false);
-            expect(flags.postCommitAbort('swap', 'swap')).toBe(false);
+            expect(flags.postCommitAbort('log', 'log', FRESH_COMMIT)).toBe(false);
+            expect(flags.postCommitAbort('swap', 'swap', FRESH_COMMIT)).toBe(false);
         },
     );
 
     it('never reads the header when NODE_ENV is unset', () => {
         const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: undefined });
 
-        expect(flags.postCommitAbort('log', 'log')).toBe(false);
+        expect(flags.postCommitAbort('log', 'log', FRESH_COMMIT)).toBe(false);
     });
+
+    it.each(ACTION_TYPES)(
+        'honours a header naming the %s action even for a stored replay, unlike the ambient switch',
+        (actionType) => {
+            // The asymmetry, pinned so it cannot be "harmonised" away: the
+            // header is a per-request instruction, so it drops exactly the
+            // response it was sent with — which is how a suite exercises a LOST
+            // REPLAY and proves it is still recoverable. The one-shot rule
+            // belongs to the ambient switch alone.
+            const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: 'test' });
+
+            expect(flags.postCommitAbort(actionType, actionType, STORED_REPLAY)).toBe(true);
+        },
+    );
+
+    it.each(['development', 'production'])(
+        'still refuses a replay-dropping header under NODE_ENV=%s, where the header is never read',
+        (nodeEnv) => {
+            const flags = loadFlags({ MEAL_PLANNING_FAULT: 'off', NODE_ENV: nodeEnv });
+
+            expect(flags.postCommitAbort('log', 'log', STORED_REPLAY)).toBe(false);
+        },
+    );
 });
 
 describe('POST_COMMIT_ABORT_HEADER', () => {

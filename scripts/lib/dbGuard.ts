@@ -9,27 +9,54 @@
 // reference data (Agent Action Plan §0.5.1 records them as the only
 // authenticated reads without a tenant predicate). That exemption removes the
 // per-row guarantee, so this module reinstates it one level up, per process: an
-// unowned write can only ever land in a database the rules below recognise, and
-// the two scripts that could populate a shared environment — `catalog-load` and
-// `recipes-seed` — proceed without a human typing that database's name after
-// `--confirm-target` only when the database's own NAME says development (a
-// `_dev` suffix, with or without a clone index, on a local host). A local
-// database that is development by its HOST ALONE — every deployment database a
-// release can reach, because it is reachable only over loopback from the
-// deployment host — has a name that says nothing about it, so both writers
-// demand the typed name there too (see evaluateScriptDatabase). `seed-dev` is
-// the one script here that writes user-scoped rows, which is exactly what §5.1
-// protects, so it gets no confirmation door at all.
+// unowned write can only ever land in a database the rules below recognise.
+//
+// FOUR RULES DECIDE EVERY RUN, and the first two admit no exception:
+//
+//   1. An origin this module cannot classify is refused. Every recognised class
+//      requires a LOCAL host, so a `_dev`, `_test` or `_shadow` name on a
+//      remote host is `unknown` and no flag reaches it.
+//   2. The SHADOW database is refused to every script. Prisma's schema tooling
+//      resets it, so nothing of value may live there and nothing may write
+//      there (§0.4.4). `evaluateShadowDatabase` at the foot of this file is its
+//      mirror: the schema tooling may address a shadow database and nothing
+//      else.
+//   3. A database that is development by its HOST ALONE is not a licence. The
+//      host arm of the development class covers every database answering on
+//      loopback — a deployment database reached through an SSH tunnel or a
+//      published container port included — so only a database whose own NAME
+//      says development (a `_dev` suffix, with or without a clone index, on a
+//      local host) is treated as one. `seed-dev`, which writes user-scoped rows
+//      and deletes them with `--reset-user` (exactly what §5.1 protects),
+//      requires that and has no confirmation door. The four stages that MUTATE
+//      shared catalog data require it or a `_test` database, and have no door
+//      either: reviewed catalog data reaches a shared environment through
+//      `catalog-load`.
+//   4. `catalog-load` and `recipes-seed` — the two writers §0.7.5 does point at
+//      a deployment database — proceed without a human typing that database's
+//      name after `--confirm-target` only under rule 3's licence; anywhere else
+//      the typed name is required.
+//
+// A URL must also DETERMINE ITS OWN TARGET, in four ways: no connection
+// parameter that moves the server or the database, no percent-escape in the
+// database name, an authority that names a host, and no parameter that
+// redirects the SCHEMA an unqualified statement resolves in (measured, see
+// SCHEMA_REDIRECTING_PARAMS — `?options=-c search_path=…` made a legitimate
+// `_test` URL resolve its tables in another schema of that database under both
+// connectors this repository uses).
 //
 // Nothing in this file opens a connection or reads a credential. It imports only
 // ./logger (deliberately not Prisma — the whole point is to be safe to load
 // before any client exists), classifies the DATABASE_URL it is handed, and
 // refuses. The URL value itself is never logged, thrown or interpolated: its
-// userinfo carries the database password (.env.example:2), so only the parsed
-// host, the database name and the resulting classification ever reach a log.
+// userinfo carries the database password (.env.example:2), and the parsed host
+// and database name do not reach a log either — {@link originLogFields} is the
+// one shape an origin is reported in, and it carries the classification, the
+// fixed reason and an opaque digest of the target instead (see the reasoning
+// there).
 
-import { createFatalLogger, describeMissingEnv, safeError } from './logger';
-import type { ScriptLogger } from './logger';
+import { createFatalLogger, describeMissingEnv, isThrownInstanceOf, opaqueDigest, safeError } from './logger';
+import type { LogFields, ScriptLogger } from './logger';
 
 export type DatabaseOriginClass = 'development' | 'test' | 'shadow' | 'unknown';
 
@@ -72,7 +99,70 @@ export interface DatabaseOrigin {
     reason: string;
 }
 
-export type ScriptDatabasePolicy = 'development_only' | 'development_or_confirmed' | 'any_recognised';
+/**
+ * THE ONE SHAPE AN ORIGIN IS REPORTED IN — by this module's own two log lines
+ * and by all nine stage entry points, which is what keeps a terminal, a CI log
+ * and a committed report from disagreeing about what a run is allowed to say
+ * about its target.
+ *
+ * WHAT IS IN IT, AND WHY NOT THE HOST AND THE DATABASE NAME. The classification
+ * is the fact a reader needs — `development`, `test`, `shadow` — together with
+ * WHICH half of the rule certified it and the fixed `reason` phrase naming that
+ * rule. The host and the database name were also being logged, and they are
+ * infrastructure topology: a stage log is read in a terminal, retained by CI and
+ * copied into `catalog_import_runs.log` and the committed report artefacts, so
+ * every run was publishing the name and address of an internal database to all
+ * three (CWE-532). Neither value decides anything a reader acts on — the policy
+ * decision is already in `originClass`/`match`, and the refusal path carries a
+ * `code` — so they are replaced by a digest.
+ *
+ * `targetDigest` is one-way (see {@link opaqueDigest}) and answers exactly one
+ * question: were two runs pointed at the same database. An operator who needs
+ * to know WHICH database computes the digest from their own `DATABASE_URL`;
+ * nothing in the log discloses it. The `host`/`database` fields the origin
+ * carries remain available to callers that must ACT on them — the confirmation
+ * flag compares `--confirm-target` against `origin.database` — because acting
+ * on a value in memory is not the same as printing it.
+ */
+export const originLogFields = (origin: DatabaseOrigin): LogFields => ({
+    originClass: origin.originClass,
+    // Stated as the policy reads it rather than as the field spells it: an
+    // absent `match` is treated as `'host'` everywhere in this module (see
+    // DatabaseOrigin), so reporting it as absent would describe a different
+    // origin from the one that was evaluated.
+    match: origin.match ?? 'host',
+    reason: origin.reason,
+    targetDigest: opaqueDigest(`${origin.host}/${origin.database}`),
+});
+
+/**
+ * What a script is allowed to address, from strictest to most permissive. Every
+ * one of them is additionally gated by two rules that no policy can waive: an
+ * origin this module cannot classify is refused, and a `shadow` origin is
+ * refused (see `evaluateScriptDatabase`).
+ *
+ *   `development_only`          A database whose own NAME says development, on a
+ *                               local host. No confirmation flag exists, and
+ *                               "development by its host alone" is not enough.
+ *                               For a script that writes user-scoped rows.
+ *   `development_or_test`       The same, or a `test`-class database. No
+ *                               confirmation flag. For the build stages that
+ *                               MUTATE shared catalog data, which are produced
+ *                               on a development machine and installed
+ *                               elsewhere by `catalog-load`.
+ *   `development_or_confirmed`  Development by name needs nothing; any other
+ *                               recognised origin needs `--confirm-target
+ *                               <dbname>`. For the two writers that may be
+ *                               asked to populate a shared environment.
+ *   `read_only_recognised`      Any recognised origin, including one that is
+ *                               development by its host alone. For stages that
+ *                               only READ, so there is nothing to confirm.
+ */
+export type ScriptDatabasePolicy =
+    | 'development_only'
+    | 'development_or_test'
+    | 'development_or_confirmed'
+    | 'read_only_recognised';
 
 export type DatabaseGuardCode =
     | 'missing_database_url'
@@ -81,7 +171,13 @@ export type DatabaseGuardCode =
     | 'unrecognised_origin'
     | 'confirmation_required'
     | 'confirmation_mismatch'
-    | 'development_only';
+    | 'development_only'
+    // A pipeline script addressed the shadow database. Its own code rather than
+    // one of the two above, because no policy and no flag changes the answer.
+    | 'shadow_database'
+    // The mirror of it: the schema tooling addressed something that is NOT the
+    // shadow database (see evaluateShadowDatabase).
+    | 'shadow_required';
 
 // §8: a failure the caller must distinguish carries the data rather than a
 // string, following entitlement.service.ts's DailyQuotaError. `origin` travels
@@ -100,7 +196,14 @@ export class DatabaseOriginError extends Error {
 
 const DATABASE_URL_ENV = 'DATABASE_URL';
 
-const CONFIRM_TARGET_FLAG = '--confirm-target';
+/**
+ * The confirmation flag, exported because two modules must agree on it and
+ * only one of them parses it. `parseConfirmTarget` below reads it; the refusal
+ * messages here and in `src/__tests__/setup/testDb.ts`'s guarded recreate NAME
+ * it, and a message naming a flag the parser no longer recognises is a remedy
+ * that does not work. One spelling, so the two cannot drift apart.
+ */
+export const CONFIRM_TARGET_FLAG = '--confirm-target';
 
 // Hosts that can only be this machine or the container network beside it.
 // Exported because src/__tests__/setup/testDb.ts::assertTestDatabase builds its
@@ -247,6 +350,52 @@ export const CONNECTION_REDIRECTING_PARAMS: readonly string[] = [
     'servicefile',
 ];
 
+// The schema this repository's migrations write to, and the schema every
+// unqualified statement in these scripts and in the test harness is meant to
+// resolve in. Named once and exported, because the rule below decides on it and
+// src/__tests__/setup/testDb.ts qualifies its destructive statement with it.
+//
+// Measured rather than assumed: `npx prisma migrate deploy` against an empty
+// database puts all 33 tables in `public`, and `public` is the only non-system
+// schema the migrated database holds.
+export const DEFAULT_SCHEMA = 'public';
+
+// The SECOND way a query string can move the target, and the reason it needs a
+// list of its own: these parameters leave the server and the database exactly
+// where the URL displays them and move the SCHEMA an unqualified statement
+// resolves in. A guard that classified only the host and the database name
+// would pass such a URL — the name rules match, the host rules match — while
+// the connection resolved its tables somewhere else entirely.
+//
+// Measured against this repository's two connectors on PostgreSQL 16.15, with a
+// decoy `live` schema beside `public` inside a database this module classifies
+// `test`:
+//
+//   * `…/soh_test_34?schema=live` — Prisma reports `current_schema() = live`,
+//     and `$executeRawUnsafe('TRUNCATE TABLE "probe_rows" CASCADE')` emptied
+//     `live.probe_rows` while `public.probe_rows` was left untouched. (`pg`
+//     ignores the keyword; Prisma's PostgreSQL connector reads it and sets the
+//     session `search_path` from it.)
+//   * `…/soh_test_34?options=-c search_path=live` — BOTH connectors report
+//     `current_schema() = live`: the same unqualified `TRUNCATE` emptied the
+//     `live` copy under Prisma, and an unqualified `INSERT` under `pg` landed
+//     there. `options` is libpq's arbitrary-startup-settings keyword, and both
+//     pg-connection-string and Prisma forward it verbatim.
+//
+// So a `DATABASE_URL` wearing a legitimate `_test` name could make the suite's
+// own `TRUNCATE … CASCADE` destroy a different schema of that database — which
+// for a deployment keeping its tables outside `public` is its data. Both keys
+// therefore make the origin unclassifiable, with the one no-op exception
+// findSchemaRedirectingParams records.
+//
+// `search_path` is in the list although neither connector honours it as a URL
+// parameter: it is the spelling an operator reaches for, and a URL carrying it
+// is a URL whose author intended a redirect. Refusing it costs nothing that
+// works today and says so explicitly.
+//
+// Only the parameter NAMES are ever reported, for the same reason as above.
+export const SCHEMA_REDIRECTING_PARAMS: readonly string[] = ['schema', 'options', 'search_path'];
+
 const RECOGNISED_ORIGIN_CLASSES = 'development, test or shadow';
 
 // Reused as identity in evaluateScriptDatabase, which is how an `unknown`
@@ -260,8 +409,16 @@ const REASON_UNPARSABLE_DATABASE_URL = `${DATABASE_URL_ENV} could not be parsed`
 // operator-facing message without re-parsing the URL.
 const REASON_CONNECTION_PARAMS_PREFIX = `${DATABASE_URL_ENV} query string sets connection parameters: `;
 
+// The schema half of the same shape, and a prefix for the same reason: the
+// matched names are appended and they are fixed constants, never operator
+// values.
+const REASON_SCHEMA_PARAMS_PREFIX = `${DATABASE_URL_ENV} query string redirects the schema: `;
+
 const describeConnectionRedirectingParams = (params: readonly string[]): string =>
     `${REASON_CONNECTION_PARAMS_PREFIX}${params.join(', ')}`;
+
+const describeSchemaRedirectingParams = (params: readonly string[]): string =>
+    `${REASON_SCHEMA_PARAMS_PREFIX}${params.join(', ')}`;
 
 // The other way a URL can fail to name its own target, and the reason it gets a
 // refusal of its own rather than falling through to the generic one:
@@ -297,13 +454,28 @@ const REASON_DEVELOPMENT_HOST = 'host is a development host';
 const REASON_NO_RULE_MATCHED =
     'the database name matches no recognised rule on this host and the host is not a development host';
 
-// The development rule in one phrase, defined once because two operator-facing
-// refusals quote it and a rule described two ways is a rule an operator has to
-// guess at. Both arms carry their host requirement, so neither reading suggests
-// that a `_dev` name travels.
-const DEVELOPMENT_ORIGIN_DESCRIPTION =
-    `host ${DEVELOPMENT_HOSTS.join(' or ')}, or a name ending ${DEVELOPMENT_DATABASE_SUFFIX} ` +
+// The development LICENCE in one phrase, defined once because three
+// operator-facing refusals quote it and a rule described three ways is a rule
+// an operator has to guess at.
+//
+// It is deliberately the NARROWER of the development class's two arms. The
+// class is "host localhost or 127.0.0.1, or a `_dev` name on a local host"
+// (classifyDatabaseOrigin), and it used to be what every development-only
+// refusal quoted — but the host arm is not a licence to write anything: it
+// covers every database that happens to answer on loopback, a deployment
+// database reached through a tunnel or a published container port included.
+// Only a NAME is evidence that a database was made for development, so only a
+// name appears here.
+const DEVELOPMENT_BY_NAME_DESCRIPTION =
+    `a database name ending ${DEVELOPMENT_DATABASE_SUFFIX}, with or without a clone index, ` +
     `on host ${LOCAL_HOSTS.join(', ')}`;
+
+// Why the host arm on its own is never that licence. One sentence, quoted by
+// every refusal that turns on the distinction, so the three of them cannot
+// describe the same fact three ways.
+const DEVELOPMENT_BY_HOST_ALONE_CLAUSE =
+    'is development by its host alone: its name matches no recognised rule, so nothing distinguishes it ' +
+    'from a deployment database reached over loopback';
 
 // The sentence an operator needs when a remote database wearing a recognised
 // name is refused. Without it the `unrecognised_origin` message names the three
@@ -316,6 +488,9 @@ const LOCAL_ORIGIN_REQUIREMENT =
 export const SCRIPT_DATABASE_POLICIES: Readonly<Record<string, ScriptDatabasePolicy>> = {
     // The loader is the only sanctioned way to populate a shared environment
     // with catalog data, so it keeps a door — guarded by an explicit flag.
+    // Agent Action Plan §0.7.5 publishes that as the release step: run on the
+    // deployment host, read the target back, and pass `--confirm-target` to
+    // both writers.
     'catalog-load': 'development_or_confirmed',
     'recipes-seed': 'development_or_confirmed',
     // Writes user-scoped rows, so there is no door to open. The wording the
@@ -323,14 +498,37 @@ export const SCRIPT_DATABASE_POLICIES: Readonly<Record<string, ScriptDatabasePol
     // DEVELOPMENT_ONLY_RATIONALES below, so the reason an operator reads and the
     // reason recorded beside the policy cannot drift apart.
     'seed-dev': 'development_only',
-    // Development-machine pipeline stages. They still must never address an
-    // origin this module cannot classify.
-    'catalog-import-usda': 'any_recognised',
-    'catalog-generate-ai': 'any_recognised',
-    'catalog-validate': 'any_recognised',
-    'catalog-report': 'any_recognised',
-    'catalog-release': 'any_recognised',
-    'search-benchmark': 'any_recognised',
+    // The four stages that BUILD catalog data, and they mutate: the first three
+    // write catalog_foods and its children, and `catalog-release` opens and
+    // closes a `catalog_import_runs` ledger row around its export. They are
+    // development-machine stages by design — §0.7.5 states it as a rule of the
+    // release ("Regenerating the catalog from vendor/model output on a target
+    // environment is never part of a release: a new version is produced on a
+    // development machine, reviewed … in a pull request, and loaded the same
+    // way") — so they get `development_or_test` and NO confirmation door.
+    //
+    // The door is what is deliberately absent. Under the older
+    // `any_recognised` setting each of these four would mutate any origin the
+    // module could classify, and a deployment database reached over loopback
+    // classifies `development` on its host alone: a pipeline pointed at one
+    // would have rewritten its catalog rows with candidate data and opened
+    // ledger rows in it, with nothing to type and nothing to read back. There
+    // is no flag here because there is no legitimate invocation to unlock —
+    // reviewed catalog data reaches a shared environment through
+    // `catalog-load`, whose door exists for exactly that.
+    'catalog-import-usda': 'development_or_test',
+    'catalog-generate-ai': 'development_or_test',
+    'catalog-validate': 'development_or_test',
+    'catalog-release': 'development_or_test',
+    // Read-only stages: `catalog-report`'s Prisma surface declares `findMany`
+    // and nothing else, and `search-benchmark` issues `$queryRawUnsafe`
+    // SELECTs. They keep the widest policy because there is nothing for a
+    // confirmation to protect, and because §0.7.5's release order runs
+    // `search:benchmark` ON the deployment host to record that environment's
+    // own report — a loopback origin that is development by its host alone,
+    // which is precisely what this policy admits and the two above do not.
+    'catalog-report': 'read_only_recognised',
+    'search-benchmark': 'read_only_recognised',
 };
 
 // A script name absent from the table is a caller mistake, and a mistake must
@@ -463,6 +661,65 @@ export const findConnectionRedirectingParams = (databaseUrl: string): string[] =
 };
 
 /**
+ * Which SCHEMA_REDIRECTING_PARAMS the URL carries, in that list's fixed order
+ * so the answer and the message built from it are deterministic — minus the one
+ * value that redirects nothing.
+ *
+ * THE ONE EXCEPTION is `schema=public`: it names the schema everything here
+ * already resolves in, so accepting it refuses nothing real, and it is what a
+ * Prisma-generated `.env` commonly spells out. It is also, strictly, narrower
+ * than the default — PostgreSQL's default `search_path` is `"$user", public`,
+ * and Prisma sets `public` alone — so accepting it cannot widen what a
+ * statement reaches. Every OTHER value of `schema` is reported, and `options`
+ * and `search_path` are reported by PRESENCE: `options` carries arbitrary
+ * startup settings and there is no subset of them worth parsing for safety.
+ *
+ * Keys are compared case-insensitively and after percent-decoding, exactly as
+ * findConnectionRedirectingParams compares them, because `?SCHEMA=` and
+ * `?%73chema=` are the same parameter to a connector that lower-cases its
+ * keywords, and `?options=-c%20search_path%3Dlive` is the form an operator
+ * actually writes.
+ *
+ * The VALUE comparison is exact and case-sensitive: PostgreSQL schema names are
+ * case-sensitive and Prisma quotes the value it is handed, so `PUBLIC` is a
+ * different schema and is reported. A repeated key must be `public` in EVERY
+ * occurrence (`?schema=public&schema=live` is reported), which is the
+ * fail-closed reading of a URL that names two schemas.
+ *
+ * An unparsable URL yields `[]`: parseDatabaseUrl already refuses it as
+ * `unparsable_database_url`.
+ */
+export const findSchemaRedirectingParams = (databaseUrl: string): string[] => {
+    let parsed: URL;
+    try {
+        parsed = new URL(databaseUrl);
+    } catch {
+        return [];
+    }
+
+    const values = new Map<string, string[]>();
+    parsed.searchParams.forEach((value, key) => {
+        const parameter = key.trim().toLowerCase();
+        const seen = values.get(parameter);
+        if (seen === undefined) {
+            values.set(parameter, [value]);
+        } else {
+            seen.push(value);
+        }
+    });
+
+    return SCHEMA_REDIRECTING_PARAMS.filter((parameter) => {
+        const carried = values.get(parameter);
+        if (carried === undefined) {
+            return false;
+        }
+        // `schema` redirects unless every occurrence names the schema this
+        // repository already uses; the other two redirect by being there.
+        return parameter !== 'schema' || carried.some((value) => value !== DEFAULT_SCHEMA);
+    });
+};
+
+/**
  * Whether the URL's database name carries a percent escape, which makes the
  * name unclassifiable rather than merely odd.
  *
@@ -517,7 +774,8 @@ export const isLocalDatabaseHost = (host: string): boolean => LOCAL_HOSTS.includ
 // convention, not a property of the server, so `…@prod.example.com/app_test`
 // is a production database wearing a test name. Gating both halves of this
 // rule on LOCAL_HOSTS keeps such an origin `unknown`, which every policy —
-// including `any_recognised` — refuses. The clone-indexed spelling is a naming
+// including the most permissive, `read_only_recognised` — refuses, because
+// `unknown` is rejected before any policy is consulted. The clone-indexed spelling is a naming
 // convention in exactly the same way, so it is gated identically:
 // `…@prod.example.com/app_test_38` stays `unknown` too.
 export const isTestDatabaseOrigin = (target: DatabaseTarget): boolean =>
@@ -556,7 +814,8 @@ export const isShadowDatabaseOrigin = (target: DatabaseTarget): boolean =>
 // narrowing further would refuse a compose-stack database that no finding is
 // about. The change is therefore purely acceptance-REMOVING: a remote `_dev`
 // name now matches no rule, falls through to `unknown`, and is refused by every
-// policy including `any_recognised` — `--confirm-target` cannot reach it either,
+// policy including the most permissive one, `read_only_recognised` —
+// `--confirm-target` cannot reach it either,
 // because an unclassifiable origin is refused before any policy is consulted.
 export const isDevelopmentDatabaseOrigin = (target: DatabaseTarget): boolean =>
     isLocalDatabaseHost(target.host) && isDevelopmentDatabaseName(target.database);
@@ -612,6 +871,32 @@ export const classifyDatabaseOrigin = (databaseUrl: string | undefined): Databas
     // target the URL does fix.
     if (host.length === 0) {
         return { originClass: 'unknown', host: '', database, reason: REASON_NO_HOST };
+    }
+
+    // The FOURTH form, and the last of them: the server and the database are
+    // determined, and the SCHEMA an unqualified statement would resolve in is
+    // not. It is checked last of the four because it is the narrowest — a URL
+    // that also redirects its server, hides its host or encodes its database
+    // name is reported by the more fundamental fault — and it is checked BEFORE
+    // every name rule because a redirected schema must never reach a recognised
+    // class: `…@127.0.0.1/soh_test_34?options=-c search_path=live` matches the
+    // `_test` name rule and the local-host rule exactly, and is the URL that
+    // made the suite's own `TRUNCATE` destroy another schema of that database
+    // (see SCHEMA_REDIRECTING_PARAMS for the measurement).
+    //
+    // Host and database ARE carried into this origin, unlike the first two
+    // forms where the pair would be a guess: here the pair is accurate and the
+    // tables are what is in doubt, and the message built from this reason says
+    // so — an operator reading `database "soh_test_34" on host "127.0.0.1"`
+    // has to be told the schema is the part that disqualified it.
+    const schemaParams = findSchemaRedirectingParams(databaseUrl);
+    if (schemaParams.length > 0) {
+        return {
+            originClass: 'unknown',
+            host,
+            database,
+            reason: describeSchemaRedirectingParams(schemaParams),
+        };
     }
 
     // NAME BEFORE HOST — this order is a decision, not an accident, and must not
@@ -735,12 +1020,12 @@ export const evaluateScriptDatabase = (input: {
                 message: `${script} cannot read ${DATABASE_URL_ENV}: it is not a connection URL naming a database.`,
             };
         }
-        // All three "the URL does not determine its own target" reasons —
-        // an encoded database name, a redirecting query parameter, and a URL
-        // with no host — share the `ambiguous_database_url` code, because in
-        // each the URL parses and the origin is not unrecognised, it is
-        // undetermined. Each keeps its own message: the operator fixes the
-        // three differently.
+        // All four "the URL does not determine its own target" reasons — an
+        // encoded database name, a URL with no host, a schema-redirecting query
+        // parameter and a connection-redirecting one — share the
+        // `ambiguous_database_url` code, because in each the URL parses and the
+        // origin is not unrecognised, it is undetermined. Each keeps its own
+        // message: the operator fixes the four differently.
         if (origin.reason === REASON_ENCODED_NAME) {
             return {
                 allowed: false,
@@ -760,6 +1045,23 @@ export const evaluateScriptDatabase = (input: {
                     `${script} cannot classify ${DATABASE_URL_ENV}: it names no host, so the server would ` +
                     'come from the environment (PGHOST/PGSERVICE) or a default socket rather than from the ' +
                     `URL. Set ${DATABASE_URL_ENV} to a URL naming both the host and the database.`,
+            };
+        }
+        // Prefix match for the same reason as the connection-parameter branch
+        // below, and its own message because the operator fixes it differently:
+        // the database in the URL is the right one and the schema keyword is
+        // what has to go.
+        if (origin.reason.startsWith(REASON_SCHEMA_PARAMS_PREFIX)) {
+            const parameters = origin.reason.slice(REASON_SCHEMA_PARAMS_PREFIX.length);
+            return {
+                allowed: false,
+                code: 'ambiguous_database_url',
+                message:
+                    `${script} cannot classify ${DATABASE_URL_ENV}: it names ${target}, but its query ` +
+                    `string moves the schema an unqualified statement would resolve in (${parameters}), so ` +
+                    'the tables it would read and write are not this database\'s ' +
+                    `${DEFAULT_SCHEMA} tables. Remove ${parameters} from ${DATABASE_URL_ENV}; the ` +
+                    `${DEFAULT_SCHEMA} schema is the one this repository's migrations create.`,
             };
         }
         // Prefix match, because this reason carries the matched parameter names
@@ -785,53 +1087,129 @@ export const evaluateScriptDatabase = (input: {
         };
     }
 
-    if (policy === 'development_only' && origin.originClass !== 'development') {
+    // THE SHADOW DATABASE IS REFUSED FOR EVERY SCRIPT, ahead of every policy
+    // and every flag.
+    //
+    // It is a recognised class, so `any_recognised` used to accept it and the
+    // confirmation door used to open it — which contradicted the contract the
+    // class exists to express. `SHADOW_DATABASE_URL` belongs to Prisma's schema
+    // tooling, reached through `scripts/schema-diff.ts`: `migrate diff
+    // --from-migrations` RESETS the database that variable names (measured — a
+    // shadow database carrying an operator's table came back with that table
+    // dropped and the command still exited 2), while `migrate dev
+    // --create-only` ignores the variable and resets a temporary shadow
+    // database of its own on the `DATABASE_URL` server instead (the block at
+    // the foot of this file has the measurements). §0.4.4 says of the shadow
+    // database: "Nothing of value may live here, and no other command reads
+    // it". A stage that wrote catalog rows, a release ledger row or a
+    // development user into it would be writing rows whose next reader is a
+    // schema replay that destroys them — and, worse for the operator, it would
+    // look like a successful run.
+    //
+    // Refusing it here rather than per policy is deliberate: a policy is a
+    // statement about how much privilege a script needs, and none of them needs
+    // this. `evaluateShadowDatabase` is the mirror — the only entry point
+    // allowed to address a shadow database is the schema tooling, and it is
+    // refused everything else.
+    if (origin.originClass === 'shadow') {
+        return {
+            allowed: false,
+            code: 'shadow_database',
+            message:
+                `${script} refuses to run against the shadow ${target}. The shadow database belongs to ` +
+                'Prisma\'s schema tooling, which RESETS it (`migrate diff --from-migrations`, through ' +
+                'scripts/schema-diff.ts), so nothing of value may live in it. No policy and no ' +
+                `${CONFIRM_TARGET_FLAG} opens it: point ${DATABASE_URL_ENV} at a development or test ` +
+                'database instead.',
+        };
+    }
+
+    // WHETHER THE DATABASE'S OWN NAME SAID DEVELOPMENT. `origin.match ===
+    // 'name'` is the whole test, and it is deliberately not `originClass ===
+    // 'development'`: the host arm hands that class to every database answering
+    // on loopback, which is exactly how a deployment database is reached during
+    // a release (release-and-recovery.md step 4 — a remote host is `unknown`
+    // and refused above, so loopback is the only shape a release can use).
+    //
+    // Three policies turn on this one value, which is why it is computed once,
+    // here, above all of them.
+    //
+    // FAIL CLOSED on an absent `match`. The field is optional (see
+    // DatabaseOrigin), so a caller-built origin can omit it; omission is read
+    // as `'host'` — the stricter arm — because the alternative would let the
+    // strictest case be waived by leaving a field out.
+    const developmentByName = origin.originClass === 'development' && origin.match === 'name';
+
+    // `development_only` reads that value too, and this is the correction that
+    // matters most in this file. It used to accept the CLASS: any database
+    // answering on loopback was `development`, so `seed-dev` would write its
+    // user-scoped rows into — and `--reset-user` would DELETE a user and
+    // everything cascading from it out of — a deployment database reached
+    // through an SSH tunnel or a published container port, with no flag to
+    // type, nothing to read back, and a log line calling the target
+    // "development". A name is the only evidence this module has that a
+    // database was made for development, so a name is what it now requires.
+    //
+    // There is still no door. §0.7.1 gives `seed-dev` none because it writes
+    // user-scoped rows (Rule backend-architecture §5.1), and adding one here to
+    // soften the refusal would be the same mistake in the other direction.
+    if (policy === 'development_only' && !developmentByName) {
         return {
             allowed: false,
             code: 'development_only',
             message:
-                `${describeDevelopmentOnlyPolicy(script)} (${DEVELOPMENT_ORIGIN_DESCRIPTION}); ` +
-                `${target} is ${origin.originClass}. There is no confirmation flag for this script.`,
+                `${describeDevelopmentOnlyPolicy(script)} (${DEVELOPMENT_BY_NAME_DESCRIPTION}); ` +
+                (origin.originClass === 'development'
+                    ? `${target} ${DEVELOPMENT_BY_HOST_ALONE_CLAUSE}.`
+                    : `${target} is ${origin.originClass}.`) +
+                ' There is no confirmation flag for this script.',
         };
     }
 
-    // The confirmation door, and the one thing it turns on: whether the
-    // database's own NAME said development. `origin.match === 'name'` is the
-    // whole test, and it is deliberately not `originClass === 'development'`:
-    // the host arm hands that class to every database answering on loopback,
-    // which is exactly how a deployment database is reached during a release
-    // (release-and-recovery.md step 4 — a remote host is `unknown` and refused
-    // above, so loopback is the only shape a release can use). Under the older
-    // reading this branch was skipped for such a database, and both writers
-    // wrote it with no confirmation demanded while accepting and ignoring
-    // `--confirm-target`, which is not what §0.7.1 states the guard is for:
-    // "no load or seed can run against a non-development one without a human
-    // typing its name".
-    //
-    // FAIL CLOSED on an absent `match`. The field is optional (see
-    // DatabaseOrigin), so a caller-built origin can omit it; omission is read
-    // as `'host'` — confirmation required — because the alternative would let
-    // the strictest case be waived by leaving a field out.
-    const developmentByName = origin.originClass === 'development' && origin.match === 'name';
+    // The mutating build stages: development by name, or a test database, and
+    // nothing else. `test` is admitted because it is what the §0.9.1 gates run
+    // these stages against — a disposable database the harness already owns —
+    // and because a database named `_test` on a local host is a database
+    // somebody made to be emptied. Everything a `development_or_test` refusal
+    // can reach here is therefore the host arm, so the message names that case
+    // and the one legitimate route out of it.
+    if (policy === 'development_or_test' && !developmentByName && origin.originClass !== 'test') {
+        return {
+            allowed: false,
+            code: 'development_only',
+            message:
+                `${script} builds shared catalog data, so it runs against ${DEVELOPMENT_BY_NAME_DESCRIPTION} ` +
+                `or a ${TEST_DATABASE_SUFFIX} database on a local host; ${target} ` +
+                `${DEVELOPMENT_BY_HOST_ALONE_CLAUSE}. There is no confirmation flag for this script: build ` +
+                'the catalog on a development machine, review the release, and install it with ' +
+                'catalog-load, which is the stage that carries a door.',
+        };
+    }
 
+    // The confirmation door. Under the older reading this branch was skipped
+    // for a loopback deployment database, and both writers wrote it with no
+    // confirmation demanded while accepting and ignoring `--confirm-target`,
+    // which is not what §0.7.1 states the guard is for: "no load or seed can
+    // run against a non-development one without a human typing its name".
     if (policy === 'development_or_confirmed' && !developmentByName) {
         if (confirmTarget === null) {
             return {
                 allowed: false,
                 code: 'confirmation_required',
                 // Two messages under one code, because the two cases are not
-                // the same news. A `test`/`shadow` origin is a database the
-                // guard can name the class of; a host-arm `development` one is
-                // a database it knows nothing about beyond where it answers,
-                // and an operator who has just been told the origin is
-                // "development" needs to read why that is not enough here.
-                // Both keep the literal `--confirm-target <database>` remedy.
+                // the same news. A `test` origin is a database the guard can
+                // name the class of; a host-arm `development` one is a database
+                // it knows nothing about beyond where it answers, and an
+                // operator who has just been told the origin is "development"
+                // needs to read why that is not enough here. Both keep the
+                // literal `--confirm-target <database>` remedy. (`shadow` is
+                // the third recognised class and cannot arrive here: it is
+                // refused for every script above.)
                 message:
                     origin.originClass === 'development'
-                        ? `${script} would write to ${target}, which is development by its host alone: its ` +
-                          'name matches no recognised rule, so nothing distinguishes it from a deployment ' +
-                          `database reached over loopback. Pass ${CONFIRM_TARGET_FLAG} ${origin.database} ` +
-                          'to confirm that is the database you mean.'
+                        ? `${script} would write to ${target}, which ${DEVELOPMENT_BY_HOST_ALONE_CLAUSE}. ` +
+                          `Pass ${CONFIRM_TARGET_FLAG} ${origin.database} to confirm that is the database ` +
+                          'you mean.'
                         : `${script} would write to the ${origin.originClass} ${target}: ` +
                           `pass ${CONFIRM_TARGET_FLAG} ${origin.database} to confirm.`,
             };
@@ -847,7 +1225,196 @@ export const evaluateScriptDatabase = (input: {
         }
     }
 
+    // Everything that reaches here is allowed, and for `read_only_recognised`
+    // that is the whole rule: a recognised origin — including one that is
+    // development by its host alone, which is what §0.7.5's release order
+    // points `search:benchmark` at — and no flag, because a stage that only
+    // reads has nothing to confirm. The two refusals every policy shares
+    // (`unknown` and `shadow`) are already behind us.
     return { allowed: true };
+};
+
+/* ---------------------------------------------------------------------------
+ * The other side of the shadow rule: the schema tooling, and only it.
+ *
+ * `evaluateScriptDatabase` above refuses a shadow origin to every pipeline
+ * script. That only tells half the story, because the two Prisma commands that
+ * DO belong there — `migrate diff --from-migrations` and `migrate dev
+ * --create-only` — were documented as raw command lines with nothing between an
+ * inherited, mistyped or stale value and a database Prisma resets. Measured: the
+ * diff dropped an operator table out of the database it was pointed at and still
+ * exited 2, reporting success.
+ *
+ * THE TWO COMMANDS DO NOT SHARE A TARGET, which is why they are not guarded
+ * through one variable. Measured against prisma 6.9.0:
+ *
+ *   `migrate diff --from-migrations` takes `--shadow-database-url` and RESETS
+ *   the database that flag names, so `SHADOW_DATABASE_URL` is its destructive
+ *   surface and `assertShadowDatabase` below is what validates it.
+ *
+ *   `migrate dev --create-only` has NO `--shadow-database-url` flag and
+ *   prisma/schema.prisma declares no `shadowDatabaseUrl` datasource field, so it
+ *   ignores `SHADOW_DATABASE_URL` entirely — it exited 0 with that variable
+ *   pointing at an unreachable host. What it actually does is create, replay and
+ *   drop a TEMPORARY shadow database on the `DATABASE_URL` server, and reset the
+ *   `DATABASE_URL` database itself if it finds drift. Its destructive surface is
+ *   therefore `DATABASE_URL`, held to `development_only` above — development by
+ *   NAME, on a local host — and validating the shadow variable for it would be a
+ *   guard on a value the command never reads.
+ *
+ * THE ONE POLICY, stated the same way here, in docs/meal-planning/README.md and
+ * in docs/meal-planning/release-and-recovery.md: `diff` validates the local
+ * shadow target; `create-only` validates `DATABASE_URL` as
+ * development-by-name; `catalog-load` and `recipes-seed` require an exact
+ * `--confirm-target` for host-only loopback targets.
+ *
+ * So the same classification runs on the shadow URL before the diff is invoked,
+ * in one place, with messages that name the variable actually at fault.
+ * `scripts/schema-diff.ts` is the only caller of both entry points: it asserts
+ * here (or through `evaluateScriptDatabase` in `create-only` mode), reads the
+ * target back over a connection, and only then spawns Prisma.
+ *
+ * The checks are spelled out rather than delegated to `evaluateScriptDatabase`
+ * because every message that function composes names `DATABASE_URL`, and an
+ * operator told to fix `DATABASE_URL` when `SHADOW_DATABASE_URL` is what is
+ * wrong has been sent to the wrong line of their `.env`. The RULES are not
+ * duplicated: every predicate below is the one this module already owns.
+ * ------------------------------------------------------------------------- */
+
+export const SHADOW_DATABASE_URL_ENV = 'SHADOW_DATABASE_URL';
+
+/**
+ * Whether `databaseUrl` may be handed to a Prisma command that resets it.
+ *
+ * `command` names the caller in the refusal (`schema-diff`, and the mode within
+ * it), and `urlEnvName` names the variable the value came from so the remedy
+ * points at the right place.
+ */
+export const evaluateShadowDatabase = (input: {
+    command: string;
+    databaseUrl: string | undefined;
+    urlEnvName?: string;
+}): { allowed: true; origin: DatabaseOrigin } | { allowed: false; code: DatabaseGuardCode; message: string } => {
+    const { command, databaseUrl } = input;
+    const urlEnvName = input.urlEnvName ?? SHADOW_DATABASE_URL_ENV;
+
+    if (databaseUrl === undefined || databaseUrl.trim().length === 0) {
+        return {
+            allowed: false,
+            code: 'missing_database_url',
+            message:
+                `${command} needs ${urlEnvName} to be set, and it is not. It must name a DISPOSABLE local ` +
+                `database whose name ends ${SHADOW_DATABASE_SUFFIX} (optionally with a clone index): the ` +
+                'command resets the database it is given.',
+        };
+    }
+
+    const parsed = parseDatabaseUrl(databaseUrl);
+    if (parsed === null) {
+        return {
+            allowed: false,
+            code: 'unparsable_database_url',
+            message: `${command} cannot read ${urlEnvName}: it is not a connection URL naming a database.`,
+        };
+    }
+
+    // Three of the four forms of "the URL does not determine its own target"
+    // the script guard refuses, through the same predicates: a redirecting
+    // connection parameter, an encoded database name and a redirecting schema
+    // parameter. The fourth — a URL naming no host — needs no check here,
+    // because `classifyDatabaseOrigin` below answers `unknown` for it and this
+    // function demands `shadow`. They matter more here than anywhere else in
+    // this module, because what follows a pass is a reset rather than a write.
+    const redirectingParams = findConnectionRedirectingParams(databaseUrl);
+    if (redirectingParams.length > 0) {
+        return {
+            allowed: false,
+            code: 'ambiguous_database_url',
+            message:
+                `${command} cannot classify ${urlEnvName}: its query string sets connection parameters ` +
+                `that can change the target (${redirectingParams.join(', ')}), so the database it would ` +
+                `RESET is not the one the URL displays. Point ${urlEnvName} directly at the database.`,
+        };
+    }
+
+    if (hasEncodedDatabaseName(databaseUrl)) {
+        return {
+            allowed: false,
+            code: 'ambiguous_database_url',
+            message:
+                `${command} cannot classify ${urlEnvName}: its database name "${parsed.database}" is ` +
+                'percent-encoded, and Prisma would open that name literally while other PostgreSQL clients ' +
+                `would decode it. Write the database name literally in ${urlEnvName}.`,
+        };
+    }
+
+    const schemaParams = findSchemaRedirectingParams(databaseUrl);
+    if (schemaParams.length > 0) {
+        return {
+            allowed: false,
+            code: 'ambiguous_database_url',
+            message:
+                `${command} cannot classify ${urlEnvName}: its query string redirects the schema ` +
+                `(${schemaParams.join(', ')}). The replay this command performs belongs in the ` +
+                `${DEFAULT_SCHEMA} schema of a disposable database; remove those parameters.`,
+        };
+    }
+
+    const origin = classifyDatabaseOrigin(databaseUrl);
+    if (origin.originClass !== 'shadow') {
+        return {
+            allowed: false,
+            code: 'shadow_required',
+            message:
+                `${command} refuses to use database "${parsed.database}" on host "${parsed.host}" as a ` +
+                `shadow database: it classified as ${origin.originClass} (${origin.reason}). Prisma RESETS ` +
+                `the shadow database, so ${urlEnvName} must name one made to be thrown away — a name ending ` +
+                `${SHADOW_DATABASE_SUFFIX}, with or without a clone index, on host ${LOCAL_HOSTS.join(', ')}.`,
+        };
+    }
+
+    return { allowed: true, origin };
+};
+
+/**
+ * `evaluateShadowDatabase` against the process environment, throwing
+ * `DatabaseOriginError` on a refusal and returning the classified origin on a
+ * pass — the same contract `assertScriptDatabase` has, so a caller reports a
+ * refusal from either in one place.
+ */
+export const assertShadowDatabase = (options: {
+    command: string;
+    env?: NodeJS.ProcessEnv;
+    urlEnvName?: string;
+    logger?: ScriptLogger;
+}): DatabaseOrigin => {
+    const env = options.env ?? process.env;
+    const urlEnvName = options.urlEnvName ?? SHADOW_DATABASE_URL_ENV;
+    const verdict = evaluateShadowDatabase({
+        command: options.command,
+        databaseUrl: env[urlEnvName],
+        urlEnvName,
+    });
+
+    if (!verdict.allowed) {
+        // The refused origin carried by the error is classified from the same
+        // value, so a reporter can log the host and database without re-reading
+        // the environment. It is `unknown` for every URL-shape refusal, which is
+        // what the classifier says of them too.
+        throw new DatabaseOriginError(verdict.message, verdict.code, classifyDatabaseOrigin(env[urlEnvName]));
+    }
+
+    if (options.logger) {
+        options.logger.debug('shadow_database_accepted', {
+            command: options.command,
+            urlEnvName,
+            originClass: verdict.origin.originClass,
+            host: verdict.origin.host,
+            database: verdict.origin.database,
+        });
+    }
+
+    return verdict.origin;
 };
 
 export const assertScriptDatabase = (options: {
@@ -887,9 +1454,7 @@ export const assertScriptDatabase = (options: {
         options.logger.debug('database_origin_accepted', {
             script,
             policy,
-            originClass: origin.originClass,
-            host: origin.host,
-            database: origin.database,
+            ...originLogFields(origin),
         });
     }
 
@@ -921,7 +1486,7 @@ if (entryScript !== null) {
     try {
         assertScriptDatabase({ script: entryScript });
     } catch (error) {
-        if (!(error instanceof DatabaseOriginError)) {
+        if (!(isThrownInstanceOf(error, DatabaseOriginError))) {
             // A genuine bug in this module must surface as itself, not as a
             // refusal an operator would try to fix with a flag.
             throw error;
@@ -933,12 +1498,25 @@ if (entryScript !== null) {
         // through fs.writeSync. The refusal reason is the only artefact this
         // path produces, and AAP §0.7.1 requires the guard to say why it
         // refused, so it is written to the descriptor before the exit.
+        // WHAT THIS LINE SAYS, NOW THAT IT SAYS NEITHER THE DATABASE NOR THE
+        // MESSAGE. §0.7.1 requires the guard to say WHY it refused, and it does:
+        // `code` names the rule that refused (`unrecognised_origin`,
+        // `development_only`, `confirmation_required`, `confirmation_mismatch`),
+        // `reason` is the fixed phrase naming the classification rule that
+        // matched, and `originClass`/`match` say what the origin was taken to
+        // be. What is gone is the refusal MESSAGE, which named the database and
+        // the host in prose, and the two fields that named them outright. The
+        // remedy is invariant and stated here rather than quoted from the
+        // message, so an operator still knows the next step without the line
+        // disclosing the target.
         createFatalLogger('dbGuard').error('database_origin_refused', {
             script: entryScript,
             code: error.code,
-            originClass: error.origin.originClass,
-            host: error.origin.host,
-            database: error.origin.database,
+            ...originLogFields(error.origin),
+            remedy:
+                `Point ${DATABASE_URL_ENV} at a local development, test or shadow database, or — for ` +
+                `catalog-load and recipes-seed — pass ${CONFIRM_TARGET_FLAG} with the database name that ` +
+                `${DATABASE_URL_ENV} already carries.`,
             error: safeError(error),
         });
         process.exit(1);

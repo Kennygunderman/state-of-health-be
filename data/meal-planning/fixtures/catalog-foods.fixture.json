@@ -32,11 +32,13 @@
         "null_is_unknown": "A null nutrient means UNKNOWN and never 0. usda:9200113 publishes with fiber_g null because fibre is not one of the four core nutrients; ai:spice_herb:smoked paprika blend:dry is quarantined because its null value is fat_g, which is.",
         "publication_status_is_not_an_outcome": "Four of the five publication_status values are validation outcomes and two are not. 'candidate' is what a generated row arrives as before validation runs - ai:produce_fruit:frozen mango chunks:raw is the one such row and it carries NO validation record. 'retired' is set only by catalog-load.ts for a previously published food a newer release no longer contains - usda:9200119 is that row, its validation outcome is still 'accepted', and it stays referenceable by recipe_ingredients while being excluded from search and from new recipe eligibility.",
         "checks_are_generated": "validation_records.checks, outcome and publication_status were produced by validateCatalogCandidate over the rows in this file, with duplicateOfSourceKey null (duplicate detection ran and found none) and, for every ai_generated row, an advisory review that confirms no check. Every check entry carries its tier, so the record is auditable without reading the validator.",
-        "staleness_is_a_pointer_comparison": "Staleness is not a validation check and never produces a status. It is the comparison between a stored pointer (catalog_food_components.component_nutrition_version, recipe_ingredients.catalog_nutrition_version) and the referenced food nutrition_version, which a refresh makes and re-derives against. That is why ai:prepared_meal:herbed yogurt dip:prepared is published with stale numbers rather than quarantined.",
+        "staleness_is_a_pointer_comparison": "Staleness is not a validation CHECK and never produces a check status. It is the comparison between a stored pointer (catalog_food_components.component_nutrition_version, recipe_ingredients.catalog_nutrition_version) and the referenced food nutrition_version, which a refresh makes and re-derives against. That is why the pure verdict of catalog.logic.ts::validateCatalogCandidate publishes ai:prepared_meal:herbed yogurt dip:prepared with stale numbers: CatalogValidationContext carries no composition, so the pure function cannot see the stale pointer and must not pretend to.",
+        "a_stale_pointer_is_held_by_the_stage_not_by_the_verdict": "The sentence above is about the PURE VERDICT and stops there. The validation STAGE (scripts/catalog-validate.ts, THE COMPONENT FLOOR in judgeRow) reads catalog_food_components, recomputes an ingredient_derived row with scripts/lib/catalogEvidence.ts::assessComponentDerivation over catalog.logic.ts::deriveComponentNutrition, and QUARANTINES this row for component_version_stale -- so ai:prepared_meal:herbed yogurt dip:prepared is published by the verdict and held by the stage, and both facts are true at once because they are facts about different functions. Read together with staleness_is_a_pointer_comparison, never in place of it. The consequence for release artefacts: a stale-pinned parent can never reach a cut release, because catalog-release.ts exports published rows only and scripts/catalog-load.ts refuses a self-contradicting one with release_component_inconsistent. That is why the release harness in src/__tests__/scripts/catalog-load.test.ts re-derives this parent and re-pins its components instead of shipping this row as-is: a real release could not contain it. The stale pointer stays HERE, unrepaired and deliberate, because it is the only row in either fixture that can exercise the staleness comparison at all (see the note on usda:9200115).",
         "component_derivation": "A component contributes quantity_grams/100 of its per-100 g values; cooking changes MASS, not nutrients, so the nutrient totals are the plain sum of the inputs while the finished weight is SUM(quantity_grams * yield_factor), and the per-100 g result is total / yieldedGrams * 100. Any unknown component nutrient makes the derived value null.",
         "one_default_portion": "Every PUBLISHED food carries exactly one is_default portion with a positive sourced gram_weight, which the partial unique index unique_default_catalog_food_portion enforces and the missing_gram_weight check requires. Two quarantined rows exist to fail that requirement from its two sides: ai:prepared_meal:vegetable barley soup cup:prepared has one default portion whose gram_weight is null, and ai:condiment_sauce:garlic herb marinade:prepared has portions but marks none default. Portion units are always tokens src/utils/units.ts resolves, so a grocery row can read its family back off the unit.",
         "nutrition_basis_coverage": "All three nutrition_basis values appear. per_100g is the norm; usda:9200110 is per_100ml WITH a density and is converted; ai:beverage:cold brew coffee concentrate:prepared is per_100ml WITHOUT one and is quarantined missing_density; ai:prepared_meal:vegetable barley soup cup:prepared is per_serving with no sourced serving gram weight and is quarantined missing_gram_weight. On the per_serving basis, basis_amount counts SERVINGS, so the stated values describe basis_amount x the serving weight.",
-        "dislike_groups_need_a_pair": "A dislike stores the food id AND its food_group, so excluding a group is only provable against two foods in that group plus one outside it. usda:9200120 and usda:9200122 are both in the mushroom group and usda:9200123 is in the unrelated olive group; both groups are marked isCommonDislikeGroup in coverage-plan.v1.json. One mushroom row alone could not tell excluding the group apart from excluding the selected food."
+        "dislike_groups_need_a_pair": "A dislike stores the food id AND its food_group, so excluding a group is only provable against two foods in that group plus one outside it. usda:9200120 and usda:9200122 are both in the mushroom group and usda:9200123 is in the unrelated olive group; both groups are marked isCommonDislikeGroup in coverage-plan.v1.json. One mushroom row alone could not tell excluding the group apart from excluding the selected food.",
+        "identity_evidence_is_complete_where_published": "Every PUBLISHED row carries a complete retrieval record in validation_records.identity_evidence, because scripts/lib/catalogEvidence.ts is a publication floor every catalog stage applies: validation holds a row whose evidence is incomplete, catalog-release.ts refuses to export one and catalog-load.ts refuses to load one. A USDA row's record is written in the import stage's snake_case vocabulary (http_status, final_host, body_sha256, record_sha256, source_cache_key) and a generated row's in evidence.logic.ts's camelCase one (status, finalHost, bodySha256); both are read by the same predicate. The values are fixture values - every digest is the sha256 of a stated string and every field names its own subject - and the rows that are NOT published (rejected, retired and one quarantined) keep an empty array, which is what a row nobody retrieved evidence for looks like."
     },
     "counts": {
         "foods": 38,
@@ -2715,7 +2717,30 @@
                     }
                 ]
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200101
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200101?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "c295cd1858bebe2b8dd3c7d6aab926a18d91a251cfccf43ab88b1e4991eb398d",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "3ee09d67fbadea3fb0b4f3a51abc04b7d3230f1a783b33738b0d590b5dee5afb",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Chicken, broiler or fryers, breast, skinless, boneless, meat only, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -2862,7 +2887,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200102
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200102?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "f50212f79befec8f19cc0304164d963fe710fbd164f72df2059cca99f184216e",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "3f5ec5f9a927388d95a4d5ed49b99523d02d6755ca082433fd14521a7226828a",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Chicken, broiler or fryers, breast, skinless, boneless, meat only, roasted",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -3009,7 +3057,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200103
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200103?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "c0143dca683d444d10def8748f10b0aaad330ec1cf59844ef6a11b7f652ffabc",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "9b55b75e442152e7105befb6f942c3528731b97e6c5fd1f1b28f9a5d75bdf313",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Rice, brown, long-grain, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -3156,7 +3227,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200104
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200104?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "5791590ff029f023c56ff58ea79cf0f23467586c41adb2ce2a114c49053ef240",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "fa4ae5bfefc2275dd0c81040dde0f88b234783713aae04f0ffcf13a71b5def1c",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Rice, brown, long-grain, cooked",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -3303,7 +3397,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200105
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200105?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "47e4c5eb13496992b75884682a1e9b4ae1f1f26c001afea6e01004e28e802ac4",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "891bd750a369f49707cbf918549b33f2e7570715f0ee2afdf41e9ff2ab942623",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Lentils, mature seeds, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -3450,7 +3567,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200106
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200106?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "c3794dce4d850eaa294d97d8a6b1bb6090d357b9d4c9779d8928fc985981d182",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "b68d1fd5822f1da6d149f9a1637f0d07a9c2044ab90200a2c61a69113ef3dc31",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Lentils, mature seeds, cooked, boiled, without salt",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -3597,7 +3737,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200107
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200107?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "29605c33e4c64921a7db2ffeac9ff55566b7035c165bdec04f71f4bed93bfcb4",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "42b18bd0f874856fe8c31ca1207e3d39d9cc252b89bff6e0a517aab61ea86e69",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Egg, white, raw, fresh",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -3744,7 +3907,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200108
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200108?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "a2668465b4020d346fa781d6cfac19210553461582654b2017495a9efa0f5a3c",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "f6497d8db06fd092db0acdb6f04af6e6c5d41b6f48f7e4f7cab9bdd5c39640d6",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Egg, yolk, raw, fresh",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -3899,7 +4085,30 @@
                     }
                 ]
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200109
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200109?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "05280673b928612d4244f9cc08051a20d697adb1284903eb79aef3e20d56bb08",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "6d44712faed84e9fd77f1040fc9b419fb282964f4edda86cca482a644339e28d",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Oil, olive, salad or cooking",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -4046,7 +4255,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200110
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200110?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "0ed4f733b734210517dde9e82b8026ac6e4f7f4dca1df86292a2a8a5970aaf24",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "1eef7b11430f968810ac23742039d850c5b7653389dbc5f186bbc9b57318836f",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Milk, whole, 3.25% milkfat, without added vitamin A and vitamin D",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -4193,7 +4425,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200111
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200111?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "6d764c09c4b9b006196f40b6f4fe97f1478827ea23c8a92b1266814393978b50",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "147df35d760aa6d4af07037eed5673c35f0cd847d1f5e153276ddbc6b6d42a8f",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Spinach, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -4340,7 +4595,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200112
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200112?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "2efcd6e95a5fb2240211b28ddf651d0070ce5fdd31f1ef9e6806b3a0c21c64c7",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "69b5b7e6f39781c8b03b837a1e8c743a3a17d2feef59557dc5e206ddd19457f0",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Kale, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -4487,7 +4765,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200113
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200113?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "2470fb97300b922d668f5e2730b8d9bf4372ef3473d86eae206a957151c14ec2",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "0f938081c0cf839881e5893c61bdf5b0087828ee6237e1a356ccfecb65a11e5f",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Soy sauce made from soy and wheat (shoyu)",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -4634,7 +4935,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200114
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200114?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "dd994bd207a5b8086f1a3802032b79def56532e69becce5a349e26592c8b0258",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "2914fa11009b6002b6d2697d64b7ee30e060435dcad3ba5cb2b03bc2859246d3",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Lemon juice, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -4781,7 +5105,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200115
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200115?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "caf46a9c7911b90e38eff9c8ee13eb2e51c266c65d0254711966ee9fcd6b3521",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "6c6fc4f27b60b089132a4437731aa58213bb1279e790253cc846504bbbd04942",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Yogurt, Greek, plain, nonfat",
+                    "fetched_at": "2026-09-13T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -4936,7 +5283,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200116
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200116?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "3c0392fe82b3d237ed0d3532929ff9b7b40677a4102b019df4ae44f89073b045",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "5ebcb8fa55fc9c229a5babe1c3c92723e4c0efb2cbc9316c7c39316df809550e",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Crackers, wheat, regular",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -5237,7 +5607,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200118
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200118?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "a59495094f7a257d2e378c26368f901db89549227129b4ed094d5e08ced4ea45",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "35d054f14602636c798c9ed11c2513fe3ad8855e981966152df6aa43816e802a",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Crackers, rye, wafers, plain",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -5545,7 +5938,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200120
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200120?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "3d25852afe9ef6ab855741b72a0dead11ef546606c040cb30ac8077e0f6c5990",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "482ea19656e658da879b4c1cd29a4142632d704eaffc8ab7da18d3eec37b95d2",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Mushrooms, crimini, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -5692,7 +6108,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200121
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200121?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "469c141d8570339b034e59409e65c4afb99d5dd655ff3712e6641180d52cbe94",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "5ad0c7d5f94008f7f5dddfa67f475efb9f735ee984debdc2de31e1cfce239d1f",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Fish, salmon, Atlantic, wild, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -7833,7 +8272,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200122
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200122?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "c3b61ca567e3e56639a1be75cef35a1d7bd0aee5654decbae0e1d4a99a8de086",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "a37090f931b4a82eefc60614df331336a2e5a61a7c311d0337553174a7c6a582",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Mushrooms, white, button, raw",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",
@@ -7980,7 +8442,30 @@
                 },
                 "additional": []
             },
-            "identity_evidence": [],
+            "identity_evidence": [
+                {
+                    "url": "https://api.nal.usda.gov/fdc/v1/foods",
+                    "method": "POST",
+                    "request_body": {
+                        "fdcIds": [
+                            9200123
+                        ],
+                        "format": "full"
+                    },
+                    "final_host": "api.nal.usda.gov",
+                    "http_status": 200,
+                    "http_status_source": "fixture: the status a POST /foods exchange answered with, stated because a published row must carry an observed one (scripts/lib/catalogEvidence.ts, the identity-evidence floor every catalog stage applies). No request was made to produce this file.",
+                    "source_cache_key": "/food/9200123?format=full",
+                    "retrieval_source": "usda_api_cache",
+                    "body_sha256": "0fc3a6429c1bf4dd4674032ca4dc14093f4a82005a464020bd311d69ee28f83f",
+                    "body_sha256_subject": "fixture: sha256 of \"fixture-body:<source_cache_key>\", standing in for the digest of the key-sorted JSON of the whole /foods response payload",
+                    "record_sha256": "0d0da4d7bc05350975fc295a1787603612426fda65503707dceaa1a48dd921f9",
+                    "record_sha256_subject": "fixture: sha256 of \"fixture-record:<food source_key>\", standing in for the digest of this food's own record within that payload",
+                    "matched_snippet": "Olives, ripe, canned (small-extra large)",
+                    "fetched_at": "2026-09-12T06:00:00.000Z",
+                    "fetched_at_source": "fixture: the instant this record was reviewed at, since nothing was fetched"
+                }
+            ],
             "checks": [
                 {
                     "name": "unknown_category",

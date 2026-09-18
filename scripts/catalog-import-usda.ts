@@ -47,9 +47,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
-import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
-import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
+import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
+import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import {
     EXPECTED_USDA_MANIFEST_VERSION,
     ManifestError,
@@ -77,18 +77,20 @@ import type {
     UsdaSweepPortionPolicy,
 } from './lib/manifest';
 import { ModelBudgetError } from './lib/budget';
-// The four derivations both writers of `catalog_foods` must agree on, and the
-// version counters `recipe_ingredients` snapshots are checked against. They
-// live in `lib/` rather than here so that `catalog-generate-ai.ts` can share
-// them without importing this CLI — see the note at the top of that module.
-import {
-    buildSearchText,
-    canonicalJsonString,
-    dedupeSortedAliases,
-    nextCatalogFoodVersions,
-    sha256Hex,
-} from './lib/catalogFoodFacts';
-import type { StoredVersionedFacts } from './lib/catalogFoodFacts';
+// The complete-evidence predicate, shared with validation, release export and
+// release loading. This stage writes the retrieval records the other three
+// judge, so it is the first place the rule can be applied — and applying the
+// same function here is what keeps "publishable evidence" one definition
+// instead of four that agree until one of them is edited.
+import { assessIdentityEvidence, evidenceGapCodes } from './lib/catalogEvidence';
+import type { EvidenceAssessment, EvidenceGapCode } from './lib/catalogEvidence';
+// The payload-digest mechanics both writers of `catalog_foods` must take the
+// same way. They live in `lib/` rather than here so that
+// `catalog-generate-ai.ts` can share them without importing this CLI — see the
+// note at the top of that module. The catalog DERIVATIONS the two stages must
+// also agree on (the stored alias list, `search_text`, the version counters)
+// are domain rules and come from `catalog.logic.ts` below.
+import { canonicalJsonString, sha256Hex } from './lib/catalogFoodFacts';
 import {
     RateLimitConfigError,
     USDA_IMPORT_POLICY_CAP_PER_HOUR,
@@ -96,14 +98,7 @@ import {
     getUsdaImportRateLimitPerHour,
 } from './lib/rateLimiter';
 import type { UsdaRateLimiter, UsdaRequestStats } from './lib/rateLimiter';
-import {
-    CheckpointError,
-    appendRunLog,
-    finishRun,
-    openOrResumeRun,
-    saveCheckpoint,
-    withCatalogStageLock,
-} from './lib/checkpoint';
+import { CheckpointError, appendRunLog, checkpointErrorFields, finishRun, openOrResumeRun, saveCheckpoint, withCatalogStageLock } from './lib/checkpoint';
 import type { CatalogRunDb } from './lib/checkpoint';
 
 // The normaliser and the checks. Pure, so importing it costs nothing and opens
@@ -112,9 +107,12 @@ import type { CatalogRunDb } from './lib/checkpoint';
 // reached lazily from main().
 import {
     CATALOG_CHECK_NAMES,
+    buildSearchText,
     buildSourceKey,
     catalogCheckTier,
     computeCoverageShortfall,
+    dedupeSortedAliases,
+    nextCatalogFoodVersions,
     normalizeCanonicalName,
     validateCatalogCandidate,
 } from '../src/services/catalog.logic';
@@ -124,6 +122,7 @@ import type {
     CatalogFoodPortionCandidate,
     CatalogValidationPolicy,
     CatalogValidationVerdict,
+    StoredVersionedFacts,
 } from '../src/services/catalog.logic';
 import type { CatalogIdentityStatus } from '../src/types/catalog';
 // The one place the unit vocabulary lives. Asking it, rather than carrying a
@@ -233,6 +232,44 @@ export class CatalogImportError extends Error {
 }
 
 /**
+ * What a failure from this stage is worth REPORTING, as typed fields rather
+ * than as its rendered sentence.
+ *
+ * WHY THIS EXISTS. `safeError` carries a closed set of machine-readable members
+ * and no `message`, because the field a message would occupy is the one place a
+ * request URL bearing `api_key=` can reach an operator log or the
+ * `catalog_import_runs.log` column. That leaves the class and the code, which
+ * name WHAT refused but not WHICH work item stopped — and the class's own
+ * docstring above names that as the reason the wrapping exists: the batch index
+ * is what an operator re-runs with `--resume`, and the vendor's HTTP status is
+ * what separates a key problem (`403`) from an outage (`503`) from pacing
+ * (`429`).
+ *
+ * So those facts travel as the DATA they already are. Every value is either a
+ * number this stage assigned, a manifest version from a reviewed document, a
+ * sweep key from this file's own vocabulary, or a list of FDC ids — public USDA
+ * identifiers, bounded by the batch size the vendor accepts. None of them is
+ * derived from a vendor sentence, and the rendered message stays on the thrown
+ * error, where an operator reads it at the terminal.
+ *
+ * `vendorStatus` is read through `safeError` rather than off `underlying`
+ * directly, so it is subject to the same integer-and-range check as every other
+ * status this repository logs.
+ */
+export const importErrorFields = (error: CatalogImportError): LogFields => {
+    const vendorStatus = error.underlying === undefined ? undefined : safeError(error.underlying).status;
+
+    return {
+        ...(error.context.batchIndex === undefined ? {} : { batchIndex: error.context.batchIndex }),
+        ...(error.context.sweepKey === undefined ? {} : { sweepKey: error.context.sweepKey }),
+        ...(error.context.manifestVersion === undefined ? {} : { manifestVersion: error.context.manifestVersion }),
+        ...(error.context.fdcId === undefined ? {} : { fdcId: error.context.fdcId }),
+        ...(error.context.fdcIds === undefined ? {} : { fdcIds: [...error.context.fdcIds] }),
+        ...(vendorStatus === undefined ? {} : { vendorStatus }),
+    };
+};
+
+/**
  * The one error class this stage observes that it cannot name by `instanceof`.
  *
  * `UsdaError` is the vendor boundary's own error, and every batch and
@@ -245,7 +282,7 @@ export class CatalogImportError extends Error {
  * the class's constructor and pinned by `usda.service.test.ts`, so it is the
  * stable handle available here.
  */
-const isUsdaError = (error: unknown): boolean => error instanceof Error && error.name === 'UsdaError';
+const isUsdaError = (error: unknown): boolean => isThrownInstanceOf(error, Error) && error.name === 'UsdaError';
 
 /**
  * Wraps whatever the vendor boundary threw as this stage's own failure, so
@@ -264,7 +301,11 @@ const asImportFailure = (error: unknown, context: CatalogImportError['context'])
             : `batch ${context.batchIndex}`;
     return new CatalogImportError(
         'usda_request_failed',
-        `USDA did not answer usably for ${where}: ${safeError(error).message}`,
+        // The vendor's own sentence is withheld: usda.service.ts builds every
+        // request URL with `api_key=` in its query string and quotes the
+        // failure back, so the text is the one place the key can appear. The
+        // class and the HTTP status are what diagnose it.
+        `USDA did not answer usably for ${where} (${formatSafeError(error)})`,
         context,
         error,
     );
@@ -325,10 +366,12 @@ export interface PrerequisiteGap {
 const HELP_FLAGS: readonly string[] = ['--help', '-h'];
 
 // dbGuard owns this flag: it reads it straight off process.argv at module load
-// to satisfy the `development_or_confirmed` policy. It is accepted and skipped
-// here (value included, so it is not mistaken for a positional argument) rather
-// than rejected, because an operator who passes it to any stage should get that
-// stage's usage, not a parse error about a flag the pipeline does define.
+// to satisfy the `development_or_confirmed` policy of `catalog-load` and
+// `recipes-seed`. This stage is `development_or_test` and has no such door, so
+// the flag unlocks nothing here. It is accepted and skipped (value included, so
+// it is not mistaken for a positional argument) rather than rejected, because
+// an operator who passes it to any stage should get that stage's usage, not a
+// parse error about a flag the pipeline does define.
 const CONFIRM_TARGET_FLAG = '--confirm-target';
 
 interface Token {
@@ -479,7 +522,9 @@ export const describeUsage = (): string =>
         'portions and its validation record, checkpointing as it goes.',
         '',
         'This stage publishes nothing: a record whose checks pass is written as a',
-        'candidate, and catalog:validate is the stage that publishes.',
+        'candidate. catalog:validate is the stage that decides publication from',
+        'this database, and catalog:load also writes published rows - it applies',
+        'a reviewed release and restores the publication statuses it carries.',
         '',
         'Re-running is safe. Every write is an upsert keyed on the vendor id and',
         'the batch plan is a pure function of the manifest, so an interrupted run',
@@ -564,8 +609,12 @@ const manifestGap = (
         load();
         return null;
     } catch (error) {
-        if (error instanceof ManifestError) {
-            return { code, requirement, remedy, detail: `${error.code}: ${error.message}` };
+        if (isThrownInstanceOf(error, ManifestError)) {
+            // Closed code only, never the sentence: a ManifestError message can carry
+            // an absolute checkout path (manifest.ts `repo_root_not_found`) or a foreign
+            // JSON parser message (`invalid_merged_report`), and `requirement` and
+            // `remedy` beside it already carry everything an operator acts on.
+            return { code, requirement, remedy, detail: error.code };
         }
         throw error;
     }
@@ -606,7 +655,7 @@ export const preflight = (deps: ImportPreflightDeps): readonly PrerequisiteGap[]
     try {
         deps.resolveRateLimit(deps.env);
     } catch (error) {
-        if (error instanceof RateLimitConfigError) {
+        if (isThrownInstanceOf(error, RateLimitConfigError)) {
             gaps.push({
                 code: 'usda_rate_limit_misconfigured',
                 requirement:
@@ -1471,24 +1520,6 @@ export interface PreparedCatalogFood {
      */
     readonly curatorReviewRequired: boolean;
     /**
-     * True when the retrieval this record rests on carries no observed HTTP
-     * status, so `identity_evidence[0].http_status` is null.
-     *
-     * The status is a MANDATORY field of a retrieval record (Agent Action Plan
-     * §0.3.2), and a record missing a mandatory evidence field must not be
-     * published — `importPublicationStatus` quarantines it, exactly as §0.7.3
-     * classes missing identity evidence. Publishing it instead is the defect
-     * OBSEV-F12 reports at release scale: 11,046 published records whose
-     * mandatory status is null.
-     *
-     * It should never be true. `usda.service.ts` re-fetches a cached batch
-     * whose `http_status` is null rather than replaying it, so every retrieval
-     * reaching here carries a number. That is precisely why the flag exists:
-     * the guarantee is then enforced at the point of publication rather than
-     * inferred from the vendor boundary's current behaviour, and a later change
-     * there cannot quietly publish a mandatory field nobody observed.
-     */
-    readonly retrievalStatusMissing: boolean;
     /**
      * The sentence `catalog_validation_records.nutrition_method` carries, which
      * has to agree with {@link assumptions}: a record whose assumptions say
@@ -1964,12 +1995,6 @@ export const prepareCatalogFood = (
             ? `protein, fat, carbohydrate and fibre read per 100 g from the record's own foodNutrients (203 protein, 204 fat, 205 carbohydrate, 291 fibre); the record stated no energy value (208), so energy was derived from those same macros by the manifest's documented fallback (${manifest.caloriesFallback}). No value came from another food.`
             : "every value read per 100 g from the record's own foodNutrients (203 protein, 204 fat, 205 carbohydrate, 208 energy, 291 fibre); nothing was scaled, derived or estimated",
         curatorReviewRequired: !curated && !assignment.classified,
-        // The mandatory retrieval field this record cannot be published
-        // without. `usda.service.ts` re-fetches a pre-ledger cache row rather
-        // than replaying it, so a null should be unreachable — this flag is
-        // what makes that a checked property of the run instead of an
-        // assumption, and it is read by `importPublicationStatus`.
-        retrievalStatusMissing: retrieval.httpStatus === null,
         evidence: {
             url: USDA_BATCH_ENDPOINT,
             method: USDA_SOURCE_CACHE_KEY_SCHEME.method,
@@ -2276,7 +2301,9 @@ export const buildValidationRecordData = (
     aliases: prepared.aliases.slice(),
     category: prepared.row.category,
     food_state: prepared.row.food_state,
-    identity_source: 'usda',
+    // The same constant the evidence assessment is made under, so the record is
+    // judged against the requirements of the source it declares.
+    identity_source: IMPORT_IDENTITY_SOURCE,
     identity_status: prepared.row.identity_status,
     nutrition_provenance: 'source_backed',
     // Derived alongside the numbers it describes, so a record whose
@@ -2297,12 +2324,20 @@ export const buildValidationRecordData = (
     // food. A model name here would imply a review that never happened.
     llm_review: null,
     // Either import-stage refusal holds the record, whatever the checks said:
-    // an unclassified category (curator review) or a retrieval with no observed
-    // status (a mandatory evidence field, AAP §0.3.2). The reason is readable
-    // off the record itself — `identity_evidence[0].http_status_source` says
-    // which case a null status is — so the outcome never has to be explained
-    // from outside the row.
-    outcome: prepared.curatorReviewRequired || prepared.retrievalStatusMissing ? 'quarantined' : verdict.outcome,
+    // an unclassified category (curator review) or incomplete retrieval
+    // evidence (mandatory fields, AAP §0.3.2). The reason is readable off the
+    // record itself — `identity_evidence[0].http_status_source` says which case
+    // a null status is — so the outcome never has to be explained from outside
+    // the row.
+    //
+    // The evidence half is the shared floor's decision, read through the same
+    // helper `importPublicationStatus` uses: the two fields are one statement
+    // about one record, and a row written `quarantined` with an `accepted`
+    // outcome (or the reverse) would contradict itself on disk.
+    outcome:
+        prepared.curatorReviewRequired || !importEvidenceAssessment(prepared).complete
+            ? 'quarantined'
+            : verdict.outcome,
     reviewed_at: now,
     publication_status: publicationStatus,
     source_versions: {
@@ -3935,6 +3970,12 @@ const closeFailedRun = async (
         runId,
         code: failure.code,
         error: failure.error,
+        // WHICH work item stopped, as typed fields: the batch index an operator
+        // re-runs from, the FDC ids in it, and the vendor's HTTP status. These
+        // used to reach the reader inside the failure's rendered sentence, which
+        // is the field `safeError` now withholds because it is where a request
+        // URL bearing `api_key=` would appear. See importErrorFields.
+        ...failure.detail,
         attemptCounts: JSON.stringify(counts),
         note: 'each batch recorded its own counts and cursor in its own transaction, so `npm run catalog:import -- --resume` continues from the last committed batch and nothing is counted twice',
     });
@@ -4258,10 +4299,25 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
                             // catalog.logic.ts's CATALOG_CHECK_NAMES because
                             // that registry judges the FOOD, and this judges
                             // the retrieval — see IMPORT_CHECK_MISSING_RETRIEVAL_STATUS.
-                            if (prepared.retrievalStatusMissing) {
-                                byCheck[IMPORT_CHECK_MISSING_RETRIEVAL_STATUS] =
-                                    (byCheck[IMPORT_CHECK_MISSING_RETRIEVAL_STATUS] ?? 0) + 1;
-                                failedChecks.push(IMPORT_CHECK_MISSING_RETRIEVAL_STATUS);
+                            //
+                            // One entry per gap the shared floor found, rather
+                            // than one for the whole record: a report that says
+                            // only "evidence incomplete" cannot tell an
+                            // operator whether to re-retrieve, re-export or
+                            // look at the vendor boundary.
+                            //
+                            // COUNTED INTO THE BATCH DELTA, NOT THE RUN MAP.
+                            // Everything else in this loop accumulates into
+                            // `batchDelta`, which is discarded whole if the
+                            // transaction rolls back and merged into the run's
+                            // figures only once it commits. This counter used
+                            // to increment the run-level `byCheck` directly, so
+                            // a batch that rolled back left its count behind
+                            // and the report described rows no database held.
+                            for (const code of evidenceGapCodes(importEvidenceAssessment(prepared))) {
+                                const name = importEvidenceCheckName(code);
+                                bumpCount(batchDelta.byCheck, name);
+                                failedChecks.push(name);
                             }
 
                             // Collected in full for this batch; the report's cap
@@ -4501,10 +4557,15 @@ export const runImport = async (deps: RunImportDeps): Promise<ImportOutcome> => 
 const TRANSACTION_TIMEOUT_MS = 30_000;
 
 /**
- * The one refusal this stage names itself, reported beside the validation
- * checks: the retrieval behind a record carried no observed HTTP status, so a
- * mandatory field of its retrieval record (Agent Action Plan §0.3.2) is
- * missing and the record is held as `quarantined` rather than published.
+ * The refusal this stage names itself, reported beside the validation checks: a
+ * mandatory field of the record's own retrieval evidence (Agent Action Plan
+ * §0.3.2) is missing or unusable, so the record is held as `quarantined`.
+ *
+ * ITS NAME IS HISTORICAL AND STAYS THAT WAY. A null HTTP status is the gap this
+ * stage was written to catch and remains the overwhelmingly likely one, so the
+ * key an operator greps the report for does not change; the gap that actually
+ * held the record is named in full in `quarantined[].failedChecks`, which
+ * carries one entry per gap code (see {@link importEvidenceCheckName}).
  *
  * Deliberately NOT a member of `catalog.logic.ts`'s `CATALOG_CHECK_NAMES`.
  * That registry — and the tier map beside it — judges the candidate FOOD: its
@@ -4518,6 +4579,63 @@ const TRANSACTION_TIMEOUT_MS = 30_000;
 export const IMPORT_CHECK_MISSING_RETRIEVAL_STATUS = 'missing_retrieval_status';
 
 /**
+ * The identity source every row this stage writes declares.
+ *
+ * Read by the evidence assessment below as well as written onto the validation
+ * record, from this one constant: the floor asks MORE of a USDA row than of a
+ * generated one (it additionally requires the `usda_api_cache` key and the
+ * per-food record digest), so assessing a record under a source other than the
+ * one it declares would apply the wrong set of requirements to it.
+ */
+const IMPORT_IDENTITY_SOURCE = 'usda';
+
+/**
+ * The evidence record this stage is about to write, assessed against the shared
+ * complete-evidence floor.
+ *
+ * WHY THE RECORD AND NOT A FLAG. `prepared.evidence` is the exact object that
+ * lands in `catalog_validation_records.identity_evidence`, and it is what
+ * validation, the release exporter and the release loader each later assess
+ * with this same function. Deciding this stage's disposition from one boolean
+ * about one field meant a record could be written here with a non-2xx status, a
+ * malformed digest, a blank cache key, a blank snippet or an unparseable
+ * `fetched_at` — every one of which the three later stages refuse — and the
+ * disagreement would only surface at the stage that had to reject work already
+ * done. Assessing the record itself makes the four stages one rule.
+ *
+ * WHAT THIS IS AND IS NOT. It is defense in depth, not the closing of a live
+ * publication hole: this stage writes `candidate` or `quarantined` and never
+ * `published`, so an incomplete record it wrote could not have reached a
+ * consumer without `catalog:validate` publishing it, and validation applies
+ * this same floor. What it buys is that the record is held at the stage that
+ * PRODUCED it, under the name of the gap, rather than surviving to be held
+ * later by a stage that can only say the row is unpublishable.
+ *
+ * Recomputed at each of the three sites that need it rather than threaded
+ * through `persistPreparedFood`'s signature: it is a pure read of sixteen
+ * fields with no hashing and no I/O, which is nothing beside the batch's own
+ * round trips, and threading it would put a derived value in three signatures
+ * where it can drift from the record it describes.
+ */
+export const importEvidenceAssessment = (prepared: PreparedCatalogFood): EvidenceAssessment =>
+    assessIdentityEvidence([prepared.evidence], { identitySource: IMPORT_IDENTITY_SOURCE });
+
+/**
+ * The report's check name for one evidence gap.
+ *
+ * The status gap keeps the name the report has always used, so an operator's
+ * existing query still finds it; every other gap is reported under its own code
+ * behind the same prefix, so two records held for different reasons are never
+ * collapsed into one count. `groupChecksByTier` files names it does not know
+ * under `unknown`, which is where an import-stage fault belongs — the tier map
+ * grades the FOOD's checks.
+ */
+export const importEvidenceCheckName = (code: EvidenceGapCode): string =>
+    code === 'retrieval_status_missing'
+        ? IMPORT_CHECK_MISSING_RETRIEVAL_STATUS
+        : `${IMPORT_CHECK_MISSING_RETRIEVAL_STATUS}:${code}`;
+
+/**
  * What the import writes to `publication_status`.
  *
  * The import never publishes. A record the checks would accept is written as a
@@ -4525,20 +4643,23 @@ export const IMPORT_CHECK_MISSING_RETRIEVAL_STATUS = 'missing_retrieval_status';
  * only a pass over the whole table can make — that is `catalog:validate`'s
  * job, and keeping the two apart is what makes the import safe to re-run.
  *
- * ONE IMPORT-STAGE REFUSAL SITS ABOVE THE VERDICT. A record whose retrieval
- * carries no observed HTTP status is held as `quarantined` however clean its
- * nutrient checks are, because the status is a mandatory field of the retrieval
- * record (AAP §0.3.2) and §0.7.3 classes missing identity evidence as
- * quarantine-tier. It is decided here rather than in the validation checks
- * because the fault is a property of THIS STAGE'S retrieval rather than of the
- * candidate's stated values: `catalog.logic.ts` judges the food, and it neither
- * sees nor should see how the response was obtained.
+ * ONE IMPORT-STAGE REFUSAL SITS ABOVE THE VERDICT. A record whose own retrieval
+ * evidence is incomplete is held as `quarantined` however clean its nutrient
+ * checks are, because AAP §0.3.2 makes those fields mandatory and §0.7.3
+ * classes missing identity evidence as quarantine-tier. It is decided here
+ * rather than in the validation checks because the fault is a property of THIS
+ * STAGE'S retrieval rather than of the candidate's stated values:
+ * `catalog.logic.ts` judges the food, and it neither sees nor should see how the
+ * response was obtained.
+ *
+ * The decision is {@link importEvidenceAssessment}'s, so it is the same
+ * decision validation, the exporter and the loader make about the same bytes.
  */
 export const importPublicationStatus = (
     prepared: PreparedCatalogFood,
     verdict: CatalogValidationVerdict,
 ): string =>
-    prepared.retrievalStatusMissing
+    !importEvidenceAssessment(prepared).complete
         ? 'quarantined'
         : verdict.publicationStatus === 'published'
           ? 'candidate'
@@ -4611,26 +4732,34 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => ({
 // Exported for the same reason every other decision in this file is: the code
 // an operator reads is a behaviour, and `src/__tests__/scripts/` asserts it
 // without running a stage.
-export const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
+// The reported `error` is `SafeErrorFields` — a scrubbed name plus an optional
+// machine code and status, and deliberately no `message`: this value reaches the
+// durable run log and the operator console, where foreign prose can carry a
+// connection URL, a key or a fragment of the document that failed (CWE-532).
+export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
     // First, because it is this stage's OWN error and the one every vendor
     // failure now arrives as. It already names the batch that stopped, so its
     // code is reported straight rather than re-derived from what it wrapped.
-    if (error instanceof CatalogImportError) {
+    if (isThrownInstanceOf(error, CatalogImportError)) {
+        return { code: error.code, error: safeError(error), detail: importErrorFields(error) };
+    }
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof DatabaseOriginError) {
+    if (isThrownInstanceOf(error, ManifestError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ManifestError) {
+    if (isThrownInstanceOf(error, ModelBudgetError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ModelBudgetError) {
-        return { code: error.code, error: safeError(error) };
+    // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
+    // refusal names the stage holding the catalog graph and the mode it asked
+    // for, and those are what an operator acts on — see checkpointErrorFields
+    // for why they travel as data rather than inside the rendered sentence.
+    if (isThrownInstanceOf(error, CheckpointError)) {
+        return { code: error.code, error: safeError(error), detail: checkpointErrorFields(error) };
     }
-    if (error instanceof CheckpointError) {
-        return { code: error.code, error: safeError(error) };
-    }
-    if (error instanceof RateLimitConfigError) {
+    if (isThrownInstanceOf(error, RateLimitConfigError)) {
         return { code: 'rate_limit_misconfigured', error: safeError(error) };
     }
     if (isUsdaError(error)) {
@@ -4655,16 +4784,15 @@ const main = async (): Promise<number> => {
         return 0;
     }
 
-    // The URL itself never reaches the log — only the classification, the host
-    // and the database name. dbGuard has already refused anything it could not
-    // classify, so reaching this line means the origin was accepted.
+    // The URL never reaches the log, and neither does the host or the database
+    // name: originLogFields is the one origin-reporting shape and carries the
+    // classification, the fixed reason and an opaque target digest instead (see
+    // scripts/lib/dbGuard.ts for why). dbGuard has already refused anything it
+    // could not classify, so reaching this line means the origin was accepted.
     const origin = classifyDatabaseOrigin(process.env.DATABASE_URL);
     logger.info('database_origin_accepted', {
         stage: STAGE,
-        originClass: origin.originClass,
-        host: origin.host,
-        database: origin.database,
-        reason: origin.reason,
+        ...originLogFields(origin),
     });
     logger.info('stage_invoked', {
         stage: STAGE,
@@ -4904,6 +5032,13 @@ if (require.main === module) {
                 stage: STAGE,
                 code: failure.code,
                 error: failure.error,
+                // Spread, not nested: these are typed facts about the failure
+                // (a run id, the stage holding the catalog graph, the mode it
+                // asked for), and they read as fields of the failure rather
+                // than as one opaque member. Absent for every failure that is
+                // not a stage-lock refusal, which is the only branch that
+                // supplies them.
+                ...failure.detail,
             });
             process.exit(1);
         });

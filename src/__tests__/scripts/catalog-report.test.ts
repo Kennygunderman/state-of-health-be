@@ -1,6 +1,8 @@
 /**
  * The evidence stage's judgements: `scripts/catalog-report.ts`, plus the
- * duplicate-identity accounting `scripts/catalog-validate.ts` publishes.
+ * duplicate-identity accounting `scripts/catalog-validate.ts` publishes and the
+ * stored-assumptions decoder both stages read that column through
+ * (`scripts/lib/nutritionAssumptions.ts`).
  *
  * WHAT THIS SUITE SETTLES. Three claims in the committed evidence artefacts
  * were asserted rather than measured, and each is now computed by a pure
@@ -29,6 +31,15 @@
  * ROWS and validation RECORDS apart and classify the residue rather than
  * subtract it.
  *
+ * `parseStoredAssumptions` is pinned here for the same reason: it is the one
+ * rule the validate and report stages both decode
+ * `catalog_validation_records.nutrition_assumptions` with, and `toItemRecord`
+ * puts its result on every published item's record — so the assumptions a
+ * report states and the assumptions a row carries can only agree if this
+ * decoder answers to the encoder. Its cases are the values the column can
+ * actually hold: absent, empty, a written array, and text no writer here would
+ * have produced.
+ *
  * WHY IT IS DATABASE-FREE. Everything asserted here is a pure function taking
  * its measurement as an argument (Rule backend-architecture §7, §11): the
  * scan, the file writes and the reconciliation are the stage's I/O and are
@@ -37,15 +48,23 @@
  * mock — the inputs are plain data.
  *
  * WHY THE `catalog-validate` HELPER IS PINNED HERE. `buildDuplicateIdentityAccounting`
- * belongs to the validate stage but is evidence-shaping code, and
- * `src/__tests__/scripts/catalog-validate.test.ts` is owned by a different
- * work unit at this checkpoint. Its import is the same relative import
+ * belongs to the validate stage but is pure evidence-shaping code, and this
+ * file is the database-free home for the evidence artefacts' pure judgements.
+ * `src/__tests__/scripts/catalog-validate.test.ts` is the PostgreSQL-backed
+ * suite for that stage's unit of work, its resume accounting and its log
+ * volume — a rolled-back transaction is its mechanism, and an accounting
+ * function that takes its figures as arguments would pay for a database it
+ * never reaches. Its import is the same relative import
  * `catalog-import.test.ts` already uses for that module.
  *
  * Jest's `roots` is `<rootDir>/src` (jest.config.ts), so a test under
  * `scripts/` would never be collected; the relative imports into `scripts/` are
  * the consequence of that, not a choice.
  */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import {
     CATALOG_CHECK_NAMES,
     CATALOG_QUARANTINE_CHECK_NAMES,
@@ -56,23 +75,37 @@ import {
 } from '../../services/catalog.logic';
 import type { CatalogIdentityCandidate, CatalogValidationPolicy } from '../../services/catalog.logic';
 import {
+    CatalogReportError,
+    assertRecognisedStoredValues,
     buildCoverageRows,
     buildRequirementBlock,
     buildWithheldIdentityAudit,
+    canonicalReportDirectory,
+    defaultReportIo,
     generatedContentPresence,
+    measureCatalog,
     notApplicableChecksForItem,
     perCategoryByStatus,
     pruneSupersededKeys,
+    publicationDirectoryDriftRefusal,
+    publicationDirectoryReplacedRefusal,
     publishedItemFacts,
+    quoteStoredValue,
+    resolveReportOutputDirectory,
+    runReport,
     supersededKeyPaths,
     toItemRecord,
     toQuarantinedIdentity,
+    unrecognisedStoredValuesOfRow,
 } from '../../../scripts/catalog-report';
 import type {
     CatalogMeasurement,
     CategoryMeasurement,
     PublishedItemFacts,
+    ReportDb,
     ReportFoodRow,
+    ReportIo,
+    ReportOutcome,
     ValidationRecordRow,
     WithheldIdentity,
 } from '../../../scripts/catalog-report';
@@ -83,9 +116,18 @@ import {
     validationRecordPatch,
 } from '../../../scripts/catalog-validate';
 import type { AliasMergePartition } from '../../../scripts/catalog-validate';
+import { parseStoredAssumptions } from '../../../scripts/lib/nutritionAssumptions';
 import type { CatalogValidationVerdict } from '../../../src/services/catalog.logic';
 import type { CatalogValidationCheck } from '../../../src/types/catalog';
+import {
+    ManifestError,
+    loadCoveragePlan,
+    loadEvidenceAllowlist,
+    physicalPathIdentity,
+    withArtifactPublicationLock,
+} from '../../../scripts/lib/manifest';
 import type { CoveragePlan } from '../../../scripts/lib/manifest';
+import type { ScriptLogger } from '../../../scripts/lib/logger';
 
 /* ---------------------------------------------------------------------------
  * Fixtures. Every field is stated so a test reads as the row it describes, and
@@ -148,6 +190,8 @@ const measurement = (overrides: Partial<CatalogMeasurement> = {}): CatalogMeasur
     recordFieldMismatchCount: 0,
     recordFieldMismatches: [],
     rowsWithValidationRecord: 0,
+    unrecognisedStoredValues: [],
+    unrecognisedStoredValueCount: 0,
     ...overrides,
 });
 
@@ -603,6 +647,71 @@ describe('publishedItemFacts', () => {
     });
 });
 
+describe('parseStoredAssumptions', () => {
+    describe('a record that states no assumptions', () => {
+        it('reads a null column as an empty list', () => {
+            expect(parseStoredAssumptions(null)).toEqual([]);
+        });
+
+        it('reads an unselected column as an empty list', () => {
+            expect(parseStoredAssumptions(undefined)).toEqual([]);
+        });
+
+        it('reads an empty string as an empty list', () => {
+            expect(parseStoredAssumptions('')).toEqual([]);
+        });
+
+        it('reads a whitespace-only value as an empty list', () => {
+            expect(parseStoredAssumptions('   \n\t ')).toEqual([]);
+        });
+    });
+
+    describe('a record that states assumptions', () => {
+        it('returns the stored strings in the order the writing stage encoded them', () => {
+            const written = ['density assumed from a like food', 'portion estimated'];
+
+            expect(parseStoredAssumptions(JSON.stringify(written))).toEqual(written);
+        });
+
+        it('returns an empty list for a written array that holds nothing', () => {
+            expect(parseStoredAssumptions('[]')).toEqual([]);
+        });
+
+        it('drops the entries that are not strings rather than carrying them forward', () => {
+            const encoded = '["density assumed",7,null,{"assumption":"nested"},["nested"],"portion estimated"]';
+
+            expect(parseStoredAssumptions(encoded)).toEqual(['density assumed', 'portion estimated']);
+        });
+
+        it('returns an empty list for an array in which no entry is a string', () => {
+            expect(parseStoredAssumptions('[1,2,null]')).toEqual([]);
+        });
+    });
+
+    describe('a value no writer of the column would have produced', () => {
+        it('drops JSON that parses to an object', () => {
+            expect(parseStoredAssumptions('{"assumption":"density assumed"}')).toEqual([]);
+        });
+
+        it('drops JSON that parses to a number', () => {
+            expect(parseStoredAssumptions('7')).toEqual([]);
+        });
+
+        it('drops a quoted string rather than reading the text as one assumption', () => {
+            expect(parseStoredAssumptions('"density assumed from a like food"')).toEqual([]);
+        });
+
+        it('drops JSON that parses to null', () => {
+            expect(parseStoredAssumptions('null')).toEqual([]);
+        });
+
+        it('drops malformed JSON rather than carrying the raw text forward', () => {
+            expect(parseStoredAssumptions('["density assumed"')).toEqual([]);
+            expect(parseStoredAssumptions('density assumed from a like food')).toEqual([]);
+        });
+    });
+});
+
 describe('toItemRecord', () => {
     const row: ReportFoodRow = {
         source_key: 'usda:169967',
@@ -649,6 +758,14 @@ describe('toItemRecord', () => {
         const item = toItemRecord(row, record);
 
         expect(nameOf(item.notApplicableChecks as { name: string }[])).toContain('missing_density');
+    });
+
+    it('states the stored assumptions as the list they were encoded from', () => {
+        const encoded = JSON.stringify(['density assumed from a like food']);
+        const item = toItemRecord(row, { ...record, nutrition_assumptions: encoded });
+
+        expect(item.nutritionAssumptions).toEqual(['density assumed from a like food']);
+        expect(toItemRecord(row, record).nutritionAssumptions).toEqual([]);
     });
 
     it('leaves the checks array exactly as the validator wrote it', () => {
@@ -834,9 +951,9 @@ describe('buildWithheldIdentityAudit', () => {
         expect(audit.note).toContain('4 identity(ies) are listed');
     });
 
-    // F06: a withheld identity that states only the NAME of what failed cannot
-    // be triaged from committed evidence. These pin the judgement data beside
-    // it, and the per-entry agreement between the two.
+    // A withheld identity that states only the NAME of what failed cannot be
+    // triaged from committed evidence. These pin the judgement data beside it,
+    // and the per-entry agreement between the two.
     it('states every failing check with its observed value and bound', () => {
         const audit = buildWithheldIdentityAudit(coverage(), measured());
 
@@ -1328,9 +1445,9 @@ describe('buildCoverageRows', () => {
         ]);
     });
 
-    // CMPBE-F01 / DOCSMOB-F08: a shortfall number alone does not say whether
-    // the gap can be closed by triaging withheld rows or only by obtaining
-    // more input, and that is the first thing an operator needs.
+    // A shortfall number alone does not say whether the gap can be closed by
+    // triaging withheld rows or only by obtaining more input, and that is the
+    // first thing an operator needs.
     it('divides the gap into rows that exist and rows that were never obtained', () => {
         const published = { produce_vegetable: 1400, spice_herb: 49 };
         const rows = buildCoverageRows(
@@ -2092,5 +2209,1247 @@ describe('buildDuplicateIdentityAccounting', () => {
         expect(accounting.lostIdentitiesByStatusBeforeThisRun).toEqual({});
         expect(accounting.reconciliation.everyCheckHolds).toBe(true);
         expect(accounting.note).toContain('0 identity(ies) lost the identity dedupe');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * ONE PHYSICAL OUTPUT DIRECTORY, FROM THE GUARD TO THE RENAME
+ * (SEC3-report-outdir-symlink, CWE-59 + CWE-367).
+ *
+ * The stage used to resolve `--out` twice: the scoped-report guard was
+ * evaluated against the symlink-resolved directory while the publication lock
+ * and both artefact writes used the operator's spelling. A symlink on that
+ * spelling could therefore name a harmless directory while the guard ran and
+ * name data/meal-planning/reports/latest by the time the renames happened —
+ * replacing whole-catalog acceptance evidence with one category's figures under
+ * the same file names, with the lock serialising a directory nobody was
+ * writing to.
+ *
+ * WHY THESE CASES TOUCH A FILESYSTEM while the rest of this suite does not:
+ * what is under test IS a filesystem identity. A symlink alias, a retarget
+ * between two moments and "the lock and the writes agree on one directory" are
+ * not statements about data, and a fake path layer would only assert the
+ * assumption the bug was made of. The pure half of the decision
+ * (`publicationDirectoryDriftRefusal`) is pinned without a filesystem, exactly
+ * as Rule backend-architecture §1.2 and §11 ask.
+ *
+ * WHY NO CASE HERE CAN DAMAGE THE COMMITTED PAIR: the hostile destinations aim
+ * at a fresh, randomly named SUBDIRECTORY of the committed report directory —
+ * `writesIntoCanonicalReportDirectory` is true for it, so it exercises the same
+ * refusal — and every case asserts the committed `validation-report.json` and
+ * `import-report.json` are byte-for-byte the files they were, by size and
+ * modification time, rather than trusting that they were left alone.
+ * ------------------------------------------------------------------------- */
+
+describe('the report stage publishes into one physical directory (SEC3-report-outdir-symlink)', () => {
+    const committedPlan = loadCoveragePlan();
+    const committedAllowlist = loadEvidenceAllowlist();
+    const reportedCategory = committedPlan.categories[0].category;
+
+    const silentLogger: ScriptLogger = {
+        debug: () => undefined,
+        info: () => undefined,
+        warn: () => undefined,
+        error: () => undefined,
+        child: () => silentLogger,
+    };
+
+    const VALIDATION_REPORT = 'validation-report.json';
+    const IMPORT_REPORT = 'import-report.json';
+
+    const publishedRecord: ValidationRecordRow = {
+        canonical_identity: { canonicalName: 'reported food', foodState: 'raw' },
+        aliases: ['reported'],
+        category: reportedCategory,
+        food_state: 'raw',
+        identity_source: 'usda',
+        identity_status: 'verified',
+        nutrition_provenance: 'source_backed',
+        nutrition_method: 'usda_record',
+        nutrition_assumptions: null,
+        portion_units: [{ description: '1 cup', gramWeight: 100 }],
+        identity_evidence: [],
+        checks: [{ name: 'energy_vs_macros', pass: true, observed: 1, bound: 30 }],
+        llm_review: null,
+        outcome: 'accepted',
+        reviewed_at: new Date('2026-09-14T09:00:00.000Z'),
+        publication_status: 'published',
+        source_versions: { usda: 'sr-legacy' },
+    };
+
+    /** A published row as the release stores one, annotated rather than cast so
+     * a column the stage starts selecting is a compile error here. */
+    const publishedRow = (sourceKey: string): ReportFoodRow => ({
+        source_key: sourceKey,
+        canonical_name: `name ${sourceKey}`,
+        display_name: `Display ${sourceKey}`,
+        category: reportedCategory,
+        food_state: 'raw',
+        identity_source: 'usda',
+        identity_status: 'verified',
+        nutrition_provenance: 'source_backed',
+        nutrition_basis: 'per_100g',
+        basis_amount: 100,
+        publication_status: 'published',
+        food_group: 'other',
+        usda_data_type: 'SR Legacy',
+        catalog_validation_records: publishedRecord,
+        _count: { catalog_food_components: 0 },
+    });
+
+    const PUBLISHED_ROWS: readonly ReportFoodRow[] = [publishedRow('usda:1'), publishedRow('usda:2')];
+
+    /** A keyset-paging `catalog_foods.findMany` over a fixed row set. */
+    const reportDb = (rows: readonly ReportFoodRow[]): ReportDb => ({
+        catalog_foods: {
+            findMany: async (args: unknown): Promise<ReportFoodRow[]> => {
+                const query = args as {
+                    where?: Record<string, unknown>;
+                    cursor?: { source_key: string };
+                    take?: number;
+                };
+                const wantedStatus = query.where?.publication_status as string | undefined;
+                const wantedCategory = query.where?.category as string | undefined;
+                let scoped = [...rows]
+                    .filter((row) => wantedStatus === undefined || row.publication_status === wantedStatus)
+                    .filter((row) => wantedCategory === undefined || row.category === wantedCategory)
+                    .sort((left, right) => (left.source_key < right.source_key ? -1 : 1));
+                if (query.cursor !== undefined) {
+                    const at = scoped.findIndex((row) => row.source_key === query.cursor?.source_key);
+                    scoped = scoped.slice(at + 1);
+                }
+                return query.take === undefined ? scoped : scoped.slice(0, query.take);
+            },
+        },
+    });
+
+    /**
+     * A reader that fails the test if it is consulted at all.
+     *
+     * Every refusal below must be decided from the destination alone, before
+     * the catalog is measured: a run that scanned first and refused afterwards
+     * would already have held a snapshot open and, worse, would prove nothing
+     * about the order the real guard runs in.
+     */
+    const unreadableDb: ReportDb = {
+        catalog_foods: {
+            findMany: async (): Promise<ReportFoodRow[]> => {
+                throw new Error('the catalog must not be read by a run whose destination is refused');
+            },
+        },
+    };
+
+    const run = async (
+        outDir: string,
+        db: ReportDb,
+        overrides: { readonly category?: string | null; readonly io?: ReportIo } = {},
+    ): Promise<ReportOutcome> =>
+        runReport({
+            db,
+            plan: committedPlan,
+            allowlistVersion: committedAllowlist.allowlistVersion,
+            evidenceRegistrySnapshot: committedAllowlist.registrySnapshot,
+            options: { help: false, category: overrides.category ?? null, out: outDir },
+            outDir,
+            logger: silentLogger,
+            io: overrides.io ?? defaultReportIo(),
+        });
+
+    const failureOf = async (attempt: Promise<unknown>): Promise<unknown> =>
+        attempt.then(
+            () => null,
+            (error: unknown) => error,
+        );
+
+    /** Size and mtime of the two committed artefacts, so "untouched" is
+     * measured rather than assumed. */
+    const committedPairState = (): readonly string[] =>
+        [VALIDATION_REPORT, IMPORT_REPORT].map((name) => {
+            const stats = fs.statSync(path.join(canonicalReportDirectory(), name));
+            return `${name}:${stats.size}:${stats.mtimeMs}`;
+        });
+
+    let workspace: string;
+
+    beforeEach(() => {
+        workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'soh-report-identity-'));
+    });
+
+    afterEach(() => {
+        fs.rmSync(workspace, { recursive: true, force: true });
+    });
+
+    describe('publicationDirectoryDriftRefusal', () => {
+        it('accepts the run when both later observations still name the resolved directory', () => {
+            expect(
+                publicationDirectoryDriftRefusal({
+                    named: '/tmp/link-to-reports',
+                    expected: '/real/reports',
+                    observedFromNamedPath: '/real/reports',
+                    observedFromIdentity: '/real/reports',
+                }),
+            ).toBeNull();
+        });
+
+        it('refuses when the path the operator named now resolves somewhere else', () => {
+            const refusal = publicationDirectoryDriftRefusal({
+                named: '/tmp/link-to-reports',
+                expected: '/real/reports',
+                observedFromNamedPath: '/real/elsewhere',
+                observedFromIdentity: '/real/reports',
+            });
+
+            // The operator has to be able to see BOTH places to act on this:
+            // the one they pointed at and the one the run was about.
+            expect(String(refusal)).toContain('/tmp/link-to-reports');
+            expect(String(refusal)).toContain('/real/elsewhere');
+            expect(String(refusal)).toContain('/real/reports');
+            expect(String(refusal)).toContain('Nothing was written');
+        });
+
+        it('refuses when the resolved directory itself has been replaced', () => {
+            const refusal = publicationDirectoryDriftRefusal({
+                named: '/real/reports',
+                expected: '/real/reports',
+                observedFromNamedPath: '/real/reports',
+                observedFromIdentity: '/real/swapped',
+            });
+
+            expect(String(refusal)).toContain('the resolved output directory itself');
+            expect(String(refusal)).toContain('/real/swapped');
+        });
+    });
+
+    describe('the destination main() decides', () => {
+        it('refuses a --category run whose --out reaches the committed directory through a symlinked parent', () => {
+            // The alias names the committed report directory's PARENT, so the
+            // `--out` value spells a path that contains no committed component
+            // at all — which is exactly the walk-around a lexical comparison
+            // waves through.
+            const aliasParent = path.join(workspace, 'reports-alias');
+            fs.symlinkSync(path.dirname(canonicalReportDirectory()), aliasParent, 'dir');
+            const aliasedCommittedDir = path.join(aliasParent, path.basename(canonicalReportDirectory()));
+            const before = committedPairState();
+
+            const failure = (() => {
+                try {
+                    resolveReportOutputDirectory({
+                        options: { help: false, category: reportedCategory, out: aliasedCommittedDir },
+                        logger: silentLogger,
+                    });
+                    return null;
+                } catch (error: unknown) {
+                    return error;
+                }
+            })();
+
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('scoped_report_needs_out_dir');
+            // The refusal names the place it is protecting, by its real path,
+            // not by the alias the operator typed.
+            expect((failure as CatalogReportError).message).toContain(physicalPathIdentity(canonicalReportDirectory()));
+            expect((failure as CatalogReportError).message).toContain(aliasedCommittedDir);
+            expect(committedPairState()).toEqual(before);
+        });
+
+        it('creates nothing at a destination it refuses', () => {
+            const refused = path.join(workspace, 'scoped-out');
+
+            expect(() =>
+                resolveReportOutputDirectory({
+                    options: { help: false, category: reportedCategory, out: path.join(canonicalReportDirectory(), 'scoped') },
+                    logger: silentLogger,
+                }),
+            ).toThrow(CatalogReportError);
+            // And the refusal above is about the destination, not about the
+            // flag: the same category with a destination outside the committed
+            // directory resolves and is created.
+            const accepted = resolveReportOutputDirectory({
+                options: { help: false, category: reportedCategory, out: refused },
+                logger: silentLogger,
+            });
+
+            expect(fs.existsSync(path.join(canonicalReportDirectory(), 'scoped'))).toBe(false);
+            expect(accepted.directory).toBe(fs.realpathSync(refused));
+            expect(fs.statSync(accepted.directory).isDirectory()).toBe(true);
+        });
+
+        it('hands downstream the physical identity, so a later retarget has nothing left to redirect', async () => {
+            const real = path.join(workspace, 'real-a');
+            const decoy = path.join(workspace, 'real-b');
+            const alias = path.join(workspace, 'alias');
+            fs.mkdirSync(real);
+            fs.mkdirSync(decoy);
+            fs.symlinkSync(real, alias, 'dir');
+
+            const destination = resolveReportOutputDirectory({
+                options: { help: false, category: null, out: alias },
+                logger: silentLogger,
+            });
+
+            // The attacker's move, after the destination was decided and the
+            // guard ran on it.
+            fs.unlinkSync(alias);
+            fs.symlinkSync(decoy, alias, 'dir');
+
+            expect(destination.named).toBe(alias);
+            expect(destination.directory).toBe(fs.realpathSync(real));
+            expect(physicalPathIdentity(alias)).not.toBe(destination.directory);
+
+            const outcome = await run(destination.directory, reportDb(PUBLISHED_ROWS));
+
+            expect(fs.readdirSync(fs.realpathSync(real)).sort()).toEqual([IMPORT_REPORT, VALIDATION_REPORT]);
+            expect(fs.readdirSync(fs.realpathSync(decoy))).toEqual([]);
+            expect(outcome.validationReportPath).toBe(path.join(fs.realpathSync(real), VALIDATION_REPORT));
+            expect(outcome.importReportPath).toBe(path.join(fs.realpathSync(real), IMPORT_REPORT));
+        });
+
+        it('states the committed-artefact verdict for the identity, not for the spelling', () => {
+            const alias = path.join(workspace, 'committed-alias');
+            fs.symlinkSync(canonicalReportDirectory(), alias, 'dir');
+
+            const destination = resolveReportOutputDirectory({
+                options: { help: false, category: null, out: alias },
+                logger: silentLogger,
+            });
+
+            // A whole-catalog run into the committed directory is legitimate —
+            // it is the default — but the log has to say so however the
+            // operator spelled it.
+            expect(destination.writesCommittedArtefacts).toBe(true);
+            expect(destination.directory).toBe(physicalPathIdentity(canonicalReportDirectory()));
+        });
+    });
+
+    describe('runReport under the publication lock', () => {
+        it('refuses a scoped run aimed inside the committed directory through an alias, without reading the catalog', async () => {
+            // A destination INSIDE the committed directory, reached through an
+            // alias on its parent: `writesIntoCanonicalReportDirectory` is true
+            // for it, so it earns the same refusal the committed pair does —
+            // and a regression cannot overwrite either artefact, because this
+            // name has never existed.
+            const aliasParent = path.join(workspace, 'reports-alias');
+            fs.symlinkSync(path.dirname(canonicalReportDirectory()), aliasParent, 'dir');
+            const scopedInsideCommitted = path.join(
+                aliasParent,
+                path.basename(canonicalReportDirectory()),
+                `scoped-${path.basename(workspace)}`,
+            );
+            const before = committedPairState();
+
+            try {
+                const failure = await failureOf(
+                    run(scopedInsideCommitted, unreadableDb, { category: reportedCategory }),
+                );
+
+                expect(failure).toBeInstanceOf(CatalogReportError);
+                expect((failure as CatalogReportError).code).toBe('scoped_report_needs_out_dir');
+                expect((failure as CatalogReportError).message).toContain(
+                    physicalPathIdentity(canonicalReportDirectory()),
+                );
+                // Nothing of this run reached the committed directory: neither
+                // the pair nor the subdirectory it was aimed at.
+                expect(fs.existsSync(path.join(canonicalReportDirectory(), path.basename(scopedInsideCommitted)))).toBe(
+                    false,
+                );
+                expect(committedPairState()).toEqual(before);
+            } finally {
+                // A regression would have created it; the committed tree must
+                // not carry a stray directory out of a failed test run.
+                fs.rmSync(path.join(canonicalReportDirectory(), path.basename(scopedInsideCommitted)), {
+                    recursive: true,
+                    force: true,
+                });
+            }
+        });
+
+        it('refuses when the path it was given is retargeted between resolving the destination and the lock', async () => {
+            const real = path.join(workspace, 'real-a');
+            const decoy = path.join(workspace, 'real-b');
+            const alias = path.join(workspace, 'alias');
+            fs.mkdirSync(real);
+            fs.mkdirSync(decoy);
+            fs.symlinkSync(real, alias, 'dir');
+
+            // The race the finding names: the retarget lands after the run has
+            // resolved its destination and before it publishes. Taking the lock
+            // is that instant, so the fake lock is where it is staged.
+            const racingIo: ReportIo = {
+                ...defaultReportIo(),
+                withPublicationLock: async (directory, holder, publish) => {
+                    fs.unlinkSync(alias);
+                    fs.symlinkSync(decoy, alias, 'dir');
+                    return withArtifactPublicationLock(directory, holder, publish);
+                },
+            };
+
+            const failure = await failureOf(run(alias, reportDb(PUBLISHED_ROWS), { io: racingIo }));
+
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('output_directory_changed');
+            expect((failure as CatalogReportError).message).toContain(alias);
+            // Neither directory holds an artefact: the run refused instead of
+            // publishing into the place it had not checked, and left no
+            // staging file behind either.
+            expect(fs.readdirSync(fs.realpathSync(real))).toEqual([]);
+            expect(fs.readdirSync(fs.realpathSync(decoy))).toEqual([]);
+        });
+
+        it('refuses when the resolved directory itself is replaced by a symlink under the lock', async () => {
+            const real = path.join(workspace, 'real-a');
+            const decoy = path.join(workspace, 'real-b');
+            fs.mkdirSync(real);
+            fs.mkdirSync(decoy);
+            const identity = fs.realpathSync(real);
+
+            const racingIo: ReportIo = {
+                ...defaultReportIo(),
+                withPublicationLock: async (directory, holder, publish) => {
+                    // The other half of the attack: the identity carries no
+                    // symlink, so the only way to redirect a write through it
+                    // is to replace the directory it names.
+                    fs.rmdirSync(identity);
+                    fs.symlinkSync(decoy, identity, 'dir');
+                    return withArtifactPublicationLock(directory, holder, publish);
+                },
+            };
+
+            const failure = await failureOf(run(identity, reportDb(PUBLISHED_ROWS), { io: racingIo }));
+
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('output_directory_changed');
+            expect(fs.readdirSync(fs.realpathSync(decoy))).toEqual([]);
+        });
+
+        it('locks the same directory the artefacts appear in, whatever the caller spelled', async () => {
+            const real = path.join(workspace, 'real');
+            const alias = path.join(workspace, 'alias');
+            fs.mkdirSync(real);
+            fs.symlinkSync(real, alias, 'dir');
+
+            const locked: string[] = [];
+            const recordingIo: ReportIo = {
+                ...defaultReportIo(),
+                withPublicationLock: async (directory, holder, publish) => {
+                    locked.push(directory);
+                    return withArtifactPublicationLock(directory, holder, publish);
+                },
+            };
+
+            const outcome = await run(alias, reportDb(PUBLISHED_ROWS), { io: recordingIo });
+
+            // Mutual exclusion and the writes have to be about one place. The
+            // spelling would have serialised `<workspace>/alias` while the
+            // artefacts landed in `<workspace>/real`.
+            expect(locked).toEqual([fs.realpathSync(real)]);
+            expect(path.dirname(outcome.validationReportPath)).toBe(fs.realpathSync(real));
+            expect(fs.readdirSync(fs.realpathSync(real)).sort()).toEqual([IMPORT_REPORT, VALIDATION_REPORT]);
+        });
+
+        it('still publishes both artefacts, and nothing else, into an ordinary output directory', async () => {
+            const outcome = await run(workspace, reportDb(PUBLISHED_ROWS));
+
+            // The unremarkable run has to stay unremarkable: the pair appears
+            // together, no staging or backup file survives, and the outcome
+            // names the directory it was given.
+            expect(fs.readdirSync(workspace).sort()).toEqual([IMPORT_REPORT, VALIDATION_REPORT]);
+            expect(outcome.validationReportPath).toBe(path.join(workspace, VALIDATION_REPORT));
+            expect(outcome.importReportPath).toBe(path.join(workspace, IMPORT_REPORT));
+            expect(outcome.itemRecords).toBe(PUBLISHED_ROWS.length);
+            expect(outcome.publishedRows).toBe(PUBLISHED_ROWS.length);
+
+            const validationReport = JSON.parse(
+                fs.readFileSync(path.join(workspace, VALIDATION_REPORT), 'utf-8'),
+            ) as Record<string, unknown>;
+            expect(Object.keys(validationReport.items as Record<string, unknown>).sort()).toEqual(['usda:1', 'usda:2']);
+        });
+
+        it('publishes a scoped report into a directory outside the committed one', async () => {
+            const outcome = await run(workspace, reportDb(PUBLISHED_ROWS), { category: reportedCategory });
+
+            // The guard is about the destination, not about the flag: a scoped
+            // run with somewhere else to write still produces its evidence.
+            expect(fs.readdirSync(workspace).sort()).toEqual([IMPORT_REPORT, VALIDATION_REPORT]);
+            expect(outcome.itemRecords).toBe(PUBLISHED_ROWS.length);
+        });
+    });
+
+    /* ----------------------------------------------------------------------
+     * THE WINDOW AFTER THE UNDER-LOCK CHECK.
+     *
+     * The cases above cover a retarget that lands BEFORE the run reads the
+     * catalog: the drift check under the publication lock refuses it. What they
+     * cannot cover is the interval the check opens onto — the catalog
+     * measurement is two awaited scans, minutes long on a full catalog, and the
+     * staging writes, the read-back and the promotion that follow it are
+     * path-based. A directory replaced during the scan would be followed by
+     * every one of them while the lock was still keyed to the directory that
+     * had gone.
+     *
+     * Each case below therefore mutates the filesystem from inside an awaited
+     * database call, after every check the run makes before its first scan has
+     * already passed, and asserts the two things that matter: the replacement
+     * receives nothing, and the committed pair is byte-identical.
+     * -------------------------------------------------------------------- */
+    describe('the window after the under-lock check', () => {
+        /** The two committed artefacts' bytes, so "byte-identical" is compared
+         * rather than inferred from a size and a timestamp. */
+        const committedPairBytes = (): readonly Buffer[] =>
+            [VALIDATION_REPORT, IMPORT_REPORT].map((name) =>
+                fs.readFileSync(path.join(canonicalReportDirectory(), name)),
+            );
+
+        const expectBytesEqual = (actual: readonly Buffer[], expected: readonly Buffer[]): void => {
+            expect(actual.length).toBe(expected.length);
+            actual.forEach((buffer, index) => {
+                expect(buffer.equals(expected[index])).toBe(true);
+            });
+        };
+
+        /**
+         * A reader that runs `mutate` inside the FIRST awaited page of the
+         * chosen pass, then answers normally.
+         *
+         * `publication_status` is what separates the two passes: the aggregate
+         * pass scans the whole catalog and the item pass scans published rows
+         * only. Mutating from inside the call is what puts the change after the
+         * drift check, the parent check and the identity capture — which is the
+         * moment the earlier cases cannot reach.
+         */
+        const mutatingDb = (
+            rows: readonly ReportFoodRow[],
+            pass: 'aggregate' | 'items',
+            mutate: () => void,
+        ): ReportDb => {
+            const underlying = reportDb(rows);
+            let mutated = false;
+            return {
+                catalog_foods: {
+                    findMany: async (args: unknown): Promise<ReportFoodRow[]> => {
+                        const scoped = (args as { where?: Record<string, unknown> }).where?.publication_status;
+                        const thisPass = scoped === undefined ? 'aggregate' : 'items';
+                        if (!mutated && thisPass === pass) {
+                            mutated = true;
+                            mutate();
+                        }
+                        return underlying.catalog_foods.findMany(args);
+                    },
+                },
+            };
+        };
+
+        /**
+         * The real IO with both staging files redirected OUTSIDE the publication
+         * directory, and a hook fired after the import document is staged.
+         *
+         * Needed to reach the read-back and promotion checks at all: a staging
+         * file inside the publication directory makes that directory
+         * non-empty, so an attacker who replaced it would have to destroy this
+         * run's own open descriptor first and the run would fail on its own
+         * write instead of on the check being exercised. Redirecting the
+         * staging files leaves the directory empty and replaceable, which is
+         * the state those two checks exist for. `finalPath` is untouched, so
+         * the promotion still targets the real artefact paths.
+         */
+        const stagingOutside = (elsewhere: string, afterImportStaged: () => void = () => undefined): ReportIo => {
+            const real = defaultReportIo();
+            return {
+                ...real,
+                openStagedSink: (absolutePath) => {
+                    const opened = real.openStagedSink(path.join(elsewhere, path.basename(absolutePath)));
+                    return {
+                        sink: opened.sink,
+                        staged: { finalPath: absolutePath, stagingPath: opened.staged.stagingPath },
+                    };
+                },
+                stageJsonObject: (absolutePath, value) => {
+                    const staged = real.stageJsonObject(path.join(elsewhere, path.basename(absolutePath)), value);
+                    afterImportStaged();
+                    return { finalPath: absolutePath, stagingPath: staged.stagingPath };
+                },
+            };
+        };
+
+        describe('publicationDirectoryReplacedRefusal', () => {
+            const expected = { device: 66306, inode: 4211 };
+
+            it('accepts the run while the directory is the same object it captured', () => {
+                expect(
+                    publicationDirectoryReplacedRefusal({
+                        directory: '/real/reports',
+                        operation: 'publishing both artefacts',
+                        expected,
+                        observed: { device: 66306, inode: 4211 },
+                    }),
+                ).toBeNull();
+            });
+
+            it('refuses a directory replaced by another one at the same path, naming both inodes', () => {
+                // The case a re-resolution cannot see: the path still resolves
+                // to itself, and it is not the same directory.
+                const refusal = publicationDirectoryReplacedRefusal({
+                    directory: '/real/reports',
+                    operation: 'publishing both artefacts',
+                    expected,
+                    observed: { device: 66306, inode: 9999 },
+                });
+
+                expect(String(refusal)).toContain('/real/reports');
+                expect(String(refusal)).toContain('inode 9999');
+                expect(String(refusal)).toContain('inode 4211');
+                expect(String(refusal)).toContain('publishing both artefacts');
+                // The operator has to know where to look: the right to replace
+                // that name belongs to whoever can write to its parent.
+                expect(String(refusal)).toContain('/real');
+                expect(String(refusal)).toContain('are intact');
+            });
+
+            it('refuses a directory on a different device even when the inode matches', () => {
+                expect(
+                    publicationDirectoryReplacedRefusal({
+                        directory: '/real/reports',
+                        operation: `staging ${VALIDATION_REPORT}`,
+                        expected,
+                        observed: { device: 1, inode: 4211 },
+                    }),
+                ).not.toBeNull();
+            });
+
+            it('refuses when the name holds no directory at all, and says so', () => {
+                const refusal = publicationDirectoryReplacedRefusal({
+                    directory: '/real/reports',
+                    operation: `staging ${IMPORT_REPORT}`,
+                    expected,
+                    observed: null,
+                });
+
+                expect(String(refusal)).toContain('no directory at all');
+                expect(String(refusal)).toContain(`staging ${IMPORT_REPORT}`);
+            });
+        });
+
+        it('refuses when the directory is replaced during the first awaited catalog scan', async () => {
+            const real = path.join(workspace, 'real-a');
+            const decoy = path.join(workspace, 'real-b');
+            fs.mkdirSync(real);
+            fs.mkdirSync(decoy);
+            const identity = fs.realpathSync(real);
+            const committedBefore = committedPairBytes();
+
+            // The attack this case exists for: the run has already passed the
+            // under-lock drift check, the parent check and the identity
+            // capture, and is inside its first scan — which on a real catalog
+            // is minutes of wall time.
+            const db = mutatingDb(PUBLISHED_ROWS, 'aggregate', () => {
+                fs.rmdirSync(identity);
+                fs.symlinkSync(decoy, identity, 'dir');
+            });
+
+            const failure = await failureOf(run(identity, db));
+
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('output_directory_changed');
+            expect((failure as CatalogReportError).message).toContain(identity);
+            // The replacement received no bytes: not an artefact, not a staging
+            // file, not a partial stream.
+            expect(fs.readdirSync(decoy)).toEqual([]);
+            // And the artefacts a reviewer reads are the ones that were there
+            // before this run started.
+            expectBytesEqual(committedPairBytes(), committedBefore);
+        });
+
+        it('refuses before reading the staged report back when the directory is replaced during the item pass', async () => {
+            const real = path.join(workspace, 'real-a');
+            const decoy = path.join(workspace, 'real-b');
+            const elsewhere = path.join(workspace, 'staging');
+            [real, decoy, elsewhere].forEach((directory) => fs.mkdirSync(directory));
+            const identity = fs.realpathSync(real);
+            const committedBefore = committedPairBytes();
+
+            const db = mutatingDb(PUBLISHED_ROWS, 'items', () => {
+                fs.rmdirSync(identity);
+                fs.symlinkSync(decoy, identity, 'dir');
+            });
+
+            const failure = await failureOf(run(identity, db, { io: stagingOutside(elsewhere) }));
+
+            // The read-back is what gates the second artefact on the first, so
+            // reading it through a replaced directory would gate the pair on a
+            // document this run never wrote.
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('output_directory_changed');
+            expect((failure as CatalogReportError).message).toContain(`reading the staged ${VALIDATION_REPORT} back`);
+            expect(fs.readdirSync(decoy)).toEqual([]);
+            // The staging files this run opened are removed on the failure
+            // path, so a refused run leaves no debris behind either.
+            expect(fs.readdirSync(elsewhere)).toEqual([]);
+            expectBytesEqual(committedPairBytes(), committedBefore);
+        });
+
+        it('refuses to promote when the directory is replaced after both documents are staged', async () => {
+            const real = path.join(workspace, 'real-a');
+            const decoy = path.join(workspace, 'real-b');
+            const elsewhere = path.join(workspace, 'staging');
+            [real, decoy, elsewhere].forEach((directory) => fs.mkdirSync(directory));
+            const identity = fs.realpathSync(real);
+            const committedBefore = committedPairBytes();
+
+            const io = stagingOutside(elsewhere, () => {
+                // The last window there is: both documents are complete and
+                // reconciled, and the only step left is the pair of renames
+                // onto the artefact pathnames.
+                fs.rmdirSync(identity);
+                fs.symlinkSync(decoy, identity, 'dir');
+            });
+
+            const failure = await failureOf(run(identity, reportDb(PUBLISHED_ROWS), { io }));
+
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('output_directory_changed');
+            expect((failure as CatalogReportError).message).toContain(
+                `publishing ${VALIDATION_REPORT} and ${IMPORT_REPORT}`,
+            );
+            // Nothing was renamed into the replacement, and nothing was left in
+            // the staging directory.
+            expect(fs.readdirSync(decoy)).toEqual([]);
+            expect(fs.readdirSync(elsewhere)).toEqual([]);
+            expectBytesEqual(committedPairBytes(), committedBefore);
+        });
+
+        it('refuses a publication directory another local principal can plant a name in, without reading the catalog', async () => {
+            const shared = path.join(workspace, 'shared-out');
+            fs.mkdirSync(shared);
+            // `mkdir` masks its mode with the umask, so the hostile mode is set
+            // explicitly: world-writable and NOT sticky, which is the state in
+            // which any local principal can pre-place or replace either
+            // artefact name — and replace the directory's own contents.
+            fs.chmodSync(shared, 0o777);
+            const committedBefore = committedPairBytes();
+
+            const failure = await failureOf(run(shared, unreadableDb));
+
+            expect(failure).toBeInstanceOf(ManifestError);
+            expect((failure as ManifestError).code).toBe('unsafe_artifact_directory');
+            expect(fs.readdirSync(shared)).toEqual([]);
+            expectBytesEqual(committedPairBytes(), committedBefore);
+        });
+
+        it('publishes into a shared directory whose sticky bit protects the names it creates', async () => {
+            const sticky = path.join(workspace, 'sticky-out');
+            fs.mkdirSync(sticky);
+            fs.chmodSync(sticky, 0o1777);
+
+            // The rule is "no other principal can plant a name here", not "no
+            // shared directory ever": in a sticky directory a name can only be
+            // renamed or deleted by its owner, so the run proceeds — which is
+            // what keeps `/tmp`-rooted output usable.
+            const outcome = await run(sticky, reportDb(PUBLISHED_ROWS));
+
+            expect(fs.readdirSync(sticky).sort()).toEqual([IMPORT_REPORT, VALIDATION_REPORT]);
+            expect(outcome.itemRecords).toBe(PUBLISHED_ROWS.length);
+        });
+
+        it('refuses a destination whose parent another local principal can plant a name in, creating nothing', () => {
+            const sharedParent = path.join(workspace, 'shared-parent');
+            fs.mkdirSync(sharedParent);
+            fs.chmodSync(sharedParent, 0o777);
+            const destination = path.join(sharedParent, 'out');
+
+            const failure = (() => {
+                try {
+                    resolveReportOutputDirectory({
+                        options: { help: false, category: null, out: destination },
+                        logger: silentLogger,
+                    });
+                    return null;
+                } catch (error: unknown) {
+                    return error;
+                }
+            })();
+
+            expect(failure).toBeInstanceOf(ManifestError);
+            expect((failure as ManifestError).code).toBe('unsafe_artifact_directory');
+            // The refusal comes before the destination is created, so a refused
+            // run leaves nothing at the name it refused to publish into.
+            expect(fs.existsSync(destination)).toBe(false);
+        });
+
+        it('reads a report header without following a symbolic link planted at the artefact name', async () => {
+            const outDir = path.join(workspace, 'out');
+            const outside = path.join(workspace, 'outside.json');
+            fs.mkdirSync(outDir);
+            fs.writeFileSync(outside, '{"secret":"untouched"}\n', 'utf-8');
+            // The canonical read is how another stage's fields are preserved, so
+            // a link at that name would have this run preserve — and then
+            // replace — a document it never wrote.
+            fs.symlinkSync(outside, path.join(outDir, VALIDATION_REPORT));
+
+            const failure = await failureOf(run(outDir, reportDb(PUBLISHED_ROWS)));
+
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('report_unreadable');
+            expect((failure as CatalogReportError).message).toContain('symbolic link');
+            // The link's target was neither read into the artefact nor written
+            // through, and no half of the pair was published.
+            expect(fs.readFileSync(outside, 'utf-8')).toBe('{"secret":"untouched"}\n');
+            expect(fs.readdirSync(outDir)).toEqual([VALIDATION_REPORT]);
+            expect(fs.lstatSync(path.join(outDir, VALIDATION_REPORT)).isSymbolicLink()).toBe(true);
+        });
+
+        it('refuses a symbolic link planted at the import report name after the validation report is staged', async () => {
+            const outDir = path.join(workspace, 'out');
+            const outside = path.join(workspace, 'outside-import.json');
+            fs.mkdirSync(outDir);
+            fs.writeFileSync(outside, '{"counts":{"inserted":1}}\n', 'utf-8');
+            fs.symlinkSync(outside, path.join(outDir, IMPORT_REPORT));
+
+            const failure = await failureOf(run(outDir, reportDb(PUBLISHED_ROWS)));
+
+            // The second read happens after the validation report has been
+            // staged, which is why this case also proves the staging file is
+            // discarded and neither artefact is promoted.
+            expect(failure).toBeInstanceOf(CatalogReportError);
+            expect((failure as CatalogReportError).code).toBe('report_unreadable');
+            expect(fs.readFileSync(outside, 'utf-8')).toBe('{"counts":{"inserted":1}}\n');
+            expect(fs.readdirSync(outDir)).toEqual([IMPORT_REPORT]);
+            expect(fs.lstatSync(path.join(outDir, IMPORT_REPORT)).isSymbolicLink()).toBe(true);
+        });
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * KEYS THAT COME FROM THE DATA.
+ *
+ * WHAT THESE CASES PIN. Almost every figure in the two artefacts is a counter
+ * keyed by a string read out of `catalog_foods` or
+ * `catalog_validation_records`, and three of those strings are not ordinary
+ * data: `__proto__`, `constructor` and `prototype` reach `Object.prototype`
+ * through a plain object. `publishedChecks[check.name] ?? { evaluated: 0, … }`
+ * answered a row whose check was named `__proto__` with `Object.prototype`
+ * itself, so the `??` did not fire and the `tally.evaluated += 1` that followed
+ * wrote three counters onto the prototype every object in the process inherits
+ * from — and `counts['__proto__'] = n` on a plain object drops the count
+ * instead of recording it, leaving a report that omits rows it scanned while
+ * reading as a complete measurement.
+ *
+ * So each case below asserts BOTH halves: that `Object.prototype` is exactly as
+ * it was before the run, and that the count the scan made is present in the
+ * measurement and in the JSON the artefact carries. The first assertion is the
+ * one that fails loudly if the defect returns; the second is what stops the
+ * "fix" being to silently drop the row.
+ *
+ * WHY THIS BLOCK DRIVES `measureCatalog` AND NOT A PURE FUNCTION. The
+ * accumulation IS the aggregate pass, so a fixture handed to a builder cannot
+ * exercise it. `ReportDb` is the seam the stage was given for exactly this —
+ * `findMany` and nothing else — and the reader below is plain data over a fixed
+ * row set, with no database and nothing mocked, like the rest of this suite.
+ * ------------------------------------------------------------------------- */
+
+/** The three names a data key must not be trusted to be. */
+const RESERVED_KEYS: readonly string[] = ['__proto__', 'constructor', 'prototype'];
+
+/**
+ * A lookup by a name TypeScript resolves against `Object` rather than against
+ * the index signature: `measurement.categories.constructor` is typed `Function`
+ * even where the value is a measurement, so the key is passed as a value.
+ */
+const at = <T>(record: Readonly<Record<string, T>>, key: string): T => record[key];
+
+/**
+ * One row and the validation record that mirrors it.
+ *
+ * The record repeats the food's five mirrored columns, so a case about keys
+ * cannot accidentally also be a case about `recordFieldMismatches`.
+ */
+const scannedRow = (
+    sourceKey: string,
+    overrides: Partial<ReportFoodRow>,
+    checkNames: readonly string[],
+): ReportFoodRow => {
+    const food: ReportFoodRow = {
+        source_key: sourceKey,
+        canonical_name: `name ${sourceKey}`,
+        display_name: `Display ${sourceKey}`,
+        category: 'produce_vegetable',
+        food_state: 'raw',
+        identity_source: 'usda',
+        identity_status: 'verified',
+        nutrition_provenance: 'source_backed',
+        nutrition_basis: 'per_100g',
+        basis_amount: 100,
+        publication_status: 'published',
+        food_group: 'other',
+        usda_data_type: 'SR Legacy',
+        catalog_validation_records: null,
+        _count: { catalog_food_components: 0 },
+        ...overrides,
+    };
+
+    return {
+        ...food,
+        catalog_validation_records: {
+            canonical_identity: { canonicalName: food.canonical_name, foodState: food.food_state },
+            aliases: [],
+            category: food.category,
+            food_state: food.food_state,
+            identity_source: food.identity_source,
+            identity_status: food.identity_status,
+            nutrition_provenance: food.nutrition_provenance,
+            nutrition_method: 'read per 100 g from the USDA record',
+            nutrition_assumptions: null,
+            portion_units: [{ description: '1 cup', gram_weight: 91, is_default: true }],
+            identity_evidence: [],
+            checks: checkNames.map((name) => ({ name, pass: false, observed: 1, bound: 2 })),
+            llm_review: null,
+            outcome: 'accepted',
+            reviewed_at: '2026-09-14T09:00:00.000Z',
+            publication_status: food.publication_status,
+            source_versions: { coverage_plan_version: 'v1' },
+        },
+    };
+};
+
+/** A keyset-paging `catalog_foods.findMany` over a fixed row set. */
+const reportDbOver = (rows: readonly ReportFoodRow[]): ReportDb => ({
+    catalog_foods: {
+        findMany: async (args: unknown): Promise<ReportFoodRow[]> => {
+            const query = args as {
+                where?: { publication_status?: string };
+                cursor?: { source_key: string };
+                take?: number;
+            };
+            const wantedStatus = query.where?.publication_status;
+            let scoped = [...rows]
+                .filter((row) => wantedStatus === undefined || row.publication_status === wantedStatus)
+                .sort((left, right) => (left.source_key < right.source_key ? -1 : 1));
+            if (query.cursor !== undefined) {
+                scoped = scoped.slice(scoped.findIndex((row) => row.source_key === query.cursor?.source_key) + 1);
+            }
+            return query.take === undefined ? scoped : scoped.slice(0, query.take);
+        },
+    },
+});
+
+describe('the aggregate pass over rows whose values are reserved keys', () => {
+    /**
+     * Four rows, each aiming one reserved name at a different accumulator: the
+     * check tally the finding quoted, the per-category map, the withheld
+     * identity-source map, and the publication-status counter.
+     */
+    const ROWS: readonly ReportFoodRow[] = [
+        scannedRow('usda:1', {}, [...RESERVED_KEYS, 'kcal_ceiling']),
+        scannedRow('usda:2', { category: '__proto__' }, ['kcal_ceiling']),
+        scannedRow(
+            'usda:3',
+            { category: 'constructor', publication_status: 'quarantined', identity_source: 'prototype' },
+            ['__proto__'],
+        ),
+        scannedRow('usda:4', { publication_status: '__proto__' }, ['kcal_ceiling']),
+    ];
+
+    it('leaves Object.prototype exactly as it found it', async () => {
+        const before = Object.getOwnPropertyNames(Object.prototype).sort();
+
+        await measureCatalog(reportDbOver(ROWS), {});
+
+        expect(Object.getOwnPropertyNames(Object.prototype).sort()).toEqual(before);
+
+        // The four counters the defect wrote onto the prototype, asked of an
+        // object that never went anywhere near this stage. `toBeUndefined`
+        // rather than a key check, because an inherited value is exactly what
+        // this reads out if the pollution returns.
+        const probe = {} as Record<string, unknown>;
+        expect(probe.evaluated).toBeUndefined();
+        expect(probe.passed).toBeUndefined();
+        expect(probe.failed).toBeUndefined();
+        expect(probe.tier).toBeUndefined();
+        expect(Object.getPrototypeOf(probe)).toBe(Object.prototype);
+
+        // `constructor` as a check name reached the `Object` function itself by
+        // the same route, so it is asked separately.
+        expect((Object as unknown as Record<string, unknown>).evaluated).toBeUndefined();
+    });
+
+    it('records every count it scanned rather than dropping the reserved keys', async () => {
+        const measurement = await measureCatalog(reportDbOver(ROWS), {});
+
+        expect(measurement.rowsScanned).toBe(4);
+        expect(Object.keys(measurement.byPublicationStatus).sort()).toEqual([
+            '__proto__',
+            'published',
+            'quarantined',
+        ]);
+        expect(measurement.byPublicationStatus['__proto__']).toBe(1);
+        expect(measurement.byPublicationStatus.published).toBe(2);
+        expect(measurement.byPublicationStatus.quarantined).toBe(1);
+    });
+
+    it('tallies a check named after a reserved key under the unrecognised tier', async () => {
+        const measurement = await measureCatalog(reportDbOver(ROWS), {});
+
+        expect(Object.keys(measurement.publishedChecks).sort()).toEqual([
+            '__proto__',
+            'constructor',
+            'kcal_ceiling',
+            'prototype',
+        ]);
+        // The site the finding named, measured: one evaluation, one failure,
+        // and no tier invented for a name the vocabulary does not declare.
+        expect(measurement.publishedChecks['__proto__']).toEqual({
+            tier: 'unrecognised',
+            evaluated: 1,
+            passed: 0,
+            failed: 1,
+        });
+        expect(at(measurement.publishedChecks, 'constructor')).toEqual({
+            tier: 'unrecognised',
+            evaluated: 1,
+            passed: 0,
+            failed: 1,
+        });
+        // And named, with its count, in the block the artefact publishes for
+        // exactly this purpose. `__proto__` is counted twice because two rows
+        // record it — the published one and the quarantined one — which is what
+        // this counter measures: recorded entries, not distinct names.
+        expect(measurement.unrecognisedCheckNames['__proto__']).toBe(2);
+        expect(measurement.unrecognisedCheckNames.prototype).toBe(1);
+    });
+
+    it('keeps a category named after a reserved key as a measurement, not a prototype', async () => {
+        const measurement = await measureCatalog(reportDbOver(ROWS), {});
+
+        expect(Object.keys(measurement.categories).sort()).toEqual(['__proto__', 'constructor', 'produce_vegetable']);
+        expect(at(measurement.categories, '__proto__').byPublicationStatus).toEqual({ published: 1 });
+        expect(measurement.publishedByCategory['__proto__']).toBe(1);
+        expect(at(measurement.quarantinedByCategory, 'constructor')).toBe(1);
+        expect(Object.keys(at(measurement.categories, 'constructor').quarantinedByCheck)).toEqual(['__proto__']);
+    });
+
+    it('counts a withheld row under the identity source and status the row states', async () => {
+        const measurement = await measureCatalog(reportDbOver(ROWS), {});
+
+        expect(Object.keys(measurement.withheldByIdentitySourceAndStatus)).toEqual(['prototype']);
+        expect(measurement.withheldByIdentitySourceAndStatus.prototype).toEqual({ quarantined: 1 });
+        expect(measurement.withheldIdentities.map((identity) => identity.sourceKey)).toEqual(['usda:3']);
+        expect(measurement.quarantinedByCheck['__proto__']).toBe(1);
+    });
+
+    it('serialises to the JSON a plain object would have produced, keys and all', async () => {
+        const measurement = await measureCatalog(reportDbOver(ROWS), {});
+
+        // The artefact boundary: insertion order, no `Map` that would serialise
+        // to `{}`, and the reserved key present rather than silently absent.
+        const text = JSON.stringify(measurement.byPublicationStatus);
+        expect(text).toBe('{"published":2,"quarantined":1,"__proto__":1}');
+
+        // What the next reader of the artefact gets: `JSON.parse` makes it an
+        // ordinary own property, so carrying the key discloses no hazard.
+        const parsed = JSON.parse(text) as Record<string, number>;
+        expect(Object.prototype.hasOwnProperty.call(parsed, '__proto__')).toBe(true);
+        expect(Object.getPrototypeOf(parsed)).toBe(Object.prototype);
+    });
+
+    it('carries the reserved keys into the blocks the artefacts publish', async () => {
+        const measurement = await measureCatalog(reportDbOver(ROWS), {});
+        const shortfall = computeCoverageShortfall(policy(), measurement.publishedByCategory);
+        const rows = buildCoverageRows(policy(), plan(), measurement, shortfall);
+        const audit = buildWithheldIdentityAudit(rows, measurement);
+
+        // The category vocabulary's own explicit bucket, which is why this
+        // stage counts an undeclared category instead of refusing it.
+        expect(shortfall.unknownCategories).toEqual(['__proto__']);
+        expect(JSON.stringify(audit.byCheck.quarantined)).toBe('{"__proto__":1}');
+        expect(audit.identities.quarantined.map((identity) => identity.sourceKey)).toEqual(['usda:3']);
+        expect(audit.totals.quarantined).toBe(1);
+    });
+
+    it('collects the values no closed set declares so the run can refuse to publish', async () => {
+        const measurement = await measureCatalog(reportDbOver(ROWS), {});
+
+        expect(measurement.unrecognisedStoredValueCount).toBe(2);
+        expect(measurement.unrecognisedStoredValues).toEqual([
+            { sourceKey: 'usda:3', field: 'identity_source', value: '"prototype"' },
+            { sourceKey: 'usda:4', field: 'publication_status', value: '"__proto__"' },
+        ]);
+        expect(() => assertRecognisedStoredValues(measurement)).toThrow(/outside the closed set/);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The closed value sets the counters are keyed by.
+ * ------------------------------------------------------------------------- */
+
+describe('unrecognisedStoredValuesOfRow', () => {
+    it('finds nothing in a row every closed set declares', () => {
+        expect(unrecognisedStoredValuesOfRow(scannedRow('usda:1', {}, ['kcal_ceiling']))).toEqual([]);
+    });
+
+    it('names the column and quotes the value for each set that does not declare it', () => {
+        const row = scannedRow(
+            'usda:9',
+            { publication_status: 'Published', identity_status: 'trusted', nutrition_basis: 'per_ounce' },
+            [],
+        );
+
+        expect(unrecognisedStoredValuesOfRow(row)).toEqual([
+            { sourceKey: 'usda:9', field: 'publication_status', value: '"Published"' },
+            { sourceKey: 'usda:9', field: 'identity_status', value: '"trusted"' },
+            { sourceKey: 'usda:9', field: 'nutrition_basis', value: '"per_ounce"' },
+        ]);
+    });
+
+    it('judges the validation record\u2019s outcome as well as the food\u2019s own columns', () => {
+        const row = scannedRow('usda:9', {}, []);
+        const judged: ReportFoodRow = {
+            ...row,
+            catalog_validation_records: { ...(row.catalog_validation_records as ValidationRecordRow), outcome: 'ok' },
+        };
+
+        expect(unrecognisedStoredValuesOfRow(judged)).toEqual([
+            { sourceKey: 'usda:9', field: 'catalog_validation_records.outcome', value: '"ok"' },
+        ]);
+    });
+
+    it('says nothing about an outcome for a row that carries no validation record', () => {
+        const row: ReportFoodRow = { ...scannedRow('usda:9', {}, []), catalog_validation_records: null };
+
+        expect(unrecognisedStoredValuesOfRow(row)).toEqual([]);
+    });
+
+    it('judges a null in a NOT NULL column as the defect it is', () => {
+        const row = scannedRow('usda:9', { food_state: null as unknown as string }, []);
+
+        expect(unrecognisedStoredValuesOfRow(row)).toEqual([
+            { sourceKey: 'usda:9', field: 'food_state', value: '"null"' },
+        ]);
+    });
+});
+
+describe('assertRecognisedStoredValues', () => {
+    it('says nothing about a measurement whose every value its set declares', () => {
+        expect(() => assertRecognisedStoredValues(measurement())).not.toThrow();
+    });
+
+    it('names the rows, the columns and where the sets live', () => {
+        const measured = measurement({
+            unrecognisedStoredValueCount: 1,
+            unrecognisedStoredValues: [{ sourceKey: 'usda:9', field: 'publication_status', value: '"Published"' }],
+        });
+
+        expect(() => assertRecognisedStoredValues(measured)).toThrow(/usda:9 publication_status="Published"/);
+        expect(() => assertRecognisedStoredValues(measured)).toThrow(/src\/services\/catalog\.logic\.ts/);
+    });
+
+    it('states how many it did not name once the cap bites, so a capped list is never read as the whole set', () => {
+        const measured = measurement({
+            unrecognisedStoredValueCount: 25,
+            unrecognisedStoredValues: [{ sourceKey: 'usda:9', field: 'food_state', value: '"frozen"' }],
+        });
+
+        expect(() => assertRecognisedStoredValues(measured)).toThrow(/and 24 more/);
+    });
+});
+
+describe('quoteStoredValue', () => {
+    it('escapes a control character so it cannot reach a terminal as an escape sequence', () => {
+        expect(quoteStoredValue('pub\u001blished\n')).toBe('"pub\\u001blished\\n"');
+    });
+
+    it('bounds a long value and states the length it truncated', () => {
+        const quoted = quoteStoredValue('x'.repeat(5000));
+
+        expect(quoted).toContain('(5,000 characters)');
+        expect(quoted.length).toBeLessThan(120);
+    });
+
+    it('names a null column rather than printing nothing', () => {
+        expect(quoteStoredValue(null)).toBe('"null"');
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The exported figures read what a record STATES, never what it inherits.
+ *
+ * Every one of these functions is handed a record built somewhere else — by a
+ * sibling stage, by the JSON already on disk, by a fixture in this file — so a
+ * plain `{}` reaching them must not answer a lookup of an inherited name with
+ * the inherited value. A count derived that way is not a measurement.
+ * ------------------------------------------------------------------------- */
+
+describe('reading a counter block by a name Object.prototype also carries', () => {
+    it('reports a measured zero for a status named after an inherited property', () => {
+        const measured = measurement({
+            categories: {
+                produce_vegetable: emptyCategory({ byPublicationStatus: { published: 2 } }),
+                spice_herb: emptyCategory({ byPublicationStatus: { published: 1 } }),
+            },
+            publishedByCategory: { produce_vegetable: 2, spice_herb: 1 },
+        });
+        const rows = buildCoverageRows(
+            policy(),
+            plan(),
+            measured,
+            computeCoverageShortfall(policy(), { produce_vegetable: 2, spice_herb: 1 }),
+        );
+
+        expect(perCategoryByStatus(rows, measured, 'constructor')).toEqual({
+            produce_vegetable: 0,
+            spice_herb: 0,
+        });
+    });
+
+    it('measures a plan category named after an inherited property instead of reading the Object function', () => {
+        // The cast is exactly what the loader does at runtime
+        // (`assertCoveragePlanModelShape` returns `value as CoveragePlan`
+        // without checking the category codes), so a plan file naming an
+        // inherited property reaches this function typed as any other.
+        const inheritedPlan: CoveragePlan = {
+            ...plan(),
+            publishedTargetTotal: 10,
+            categories: [
+                {
+                    category: 'constructor' as CoveragePlan['categories'][number]['category'],
+                    publishedTarget: 10,
+                    candidateVolume: 12,
+                    kcalReviewRange: { min: 0, max: 400 },
+                    energyMacroTolerancePercent: 30,
+                },
+            ],
+        };
+        const inheritedPolicy: CatalogValidationPolicy = {
+            categories: inheritedPlan.categories,
+            validationBounds: inheritedPlan.validationBounds,
+        };
+
+        const rows = buildCoverageRows(
+            inheritedPolicy,
+            inheritedPlan,
+            measurement(),
+            computeCoverageShortfall(inheritedPolicy, {}),
+        );
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0].category).toBe('constructor');
+        expect(rows[0].published).toBe(0);
+        expect(rows[0].quarantined).toBe(0);
+        expect(rows[0].shortfall).toBe(10);
+        expect(rows[0].unmet).toBe(true);
+    });
+
+    it('prunes nothing for a block name that is only an inherited property', () => {
+        expect(pruneSupersededKeys('constructor', { checksPerItem: 13 })).toEqual({ checksPerItem: 13 });
+    });
+
+    it('carries a withheld status named after a reserved key into the generated-content statement', () => {
+        // `JSON.parse` is how a `__proto__` key legitimately arrives as an own
+        // property — from a stored document — which is exactly the case a plain
+        // accumulator dropped.
+        const withheldByStatus = JSON.parse('{"quarantined": 2, "__proto__": 3}') as Record<string, number>;
+
+        const presence = generatedContentPresence({ ai_generated: 1 }, { ai_generated: withheldByStatus });
+
+        expect(presence.withheldGeneratedRowsTotal).toBe(5);
+        expect(presence.withheldGeneratedRowsByStatus['__proto__']).toBe(3);
+        expect(presence.statement).toContain('__proto__ 3, quarantined 2');
     });
 });

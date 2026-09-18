@@ -139,23 +139,33 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-// THE BORROWED READER STAGE, and why it is not a sixth stage name.
+// THE BORROWED READER STAGE, and why this stage adds no stage name of its own.
 //
 // lib/checkpoint.ts holds ONE advisory lock name for the whole catalog graph;
 // the `stage` argument selects the mode and labels the holder in
-// pg_stat_activity. The four mutating stages take it exclusively and the one
-// reader stage — `release`, the export — takes it SHARED, which is refused
-// exactly while a mutator holds it. That is the guarantee this stage needs: it
-// reads the catalog graph and writes only recipe tables, so two seeds or a seed
-// beside an export are harmless, while a seed beside an import, a generation
-// pass, a validation pass or a release load is the defect. `release` is
-// therefore borrowed rather than extended, following catalog-release.ts:2159:
-// `CATALOG_STAGE_LOCK_MODES` is a `Record<CatalogStageName, …>` over
-// `CatalogRunKind | 'release'`, so adding a name is a change to that module —
-// whose exhaustive key set is asserted in
-// src/__tests__/scripts/catalog-import.test.ts — and not a change to this file.
-// The mode is passed explicitly all the same, so this stage's hold stays shared
-// even if that table were ever re-keyed.
+// pg_stat_activity. `CATALOG_STAGE_LOCK_MODES` in scripts/lib/checkpoint.ts is
+// that table: the four MUTATING stages — the `CatalogRunKind` values
+// `usda_import`, `ai_generation`, `validation` and `release_load` — take the
+// lock EXCLUSIVELY, and the two READ-ONLY labels take it SHARED: `release`, the
+// export, and `benchmark`, the search-acceptance measurement in
+// scripts/search-benchmark.ts. A shared hold is refused exactly while a mutator
+// holds it, and that is the guarantee this stage needs: it reads the whole
+// catalog graph and writes only recipe tables, so two seeds, or a seed beside
+// an export or a benchmark run, are harmless, while a seed beside an import, a
+// generation pass, a validation pass or a release load is the defect.
+//
+// Of those two read-only labels this stage borrows `release`, and it borrows
+// rather than extends. Adding a name is a change to `CATALOG_STAGE_LOCK_MODES`
+// — whose exhaustive key set is asserted in
+// src/__tests__/scripts/catalog-import.test.ts — and not a change to this file;
+// `release` is the existing shared label whose semantics already match this
+// stage, which reads the whole graph and writes only outside it; and
+// `benchmark` labels the acceptance-evidence measurement run, which a seed is
+// not. The mode is passed explicitly all the same, so this stage's hold stays
+// shared even if that table were ever re-keyed. What this paragraph claims
+// about that table — two read-only labels, both shared, and the four run kinds
+// exclusive — is asserted in src/__tests__/scripts/recipes-seed.test.ts against
+// the table itself, so it cannot drift from it again.
 //
 // THE RUN LEDGER. The claim is written here rather than through
 // checkpoint.ts's `openOrResumeRun`, for the reason that module states about
@@ -173,23 +183,16 @@ import path from 'path';
 // modules' error classes are unreachable here. Importing them to classify a
 // failure that cannot happen would tell a reader this stage can exhaust a model
 // budget, which it cannot.
-import {
-    appendRunLog,
-    CheckpointError,
-    finishRun,
-    RUN_STATUS_SUCCEEDED,
-    saveCursor,
-    withCatalogStageLock,
-} from './lib/checkpoint';
+import { CheckpointError, RUN_STATUS_SUCCEEDED, appendRunLog, checkpointErrorFields, finishRun, saveCursor, withCatalogStageLock } from './lib/checkpoint';
 import type {
     CatalogRunDb,
     CatalogStageLockConnection,
     CatalogStageLockMode,
     CatalogStageName,
 } from './lib/checkpoint';
-import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
-import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
-import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
+import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
+import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import { loadCoveragePlan, ManifestError, recipesDir, writeJsonFile } from './lib/manifest';
 import type { CoveragePlan } from './lib/manifest';
 // The pure derivation layer. Every rule this stage applies to an ingredient set
@@ -260,12 +263,17 @@ const PUBLISH_TRANSACTION_TIMEOUT_MS = 30_000;
 
 /**
  * The stage name this run's catalog hold is labelled with, and the mode it is
- * taken in — the graph's one reader stage, borrowed (see the header's THE
- * BORROWED READER STAGE for why adding a name here is a checkpoint.ts change and
- * not a change to this file).
+ * taken in — `release`, one of the two read-only labels in
+ * `CATALOG_STAGE_LOCK_MODES`, borrowed (see the header's THE BORROWED READER
+ * STAGE for why this stage borrows that label instead of adding one, which
+ * would be a checkpoint.ts change and not a change to this file).
+ *
+ * Exported for src/__tests__/scripts/recipes-seed.test.ts, which checks this
+ * pair against that table rather than against the same two strings written
+ * twice.
  */
-const CATALOG_READER_STAGE: CatalogStageName = 'release';
-const CATALOG_READER_STAGE_MODE: CatalogStageLockMode = 'shared';
+export const CATALOG_READER_STAGE: CatalogStageName = 'release';
+export const CATALOG_READER_STAGE_MODE: CatalogStageLockMode = 'shared';
 
 /**
  * THE RECIPE-SEED WRITER LOCK'S KEYSPACE, and why it is neither of the two
@@ -993,7 +1001,7 @@ export const readRecipeFiles = (directory: string, only: readonly string[]): Rec
     } catch (error) {
         throw new RecipeSeedError(
             'recipes_unreadable',
-            `the recipe directory could not be read: ${safeError(error).message}`,
+            `the recipe directory could not be read (${formatSafeError(error)})`,
         );
     }
 
@@ -1023,7 +1031,7 @@ export const readRecipeFiles = (directory: string, only: readonly string[]): Rec
         } catch (error) {
             throw new RecipeSeedError(
                 'recipes_unreadable',
-                `recipes/${file} could not be read: ${safeError(error).message}`,
+                `recipes/${file} could not be read (${formatSafeError(error)})`,
             );
         }
 
@@ -1047,7 +1055,7 @@ export const readRecipeFiles = (directory: string, only: readonly string[]): Rec
         try {
             payloads.push(parseRecipePayload(file, parsed));
         } catch (error) {
-            if (error instanceof RecipeSeedError) {
+            if (isThrownInstanceOf(error, RecipeSeedError)) {
                 problems.push(...(error.problems.length > 0 ? error.problems : [error.message]));
                 continue;
             }
@@ -1594,7 +1602,7 @@ export const validateRecipeFile = (
             publicationIngredients,
         );
     } catch (error) {
-        if (error instanceof RecipeDerivationError || error instanceof UnitConversionError) {
+        if (isThrownInstanceOf(error, RecipeDerivationError) || isThrownInstanceOf(error, UnitConversionError)) {
             return {
                 slug: payload.slug,
                 file: payload.file,
@@ -3658,7 +3666,7 @@ const closeFailedRun = async (
             });
         });
     } catch (closeError) {
-        const fenced = closeError instanceof RecipeSeedError && closeError.code === 'run_attempt_superseded';
+        const fenced = isThrownInstanceOf(closeError, RecipeSeedError) && closeError.code === 'run_attempt_superseded';
 
         stageLogger.error(fenced ? 'run_close_refused' : 'run_close_failed', {
             stage: STAGE,
@@ -3730,9 +3738,9 @@ const defaultCatalogLockRunner =
  *
  * It is implemented HERE rather than added to lib/checkpoint.ts's stage-lock
  * table on purpose: `CATALOG_STAGE_LOCK_MODES` is a
- * `Record<CatalogStageName, …>` over the closed union `CatalogRunKind |
- * 'release'`, whose exhaustive key set is asserted in
- * src/__tests__/scripts/catalog-import.test.ts, so a sixth stage name is a
+ * `Record<CatalogStageName, …>` over a closed union of stage names, whose
+ * exhaustive key set is asserted in
+ * src/__tests__/scripts/catalog-import.test.ts, so one more stage name is a
  * change to that module and its suite rather than to this file — the same
  * reason this stage BORROWS `release` for its graph hold. The construction
  * below follows `acquireCatalogStageLock` step for step (dedicated `pg`
@@ -3896,9 +3904,9 @@ const withoutWriterHold = <T>(work: () => Promise<T>): Promise<T> => work();
  *
  * TWO HOLDS, AND THEY ANSWER DIFFERENT QUESTIONS. The RECIPE-SEED WRITER LOCK
  * (exclusive, this stage's own key) is what stops a SECOND SEED; the CATALOG
- * GRAPH HOLD (shared, borrowed from the graph's reader stage) is what stops a
- * catalog MUTATOR. Neither substitutes for the other, and both are refusals
- * rather than waits.
+ * GRAPH HOLD (shared, borrowed from the graph's `release` reader label) is what
+ * stops a catalog MUTATOR. Neither substitutes for the other, and both are
+ * refusals rather than waits.
  *
  * Both live HERE rather than in `main` because `runSeed` is the entry point AAP
  * §0.9.2 names — the one the API-level concurrency suite drives and the one any
@@ -3937,7 +3945,7 @@ export const runSeed = async (deps: SeedDeps): Promise<SeedOutcome> => {
     try {
         return await runUnderWriterLock(() => runUnderCatalogLock(() => seedUnderCatalogHold(deps)));
     } catch (error) {
-        if (error instanceof CheckpointError && STAGE_LOCK_REFUSAL_CODES.includes(error.code)) {
+        if (isThrownInstanceOf(error, CheckpointError) && STAGE_LOCK_REFUSAL_CODES.includes(error.code)) {
             throw new RecipeSeedError(
                 'catalog_locked',
                 `${STAGE} did not run: ${error.message}`,
@@ -4370,14 +4378,18 @@ const gapFields = (gaps: readonly PrerequisiteGap[]): LogFields => {
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
 // than swallowed or printed raw.
-export const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
-    if (error instanceof RecipeSeedError) {
+// The reported `error` is `SafeErrorFields` — a scrubbed name plus an optional
+// machine code and status, and deliberately no `message`: this value reaches the
+// durable run log and the operator console, where foreign prose can carry a
+// connection URL, a key or a fragment of the document that failed (CWE-532).
+export const describeFailure = (error: unknown): { code: string; error: SafeErrorFields; detail?: LogFields } => {
+    if (isThrownInstanceOf(error, RecipeSeedError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof DatabaseOriginError) {
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ManifestError) {
+    if (isThrownInstanceOf(error, ManifestError)) {
         return { code: error.code, error: safeError(error) };
     }
     // Reachable for the ledger's own refusals — a run row that vanished or was
@@ -4386,13 +4398,17 @@ export const describeFailure = (error: unknown): { code: string; error: { name: 
     // under checkpoint.ts's code for the same reason every other stage does: a
     // new code in that module reaches operator terminals under its own name with
     // no change here.
-    if (error instanceof CheckpointError) {
-        return { code: error.code, error: safeError(error) };
+    // The one branch that reports TYPED CONTEXT beside the code. A stage-lock
+    // refusal names the stage holding the catalog graph and the mode it asked
+    // for, and those are what an operator acts on — see checkpointErrorFields
+    // for why they travel as data rather than inside the rendered sentence.
+    if (isThrownInstanceOf(error, CheckpointError)) {
+        return { code: error.code, error: safeError(error), detail: checkpointErrorFields(error) };
     }
-    if (error instanceof RecipeDerivationError) {
+    if (isThrownInstanceOf(error, RecipeDerivationError)) {
         return { code: 'recipe_derivation_failed', error: safeError(error) };
     }
-    if (error instanceof UnitConversionError) {
+    if (isThrownInstanceOf(error, UnitConversionError)) {
         return { code: 'unit_conversion_failed', error: safeError(error) };
     }
     return { code: 'unexpected_error', error: safeError(error) };
@@ -4419,10 +4435,7 @@ const main = async (): Promise<number> => {
     const origin = classifyDatabaseOrigin(process.env.DATABASE_URL);
     logger.info('database_origin_accepted', {
         stage: STAGE,
-        originClass: origin.originClass,
-        host: origin.host,
-        database: origin.database,
-        reason: origin.reason,
+        ...originLogFields(origin),
     });
     logger.info('stage_invoked', { stage: STAGE, only: parsed.options.only, dryRun: parsed.options.dryRun });
 
@@ -4495,6 +4508,13 @@ if (require.main === module) {
                 stage: STAGE,
                 code: failure.code,
                 error: failure.error,
+                // Spread, not nested: these are typed facts about the failure
+                // (a run id, the stage holding the catalog graph, the mode it
+                // asked for), and they read as fields of the failure rather
+                // than as one opaque member. Absent for every failure that is
+                // not a stage-lock refusal, which is the only branch that
+                // supplies them.
+                ...failure.detail,
             });
             process.exit(1);
         });

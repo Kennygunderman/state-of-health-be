@@ -54,9 +54,12 @@
 // resolves only for the user whose own plan or diary still references it.
 //
 // Two things are deliberately not asserted anywhere here: the rounding of
-// nutrition on plan DTOs and the exact text of `portionText`. Both are open
-// findings against `mealPlan.mapper.ts` (F04, F05) being changed in another
-// work unit, so an assertion on either would pin a value that is about to move.
+// nutrition on plan DTOs and the exact text of `portionText`. Both are
+// `mealPlan.mapper.ts`'s DISPLAY contract — `readPlannedTotals` and
+// `formatPortionText` — and both are pinned where a client reads them, by
+// `api/plans.test.ts` and `api/swaps.test.ts`. This file's subject is WHOSE
+// rows a route reached, so re-pinning a display value here would duplicate a
+// neighbour rather than add coverage.
 //
 // DETERMINISM, and why the fixture week is not a pinned calendar week. Every
 // service call takes the same injected `now`, but a REQUEST cannot be given
@@ -163,14 +166,19 @@ const SLOT_SIZES = {
  * What makes each tenant's rows TELLABLE APART, and the only reason the two
  * tenants are not byte-identical.
  *
- * Five of the twenty-two routes carry no id at all — the preferences read and
- * both writes, the targets read and write, the estimate, and the current-plan
- * read — so there is no foreign id to present and "existence never leaks" has
- * nothing to say about them. The question they answer instead is whether the
- * response was scoped to the caller, and that is only observable when the two
- * tenants hold DIFFERENT values: with identical fixtures, a handler that read
- * the wrong row would produce the right answer by accident and every assertion
- * would pass.
+ * Seven of the twenty-two routes are addressed by the caller's identity alone
+ * and answer from state that identity already holds — the preferences read and
+ * both of its writes, the targets read and write, the estimate, and the
+ * current-plan read — so there is no foreign id to present and "existence never
+ * leaks" has nothing to say about them. The question they answer instead is
+ * whether the response was scoped to the caller, and that is only observable
+ * when the two tenants hold DIFFERENT values: with identical fixtures, a
+ * handler that read the wrong row would produce the right answer by accident
+ * and every assertion would pass. (The publication and the three tenant-less
+ * catalog reads carry no id either, and neither needs a tenant marker: the
+ * first is judged on the rows it wrote, in `the two publications the matrix
+ * answers 201 for`, and the others are asserted the other way round in `the
+ * shared reads`.)
  *
  * Every value here is therefore a marker some route reports:
  *  - `targets` reach `users.target_*` and `confirmed_targets` together, which
@@ -2105,10 +2113,14 @@ describe('identity comes from the token, never from the body', () => {
     });
 
     it('scopes the id-less reads to the caller, which is the only way they can be scoped at all', async () => {
-        // Five routes carry no id, so "another tenant's id" does not exist for
-        // them and the property is asserted the only way it can be: the two
-        // tenants hold different values ({@link TENANT_PROFILES}) and each
-        // caller is answered with their own.
+        // Four of the seven id-less routes are READS, and they are what this
+        // case drives: "another tenant's id" does not exist for them, so the
+        // property is asserted the only way it can be — the two tenants hold
+        // different values ({@link TENANT_PROFILES}) and each caller is
+        // answered with their own. The three id-less WRITES are covered by
+        // `identity comes from the token, never from the body`'s
+        // `it.each(writeRoutes)` case, which aims a body at the other tenant
+        // and reads their rows back unmoved.
         const preferencesForA = await asUser(request.get('/api/meal-planning/preferences'), {
             uid: USER_A,
         }).expect(200);

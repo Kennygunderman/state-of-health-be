@@ -11,6 +11,7 @@ dns.setDefaultResultOrder('ipv4first');
 
 import dotenv from 'dotenv';
 // Scripts run through `npm run <script>` from the backend package root, so the
-// default lookup resolves that directory's .env. Variables already present in
-// the environment are never overwritten, so CI-injected values win.
+// default lookup resolves that directory's .env. `dotenv.config()` only FILLS
+// variables that are absent — one already present in the environment is never
+// overwritten, so CI-injected values win.
 dotenv.config();

@@ -33,11 +33,14 @@
 // `meal_plan_actions`, `meal_plans` and `meal_plan_meals` and asserts row
 // counts, columns, links and revisions. Two things are deliberately NOT
 // asserted: the rounding of nutrition on the plan-meal/day DTOs and the exact
-// text of `portionText`. Both are open findings against `mealPlan.mapper.ts`
-// (F04, F05) being changed in another work unit, so an assertion on either
-// would pin a value that is about to move. The STORED snapshot's own integer
-// rounding is a different contract — `nutrition.service.ts::
-// insertPlannedMealEntry` owns it and it is stable — so it is asserted in full.
+// text of `portionText`. Both are `mealPlan.mapper.ts`'s DISPLAY contract —
+// `readPlannedTotals` and `formatPortionText` — and both are pinned where a
+// client reads them, by `api/plans.test.ts` and `api/swaps.test.ts`, so
+// re-pinning either here would duplicate a neighbour rather than add coverage.
+// The STORED snapshot's own integer rounding is a different contract —
+// `plannedMealLog.logic.ts::derivePlannedSnapshot` owns it and it is stable,
+// and `nutrition.service.ts::insertPlannedMealEntry` stores its integers
+// verbatim — so it is asserted in full.
 //
 // WHAT THIS FILE DOES NOT COVER, because a neighbour owns it.
 // `plannedMealLog.logic.test.ts` owns every pure rule: the servings contract
@@ -89,6 +92,10 @@ import { prisma } from '../../prisma/client';
 // mechanism `api/targets.test.ts` uses to hold a publication open).
 import * as mealPlanMapper from '../../services/mealPlan.mapper';
 import * as nutritionService from '../../services/nutrition.service';
+// The rounding owner itself, so the writer cases below are driven with the REAL
+// snapshot rather than with integers this file computed — what they assert is
+// that the writer stores that snapshot and adds nothing to it.
+import { derivePlannedSnapshot } from '../../services/plannedMealLog.logic';
 import {
     InvalidRequestDetail,
     LogPlannedMealResponse,
@@ -96,7 +103,7 @@ import {
     MealPlanMealResponse,
     MealPlanResponse,
 } from '../../types/mealPlanning';
-import { MealEntryResponse } from '../../types/nutrition';
+import { MacroTotals, MealEntryResponse } from '../../types/nutrition';
 import {
     FIXTURE_ENDED_PLAN_START_DAY_KEY,
     FIXTURE_USER_TARGET_COLUMNS,
@@ -1300,8 +1307,8 @@ describe('a successful planned log', () => {
  *   1. the planned portion is `per_serving × portion_multiplier` at FULL
  *      precision (`derivePlannedPortion`);
  *   2. each of the four values is rounded ONCE into the stored snapshot
- *      (`derivePlannedSnapshot`, re-applied identically by
- *      `insertPlannedMealEntry`);
+ *      (`derivePlannedSnapshot`, whose integers `insertPlannedMealEntry` stores
+ *      verbatim — it rounds nothing and refuses a fractional value);
  *   3. the diary shows `Math.round(snapshot × servings)` (`nutrition.service
  *      .ts::asEaten`, and the same arithmetic in its SQL aggregates).
  *
@@ -1406,6 +1413,100 @@ describe('the rounding contract', () => {
             expect(entry.serving_text).toContain(String(LARGE_PORTION));
             expect(entry.serving_text).toContain(week.recipe.serving_description);
         });
+    });
+
+    /**
+     * Step 2 has exactly ONE owner, and the writer is not it.
+     *
+     * `derivePlannedSnapshot` rounds; `insertPlannedMealEntry` stores what it
+     * was handed. That split is invisible to every case above — the writer used
+     * to re-apply the identical `Math.round`, which is a no-op on integers, so
+     * the whole suite passed either way and §0.7.3's single-rounding ownership
+     * was unenforced. The two cases here are the only ones that can tell the
+     * arrangements apart, and they need the writer driven DIRECTLY: no request
+     * can put a fractional value in front of it, because the only caller hands
+     * it a snapshot.
+     */
+    describe('step 2 has one owner — the writer stores and does not round', () => {
+        /** The real snapshot for the ×1.25 dinner slot: four integers by construction. */
+        const dinnerSnapshot = () => derivePlannedSnapshot(week.dinner, week.recipe);
+
+        /** One planned insert, in its own transaction, exactly as the service performs it. */
+        const insertPlanned = (bucketId: string, perServing: MacroTotals) =>
+            prisma.$transaction((tx) =>
+                nutritionService.insertPlannedMealEntry(tx, {
+                    userId: USER_ID,
+                    mealId: bucketId,
+                    date: new Date(week.dayKey),
+                    mealPlanMealId: week.dinner.id,
+                    recipeVersionId: week.recipe.id,
+                    name: dinnerSnapshot().name,
+                    servingText: dinnerSnapshot().serving_text,
+                    servings: 1,
+                    perServing,
+                }),
+            );
+
+        const snapshotMacros = (): MacroTotals => {
+            const snapshot = dinnerSnapshot();
+
+            return {
+                calories: snapshot.calories,
+                protein: snapshot.protein_g,
+                carbs: snapshot.carbs_g,
+                fat: snapshot.fat_g,
+            };
+        };
+
+        it('stores the snapshot\'s four integers exactly, adding no arithmetic of its own', async () => {
+            const bucketId = await diaryBucketId(USER_ID, week.dayKey, DEFAULT_MEAL_NAMES[2]);
+            const snapshot = dinnerSnapshot();
+
+            await insertPlanned(bucketId, snapshotMacros());
+
+            const entry = await storedEntry();
+
+            // The row IS the snapshot, member for member — and the snapshot is
+            // the planned portion rounded once, asserted from the stored recipe
+            // rather than restated, so neither side can drift.
+            expect({
+                calories: entry.calories,
+                protein_g: entry.protein_g,
+                carbs_g: entry.carbs_g,
+                fat_g: entry.fat_g,
+            }).toEqual({
+                calories: snapshot.calories,
+                protein_g: snapshot.protein_g,
+                carbs_g: snapshot.carbs_g,
+                fat_g: snapshot.fat_g,
+            });
+            expect(entry.calories).toBe(Math.round(plannedPortion(DIVERGENT_PORTION).calories));
+        });
+
+        it.each(['calories', 'protein', 'carbs', 'fat'] as const)(
+            'refuses a fractional perServing.%s rather than rounding it',
+            async (field) => {
+                const bucketId = await diaryBucketId(USER_ID, week.dayKey, DEFAULT_MEAL_NAMES[2]);
+                const contract = snapshotMacros();
+
+                // The fixture earns its keep: the contract's own value for this
+                // field is an integer, so half a unit above it is a genuine
+                // departure and not something `derivePlannedSnapshot` could
+                // have produced.
+                expect(Number.isInteger(contract[field])).toBe(true);
+
+                // The message names the field, so one log line identifies which
+                // of the four arrived unrounded without reproducing the request.
+                await expect(
+                    insertPlanned(bucketId, { ...contract, [field]: contract[field] + 0.5 }),
+                ).rejects.toThrow(new RegExp(`non-integer perServing\\.${field}`));
+
+                // A refusal and not a repair: nothing is written, and in
+                // particular no row holding the rounded value the writer would
+                // have stored if it were still a rounding site.
+                expect(await prisma.meal_entries.count({ where: { user_id: USER_ID } })).toBe(0);
+            },
+        );
     });
 
     describe('step 3 — what the diary shows', () => {

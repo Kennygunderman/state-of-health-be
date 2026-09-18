@@ -5,8 +5,8 @@
  * `POST /api/macros/label-scan` — and both used to reach it through private
  * helpers that threw `EstimateFailedError` directly. The extraction gives the
  * transport its own error class and makes `estimate.service.ts` translate back,
- * so the failure text a client sees now survives a translation step that did
- * not exist before. Nothing else in the repository pins that text.
+ * so the failure text that service raises now survives a translation step that
+ * did not exist before. Nothing else in the repository pins that text.
  *
  * What this suite pins, and why each one is a decision someone could break:
  *
@@ -137,16 +137,21 @@ const JSON_SCHEMA = {
 };
 
 /**
- * THE SIX CLIENT-VISIBLE FAILURE STRINGS.
+ * THE SIX FAILURE STRINGS THE ESTIMATE SERVICE CARRIES.
  *
- * Every one of these is returned verbatim to a mobile client by
- * `POST /api/macros/estimate` and `POST /api/macros/label-scan`: the controller
- * maps `EstimateFailedError` to a 502 whose body carries this message, and
+ * Every one of these becomes an `EstimateFailedError.message` verbatim on the
+ * paths `POST /api/macros/estimate` and `POST /api/macros/label-scan` take:
  * `estimate.service.ts` builds that error from an `OpenRouterError`'s message
- * without rewriting it. Editing any string below — including its punctuation,
- * its `: ` separator and its lack of a trailing period — changes what those two
- * shipped endpoints tell a user, so it is a documented behaviour change and not
- * a wording tidy-up. Two of the six are templates and are asserted as
+ * without rewriting it. The text is internal — both endpoints answer
+ * `502 {error: 'estimation_failed'}`, a fixed machine code rather than this
+ * text, and their controller records the failure by class name (plus a machine
+ * code where the thrown value carries one, which an EstimateFailedError does
+ * not) rather than by message — so what these
+ * literals protect is the estimate service's own failure text across the
+ * extraction (AAP §0.4.3), which nothing else in the repository pins. Editing
+ * any string below — including its punctuation, its `: ` separator and its
+ * lack of a trailing period — is therefore a deliberate change to that text
+ * and not a wording tidy-up. Two of the six are templates and are asserted as
  * fully-formed literals at each use.
  */
 const NOT_CONFIGURED_MESSAGE = 'OPENROUTER_API_KEY is not configured';
@@ -164,6 +169,16 @@ const VENDOR_FAILURE_PREFIX = 'OpenRouter request failed:';
 
 /** The number of leading body characters the `http` message carries. */
 const HTTP_BODY_LIMIT = 300;
+
+/**
+ * The redirect policy every call is sent with, asserted as a literal on the
+ * outbound request because the default (`'follow'`) is the insecure one for a
+ * boundary with a single destination.
+ */
+const REFUSE_REDIRECTS: RequestRedirect = 'error';
+
+/** What a refused hop reports, whichever shape the transport handed back. */
+const REDIRECT_REFUSED_MESSAGE = 'OpenRouter request failed: the response was redirected away from the vendor';
 
 type FetchStub = jest.MockedFunction<typeof fetch>;
 
@@ -357,6 +372,12 @@ interface OutboundBody {
     temperature: number;
     messages: Array<{ role: string; content: MessageContent }>;
     response_format: { type: string; json_schema: unknown };
+    /**
+     * Optional because the boundary omits it unless a caller asks for a
+     * ceiling, which is what keeps the shipped endpoints' request body
+     * unchanged — see the `max_tokens` cases in 'the outbound request'.
+     */
+    max_tokens?: number;
 }
 
 interface SentRequest {
@@ -365,6 +386,13 @@ interface SentRequest {
     headers: unknown;
     body: OutboundBody;
     signal: AbortSignal | null | undefined;
+    /**
+     * Captured because it is a security property of the request rather than a
+     * formatting detail: this POST carries the API key in an `Authorization`
+     * header and the prompt — a user's photograph, on the label-scan path — in
+     * its body, and a 307 preserves both.
+     */
+    redirect: RequestRedirect | undefined;
 }
 
 const sentRequest = (stub: FetchStub, index = 0): SentRequest => {
@@ -386,6 +414,7 @@ const sentRequest = (stub: FetchStub, index = 0): SentRequest => {
         headers: init.headers,
         body: JSON.parse(init.body) as OutboundBody,
         signal: init.signal,
+        redirect: init.redirect,
     };
 };
 
@@ -447,6 +476,58 @@ describe('callOpenRouter', () => {
             });
         });
 
+        // THE COMPLETION-TOKEN CEILING, and the reason it is absent above.
+        //
+        // `max_tokens` is the upstream half of bounding a model answer, and it
+        // is the only one of the two ceilings that changes the REQUEST. Several
+        // providers reject a `max_tokens` above the routed model's own output
+        // limit and OpenRouter re-routes over time, so defaulting one would put
+        // a new vendor-side 400 on `/api/macros/estimate` and
+        // `/api/macros/label-scan` — shipped endpoints whose failure text is an
+        // API contract. These three cases pin that: the body a caller who asks
+        // for nothing sends is byte-identical to the shipped one, the ceiling
+        // appears verbatim when asked for, and a value that could not bound
+        // anything is treated as not asked for.
+        it('omits max_tokens entirely when no caller asked for a ceiling', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(completion('{"items":[]}'));
+
+            await openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub);
+
+            expect(Object.keys(sentRequest(stub).body)).not.toContain('max_tokens');
+        });
+
+        it('sends the ceiling a caller asked for, unaltered', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(completion('{"items":[]}'));
+
+            await openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub, undefined, 4096);
+
+            expect(sentRequest(stub).body.max_tokens).toBe(4096);
+        });
+
+        it.each([
+            ['zero, which would ask for an empty completion', 0],
+            ['a negative count', -1],
+            ['a fraction the vendor cannot honour', 512.5],
+            ['a non-finite count', Number.NaN],
+        ])('omits max_tokens for %s rather than sending it', async (_label, requested) => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(completion('{"items":[]}'));
+
+            await openRouter.callOpenRouter(
+                SYSTEM_PROMPT,
+                USER_TEXT,
+                JSON_SCHEMA,
+                undefined,
+                stub,
+                undefined,
+                requested,
+            );
+
+            expect(Object.keys(sentRequest(stub).body)).not.toContain('max_tokens');
+        });
+
         it('pins temperature at zero', async () => {
             const openRouter = loadConfigured();
             const stub = respondWith(completion('{"items":[]}'));
@@ -500,6 +581,27 @@ describe('callOpenRouter', () => {
             const { signal } = sentRequest(stub);
             expect(signal).toBeInstanceOf(AbortSignal);
             expect(signal?.aborted).toBe(false);
+        });
+
+        /**
+         * THE REDIRECT POLICY, which is the other half of "the request is the
+         * contract" for a boundary with one destination.
+         *
+         * `fetch` follows redirects by default and a 307 or 308 preserves the
+         * METHOD AND BODY of what it redirects, so the default would let
+         * anything able to answer for `openrouter.ai` be handed this request's
+         * bearer token and its prompt. `'error'` makes a conforming transport
+         * reject the 3xx before any hop; the refusals asserted further down
+         * cover a transport that follows one regardless, which matters because
+         * `fetchImpl` is a declared seam.
+         */
+        it('refuses redirects on the request itself', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(completion('{"items":[]}'));
+
+            await openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub);
+
+            expect(sentRequest(stub).redirect).toBe(REFUSE_REDIRECTS);
         });
 
         it('issues one request per call, so the boundary adds no round trip of its own', async () => {
@@ -795,13 +897,14 @@ describe('OpenRouterError', () => {
     /**
      * THE HALF OF THE FAILURE A LOG MAY CARRY.
      *
-     * `message` is the client-visible text asserted throughout this file, and
+     * `message` is the internal diagnostic asserted throughout this file, and
      * for the `http` and `network` kinds it quotes the vendor: up to 300
      * characters of the failed response body, or the transport's own words.
-     * That is right for a 502 returned to the caller who made the request and
-     * wrong for anything that outlives it — a log line, a run ledger, a
-     * committed report — because `scripts/lib/logger.ts` can scrub credential
-     * patterns and cannot scrub arbitrary prose.
+     * That is right for a string the estimate service re-raises inside the
+     * request that failed, and wrong for anything that outlives it — a log
+     * line, a run ledger, a committed report — because
+     * `scripts/lib/logger.ts` can scrub credential patterns and cannot scrub
+     * arbitrary prose.
      *
      * `safeMessage` is the form those paths take, and the assertions below are
      * the reason it can be trusted: it is assembled from the closed kind set
@@ -822,8 +925,9 @@ describe('OpenRouterError', () => {
             const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
 
             expect(error.safeMessage).toBe('OpenRouter call failed (http, status 429)');
-            // The message still quotes the vendor — that is the shipped 502
-            // text — which is exactly why the two properties are separate.
+            // The message still quotes the vendor — that is the text the
+            // estimate service re-raises — which is exactly why the two
+            // properties are separate.
             expect(error.message).toContain(SENSITIVE_BODY);
             expect(error.safeMessage).not.toContain('bob@example.com');
             expect(error.safeMessage).not.toContain('org_42');
@@ -852,7 +956,15 @@ describe('OpenRouterError', () => {
             expect(error.safeMessage).not.toContain('10.1.2.3');
         });
 
-        it.each<OpenRouterErrorKind>(['not_configured', 'http', 'empty', 'timeout', 'network', 'unparseable'])(
+        it.each<OpenRouterErrorKind>([
+            'not_configured',
+            'http',
+            'empty',
+            'timeout',
+            'network',
+            'unparseable',
+            'oversized',
+        ])(
             'names %s without repeating the constructor message',
             (kind) => {
                 const openRouter = loadConfigured();
@@ -1062,6 +1174,66 @@ describe('OpenRouterError', () => {
         });
     });
 
+    /**
+     * A REFUSED HOP, which is a `network` failure because nothing was completed
+     * with the vendor.
+     *
+     * The policy on the request is what a conforming `fetch` enforces, and it
+     * rejects the 3xx itself — arriving here as an ordinary `network` failure
+     * carrying the transport's own words. These cases cover the transport this
+     * module does not own: `fetchImpl` is a declared seam that
+     * `estimate.service.ts` threads through, and an implementation that builds
+     * its own init can follow a hop and answer with the result. The 200 case is
+     * the one that matters, because that body would otherwise be parsed as the
+     * model's completion.
+     *
+     * The same kind either way, so how the failure is classified never depends
+     * on which side enforced the policy.
+     */
+    describe('a redirect it refuses', () => {
+        /** A hop already followed: the getter is shadowed, as nothing in-process can set it. */
+        const followedRedirect = (response: Response): Response => {
+            Object.defineProperty(response, 'redirected', { value: true, configurable: true });
+
+            return response;
+        };
+
+        it.each([301, 302, 303, 307, 308])('refuses an unfollowed %i as a network failure', async (status) => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(new Response('', { status, headers: { location: 'https://elsewhere.invalid/v1' } }));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe(REDIRECT_REFUSED_MESSAGE);
+            expect(error.status).toBeUndefined();
+        });
+
+        it('refuses a 200 that was reached by following a hop, without reading it as a completion', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(followedRedirect(completion('{"items":[{"name":"stolen"}]}')));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.kind).toBe('network');
+            expect(error.message).toBe(REDIRECT_REFUSED_MESSAGE);
+            // The refusal happens before the body is read, so the value in it
+            // never becomes this call's result.
+            expect(error.message).not.toContain('stolen');
+        });
+
+        it('describes the refusal safely, with no location and no vendor text', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(new Response('', { status: 308, headers: { location: 'https://elsewhere.invalid/v1' } }));
+
+            const error = await vendorFailure(openRouter, openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub));
+
+            expect(error.safeMessage).toBe('OpenRouter call failed (network)');
+            expect(error.safeMessage).not.toContain('elsewhere.invalid');
+            expect(error.message).not.toContain('elsewhere.invalid');
+        });
+    });
+
     describe('network', () => {
         it('interpolates the thrown error message verbatim', async () => {
             const openRouter = loadConfigured();
@@ -1118,7 +1290,7 @@ describe('OpenRouterError', () => {
          * `TypeError` from reading `.name` off `null` would be caught here, and
          * it is what made the two shipped endpoints answer 500 instead of the
          * 502 their controller maps), and the message proves the thrown value's
-         * own content reached the text a client is shown.
+         * own content reached the text the estimate service re-raises.
          *
          * A thrown string is carried verbatim rather than JSON-encoded, since
          * its quotes would otherwise appear in that text; anything else is
@@ -1197,12 +1369,13 @@ describe('OpenRouterError', () => {
 
         /**
          * The description of a thrown value is bounded by the same 300
-         * characters the `http` branch allows a vendor response body, because
-         * it reaches the same two places: a client's 502 body and the server
-         * log. An Error's own `message` is NOT bounded — it never has been, and
-         * the truncated-JSON parse failure surfaces a SyntaxError message
-         * through this very function — so the two are asserted together, one
-         * capped and one whole.
+         * characters the `http` branch allows a vendor response body, and for
+         * the same reason: a rejection of any size must not be able to inflate
+         * the error held in memory, the `EstimateFailedError` text built from
+         * it, or whatever handles that error next. An Error's own `message` is
+         * NOT bounded — it never has been, and the truncated-JSON parse failure
+         * surfaces a SyntaxError message through this very function — so the
+         * two are asserted together, one capped and one whole.
          */
         it('caps the description of an oversized thrown string at the vendor-body limit', async () => {
             const openRouter = loadConfigured();
@@ -1318,8 +1491,9 @@ describe('OpenRouterError', () => {
         // always reported 'Model returned unparseable output'; content that did
         // contain a block let the second parse's SyntaxError escape to the
         // transport catch, which reported it as 'OpenRouter request failed:
-        // <syntax message>'. Both reach the client through EstimateFailedError,
-        // so neither may be unified with the other.
+        // <syntax message>'. Both travel verbatim into the
+        // EstimateFailedError raised from them, so neither may be unified with
+        // the other.
         it('reports a recoverable block that is still malformed with the vendor-failure wording', async () => {
             const openRouter = loadConfigured();
             const stub = respondWith(completion('{"items": }'));
@@ -1329,6 +1503,151 @@ describe('OpenRouterError', () => {
             expect(error.kind).toBe('unparseable');
             expect(error.message.startsWith(VENDOR_FAILURE_PREFIX)).toBe(true);
             expect(error.message).not.toBe(UNPARSEABLE_MESSAGE);
+        });
+    });
+
+    /**
+     * THE RESPONSE-BYTE CEILING.
+     *
+     * `fetch` imposes no limit on a body, so before this ceiling existed the
+     * size of this process's allocation was chosen by whatever answered the
+     * request (CWE-400) — for every caller, including the two request-time
+     * endpoints. It is the unconditional half of the pair: unlike `max_tokens`
+     * it needs no vendor cooperation and cannot be refused by a routing change,
+     * because it is enforced on the way in.
+     *
+     * The cases below are driven with a small explicit ceiling where the
+     * behaviour is what matters, and once at the real
+     * `OPENROUTER_MAX_RESPONSE_BYTES` so the shipped constant is exercised
+     * rather than only the mechanism.
+     */
+    describe('oversized', () => {
+        /**
+         * A body that streams in many chunks, so the refusal has to happen
+         * DURING the read rather than after it. Built from a repeated marker so
+         * any fragment surviving into a message is unmistakable.
+         */
+        const streamedBody = (bytes: number): Response => {
+            const chunk = Buffer.from('X'.repeat(1024), 'utf8');
+            let sent = 0;
+
+            return new Response(
+                new ReadableStream<Uint8Array>({
+                    pull(controller) {
+                        if (sent >= bytes) {
+                            controller.close();
+                            return;
+                        }
+                        controller.enqueue(new Uint8Array(chunk));
+                        sent += chunk.byteLength;
+                    },
+                }),
+                { status: 200 },
+            );
+        };
+
+        it('refuses a success body past the ceiling instead of buffering it', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(streamedBody(openRouter.OPENROUTER_MAX_RESPONSE_BYTES + 1024));
+
+            const error = await vendorFailure(
+                openRouter,
+                openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub),
+            );
+
+            expect(error.kind).toBe('oversized');
+            expect(error.status).toBeUndefined();
+            // Reported as itself, not re-wrapped as `network` by the transport
+            // catch and not mistaken for an `empty` completion.
+            expect(error.message).not.toBe(EMPTY_COMPLETION_MESSAGE);
+            expect(error.message.startsWith(VENDOR_FAILURE_PREFIX)).toBe(false);
+        });
+
+        it('names only its own ceiling, never a byte of what the vendor sent', async () => {
+            const openRouter = loadConfigured();
+            const stub = respondWith(streamedBody(openRouter.OPENROUTER_MAX_RESPONSE_BYTES + 1024));
+
+            const error = await vendorFailure(
+                openRouter,
+                openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub),
+            );
+
+            // BOTH properties, unlike every other kind: the ceiling's message
+            // is authored here and content-free, so there is no half of it that
+            // a caller has to avoid logging.
+            expect(error.message).not.toContain('X');
+            expect(error.safeMessage).toBe('OpenRouter call failed (oversized)');
+            expect(error.message).toContain(String(openRouter.OPENROUTER_MAX_RESPONSE_BYTES));
+        });
+
+        it('reads a body that fits, so the ceiling is a bound and not a blanket refusal', async () => {
+            const openRouter = loadConfigured();
+            // A real completion, delivered as a stream rather than a string, so
+            // this proves the streaming path parses as well as refuses.
+            const payload = JSON.stringify({ choices: [{ message: { content: '{"items":[1,2,3]}' } }] });
+            const stub = respondWith(new Response(Buffer.from(payload, 'utf8'), { status: 200 }));
+
+            await expect(
+                openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub),
+            ).resolves.toStrictEqual({ items: [1, 2, 3] });
+        });
+
+        it('refuses an oversized FAILURE body too, rather than reporting it as an empty one', async () => {
+            const openRouter = loadConfigured();
+            const chunk = Buffer.from('Y'.repeat(1024), 'utf8');
+            let sent = 0;
+            const oversizedFailure = new Response(
+                new ReadableStream<Uint8Array>({
+                    pull(controller) {
+                        if (sent >= openRouter.OPENROUTER_MAX_RESPONSE_BYTES + 1024) {
+                            controller.close();
+                            return;
+                        }
+                        controller.enqueue(new Uint8Array(chunk));
+                        sent += chunk.byteLength;
+                    },
+                }),
+                { status: 503 },
+            );
+            const stub = respondWith(oversizedFailure);
+
+            const error = await vendorFailure(
+                openRouter,
+                openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub),
+            );
+
+            // The `http` branch used to buffer a whole failure body to keep 300
+            // characters of it. It is bounded now — and an oversized one is
+            // reported as oversized rather than silently becoming the empty
+            // string the unreadable-body fallback produces, because "the vendor
+            // sent 40 MiB" and "the vendor sent no body" are different facts.
+            expect(error.kind).toBe('oversized');
+            expect(error.message).not.toContain('Y');
+        });
+
+        it('still reports an unreadable failure body as the status, with no body text', async () => {
+            const openRouter = loadConfigured();
+            // A body whose read rejects for a reason that is not the ceiling:
+            // the pre-existing behaviour is that the STATUS survives and the
+            // body is simply absent, and that is unchanged.
+            const unreadable = new Response(
+                new ReadableStream<Uint8Array>({
+                    pull(controller) {
+                        controller.error(new Error('socket closed mid-body'));
+                    },
+                }),
+                { status: 429 },
+            );
+            const stub = respondWith(unreadable);
+
+            const error = await vendorFailure(
+                openRouter,
+                openRouter.callOpenRouter(SYSTEM_PROMPT, USER_TEXT, JSON_SCHEMA, undefined, stub),
+            );
+
+            expect(error.kind).toBe('http');
+            expect(error.status).toBe(429);
+            expect(error.message).toBe('OpenRouter returned 429: ');
         });
     });
 });
@@ -1342,7 +1661,7 @@ describe('OpenRouterError', () => {
  * `if (error instanceof OpenRouterError) throw error;`, which was
  * `if (error instanceof EstimateFailedError) throw error;` before the
  * extraction — is the only thing stopping them from being caught and re-wrapped
- * as `network`. Without it an unreadable model response reaches the client as
+ * as `network`. Without it an unreadable model response would be reported as
  * 'OpenRouter request failed: Model returned unparseable output': the wrong
  * kind, and one message nested inside another. Nothing else would catch that
  * regression, because the nested string still CONTAINS the original one — which
@@ -1526,8 +1845,8 @@ describe('parseModelJson', () => {
         // outcome that carries the vendor-failure wording (see the note in
         // `openrouter.service.ts`): before the extraction the second parse's
         // SyntaxError escaped to the transport catch and was reported this way,
-        // and that message reaches the client, so it must not be unified with
-        // the message above.
+        // and that message is still what the estimate service re-raises, so it
+        // must not be unified with the message above.
         const malformedSpans: Array<[string, string]> = [
             ['a braced span with a missing value', '{"items": }'],
             ['a braced span with a stray comma', '```json\n{"a": ,}\n```'],
@@ -1899,9 +2218,9 @@ describe('estimate.service regression', () => {
     };
 
     /**
-     * Every vendor failure mode with the message the endpoint has always shown
-     * a client. `not_configured` is absent because it needs a module instance
-     * that never saw a key; it is driven separately below.
+     * Every vendor failure mode with the message the endpoint's failure has
+     * always carried. `not_configured` is absent because it needs a module
+     * instance that never saw a key; it is driven separately below.
      */
     const vendorFailures: Array<[string, OpenRouterErrorKind, () => FetchStub, string]> = [
         [

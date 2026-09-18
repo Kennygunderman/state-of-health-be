@@ -1,7 +1,7 @@
 // The versioned manifest loader and repository-root path resolver for the
 // meal-planning data files under `backend/data/meal-planning/`. Eight of the
 // nine CLI entry points in `backend/scripts/` read their inputs through this
-// module (`seed-dev.ts` is the exception), and it makes them two promises.
+// module (`seed-dev.ts` is the exception), and it makes them three promises.
 //
 // FIRST: paths resolve from the repository root, never from the process working
 // directory, and they stay inside `data/meal-planning`. A script launched from
@@ -39,18 +39,23 @@
 //
 // Scope (§1.1, §7.1): this module resolves paths, reads and writes JSON
 // (including staging, locking and promoting the artefacts the stages publish),
-// compares versions, and verifies that the two policy documents whose missing
-// fields would fail silently rather than loudly — the evidence allowlist, where
-// an absent field removes a security limit, and the USDA manifest, where an
-// absent or mistyped field imports the wrong food under a name that looks right
-// — carry the fields their declared shapes promise. Checksum verification belongs
-// to `catalog-load.ts`, JSONL streaming to the release and load scripts,
-// shortfall arithmetic to `catalog-report.ts`, the evidence policy's meaning to
-// `src/services/evidence.logic.ts`, and model-call budgeting to `budget.ts`. It imports two
-// Node built-ins and its sibling logger, reads no environment variable, and
-// does nothing at import time — every read happens when a caller calls a
-// loader, and every argument a rule depends on is a parameter, so the pure
-// parts are unit-testable from `src/__tests__/scripts/` (§11: Jest's `roots` is
+// compares versions, and verifies the shape of the three policy documents whose
+// missing fields would fail silently rather than loudly — the evidence
+// allowlist, where an absent field removes a security limit; the USDA manifest,
+// where an absent or mistyped field imports the wrong food under a name that
+// looks right; and the coverage plan's model and prompt metadata, which is
+// copied into a release manifest rather than computed with, so a wrong type
+// there is shipped instead of raised. The other two documents it loads (the
+// search benchmark and a generated release manifest) are version-checked and
+// cast, because a missing field in either fails where it is used. Checksum
+// verification belongs to `catalog-load.ts`, JSONL streaming to the release and
+// load scripts, shortfall arithmetic to `catalog-report.ts`, the evidence
+// policy's meaning to `src/services/evidence.logic.ts`, and model-call budgeting
+// to `budget.ts`. It imports four Node built-ins (`crypto`, `fs`, `os`, `path`)
+// and its sibling logger, reads no environment variable, and does nothing at
+// import time — every read happens when a caller calls a loader, and every
+// argument a rule depends on is a parameter, so the pure parts are
+// unit-testable from `src/__tests__/scripts/` (§11: Jest's `roots` is
 // `<rootDir>/src`, so no test file can live in this folder).
 
 import crypto from 'crypto';
@@ -90,7 +95,7 @@ export type ManifestErrorCode =
     | 'invalid_path_segment'
     | 'path_outside_data_root'
     | 'invalid_manifest_shape'
-    // The four publication codes (see ARTEFACT PUBLICATION). An operator acts
+    // The six publication codes (see ARTEFACT PUBLICATION). An operator acts
     // on each differently: `artifact_publication_locked` means another stage is
     // publishing into the same directory and this run should be repeated once it
     // finishes; `incomplete_staged_artifact` means a staged document was
@@ -99,10 +104,34 @@ export type ManifestErrorCode =
     // which artefacts were promoted and which kept their previous content; and
     // `invalid_merged_report` means a stage's report could not be represented as
     // JSON, so nothing was written at all.
+    //
+    // `unsafe_artifact_directory` is a refusal to write into, or read through, a
+    // path that is not the plain thing it has to be: an output directory's
+    // parent that is a symlink, that is not a directory at all, or that another
+    // local principal may write to without the sticky bit; an output directory
+    // whose name is already taken by an entry of any kind; or an artefact path
+    // that is not a regular file. An operator answers it by pointing `--out`
+    // (or `--out-dir`/`--out-path`) at a directory they own, typically one under
+    // their home directory or the repository, rather than at a shared one.
+    //
+    // `untrusted_publication_journal` means a `.artefact-publication.journal`
+    // was found that this module will not act on: it does not parse, it is not a
+    // regular file, it is owned by another local principal or writable by one,
+    // it is larger or carries more entries than a journal this pipeline writes
+    // can, it names paths outside the directory being recovered, or it cannot
+    // prove which generation an artefact held before the interrupted run.
+    // Nothing is renamed or unlinked and the journal is KEPT, because acting on
+    // it is the risk and deleting it would destroy the only record of the
+    // interrupted publication. An operator answers it by reading the directory's
+    // contents (the message names the journal and the exact reason), deciding
+    // which generation each artefact should hold, and deleting the journal by
+    // hand once they have.
     | 'artifact_publication_locked'
     | 'incomplete_staged_artifact'
     | 'artifact_publication_failed'
-    | 'invalid_merged_report';
+    | 'invalid_merged_report'
+    | 'unsafe_artifact_directory'
+    | 'untrusted_publication_journal';
 
 export class ManifestError extends Error {
     constructor(
@@ -242,9 +271,9 @@ export const resolveRepoRoot = (fromDir: string = __dirname): string => {
 // `releaseFilePath('..', '../../../etc/passwd')` used to normalise to a path
 // outside the data tree — which the callers then read through `readJsonFile`
 // and write through `writeJsonFile`, and `writeJsonFile` creates missing
-// parents on the way. Root containment is one of this module's two promises
-// (see the header), so it is enforced here, at the single place every path is
-// built, rather than left to nine CLI scripts to remember.
+// parents on the way. Root containment is the first of this module's three
+// promises (see the header), so it is enforced here, at the single place every
+// path is built, rather than left to nine CLI scripts to remember.
 //
 // A segment is therefore one name — a single directory or file inside the data
 // tree — held to an allowlist rather than checked against a `..` denylist: a
@@ -511,6 +540,368 @@ const JSON_INDENT = 2;
 // that a dead one was cleared, is more useful than blocking.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// FILESYSTEM SAFETY PRIMITIVES — why a publisher cannot simply open its output.
+//
+// Every publishing stage takes an output directory from a flag (`--out`,
+// `--out-dir`, `--out-path`), and a flag accepts any directory: a shared one, a
+// world-writable one, one whose parent another local principal can rename. Two
+// classes of failure follow from that, and neither is visible in a run's output:
+//
+//   A FOLLOWED LINK. A create that follows a symlink another principal
+//   pre-placed at the name this run is about to write truncates whatever the
+//   link points at, with this process's privileges (CWE-59). A read that
+//   follows one reads a document this pipeline never wrote and then checksums,
+//   merges or accepts it as evidence.
+//
+//   A SPELLING MISTAKEN FOR AN IDENTITY. `path.resolve` collapses `..` but
+//   leaves symlinks alone, so two spellings of one directory compare as two
+//   directories — which is how two publishers each hold "their" lock over one
+//   `import-report.json`, and how a path check against a canonical artefact
+//   passes for an alias that writes straight into it.
+//
+// The primitives below are the answers, and they are exported and
+// argument-driven so each rule is pinned by `src/__tests__/scripts/` rather
+// than re-implemented per stage (Rule backend-architecture §1.2/§11). They
+// create nothing unless their name says they do, and they refuse rather than
+// repair: an output path a stage cannot prove is safe is an operator's flag to
+// correct, not a directory for this module to fix up.
+// ---------------------------------------------------------------------------
+
+/**
+ * The physical identity of `absolutePath`: every symlink on it resolved as far
+ * as the path exists, with the not-yet-existing tail appended lexically.
+ *
+ * This is what "are these two paths the same place?" has to be asked of. A
+ * spelling comparison answers "no" for an alias, which is the failure mode:
+ * `--out /tmp/link-to-reports` and the committed
+ * `data/meal-planning/reports/latest` name one directory and one artefact set.
+ *
+ * It CREATES NOTHING. A caller asking whether a path is safe to create must be
+ * able to ask before creating it, and a primitive that made its argument exist
+ * would answer a different question. `realpathSync` needs an existing path, so
+ * the deepest existing ancestor is resolved and the components below it are
+ * appended as they were spelled — those components do not exist, so no symlink
+ * on them exists either, and the identity is exact as soon as they do.
+ *
+ * A resolution failure that is not "no such path" (a permission wall on an
+ * ancestor) yields `path.resolve`'s answer and logs the reason, exactly as the
+ * lock's directory identity has always done: a narrower identity still
+ * distinguishes the ordinary case, and refusing to publish over an unresolvable
+ * ancestor would be worse than a narrower guarantee.
+ */
+export const physicalPathIdentity = (absolutePath: string): string => {
+    const resolved = path.resolve(absolutePath);
+    let existing = resolved;
+    // Innermost component first; reversed onto the resolved ancestor below.
+    const missingTail: string[] = [];
+
+    // Terminates at the filesystem root: every iteration either returns or
+    // removes one component, and `path.dirname` of the root is the root, which
+    // the equality check below treats as the end of the walk.
+    for (;;) {
+        try {
+            const physicalAncestor = fs.realpathSync(existing);
+            return missingTail.length === 0
+                ? physicalAncestor
+                : path.join(physicalAncestor, ...missingTail.reverse());
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            const parent = path.dirname(existing);
+            if (code === undefined || !MISSING_FILE_CODES.has(code) || parent === existing) {
+                logger.warn('artifact_path_unresolved', {
+                    path: describePath(resolved),
+                    error: (error as Error).message,
+                    consequence:
+                        'The path is identified by its resolved spelling instead of its physical location, so a ' +
+                        'caller reaching it through a symlink would not be recognised as reaching the same place.',
+                });
+                return resolved;
+            }
+            missingTail.push(path.basename(existing));
+            existing = parent;
+        }
+    }
+};
+
+/**
+ * Whether two paths name one physical place — the comparison every check
+ * against a canonical artefact path has to make instead of `===` on strings.
+ */
+export const samePhysicalPath = (left: string, right: string): boolean =>
+    physicalPathIdentity(left) === physicalPathIdentity(right);
+
+// The write bits that say "someone other than the owner may create, rename or
+// delete names in this directory": group-write and other-write.
+const GROUP_OR_OTHER_WRITE_MODE = 0o022;
+
+// The sticky bit. In a sticky directory only a name's owner (or the
+// directory's) may rename or delete it, which is what makes `/tmp` usable at
+// all.
+const STICKY_MODE = 0o1000;
+
+/**
+ * Refuses `absolutePath` unless its PARENT is a directory this process can
+ * publish into safely: it exists, it is a real directory under `lstat` rather
+ * than a symlink to one, it is OWNED by the principal running this stage, and
+ * no other local principal can plant a name in it.
+ *
+ * The parent rather than the path itself, because the attack is on the name
+ * this run is about to create: a principal who can write to the parent can
+ * pre-place that name as a symlink, and a create that follows it writes outside
+ * the directory the operator named.
+ *
+ * Ownership is a requirement of its own rather than a consequence of the mode
+ * rules. A `0700` or `0755` directory belonging to another local user satisfies
+ * every mode rule below — no group or other write bit is set — and is still
+ * unsafe: its owner can list the unguessable name this run creates inside it,
+ * unlink it, put their own entry there, and widen the mode at any moment after
+ * this check returns. An unguessable name defends against a principal who
+ * cannot read the directory, which the owner of a directory always can.
+ *
+ * "No other principal can plant a name" is satisfied EITHER by no group or
+ * other write bit, OR by the sticky bit. Sticky is sufficient rather than a
+ * concession: a name another principal cannot guess cannot be pre-created (every
+ * name this module creates under a shared directory carries
+ * `unguessableSuffix`), and in a sticky directory they cannot rename or delete a
+ * name they do not own either — which is exactly why the publication lock lives
+ * in `os.tmpdir()`.
+ *
+ * Where POSIX owner and mode semantics are not available, the
+ * existence-and-directory check still runs and the weaker guarantee is logged.
+ * Windows reports synthesised mode bits that do not describe its ACLs and a uid
+ * that describes nothing, so reading either there would produce a verdict about
+ * nothing.
+ */
+export const assertSafeArtifactParent = (absolutePath: string): void => {
+    const resolved = path.resolve(absolutePath);
+    const parent = path.dirname(resolved);
+
+    let parentStats: fs.Stats;
+    try {
+        // `lstat`, not `stat`: a symlinked parent is the case being refused, and
+        // `stat` would report the directory it points at and pass.
+        parentStats = fs.lstatSync(parent);
+    } catch (error) {
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            `${describePath(parent)} must exist before ${describePath(resolved)} can be published into it, and it ` +
+                `could not be read: ${(error as Error).message}. Point the output flag at a directory you own.`,
+        );
+    }
+
+    if (parentStats.isSymbolicLink()) {
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            `${describePath(parent)} is a symbolic link, so what it points at can be changed underneath this run ` +
+                'between the check and the write. Point the output flag at a real directory you own.',
+        );
+    }
+
+    if (!parentStats.isDirectory()) {
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            `${describePath(parent)} is not a directory, so ${describePath(resolved)} cannot be created inside it. ` +
+                'Point the output flag at a directory you own.',
+        );
+    }
+
+    if (process.platform === 'win32') {
+        logger.warn('artifact_parent_permissions_unchecked', {
+            directory: describePath(parent),
+            reason: 'this platform reports synthesised POSIX mode bits that do not describe its access control',
+            consequence:
+                'The output directory was checked for existence and for being a real directory only; whether the ' +
+                'principal running this stage owns it, and whether another local principal may plant a name in ' +
+                'it, were not established.',
+        });
+        return;
+    }
+
+    // Ownership, before the mode rules, because a directory another user owns
+    // is unsafe at ANY mode. A `0700` or `0755` directory belonging to another
+    // local principal passes every check below — no group or other write bit is
+    // set — while its owner can still list the staging nonce this run creates
+    // inside it, unlink it and put their own entry at the name, and can change
+    // the directory's mode at any moment after this check. The staging nonce is
+    // unguessable to a principal who cannot READ the directory; the owner of a
+    // directory always can.
+    //
+    // `process.getuid` is declared optional because it is POSIX-only, and the
+    // win32 branch above has already returned by here, so reading it through
+    // the optional call is a narrowing for the type system rather than a second
+    // platform decision.
+    const ourUid = process.getuid?.();
+    if (ourUid !== undefined && parentStats.uid !== ourUid) {
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            `${describePath(parent)} is owned by uid ${parentStats.uid} and this stage runs as uid ${ourUid}, so ` +
+                'its owner can read, replace and remove the entries this publication creates inside it whatever ' +
+                'its current mode is. Point the output flag at a directory you own.',
+        );
+    }
+
+    const writableByOthers = (parentStats.mode & GROUP_OR_OTHER_WRITE_MODE) !== 0;
+    const sticky = (parentStats.mode & STICKY_MODE) !== 0;
+    if (writableByOthers && !sticky) {
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            `${describePath(parent)} is writable by other local principals and is not sticky, so another user can ` +
+                `pre-place or replace ${path.basename(resolved)} inside it between this check and the write. Point ` +
+                'the output flag at a directory only you can write to, or set the sticky bit on this one.',
+        );
+    }
+};
+
+/**
+ * Creates the directory at `absolutePath` and nothing else at that name.
+ *
+ * `mkdirSync(…, { recursive: true })` is the wrong primitive for the final
+ * component: it treats an existing entry as success, so a symlink pre-placed at
+ * the output directory's name is adopted and every artefact the run publishes
+ * is written through it. A non-recursive `mkdir` is the atomic test-and-create
+ * the kernel provides — an existing entry of ANY kind, symlink included, fails
+ * with EEXIST — and this function turns that into a typed refusal.
+ *
+ * Parents are created recursively first (every publisher creates its output
+ * tree anyway) and then held to `assertSafeArtifactParent`, so the name being
+ * created is one no other principal can race. `mode` defaults to owner-only,
+ * which keeps a freshly created output directory private to the operator who
+ * ran the stage; the caller passes a wider mode only for a directory that is
+ * meant to be shared.
+ */
+export const createExclusiveDirectory = (absolutePath: string, mode: number = 0o700): void => {
+    const resolved = path.resolve(absolutePath);
+    const parent = path.dirname(resolved);
+
+    try {
+        fs.mkdirSync(parent, { recursive: true });
+    } catch (error) {
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            `the parent directories of ${describePath(resolved)} could not be created: ${(error as Error).message}.`,
+        );
+    }
+
+    assertSafeArtifactParent(resolved);
+
+    try {
+        fs.mkdirSync(resolved, { recursive: false, mode });
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            code === 'EEXIST'
+                ? `${describePath(resolved)} already exists. This stage creates its own output directory so that an ` +
+                  'entry pre-placed at that name — a symbolic link in particular — cannot redirect the artefacts it ' +
+                  'publishes. Remove or rename what is there, or name a directory that does not exist yet.'
+                : `${describePath(resolved)} could not be created: ${(error as Error).message}.`,
+        );
+    }
+
+    // The created name is verified rather than assumed: `mkdir` succeeding is
+    // proof enough on every platform this runs on, and the check costs one
+    // `lstat` against the one state that would invalidate everything above it.
+    const stats = fs.lstatSync(resolved);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        throw new ManifestError(
+            'unsafe_artifact_directory',
+            `${describePath(resolved)} is not a directory after being created, so the artefacts this stage publishes ` +
+                'would be written somewhere other than where they were asked for.',
+        );
+    }
+};
+
+// Eight bytes: 16 hex characters, which is what every generated name in this
+// module carries. Long enough that pre-placing a name is a guess against 2^64
+// rather than a plan, and short enough to leave a basename readable in a
+// directory listing an operator is reading to understand what a run left behind.
+const UNGUESSABLE_SUFFIX_BYTES = 8;
+
+/**
+ * 16 lowercase hex characters from the CSPRNG — the component that makes a name
+ * this module is about to create unguessable.
+ *
+ * Exclusive creation already refuses a name that is taken, so the suffix is the
+ * second half of the same defence: an attacker who cannot guess the name cannot
+ * pre-place it, and therefore never gets to race the create at all.
+ */
+export const unguessableSuffix = (): string => crypto.randomBytes(UNGUESSABLE_SUFFIX_BYTES).toString('hex');
+
+// `O_NOFOLLOW` is POSIX and present on every platform this pipeline runs on,
+// but it is not in Node's constants on every platform, and `undefined` in a
+// bitwise OR becomes 0 silently — which would quietly remove the protection.
+// Read once, explicitly, so the absence is a documented degradation rather than
+// an invisible one.
+const O_NOFOLLOW_FLAG = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+
+/**
+ * Creates and opens `absolutePath` for writing, refusing to follow a link or to
+ * touch an existing entry. The caller closes the returned descriptor.
+ *
+ * `O_CREAT | O_EXCL` is the atomic "create this name or fail" the kernel
+ * provides: a pre-placed entry of any kind, including a symlink, fails with
+ * EEXIST instead of being written through. `O_NOFOLLOW` makes the refusal
+ * explicit (ELOOP) where the platform defines it, which also covers the case of
+ * a link appearing between a caller's own check and this call.
+ *
+ * The errno is deliberately left to propagate rather than being wrapped: EEXIST
+ * is the outcome a staging writer retries with a new name, ELOOP is the one it
+ * reports, and a typed error would erase that distinction. The file is created
+ * owner-only, because a staged artefact is this run's private document until the
+ * rename that publishes it.
+ */
+export const openArtifactForWriteSync = (absolutePath: string): number =>
+    fs.openSync(absolutePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW_FLAG, 0o600);
+
+/**
+ * Reads `absolutePath` whole, refusing a symlink and anything that is not a
+ * regular file.
+ *
+ * The reason this is not `fs.readFileSync`: a stage that reads an artefact back
+ * — to checksum a release, to merge another stage's block into a report, to
+ * compare a benchmark against the accepted one — makes a decision from what it
+ * reads. `readFileSync` follows a symlink, so on a shared output directory that
+ * decision can be made from a document this pipeline never wrote.
+ *
+ * `O_NOFOLLOW` refuses the link at the open where the platform defines it, and
+ * `fstat` on the DESCRIPTOR — not a second `stat` on the path — is what rules
+ * out a directory, a FIFO or a device without a window in which the path could
+ * change between the two calls.
+ */
+export const readArtifactFileNoFollow = (absolutePath: string): Buffer => {
+    const descriptor = fs.openSync(absolutePath, fs.constants.O_RDONLY | O_NOFOLLOW_FLAG);
+    try {
+        const stats = fs.fstatSync(descriptor);
+        if (!stats.isFile()) {
+            throw new ManifestError(
+                'unsafe_artifact_directory',
+                `${describePath(absolutePath)} is not a regular file, so it is not an artefact this pipeline wrote ` +
+                    'and nothing was read from it.',
+            );
+        }
+
+        const buffer = Buffer.alloc(stats.size);
+        let filled = 0;
+        // A single `readSync` is not required to return the whole file, so the
+        // loop is the read: a short return is normal, and a zero return means
+        // the file is shorter than its reported size (it was truncated while
+        // being read), which the slice below reports honestly instead of
+        // padding with zero bytes.
+        while (filled < buffer.length) {
+            const read = fs.readSync(descriptor, buffer, filled, buffer.length - filled, filled);
+            if (read === 0) {
+                break;
+            }
+            filled += read;
+        }
+
+        return filled === buffer.length ? buffer : buffer.subarray(0, filled);
+    } finally {
+        fs.closeSync(descriptor);
+    }
+};
+
 /** The suffix every staged artefact carries while it is incomplete. */
 const STAGING_SUFFIX = '.tmp';
 
@@ -570,8 +961,15 @@ export const stagingPathFor = (absolutePath: string): string => {
     // Every creator of this path opens it `wx`/`'wx'`, which refuses an existing
     // entry of any kind including a symlink, so the guess would have to win a
     // race it cannot see; the random suffix removes the guess as well.
-    const nonce = crypto.randomBytes(8).toString('hex');
-    return path.join(directory, `.${name}.${process.pid}.${stagingCounter}.${nonce}${STAGING_SUFFIX}`);
+    //
+    // The shape is not only a naming convention: the publication journal's
+    // validator refuses an entry whose `stagingPath` is not a name this function
+    // could have produced, so the format below and `STAGING_BASENAME_PATTERN`
+    // are one contract and the suffix comes from one generator.
+    return path.join(
+        directory,
+        `.${name}.${process.pid}.${stagingCounter}.${unguessableSuffix()}${STAGING_SUFFIX}`,
+    );
 };
 
 /**
@@ -617,14 +1015,29 @@ const flushDirectory = (directory: string): void => {
  * rather than a silent overwrite of another publisher's staging document. The
  * staging file is removed if anything after its creation fails, so a failed
  * write leaves the previous artefact intact and no debris behind.
+ *
+ * `mode` is the permission the document must carry, and it is applied to the
+ * STAGING FILE at creation rather than to the target afterwards: the staging
+ * file holds the same bytes, so widening it first and narrowing the result
+ * later would leave a window in which another principal could read or copy
+ * them. The artefacts this pipeline publishes are evidence a reviewer reads, so
+ * the default — `open`'s default mode, narrowed by the process umask — is
+ * right for them; a caller passes a mode only for a document whose CONTENTS are
+ * part of a security decision, which is the publication journal (see ARTEFACT
+ * PUBLICATION). `fchmod` on the descriptor follows the create because `open`
+ * masks its mode argument with the umask, so a requested `0600` under an
+ * unusual umask would otherwise silently land without its owner-write bit.
  */
-const writeFileAtomicSync = (absolutePath: string, text: string): void => {
+const writeFileAtomicSync = (absolutePath: string, text: string, mode?: number): void => {
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
     const stagingPath = stagingPathFor(absolutePath);
 
     let descriptor: number | null = null;
     try {
-        descriptor = fs.openSync(stagingPath, 'wx');
+        descriptor = mode === undefined ? fs.openSync(stagingPath, 'wx') : fs.openSync(stagingPath, 'wx', mode);
+        if (mode !== undefined) {
+            fs.fchmodSync(descriptor, mode);
+        }
         fs.writeFileSync(descriptor, text, 'utf8');
         fs.fsyncSync(descriptor);
     } catch (error) {
@@ -759,13 +1172,40 @@ export const assertStagedDocumentComplete = (staged: StagedArtifact, expectedTai
 const PUBLICATION_JOURNAL_NAME = '.artefact-publication.journal';
 const BACKUP_SUFFIX = '.previous';
 
+/**
+ * The version of the journal DOCUMENT, not of the module.
+ *
+ * Version 2 adds the two fields that make a journal something this module can
+ * verify rather than something it has to trust: `directory`, the physical
+ * identity of the directory the journal belongs to, and `finalExisted` per
+ * entry, which is what lets a recovery prove the previous generation was
+ * restored when that generation was "no artefact at all". A journal declaring a
+ * HIGHER version was written by a build that knows fields this one would
+ * silently ignore, so it is refused for the same reason a `v2` manifest is (see
+ * the module header's SECOND promise); an absent version is a journal from
+ * before the field existed and is accepted on its contents.
+ */
+const PUBLICATION_JOURNAL_VERSION = 2;
+
 interface JournalEntry {
     readonly finalPath: string;
     readonly stagingPath: string;
     readonly backupPath: string;
+    /**
+     * Whether `finalPath` held an artefact when the publication began.
+     *
+     * Optional in the TYPE because a journal written before version 2 does not
+     * carry it, and such a journal is still recoverable for every entry whose
+     * backup is present — a backup is itself proof that a previous generation
+     * existed. It is written unconditionally by this build.
+     */
+    readonly finalExisted?: boolean;
 }
 
 interface PublicationJournal {
+    readonly journalVersion?: number;
+    /** The physical identity (see {@link physicalPathIdentity}) of the directory this journal belongs to. */
+    readonly directory?: string;
     readonly holderPid: number;
     readonly startedAt: string;
     readonly entries: readonly JournalEntry[];
@@ -773,18 +1213,412 @@ interface PublicationJournal {
 
 const journalPathFor = (directory: string): string => path.join(directory, PUBLICATION_JOURNAL_NAME);
 
-const backupPathFor = (absolutePath: string): string => {
-    const nonce = crypto.randomBytes(8).toString('hex');
-    return path.join(
-        path.dirname(absolutePath),
-        `.${path.basename(absolutePath)}.${process.pid}.${nonce}${BACKUP_SUFFIX}`,
+// ---------------------------------------------------------------------------
+// WHY THE JOURNAL IS VALIDATED RATHER THAN READ.
+//
+// A journal tells a later process to `rename` one path over another and to
+// `unlink` a third. Trusting the paths it names makes the document an
+// instruction set: `--out` accepts any directory, so on a shared one another
+// local principal writes `.artefact-publication.journal` naming
+// `{finalPath: "~/.ssh/authorized_keys", backupPath: "<their file>"}`, and the
+// next stage to publish there performs that rename with this process's
+// privileges (CWE-22/CWE-59). No stage would notice: recovery is a routine
+// step that logs a line.
+//
+// The journal is therefore BOUND to the directory being recovered and checked
+// against the shapes this module itself generates, before anything moves:
+//
+//   Every path is a DIRECT CHILD of that directory. `path.dirname` equal to the
+//   directory rules out traversal, an absolute path elsewhere, and a nested
+//   subdirectory in one comparison, and it is the property that matters — a
+//   principal who can write a journal into the directory can already write the
+//   names inside it, so a journal that can only name those adds nothing to what
+//   they have.
+//
+//   `finalPath` is a PLAIN ARTEFACT NAME (the module's own segment rule, which
+//   refuses a leading dot), so a journal cannot make this module rename
+//   something over another journal, a lock, a staging file or a backup.
+//
+//   `stagingPath` and `backupPath` match the patterns `stagingPathFor` and
+//   `backupPathFor` GENERATE. Those names carry a CSPRNG suffix, so an entry
+//   naming an arbitrary file in the directory is refused even though that file
+//   is a direct child: the only paths a real journal names are ones this module
+//   created.
+//
+// The rule set is pure and exported so it is pinned by unit tests rather than
+// by a filesystem fixture (Rule backend-architecture §1.2/§11): every refusal
+// branch is a security decision, and the ones that matter most are the ones a
+// filesystem test is least likely to reach.
+//
+// CONFINEMENT IS NOT AUTHENTICATION, so the FILE is authenticated too. The
+// rules above bound a journal to the names inside one directory, which answers
+// the journal that points somewhere else — but not the confused deputy INSIDE
+// the directory. In a world-writable sticky output directory another local user
+// can create `.artefact-publication.journal` themselves, declare the right
+// physical directory, invent staging and backup names of exactly the shapes
+// above (nothing has to exist at them), and name a REAL artefact this pipeline
+// owns with `finalExisted: false` and no backup. `planJournalSettlement` then
+// plans `remove-new-final` and the recovery unlinks that artefact as its owner:
+// sticky-bit rules stop the attacker deleting it themselves, and the recovery
+// would have done it for them.
+//
+// `readJournal` therefore requires, on POSIX, that the journal be OWNED BY THE
+// PRINCIPAL RUNNING THE STAGE and be writable by nobody else, and refuses
+// anything else through `untrusted_publication_journal` — nothing renamed,
+// nothing unlinked, the journal kept. Ownership is the instrument because the
+// alternatives are not available here:
+//
+//   A TOKEN IS NOT A SECRET IN THIS DIRECTORY. A journal has to be readable by
+//   the next run, and recovery happens in a LATER process holding a DIFFERENT
+//   lock claim, so there is nothing for it to compare an embedded token against
+//   — and a token embedded in a document the attacker can read would defend
+//   against nobody. This build writes the journal `0600` for the same reason:
+//   its contents name the paths a later run will act on, so no other principal
+//   should be able to read them either, let alone copy them into a forgery.
+//
+//   A VERSION FIELD IS NOT PROVENANCE. Refusing a document that does not
+//   declare `journalVersion` would refuse the legacy shape this module still
+//   has to revert (see {@link PUBLICATION_JOURNAL_VERSION}), and an attacker
+//   writes whatever version number the code demands anyway.
+//
+// The two caps below are the same decision applied to COST: a journal is read
+// and parsed before any of the rules above can speak, so its size and its entry
+// count are bounded first. A forged multi-gigabyte or millions-of-entries
+// document would otherwise be allocated and parsed before being refused.
+// ---------------------------------------------------------------------------
+
+// A real journal is a few hundred bytes per artefact, and the largest set any
+// stage in this pipeline publishes is a release's six members plus its
+// manifest — two kilobytes of document. 1 MiB is therefore hundreds of times
+// the real thing and still small enough to read and parse without thinking
+// about it; a document past it did not come from this pipeline.
+const MAX_PUBLICATION_JOURNAL_BYTES = 1024 * 1024;
+
+// The same bound on the axis the byte cap does not constrain tightly: 1 MiB of
+// minimal entries is tens of thousands of settlement decisions, each of which
+// costs `lstat` calls and can rename or unlink a path. No publisher stages more
+// than a handful of artefacts, so 64 is generous and still finite.
+const MAX_PUBLICATION_JOURNAL_ENTRIES = 64;
+
+// Owner-read/owner-write. The journal is the one document this module writes
+// whose CONTENTS are an input to a later security decision, so another
+// principal must not be able to read it and reproduce it (see above).
+const PUBLICATION_JOURNAL_MODE = 0o600;
+
+// The nonce width `unguessableSuffix` emits is 16 characters, and the bound is
+// deliberately a RANGE rather than that exact number: a journal left by an
+// earlier build (or by an operator reproducing one from the documentation) is a
+// document this run may still have to revert, and the security property here is
+// "a name this module generates in this directory", which the shape carries.
+// Entropy is what `unguessableSuffix` guarantees for names being CREATED; it is
+// not something a validator can verify after the fact.
+const GENERATED_NONCE_PATTERN = '[0-9a-f]{8,32}';
+
+// The characters a basename can legitimately contain that also mean something
+// in a regular expression — `.` in every artefact name, and the rest defensively
+// so a name can never be a pattern.
+const escapeRegExpLiteral = (literal: string): string => literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** The basenames `stagingPathFor` produces: `.<artefact>.<pid>.<counter>.<nonce>.tmp`. */
+const stagingBasenamePattern = (artefactName: string): RegExp =>
+    new RegExp(
+        `^\\.${escapeRegExpLiteral(artefactName)}\\.[0-9]+\\.[0-9]+\\.${GENERATED_NONCE_PATTERN}${escapeRegExpLiteral(
+            STAGING_SUFFIX,
+        )}$`,
     );
+
+/** The basenames `backupPathFor` produces: `.<artefact>.<pid>.<nonce>.previous`. */
+const backupBasenamePattern = (artefactName: string): RegExp =>
+    new RegExp(
+        `^\\.${escapeRegExpLiteral(artefactName)}\\.[0-9]+\\.${GENERATED_NONCE_PATTERN}${escapeRegExpLiteral(
+            BACKUP_SUFFIX,
+        )}$`,
+    );
+
+/** A journal this module will act on, with the entries it may act on. */
+export interface AcceptedPublicationJournal {
+    readonly valid: true;
+    readonly entries: readonly JournalEntry[];
+}
+
+/** A journal this module refuses, with the reason an operator is shown. */
+export interface RefusedPublicationJournal {
+    readonly valid: false;
+    /** Names the entry index and the field that failed, so the refusal is actionable. */
+    readonly reason: string;
+}
+
+export type PublicationJournalValidation = AcceptedPublicationJournal | RefusedPublicationJournal;
+
+const refuse = (reason: string): RefusedPublicationJournal => ({ valid: false, reason });
+
+/**
+ * Decides whether a parsed `.artefact-publication.journal` document may be
+ * acted on for `physicalDirectory`, and returns either its entries or the
+ * reason it is refused.
+ *
+ * Pure: it performs no I/O and reads no clock, so every branch above is
+ * exercised by a unit test rather than by arranging a filesystem. `parsed` is
+ * `unknown` because the document is untrusted input — the whole point is that
+ * its declared shape means nothing until this function has agreed with it.
+ *
+ * `physicalDirectory` is the identity of the directory being recovered (see
+ * {@link physicalPathIdentity}), which the publication lock has already
+ * resolved. Paths are compared after `path.resolve`, so a trailing separator or
+ * a `.` component in either spelling is not a mismatch.
+ */
+export const validatePublicationJournal = (
+    parsed: unknown,
+    physicalDirectory: string,
+): PublicationJournalValidation => {
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return refuse('the journal is not a JSON object');
+    }
+
+    const document = parsed as Record<string, unknown>;
+
+    if (document.journalVersion !== undefined) {
+        if (typeof document.journalVersion !== 'number' || !Number.isInteger(document.journalVersion)) {
+            return refuse('"journalVersion" is present but is not an integer');
+        }
+        if (document.journalVersion > PUBLICATION_JOURNAL_VERSION) {
+            return refuse(
+                `"journalVersion" is ${document.journalVersion}, which is newer than the version this build ` +
+                    `writes and reverts (${PUBLICATION_JOURNAL_VERSION})`,
+            );
+        }
+    }
+
+    const directory = path.resolve(physicalDirectory);
+
+    if (document.directory !== undefined) {
+        if (typeof document.directory !== 'string' || document.directory.length === 0) {
+            return refuse('"directory" is present but is not a non-empty string');
+        }
+        if (path.resolve(document.directory) !== directory) {
+            // A journal naming another directory did not come from a
+            // publication into this one, whether it was copied here or written
+            // here on purpose.
+            return refuse(
+                `"directory" names ${describeSegment(document.directory)}, which is not the directory being recovered`,
+            );
+        }
+    }
+
+    if (!Array.isArray(document.entries)) {
+        return refuse('"entries" is not an array');
+    }
+
+    if (document.entries.length > MAX_PUBLICATION_JOURNAL_ENTRIES) {
+        // Refused as a whole, before the loop below settles anything: each
+        // entry costs `lstat` calls and can rename or unlink a path, and no
+        // publisher in this pipeline stages this many artefacts.
+        return refuse(
+            `"entries" holds ${document.entries.length} entries, which is more than the ${MAX_PUBLICATION_JOURNAL_ENTRIES} ` +
+                'a publication in this pipeline can leave behind',
+        );
+    }
+
+    const entries: JournalEntry[] = [];
+
+    for (let index = 0; index < document.entries.length; index += 1) {
+        const candidate: unknown = document.entries[index];
+        if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) {
+            return refuse(`entry ${index} is not a JSON object`);
+        }
+
+        const entry = candidate as Record<string, unknown>;
+
+        const paths: Record<string, string> = {};
+        for (const field of ['finalPath', 'stagingPath', 'backupPath'] as const) {
+            const value = entry[field];
+            if (typeof value !== 'string' || value.length === 0) {
+                return refuse(`entry ${index}'s "${field}" is not a non-empty string`);
+            }
+            const resolved = path.resolve(value);
+            if (path.dirname(resolved) !== directory) {
+                return refuse(
+                    `entry ${index}'s "${field}" (${describeSegment(value)}) is not a direct child of the directory ` +
+                        'being recovered',
+                );
+            }
+            paths[field] = resolved;
+        }
+
+        const artefactName = path.basename(paths.finalPath);
+        if (!SAFE_PATH_SEGMENT.test(artefactName)) {
+            return refuse(
+                `entry ${index}'s "finalPath" names ${describeSegment(artefactName)}, which is not a plain artefact ` +
+                    'name',
+            );
+        }
+
+        if (!stagingBasenamePattern(artefactName).test(path.basename(paths.stagingPath))) {
+            return refuse(
+                `entry ${index}'s "stagingPath" (${describeSegment(
+                    path.basename(paths.stagingPath),
+                )}) is not a staging name this module generates for ${artefactName}`,
+            );
+        }
+
+        if (!backupBasenamePattern(artefactName).test(path.basename(paths.backupPath))) {
+            return refuse(
+                `entry ${index}'s "backupPath" (${describeSegment(
+                    path.basename(paths.backupPath),
+                )}) is not a backup name this module generates for ${artefactName}`,
+            );
+        }
+
+        if (entry.finalExisted !== undefined && typeof entry.finalExisted !== 'boolean') {
+            return refuse(`entry ${index}'s "finalExisted" is present but is not a boolean`);
+        }
+
+        entries.push({
+            finalPath: paths.finalPath,
+            stagingPath: paths.stagingPath,
+            backupPath: paths.backupPath,
+            ...(entry.finalExisted === undefined ? {} : { finalExisted: entry.finalExisted }),
+        });
+    }
+
+    return { valid: true, entries };
 };
 
-const readJournal = (journalPath: string): PublicationJournal | null => {
-    let text: string;
+/** The remedy every `untrusted_publication_journal` refusal ends with. */
+const JOURNAL_REFUSAL_REMEDY =
+    'Nothing was renamed or unlinked and the journal was kept, because acting on it is the risk and deleting it ' +
+    'would destroy the only record of the interrupted publication. Inspect the directory\'s contents, decide which ' +
+    'generation each artefact should hold, then delete the journal by hand.';
+
+const untrustedJournal = (journalPath: string, reason: string): ManifestError =>
+    new ManifestError(
+        'untrusted_publication_journal',
+        `${describePath(journalPath)} will not be acted on: ${reason}. ${JOURNAL_REFUSAL_REMEDY}`,
+    );
+
+// Same reasoning as `stagingPathFor`, and the same contract with the journal's
+// validator (`BACKUP_BASENAME_PATTERN`): a backup is a name this module created
+// in this directory, and an entry naming anything else is not a backup of ours
+// to rename over a canonical artefact.
+const backupPathFor = (absolutePath: string): string =>
+    path.join(
+        path.dirname(absolutePath),
+        `.${path.basename(absolutePath)}.${process.pid}.${unguessableSuffix()}${BACKUP_SUFFIX}`,
+    );
+
+/**
+ * Refuses a journal this process's principal does not own, or that another
+ * principal may write to.
+ *
+ * `stats` comes from the DESCRIPTOR the bytes are read through, so what is
+ * authenticated is the inode being read rather than a name that could have been
+ * replaced since it was looked at. The two facts it carries are the whole
+ * verdict: a journal owned by another uid was not written by this stage (nor by
+ * any earlier run of it), and a journal any other principal can write to could
+ * have been rewritten after a legitimate run created it. See the block above
+ * ARTEFACT PUBLICATION's journal rules for why ownership, rather than a token or
+ * a version field, is what can be checked here.
+ *
+ * Where POSIX identity is not available — `process.getuid` is absent on win32 —
+ * the degradation is logged in the same shape `assertSafeArtifactParent` uses
+ * and the read continues: the confinement rules still apply, and refusing every
+ * recovery on a platform whose ACLs this module cannot read would leave an
+ * interrupted publication permanently unrevertible.
+ */
+const assertJournalOwnedByThisPrincipal = (journalPath: string, stats: fs.Stats): void => {
+    if (typeof process.getuid !== 'function') {
+        logger.warn('publication_journal_ownership_unchecked', {
+            journal: describePath(journalPath),
+            reason: 'this platform does not report a POSIX owner, and its mode bits do not describe its access control',
+            consequence:
+                'The journal was checked for being a regular file and for naming only this directory\'s own ' +
+                'generated paths; whether it was written by the principal running this stage, rather than by ' +
+                'another local user choosing which artefacts this recovery renames and unlinks, was not established.',
+        });
+        return;
+    }
+
+    const ourUid = process.getuid();
+    if (stats.uid !== ourUid) {
+        throw untrustedJournal(
+            journalPath,
+            `it is owned by uid ${stats.uid} and this stage runs as uid ${ourUid}, so it was written by another ` +
+                'local principal rather than by an interrupted publication of this pipeline — acting on it would ' +
+                'rename and unlink the artefacts THEY chose, with this process\'s privileges',
+        );
+    }
+
+    if ((stats.mode & GROUP_OR_OTHER_WRITE_MODE) !== 0) {
+        throw untrustedJournal(
+            journalPath,
+            `its mode is ${(stats.mode & 0o7777).toString(8)}, which lets a principal other than its owner write ` +
+                'to it, so its contents cannot be attributed to the publication that created it',
+        );
+    }
+};
+
+/**
+ * Opens the journal, AUTHENTICATES the inode it opened, and reads it — one
+ * descriptor for all three, so nothing about the file can change between the
+ * verdict and the bytes.
+ *
+ * `O_NOFOLLOW` refuses a symlink at the open where the platform defines it, and
+ * `fstat` on the descriptor — not a second `stat` on the path — is what rules
+ * out a directory or a device, proves the ownership and mode, and bounds the
+ * size BEFORE any of the document is read into memory or parsed.
+ */
+const readAuthenticatedJournal = (journalPath: string): Buffer => {
+    const descriptor = fs.openSync(journalPath, fs.constants.O_RDONLY | O_NOFOLLOW_FLAG);
     try {
-        text = fs.readFileSync(journalPath, 'utf8');
+        const stats = fs.fstatSync(descriptor);
+        if (!stats.isFile()) {
+            throw untrustedJournal(
+                journalPath,
+                'it stopped being a regular file while it was being opened, so what it names is under the control ' +
+                    'of whoever replaced it rather than of a publication that was interrupted here',
+            );
+        }
+
+        assertJournalOwnedByThisPrincipal(journalPath, stats);
+
+        if (stats.size > MAX_PUBLICATION_JOURNAL_BYTES) {
+            throw untrustedJournal(
+                journalPath,
+                `it is ${stats.size} bytes, which is larger than the ${MAX_PUBLICATION_JOURNAL_BYTES} bytes a ` +
+                    'journal this pipeline writes can reach, so it was not read into memory or parsed',
+            );
+        }
+
+        // Reading by DESCRIPTOR rather than by path: the file authenticated
+        // above is the file read here. The size is already bounded, and the one
+        // principal who could grow it between the two calls is the owner the
+        // check above has just established is us.
+        return fs.readFileSync(descriptor);
+    } finally {
+        fs.closeSync(descriptor);
+    }
+};
+
+/**
+ * Reads the journal in a directory and returns the entries a recovery may act
+ * on, or `null` when no publication was interrupted there.
+ *
+ * Every other outcome THROWS `untrusted_publication_journal`.
+ *
+ * The document is authenticated and bounded before it is parsed (see
+ * {@link readAuthenticatedJournal}) and its contents are then held to
+ * {@link validatePublicationJournal}. An UNPARSABLE journal is refused rather
+ * than normalised to "no entries and clear it": that normalisation deleted the
+ * only record of an interrupted publication and left whatever the killed run
+ * had put at the canonical paths, reported as a successful recovery. A journal that does not parse is a directory an operator
+ * has to look at, and this is the one moment the pipeline can tell them so.
+ */
+const readJournal = (journalPath: string, physicalDirectory: string): readonly JournalEntry[] | null => {
+    let stats: fs.Stats;
+    try {
+        // `lstat`, not `stat`: a symlink at the journal name is the case being
+        // refused, and `stat` would report whatever it points at.
+        stats = fs.lstatSync(journalPath);
     } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         if (code !== undefined && MISSING_FILE_CODES.has(code)) {
@@ -793,17 +1627,171 @@ const readJournal = (journalPath: string): PublicationJournal | null => {
         throw error;
     }
 
-    try {
-        const parsed = JSON.parse(text) as PublicationJournal;
-        return Array.isArray(parsed?.entries) ? parsed : null;
-    } catch {
-        // An unparsable journal still means a publication was interrupted here,
-        // but it cannot say which paths to revert. Treated as a journal with no
-        // entries so it is cleared rather than blocking every future run: the
-        // artefacts themselves are then whatever the interrupted run left, which
-        // the reconciliation in the next run is what catches.
-        return { holderPid: 0, startedAt: '', entries: [] };
+    if (!stats.isFile()) {
+        throw untrustedJournal(
+            journalPath,
+            'it is not a regular file, so what it names is under the control of whoever placed it there rather ' +
+                'than of a publication that was interrupted here',
+        );
     }
+
+    let raw: Buffer;
+    try {
+        raw = readAuthenticatedJournal(journalPath);
+    } catch (error) {
+        // A refusal the reader already decided carries its own reason — the
+        // ownership, mode and size verdicts among them — and is re-thrown as it
+        // is rather than being flattened into one generic message.
+        if (error instanceof ManifestError) {
+            throw error;
+        }
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== undefined && MISSING_FILE_CODES.has(code)) {
+            // Removed between the `lstat` and the open, which only the holder of
+            // this directory's lock can have done: its own recovery finished.
+            return null;
+        }
+        if (code === 'ELOOP') {
+            throw untrustedJournal(journalPath, 'it stopped being a regular file while it was being read');
+        }
+        throw error;
+    }
+
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(stripUtf8Bom(raw.toString('utf8')));
+    } catch (error) {
+        throw untrustedJournal(journalPath, `it does not parse as JSON (${(error as Error).message})`);
+    }
+
+    const validation = validatePublicationJournal(parsed, physicalDirectory);
+    if (!validation.valid) {
+        throw untrustedJournal(journalPath, validation.reason);
+    }
+
+    return validation.entries;
+};
+
+/**
+ * What a recovery has to do to one journal entry to put the previous generation
+ * back — decided for every entry BEFORE any of them is acted on.
+ */
+type JournalSettlement =
+    /** A backup is present: renaming it back restores the previous generation. */
+    | { readonly kind: 'restore-backup'; readonly entry: JournalEntry }
+    /** No backup and the entry records that nothing was there: the previous generation is "no artefact". */
+    | { readonly kind: 'remove-new-final'; readonly entry: JournalEntry; readonly finalPresent: boolean }
+    /** No backup, an artefact existed and is still at its path: the backup loop never reached this entry. */
+    | { readonly kind: 'previous-still-in-place'; readonly entry: JournalEntry };
+
+const lstatOrNull = (absolutePath: string): fs.Stats | null => {
+    try {
+        return fs.lstatSync(absolutePath);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== undefined && MISSING_FILE_CODES.has(code)) {
+            return null;
+        }
+        throw error;
+    }
+};
+
+/**
+ * Settles every entry by PROOF, or refuses the whole journal.
+ *
+ * The four cases are exhaustive over what an interruption can leave, and each
+ * one is decided by something observable rather than assumed:
+ *
+ *   A BACKUP IS PRESENT. Its existence is proof a previous generation was moved
+ *   aside, whether or not the staged replacement made it in, so renaming it back
+ *   restores that generation. It must be a REGULAR FILE: a symlink renamed onto
+ *   the canonical path would make the artefact a symlink that every later reader
+ *   follows, which is the same attack the staging paths are hardened against.
+ *
+ *   NO BACKUP, `finalExisted: false`. Nothing was at this path before the
+ *   publication, so the previous generation is "no artefact" and restoring it
+ *   means removing what this run put there. Without this case an interrupted
+ *   ALL-NEW publication left its new documents at the canonical paths while the
+ *   recovery reported a rollback.
+ *
+ *   NO BACKUP, `finalExisted: true`. The backup loop had not reached this entry,
+ *   so the artefact at the path IS the previous generation and there is nothing
+ *   to do. If it is absent, or is not a regular file, the previous generation
+ *   cannot be shown to be in place — so the journal is kept and the refusal says
+ *   which artefact.
+ *
+ *   NO BACKUP, NO RECORDED FLAG. "This run's new document" and "the generation
+ *   published before it" are indistinguishable at that path — removing it could
+ *   destroy the only artefact, and keeping it could publish a document no run
+ *   agreed on. Only an operator can tell them apart, so the journal is kept.
+ */
+const planJournalSettlement = (
+    entries: readonly JournalEntry[],
+    journalPath: string,
+): readonly JournalSettlement[] => {
+    const plan: JournalSettlement[] = [];
+
+    for (let index = 0; index < entries.length; index += 1) {
+        const entry = entries[index];
+        const artefact = path.basename(entry.finalPath);
+        const backupStats = lstatOrNull(entry.backupPath);
+
+        if (backupStats !== null) {
+            if (!backupStats.isFile()) {
+                throw untrustedJournal(
+                    journalPath,
+                    `entry ${index}'s backup of ${artefact} is not a regular file, so renaming it over the ` +
+                        'canonical path would replace the artefact with something every later reader would follow',
+                );
+            }
+            plan.push({ kind: 'restore-backup', entry });
+            continue;
+        }
+
+        const finalStats = lstatOrNull(entry.finalPath);
+
+        if (entry.finalExisted === false) {
+            if (finalStats !== null && !finalStats.isFile()) {
+                throw untrustedJournal(
+                    journalPath,
+                    `entry ${index} records that nothing was at ${artefact} before the interrupted publication, ` +
+                        'but what is there now is not a regular file, so it is not this pipeline\'s document to remove',
+                );
+            }
+            plan.push({ kind: 'remove-new-final', entry, finalPresent: finalStats !== null });
+            continue;
+        }
+
+        if (entry.finalExisted === true) {
+            if (finalStats === null) {
+                throw untrustedJournal(
+                    journalPath,
+                    `entry ${index} records that ${artefact} existed before the interrupted publication, there is ` +
+                        'no backup of it, and nothing is at its path, so the generation published before that run ' +
+                        'cannot be shown to be restored',
+                );
+            }
+            if (!finalStats.isFile()) {
+                throw untrustedJournal(
+                    journalPath,
+                    `entry ${index} records that ${artefact} existed before the interrupted publication and what ` +
+                        'is at its path now is not a regular file, so the previous generation cannot be shown to ' +
+                        'be in place',
+                );
+            }
+            plan.push({ kind: 'previous-still-in-place', entry });
+            continue;
+        }
+
+        throw untrustedJournal(
+            journalPath,
+            `entry ${index} has no backup and does not record whether ${artefact} existed before the interrupted ` +
+                'publication, so this run\'s new document and the generation published before it are ' +
+                'indistinguishable at that path',
+        );
+    }
+
+    return plan;
 };
 
 /**
@@ -815,30 +1803,81 @@ const readJournal = (journalPath: string): PublicationJournal | null => {
  * live process, so rolling forward could publish a pair no run ever agreed on,
  * while rolling back restores a generation that was published as a set.
  *
+ * `physicalDirectory` is the identity the journal must be bound to, and it
+ * defaults to the identity of `directory` so the one-argument call stays valid.
+ * The under-lock caller passes the identity the LOCK keyed on, which is what
+ * makes mutual exclusion and this recovery agree on which directory is being
+ * recovered rather than each resolving the spelling for itself.
+ *
  * Returns the final paths it reverted, so the caller can log that it happened —
- * an interrupted publication is an operational event, not a detail.
+ * an interrupted publication is an operational event, not a detail. A journal
+ * this module will not act on throws `untrusted_publication_journal` with
+ * nothing renamed or unlinked and the journal left in place.
  */
-export const recoverInterruptedPublication = (directory: string): readonly string[] => {
-    const journalPath = journalPathFor(directory);
-    const journal = readJournal(journalPath);
-    if (journal === null) {
+export const recoverInterruptedPublication = (
+    directory: string,
+    physicalDirectory: string = physicalPathIdentity(directory),
+): readonly string[] => {
+    const journalPath = journalPathFor(physicalDirectory);
+    const entries = readJournal(journalPath, physicalDirectory);
+    if (entries === null) {
         return [];
     }
 
+    // Decided in full before anything moves, so every refusal above leaves the
+    // directory exactly as it was found — including a refusal that only the
+    // last entry earns.
+    const plan = planJournalSettlement(entries, journalPath);
+
     const reverted: string[] = [];
-    for (const entry of journal.entries) {
-        // A backup exists exactly when this entry's previous content was moved
-        // aside, whether or not the staged replacement made it in. Moving the
-        // backup back therefore restores the previous generation in both cases.
-        if (fs.existsSync(entry.backupPath)) {
-            fs.renameSync(entry.backupPath, entry.finalPath);
+    for (const settlement of plan) {
+        const entry = settlement.entry;
+
+        // Every failure below throws with the journal still in place: it is the
+        // only record of which backup belongs to which artefact, and a revert
+        // that could not finish is one the next run has to be able to retry.
+        // "Already gone" is tolerated only where absence is the state being
+        // produced — never for a backup that was supposed to be renamed back.
+        if (settlement.kind === 'restore-backup') {
+            try {
+                fs.renameSync(entry.backupPath, entry.finalPath);
+            } catch (error) {
+                throw new ManifestError(
+                    'artifact_publication_failed',
+                    `restoring ${describePath(entry.finalPath)} from its backup failed ` +
+                        `(${(error as Error).message}), so ${describePath(journalPath)} was kept and the next run ` +
+                        'reverts the set from it.',
+                );
+            }
+            reverted.push(describePath(entry.finalPath));
+        } else if (settlement.kind === 'remove-new-final' && settlement.finalPresent) {
+            try {
+                // Not `removeIfPresent`: that warns and continues, and a new
+                // artefact left at a canonical path is the failure this case
+                // exists to prevent.
+                fs.unlinkSync(entry.finalPath);
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code === undefined || !MISSING_FILE_CODES.has(code)) {
+                    throw new ManifestError(
+                        'artifact_publication_failed',
+                        `removing the artefact the interrupted publication had created at ` +
+                            `${describePath(entry.finalPath)} failed (${(error as Error).message}), so ` +
+                            `${describePath(journalPath)} was kept and the next run reverts the set from it.`,
+                    );
+                }
+            }
             reverted.push(describePath(entry.finalPath));
         }
+
         removeIfPresent(entry.stagingPath);
     }
 
+    // The journal is the record of the interrupted publication, so it is
+    // removed only once every entry has been settled — which is what makes its
+    // absence mean "the previous generation is what is on disk".
     removeIfPresent(journalPath);
-    flushDirectory(directory);
+    flushDirectory(physicalDirectory);
     return reverted;
 };
 
@@ -847,13 +1886,27 @@ export const recoverInterruptedPublication = (directory: string): readonly strin
  *
  * This is the set's single commit point. The sequence is a write-ahead
  * transaction: verify every staged document, record the intent in a flushed
- * journal, move each previous artefact aside to a backup, rename the staged
- * documents in, then clear the journal and the backups. Any failure after the
- * journal exists restores every final path from its backup, so when this
- * function returns — successfully or not — the canonical paths hold either all
- * of the new generation or all of the previous one, never a mix of the two.
- * A process killed mid-sequence leaves the journal, and the next publisher's
- * `recoverInterruptedPublication` reverts the set.
+ * journal — including, per artefact, whether anything was at its canonical path
+ * — move each previous artefact aside to a backup, rename the staged documents
+ * in, then clear the journal and the backups.
+ *
+ * Any failure after the journal exists undoes BOTH halves of the generation it
+ * found: an artefact that existed is restored from its backup, and an artefact
+ * this run would have created is removed again. The second half is what makes
+ * the guarantee true for an all-new or mixed set rather than only for a
+ * replacement — so when this function returns, successfully or not, the
+ * canonical paths hold either all of the new generation or all of the previous
+ * one, and "previous" includes "there was nothing here". A process killed
+ * mid-sequence leaves the journal, and the next publisher's
+ * `recoverInterruptedPublication` reverts the set from it by the same rule.
+ *
+ * That rollback is PROVEN before it is reported. Every restoring `rename` and
+ * every removal is tracked by its own outcome, and the journal and the backups
+ * are destroyed only when all of them succeeded — a step that failed leaves its
+ * backup and the journal on disk and is named in the thrown message, which then
+ * says only that the set is not back. The two are not interchangeable: the
+ * journal plus the backups are the entire means of recovering the previous
+ * generation, so deleting them on an unproven rollback destroys it permanently.
  *
  * What this does NOT do, stated so no caller assumes it: a reader that does not
  * take the publication lock can still observe the instant between two renames.
@@ -882,31 +1935,60 @@ export const promoteStagedArtifacts = (staged: readonly StagedArtifact[]): void 
                 `artefact in the set must share one directory; this set spans ${directories.size}.`,
         );
     }
-    const directory = [...directories][0];
-    const journalPath = journalPathFor(directory);
+    // The journal and its entries are written in the directory's PHYSICAL
+    // spelling, and the sequence below moves those same paths. The recovery that
+    // may later read this journal resolves the identity the lock keyed on, so a
+    // journal recorded in an aliased spelling would be refused as belonging to
+    // another directory — and resolving once here also means a symlink
+    // retargeted mid-sequence cannot redirect the remaining renames.
+    const physicalDirectory = physicalPathIdentity([...directories][0]);
+    const journalPath = journalPathFor(physicalDirectory);
 
-    const entries: JournalEntry[] = staged.map((artifact) => ({
-        finalPath: artifact.finalPath,
-        stagingPath: artifact.stagingPath,
-        backupPath: backupPathFor(artifact.finalPath),
-    }));
+    const entries: JournalEntry[] = staged.map((artifact) => {
+        const finalPath = path.join(physicalDirectory, path.basename(artifact.finalPath));
+        return {
+            finalPath,
+            stagingPath: path.join(physicalDirectory, path.basename(artifact.stagingPath)),
+            backupPath: path.join(physicalDirectory, path.basename(backupPathFor(finalPath))),
+            // Determined BEFORE the journal is written, because after the first
+            // rename it is no longer observable: a recovery that cannot tell
+            // "this run's new document" from "the generation published before
+            // it" cannot prove it restored anything (see
+            // `planJournalSettlement`).
+            finalExisted: lstatOrNull(finalPath) !== null,
+        };
+    });
 
     // The journal is written and flushed first, so every state the sequence can
-    // be interrupted in is one the recovery above can read and undo.
+    // be interrupted in is one the recovery above can read and undo. Owner-only:
+    // the next run authenticates this document by its ownership and mode, so a
+    // world-readable journal would hand another principal the exact names a
+    // forgery has to carry.
     writeFileAtomicSync(
         journalPath,
         `${JSON.stringify(
-            { holderPid: process.pid, startedAt: new Date().toISOString(), entries } satisfies PublicationJournal,
+            {
+                journalVersion: PUBLICATION_JOURNAL_VERSION,
+                directory: physicalDirectory,
+                holderPid: process.pid,
+                startedAt: new Date().toISOString(),
+                entries,
+            } satisfies PublicationJournal,
             null,
             JSON_INDENT,
         )}\n`,
+        PUBLICATION_JOURNAL_MODE,
     );
 
     const backedUp: JournalEntry[] = [];
     const promoted: JournalEntry[] = [];
     try {
         for (const entry of entries) {
-            if (fs.existsSync(entry.finalPath)) {
+            // The same predicate `finalExisted` was recorded with, so the
+            // journal cannot say an artefact existed while this loop decides it
+            // did not (an entry at the path that `existsSync` does not see — a
+            // dangling symlink — used to make the two disagree).
+            if (lstatOrNull(entry.finalPath) !== null) {
                 fs.renameSync(entry.finalPath, entry.backupPath);
                 backedUp.push(entry);
             }
@@ -916,39 +1998,104 @@ export const promoteStagedArtifacts = (staged: readonly StagedArtifact[]): void 
             promoted.push(entry);
         }
     } catch (error) {
-        // Roll the whole set back to the generation it had on entry: a promoted
-        // final is overwritten by its backup, a final that was only moved aside
-        // is moved back, and anything still staged is discarded.
+        // Roll the whole set back to the generation it had on entry. That
+        // generation is "the previous document" for an artefact that existed and
+        // "no artefact at all" for one this run would have created, and BOTH
+        // halves have to be undone: restoring only the backups left this run's
+        // new documents at the canonical paths of an all-new or mixed set while
+        // the message below claimed the set was rolled back.
+        //
+        // Every step's OUTCOME is recorded, and the ones that did not happen are
+        // named. Inferring the verdict from "is something at this path?" was
+        // wrong in the one case that matters: if the restoring `rename` throws
+        // while this run's newly promoted document is still sitting at the
+        // canonical path, something IS there, so the existence predicate held,
+        // the journal and every backup were deleted, and the previous generation
+        // was gone for good behind a message claiming it had been restored.
+        const restored: JournalEntry[] = [];
+        const removed: JournalEntry[] = [];
+        // What is still not the generation this run found, in the operator's
+        // words. Its emptiness is the ONLY thing that authorises deleting the
+        // journal or a backup below.
+        const outstanding: string[] = [];
+
         for (const entry of backedUp) {
             try {
+                // The rename SUCCEEDING is the proof, not something being at the
+                // path afterwards: `rename` either moved the previous generation
+                // back or it did not.
                 fs.renameSync(entry.backupPath, entry.finalPath);
-            } catch {
-                // The journal is deliberately left in place when a rollback step
-                // fails: it is the only record of which backup belongs to which
-                // artefact, and the next run's recovery retries from it.
+                restored.push(entry);
+            } catch (restoreError) {
+                outstanding.push(
+                    `${describePath(entry.finalPath)} was not restored from ${describePath(entry.backupPath)} ` +
+                        `(${(restoreError as Error).message})`,
+                );
             }
         }
+
+        const newlyPromoted = promoted.filter((entry) => entry.finalExisted === false);
+        for (const entry of newlyPromoted) {
+            try {
+                // Regular files only: this run created what is at that path, and
+                // anything else there is not this run's document to delete.
+                if (lstatOrNull(entry.finalPath)?.isFile() === true) {
+                    fs.unlinkSync(entry.finalPath);
+                }
+                if (lstatOrNull(entry.finalPath) === null) {
+                    // Including the case where it was already gone: the previous
+                    // generation of an artefact this run created is "no
+                    // artefact", and that is what the path now holds.
+                    removed.push(entry);
+                } else {
+                    outstanding.push(
+                        `${describePath(entry.finalPath)} still holds an entry this run's publication created, ` +
+                            'and it is not a regular file this pipeline may remove',
+                    );
+                }
+            } catch (removeError) {
+                outstanding.push(
+                    `the document this run created at ${describePath(entry.finalPath)} was not removed ` +
+                        `(${(removeError as Error).message})`,
+                );
+            }
+        }
+
         discardStagedArtifacts(staged);
         const failed = entries
             .filter((entry) => !promoted.includes(entry))
             .map((entry) => describePath(entry.finalPath));
-        const rolledBack = backedUp.every((entry) => fs.existsSync(entry.finalPath));
-        if (rolledBack) {
+
+        if (outstanding.length === 0) {
+            // Proven over both halves: every artefact that existed was renamed
+            // back, and every artefact that did not exist is gone again. Only
+            // now is "the artefacts hold the generation they had before this
+            // run" true of the whole set, and only now may the record of the
+            // interrupted publication and the backups it names be destroyed.
             removeIfPresent(journalPath);
             for (const entry of backedUp) {
                 removeIfPresent(entry.backupPath);
             }
+            flushDirectory(physicalDirectory);
+            throw new ManifestError(
+                'artifact_publication_failed',
+                `publishing the artefact set failed at ${failed.join(', ')}, so the set was rolled back and every ` +
+                    `artefact holds the generation it had before this run. ${(error as Error).message}`,
+            );
         }
-        flushDirectory(directory);
+
+        // One outcome, stated once: the set is NOT back, these are the parts
+        // that are not, and the journal and every backup it names are still on
+        // disk for the next run's `recoverInterruptedPublication` to finish
+        // from. Nothing here claims the generation was restored.
+        flushDirectory(physicalDirectory);
         throw new ManifestError(
             'artifact_publication_failed',
-            `publishing the artefact set failed at ${failed.join(', ')}, so the set was rolled back and every ` +
-                `artefact holds the generation it had before this run` +
-                (rolledBack
-                    ? '. '
-                    : `; the rollback could not finish, so ${describePath(journalPath)} was kept and the next run ` +
-                      'reverts the set from it. ') +
-                (error as Error).message,
+            `publishing the artefact set failed at ${failed.join(', ')} and the rollback could not be completed: ` +
+                `${outstanding.join('; ')}. ${restored.length + removed.length} of ${
+                    backedUp.length + newlyPromoted.length
+                } artefacts were put back; ${describePath(journalPath)} and the backups it names were KEPT, and the ` +
+                `next run reverts the set from them. ${(error as Error).message}`,
         );
     }
 
@@ -958,7 +2105,7 @@ export const promoteStagedArtifacts = (staged: readonly StagedArtifact[]): void 
     for (const entry of backedUp) {
         removeIfPresent(entry.backupPath);
     }
-    flushDirectory(directory);
+    flushDirectory(physicalDirectory);
 };
 
 // A staged file already promoted by an earlier iteration is gone; the check is
@@ -993,15 +2140,105 @@ export const discardStagedArtifacts = (staged: readonly StagedArtifact[]): void 
  */
 export const ARTIFACT_LOCK_STALE_MS = 30 * 60 * 1000;
 
-interface ArtifactLockRecord {
-    readonly holder: string;
+/**
+ * What identifies the HOLDER of a lock, as opposed to the lock file's name.
+ *
+ * `token` is CSPRNG hex minted per claim, and it is what makes two successive
+ * claims by ONE process distinguishable: pid and `startedAt` can repeat — the
+ * same publisher retaking the lock inside the same millisecond is the ordinary
+ * case in a test and a plausible one in a fast retry — and "it looks like the
+ * record I wrote" is then not the same statement as "it IS the record I wrote".
+ *
+ * An empty token means the record carries none: a lock file written by an
+ * earlier build, or by hand. Such a record is still usable — identity falls
+ * back to pid and `startedAt` — so a tokenless lock can still be released and
+ * taken over rather than becoming permanently unclaimable.
+ */
+export interface ArtifactLockOwnership {
+    readonly token: string;
     readonly pid: number;
     readonly startedAt: string;
+}
+
+interface ArtifactLockRecord extends ArtifactLockOwnership {
+    readonly holder: string;
     readonly directory: string;
 }
 
+/**
+ * A lock file as one observation: the inode it was, the bytes it had, and the
+ * holder it named. Comparing two of these is how a decision taken about a lock
+ * is checked against the lock still being the same one.
+ *
+ * `device` and `inode` change when the file is replaced (the claim path links a
+ * fresh inode into place, so a release-and-retake always changes them), while
+ * `modifiedAtMs` and `size` catch a rewrite in place that reused the inode.
+ */
+export interface ArtifactLockIdentity extends ArtifactLockOwnership {
+    readonly device: number;
+    readonly inode: number;
+    readonly modifiedAtMs: number;
+    readonly size: number;
+}
+
+/**
+ * Whether two observations are of the SAME lock — every field, with a missing
+ * observation never equal to anything, including another missing one.
+ *
+ * "The file is gone" is deliberately not an identity: a lock that vanished
+ * between two reads was released, and the correct answer is to retry the claim
+ * rather than to unlink a name that may already belong to someone else.
+ *
+ * Pure and exported because it is the whole of the stale-lock decision worth
+ * pinning (Rule backend-architecture §1.2/§11): every field has to participate,
+ * and a test is the only thing that keeps a later edit from dropping one.
+ */
+export const sameArtifactLock = (
+    left: ArtifactLockIdentity | null,
+    right: ArtifactLockIdentity | null,
+): boolean =>
+    left !== null &&
+    right !== null &&
+    left.device === right.device &&
+    left.inode === right.inode &&
+    left.modifiedAtMs === right.modifiedAtMs &&
+    left.size === right.size &&
+    left.token === right.token &&
+    left.pid === right.pid &&
+    left.startedAt === right.startedAt;
+
+/**
+ * Whether the lock record currently on disk is the one `ours` claimed.
+ *
+ * The token decides it whenever the CURRENT record carries one, because that is
+ * the field a second claim cannot reproduce. A current record without a token
+ * comes from an earlier build or from an operator's hand, and for those the
+ * strongest available statement is pid plus start time — weaker, but it still
+ * refuses to release a lock whose holder is a different process.
+ */
+export const artifactLockRecordIsOurs = (
+    current: ArtifactLockOwnership,
+    ours: ArtifactLockOwnership,
+): boolean =>
+    current.token.length > 0
+        ? current.token === ours.token
+        : current.pid === ours.pid && current.startedAt === ours.startedAt;
+
 export interface ArtifactPublicationLock {
     readonly lockPath: string;
+    /**
+     * The physical directory this lock was keyed on — the identity, not the
+     * spelling the caller passed (see {@link physicalPathIdentity}).
+     *
+     * Published because mutual exclusion and path safety have to agree on which
+     * directory is being published into: a holder that resolved its output
+     * directory once, took the lock on that identity, and then wrote through the
+     * original spelling would have serialised one place and written to another.
+     * Every write a holder performs is meant to be relative to this value, and
+     * `recoverInterruptedPublication` takes it as the identity a journal must be
+     * bound to.
+     */
+    readonly physicalDirectory: string;
     readonly release: () => void;
 }
 
@@ -1013,28 +2250,29 @@ export interface ArtifactPublicationLock {
  * `data/meal-planning/reports/latest` resolve to different strings while naming
  * the same directory and the same `import-report.json`. Keying the lock on the
  * spelling would let two publishers each hold "their" lock and overwrite each
- * other's merged fields. `realpath` collapses the aliases to one identity.
+ * other's merged fields. {@link physicalPathIdentity} collapses the aliases to
+ * one identity, and logs its own reason when an ancestor cannot be resolved.
  *
- * The directory is created first because every publisher creates it anyway, and
- * `realpath` needs it to exist. If it cannot be resolved (a permission wall on
- * an ancestor), the resolved spelling is used and the reason is logged: a lock
- * keyed on the spelling still excludes the common case, and refusing to publish
- * over an unresolvable path would be worse than a narrower guarantee.
+ * The directory is created here, which is the one thing the exported primitive
+ * deliberately does not do: a lock is taken by a publisher that is about to
+ * write into this directory, so it exists either way, and the identity is exact
+ * rather than part-lexical once it does.
  */
 const physicalDirectoryIdentity = (directory: string): string => {
     try {
         fs.mkdirSync(directory, { recursive: true });
-        return fs.realpathSync(directory);
     } catch (error) {
         logger.warn('artifact_lock_directory_unresolved', {
             directory: describePath(directory),
             error: (error as Error).message,
             consequence:
-                'The publication lock is keyed on the resolved path instead of the physical directory, so a ' +
-                'publisher reaching this directory through a symlink would not contend for the same lock.',
+                'The publication lock is keyed on whatever identity the path resolves to without the directory ' +
+                'being created, so a publisher reaching this directory through a symlink may not contend for the ' +
+                'same lock.',
         });
-        return path.resolve(directory);
     }
+
+    return physicalPathIdentity(directory);
 };
 
 const artifactLockPathFor = (physicalIdentity: string): string =>
@@ -1068,12 +2306,52 @@ const readArtifactLockRecord = (lockPath: string): ArtifactLockRecord | null => 
             pid: record.pid,
             startedAt: record.startedAt,
             directory: typeof record.directory === 'string' ? record.directory : '',
+            // Absent rather than invalid: a record written before the token
+            // existed is still a record, and `artifactLockRecordIsOurs` falls
+            // back to pid and start time for it.
+            token: typeof record.token === 'string' ? record.token : '',
         };
     } catch {
         // A lock file that does not parse carries no holder to name, so it is
         // treated as abandoned rather than as a reason to stop publishing.
         return null;
     }
+};
+
+/**
+ * One observation of the lock file: its record (when it has a readable one) and
+ * its inode identity, read back to back.
+ *
+ * Both halves come from one call so a caller cannot accidentally pair a record
+ * read at one moment with a `stat` taken at another — which is precisely the
+ * mistake the stale-lock recheck exists to avoid.
+ */
+const observeArtifactLock = (
+    lockPath: string,
+): { readonly record: ArtifactLockRecord | null; readonly identity: ArtifactLockIdentity | null } => {
+    const record = readArtifactLockRecord(lockPath);
+
+    let stats: fs.Stats;
+    try {
+        stats = fs.lstatSync(lockPath);
+    } catch {
+        // Gone, or unreadable: either way there is no identity to hold a later
+        // decision to.
+        return { record, identity: null };
+    }
+
+    return {
+        record,
+        identity: {
+            device: stats.dev,
+            inode: stats.ino,
+            modifiedAtMs: stats.mtimeMs,
+            size: stats.size,
+            token: record?.token ?? '',
+            pid: record?.pid ?? 0,
+            startedAt: record?.startedAt ?? '',
+        },
+    };
 };
 
 const holderProcessIsAlive = (pid: number): boolean => {
@@ -1195,12 +2473,19 @@ export const acquireArtifactPublicationLock = (directory: string, holder: string
         pid: process.pid,
         startedAt: new Date().toISOString(),
         directory: physicalIdentity,
+        // Minted per claim, so this holder's lock is distinguishable from the
+        // lock the same process claims a moment later (see
+        // `ArtifactLockOwnership`).
+        token: unguessableSuffix(),
     };
     const payload = `${JSON.stringify(record, null, JSON_INDENT)}\n`;
 
     for (let attempt = 1; attempt <= LOCK_ACQUIRE_ATTEMPTS; attempt += 1) {
         if (!claimArtifactLockFile(lockPath, payload)) {
-            const existing = readArtifactLockRecord(lockPath);
+            // The record and the inode identity of the file the verdict below
+            // is about, read as one observation.
+            const observed = observeArtifactLock(lockPath);
+            const existing = observed.record;
             if (!artifactLockIsStale(existing, Date.now(), lockPath)) {
                 throw new ManifestError(
                     'artifact_publication_locked',
@@ -1211,6 +2496,27 @@ export const acquireArtifactPublicationLock = (directory: string, holder: string
                 );
             }
 
+            // The verdict was taken about the file as it was observed above, and
+            // reaching it took a `process.kill` probe and a timestamp parse. A
+            // lock released and freshly claimed in that window is a DIFFERENT
+            // lock, and unlinking it by pathname deleted a live holder's claim
+            // and let two publishers into one directory (CWE-367). Re-read
+            // immediately before the unlink and act only while the two
+            // observations are the same lock.
+            const beforeUnlink = observeArtifactLock(lockPath);
+            if (!sameArtifactLock(observed.identity, beforeUnlink.identity)) {
+                logger.warn('artifact_publication_lock_changed_hands', {
+                    directory: describePath(directory),
+                    previousHolder: existing?.holder ?? 'unparsable lock file',
+                    currentHolder: beforeUnlink.record?.holder ?? 'unparsable or absent lock file',
+                    reason:
+                        'the lock was released and re-claimed between the staleness verdict and the takeover, so ' +
+                        'the new claim was left in place',
+                    outcome: 'this run retries the claim instead of clearing a lock that is no longer stale',
+                });
+                continue;
+            }
+
             logger.warn('artifact_publication_lock_taken_over', {
                 directory: describePath(directory),
                 previousHolder: existing?.holder ?? 'unparsable lock file',
@@ -1218,18 +2524,33 @@ export const acquireArtifactPublicationLock = (directory: string, holder: string
                 previousStartedAt: existing?.startedAt ?? 'unknown',
                 reason: 'the recorded holder is gone or older than the stale bound, so its lock was cleared',
             });
+            // THE RESIDUAL RACE, STATED RATHER THAN IMPLIED. The recheck cannot
+            // be fused with the unlink: Node exposes no unlink-by-handle or
+            // unlink-by-inode primitive, so a lock that changes hands in the
+            // instant between the recheck and this call is still deleted. The
+            // window is now the two statements below rather than a `kill` probe,
+            // a `stat`, a timestamp parse and a log line, and what it costs is
+            // bounded by what the lock protects: a publication whose lock was
+            // broken still writes each artefact atomically and still promotes
+            // through the journal, so the loss is a merged report's block, not a
+            // truncated artefact. Closing it completely needs a lock manager
+            // outside the filesystem, which these operator-run CLI stages do
+            // not have.
             removeIfPresent(lockPath);
             continue;
         }
 
         return {
             lockPath,
+            physicalDirectory: physicalIdentity,
             release: (): void => {
                 // Only OUR record is removed: a lock another publisher took
                 // over after ours went stale belongs to that publisher, and
-                // deleting it would hand the directory to a third writer.
+                // deleting it would hand the directory to a third writer. The
+                // token is what answers "ours" when the same process is the one
+                // that retook it.
                 const current = readArtifactLockRecord(lockPath);
-                if (current !== null && (current.pid !== record.pid || current.startedAt !== record.startedAt)) {
+                if (current !== null && !artifactLockRecordIsOurs(current, record)) {
                     logger.warn('artifact_publication_lock_not_ours', {
                         directory: describePath(directory),
                         holder: current.holder,
@@ -1254,7 +2575,7 @@ export const acquireArtifactPublicationLock = (directory: string, holder: string
 export const withArtifactPublicationLockSync = <T>(directory: string, holder: string, publish: () => T): T => {
     const lock = acquireArtifactPublicationLock(directory, holder);
     try {
-        revertInterruptedPublicationUnderLock(directory, holder);
+        revertInterruptedPublicationUnderLock(directory, lock.physicalDirectory, holder);
         return publish();
     } finally {
         lock.release();
@@ -1269,7 +2590,7 @@ export const withArtifactPublicationLock = async <T>(
 ): Promise<T> => {
     const lock = acquireArtifactPublicationLock(directory, holder);
     try {
-        revertInterruptedPublicationUnderLock(directory, holder);
+        revertInterruptedPublicationUnderLock(directory, lock.physicalDirectory, holder);
         return await publish();
     } finally {
         lock.release();
@@ -1285,9 +2606,18 @@ export const withArtifactPublicationLock = async <T>(
  * same reason the marker clearing lives in the merge: a producer that forgets
  * it would silently inherit a half-published set, and there is no signal that
  * would tell it to.
+ *
+ * `physicalDirectory` is passed rather than re-derived: the journal is bound to
+ * the directory's identity, and the authority for that identity is the one the
+ * LOCK keyed on. Resolving it twice would let the two disagree — which is the
+ * whole failure mode of comparing spellings instead of identities.
  */
-const revertInterruptedPublicationUnderLock = (directory: string, holder: string): void => {
-    const reverted = recoverInterruptedPublication(directory);
+const revertInterruptedPublicationUnderLock = (
+    directory: string,
+    physicalDirectory: string,
+    holder: string,
+): void => {
+    const reverted = recoverInterruptedPublication(directory, physicalDirectory);
     if (reverted.length > 0) {
         logger.warn('interrupted_publication_reverted', {
             directory: describePath(directory),
@@ -1560,23 +2890,45 @@ export const assertManifestVersion = (args: {
 // `EvidenceFetchLimits` are transcribed from `evidence-allowlist.v1.json` as it
 // actually stands, not from the intended field list (see the note above each).
 //
-// Four of the five loaders cast rather than validate structurally, so a
-// divergence surfaces in the consuming script — deliberate, because a
-// hand-authored policy file is reviewed input, not untrusted input, and
-// re-validating every field here would duplicate the checks
-// `catalog-validate.ts` already owns.
+// THE TWO CLASSES OF LOADER, and the one question that sorts a document into
+// them: would a field this document is missing fail where it is USED?
 //
-// `evidence-allowlist.v1.json` is the exception, and `loadEvidenceAllowlist`
-// validates it at runtime, because "surfaces in the consuming script" is not
-// true of this one document: it is the SSRF policy. A `fetchLimits` member that
-// is missing rather than wrong does not throw downstream, it removes a limit —
-// an absent `maxBodyBytes` is no size cap at all — and a `specialPurposeRanges`
-// row whose `cidr` is missing silently drops a range from the non-globally-
-// routable table, which turns every address inside it into an address the fetch
-// path accepts. Neither failure is visible in a run's output. So this loader
-// checks the fields the policy is made of and refuses the document otherwise
-// (`invalid_manifest_shape`); it does not re-derive the policy, which belongs
-// to `src/services/evidence.logic.ts`.
+// CAST AND VERSION-CHECKED — `loadSearchBenchmark` and `loadReleaseManifest`.
+// A missing field in either surfaces in the consuming script: the benchmark's
+// queries are iterated and compared, and a release manifest's `files[]` entries
+// are checksummed byte for byte by `catalog-load.ts`. Re-validating them here
+// would duplicate checks `catalog-validate.ts` and `catalog-load.ts` already
+// own, and a hand-authored policy file is reviewed input rather than untrusted
+// input.
+//
+// STRUCTURALLY VERIFIED — `loadEvidenceAllowlist`, `loadUsdaManifest` and
+// `loadCoveragePlan`, each because "surfaces in the consuming script" is not
+// true of the part of its document that is checked:
+//
+//   `evidence-allowlist.v1.json` IS the SSRF policy. A `fetchLimits` member
+//   that is missing rather than wrong does not throw downstream, it removes a
+//   limit — an absent `maxBodyBytes` is no size cap at all — and a
+//   `specialPurposeRanges` row whose `cidr` is missing silently drops a range
+//   from the non-globally-routable table, which turns every address inside it
+//   into an address the fetch path accepts.
+//
+//   `usda-manifest.v1.json` is the import's whole policy. An entry whose
+//   `category` is a typo is filed under a category nothing targets, and a
+//   `reviewedSafety` block missing `allergenStatus` reads as `undefined`, which
+//   is neither `'known'` nor `'unknown'`. The import completes and reports
+//   success against a catalog that is wrong.
+//
+//   `coverage-plan.v1.json`'s MODEL AND PROMPT fields are metadata — copied
+//   into a release manifest, logged, compared — so a wrong type there is
+//   written out and shipped instead of raising anything. Only those fields are
+//   checked; the plan's counts and bounds are consumed as numbers by code that
+//   computes with them, which is where a wrong type fails.
+//
+// None of those failures is visible in a run's output, so each of the three
+// loaders checks the fields its document is made of and refuses it otherwise
+// (`invalid_manifest_shape`). None of them re-derives the policy it validates:
+// the evidence policy's meaning belongs to `src/services/evidence.logic.ts`,
+// and each consuming `*.logic.ts` parser validates the slice it acts on.
 //
 // `src/services/evidence.logic.ts` and `evidence.service.ts` load
 // `evidence-allowlist.v1.json` through their own types instead of importing
@@ -1634,9 +2986,9 @@ export type UsdaDataType = 'Foundation' | 'SR Legacy' | 'Survey (FNDDS)' | 'Bran
 // Declared here rather than imported from `src/services/catalog.logic.ts`,
 // whose `CATALOG_FOOD_STATES` covers the same ground: `scripts/` may read
 // `src/`, but this module is the one every script loads its inputs through and
-// it deliberately imports two Node built-ins and its sibling logger and nothing
-// else (see the scope note at the top). The compile-time exhaustiveness above
-// is what makes the restatement safe.
+// it deliberately imports only Node built-ins and its sibling logger (see the
+// scope note at the top). The compile-time exhaustiveness above is what makes
+// the restatement safe.
 // ---------------------------------------------------------------------------
 
 const COVERAGE_CATEGORY_MEMBERS: Readonly<Record<CoverageCategory, true>> = {
@@ -2550,13 +3902,15 @@ export const assertEvidenceAllowlistShape = (value: unknown, relativePath: strin
 
     // Every member the declared type promises has now been checked against the
     // document itself, which is what makes this a verified narrowing rather than
-    // the declarative cast the remaining three loaders make.
+    // the declarative cast the two version-only loaders make (see the two
+    // classes of loader above the shapes).
     return value as EvidenceAllowlist;
 };
 
 // ---------------------------------------------------------------------------
-// `usda-manifest.v1.json`'s structural check — the second verified narrowing in
-// this module, and for the same reason as the first.
+// `usda-manifest.v1.json`'s structural check — one of the three verified
+// narrowings in this module, and for the same reason as the other two: a field
+// this document is missing does not fail where it is used.
 //
 // This document is the import's whole policy: which vendor records are fetched,
 // which category and food state each one is filed under, which allergen and
@@ -3436,8 +4790,11 @@ const readVersionField = (value: unknown, field: string): unknown =>
  * `v2` document is refused for its version, not for failing a `v1` shape — and
  * before the result is cached, so a refused document is never memoised.
  *
- * `loadEvidenceAllowlist` and `loadUsdaManifest` pass one; the reason those two
- * documents are the exceptions is written out above each check.
+ * Three of the five loaders pass one — `loadEvidenceAllowlist`,
+ * `loadUsdaManifest` and `loadCoveragePlan` — and the reason each of those
+ * documents is verified rather than cast is written out above its check.
+ * `loadSearchBenchmark` and `loadReleaseManifest` pass none, because a field
+ * missing from either fails where it is used.
  */
 type ManifestShapeCheck<T> = (value: unknown, relativePath: string) => T;
 
@@ -3496,11 +4853,11 @@ export const loadUsdaManifest = (): UsdaManifest =>
     loadVersionedManifest<UsdaManifest>(
         dataPath(USDA_MANIFEST_FILE),
         [{ field: USDA_MANIFEST_VERSION_FIELD, expected: EXPECTED_USDA_MANIFEST_VERSION }],
-        // The second loader that verifies its document rather than declaring
-        // it: this file is the import's whole policy, and a field missing from
-        // it — a category, a food state, an allergen determination — does not
-        // fail the run. It completes against a catalog that is wrong in a way no
-        // counter shows. See the note above the check.
+        // Structurally verified rather than declared: this file is the
+        // import's whole policy, and a field missing from it — a category, a
+        // food state, an allergen determination — does not fail the run. It
+        // completes against a catalog that is wrong in a way no counter shows.
+        // See the note above the check.
         assertUsdaManifestShape,
     );
 
@@ -3513,9 +4870,9 @@ export const loadEvidenceAllowlist = (): EvidenceAllowlist =>
     loadVersionedManifest<EvidenceAllowlist>(
         dataPath(EVIDENCE_ALLOWLIST_FILE),
         [{ field: EVIDENCE_ALLOWLIST_VERSION_FIELD, expected: EXPECTED_EVIDENCE_ALLOWLIST_VERSION }],
-        // The one loader that verifies its document rather than declaring it:
-        // this file is the SSRF policy, and a field missing from it removes a
-        // limit instead of raising one.
+        // Structurally verified rather than declared: this file is the SSRF
+        // policy, and a field missing from it removes a limit instead of
+        // raising one.
         assertEvidenceAllowlistShape,
     );
 

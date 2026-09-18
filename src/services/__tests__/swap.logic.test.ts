@@ -18,7 +18,10 @@
 //    elsewhere makes it inadmissible again — so the removal subtracts exactly
 //    one. The day-before and day-after cases are asserted separately, because
 //    passing only one neighbour is the plausible mistake (the generator has
-//    one).
+//    one). The rule applied is §0.7.3's TWO clauses and nothing more, so a
+//    recipe another slot of the same day holds is OFFERED — the generator
+//    permits two uses on one day, and a swap-only narrowing would make the
+//    sheet refuse a dish generation would have planted in that very slot.
 //  - DETERMINISM WITHOUT A PRNG. The same candidates in a shuffled input order
 //    yield an identical list, equal-proximity candidates order by slug then
 //    version, and `Math.random` is asserted never to be consulted. The ranking
@@ -137,7 +140,7 @@ const BREAKFAST_MEAL_ID = 'meal-breakfast';
 const LUNCH_MEAL_ID = 'meal-lunch';
 const DINNER_MEAL_ID = 'meal-dinner';
 
-/** The recipe the day's breakfast holds — reused as the same-day repetition case. */
+/** The recipe the day's breakfast holds — reused as the same-day offer case. */
 const SHARED_RECIPE_ID = 'shared-recipe';
 /** The recipe the lunch being replaced holds, and its planned version. */
 const WRAP_RECIPE_ID = 'wrap-recipe';
@@ -763,8 +766,7 @@ describe('selectSwapCandidates repetition', () => {
     it('keeps a recipe whose only other use in the week is the meal being replaced', () => {
         // `wrap` is planned twice: at this very lunch and on the last day. The
         // meal being replaced does not count against itself, so one use remains
-        // and the republished version is admissible — and because the current
-        // meal also leaves the SAME-DAY set, its own dish does not block it.
+        // and the republished version is admissible.
         const context = makeContext({
             recipes: [WRAP_V2],
             weekMeals: weekMeals([{ id: 'meal-last-day-lunch', date: PLAN_END, recipeId: WRAP_RECIPE_ID }]),
@@ -819,13 +821,44 @@ describe('selectSwapCandidates repetition', () => {
         expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-neighbour']);
     });
 
-    it('excludes a recipe already planned at another meal of the same day', () => {
+    it('offers a recipe already planned at another meal of the same day', () => {
+        // §0.7.3 IS TWO CLAUSES, and "the rest of today" is not one of them: a
+        // recipe may appear twice in the week and the two uses may fall on the
+        // same day in two different slots — which is exactly what the generator
+        // does, so the sheet has to offer what generation would have planted.
+        // The dish here is the day's own breakfast recipe at a DIFFERENT
+        // version, the case that matters most: after a catalog refresh
+        // republishes a dish, this may be the only version still offered for
+        // it, and a swap-only same-day ban would leave the slot short or empty.
         const sameDish = makeRecipe({
             slug: 'alt-same-dish',
             recipeId: SHARED_RECIPE_ID,
             versionId: 'shared-version-2',
         });
         const context = makeContext({ recipes: [sameDish, ALT_ALPHA] });
+
+        // Both land the day exactly on target, so they tie on proximity and the
+        // portable slug key orders them — the same deterministic ranking every
+        // other case in this file asserts.
+        expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-alpha', 'alt-same-dish']);
+    });
+
+    it('still counts the same day toward the weekly cap it belongs to', () => {
+        // The clause the same day DOES participate in: two uses already on this
+        // day (breakfast and dinner, the outgoing lunch aside) are two uses in
+        // the week, so a third is refused wherever it would fall.
+        const twiceToday = makeRecipe({ slug: 'alt-twice-today', recipeId: 'twice-today-recipe' });
+        const context = makeContext({
+            recipes: [twiceToday, ALT_ALPHA],
+            dayMeals: dayMeals().map((meal) =>
+                meal.id === LUNCH_MEAL_ID ? meal : { ...meal, recipeId: 'twice-today-recipe' },
+            ),
+            weekMeals: [
+                { id: BREAKFAST_MEAL_ID, date: SWAP_DATE, recipeId: 'twice-today-recipe' },
+                { id: LUNCH_MEAL_ID, date: SWAP_DATE, recipeId: WRAP_RECIPE_ID },
+                { id: DINNER_MEAL_ID, date: SWAP_DATE, recipeId: 'twice-today-recipe' },
+            ],
+        });
 
         expect(slugsOf(selectSwapCandidates(context))).toEqual(['alt-alpha']);
     });
@@ -1607,8 +1640,10 @@ describe('a logged meal swapped twice', () => {
  *
  * Everything above judges synthetic recipes whose macros sit on the target's
  * own ratio, which is what makes each rule's arithmetic readable. This block
- * judges the COMMITTED rows instead: `data/meal-planning/recipes.fixture.json`
- * is the referentially closed pair (§0.3.3) the recipe, planner, grocery and
+ * judges the COMMITTED rows instead:
+ * `data/meal-planning/fixtures/recipes.fixture.json`, read here through
+ * `RECIPES_FIXTURE_JSON` and the `readRecipeFixture` accessor below, is the
+ * referentially closed pair (§0.3.3) the recipe, planner, grocery and
  * planned-log suites all read, so driving a swap through it proves the two
  * domains accept the same meals over real ingredient snapshots, real allergen
  * metadata and real cooking times — the property §0.7.3 asks for when it says

@@ -195,3 +195,25 @@ export interface CatalogValidationRecordResponse {
     // Append-only prior outcomes for this food; entries are open-ended.
     history: Record<string, unknown>[];
 }
+
+// One raw vendor response, as the `usda_api_cache.payload` `Json` column can
+// hold it.
+//
+// This is a STORED shape rather than a wire DTO, and it is deliberately the
+// whole of JSON rather than a projection of a USDA response: the column exists
+// to replay the vendor's answer byte for byte, and
+// `catalog_validation_records.identity_evidence` quotes the row it produced as
+// retrieval evidence (Agent Action Plan §0.3.2/§0.5.1). Narrowing it to the
+// fields the import happens to read would let a payload be "converted" into
+// something the evidence no longer describes.
+//
+// `null` is a member because `JSON.parse('null')` is a valid document and a
+// vendor can answer one; `usda.service.ts` is where that case is translated
+// into the column's own spelling of JSON null.
+export type UsdaRecordedPayload =
+    | string
+    | number
+    | boolean
+    | null
+    | readonly UsdaRecordedPayload[]
+    | { readonly [key: string]: UsdaRecordedPayload };

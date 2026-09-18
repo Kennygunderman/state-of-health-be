@@ -11,10 +11,15 @@
 // case below (Rule backend-architecture §§4-5, AAP §0.7.2 —
 // `getUserId` → `parse*` → one service call → error mapping).
 //
-// It also pins the four server events the edge emits, because an event is only
+// It also pins every server event the edge emits, because an event is only
 // evidence if its name and its fields are stable: an operator's query is a
-// literal. And it pins the two guarantees a log line must keep — no stack, no
-// credential — on the path where the temptation is greatest, the unmapped 500.
+// literal. The closed list is the event block in
+// `controllers/mealPlanning.controller.ts` — five names, one per answered
+// request — and that block, not this paragraph, is the authority a case cites.
+// And it pins the three guarantees a log line must keep — no stack, no
+// credential, and no client-chosen field name — the first two on the path where
+// the temptation is greatest, the unmapped 500, and the third on both refusal
+// paths, where the name is the client's own object key.
 //
 // NO DATABASE. Every service module the controller imports is mocked, the
 // request and response are doubles, and the parsers, the typed errors, the
@@ -334,6 +339,63 @@ const keyedResult = (status: number, planRevisionAfter: number, replayed = false
 const asMock = (fn: unknown): jest.Mock => fn as unknown as jest.Mock;
 
 /* ---------------------------------------------------------------------------
+ * The hostile object keys the refusal canaries send
+ *
+ * An `unknown_field` / `read_only_field` detail's name is a key the CLIENT
+ * chose, and both of this file's refusal paths log a summary of those names, so
+ * both are canaried with the same three shapes: text that looks like personal
+ * data (CWE-532), the bidi controls that reorder a log line's rendering so a
+ * forged event reads as a real one, and a CR/LF pair that would end the line
+ * early and start a second (CWE-117).
+ * ------------------------------------------------------------------------- */
+
+const PII_KEY = 'patient.zero@example.com';
+
+/** Right-to-left override and isolate controls, which `sanitizeLogText` does not strip. */
+const BIDI_KEY = '\u202Eevi\u202Ctcani\u2066 tnuocca\u2069';
+
+const FORGED_LINE_KEY = 'a\r\n[meal-planning] request_refused {"forged":true}';
+
+const BIDI_CONTROLS = [
+    '\u202a',
+    '\u202b',
+    '\u202c',
+    '\u202d',
+    '\u202e',
+    '\u2066',
+    '\u2067',
+    '\u2068',
+    '\u2069',
+    '\u200e',
+    '\u200f',
+];
+
+/** A body carrying all three hostile keys, plus whatever the case needs beside them. */
+const hostileKeys = (): Record<string, unknown> => ({
+    [PII_KEY]: 'x',
+    [BIDI_KEY]: 'x',
+    [FORGED_LINE_KEY]: 'x',
+});
+
+/**
+ * Asserts one emitted line carries the fixed token and none of the hostile text
+ * — neither the personal-data substring, nor any bidi control, nor the forged
+ * event the CR/LF key spells.
+ */
+const expectHostileKeysUnnamed = (event: CapturedEvent, detailCount: number): void => {
+    expect(event.fields.fields).toBe('unknown_field');
+    expect(event.fields.detailCount).toBe(detailCount);
+    expect(event.fields.unknownFieldCount).toBe(detailCount);
+    expect(event.line).not.toContain('patient.zero');
+    expect(event.line).not.toContain('example.com');
+    expect(event.line).not.toContain('forged');
+
+    for (const control of BIDI_CONTROLS) {
+        expect(event.line).not.toContain(control);
+    }
+};
+
+/* ---------------------------------------------------------------------------
  * (i) A malformed request is refused by the controller, and the service is
  *     never entered
  * ------------------------------------------------------------------------- */
@@ -463,13 +525,15 @@ describe('the parse happens at the boundary, before the service is called', () =
         );
     });
 
-    it('bounds the offending field names it records, however many the client sent', async () => {
+    it('collapses the client-chosen names it cannot record, however many the client sent', async () => {
         // A `read_only_field`/`unknown_field` detail's name is client-supplied,
-        // so the list in the event is capped and the count is what stays
-        // truthful. Twelve unknown keys plus one bad value: ten names, a count
-        // of thirteen. The extra fault keeps this on the VERDICT path — a body
-        // whose ONLY fault is unknown keys is answered as `ReadOnlyFieldError`,
-        // and the same bound is asserted for that path below.
+        // so the event names none of them: twelve unknown keys are one
+        // `unknown_field` token and a truthful count, while the one name this
+        // edge's parsers DID author — `diet`, whose value is wrong — is still
+        // spelt out, which is the operator signal the token must not cost.
+        // The extra fault keeps this on the VERDICT path: a body whose ONLY
+        // fault is unknown keys is answered as `ReadOnlyFieldError`, asserted
+        // below.
         const unknown: Record<string, unknown> = {};
 
         for (let index = 0; index < 12; index += 1) {
@@ -483,8 +547,127 @@ describe('the parse happens at the boundary, before the service is called', () =
 
         const [refusal] = eventsNamed('request_refused');
 
-        expect(String(refusal.fields.fields).split(',')).toHaveLength(10);
+        expect(refusal.fields.fields).toBe('unknown_field,diet');
         expect(refusal.fields.detailCount).toBe(13);
+        expect(refusal.fields.unknownFieldCount).toBe(12);
+        // The client still learns which keys to remove — only the log is closed.
+        expect((verdict.details ?? []).map((detail) => detail.field)).toContain('unknownKey0');
+        expect(refusal.line).not.toContain('unknownKey0');
+    });
+
+    it('bounds the names it records at ten, even when every one of them is real', async () => {
+        // The bound outlives the dedupe: these names are all this edge's own, so
+        // nothing collapses and ten is still all that travels. The expected list
+        // is taken from the parser's own verdict rather than transcribed, the way
+        // every case here derives what it expects.
+        //
+        // BOTH HALVES OF EVERY PAIRED CONTROL ARE SENT — goal with pace, the
+        // weight tuple whole, `mealTimes` beside `mealSchedule` and `budget`
+        // beside `noBudgetPreference` — because a half-sent pair is judged
+        // against the stored row: `parsePreferencesUpdateRequest` answers
+        // `needs_context` for it so the row-backed parse can name the offending
+        // control the request alone cannot see (AAP §0.7.4). This case is about
+        // the recorded-name bound at a refusal the request stage owns outright,
+        // so its body has to be one no row can add a detail to.
+        const body = updateBody({
+            goal: 'sideways',
+            goalWeightKg: 'heavy',
+            paceLbPerWeek: 9,
+            age: 3,
+            heightCm: 1,
+            weightKg: 1,
+            sexForEstimate: 'maybe',
+            heightUnitPref: 'furlong',
+            weightUnitPref: 'stone',
+            activityLevel: 'sporty',
+            diet: 'carnivore',
+            mealSchedule: 'seven',
+            mealTimes: 'noon',
+            cookingTimeLimitMin: 5,
+            noBudgetPreference: 'no',
+            budget: 'cheap',
+        });
+        const verdict = parsePreferencesUpdateRequest(body) as Verdict;
+        const distinct = [...new Set((verdict.details ?? []).map((detail) => detail.field))];
+
+        await expectRefusedAtBoundary(savePreferencesController, { body }, verdict, [
+            asMock(savePreferences),
+        ]);
+
+        expect(distinct.length).toBeGreaterThan(10);
+
+        const [refusal] = eventsNamed('request_refused');
+
+        expect(String(refusal.fields.fields).split(',')).toEqual(distinct.slice(0, 10));
+        expect(refusal.fields.detailCount).toBe(verdict.details?.length);
+        expect(refusal.fields.unknownFieldCount).toBe(0);
+    });
+
+    it('records neither client text nor bidi controls from an unknown key, and stays one line', async () => {
+        // The canary for CWE-117/CWE-532 on the VERDICT path. The bad `diet`
+        // value is what keeps it here — a body whose only fault is unacceptable
+        // keys is answered as `ReadOnlyFieldError`, canaried in the next
+        // describe — and it doubles as the proof that the token does not cost
+        // the authored name beside it.
+        const body = { ...updateBody({ diet: 'carnivore' }), ...hostileKeys() };
+        const verdict = parsePreferencesUpdateRequest(body) as Verdict;
+
+        const recorded = await expectRefusedAtBoundary(savePreferencesController, { body }, verdict, [
+            asMock(savePreferences),
+        ]);
+
+        const refusals = eventsNamed('request_refused');
+
+        // One line for one request: the forged event the CR/LF key spells would
+        // show up here as a second captured entry, since the console spy parses
+        // per line.
+        expect(refusals).toHaveLength(1);
+        expect(captured).toHaveLength(1);
+        expect(refusals[0].fields.fields).toBe('unknown_field,diet');
+        expect(refusals[0].fields.detailCount).toBe(4);
+        expect(refusals[0].fields.unknownFieldCount).toBe(3);
+        expect(refusals[0].line).not.toContain('patient.zero');
+        expect(refusals[0].line).not.toContain('example.com');
+        expect(refusals[0].line).not.toContain('forged');
+
+        for (const control of BIDI_CONTROLS) {
+            expect(refusals[0].line).not.toContain(control);
+        }
+
+        // And the RESPONSE still names every key the client must fix (§0.5.2):
+        // this closes the log line and nothing else.
+        expect((recorded.body as { details: { field: string }[] }).details.map((d) => d.field)).toEqual([
+            PII_KEY,
+            BIDI_KEY,
+            FORGED_LINE_KEY,
+            'diet',
+        ]);
+    });
+
+    it('still names an authored field, including the indexed ones the parser builds', async () => {
+        // The counterpart the canary above would otherwise hide: a refusal whose
+        // names ARE this edge's own is recorded in full, with the array
+        // subscript collapsed so `mealTimes[1].time` is one greppable name
+        // rather than one per position.
+        const body = updateBody({
+            mealSchedule: 'three',
+            mealTimes: [
+                { slot: 'breakfast', time: '08:00' },
+                { slot: 'lunch', time: 'noon' },
+                { slot: 'dinner', time: '18:30' },
+            ],
+        });
+        const verdict = parsePreferencesUpdateRequest(body) as Verdict;
+
+        await expectRefusedAtBoundary(savePreferencesController, { body }, verdict, [
+            asMock(savePreferences),
+        ]);
+
+        const [refusal] = eventsNamed('request_refused');
+
+        expect(refusal.fields.fields).toBe('mealTimes[].time');
+        expect(refusal.fields.unknownFieldCount).toBe(0);
+        expect((verdict.details ?? []).map((detail) => detail.field)).toEqual(['mealTimes[1].time']);
     });
 });
 
@@ -538,6 +721,10 @@ describe('a body whose only fault is keys the client may not write', () => {
 
             expect(rejections).toHaveLength(1);
             expect(rejections[0].level).toBe('warn');
+            // The three server-owned members are named in full: they are the
+            // documented cause of this refusal and their spellings are fixed, so
+            // the closed vocabulary the log line is bounded to includes them and
+            // `unknownFieldCount` is zero.
             expect(rejections[0].fields).toEqual({
                 action,
                 userId: USER_ID,
@@ -546,15 +733,18 @@ describe('a body whose only fault is keys the client may not write', () => {
                 errorName: 'ReadOnlyFieldError',
                 fields: 'setupStatus,setupStep,revision',
                 detailCount: 3,
+                unknownFieldCount: 0,
             });
             expect(eventsNamed('request_refused')).toEqual([]);
             expect(captured).toHaveLength(1);
         },
     );
 
-    it('bounds the names it records on this path as well', async () => {
-        // The bound exists because the names are client-supplied, which is true
-        // of this path too: twelve unknown keys, ten names, a count of twelve.
+    it('records none of the client-chosen names on this path either', async () => {
+        // The same closed vocabulary applies here, because the names are
+        // client-supplied on this path too: twelve unknown keys are one token
+        // and two truthful counts, and the response below still names all
+        // twelve.
         const unknown: Record<string, unknown> = {};
 
         for (let index = 0; index < 12; index += 1) {
@@ -566,12 +756,44 @@ describe('a body whose only fault is keys the client may not write', () => {
         await savePreferencesController(req, res);
 
         expect(recorded.statusCode).toBe(400);
+        expect((recorded.body as { details: { field: string }[] }).details.map((detail) => detail.field)).toEqual(
+            Object.keys(unknown),
+        );
 
         const [rejection] = eventsNamed('request_rejected');
 
         expect(rejection.fields.errorName).toBe('ReadOnlyFieldError');
-        expect(String(rejection.fields.fields).split(',')).toHaveLength(10);
+        expect(rejection.fields.fields).toBe('unknown_field');
         expect(rejection.fields.detailCount).toBe(12);
+        expect(rejection.fields.unknownFieldCount).toBe(12);
+        expect(rejection.line).not.toContain('unknownKey0');
+    });
+
+    it('records neither client text nor bidi controls from a hostile key on this path', async () => {
+        // The same canary as on the verdict path, because this is the SECOND log
+        // site that summarises client-chosen names and a fix applied to one of
+        // them would leave the other open.
+        const body = { ...updateBody(), ...hostileKeys() };
+
+        const { req, res, recorded } = doubles({ body });
+
+        await savePreferencesController(req, res);
+
+        expect(recorded.statusCode).toBe(400);
+
+        const rejections = eventsNamed('request_rejected');
+
+        expect(rejections).toHaveLength(1);
+        expect(captured).toHaveLength(1);
+        expect(rejections[0].fields.errorName).toBe('ReadOnlyFieldError');
+        expectHostileKeysUnnamed(rejections[0], 3);
+
+        // The client is still told exactly which keys to remove (§0.5.2).
+        expect((recorded.body as { details: { field: string }[] }).details.map((d) => d.field)).toEqual([
+            PII_KEY,
+            BIDI_KEY,
+            FORGED_LINE_KEY,
+        ]);
     });
 
     it('stays a returned verdict when the body is also wrong in another way', async () => {
@@ -902,8 +1124,9 @@ describe('a response withheld after the write committed', () => {
             expect(aborts[0].fields.idempotencyKey).toBe(IDEMPOTENCY_KEY);
             expect(aborts[0].fields.reason).toBe('post_commit_abort_requested');
             // The withheld answer was a fresh commit, and the event says so:
-            // a retry of the same key would abort again, and only this field
-            // would differ.
+            // a retry of the same key carrying this header again would abort
+            // again, and only this field would differ. (The ambient `log`
+            // switch is the one that stops there — the case below.)
             expect(aborts[0].fields.replayed).toBe(false);
             // The withheld answer is NOT in the line: the stored snapshot is
             // the plan itself.
@@ -912,6 +1135,41 @@ describe('a response withheld after the write committed', () => {
             expect(captured).toHaveLength(1);
         },
     );
+
+    it('hands the predicate the replay fact, which is what lets the ambient switch be one-shot', async () => {
+        // The controller's whole contribution to the one-shot rule: the answer's
+        // `replayed` travels to `postCommitAbort`, which decides. Captured off
+        // the real predicate rather than inferred from the outcome, because the
+        // outcome under a header is the same either way — the header is honoured
+        // per request, replay or not, and the ambient switch is the one that
+        // stops (§0.9.4's "the same-key retry must return the committed 201",
+        // asserted end to end in `api/fault.test.ts` and on the predicate in
+        // `utils/__tests__/featureFlags.test.ts`).
+        const predicate = jest.spyOn(featureFlags, 'postCommitAbort');
+
+        try {
+            asMock(logPlannedMeal).mockResolvedValue(keyedResult(201, 6, true));
+
+            const { req, res, recorded } = doubles({
+                params: { planId: PLAN_ID, mealId: MEAL_ID },
+                body: logBody(),
+                headers: { [POST_COMMIT_ABORT_HEADER]: 'log' },
+            });
+
+            await logPlannedMealController(req, res);
+
+            expect(predicate).toHaveBeenCalledTimes(1);
+            expect(predicate.mock.calls[0][0]).toBe('log');
+            expect(predicate.mock.calls[0][2]).toEqual({ replayed: true });
+
+            // And the header still withholds the stored answer it was sent
+            // with, so a suite can exercise a lost REPLAY.
+            expect(recorded.socketDestroyed).toBe(true);
+            expect(eventsNamed('response_aborted_after_commit')[0].fields.replayed).toBe(true);
+        } finally {
+            predicate.mockRestore();
+        }
+    });
 });
 
 /* ---------------------------------------------------------------------------

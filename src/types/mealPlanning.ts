@@ -253,17 +253,27 @@ export interface PreferencesUpdatePayload {
     cookingTimeLimitMin?: CookingTimeLimitMin;
     budget?: BudgetPreference | null;
     noBudgetPreference?: boolean;
-    // REQUIRED, like expectedRevision and unlike every answer above: the two of
-    // them are this endpoint's envelope rather than an edit. The client sends
-    // the device's IANA zone on every step save AND on every full save, and the
-    // server resolves the "today" its plan-ended, start-date-bound and
-    // flag-recomputation rules read from the value THIS request carried — so a
-    // user who has moved sees plan days in the zone of their most recent edit.
-    // Accepting an omission as "keep the stored zone" made that refresh
-    // optional in practice and computed `today` from a zone the user may have
-    // left; an absent or unknown name is now 400 invalid_request with a
-    // timeZone detail. A body carrying only these two keys edits nothing and is
-    // refused with a `body` detail rather than bumping the revision.
+    // REQUIRED on every save, like expectedRevision and unlike every answer
+    // above — but unlike expectedRevision it is also a STORED COLUMN, so it is
+    // an answer this endpoint keeps rather than only an envelope it reads. The
+    // client sends the device's IANA zone on every step save AND on every full
+    // save, and the server resolves the "today" its plan-ended,
+    // start-date-bound and flag-recomputation rules read from the value THIS
+    // request carried — so a user who has moved sees plan days in the zone of
+    // their most recent edit. Accepting an omission as "keep the stored zone"
+    // made that refresh optional in practice and computed `today` from a zone
+    // the user may have left; an absent or unknown name is 400 invalid_request
+    // with a timeZone detail.
+    //
+    // A BODY CARRYING ONLY THESE TWO KEYS IS THE CONTRACT'S ZONE-REFRESH SAVE,
+    // and whether it edits anything is decided by this field: the submitted
+    // name is canonicalised and compared with the stored one, and when they
+    // differ the zone IS the edit — it is written and the revision is bumped,
+    // which is the only channel a settings screen has for reconciling a moved
+    // device without the user editing an answer. Only a canonical zone the row
+    // already holds (or one absent or unknown, whose own timeZone detail
+    // travels with it) edits nothing, and that body alone is refused with a
+    // `body` detail rather than bumping the revision for no change.
     timeZone: string;
     // Required on this endpoint, unlike the per-step saves below: a full save
     // only ever edits an existing row. A mismatch is 409 stale_revision.
@@ -714,23 +724,31 @@ export interface MealPlanResponse {
     // varies the generator's seed so a regeneration differs from the plan it
     // replaces.
     generationAttempt: number;
-    // The idempotency key of the keyed write that published this plan, which is
-    // what lets a client prove a plan it just read is the one its own pending
-    // request produced.
+    // The idempotency key of the keyed write that published this plan.
     //
-    // A client whose generate or regenerate response was lost cannot otherwise
-    // tell: refetching the current plan may return the plan its request
-    // committed, a plan another device made, or the untouched plan it was
-    // replacing, and all three look alike. Matching this against the key the
-    // client still holds is the only exact answer, so an unresolved intent is
-    // retired on a match and kept — with the refetch left display-only — on
-    // anything else (§0.2.5, §0.7.2).
+    // OPTIONAL, BECAUSE IT IS NOT PART OF THE FROZEN READ CONTRACT. §0.5.2
+    // declares this response as `{id, revision, generationAttempt, startDate,
+    // endDate, status, targets, generationTargets, targetsStale,
+    // preferencesRevision, targetsRevision, hasIncompatibilities, summary,
+    // days}` and nothing else. This member is an additive extra: the mapper
+    // populates it for every published plan (`meal_plans.generation_key` is NOT
+    // NULL), and a client must nevertheless treat its absence as ordinary — the
+    // codec on the other side admits a response without it, so a conforming
+    // §0.5.2 payload can never fail to decode over a member the contract does
+    // not require.
+    //
+    // WHAT IT MAY AND MAY NOT BE USED FOR. §0.7.4 lets the screen that OWNS a
+    // pending generation short-circuit its own wait when a refetch already
+    // returns a plan carrying the key it sent. It is never a settlement signal
+    // for an ordinary read: §0.2.5 leaves such a refetch display-only, and only
+    // a server answer to the same key — a stored replay, a fresh commit, or a
+    // confirmed terminal error — may retire a pending intent.
     //
     // Safe to expose: it is a value this user's own client minted and sent, it
     // is unique per user (meal_plans.@@unique([user_id, generation_key])), and
     // it grants nothing — a keyed write is authenticated and owner-scoped
     // regardless of the key it carries.
-    generationKey: string;
+    generationKey?: string;
     startDate: string; // 'YYYY-MM-DD'
     endDate: string; // 'YYYY-MM-DD', six days after startDate
     status: PlanStatus;
@@ -788,19 +806,26 @@ export interface CurrentMealPlanResponse {
 // One day read on its own, for fresh logged state without refetching the week.
 // Readable for a superseded or an ENDED plan too, so history keeps working.
 //
-// WHICH MEMBER ANSWERS "MAY I STILL WRITE TO THIS?" — `isWritable`, and only
-// `isWritable`. `planStatus` is the stored column, and §0.5.1 leaves it
-// `'active'` on a plan whose last date has passed: no job rewrites it, because
-// its rows have to stay readable. A client that gated Swap and Log on
-// `planStatus === 'active'` would therefore offer both on last month's week and
-// be refused `409 plan_not_active {reason: 'ended'}` by every write path. The
-// two effective members below exist so the envelope cannot be read that way.
+// THE CONTRACT IS THE FIRST FOUR MEMBERS. §0.5.2 declares this envelope as
+// exactly `{planId, planRevision, planStatus, day}`, so those four are what a
+// conforming response must carry and what a client may require. The two
+// lifecycle members after them are ADDITIVE EXTRAS: this server populates both
+// on every day read, and a client must still work when they are absent, which
+// is why they are declared optional here rather than as part of the shape.
+//
+// WHAT THE EXTRAS ARE FOR. `planStatus` is the stored column and §0.5.1 leaves
+// it `'active'` on a plan whose last date has passed: no job rewrites it,
+// because its rows have to stay readable. A client gating Swap and Log on
+// `planStatus === 'active'` alone therefore offers both on last month's week
+// and is refused `409 plan_not_active {reason: 'ended'}` by every write path —
+// recoverable (the client refetches and says so) but avoidable, which is what
+// these two save when they are present.
 export interface MealPlanDayEnvelopeResponse {
     planId: string;
     planRevision: number;
     // STORAGE TRUTH, not a capability: `'active'` here includes an ended week.
-    // Reported because §0.5.2 declares it and a client may want to distinguish
-    // a superseded plan from a finished one — never as a writeability gate.
+    // Declared by §0.5.2 and always sent; a client may also want it to
+    // distinguish a superseded plan from a finished one.
     planStatus: PlanStatus;
     // The plan's EFFECTIVE lifecycle, computed in the user's stored IANA zone
     // (the same "today" `GET /plans/current` resolves, never server time): a
@@ -808,15 +833,14 @@ export interface MealPlanDayEnvelopeResponse {
     // `end_date` has passed in that zone is `'ended'`, and only a plan that is
     // both active and unfinished is `'active'`. This is `mealPlan.logic.ts`'s
     // own endedness rule reported, not a second spelling of it.
-    planLifecycle: PlanLifecycle;
+    planLifecycle?: PlanLifecycle;
     // The server's verdict on whether a write against this plan would be
-    // accepted right now — exactly `planLifecycle === 'active'` today, and the
-    // one member clients gate Swap and Log on. `planLifecycle` is the REASON
-    // the verdict is what it is, which is what a client needs to say something
-    // truthful about it ("this week has finished" versus "this plan was
-    // replaced"); a future non-lifecycle reason to refuse writes would move
-    // this boolean without needing a new lifecycle value.
-    isWritable: boolean;
+    // accepted right now — exactly `planLifecycle === 'active'` today.
+    // `planLifecycle` is the REASON the verdict is what it is, which is what a
+    // client needs to say something truthful about it ("this week has finished"
+    // versus "this plan was replaced"); a future non-lifecycle reason to refuse
+    // writes would move this boolean without needing a new lifecycle value.
+    isWritable?: boolean;
     day: MealPlanDayResponse;
 }
 

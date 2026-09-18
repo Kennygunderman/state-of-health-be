@@ -32,10 +32,16 @@
 //
 // THIS STAGE IS READ-ONLY. It is the evidence stage, and evidence that could
 // alter its subject is not evidence. There is no `create`, `update`, `upsert`,
-// `delete`, `createMany`, `updateMany`, `executeRaw` or `$transaction` anywhere
-// in this file, and {@link ReportDb} — the slice of the client this stage may
-// use — declares `findMany` and nothing else, so adding a write is a compile
-// error rather than a review miss.
+// `delete`, `createMany`, `updateMany` or `executeRaw` anywhere in this file,
+// and {@link ReportDb} — the slice of the client this stage may use — declares
+// `findMany` and nothing else, so adding a write is a compile error rather than
+// a review miss. The ONE transaction this file opens is the read-only
+// REPEATABLE READ snapshot both passes read through (see WHY BOTH PASSES RUN IN
+// ONE SNAPSHOT below): because the only statements inside it are those
+// `findMany` reads, it takes no row locks, blocks no writer and changes
+// nothing — it exists to pin the state the two passes are reconciled against.
+// Everything this stage does write goes to the FILESYSTEM: its publication
+// lock, the staged artefacts and the committed pair it promotes them over.
 //
 // WHY IT RECORDS MEASUREMENTS AND NEVER POLICY. Every bound, category target,
 // kcal review range and check name this report mentions is read from
@@ -73,6 +79,45 @@
 // `import-report.json` — cannot write into it between this run's read of that
 // file and its promotion of the merged result.
 //
+// WHY ONE PHYSICAL DIRECTORY IDENTITY RUNS THROUGH ALL OF IT. `--out` is an
+// arbitrary operator path, and a path is not a place: a symlink on it can name
+// one directory when a check runs and another when the rename happens. So the
+// destination is resolved ONCE to its physical identity and that single value
+// is what the scoped-report guard is evaluated against, what the publication
+// lock is taken on, and what both artefact paths are built from — written
+// through, never re-derived from the spelling. Publishing through an identity
+// leaves nothing on the path to retarget; the remaining window, between
+// resolving the destination and publishing into it, is closed by re-deriving
+// the identity under the lock and refusing the run if it moved.
+//
+// AND WHY ONE CHECK UNDER THE LOCK IS NOT THE WHOLE STORY. An identity holds no
+// symlink, but the DIRECTORY it names can still be unlinked and re-created as
+// one, and the catalog measurement between the check and the publication is two
+// awaited scans that take minutes on a full catalog. A principal who can plant
+// a name in that directory's parent could therefore replace it while the scan
+// runs, and every later use of the path — the staging writes, the read-back and
+// the promotion — would follow the replacement while the publication lock was
+// still keyed to the directory that had gone. Two things close that window, and
+// neither is a second identity:
+//
+//   * the destination's parent is held to lib/manifest.ts's
+//     `assertSafeArtifactParent`, so a parent another local principal can plant
+//     a name in is refused before anything is read or published — the same rule
+//     `catalog-release.ts` holds its release parent to;
+//   * the publication directory's `(device, inode)` is captured under the lock
+//     and re-verified immediately before EACH path-based operation that happens
+//     after the awaited measurement. Node offers no descriptor-relative open
+//     (no `openat`, no `mkdirat`, no `renameat`) and no way to hand a directory
+//     handle to `fs.rename` or to a write stream, so this stage cannot hold the
+//     directory as a capability and write through it. Revalidation immediately
+//     before each use is the instrument that remains: it does not remove the
+//     race, it reduces it to the two statements between the `lstat` and the
+//     call it authorises, and it turns a redirected publication into a refusal.
+//
+// Both header reads are no-follow regular-file reads for the same reason: a
+// document this stage reads is a document it makes a decision from, and a
+// symlink planted at an artefact name would otherwise redirect that read.
+//
 // WHY BOTH PASSES RUN IN ONE SNAPSHOT. The aggregate figures come from one
 // scan of `catalog_foods` and the per-item records from a second, and the two
 // numbers they produce are reconciled against each other. Two passes over a
@@ -103,16 +148,18 @@ import { once } from 'events';
 import fs from 'fs';
 import path from 'path';
 
-import { classifyDatabaseOrigin, DatabaseOriginError } from './lib/dbGuard';
-import { createFatalLogger, createLogger, safeError, writeLineSync } from './lib/logger';
-import type { LogFields, LogLevel, ScriptLogger } from './lib/logger';
+import { classifyDatabaseOrigin, DatabaseOriginError, originLogFields } from './lib/dbGuard';
+import { createFatalLogger, createLogger, formatSafeError, isThrownInstanceOf, safeError, writeLineSync } from './lib/logger';
+import type { LogFields, LogLevel, SafeErrorFields, ScriptLogger } from './lib/logger';
 import {
     MERGED_REPORT_COMPOUND_BLOCKS,
     ManifestError,
+    assertSafeArtifactParent,
     discardStagedArtifacts,
     loadCoveragePlan,
     loadEvidenceAllowlist,
     mergeStageReport,
+    physicalPathIdentity,
     promoteStagedArtifacts,
     reportPath,
     stageJsonArtifact,
@@ -121,16 +168,22 @@ import {
 } from './lib/manifest';
 import type { CatalogFoodState, CoveragePlan, StagedArtifact } from './lib/manifest';
 
-// The decode half of the storage rule `catalog-validate` writes under:
-// `nutrition_assumptions` is a JSON-encoded array in a TEXT column. Imported
-// rather than re-implemented, because a second decoder is a second rule that
-// can drift from the encoder while still parsing.
-import { parseStoredAssumptions } from './catalog-validate';
+// The decode half of the storage rule the validation record is written under:
+// `nutrition_assumptions` is a JSON-encoded array in a TEXT column. Taken from
+// the library the catalog stages share rather than re-implemented here, because
+// a second decoder is a second rule that can drift from the encoder while still
+// parsing (see lib/nutritionAssumptions.ts).
+import { parseStoredAssumptions } from './lib/nutritionAssumptions';
 
 // The RULES this report applies, none of them re-derived here: the shortfall
 // arithmetic, the tier every check name carries, and the bound a category and
 // food state resolve to (Rule backend-architecture §1.2 and §7 — pure
 // functions decide, the aggregation loop and the file writing orchestrate).
+// The closed value sets the aggregate counters are keyed by come from the same
+// module for the same reason (see THE CLOSED VALUE SETS THE COUNTERS ARE KEYED
+// BY): it is the one enforcement point for them, and a set restated here would
+// be a second authority that can drift from the one the rows were written
+// under.
 import {
     CATALOG_CHECK_NAMES,
     CATALOG_QUARANTINE_CHECK_NAMES,
@@ -138,9 +191,17 @@ import {
     CATALOG_REVIEW_CHECK_NAMES,
     catalogCheckTier,
     computeCoverageShortfall,
+    isCatalogFoodState,
+    isCatalogIdentitySource,
+    isCatalogIdentityStatus,
+    isCatalogNutritionBasis,
+    isCatalogNutritionProvenance,
+    isCatalogPublicationStatus,
     resolveCategoryBounds,
 } from '../src/services/catalog.logic';
 import type { CatalogCheckName, CatalogCoverageShortfall, CatalogValidationPolicy } from '../src/services/catalog.logic';
+// Type-only, for the one closed set `catalog.logic.ts` exports no guard for.
+import type { CatalogValidationOutcome } from '../src/types/catalog';
 
 const STAGE = 'catalog-report';
 
@@ -255,6 +316,12 @@ export type CatalogReportErrorCode =
     | 'scoped_report_needs_out_dir'
     | 'report_unreadable'
     /**
+     * A row holds a value in a closed-set column that the set does not declare,
+     * so a counter keyed on that column would file it under an unvalidated
+     * string (see {@link assertRecognisedStoredValues}).
+     */
+    | 'unrecognised_stored_value'
+    /**
      * The per-item records emitted do not number what the aggregate pass
      * measured. Under one snapshot the two passes see one catalog, so a
      * disagreement means the report is not describing a single state — and a
@@ -267,7 +334,20 @@ export type CatalogReportErrorCode =
      * held for the whole run (a transaction timeout, a lost connection). The
      * run produces nothing rather than two passes over two different states.
      */
-    | 'report_snapshot_failed';
+    | 'report_snapshot_failed'
+    /**
+     * The output directory this run resolved is no longer the same physical
+     * directory it was when the destination was decided: a symlink on the path
+     * was retargeted, or the directory itself was replaced, between the guard
+     * and the publication.
+     *
+     * Reported rather than followed. The two artefacts are whole-catalog
+     * acceptance evidence, and the one thing a run must never do is write them
+     * somewhere other than the place whose suitability was checked — the
+     * scoped-report guard, the publication lock and both writes are only
+     * meaningful if they are about ONE directory (CWE-59, CWE-367).
+     */
+    | 'output_directory_changed';
 
 export class CatalogReportError extends Error {
     constructor(
@@ -468,7 +548,8 @@ export const resolveOutDir = (out: string | null): string =>
 export const canonicalReportDirectory = (): string => path.dirname(reportPath(VALIDATION_REPORT_FILE));
 
 /**
- * Resolves `absolutePath` through any symlink on it, as far as the path exists.
+ * Resolves `absolutePath` through any symlink on it, as far as the path exists
+ * — the identity every comparison and every write in this stage is about.
  *
  * Needed because the scoped-report guard below compares two directories, and a
  * lexical comparison alone can be walked around: a symlink, a bind mount or a
@@ -476,43 +557,17 @@ export const canonicalReportDirectory = (): string => path.dirname(reportPath(VA
  * spelling it. Resolution stops at the deepest ancestor that exists and the
  * remaining segments are appended lexically, so the guard also works for an
  * `--out` directory the run has not created yet.
+ *
+ * Delegates to manifest.ts's `physicalPathIdentity` rather than resolving here.
+ * The publication lock keys mutual exclusion on THAT function's answer, so a
+ * second resolver in this file — however faithful today — would be a second
+ * authority able to drift from the one the lock uses, which is the precise
+ * shape of the bug this stage now refuses: a directory that was validated
+ * under one identity and written under another. Kept as a named export because
+ * the guard below reads as a comparison of DIRECTORIES, and because
+ * `src/__tests__/scripts/` pins the resolution rule through this name.
  */
-export const canonicalizeDirectoryPath = (absolutePath: string): string => {
-    const resolved = path.resolve(absolutePath);
-    const trailing: string[] = [];
-    let existing = resolved;
-
-    while (!fs.existsSync(existing)) {
-        const parent = path.dirname(existing);
-        if (parent === existing) {
-            // Reached the filesystem root without finding anything that
-            // exists: there is nothing to resolve, so the lexical form is the
-            // best answer available and the guard still compares two absolute
-            // paths.
-            return resolved;
-        }
-        trailing.unshift(path.basename(existing));
-        existing = parent;
-    }
-
-    let realExisting: string;
-    try {
-        realExisting = fs.realpathSync(existing);
-    } catch (error) {
-        // A path that exists but cannot be resolved (a permission boundary on
-        // an ancestor) is reported as its lexical form rather than failing the
-        // run: the guard then compares lexically, which is weaker but never
-        // wrong in the permissive direction for the paths this stage writes.
-        logger.warn('out_dir_realpath_unavailable', {
-            stage: STAGE,
-            path: existing,
-            error: safeError(error),
-        });
-        realExisting = existing;
-    }
-
-    return trailing.length === 0 ? realExisting : path.join(realExisting, ...trailing);
-};
+export const canonicalizeDirectoryPath = (absolutePath: string): string => physicalPathIdentity(absolutePath);
 
 /**
  * Whether `resolvedOutDir` IS the canonical report directory or sits inside it.
@@ -568,6 +623,325 @@ export const scopedReportRefusal = (input: {
 };
 
 // ---------------------------------------------------------------------------
+// ONE OUTPUT DIRECTORY, FROM THE GUARD TO THE RENAME.
+//
+// The destination is decided once, as a PHYSICAL IDENTITY, and that single
+// value is what the scoped-report guard is evaluated against, what the
+// publication lock is taken on, what both artefact paths are built from and
+// what the run logs. The bug this closes had the guard consider the resolved
+// directory while the lock and the writes used the operator's spelling: a
+// symlink on that spelling could be pointed at a harmless directory while the
+// guard ran and retargeted at data/meal-planning/reports/latest before the
+// renames, so a single category's figures replaced whole-catalog acceptance
+// evidence under the same file names, and the lock — keyed on the identity it
+// was handed — serialised a directory nobody was writing to (CWE-59, CWE-367).
+//
+// Writing THROUGH the identity is what makes a later retarget inert: the
+// identity holds no symlink, so there is nothing left on the path to retarget.
+// The checks below cover what remains — the directory itself being replaced,
+// and the window between deciding the destination and publishing into it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The refusal a run earns when the directory it resolved is no longer the same
+ * physical place, or `null` when both later observations still agree with the
+ * identity the destination was decided as.
+ *
+ * TWO observations rather than one, because two different things can change:
+ *
+ *   * `observedFromNamedPath` re-resolves the path as the OPERATOR spelled it.
+ *     It diverges when a symlink on that spelling has been retargeted — the
+ *     original attack. Nothing was redirected (the writes go through
+ *     `expected`), but the operator named a place this run is no longer about,
+ *     and publishing evidence to a directory they did not mean is the mistake.
+ *   * `observedFromIdentity` re-resolves the identity itself. It diverges when
+ *     the resolved directory has been replaced — unlinked and re-created as a
+ *     symlink, say — which WOULD redirect a write that followed it.
+ *
+ * Pure, so both failure modes are pinned by `src/__tests__/scripts/` without a
+ * filesystem: the caller takes the observations and this function decides
+ * (Rule backend-architecture §1.2, §11).
+ */
+export const publicationDirectoryDriftRefusal = (input: {
+    readonly named: string;
+    readonly expected: string;
+    readonly observedFromNamedPath: string;
+    readonly observedFromIdentity: string;
+}): string | null => {
+    const divergence =
+        input.observedFromNamedPath !== input.expected
+            ? { through: `the path this run was given (${input.named})`, observed: input.observedFromNamedPath }
+            : input.observedFromIdentity !== input.expected
+              ? { through: 'the resolved output directory itself', observed: input.observedFromIdentity }
+              : null;
+
+    if (divergence === null) {
+        return null;
+    }
+
+    return (
+        `the output directory changed identity while this run was preparing to publish: ${divergence.through} now ` +
+        `resolves to ${divergence.observed}, and the destination this run checked, locked and built its artefact ` +
+        `paths from is ${input.expected}. Nothing was written, so the previous ${VALIDATION_REPORT_FILE} and ` +
+        `${IMPORT_REPORT_FILE} are intact. A symlink on the output path was retargeted or the directory was ` +
+        'replaced; confirm what the path points at and run the stage again.'
+    );
+};
+
+/**
+ * The publication directory as the KERNEL identifies it, rather than as a path
+ * resolves: the device and inode of the entry AT that name.
+ *
+ * `physicalPathIdentity` answers "which place does this spelling mean", which is
+ * the question the guard, the lock and the artefact paths are built on. This
+ * answers the different question the post-measurement checks need: "is the
+ * directory still the same OBJECT it was", which a re-resolution cannot see —
+ * a directory unlinked and re-created, or replaced by a link that points back
+ * at an equal-looking path, resolves to the same string and is not the same
+ * directory.
+ */
+export interface PublicationDirectoryIdentity {
+    readonly device: number;
+    readonly inode: number;
+}
+
+/**
+ * The identity of the real directory at `directory`, or `null` when that name
+ * does not hold one — a symbolic link (however it resolves), a file, or nothing
+ * at all.
+ *
+ * `lstat` rather than `stat`, because what a caller is deciding about is the
+ * ENTRY at this name: a link that resolves to a perfectly good directory is
+ * still a redirected publication, and `stat` would report the target and agree.
+ *
+ * Every unreadable outcome collapses to `null` and is logged with its errno:
+ * absent, not-a-directory and unreadable are one answer for the caller — "this
+ * is not the directory the run captured" — and the refusal that follows names
+ * the path, so the log line is where an unexpected errno stays visible.
+ */
+const observePublicationDirectory = (
+    directory: string,
+    logger: ScriptLogger,
+): PublicationDirectoryIdentity | null => {
+    let stats: fs.Stats;
+    try {
+        stats = fs.lstatSync(directory);
+    } catch (error) {
+        logger.warn('publication_directory_unidentified', {
+            stage: STAGE,
+            outDir: directory,
+            error: safeError(error),
+            consequence:
+                'The output directory could not be identified, so this run cannot establish that it is still ' +
+                'publishing into the directory it locked and refuses instead.',
+        });
+        return null;
+    }
+
+    if (!stats.isDirectory()) {
+        logger.warn('publication_directory_replaced', {
+            stage: STAGE,
+            outDir: directory,
+            entryIsSymbolicLink: stats.isSymbolicLink(),
+            consequence:
+                'The output directory name no longer holds a directory, so a write through it would land somewhere ' +
+                'this run never checked.',
+        });
+        return null;
+    }
+
+    return { device: stats.dev, inode: stats.ino };
+};
+
+/**
+ * The refusal a run earns when the publication directory is no longer the
+ * directory whose identity it captured, or `null` when it still is.
+ *
+ * The sibling of {@link publicationDirectoryDriftRefusal}, and the reason there
+ * are two: that one compares RESOLUTIONS, which catches a retargeted symlink on
+ * the output path, and this one compares the `(device, inode)` of the directory
+ * OBJECT, which is the only thing that catches the directory itself being
+ * swapped for another one — including a swap for a directory whose path
+ * resolves to the same spelling. It is called immediately before each
+ * path-based operation that follows the awaited catalog measurement, so
+ * `operation` names the act the verdict authorises and the refusal can say what
+ * did not happen.
+ *
+ * Pure: the caller takes the observation and this function decides, so both
+ * verdicts are pinned by `src/__tests__/scripts/` without a filesystem (Rule
+ * backend-architecture §1.2, §11).
+ */
+export const publicationDirectoryReplacedRefusal = (input: {
+    readonly directory: string;
+    readonly operation: string;
+    readonly expected: PublicationDirectoryIdentity;
+    readonly observed: PublicationDirectoryIdentity | null;
+}): string | null => {
+    if (
+        input.observed !== null &&
+        input.observed.device === input.expected.device &&
+        input.observed.inode === input.expected.inode
+    ) {
+        return null;
+    }
+
+    const holdsNow =
+        input.observed === null
+            ? 'no directory at all'
+            : `a different directory (device ${input.observed.device}, inode ${input.observed.inode} rather than ` +
+              `device ${input.expected.device}, inode ${input.expected.inode})`;
+
+    return (
+        `${input.directory} is no longer the directory this run locked and measured the catalog for, so ` +
+        `${input.operation} did not happen and the previous ${VALIDATION_REPORT_FILE} and ${IMPORT_REPORT_FILE} are ` +
+        `intact. The name now holds ${holdsNow}. Something replaced the output directory while the report was being ` +
+        `produced: check who can write to ${path.dirname(input.directory)}, then run the stage again.`
+    );
+};
+
+/** The one directory a run publishes into, and what was decided about it. */
+export interface ReportOutputDirectory {
+    /** The operator's own spelling, resolved to an absolute path. Named in
+     * messages and logs, never written through. */
+    readonly named: string;
+    /** The physical identity the guard, the lock and both writes all use. */
+    readonly directory: string;
+    /** The identity of the committed whole-catalog report directory. */
+    readonly canonicalReportDir: string;
+    /** Whether this run publishes the committed artefacts (or something inside
+     * that directory) — stated in the invocation log so the operator can see
+     * which artefacts a run is about to replace. */
+    readonly writesCommittedArtefacts: boolean;
+}
+
+/**
+ * Decides the destination, once, and returns the identity everything
+ * downstream uses.
+ *
+ * The ORDER of the four steps is the contract:
+ *
+ *  1. Resolve the identity WITHOUT creating anything, and evaluate the
+ *     scoped-report guard on it. A refused run must not leave a directory
+ *     behind at a path it just refused to publish into.
+ *  2. Create the destination's PARENT, and refuse a parent another local
+ *     principal can plant a name in. That right is what a later replacement of
+ *     the output directory needs, and it is the one thing no check downstream
+ *     of here can take away — so it is refused before the destination exists,
+ *     which also keeps step 1's promise for this refusal too.
+ *  3. Create the directory. `physicalPathIdentity` appends a not-yet-existing
+ *     tail lexically, and this stage creates the directory anyway (the sink and
+ *     the lock both `mkdir` it); creating it here is what makes the identity
+ *     EXACT for the guard, the lock and the paths rather than part-lexical.
+ *  4. Re-resolve and refuse on drift. Steps 1 and 3 are two moments, and a
+ *     symlink planted at the output name in between would make the directory
+ *     that now exists a different place from the one the guard passed. Refusing
+ *     is the only answer that keeps the guarantee this function exists for.
+ *
+ * Throws `CatalogReportError` and never a bare string, so `main()`'s single
+ * error mapping reports it with a code an operator can act on (Rule
+ * backend-architecture §8) — except the parent refusal, which is
+ * lib/manifest.ts's `ManifestError` and is reported by `main()` through the
+ * same single mapping (`describeFailure`) under its own
+ * `unsafe_artifact_directory` code.
+ */
+export const resolveReportOutputDirectory = (input: {
+    readonly options: ReportOptions;
+    readonly logger: ScriptLogger;
+}): ReportOutputDirectory => {
+    const named = resolveOutDir(input.options.out);
+    const directory = physicalPathIdentity(named);
+    const canonicalReportDir = physicalPathIdentity(canonicalReportDirectory());
+
+    if (input.options.category !== null) {
+        // Omitting `--out` and passing the committed directory as `--out`
+        // produce the same partial artefacts in the same place, so both are
+        // refused: a guard that only asked whether the flag was given would
+        // wave the explicit form through.
+        const refusal = scopedReportRefusal({
+            category: input.options.category,
+            out: input.options.out,
+            resolvedOutDir: directory,
+            canonicalReportDir,
+        });
+        if (refusal !== null) {
+            throw new CatalogReportError(refusal, 'scoped_report_needs_out_dir');
+        }
+    }
+
+    try {
+        // The PARENT first, and the destination after the refusal below, both
+        // at the IDENTITY rather than at the spelling: every component of the
+        // identity that existed at resolution is a real directory, so neither
+        // create can be diverted by a symlink on an ancestor of the operator's
+        // path. `--out` legitimately names a directory whose parent this run is
+        // the first to make, which is why the parent is created rather than
+        // required.
+        fs.mkdirSync(path.dirname(directory), { recursive: true });
+    } catch (error) {
+        // Logged rather than thrown: the refusal below reports a parent that is
+        // not there, and it names both the parent and the destination, which is
+        // the more useful message.
+        input.logger.warn('out_dir_parent_not_created', {
+            stage: STAGE,
+            outDir: directory,
+            parent: path.dirname(directory),
+            error: safeError(error),
+            consequence:
+                'The parent of the output directory could not be created, so the destination cannot be established ' +
+                'as one no other local principal can plant a name in.',
+        });
+    }
+
+    // THE CAPABILITY THE LATER RACE NEEDS, REFUSED HERE. Everything downstream
+    // protects the identity of this directory; nothing downstream can stop
+    // another local principal from REPLACING it, because replacing a name is a
+    // right the name's parent grants. So the parent is held to the pipeline's
+    // one definition of a publishable parent — a real directory, not a link,
+    // that no other principal may plant a name in — which is the same rule
+    // `catalog-release.ts` holds its release parent to, through the same
+    // helper.
+    //
+    // Before the destination is created, so a run refused by this rule leaves
+    // nothing behind at the name it refused to publish into.
+    assertSafeArtifactParent(directory);
+
+    try {
+        fs.mkdirSync(directory, { recursive: true });
+    } catch (error) {
+        // Logged rather than thrown: the write that needs this directory is
+        // about to attempt it too, and its failure names the artefact as well
+        // as the directory, which is the more useful message. The identity
+        // stays part-lexical here, and the drift check below still compares
+        // like for like.
+        input.logger.warn('out_dir_not_created', {
+            stage: STAGE,
+            outDir: directory,
+            error: safeError(error),
+            consequence:
+                'The output directory could not be created here, so the publication attempt will report the ' +
+                'failure against the artefact it could not write.',
+        });
+    }
+
+    const drift = publicationDirectoryDriftRefusal({
+        named,
+        expected: directory,
+        observedFromNamedPath: physicalPathIdentity(named),
+        observedFromIdentity: physicalPathIdentity(directory),
+    });
+    if (drift !== null) {
+        throw new CatalogReportError(drift, 'output_directory_changed');
+    }
+
+    return {
+        named,
+        directory,
+        canonicalReportDir,
+        writesCommittedArtefacts: writesIntoCanonicalReportDirectory(directory, canonicalReportDir),
+    };
+};
+
+// ---------------------------------------------------------------------------
 // Determinism helpers.
 //
 // A rerun against unchanged data must produce byte-identical artefacts, so a
@@ -580,16 +954,106 @@ export const scopedReportRefusal = (input: {
 
 export const compareStrings = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
 
+// ---------------------------------------------------------------------------
+// Key safety — every map in this file is keyed by DATA.
+//
+// THE DEFECT THIS CLOSES (CWE-1321). Almost every figure in the two artefacts
+// is a counter keyed by a string read out of `catalog_foods` or
+// `catalog_validation_records`: a check name, a category, a publication status,
+// an identity source. Accumulated into a plain `{}`, those keys reach
+// `Object.prototype` by two routes, and both of them were live here:
+//
+//   * THROUGH THE READ. `publishedChecks[check.name] ?? { evaluated: 0, … }`
+//     answers `Object.prototype` for a row whose check is named `__proto__`,
+//     and the `Object` function itself for one named `constructor`, because the
+//     lookup walks the prototype chain. The `??` therefore never fires, and the
+//     `tally.evaluated += 1` that follows writes the counter ONTO
+//     `Object.prototype`, where every object in the process inherits it —
+//     including the objects this run is serialising as evidence.
+//   * THROUGH THE WRITE. `counts['__proto__'] = n` on a plain object invokes
+//     the inherited `__proto__` setter instead of creating a property, so the
+//     count silently vanishes: a report that omits rows it scanned while
+//     reading as a complete measurement.
+//
+// So no map in this file whose keys are data is a plain `{}`. Each is created
+// by {@link emptyCounts} or {@link emptyIndex} with NO prototype at all, which
+// removes both routes at once: there is no inherited `__proto__` accessor to
+// invoke and nothing to inherit a value from, so every key — the three
+// reserved names included — behaves as the ordinary own data property the
+// measurement means it to be.
+//
+// WHY NOT A `Map`. These maps ARE the artefacts: they are handed to
+// `JSON.stringify`, and a `Map` serialises to `{}` — an evidence file whose
+// every counter block is empty. A prototype-free object serialises exactly as a
+// plain one does, so the published documents are byte-identical to what this
+// stage wrote before. A `Map` is used only where the accumulator never leaves
+// the function that builds it (`withheldCollected`, `publishedIdentities`).
+//
+// WHY THE READS GO THROUGH `ownValue`/`ownCount` AS WELL. The prototype-free
+// maps above are the ones this file builds; the exported pure functions are
+// also handed records built elsewhere — by a sibling stage, by the JSON already
+// on disk, by a test — and a plain `{}` from one of those callers answers
+// `constructor` with the `Object` function and would turn it into a count. An
+// own-property read is the only lookup that states what a record itself says.
+// ---------------------------------------------------------------------------
+
+/** A map with no prototype, for keys that come from the data. */
+const emptyIndex = <T>(): Record<string, T> => Object.create(null) as Record<string, T>;
+
+/** {@link emptyIndex} for the counters, which is most of them. */
+const emptyCounts = (): Record<string, number> => emptyIndex<number>();
+
+/**
+ * The value a record states AT `key` itself, never one it inherits.
+ *
+ * `Object.prototype.hasOwnProperty.call` rather than `record.hasOwnProperty`:
+ * the record may itself be prototype-free, in which case it has no
+ * `hasOwnProperty` method to call.
+ */
+const ownValue = <T>(record: Readonly<Record<string, T>>, key: string): T | undefined =>
+    Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+
+/** {@link ownValue} for a counter: a key the record does not state is a zero. */
+const ownCount = (record: Readonly<Record<string, number>>, key: string): number => ownValue(record, key) ?? 0;
+
+/**
+ * A prototype-free copy of a record this stage did not build — the artefact
+ * already on disk, a JSONB column.
+ *
+ * `JSON.parse` produces `__proto__` as an ORDINARY own property, so a document
+ * carrying one survives the parse intact and then re-enters the prototype
+ * chain the moment its keys are copied into a plain object with `[]=`, where
+ * the key is dropped instead of preserved. Copying into a prototype-free
+ * target keeps every key an own property, which is exactly what the merges
+ * below promise: the keys this stage does not own survive as found.
+ */
+const copyOwnEntries = <T>(source: Readonly<Record<string, T>>): Record<string, T> => {
+    const copy = emptyIndex<T>();
+    for (const key of Object.keys(source)) {
+        copy[key] = source[key];
+    }
+    return copy;
+};
+
 const sortedRecord = <T>(record: Readonly<Record<string, T>>): Record<string, T> => {
-    const sorted: Record<string, T> = {};
+    const sorted = emptyIndex<T>();
     for (const key of Object.keys(record).sort(compareStrings)) {
         sorted[key] = record[key];
     }
     return sorted;
 };
 
+/**
+ * Adds to the counter at `key`.
+ *
+ * Every counter this is called on comes from {@link emptyCounts}, and it has to:
+ * the own-property read below makes the LOOKUP state only what the record
+ * itself says, but the assignment that follows is what needs the prototype-free
+ * target — `record['__proto__'] = n` on a plain object would invoke the
+ * inherited setter and drop the count rather than record it.
+ */
 const increment = (record: Record<string, number>, key: string, by = 1): void => {
-    record[key] = (record[key] ?? 0) + by;
+    record[key] = ownCount(record, key) + by;
 };
 
 /** Thousands separators without `toLocaleString`, whose output is locale-dependent. */
@@ -620,7 +1084,11 @@ export const camelizeKeys = (value: unknown): unknown => {
     if (record === null) {
         return value;
     }
-    const camelized: Record<string, unknown> = {};
+    // Prototype-free: the keys are whatever the JSONB column holds, and a
+    // stored `__proto__` key written into a plain object would set that
+    // object's prototype instead of appearing on the item record — dropping a
+    // field from the per-item evidence rather than carrying it.
+    const camelized = emptyIndex<unknown>();
     for (const key of Object.keys(record)) {
         camelized[snakeToCamel(key)] = camelizeKeys(record[key]);
     }
@@ -891,9 +1359,11 @@ export const generatedContentPresence = (
     publishedByIdentitySource: Readonly<Record<string, number>>,
     withheldByIdentitySourceAndStatus: Readonly<Record<string, Readonly<Record<string, number>>>>,
 ): GeneratedContentPresence => {
-    const published = publishedByIdentitySource[AI_GENERATED_IDENTITY_SOURCE] ?? 0;
-    const withheldByStatus: Record<string, number> = {};
-    for (const [status, count] of Object.entries(withheldByIdentitySourceAndStatus[AI_GENERATED_IDENTITY_SOURCE] ?? {})) {
+    const published = ownCount(publishedByIdentitySource, AI_GENERATED_IDENTITY_SOURCE);
+    const withheldByStatus = emptyCounts();
+    for (const [status, count] of Object.entries(
+        ownValue(withheldByIdentitySourceAndStatus, AI_GENERATED_IDENTITY_SOURCE) ?? {},
+    )) {
         if (count > 0) {
             withheldByStatus[status] = count;
         }
@@ -903,7 +1373,7 @@ export const generatedContentPresence = (
     // count without separators reads as a different order of magnitude.
     const describe = Object.keys(withheldByStatus)
         .sort(compareStrings)
-        .map((status) => `${status} ${formatCount(withheldByStatus[status])}`);
+        .map((status) => `${status} ${formatCount(ownCount(withheldByStatus, status))}`);
 
     return {
         publishedGeneratedFoods: published,
@@ -1000,6 +1470,158 @@ const MISMATCH_EXAMPLE_LIMIT = 20;
  * items the cap left unnamed is emitted with them. */
 const UNEXPLAINED_GAP_EXAMPLE_LIMIT = 20;
 
+/* ---------------------------------------------------------------------------
+ * THE CLOSED VALUE SETS THE COUNTERS ARE KEYED BY
+ *
+ * WHY A COUNTER KEY IS VALIDATED AND NOT MERELY COUNTED. Every column the
+ * aggregate pass keys a counter on is TEXT with no database enum behind it (the
+ * schema is introspected — Rule backend-architecture §10), so the only thing
+ * standing between the report and an arbitrary key is the stage that wrote the
+ * row. A value outside the set its column declares is therefore either a defect
+ * in one of those stages or a row somebody edited by hand, and counting it
+ * under whatever string arrived produces an artefact whose `published`,
+ * `quarantined` and `withheld` figures each omit that row while stating nothing
+ * about it — the "claim nothing checked" this file's header exists to refuse.
+ *
+ * WHY THE SETS ARE IMPORTED AND NEVER RESTATED. `src/services/catalog.logic.ts`
+ * is the one enforcement point for these vocabularies; a list copied here would
+ * be a second authority that can drift from the one the pipeline wrote the rows
+ * under, and the first symptom would be a report refusing a value the rest of
+ * the system accepts. `catalog_validation_records.outcome` is the single
+ * exception and is derived from its own union below, for the reason recorded
+ * there.
+ *
+ * WHAT IS DELIBERATELY *NOT* IN THIS TABLE:
+ *
+ *   * `category` — validated against `coverage-plan.v1.json` by
+ *     `computeCoverageShortfall`, which excludes an undeclared category from
+ *     every total and names it in `coverage.unknownCategories`. That is the
+ *     explicit bucket for this column and it already reaches both artefacts; a
+ *     refusal here would replace a reported, per-release fact with a failed run.
+ *   * a recorded CHECK NAME — validated by `KNOWN_CHECK_NAMES`, filed under
+ *     tier `unrecognised` and named in `checkVocabulary.unrecognisedCheckNames`
+ *     with its count. Same reasoning: an already-explicit bucket.
+ *   * `nutrition_method`, `usda_data_type`, `food_group` — free text by
+ *     design (a method the validator names, a vendor's dataset label, an
+ *     importer's grouping). This repository owns no set for them, so there is
+ *     nothing to validate against and inventing one would be exactly the
+ *     second authority the paragraph above refuses. Their counters are
+ *     prototype-free like every other, which is what makes an arbitrary value
+ *     in them harmless rather than dangerous.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * `catalog_validation_records.outcome`'s three values.
+ *
+ * Declared here rather than imported because `catalog.logic.ts` exports a guard
+ * for every other set in the table below but none for this one. It is derived
+ * from the union that owns it — `Record<CatalogValidationOutcome, true>` — so
+ * adding a member in `src/types/catalog.ts` without listing it here is a
+ * compile error rather than a value this report would quietly refuse. A guard
+ * beside the others would be the better home; that file belongs to another
+ * change.
+ *
+ * `hasOwnProperty` and not `in`, for the reason `closedSet` gives in
+ * `catalog.logic.ts`: `'toString' in members` is true of every object literal.
+ */
+const VALIDATION_OUTCOMES: Readonly<Record<CatalogValidationOutcome, true>> = {
+    accepted: true,
+    quarantined: true,
+    rejected: true,
+};
+
+const isCatalogValidationOutcome = (value: unknown): boolean =>
+    typeof value === 'string' && Object.prototype.hasOwnProperty.call(VALIDATION_OUTCOMES, value);
+
+/**
+ * One row's value in a closed-set column, and the set that does not declare it.
+ *
+ * `value` is already quoted and bounded by {@link quoteStoredValue}: it is
+ * stored text, and it reaches a failure message and an operator console.
+ */
+export interface UnrecognisedStoredValue {
+    readonly sourceKey: string;
+    readonly field: string;
+    readonly value: string;
+}
+
+/** Enough named rows to see whether an unrecognised value is one row or a
+ * pattern across a stage's whole output; the count beside the list is exact. */
+const UNRECOGNISED_VALUE_EXAMPLE_LIMIT = 20;
+
+/** Long enough to recognise the offending value, short enough that a TEXT
+ * column cannot turn one row into a megabyte of failure message. */
+const STORED_VALUE_QUOTE_LIMIT = 80;
+
+/**
+ * A stored value as a failure may quote it.
+ *
+ * JSON-escaped, because the value is unvalidated text from a TEXT column: a
+ * quote or a newline in it would otherwise break the sentence it is embedded
+ * in, and a control character would reach an operator's terminal as an escape
+ * sequence. Length-bounded for the same reason the identity list is capped —
+ * the size of the evidence must not be chosen by the data.
+ */
+export const quoteStoredValue = (value: unknown): string => {
+    const text = typeof value === 'string' ? value : value === null ? 'null' : `<${typeof value}>`;
+    const bounded =
+        text.length > STORED_VALUE_QUOTE_LIMIT
+            ? `${text.slice(0, STORED_VALUE_QUOTE_LIMIT)}\u2026 (${formatCount(text.length)} characters)`
+            : text;
+    return JSON.stringify(bounded);
+};
+
+/**
+ * The closed sets, and how to read each from a row.
+ *
+ * Held as data for the same reason `MIRRORED_FIELDS` and
+ * `CHECK_APPLICABILITY_RULES` are: the list of columns checked cannot drift
+ * from the list the failure claims to cover.
+ *
+ * `of` returns `undefined` only where the row states nothing to judge — it
+ * carries no validation record at all, which the report already measures and
+ * refuses on its own terms (`assertEveryPublishedItemHasARecord`). A column
+ * holding SQL `NULL` is a different thing and is judged like any other value:
+ * these columns are NOT NULL, so a `null` reaching here is itself the defect.
+ */
+const CLOSED_SET_COLUMNS: readonly {
+    readonly field: string;
+    readonly of: (row: ReportFoodRow) => unknown;
+    readonly admits: (value: unknown) => boolean;
+}[] = [
+    { field: 'publication_status', of: (row) => row.publication_status, admits: isCatalogPublicationStatus },
+    { field: 'identity_source', of: (row) => row.identity_source, admits: isCatalogIdentitySource },
+    { field: 'identity_status', of: (row) => row.identity_status, admits: isCatalogIdentityStatus },
+    { field: 'nutrition_provenance', of: (row) => row.nutrition_provenance, admits: isCatalogNutritionProvenance },
+    { field: 'nutrition_basis', of: (row) => row.nutrition_basis, admits: isCatalogNutritionBasis },
+    { field: 'food_state', of: (row) => row.food_state, admits: isCatalogFoodState },
+    {
+        field: 'catalog_validation_records.outcome',
+        of: (row) => (row.catalog_validation_records === null ? undefined : row.catalog_validation_records.outcome),
+        admits: isCatalogValidationOutcome,
+    },
+];
+
+/**
+ * Every closed-set column of one row whose stored value its set does not
+ * declare.
+ *
+ * Pure, so the vocabulary judgement is unit-testable without a database — and
+ * so the aggregate pass, which calls it once per row, holds no rule of its own
+ * (Rule backend-architecture §7).
+ */
+export const unrecognisedStoredValuesOfRow = (row: ReportFoodRow): readonly UnrecognisedStoredValue[] => {
+    const found: UnrecognisedStoredValue[] = [];
+    for (const column of CLOSED_SET_COLUMNS) {
+        const value = column.of(row);
+        if (value === undefined || column.admits(value)) {
+            continue;
+        }
+        found.push({ sourceKey: row.source_key, field: column.field, value: quoteStoredValue(value) });
+    }
+    return found;
+};
+
 export interface CategoryMeasurement {
     byPublicationStatus: Record<string, number>;
     publishedFoodStates: Record<string, number>;
@@ -1080,6 +1702,19 @@ export interface CatalogMeasurement {
     readonly recordFieldMismatchCount: number;
     readonly recordFieldMismatches: readonly RecordFieldMismatch[];
     readonly rowsWithValidationRecord: number;
+    /**
+     * Stored values in a column whose value set this repository owns that the
+     * set does not declare — named rows and columns, capped at
+     * {@link UNRECOGNISED_VALUE_EXAMPLE_LIMIT}.
+     *
+     * Collected rather than thrown on at the row, so one failure can state the
+     * whole pattern instead of the first row of it (the same shape as
+     * `publishedWithoutValidationRecord` and `recordFieldMismatches`).
+     * `assertRecognisedStoredValues` is what refuses the run.
+     */
+    readonly unrecognisedStoredValues: readonly UnrecognisedStoredValue[];
+    /** Every such value the scan found, uncapped. */
+    readonly unrecognisedStoredValueCount: number;
 }
 
 /**
@@ -1162,7 +1797,10 @@ const tierOfCheck = (name: string): string | null =>
 const summarizeChecks = (checks: unknown, unrecognised: Record<string, number>): FailingCheckSummary => {
     const names: string[] = [];
     const failing: WithheldCheckEvidence[] = [];
-    const byTier: Record<string, number> = {};
+    // Keyed by the closed tier set rather than by data, but created the same
+    // way as every other map here: one plain `{}` left among them is the one a
+    // later edit feeds a stored check name to.
+    const byTier = emptyCounts();
     let entries = 0;
     let passed = 0;
 
@@ -1465,7 +2103,12 @@ export const notApplicableChecksForItem = (facts: PublishedItemFacts): ItemCheck
             continue;
         }
 
-        const rule = CHECK_APPLICABILITY_RULES[name];
+        // An own-property lookup, though the name comes from the code-owned
+        // vocabulary: this map is a plain object literal indexed by a string
+        // variable, and `CHECK_APPLICABILITY_RULES['constructor']` would answer
+        // with the `Object` function — a "rule" whose `applies` does not exist
+        // — the moment a vocabulary name or a caller changed.
+        const rule = ownValue(CHECK_APPLICABILITY_RULES, name);
         if (rule === undefined || rule.applies(facts)) {
             // Either no rule covers this name, or the item DOES meet the
             // precondition and the check is still absent. Both are reported as
@@ -1524,13 +2167,13 @@ export const publishedItemFacts = (row: ReportFoodRow, record: ValidationRecordR
 };
 
 const emptyCategoryMeasurement = (): CategoryMeasurement => ({
-    byPublicationStatus: {},
-    publishedFoodStates: {},
-    publishedReviewFailuresByCheck: {},
+    byPublicationStatus: emptyCounts(),
+    publishedFoodStates: emptyCounts(),
+    publishedReviewFailuresByCheck: emptyCounts(),
     publishedItemsWithRejectFailure: 0,
     publishedItemsWithQuarantineFailure: 0,
     publishedItemsWithReviewFailure: 0,
-    quarantinedByCheck: {},
+    quarantinedByCheck: emptyCounts(),
 });
 
 /** The key a published identity is unique on, per the partial unique index on
@@ -1549,39 +2192,47 @@ const NO_USDA_DATA_TYPE = 'none';
  * disagree with each other about the rows they describe.
  */
 export const measureCatalog = async (db: ReportDb, where: Record<string, unknown>): Promise<CatalogMeasurement> => {
-    const byPublicationStatus: Record<string, number> = {};
-    const categories: Record<string, CategoryMeasurement> = {};
-    const publishedByCategory: Record<string, number> = {};
-    const publishedByIdentitySource: Record<string, number> = {};
-    const publishedByIdentityStatus: Record<string, number> = {};
-    const publishedByNutritionProvenance: Record<string, number> = {};
-    const publishedByNutritionMethod: Record<string, number> = {};
-    const publishedByNutritionBasis: Record<string, number> = {};
-    const publishedByUsdaDataType: Record<string, number> = {};
-    const publishedByOutcome: Record<string, number> = {};
-    const publishedByFoodState: Record<string, number> = {};
-    const publishedChecks: Record<string, CheckTally> = {};
-    const unrecognisedCheckNames: Record<string, number> = {};
-    const quarantinedByCheck: Record<string, number> = {};
-    const quarantinedByCategory: Record<string, number> = {};
-    const rejectedByCheck: Record<string, number> = {};
-    const candidateByCheck: Record<string, number> = {};
-    const publishedEvidenceRecordsPerItem: Record<string, number> = {};
-    const publishedRecordedChecksPerItem: Record<string, number> = {};
-    const publishedNotApplicableByName: Record<string, number> = {};
-    const publishedNotApplicableByReasonCode: Record<string, number> = {};
-    const publishedUnexplainedByName: Record<string, number> = {};
+    // Every map below is keyed by data read out of the catalog, so every one of
+    // them is prototype-free (see KEY SAFETY above). They are the artefacts'
+    // counter blocks, which is why they are prototype-free OBJECTS and not
+    // `Map`s: a `Map` serialises to `{}`.
+    const byPublicationStatus = emptyCounts();
+    const categories = emptyIndex<CategoryMeasurement>();
+    const publishedByCategory = emptyCounts();
+    const publishedByIdentitySource = emptyCounts();
+    const publishedByIdentityStatus = emptyCounts();
+    const publishedByNutritionProvenance = emptyCounts();
+    const publishedByNutritionMethod = emptyCounts();
+    const publishedByNutritionBasis = emptyCounts();
+    const publishedByUsdaDataType = emptyCounts();
+    const publishedByOutcome = emptyCounts();
+    const publishedByFoodState = emptyCounts();
+    const publishedChecks = emptyIndex<CheckTally>();
+    const unrecognisedCheckNames = emptyCounts();
+    const quarantinedByCheck = emptyCounts();
+    const quarantinedByCategory = emptyCounts();
+    const rejectedByCheck = emptyCounts();
+    const candidateByCheck = emptyCounts();
+    const publishedEvidenceRecordsPerItem = emptyCounts();
+    const publishedRecordedChecksPerItem = emptyCounts();
+    const publishedNotApplicableByName = emptyCounts();
+    const publishedNotApplicableByReasonCode = emptyCounts();
+    const publishedUnexplainedByName = emptyCounts();
     const publishedUnexplainedExamples: { sourceKey: string; names: readonly string[] }[] = [];
     const withheldIdentities: WithheldIdentity[] = [];
-    const withheldIdentitiesOmitted: Record<string, number> = {};
-    const withheldCollected: Record<string, number> = {};
+    const withheldIdentitiesOmitted = emptyCounts();
+    // A `Map` rather than a prototype-free object, because unlike its
+    // neighbours this counter never leaves the scan: nothing serialises it, so
+    // the strongest form of key isolation costs nothing here.
+    const withheldCollected = new Map<string, number>();
     // Uncapped, and deliberately separate from the collected list: a figure
     // derived from a capped list understates the population it claims to
     // describe, and does so only once the catalog is too big to check by hand.
-    const withheldByIdentitySourceAndStatus: Record<string, Record<string, number>> = {};
+    const withheldByIdentitySourceAndStatus = emptyIndex<Record<string, number>>();
     const publishedWithoutValidationRecord: string[] = [];
     const publishedIdentities = new Map<string, string[]>();
     const recordFieldMismatches: RecordFieldMismatch[] = [];
+    const unrecognisedStoredValues: UnrecognisedStoredValue[] = [];
 
     let rowsScanned = 0;
     let rowsWithValidationRecord = 0;
@@ -1596,9 +2247,16 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
     let publishedItemsWithCompleteVocabulary = 0;
     let publishedItemsWithUnexplainedGap = 0;
     let publishedUnexplainedExamplesOmitted = 0;
+    let unrecognisedStoredValueCount = 0;
 
     const categoryOf = (category: string): CategoryMeasurement => {
-        const existing = categories[category];
+        // The own-property read is what makes this a lookup of a MEASUREMENT.
+        // On a plain object `categories['__proto__']` answers with
+        // `Object.prototype` and `categories['constructor']` with the `Object`
+        // function — neither of which is `undefined`, so the cache appeared to
+        // hit and the counters below were then incremented on the prototype
+        // every object in this process inherits from.
+        const existing = ownValue(categories, category);
         if (existing !== undefined) {
             return existing;
         }
@@ -1619,18 +2277,18 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
         // Counted first and unconditionally: this is the population, and it must
         // not depend on whether the identity below was listed or capped out.
         const bySource =
-            withheldByIdentitySourceAndStatus[row.identity_source] ??
-            (withheldByIdentitySourceAndStatus[row.identity_source] = {});
+            ownValue(withheldByIdentitySourceAndStatus, row.identity_source) ??
+            (withheldByIdentitySourceAndStatus[row.identity_source] = emptyCounts());
         increment(bySource, row.publication_status);
 
         // A counter per status rather than a scan of what is already collected:
         // the scan would be quadratic in the withheld row count, on a stage
         // whose whole memory discipline is per-page.
-        if ((withheldCollected[row.publication_status] ?? 0) >= WITHHELD_IDENTITY_LIMIT) {
+        if ((withheldCollected.get(row.publication_status) ?? 0) >= WITHHELD_IDENTITY_LIMIT) {
             increment(withheldIdentitiesOmitted, row.publication_status);
             return;
         }
-        increment(withheldCollected, row.publication_status);
+        withheldCollected.set(row.publication_status, (withheldCollected.get(row.publication_status) ?? 0) + 1);
 
         withheldIdentities.push({
             sourceKey: row.source_key,
@@ -1650,6 +2308,18 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
     await forEachFoodPage(db, where, (rows) => {
         for (const row of rows) {
             rowsScanned += 1;
+
+            // Judged BEFORE anything is counted from the row, so the failure
+            // names the columns the figures below would have been keyed on.
+            // Collected rather than thrown on: `assertRecognisedStoredValues`
+            // refuses the run once the scan can state the whole pattern.
+            for (const unrecognised of unrecognisedStoredValuesOfRow(row)) {
+                unrecognisedStoredValueCount += 1;
+                if (unrecognisedStoredValues.length < UNRECOGNISED_VALUE_EXAMPLE_LIMIT) {
+                    unrecognisedStoredValues.push(unrecognised);
+                }
+            }
+
             increment(byPublicationStatus, row.publication_status);
 
             const category = categoryOf(row.category);
@@ -1723,7 +2393,15 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
                         continue;
                     }
                     const tier = tierOfCheck(check.name);
-                    const tally = publishedChecks[check.name] ?? {
+                    // THE SITE THE PROTOTYPE-POLLUTION FINDING NAMED. A stored
+                    // check name of `__proto__` made this lookup answer with
+                    // `Object.prototype` instead of `undefined`, so the `??`
+                    // did not fire and `tally.evaluated += 1` below wrote
+                    // `evaluated`, `passed` and `failed` onto the prototype of
+                    // every object in the process — falsifying the evidence
+                    // this stage exists to produce. The own-property read on a
+                    // prototype-free map is what makes an absent tally absent.
+                    const tally = ownValue(publishedChecks, check.name) ?? {
                         tier: tier ?? 'unrecognised',
                         evaluated: 0,
                         passed: 0,
@@ -1894,6 +2572,8 @@ export const measureCatalog = async (db: ReportDb, where: Record<string, unknown
         recordFieldMismatchCount,
         recordFieldMismatches,
         rowsWithValidationRecord,
+        unrecognisedStoredValues,
+        unrecognisedStoredValueCount,
     };
 };
 
@@ -1921,6 +2601,50 @@ export const assertEveryPublishedItemHasARecord = (measurement: CatalogMeasureme
             `so no report can claim every published item is evidenced: ${named}${remainder}. ` +
             'Re-run npm run catalog:validate so those foods are judged, then re-run this report.',
         'missing_validation_record',
+    );
+};
+
+/**
+ * Every counter key came from a value set this repository owns.
+ *
+ * WHY THE RUN ENDS HERE RATHER THAN COUNTING IT. The alternative is an artefact
+ * in which the row is absent from `published`, from `quarantined` and from the
+ * withheld audit, present only as a key nothing validated, and described by no
+ * claim — evidence that reads as complete while omitting a row it scanned.
+ * This file already refuses to publish for one published food missing its
+ * validation record ({@link assertEveryPublishedItemHasARecord}); a column
+ * whose value no set declares is the same kind of defect reached from the other
+ * end, and the same answer applies: produce nothing, name what is wrong, and
+ * leave the previous pair of artefacts exactly as it was.
+ *
+ * The message names the sets and where they live, because the fix is either in
+ * the rows or in the set — and which of the two it is, is a judgement only the
+ * operator can make.
+ */
+export const assertRecognisedStoredValues = (measurement: CatalogMeasurement): void => {
+    if (measurement.unrecognisedStoredValueCount === 0) {
+        return;
+    }
+
+    const named = measurement.unrecognisedStoredValues
+        .map((entry) => `${entry.sourceKey} ${entry.field}=${entry.value}`)
+        .join(', ');
+    const remainder =
+        measurement.unrecognisedStoredValueCount > measurement.unrecognisedStoredValues.length
+            ? ` and ${formatCount(
+                  measurement.unrecognisedStoredValueCount - measurement.unrecognisedStoredValues.length,
+              )} more`
+            : '';
+
+    throw new CatalogReportError(
+        `${formatCount(measurement.unrecognisedStoredValueCount)} catalog row value(s) are outside the closed set ` +
+            'their column declares, so every figure keyed on that column would count them under a string nothing ' +
+            `validated: ${named}${remainder}. The sets are owned by src/services/catalog.logic.ts ` +
+            '(CATALOG_PUBLICATION_STATUSES, CATALOG_IDENTITY_SOURCES, CATALOG_IDENTITY_STATUSES, ' +
+            'CATALOG_NUTRITION_PROVENANCES, CATALOG_NUTRITION_BASES, CATALOG_FOOD_STATES) and, for the outcome, by ' +
+            'CatalogValidationOutcome in src/types/catalog.ts. Correct the rows, or add the value to the set that ' +
+            'owns it so every stage judges it the same way, then re-run this report.',
+        'unrecognised_stored_value',
     );
 };
 
@@ -1991,7 +2715,15 @@ export interface CoverageRow {
     readonly energyMacroTolerancePercentMeasuredAgainst: number;
 }
 
-const statusCount = (row: Readonly<Record<string, number>>, status: string): number => row[status] ?? 0;
+/**
+ * One status's count off a counter block.
+ *
+ * An own-property read, because the block may be one another stage or a test
+ * built: on a plain `{}` a lookup of an inherited name answers with the
+ * inherited value, and a count is the one thing in this file that must come
+ * from the rows.
+ */
+const statusCount = (row: Readonly<Record<string, number>>, status: string): number => ownCount(row, status);
 
 export const buildCoverageRows = (
     policy: CatalogValidationPolicy,
@@ -2001,7 +2733,11 @@ export const buildCoverageRows = (
 ): readonly CoverageRow[] => {
     const rows = shortfall.categories.map((entry): CoverageRow => {
         const planCategory = plan.categories.find((candidate) => candidate.category === entry.category);
-        const category = measurement.categories[entry.category] ?? emptyCategoryMeasurement();
+        // Own-property, though the category comes from the plan: the plan is a
+        // JSON document on disk, so `categories['constructor']` is reachable
+        // from a file rather than from the database, and it would hand this row
+        // the `Object` function in place of a measurement.
+        const category = ownValue(measurement.categories, entry.category) ?? emptyCategoryMeasurement();
         const bounds = resolveCategoryBounds(policy, entry.category, 'raw' as CatalogFoodState);
 
         // What the observations in this category were actually measured
@@ -2009,10 +2745,7 @@ export const buildCoverageRows = (
         // assumed: `grain` and `legume` override the category-wide band for
         // their dry and cooked forms, and `resolveCategoryBounds` is the rule
         // that decides which band applies.
-        const byFoodState: Record<
-            string,
-            { min: number; max: number; fromFoodStateOverride: boolean }
-        > = {};
+        const byFoodState = emptyIndex<{ min: number; max: number; fromFoodStateOverride: boolean }>();
         for (const foodState of Object.keys(category.publishedFoodStates)) {
             const resolved = resolveCategoryBounds(policy, entry.category, foodState as CatalogFoodState);
             if (resolved === null) {
@@ -2077,7 +2810,7 @@ export const quarantinePerCategory = (
     rows: readonly CoverageRow[],
     measurement: CatalogMeasurement,
 ): Record<string, number> => {
-    const perCategory: Record<string, number> = {};
+    const perCategory = emptyCounts();
     for (const row of rows) {
         perCategory[row.category] = row.quarantined;
     }
@@ -2101,10 +2834,10 @@ export const perCategoryByStatus = (
     measurement: CatalogMeasurement,
     status: string,
 ): Record<string, number> => {
-    const perCategory: Record<string, number> = {};
+    const perCategory = emptyCounts();
 
     for (const row of rows) {
-        const category = measurement.categories[row.category];
+        const category = ownValue(measurement.categories, row.category);
         perCategory[row.category] = category === undefined ? 0 : statusCount(category.byPublicationStatus, status);
     }
 
@@ -2195,15 +2928,20 @@ export const buildWithheldIdentityAudit = (
     rows: readonly CoverageRow[],
     measurement: CatalogMeasurement,
 ): WithheldIdentityAudit => {
-    const totals: Record<string, number> = {};
-    const perCategory: Record<string, Record<string, number>> = {};
-    const byCheck: Record<string, Record<string, number>> = {};
-    const identities: Record<string, readonly WithheldIdentity[]> = {};
-    const identitiesListed: Record<string, number> = {};
-    const listedIdentitiesWithNoFailingCheck: Record<string, number> = {};
-    const identitiesOmittedByCap: Record<string, number> = {};
-    const failingCheckEvidenceEntries: Record<string, number> = {};
-    const failingChecksListed: Record<string, number> = {};
+    // Keyed by WITHHELD_STATUSES, which is a constant of this module and not
+    // data — but built the same prototype-free way as the maps that ARE
+    // data-keyed, so no plain `{}` is left here for a later edit to key on a
+    // stored status. The per-category and per-check maps they hold are
+    // data-keyed throughout.
+    const totals = emptyCounts();
+    const perCategory = emptyIndex<Record<string, number>>();
+    const byCheck = emptyIndex<Record<string, number>>();
+    const identities = emptyIndex<readonly WithheldIdentity[]>();
+    const identitiesListed = emptyCounts();
+    const listedIdentitiesWithNoFailingCheck = emptyCounts();
+    const identitiesOmittedByCap = emptyCounts();
+    const failingCheckEvidenceEntries = emptyCounts();
+    const failingChecksListed = emptyCounts();
     let identitiesWhoseEvidenceDisagrees = 0;
 
     const checksOfStatus = (status: string): Record<string, number> => {
@@ -2230,7 +2968,7 @@ export const buildWithheldIdentityAudit = (
         listedIdentitiesWithNoFailingCheck[status] = listed.filter(
             (entry) => entry.failingChecks.length === 0,
         ).length;
-        identitiesOmittedByCap[status] = measurement.withheldIdentitiesOmitted[status] ?? 0;
+        identitiesOmittedByCap[status] = ownCount(measurement.withheldIdentitiesOmitted, status);
 
         // Counted per entry, and the agreement checked per entry: a report that
         // compared only the two totals would pass a set where one row lost a
@@ -2253,22 +2991,22 @@ export const buildWithheldIdentityAudit = (
     }
     totals.withheldTotal = withheldTotal;
 
-    const listedTotal = WITHHELD_STATUSES.reduce((total, status) => total + (identitiesListed[status] ?? 0), 0);
-    const omittedTotal = WITHHELD_STATUSES.reduce((total, status) => total + (identitiesOmittedByCap[status] ?? 0), 0);
+    const listedTotal = WITHHELD_STATUSES.reduce((total, status) => total + ownCount(identitiesListed, status), 0);
+    const omittedTotal = WITHHELD_STATUSES.reduce((total, status) => total + ownCount(identitiesOmittedByCap, status), 0);
 
     const perStatusPhrase = WITHHELD_STATUSES.map(
-        (status) => `${formatCount(totals[status] ?? 0)} ${status}`,
+        (status) => `${formatCount(ownCount(totals, status))} ${status}`,
     ).join(', ');
     const noFailingCheckTotal = WITHHELD_STATUSES.reduce(
-        (total, status) => total + (listedIdentitiesWithNoFailingCheck[status] ?? 0),
+        (total, status) => total + ownCount(listedIdentitiesWithNoFailingCheck, status),
         0,
     );
     const evidenceEntriesTotal = WITHHELD_STATUSES.reduce(
-        (total, status) => total + (failingCheckEvidenceEntries[status] ?? 0),
+        (total, status) => total + ownCount(failingCheckEvidenceEntries, status),
         0,
     );
     const namesListedTotal = WITHHELD_STATUSES.reduce(
-        (total, status) => total + (failingChecksListed[status] ?? 0),
+        (total, status) => total + ownCount(failingChecksListed, status),
         0,
     );
     const everyFailingCheckStatesItsEvidence = identitiesWhoseEvidenceDisagrees === 0;
@@ -2551,7 +3289,7 @@ const mergeProducedBy = (existing: unknown, aggregate: Readonly<Record<string, u
     // aggregateFieldsDerivedFrom written right beside it. The stageFields*
     // entries, which belong to the stage that wrote them, are not named in
     // SUPERSEDED_KEYS and survive untouched.
-    const merged: Record<string, unknown> = pruneSupersededKeys('producedBy', asRecord(existing) ?? {});
+    const merged = pruneSupersededKeys('producedBy', asRecord(existing) ?? {});
     for (const key of Object.keys(aggregate)) {
         merged[key] = aggregate[key];
     }
@@ -2624,7 +3362,7 @@ const buildCheckVocabularyBlock = (plan: CoveragePlan, measurement: CatalogMeasu
     const evaluatedOnEveryItem: string[] = [];
     const recordedOnSomeItems: string[] = [];
     for (const name of [...KNOWN_CHECK_NAMES].sort(compareStrings)) {
-        const tally = measurement.publishedChecks[name];
+        const tally = ownValue(measurement.publishedChecks, name);
         if (tally === undefined || tally.evaluated === 0) {
             continue;
         }
@@ -2635,7 +3373,7 @@ const buildCheckVocabularyBlock = (plan: CoveragePlan, measurement: CatalogMeasu
         recordedOnSomeItems.push(name);
     }
     const notRecorded = [...KNOWN_CHECK_NAMES]
-        .filter((name) => (measurement.publishedChecks[name]?.evaluated ?? 0) === 0)
+        .filter((name) => (ownValue(measurement.publishedChecks, name)?.evaluated ?? 0) === 0)
         .sort(compareStrings);
 
     const planQuarantineChecks = [...plan.quarantineChecks].sort(compareStrings);
@@ -2720,8 +3458,9 @@ const buildCheckVocabularyBlock = (plan: CoveragePlan, measurement: CatalogMeasu
 };
 
 const buildBoundsBlock = (plan: CoveragePlan): unknown => {
-    const kcalReviewRangeByCategory: Record<string, unknown> = {};
-    const energyMacroTolerancePercentByCategory: Record<string, number> = {};
+    // Keyed by the plan's category codes, which are data in a file on disk.
+    const kcalReviewRangeByCategory = emptyIndex<unknown>();
+    const energyMacroTolerancePercentByCategory = emptyCounts();
     for (const category of plan.categories) {
         const byFoodState = category.kcalReviewRangeByFoodState;
         kcalReviewRangeByCategory[category.category] = {
@@ -2823,7 +3562,7 @@ export const buildValidationReportEntries = (input: {
     const publishedItems = shortfall.publishedTotal;
 
     const failuresByTier = (tier: string): Record<string, number> => {
-        const byCheck: Record<string, number> = {};
+        const byCheck = emptyCounts();
         for (const [name, tally] of Object.entries(measurement.publishedChecks)) {
             if (tally.tier === tier && tally.failed > 0) {
                 byCheck[name] = tally.failed;
@@ -2835,7 +3574,7 @@ export const buildValidationReportEntries = (input: {
     const itemsWithTierFailure = (pick: (category: CategoryMeasurement) => number): number =>
         Object.values(measurement.categories).reduce((total, category) => total + pick(category), 0);
 
-    const checksByCheck: Record<string, unknown> = {};
+    const checksByCheck = emptyIndex<unknown>();
     for (const [name, tally] of Object.entries(measurement.publishedChecks)) {
         checksByCheck[name] = { tier: tally.tier, evaluated: tally.evaluated, passed: tally.passed, failed: tally.failed };
     }
@@ -3160,7 +3899,7 @@ const projectEvidence = (entry: unknown): unknown => {
     if (camelized === null) {
         return entry;
     }
-    const projected: Record<string, unknown> = {};
+    const projected = emptyIndex<unknown>();
     for (const field of IDENTITY_EVIDENCE_FIELDS) {
         // Only fields the record actually states: an absent field left absent
         // says "the retrieval did not record this", while a manufactured null
@@ -3221,8 +3960,10 @@ export const toItemRecord = (row: ReportFoodRow, record: ValidationRecordRow): R
 // cannot be merged without deciding which entries mean the same thing.
 // ---------------------------------------------------------------------------
 
-const subObjectOf = (existing: Readonly<Record<string, unknown>> | null, key: string): Record<string, unknown> =>
-    existing === null ? {} : { ...(asRecord(existing[key]) ?? {}) };
+const subObjectOf = (existing: Readonly<Record<string, unknown>> | null, key: string): Record<string, unknown> => {
+    const block = existing === null ? null : asRecord(ownValue(existing, key));
+    return block === null ? emptyIndex<unknown>() : copyOwnEntries(block);
+};
 
 /* ---------------------------------------------------------------------------
  * Superseded keys — the reason a regenerated report cannot carry a contradicted
@@ -3351,8 +4092,12 @@ export const pruneSupersededKeys = (
     blockName: string,
     block: Readonly<Record<string, unknown>>,
 ): Record<string, unknown> => {
-    const superseded = SUPERSEDED_KEYS[blockName] ?? [];
-    const pruned: Record<string, unknown> = { ...block };
+    const superseded = ownValue(SUPERSEDED_KEYS, blockName) ?? [];
+    // A prototype-free copy: the block came off the artefact on disk, where
+    // `JSON.parse` keeps a `__proto__` key as an ordinary property, and this
+    // function promises that every key it does not name survives byte for
+    // byte — which a plain `{ ...block }` target would break for that one key.
+    const pruned = copyOwnEntries(block);
     for (const entry of superseded) {
         delete pruned[entry.key];
     }
@@ -3447,7 +4192,15 @@ export const buildImportReportEntries = (input: {
     const { measurement, shortfall, rows, requirement, quarantine, existing, scopedTo } = input;
 
     const failuresOverStatus = (byCheck: Readonly<Record<string, number>>): Record<string, unknown> => {
-        const byTier: Record<string, Record<string, number>> = { reject: {}, quarantine: {}, review: {}, unrecognised: {} };
+        // The four tiers are this module's own keys; the check names inside
+        // each of them are the stored ones, so the inner maps are
+        // prototype-free.
+        const byTier: Record<string, Record<string, number>> = {
+            reject: emptyCounts(),
+            quarantine: emptyCounts(),
+            review: emptyCounts(),
+            unrecognised: emptyCounts(),
+        };
         for (const [name, count] of Object.entries(byCheck)) {
             const tier = tierOfCheck(name) ?? 'unrecognised';
             byTier[tier][name] = count;
@@ -3460,7 +4213,7 @@ export const buildImportReportEntries = (input: {
         };
     };
 
-    const publishedFailures: Record<string, number> = {};
+    const publishedFailures = emptyCounts();
     for (const [name, tally] of Object.entries(measurement.publishedChecks)) {
         if (tally.failed > 0) {
             publishedFailures[name] = tally.failed;
@@ -3785,6 +4538,16 @@ export interface ReportIo {
  */
 const HEADER_READ_LIMIT_BYTES = 32 * 1024 * 1024;
 
+// `O_NOFOLLOW` is POSIX and present on every platform this pipeline runs on,
+// but it is not in Node's constants on every platform, and `undefined` in a
+// bitwise OR becomes 0 silently — which would quietly remove the protection.
+// Read once, explicitly, so an absent constant is a documented degradation
+// rather than an invisible one. Stated here rather than imported because
+// manifest.ts keeps its copy private; the two are deliberately identical, and
+// exporting one of them is the way to make that structural rather than
+// conventional.
+const O_NOFOLLOW_FLAG = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+
 const openFileSink = (absolutePath: string): ReportSink => {
     fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
     // `wx`, not the default `w`: exclusive creation refuses an entry that
@@ -3853,8 +4616,13 @@ const parseHeaderText = (text: string, absolutePath: string): Record<string, unk
         parsed = JSON.parse(text);
     } catch (error) {
         throw new CatalogReportError(
-            `${absolutePath} is not readable as JSON, so the fields it already carries cannot be preserved: ` +
-                `${safeError(error).message}. Move or repair the file and run again.`,
+            `${absolutePath} is not readable as JSON, so the fields it already carries cannot be preserved ` +
+                // The parser's own text is withheld: a JSON SyntaxError quotes
+                // the bytes it choked on, and this file is an artefact whose
+                // content is not this stage's to republish into a log
+                // (logger.ts::safeError). The class and its machine code name
+                // the fault; the remedy is what the operator acts on.
+                `(${formatSafeError(error)}). Move or repair the file and run again.`,
             'report_unreadable',
         );
     }
@@ -3868,17 +4636,104 @@ const parseHeaderText = (text: string, absolutePath: string): Record<string, unk
     return record;
 };
 
+/**
+ * The prefix of `absolutePath`, refusing a symlink and anything that is not a
+ * regular file, or `null` when the file is not there.
+ *
+ * NO-FOLLOW, for the same reason manifest.ts's `readArtifactFileNoFollow` is:
+ * this read is how the fields another stage owns are preserved and how the
+ * document this run staged is reconciled against what will land, so a symlink
+ * planted at either name would make both decisions from a document this
+ * pipeline never wrote — and `existsSync` + `openSync(path, 'r')` follow one
+ * without a word. That helper cannot be reused directly because it reads the
+ * whole file and a validation report is tens of megabytes of item records; this
+ * read is bounded by {@link HEADER_READ_LIMIT_BYTES} on purpose. The guarantee
+ * is therefore rebuilt from the same three parts: `lstat` on the name, so the
+ * entry is judged by what it IS rather than by what it resolves to; `O_NOFOLLOW`
+ * on the open, so a link that appears in the window between the two is refused
+ * by the kernel instead of read through; and `fstat` on the DESCRIPTOR actually
+ * read from, which is the only check no path change can invalidate and which is
+ * also where the size comes from.
+ */
 const readHeaderObjectFromFile = (absolutePath: string): Record<string, unknown> | null => {
-    if (!fs.existsSync(absolutePath)) {
-        return null;
+    let entry: fs.Stats;
+    try {
+        entry = fs.lstatSync(absolutePath);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' || code === 'ENOTDIR') {
+            // Nothing at this name, so there are no existing fields to
+            // preserve. That is the ordinary first run, not a failure.
+            return null;
+        }
+        throw new CatalogReportError(
+            `${absolutePath} could not be examined, so the fields it already carries cannot be preserved: ` +
+                `${formatSafeError(error)}. Check the output directory and run again.`,
+            'report_unreadable',
+        );
     }
 
-    const size = fs.statSync(absolutePath).size;
-    const readLength = Math.min(size, HEADER_READ_LIMIT_BYTES);
-    const buffer = Buffer.alloc(readLength);
-    const descriptor = fs.openSync(absolutePath, 'r');
+    if (!entry.isFile()) {
+        throw new CatalogReportError(
+            `${absolutePath} is ${entry.isSymbolicLink() ? 'a symbolic link' : 'not a regular file'}, so it is not ` +
+                'one of this pipeline\u2019s report artefacts and nothing was read from it. Remove or rename what is ' +
+                'at that name and run again.',
+            'report_unreadable',
+        );
+    }
+
+    let descriptor: number;
     try {
-        fs.readSync(descriptor, buffer, 0, readLength, 0);
+        descriptor = fs.openSync(absolutePath, fs.constants.O_RDONLY | O_NOFOLLOW_FLAG);
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT' || code === 'ENOTDIR') {
+            // Removed between the `lstat` and the open. Absent is absent.
+            return null;
+        }
+        throw new CatalogReportError(
+            code === 'ELOOP'
+                ? `${absolutePath} became a symbolic link while this run was opening it, so nothing was read ` +
+                  'through it. Remove or rename what is at that name and run again.'
+                : `${absolutePath} could not be opened, so the fields it already carries cannot be preserved: ` +
+                  `${formatSafeError(error)}. Check the output directory and run again.`,
+            'report_unreadable',
+        );
+    }
+
+    let size: number;
+    let buffer: Buffer;
+    try {
+        // The descriptor, not a second `stat` on the path: this is the file the
+        // bytes below come from, whatever the name now refers to.
+        const opened = fs.fstatSync(descriptor);
+        if (!opened.isFile()) {
+            throw new CatalogReportError(
+                `${absolutePath} is not a regular file, so it is not one of this pipeline\u2019s report artefacts ` +
+                    'and nothing was read from it. Remove or rename what is at that name and run again.',
+                'report_unreadable',
+            );
+        }
+
+        size = opened.size;
+        const readLength = Math.min(size, HEADER_READ_LIMIT_BYTES);
+        buffer = Buffer.alloc(readLength);
+        // A single `readSync` is not required to return everything asked for,
+        // and a header that stops early would be parsed as a truncated
+        // document. The loop is the read; a zero return means the file is
+        // shorter than it reported (truncated while being read), which the
+        // slice reports honestly rather than padding with zero bytes.
+        let filled = 0;
+        while (filled < readLength) {
+            const read = fs.readSync(descriptor, buffer, filled, readLength - filled, filled);
+            if (read === 0) {
+                break;
+            }
+            filled += read;
+        }
+        if (filled < readLength) {
+            buffer = buffer.subarray(0, filled);
+        }
     } finally {
         fs.closeSync(descriptor);
     }
@@ -3942,7 +4797,12 @@ export const mergeOwnedFields = (
     existing: Readonly<Record<string, unknown>> | null,
     entries: readonly (readonly [string, unknown])[],
 ): Record<string, unknown> => {
-    const merged: Record<string, unknown> = { ...(existing ?? {}) };
+    // The existing document is copied key by key into a prototype-free target
+    // rather than spread into a plain one, so a `__proto__` key already in the
+    // artefact stays the ordinary property `JSON.parse` read it as instead of
+    // becoming this object's prototype — which is how a preserved field
+    // disappears from a document that promises to preserve it.
+    const merged = existing === null ? emptyIndex<unknown>() : copyOwnEntries(existing);
     for (const [key, value] of entries) {
         merged[key] = value;
     }
@@ -3989,7 +4849,7 @@ export const writeValidationReport = async (input: {
 
 const numericRecord = (value: unknown): Record<string, number> => {
     const record = asRecord(value);
-    const numbers: Record<string, number> = {};
+    const numbers = emptyCounts();
     if (record === null) {
         return numbers;
     }
@@ -4047,8 +4907,12 @@ export const reconcileQuarantineFigures = (input: {
         compareStrings,
     );
     for (const category of categories) {
-        const onDisk = input.onDisk.perCategory[category];
-        const measured = input.measured.perCategory[category];
+        // `ownValue`, not `[]`: `undefined` here MEANS "this artefact does not
+        // state a figure for that category", and an inherited value would be
+        // read as one — reconciling two documents against a property of
+        // `Object.prototype`.
+        const onDisk = ownValue(input.onDisk.perCategory, category);
+        const measured = ownValue(input.measured.perCategory, category);
         if (onDisk === measured) {
             continue;
         }
@@ -4151,6 +5015,13 @@ export interface RunReportDeps {
     readonly allowlistVersion: string;
     readonly evidenceRegistrySnapshot: string;
     readonly options: ReportOptions;
+    /**
+     * The directory to publish the pair into. `main()` passes the physical
+     * identity `resolveReportOutputDirectory` decided, and `runReport` resolves
+     * whatever it is given to that identity again — so a caller may hand over a
+     * spelling and still get one directory for the lock and both writes, and
+     * the paths in {@link ReportOutcome} name the place the artefacts are in.
+     */
     readonly outDir: string;
     readonly logger: ScriptLogger;
     readonly io: ReportIo;
@@ -4191,6 +5062,35 @@ export const REPORT_STAGE_NOTE_KEY = 'reportStageWrite';
 /** The lock holder name this stage takes on the output directory. */
 const PUBLICATION_HOLDER = `${STAGE}:artefacts`;
 
+/**
+ * Refuses a scoped run whose destination is the committed report directory or
+ * something inside it, for the physical identity `publicationDirectory`.
+ *
+ * Called TWICE by `runReport`: once before the publication lock is taken, so a
+ * refused run creates nothing — acquiring the lock creates the output
+ * directory, and a refusal that had already made a directory inside the
+ * committed tree would leave litter there — and once inside the lock on the
+ * re-verified identity, so a retarget after the first check cannot land one
+ * category's figures on the whole-catalog pair. Neither call is redundant: the
+ * first decides early, the second decides late, and the attack lives in the
+ * gap between them.
+ */
+const assertScopedReportMayPublish = (
+    scopedTo: string,
+    out: string | null,
+    publicationDirectory: string,
+): void => {
+    const refusal = scopedReportRefusal({
+        category: scopedTo,
+        out,
+        resolvedOutDir: publicationDirectory,
+        canonicalReportDir: physicalPathIdentity(canonicalReportDirectory()),
+    });
+    if (refusal !== null) {
+        throw new CatalogReportError(refusal, 'scoped_report_needs_out_dir');
+    }
+};
+
 export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => {
     const { db, plan, options, outDir, logger: runLogger, io } = deps;
     const scopedTo = options.category;
@@ -4205,8 +5105,25 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
 
     const where: Record<string, unknown> = scopedTo === null ? {} : { category: scopedTo };
 
-    const validationReportPath = path.join(outDir, VALIDATION_REPORT_FILE);
-    const importReportPath = path.join(outDir, IMPORT_REPORT_FILE);
+    // THE destination, resolved once. Both artefact paths and the publication
+    // lock are built from this one value, so the directory that is locked is
+    // the directory that is written — and because an identity carries no
+    // symlink, a retarget of the path `outDir` was spelled as cannot redirect
+    // either of them (see the section above `publicationDirectoryDriftRefusal`).
+    // `main()` already hands over an identity; a caller that hands over a
+    // spelling gets the same guarantee from this line.
+    const publicationDirectory = physicalPathIdentity(outDir);
+
+    // Before the lock, because taking the lock creates the output directory:
+    // a scoped run aimed at the committed pair must be refused without leaving
+    // a directory behind inside the committed tree. The same check runs again
+    // under the lock, on the identity verified there.
+    if (scopedTo !== null) {
+        assertScopedReportMayPublish(scopedTo, options.out, publicationDirectory);
+    }
+
+    const validationReportPath = path.join(publicationDirectory, VALIDATION_REPORT_FILE);
+    const importReportPath = path.join(publicationDirectory, IMPORT_REPORT_FILE);
 
     // The lock spans the WHOLE run, not just the two renames. The half of
     // `import-report.json` this stage does not own is read at the end and
@@ -4215,7 +5132,87 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
     // silently reverted to the values this run read. Holding the lock across
     // both passes also means the artefacts an operator finds afterwards were
     // produced by exactly one publisher.
-    return io.withPublicationLock(outDir, PUBLICATION_HOLDER, async (): Promise<ReportOutcome> => {
+    return io.withPublicationLock(publicationDirectory, PUBLICATION_HOLDER, async (): Promise<ReportOutcome> => {
+        // UNDER THE LOCK, BEFORE ANYTHING IS READ OR STAGED. Resolving the
+        // destination and publishing into it are two moments, and everything an
+        // attacker needs is the gap between them: retarget a symlink on the
+        // output path, or replace the resolved directory, and a run that trusted
+        // its earlier answer would publish somewhere it never checked. The lock
+        // is keyed on this same identity (manifest.ts's
+        // `ArtifactPublicationLock.physicalDirectory`), so re-deriving it here
+        // also proves the lock and the writes are about one directory.
+        const drift = publicationDirectoryDriftRefusal({
+            named: outDir,
+            expected: publicationDirectory,
+            observedFromNamedPath: physicalPathIdentity(outDir),
+            observedFromIdentity: physicalPathIdentity(publicationDirectory),
+        });
+        if (drift !== null) {
+            throw new CatalogReportError(drift, 'output_directory_changed');
+        }
+
+        // And the scoped-report guard again, on the identity just verified.
+        // `main()` checks it before the run starts and this function checks it
+        // before the lock, which is where an operator wants the refusal;
+        // repeating it here is what stops a retarget after those checks — or a
+        // caller that never made them — from landing one category's figures on
+        // the committed whole-catalog pair.
+        if (scopedTo !== null) {
+            assertScopedReportMayPublish(scopedTo, options.out, publicationDirectory);
+        }
+
+        // THE DIRECTORY BOTH ARTEFACT NAMES ARE CREATED IN, held to the
+        // pipeline's one definition of a publishable parent: a real directory,
+        // not a link, that no other local principal may plant a name in. Both
+        // artefacts share it, so one call decides for both. `main()` holds the
+        // publication directory's OWN parent to the same rule when it decides
+        // the destination (`resolveReportOutputDirectory`); this call is the one
+        // every caller of `runReport` goes through, and it runs before anything
+        // is read, staged or promoted.
+        assertSafeArtifactParent(validationReportPath);
+
+        // THE IDENTITY OF THE DIRECTORY ITSELF, captured now — under the lock,
+        // on a directory whose resolution has just been re-verified — and
+        // re-checked immediately before every path-based operation that follows
+        // the awaited measurement below.
+        //
+        // Node offers no descriptor-relative open here: there is no `openat`,
+        // no `mkdirat` and no `renameat`, and neither `fs.rename` nor
+        // `fs.createWriteStream` will take a directory handle. This stage
+        // therefore cannot hold the publication directory as a capability and
+        // write through it — the instrument available is revalidation
+        // immediately before each path use, which narrows the window to the two
+        // statements between the `lstat` and the call it authorises and turns a
+        // redirected publication into a refusal instead of a silent write
+        // somewhere else (CWE-59, CWE-367).
+        const publicationIdentity = observePublicationDirectory(publicationDirectory, runLogger);
+        if (publicationIdentity === null) {
+            throw new CatalogReportError(
+                `${publicationDirectory} does not hold a real directory under the publication lock, so this run has ` +
+                    `no identity to hold its writes to and published nothing; the previous ${VALIDATION_REPORT_FILE} ` +
+                    `and ${IMPORT_REPORT_FILE} are intact. Check what is at that name, then run the stage again.`,
+                'output_directory_changed',
+            );
+        }
+
+        /**
+         * Refuses unless the publication directory is still the one identified
+         * above. Called immediately before each path-based operation after the
+         * measurement, so nothing separates the check from the act it
+         * authorises, and `operation` names what did not happen.
+         */
+        const assertPublicationDirectoryUnreplaced = (operation: string): void => {
+            const replaced = publicationDirectoryReplacedRefusal({
+                directory: publicationDirectory,
+                operation,
+                expected: publicationIdentity,
+                observed: observePublicationDirectory(publicationDirectory, runLogger),
+            });
+            if (replaced !== null) {
+                throw new CatalogReportError(replaced, 'output_directory_changed');
+            }
+        };
+
         const measurement = await measureCatalog(db, where);
         runLogger.info('catalog_measured', {
             stage: STAGE,
@@ -4227,6 +5224,24 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
         // Before either artefact is written: a published food with no validation
         // record would make this report claim evidence that does not exist.
         assertEveryPublishedItemHasARecord(measurement);
+
+        // The offending rows are logged as structured fields as well as named
+        // in the failure, because `describeFailure` reports a code and a
+        // scrubbed error and deliberately no message — so without this line the
+        // operator would see that the run refused and not which rows to fix.
+        if (measurement.unrecognisedStoredValueCount > 0) {
+            runLogger.error('stored_value_outside_closed_set', {
+                stage: STAGE,
+                values: measurement.unrecognisedStoredValueCount,
+                columns: [...new Set(measurement.unrecognisedStoredValues.map((entry) => entry.field))]
+                    .sort(compareStrings)
+                    .join(','),
+                examples: measurement.unrecognisedStoredValues
+                    .map((entry) => `${entry.sourceKey} ${entry.field}=${entry.value}`)
+                    .join('; '),
+            });
+        }
+        assertRecognisedStoredValues(measurement);
 
         const shortfall = computeCoverageShortfall(policy, measurement.publishedByCategory);
         const rows = buildCoverageRows(policy, plan, measurement, shortfall);
@@ -4240,6 +5255,12 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
         // The CANONICAL file, so the fields the import and generation stages own
         // are the ones preserved; the staged document read back below is this
         // run's own output.
+        //
+        // The measurement above was awaited, which means the filesystem has had
+        // the length of two catalog scans to change since the checks under the
+        // lock. Every path use from here to the promotion therefore re-verifies
+        // the directory first.
+        assertPublicationDirectoryUnreplaced(`reading the fields ${VALIDATION_REPORT_FILE} already carries`);
         const existingValidationReport = io.readHeaderObject(validationReportPath);
         const validationEntries = buildValidationReportEntries({
             plan,
@@ -4254,6 +5275,7 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
             existing: existingValidationReport,
         });
 
+        assertPublicationDirectoryUnreplaced(`staging ${VALIDATION_REPORT_FILE}`);
         const validationSink = io.openStagedSink(validationReportPath);
         const staged: StagedArtifact[] = [validationSink.staged];
 
@@ -4311,6 +5333,12 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
             // file, and only the file can show that what this run measured is
             // what it actually serialised. Reading the canonical path here
             // instead would reconcile against the PREVIOUS run's artefact.
+            //
+            // The item pass above is the second awaited scan, so the directory
+            // is re-verified before this read too: the staging path is a name
+            // inside it, and a reconciliation made from a document read through
+            // a replaced directory would gate the pair on somebody else's file.
+            assertPublicationDirectoryUnreplaced(`reading the staged ${VALIDATION_REPORT_FILE} back`);
             reconcileQuarantineFigures({
                 validationReportPath,
                 importReportPath,
@@ -4321,6 +5349,7 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
                 measured: quarantine,
             });
 
+            assertPublicationDirectoryUnreplaced(`reading the fields ${IMPORT_REPORT_FILE} already carries`);
             const existingImportReport = io.readHeaderObject(importReportPath);
             // One merge policy for all three stages that write this file
             // (`MERGED_REPORT_COMPOUND_BLOCKS`), so a sub-key a sibling stage
@@ -4350,6 +5379,7 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
                 },
             );
 
+            assertPublicationDirectoryUnreplaced(`staging ${IMPORT_REPORT_FILE}`);
             staged.push(io.stageJsonObject(importReportPath, merge.document));
             runLogger.info('import_report_staged', {
                 stage: STAGE,
@@ -4361,6 +5391,13 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
             // The publication: both documents are complete, both are reconciled
             // against each other, and only now does either replace what is on
             // disk.
+            //
+            // The last revalidation, immediately before the renames. Promotion
+            // is the one operation whose effect cannot be taken back, and it is
+            // performed on the artefact PATHNAMES — so this is the check that
+            // decides whether the pair lands in the directory this run locked or
+            // in whatever took its place.
+            assertPublicationDirectoryUnreplaced(`publishing ${VALIDATION_REPORT_FILE} and ${IMPORT_REPORT_FILE}`);
             io.promote(staged);
             runLogger.info('artefacts_published', {
                 stage: STAGE,
@@ -4392,6 +5429,13 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
             // evidence, never a run that half-replaced the evidence it was
             // rewriting — but note that is a property of the journal, not of
             // this handler, which cannot undo a rename by itself.
+            //
+            // The discard is by pathname and deliberately NOT gated on the
+            // directory identity: it must run even when the refusal above was
+            // the directory being replaced, or this run's own staging files
+            // would be left behind, and it cannot remove anything of anyone
+            // else's because every staging name carries manifest.ts's
+            // unguessable suffix and "already gone" is treated as success.
             validationSink.sink.destroy();
             io.discard(staged);
             runLogger.warn('artefacts_discarded', {
@@ -4399,7 +5443,17 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
                 stagingPaths: staged.map((artifact) => artifact.stagingPath).join(','),
                 validationReport: validationReportPath,
                 importReport: importReportPath,
-                previousArtefacts: 'rolled back to the generation this run found',
+                // This field says what is KNOWN here, which is not the state of
+                // the canonical pair. `promoteStagedArtifacts` proves its
+                // rollback before it reports one, and a rollback step that
+                // fails leaves the journal and the backups on disk and says so
+                // in the message logged verbatim under `error` below — so a
+                // fixed claim here that the previous generation is back would
+                // contradict that message in exactly the case an operator is
+                // reading this line to understand.
+                previousArtefacts:
+                    'stated in error: a rollback is reported only once proven, and otherwise the publication ' +
+                    'journal and the backups were kept for the next run to revert from',
                 error: safeError(error),
             });
             throw error;
@@ -4414,14 +5468,18 @@ export const runReport = async (deps: RunReportDeps): Promise<ReportOutcome> => 
 // Every error class this file can observe gets its own reported code; anything
 // unrecognised is reported through safeError under `unexpected_error` rather
 // than swallowed or printed raw (Rule backend-architecture §8).
-const describeFailure = (error: unknown): { code: string; error: { name: string; message: string } } => {
-    if (error instanceof CatalogReportError) {
+// The reported `error` is `SafeErrorFields` — a scrubbed name plus an optional
+// machine code and status, and deliberately no `message`: this value reaches the
+// durable run log and the operator console, where foreign prose can carry a
+// connection URL, a key or a fragment of the document that failed (CWE-532).
+const describeFailure = (error: unknown): { code: string; error: SafeErrorFields } => {
+    if (isThrownInstanceOf(error, CatalogReportError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof DatabaseOriginError) {
+    if (isThrownInstanceOf(error, DatabaseOriginError)) {
         return { code: error.code, error: safeError(error) };
     }
-    if (error instanceof ManifestError) {
+    if (isThrownInstanceOf(error, ManifestError)) {
         return { code: error.code, error: safeError(error) };
     }
     return { code: 'unexpected_error', error: safeError(error) };
@@ -4482,14 +5540,18 @@ const openReportSnapshot = async <T>(client: SnapshotCapableClient, run: (db: Re
         // finding about the catalog or about the artefacts, not about the
         // snapshot, and relabelling it would send an operator to the wrong
         // place.
-        if (error instanceof CatalogReportError || error instanceof ManifestError || error instanceof DatabaseOriginError) {
+        if (isThrownInstanceOf(error, CatalogReportError) || isThrownInstanceOf(error, ManifestError) || isThrownInstanceOf(error, DatabaseOriginError)) {
             throw error;
         }
         if (isPrismaError(error)) {
             throw new CatalogReportError(
                 'the snapshot the two passes share could not be opened or could not be held for the whole run, so ' +
                     'no artefact was written and the previous pair is intact: ' +
-                    `${safeError(error).message} (isolation ${REPORT_SNAPSHOT_ISOLATION}, timeout ` +
+                    // Prisma's message carries the connection target and the
+                    // failing statement's values; its `P####` code is the part
+                    // an operator searches for, and formatSafeError keeps
+                    // exactly that.
+                    `${formatSafeError(error)} (isolation ${REPORT_SNAPSHOT_ISOLATION}, timeout ` +
                     `${REPORT_SNAPSHOT_TIMEOUT_MS} ms, connection wait ${REPORT_SNAPSHOT_MAX_WAIT_MS} ms).`,
                 'report_snapshot_failed',
             );
@@ -4527,10 +5589,7 @@ const main = async (): Promise<number> => {
     const origin = classifyDatabaseOrigin(process.env[DATABASE_URL_ENV]);
     logger.info('database_origin_accepted', {
         stage: STAGE,
-        originClass: origin.originClass,
-        host: origin.host,
-        database: origin.database,
-        reason: origin.reason,
+        ...originLogFields(origin),
     });
 
     const plan = loadCoveragePlan();
@@ -4545,40 +5604,20 @@ const main = async (): Promise<number> => {
         );
     }
 
-    // The artefacts are written to the directory as the operator named it, so
-    // the paths in the log and in any failure are the ones they typed. The
-    // scoped-report check below compares the two directories with their
-    // symlinks resolved instead, because the DESTINATION is what decides that
-    // check and a symlink, a bind mount or a differently-spelled path would
-    // otherwise name the committed report directory without matching it.
-    const outDir = resolveOutDir(parsed.options.out);
-    const canonicalReportDir = canonicalReportDirectory();
-    const resolvedOutDir = canonicalizeDirectoryPath(outDir);
-    const resolvedCanonicalReportDir = canonicalizeDirectoryPath(canonicalReportDir);
-    const writesCommittedArtefacts = writesIntoCanonicalReportDirectory(resolvedOutDir, resolvedCanonicalReportDir);
-
-    if (scopedTo !== null) {
-        // Omitting `--out` and passing the committed directory as `--out`
-        // produce the same partial artefacts in the same place, so both are
-        // refused: a guard that only asked whether the flag was given would
-        // wave the explicit form through.
-        const refusal = scopedReportRefusal({
-            category: scopedTo,
-            out: parsed.options.out,
-            resolvedOutDir,
-            canonicalReportDir: resolvedCanonicalReportDir,
-        });
-        if (refusal !== null) {
-            throw new CatalogReportError(refusal, 'scoped_report_needs_out_dir');
-        }
-    }
+    // ONE directory, decided here: the scoped-report guard, the publication
+    // lock and both artefact writes are all about `destination.directory`. The
+    // operator's own spelling is carried alongside it and named in the log and
+    // in any refusal — it is what helps them recognise the run — but nothing is
+    // ever written through it, because a spelling can be retargeted between the
+    // guard and the rename and an identity cannot.
+    const destination = resolveReportOutputDirectory({ options: parsed.options, logger });
 
     logger.info('stage_invoked', {
         stage: STAGE,
-        outDir,
-        resolvedOutDir,
-        canonicalReportDir: resolvedCanonicalReportDir,
-        writesCommittedArtefacts,
+        outDir: destination.directory,
+        namedOutDir: destination.named,
+        canonicalReportDir: destination.canonicalReportDir,
+        writesCommittedArtefacts: destination.writesCommittedArtefacts,
         categoryFilter: scopedTo,
     });
 
@@ -4603,7 +5642,7 @@ const main = async (): Promise<number> => {
                 allowlistVersion: allowlist.allowlistVersion,
                 evidenceRegistrySnapshot: allowlist.registrySnapshot,
                 options: parsed.options,
-                outDir,
+                outDir: destination.directory,
                 logger,
                 io: defaultReportIo(),
             }),

@@ -43,11 +43,18 @@
  *
  * WHY IT DRIVES `runSeed(deps)` RATHER THAN THE COMMAND. The stage's own
  * `main()` reads `process.argv`, classifies the ambient `DATABASE_URL` and calls
- * `process.exit`, none of which a test may do. `runSeed` takes its Prisma
- * client, its recipe directory, its clock and its report path as dependencies
- * for exactly this reason, so every scenario here runs the production code path
- * with nothing stubbed but those four seams. The argument parser, the preflight
- * check and the pure helpers are covered directly, as pure functions.
+ * `process.exit`, none of which a test may do. `runSeed` takes everything it
+ * touches as an injected dependency for exactly this reason — `SeedDeps` in
+ * `scripts/recipes-seed.ts` is the authority on the full set — and every
+ * scenario here runs the production code path with only those seams replaced.
+ * The ones that shape the scenarios below are the temporary recipe directory,
+ * the pinned clock, the coverage report's path and writer, the separable run
+ * LEDGER client (`runDb`, so a scenario can fault the publication client
+ * without destroying the row that records the failure), and the two lock holds
+ * (`runUnderCatalogLock`, `runUnderWriterLock`), which are seams because a
+ * shared hold and a ZOMBIE session are otherwise unreachable from a test. The
+ * argument parser, the preflight check and the pure helpers are covered
+ * directly, as pure functions.
  *
  * WHY THE CATALOG IS SYNTHETIC. The stage resolves ingredients against
  * `catalog_foods`, and the committed v1 release is 13 MB of foods against which
@@ -88,13 +95,20 @@ import {
     entryScriptName,
     SCRIPT_DATABASE_POLICIES,
 } from '../../../scripts/lib/dbGuard';
-import { CheckpointError } from '../../../scripts/lib/checkpoint';
+import {
+    CATALOG_STAGE_LOCK_MODES,
+    catalogStageLockMode,
+    CheckpointError,
+} from '../../../scripts/lib/checkpoint';
+import type { CatalogRunKind, CatalogStageName } from '../../../scripts/lib/checkpoint';
 import { createLogger, safeError } from '../../../scripts/lib/logger';
 import { loadCoveragePlan, recipesDir, writeJsonFile } from '../../../scripts/lib/manifest';
 import type { CoveragePlan } from '../../../scripts/lib/manifest';
 import type { LogLevel, ScriptLogger } from '../../../scripts/lib/logger';
 import {
     buildIngredientVocabulary,
+    CATALOG_READER_STAGE,
+    CATALOG_READER_STAGE_MODE,
     describeFailure,
     deriveCoverageReport,
     equivalentContent,
@@ -775,11 +789,12 @@ const failingOnPublication = (nth: number): SeedDb => {
  * The real client with a catalog change committed just before the first
  * publication transaction opens.
  *
- * This is the concurrency F14 is about, in the one form a single-process test
- * can produce it: the validation pass read the catalog, and by the time the
- * first recipe is written a catalog stage has moved a row underneath it. The
- * mutation runs through the real client and commits, so the publication's own
- * re-read sees exactly what a concurrent `catalog-load` would have left.
+ * This is the concurrency the per-publication re-read exists for, in the one
+ * form a single-process test can produce it: the validation pass read the
+ * catalog, and by the time the first recipe is written a catalog stage has
+ * moved a row underneath it. The mutation runs through the real client and
+ * commits, so the publication's own re-read sees exactly what a concurrent
+ * `catalog-load` would have left.
  */
 const mutatingCatalogBeforeFirstPublication = (mutate: () => Promise<void>): SeedDb => {
     const real = prisma as unknown as SeedDb;
@@ -2062,12 +2077,19 @@ describe('what a refusal reports', () => {
     });
 
     // §8: never the raw error object. `safeError` is the shape the stage reports
-    // a failure in, and it carries exactly two members — a stack or a `cause`
-    // chain reaching a log is how a connection string escapes.
-    it('reduces the failure to a scrubbed name and message, with no stack', () => {
+    // a failure in, and it carries a CLOSED set of machine-readable members —
+    // the class name and the code it declares. Neither the message nor a stack
+    // nor a `cause` chain travels, because each of those is how a connection
+    // string or a fragment of the file that failed escapes into a log.
+    //
+    // The refusal's own detail is not lost by this: `recipes_rejected` above
+    // carries `problems`, a list this repository composed, and that is where an
+    // operator reads what was wrong with the corpus.
+    it('reduces the failure to a scrubbed name and its code, with no message or stack', () => {
         expect(describeFailure(refusal)).toEqual({ code: 'recipes_invalid', error: safeError(refusal) });
-        expect(Object.keys(safeError(refusal)).sort()).toEqual(['message', 'name']);
+        expect(Object.keys(safeError(refusal)).sort()).toEqual(['code', 'name']);
         expect(safeError(refusal).name).toBe('RecipeSeedError');
+        expect(safeError(refusal)).not.toHaveProperty('message');
 
         for (const entry of captured) {
             expect(entry.line).not.toContain('"stack"');
@@ -2122,6 +2144,50 @@ describe('a narrowed or dry run', () => {
         expect(fs.existsSync(reportPath())).toBe(false);
         expect(await prisma.recipes.count()).toBe(1);
     }, BLOCK_TIMEOUT_MS);
+});
+
+describe('the stage label this seed borrows for its catalog hold', () => {
+    /**
+     * The stage's header (THE BORROWED READER STAGE) justifies taking the graph
+     * lock under an EXISTING label rather than adding one of its own, and it
+     * states the shape of `CATALOG_STAGE_LOCK_MODES` to do so: four mutating run
+     * kinds exclusive, and exactly two read-only labels — `release`, the export, and
+     * `benchmark`, the search-acceptance measurement — both shared. That is a
+     * claim about scripts/lib/checkpoint.ts, which this file does not own, so it
+     * is asserted here against the table itself: a reader label added, removed
+     * or re-moded there fails these three cases rather than silently leaving the
+     * rationale describing a table that no longer exists.
+     */
+    const mutatingStages: readonly CatalogRunKind[] = ['usda_import', 'ai_generation', 'validation', 'release_load'];
+
+    const readerLabels = (): readonly CatalogStageName[] =>
+        (Object.keys(CATALOG_STAGE_LOCK_MODES) as readonly CatalogStageName[]).filter(
+            (stage) => !(mutatingStages as readonly string[]).includes(stage),
+        );
+
+    it('leaves exactly two read-only labels in the table, and both take the lock shared', () => {
+        expect([...readerLabels()].sort()).toEqual(['benchmark', 'release']);
+        expect(readerLabels().map((stage) => CATALOG_STAGE_LOCK_MODES[stage])).toEqual(['shared', 'shared']);
+    });
+
+    it('keeps every mutating run kind exclusive, which is what a shared hold is refused by', () => {
+        expect(mutatingStages.map((stage) => CATALOG_STAGE_LOCK_MODES[stage])).toEqual([
+            'exclusive',
+            'exclusive',
+            'exclusive',
+            'exclusive',
+        ]);
+    });
+
+    it('borrows `release` from those two, so the mode this stage passes is the shared one', () => {
+        expect(CATALOG_READER_STAGE).toBe('release');
+        expect(readerLabels()).toContain(CATALOG_READER_STAGE);
+        // Both halves: the constant this stage passes to withCatalogStageLock,
+        // and what checkpoint.ts itself resolves that label to — so the hold
+        // stays shared whether the table is consulted or the mode is passed.
+        expect(CATALOG_READER_STAGE_MODE).toBe('shared');
+        expect(catalogStageLockMode(CATALOG_READER_STAGE)).toBe(CATALOG_READER_STAGE_MODE);
+    });
 });
 
 describe('the catalog hold the run publishes under', () => {
@@ -2315,12 +2381,13 @@ describe('the catalog hold the run publishes under', () => {
 
 describe('the writer lock that makes this stage the only seed', () => {
     /**
-     * SCRLOAD-F15's remaining half. The graph hold above is SHARED, so it is
-     * compatible with itself; the run ledger's lease is keyed on the CORPUS
-     * FINGERPRINT, so two different revisions of the files never meet on it, and
-     * an `--only`-narrowed run claims no ledger row at all. Two seeds could
-     * therefore publish overlapping slugs in separate transactions and race the
-     * coverage report. This block settles the lock that stops them: one
+     * The remaining half of what the graph hold cannot settle. That hold is
+     * SHARED, so it is compatible with itself; the run ledger's lease is keyed
+     * on the CORPUS FINGERPRINT, so two different revisions of the files never
+     * meet on it, and an `--only`-narrowed run claims no ledger row at all.
+     * Two seeds could therefore publish overlapping slugs in separate
+     * transactions and race the coverage report. This block settles the lock
+     * that stops them: one
      * exclusive, session-scoped hold on a constant key, taken for every non-dry
      * run whatever corpus it names and however narrow it is.
      *
@@ -3326,16 +3393,32 @@ describe('the database policy the stage runs under', () => {
             script: SCRIPT,
             policy: 'development_or_confirmed',
             originClass: 'test',
-            host: '127.0.0.1',
-            database: 'soh_test',
+            // Which half of the rule certified it: this URL's database name is
+            // what matched, so the typed `--confirm-target` above had a name to
+            // agree with.
+            match: 'name',
         });
 
-        // The classification, never the URL it came from: the scheme, the user
-        // and the password are each absent from every line the guard emitted.
+        // NEITHER HALF OF THE TARGET, by name or by value. This line is written
+        // on every accepted run of every stage, so it reaches CI logs and
+        // whatever ships them onward; a host and a database name there describe
+        // the deployment's topology to every later reader (CWE-532) without
+        // telling an operator anything the classification does not already say.
+        // The digest keeps two runs distinguishable without naming either
+        // target — `dbGuard.test.ts` owns that pair of assertions.
+        expect(Object.keys(accepted[0].entry)).not.toContain('host');
+        expect(Object.keys(accepted[0].entry)).not.toContain('database');
+        expect(accepted[0].entry.targetDigest).toMatch(/^[0-9a-f]{12}$/);
+
+        // The classification, never the URL it came from: the scheme, the user,
+        // the password, the host and the database name are each absent from
+        // every line the guard emitted.
         for (const entry of captured) {
             expect(entry.line).not.toContain('postgresql://');
             expect(entry.line).not.toContain('seeduser');
             expect(entry.line).not.toContain('fixture-only');
+            expect(entry.line).not.toContain('127.0.0.1');
+            expect(entry.line).not.toContain('soh_test');
         }
     });
 
@@ -3352,15 +3435,25 @@ describe('the database policy the stage runs under', () => {
 describe('describeFailure', () => {
     it('reports the stage\'s own refusal under its code', () => {
         expect(describeFailure(new RecipeSeedError('unknown_slug', 'no such slug')).code).toBe('unknown_slug');
-        expect(describeFailure(new RecipeSeedError('recipes_invalid', 'bad', ['one', 'two'])).error.message).toContain(
-            'one',
-        );
+        // The CODE carries the refusal, not the message: a `recipes_invalid`
+        // error's per-problem detail reaches an operator through the
+        // `recipes_rejected` log line's `problems` list, which this repository
+        // authored. The reported error is the class and the code only.
+        expect(describeFailure(new RecipeSeedError('recipes_invalid', 'bad', ['one', 'two']))).toEqual({
+            code: 'recipes_invalid',
+            error: { name: 'RecipeSeedError', code: 'recipes_invalid' },
+        });
     });
 
     it('reports anything unrecognised as unexpected rather than swallowing it', () => {
+        // An unrecognised failure is the case where withholding the message
+        // matters most: nothing here knows what threw, so its prose could be a
+        // driver's connection error quoting the DSN or a parser quoting the
+        // document. The code says "this stage did not anticipate it", which is
+        // the actionable half.
         expect(describeFailure(new Error('boom'))).toEqual({
             code: 'unexpected_error',
-            error: { name: 'Error', message: 'boom' },
+            error: { name: 'Error' },
         });
     });
 });

@@ -61,8 +61,9 @@
 //  * NOTHING IS ROUNDED HERE. Day and meal totals are carried at full
 //    precision. Display rounding belongs to `recipe.logic.ts::roundNutritionForDisplay`
 //    via the mapper, and the diary snapshot rounds exactly once, inside
-//    `nutrition.service.ts::insertPlannedMealEntry`. An extra round here would
-//    shift every number downstream of it.
+//    `plannedMealLog.logic.ts::derivePlannedSnapshot` — whose integers
+//    `nutrition.service.ts::insertPlannedMealEntry` then stores verbatim. An
+//    extra round here would shift every number downstream of it.
 //
 //  * EXHAUSTION IS A PRODUCT ANSWER, NOT AN ENGINEERING FAILURE. Running out of
 //    evaluations throws {@link NoMatchingMealsError} — a 422 carrying
@@ -1264,13 +1265,16 @@ const EMPTY_RECIPE_IDS: ReadonlySet<string> = new Set<string>();
  *
  * `additionalExcludedRecipeIds` is an OPTIONAL exclusion set the CALLER chooses,
  * on top of the rule — it is not part of §0.7.3 and defaults to empty, so a
- * caller that says nothing gets exactly the two clauses above. Its one caller is
- * `swap.logic.ts`, which passes the other meals of the same day so the
- * alternatives sheet never offers a dish the user is already eating that day.
- * That narrowing is right THERE and wrong here: the swap list is eight rows with
- * a drawn "no alternatives" state, so a shorter list is a supported outcome,
- * whereas a refusal by the generator is a whole week the user cannot have.
- * `searchPlanWeek` therefore leaves it absent, on purpose.
+ * caller that says nothing gets exactly the two clauses above. NO CURRENT CALLER
+ * PASSES IT: `searchPlanWeek` omits it and so does `swap.logic.ts`, which
+ * applies the two clauses to the week with the meal being replaced removed and
+ * narrows nothing further. That is deliberate rather than incidental — a
+ * swap-only narrowing would make the alternatives sheet refuse a dish the
+ * generator would have planted in the same slot, and the list, the preview and
+ * the commit all read the sheet's own rows. The parameter is kept because the
+ * exclusion it expresses is a caller's to name, and because keeping it here is
+ * what stops a caller that ever needs one from spelling the repetition rule a
+ * second time.
  *
  * Every argument looks BACKWARDS — uses so far, the adjacent day's recipes, and
  * whatever extra the caller excludes. That is what lets the depth-first search
@@ -1545,9 +1549,9 @@ export const isDayWithinTolerance = (
  * A day's planned totals, summed at FULL PRECISION.
  *
  * Never rounded here. `mealPlan.mapper.ts` rounds for display and
- * `nutrition.service.ts::insertPlannedMealEntry` rounds the diary snapshot once
- * on insert; rounding each meal first and summing the results would drift the
- * day total away from both.
+ * `plannedMealLog.logic.ts::derivePlannedSnapshot` rounds the diary snapshot
+ * once; rounding each meal first and summing the results would drift the day
+ * total away from both.
  *
  * Each meal's four figures are guarded as they are added, so a non-finite one
  * is named with the meal it came from rather than anonymised into the sum. A
@@ -1890,11 +1894,12 @@ export const searchPlanWeek = (input: PlanSearchInput): PlanSearchOutcome => {
         for (const candidate of pool) {
             const recipeId = candidate.recipe.recipe_id;
 
-            // Three arguments, not four: the generator holds the week to
-            // §0.7.3's two clauses and adds no same-day exclusion of its own,
-            // because a refusal here costs the user the whole week rather than
-            // a row of a list. The optional fourth argument belongs to
-            // `swap.logic.ts` — see {@link violatesRepetitionRule}.
+            // Three arguments, not four: the week is held to §0.7.3's two
+            // clauses and to no exclusion of this module's own. `swap.logic.ts`
+            // calls it with the same three, so the generator and the
+            // alternatives sheet accept exactly the same meals; the optional
+            // fourth argument is a caller-chosen exclusion outside the rule
+            // that neither of them passes — see {@link violatesRepetitionRule}.
             if (
                 violatesRepetitionRule(recipeId, usesByRecipeId.get(recipeId) ?? 0, previousDayRecipeIds)
             ) {

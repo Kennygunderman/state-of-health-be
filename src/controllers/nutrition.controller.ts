@@ -59,8 +59,17 @@ const ACTIONS = {
  * on the estimate path, `EstimateFailedError.message` — which quotes the
  * vendor's own response text. None of that can satisfy AAP §0.3.2/§0.7.1, and
  * Rule backend-architecture §8 asks for a safe message rather than the raw
- * error. Every response body and status on these routes is unchanged: they are
- * shipped diary contracts, and this is a logging change only.
+ * error. Replacing those nine lines changed no response: every status and body
+ * these paths answer with is the one shipped clients already read.
+ *
+ * The diary's one deliberate status change is at the parsers, not here. A body
+ * whose stored text carries U+0000 now earns `400 invalid_request` with
+ * `invalid_characters` details — `nutrition.logic.ts::parseMealEntryEditBody`
+ * judges `name` for `PUT /macros/entry/:id`, and `parseLogEntryBody` judges
+ * `name`, `servingText` and `rawInput` for `POST /macros/meal/:mealId/entries`
+ * — where that value used to reach the column, PostgreSQL refused it with
+ * `22021` and the route answered 500. `api/log.test.ts` pins both statuses,
+ * both bodies and the row the refusal leaves untouched.
  */
 const logRouteFailure = (action: string, status: number, error: unknown): void => {
     logSafeEvent('error', 'request_failed', {

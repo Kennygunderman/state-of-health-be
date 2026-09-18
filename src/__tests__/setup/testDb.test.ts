@@ -8,25 +8,45 @@ import type {
     AppliedMigrationRow,
     CommandOutput,
     LedgerComparison,
+    MigrateDeployInvocation,
+    MigrateDeployResult,
     MigrationFingerprint,
+    PostgresSession,
+    PostgresSessionOpener,
+    RecreateOptions,
     SchemaObservation,
     SchemaReader,
 } from './testDb';
 import {
+    CONFIRM_TARGET_FLAG,
     FEATURE_TABLES,
+    MAINTENANCE_DATABASE,
     MIGRATIONS_DIRECTORY,
     MIGRATIONS_DIRECTORY_FLAG,
+    RECREATE_FLAG,
     SchemaFreshnessError,
     SchemaReadFailure,
     TestDatabaseGuardError,
+    TestDatabaseRecreateError,
+    TestDatabaseSessionError,
     assertSchemaFreshness,
+    assertSessionTarget,
     assertTestDatabase,
+    buildMigrateDeployInvocation,
     compareMigrationLedger,
+    createStatements,
     declaredColumnsFromMigrationSql,
+    deriveDatabaseUrl,
     describeSchemaFreshnessRefusal,
     missingDeclaredColumns,
     readMigrationFingerprints,
+    recreateStatements,
+    recreateTestDatabase,
+    runRecreateCommand,
     runSchemaFreshnessCommand,
+    runTestDbCommand,
+    serverFingerprint,
+    truncateFeatureTablesStatement,
 } from './testDb';
 
 const BACKEND_ROOT = join(__dirname, '..', '..', '..');
@@ -193,6 +213,44 @@ describe('assertTestDatabase', () => {
         ])('refuses $scenario, because the URL does not determine what it opens', ({ databaseUrl }) => {
             expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'ambiguous_database_url');
         });
+
+        // The schema half of the same rule, and the one that reaches this
+        // guard's own destructive statement. Measured on PostgreSQL 16.15 with
+        // a decoy `live` schema beside `public`: under Prisma `?schema=live`
+        // and `?options=-c search_path=live` both made
+        // `TRUNCATE TABLE "probe_rows" CASCADE` empty `live.probe_rows` and
+        // leave `public.probe_rows` untouched, and under `pg` the `options`
+        // form did the same to an unqualified `INSERT`. Every URL below names a
+        // `_test` database on a local host, so it satisfies both halves of the
+        // test rule and would have been accepted.
+        it.each([
+            { scenario: 'a Prisma schema parameter', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?schema=live` },
+            { scenario: 'a libpq options parameter carrying search_path', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?options=-c%20search_path%3Dlive` },
+            { scenario: 'a search_path parameter', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?search_path=live` },
+            { scenario: 'an upper-case schema key', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?SCHEMA=live` },
+            { scenario: 'a schema key repeated with two values', databaseUrl: `${secretUrl('127.0.0.1', 'soh_test')}?schema=public&schema=live` },
+        ])('refuses $scenario, because the tables it would empty are not this database\'s', ({ databaseUrl }) => {
+            const refusal = expectRefusal(envWith({ DATABASE_URL: databaseUrl }), 'ambiguous_database_url');
+
+            expect(refusal.message).toContain('redirects the schema');
+            expect(refusal.message).toContain('public');
+        });
+
+        it('accepts schema=public, which names the schema the migrations create', () => {
+            expect(() =>
+                assertTestDatabase(envWith({ DATABASE_URL: `${secretUrl('127.0.0.1', 'soh_test')}?schema=public` })),
+            ).not.toThrow();
+        });
+
+        it('accepts a parameter that moves neither the database nor the schema', () => {
+            expect(() =>
+                assertTestDatabase(
+                    envWith({
+                        DATABASE_URL: `${secretUrl('127.0.0.1', 'soh_test')}?connection_limit=5&application_name=soh`,
+                    }),
+                ),
+            ).not.toThrow();
+        });
     });
 
     describe('refusal messages', () => {
@@ -286,6 +344,38 @@ describe('FEATURE_TABLES', () => {
     it('names only plain lower-case identifiers', () => {
         for (const table of FEATURE_TABLES) {
             expect(table).toMatch(/^[a-z_][a-z0-9_]*$/);
+        }
+    });
+});
+
+// The statement, asserted without a database. The schema qualification is a
+// safety property — it is what stops the one destructive statement in this
+// harness from following a `search_path` set outside the URL, by `PGOPTIONS`,
+// by earlier SQL or by `ALTER ROLE … SET search_path` — and a property nothing
+// reads is a property that regresses.
+describe('truncateFeatureTablesStatement', () => {
+    it('qualifies every table with the public schema and cascades once', () => {
+        const statement = truncateFeatureTablesStatement();
+
+        expect(statement.startsWith('TRUNCATE TABLE ')).toBe(true);
+        expect(statement.endsWith(' CASCADE')).toBe(true);
+
+        for (const table of FEATURE_TABLES) {
+            expect(statement).toContain(`"public"."${table}"`);
+        }
+    });
+
+    it('leaves no table unqualified', () => {
+        // Read off the statement rather than off the list, so a table added to
+        // `FEATURE_TABLES` and interpolated some other way still fails here.
+        const tables = truncateFeatureTablesStatement()
+            .replace(/^TRUNCATE TABLE /, '')
+            .replace(/ CASCADE$/, '')
+            .split(', ');
+
+        expect(tables).toHaveLength(FEATURE_TABLES.length);
+        for (const table of tables) {
+            expect(table).toMatch(/^"public"\."[a-z_][a-z0-9_]*"$/);
         }
     });
 });
@@ -694,12 +784,23 @@ describe('describeSchemaFreshnessRefusal', () => {
         expect(message).toContain('meal_plan_preferences.targets_input_revision');
     });
 
-    it('says that migrate deploy will not repair a drift, and how to recreate the database', () => {
+    it('says that migrate deploy will not repair a drift, and points at the guarded recreate', () => {
         const message = refusalFor(drift);
 
         expect(message).toContain('"npx prisma migrate deploy" will not repair this');
-        expect(message).toContain('DROP DATABASE "soh_test_46"; CREATE DATABASE "soh_test_46";');
-        expect(message).toContain('npx prisma migrate deploy');
+        expect(message).toContain('src/__tests__/setup/testDb.ts');
+        expect(message).toContain(`${RECREATE_FLAG} ${CONFIRM_TARGET_FLAG} soh_test_46`);
+    });
+
+    // The remedy an operator meets is the remedy an operator runs, so the one
+    // place this gate names a repair must not name a hand-typed drop: a `_test`
+    // name on a tunnelled or forwarded production server satisfies every rule a
+    // person can apply by eye, which is the whole reason `--recreate` exists.
+    it('names no raw DROP DATABASE anywhere in the repair it recommends', () => {
+        expect(refusalFor(drift)).not.toContain('DROP DATABASE');
+        expect(
+            refusalFor({ kind: 'unfinished', drifted: [], unfinished: [INIT_MIGRATION], pending: [], unknown: [] }),
+        ).not.toContain('DROP DATABASE');
     });
 
     it('tells a pending migration to be deployed, and does not claim deploy is useless', () => {
@@ -842,16 +943,20 @@ describe('assertSchemaFreshness', () => {
             expect(readSchema).not.toHaveBeenCalled();
         });
 
-        it('skips as no_migrations when no migration is on disk', async () => {
+        it('skips as no_migrations when no migration is on disk, naming the directory and the flag', async () => {
             const empty = mkdtempSync(join(tmpdir(), 'soh-no-migrations-'));
             const readSchema = readerFor(observationFor(appliedCleanly));
 
             try {
-                await expect(check(freshEnv(), readSchema, empty)).resolves.toEqual({
+                const result = await check(freshEnv(), readSchema, empty);
+
+                expect(result).toEqual({
                     checked: false,
                     reason: 'no_migrations',
                     detail: expect.stringContaining(empty),
                 });
+                expect(result.checked).toBe(false);
+                expect((result as { detail: string }).detail).toContain(MIGRATIONS_DIRECTORY_FLAG);
                 expect(readSchema).not.toHaveBeenCalled();
             } finally {
                 rmSync(empty, { recursive: true, force: true });
@@ -872,16 +977,20 @@ describe('assertSchemaFreshness', () => {
             expect(result.checked).toBe(false);
         });
 
-        it('skips as unreachable when the reader cannot connect', async () => {
+        it('skips as unreachable when the reader cannot connect, and says to start the server', async () => {
             const readSchema: SchemaReader = jest
                 .fn<Promise<SchemaObservation>, []>()
                 .mockRejectedValue(new SchemaReadFailure('connection failed (ECONNREFUSED)', 'unreachable'));
 
-            await expect(check(freshEnv(), readSchema)).resolves.toEqual({
+            const result = await check(freshEnv(), readSchema);
+
+            expect(result).toEqual({
                 checked: false,
                 reason: 'unreachable',
                 detail: expect.stringContaining('ECONNREFUSED'),
             });
+            expect((result as { detail: string }).detail).toContain('Start the PostgreSQL server');
+            expect((result as { detail: string }).detail).toContain('database "soh_test_46" on host "127.0.0.1"');
         });
 
         it('skips as ledger_unreadable for any other read failure, rather than reporting a wrong schema', async () => {
@@ -889,11 +998,38 @@ describe('assertSchemaFreshness', () => {
                 .fn<Promise<SchemaObservation>, []>()
                 .mockRejectedValue(new Error('permission denied for table _prisma_migrations'));
 
-            await expect(check(freshEnv(), readSchema)).resolves.toEqual({
+            const result = await check(freshEnv(), readSchema);
+
+            expect(result).toEqual({
                 checked: false,
                 reason: 'ledger_unreadable',
                 detail: expect.stringContaining('permission denied'),
             });
+            // Deliberately no remedy: a permission, a shape this gate does not
+            // understand and a timeout do not share one, so the driver's error
+            // is the whole of what the detail can honestly carry. The doc
+            // comment on `runSchemaFreshnessCommand` says exactly this, and
+            // this is what holds it to it.
+            expect((result as { detail: string }).detail).not.toContain('Start the PostgreSQL server');
+            expect((result as { detail: string }).detail).not.toContain('npx prisma');
+            expect((result as { detail: string }).detail).not.toContain(MIGRATIONS_DIRECTORY_FLAG);
+        });
+
+        // `not_applicable` is the fourth skip and the one the command form
+        // cannot print: every URL that produces it is refused by the identity
+        // gate first, which is why it carries no remedy of its own.
+        it('carries no remedy for not_applicable, which the identity gate owns', async () => {
+            const result = await check(
+                freshEnv('postgresql://soh:soh@127.0.0.1:5433/soh_dev_46'),
+                readerFor(observationFor(appliedCleanly)),
+            );
+
+            expect(result).toEqual({
+                checked: false,
+                reason: 'not_applicable',
+                detail: expect.stringContaining('the identity guard owns that refusal'),
+            });
+            expect((result as { detail: string }).detail).not.toContain('npx prisma');
         });
     });
 
@@ -1038,6 +1174,65 @@ describe('runSchemaFreshnessCommand', () => {
         expect(lines.warn[0]).toContain('npx prisma migrate deploy');
     });
 
+    // What the doc comment on this function claims about its skips, held to the
+    // code: three of the four reachable skips print a remedy, and the fourth
+    // prints the driver's error instead of guessing at one.
+    it('warns with the server to start when the database cannot be reached', async () => {
+        const { lines, output } = recordingOutput();
+
+        const code = await runSchemaFreshnessCommand([], output, {
+            env: SAFE_ENV,
+            migrationsDirectory,
+            readSchema: jest
+                .fn<Promise<SchemaObservation>, []>()
+                .mockRejectedValue(new SchemaReadFailure('connection failed (ECONNREFUSED)', 'unreachable')),
+        });
+
+        expect(code).toBe(0);
+        expect(lines.warn).toHaveLength(1);
+        expect(lines.warn[0]).toContain('not verified (unreachable)');
+        expect(lines.warn[0]).toContain('Start the PostgreSQL server');
+    });
+
+    it('warns with the flag that points the comparison elsewhere when no migration is on disk', async () => {
+        const { lines, output } = recordingOutput();
+        const empty = mkdtempSync(join(tmpdir(), 'soh-command-no-migrations-'));
+
+        try {
+            const code = await runSchemaFreshnessCommand([], output, {
+                env: SAFE_ENV,
+                migrationsDirectory: empty,
+                readSchema: readerFor(appliedCleanly),
+            });
+
+            expect(code).toBe(0);
+            expect(lines.warn).toHaveLength(1);
+            expect(lines.warn[0]).toContain('not verified (no_migrations)');
+            expect(lines.warn[0]).toContain(MIGRATIONS_DIRECTORY_FLAG);
+        } finally {
+            rmSync(empty, { recursive: true, force: true });
+        }
+    });
+
+    it('warns with the driver error and no invented command when the ledger cannot be read', async () => {
+        const { lines, output } = recordingOutput();
+
+        const code = await runSchemaFreshnessCommand([], output, {
+            env: SAFE_ENV,
+            migrationsDirectory,
+            readSchema: jest
+                .fn<Promise<SchemaObservation>, []>()
+                .mockRejectedValue(new Error('permission denied for table _prisma_migrations')),
+        });
+
+        expect(code).toBe(0);
+        expect(lines.warn).toHaveLength(1);
+        expect(lines.warn[0]).toContain('not verified (ledger_unreadable)');
+        expect(lines.warn[0]).toContain('permission denied');
+        expect(lines.warn[0]).not.toContain('npx prisma');
+        expect(lines.warn[0]).not.toContain('Start the PostgreSQL server');
+    });
+
     it('exits 1 with exactly one message when the schema does not match', async () => {
         const { lines, output } = recordingOutput();
 
@@ -1103,6 +1298,1082 @@ describe('runSchemaFreshnessCommand', () => {
     });
 });
 
+// The session gate. Every case here runs with NO database: the session opener
+// is a parameter, so each verdict is reachable in process. The LIVE proof — a
+// real `search_path` default on a real server, which is the only way to show
+// that the URL guard above cannot see one — is at the foot of this file, beside
+// the out-of-process proofs.
+describe('assertSessionTarget', () => {
+    const HOST = '127.0.0.1';
+    const DATABASE = 'soh_test_34';
+
+    const sessionEnv = (overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+        ...SAFE_ENV,
+        DATABASE_URL: secretUrl(HOST, DATABASE),
+        ...overrides,
+    });
+
+    /** One session's answers, as the recorder below is told to behave. */
+    interface SessionPlan {
+        connectError?: Error;
+        queryError?: Error;
+        noRow?: boolean;
+        identity?: Record<string, unknown>;
+    }
+
+    const identityRow = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        database: DATABASE,
+        schema: 'public',
+        role: 'soh',
+        server_version: 'PostgreSQL 16.15 on x86_64-pc-linux-musl',
+        server_address: '172.17.0.2',
+        server_port: 5432,
+        postmaster_start_time: '2026-09-17 09:00:00.123456+00',
+        search_path: '"$user", public',
+        ...overrides,
+    });
+
+    const errorWithCode = (message: string, code: string): Error => Object.assign(new Error(message), { code });
+
+    /**
+     * A session that answers from memory and records what it was asked. The
+     * records are the instrument: `opened` shows whether a connection was
+     * attempted at all (empty is the proof that the string gate refused first),
+     * `queries` shows that one round trip settled both questions, and `ended`
+     * shows the handle was released even when the read failed.
+     */
+    const sessionRecorder = (plan: SessionPlan = {}) => {
+        const opened: string[] = [];
+        const queries: string[] = [];
+        let ended = 0;
+
+        const openSession: PostgresSessionOpener = (connectionString: string): PostgresSession => {
+            opened.push(connectionString);
+
+            return {
+                connect: async () => {
+                    if (plan.connectError !== undefined) {
+                        throw plan.connectError;
+                    }
+                },
+                query: async (sql: string) => {
+                    queries.push(sql);
+
+                    if (plan.queryError !== undefined) {
+                        throw plan.queryError;
+                    }
+
+                    return { rows: plan.noRow === true ? [] : [identityRow(plan.identity)] };
+                },
+                end: async () => {
+                    ended += 1;
+                },
+            };
+        };
+
+        return { openSession, opened, queries, endedCount: (): number => ended };
+    };
+
+    const expectSessionRefusal = async (
+        options: { env?: NodeJS.ProcessEnv; openSession?: PostgresSessionOpener },
+        code: string,
+    ): Promise<TestDatabaseSessionError> => {
+        let thrown: unknown;
+
+        try {
+            await assertSessionTarget(options);
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(TestDatabaseSessionError);
+
+        const refusal = thrown as TestDatabaseSessionError;
+        expect(refusal.name).toBe('TestDatabaseSessionError');
+        expect(refusal.code).toBe(code);
+        expect(refusal.message).toContain(DATABASE);
+        expect(refusal.message).toContain(HOST);
+        expect(refusal.message).not.toContain(SECRET_PASSWORD);
+        expect(refusal.message).not.toContain(SECRET_USER);
+        expect(refusal.message).not.toContain('postgresql://');
+
+        return refusal;
+    };
+
+    it('asks one session what it reached and returns what it verified', async () => {
+        const sessions = sessionRecorder();
+
+        const verification = await assertSessionTarget({
+            env: sessionEnv(),
+            openSession: sessions.openSession,
+        });
+
+        expect(verification).toEqual({
+            target: `database "${DATABASE}" on host "${HOST}"`,
+            database: DATABASE,
+            schema: 'public',
+            searchPath: '"$user", public',
+            role: 'soh',
+        });
+
+        // One connection, to the URL itself, and one round trip that settles
+        // both halves of the question.
+        expect(sessions.opened).toEqual([secretUrl(HOST, DATABASE)]);
+        expect(sessions.queries).toHaveLength(1);
+        expect(sessions.queries[0]).toContain('current_database()');
+        expect(sessions.queries[0]).toContain('current_schema()');
+        expect(sessions.queries[0]).toContain("current_setting('search_path')");
+        expect(sessions.endedCount()).toBe(1);
+    });
+
+    it('issues nothing but that one read, so the gate itself destroys nothing', async () => {
+        const sessions = sessionRecorder();
+
+        await assertSessionTarget({ env: sessionEnv(), openSession: sessions.openSession });
+
+        for (const query of sessions.queries) {
+            expect(query.startsWith('SELECT ')).toBe(true);
+        }
+    });
+
+    it('refuses when the session reached a different database than the URL names', async () => {
+        const sessions = sessionRecorder({ identity: { database: 'state_of_health' } });
+
+        const refusal = await expectSessionRefusal(
+            { env: sessionEnv(), openSession: sessions.openSession },
+            'session_database_mismatch',
+        );
+
+        expect(refusal.message).toContain('state_of_health');
+        expect(refusal.message).toContain('PG*');
+    });
+
+    it('refuses a session whose unqualified statements resolve outside public, with both resets', async () => {
+        const sessions = sessionRecorder({
+            identity: { schema: 'live', search_path: 'live, public' },
+        });
+
+        const refusal = await expectSessionRefusal(
+            { env: sessionEnv(), openSession: sessions.openSession },
+            'session_schema_redirected',
+        );
+
+        expect(refusal.message).toContain('"live"');
+        expect(refusal.message).toContain('search_path is "live, public"');
+        // The two server-side defaults that can do this, both named, because an
+        // operator who resets only one is still redirected.
+        expect(refusal.message).toContain(`ALTER ROLE soh IN DATABASE ${DATABASE} RESET search_path`);
+        expect(refusal.message).toContain(`ALTER DATABASE ${DATABASE} RESET search_path`);
+        expect(refusal.message).toContain('unqualified');
+    });
+
+    it('spells a current_schema the server answered as NULL rather than showing an empty name', async () => {
+        // `search_path` naming only schemas that do not exist: PostgreSQL
+        // answers `current_schema()` with NULL, which is not `public` either.
+        const sessions = sessionRecorder({
+            identity: { schema: null, search_path: 'live' },
+        });
+
+        const refusal = await expectSessionRefusal(
+            { env: sessionEnv(), openSession: sessions.openSession },
+            'session_schema_redirected',
+        );
+
+        expect(refusal.message).toContain('resolves in schema (none)');
+        expect(refusal.message).not.toContain('schema ""');
+    });
+
+    it('refuses an unreadable session by the driver code, never by its text', async () => {
+        // A real `28P01` message is `password authentication failed for user
+        // "appuser"`, so quoting the text would put the database user in a
+        // message this module promises never to name one in.
+        const sessions = sessionRecorder({
+            connectError: errorWithCode(`password authentication failed for user "${SECRET_USER}"`, '28P01'),
+        });
+
+        const refusal = await expectSessionRefusal(
+            { env: sessionEnv(), openSession: sessions.openSession },
+            'session_unreadable',
+        );
+
+        expect(refusal.message).toContain('driver error 28P01');
+        expect(refusal.message).not.toContain('password authentication failed');
+    });
+
+    it('refuses an unreachable server rather than skipping it, because a truncate follows', async () => {
+        const sessions = sessionRecorder({
+            connectError: errorWithCode('connect ECONNREFUSED 127.0.0.1:5433', 'ECONNREFUSED'),
+        });
+
+        const refusal = await expectSessionRefusal(
+            { env: sessionEnv(), openSession: sessions.openSession },
+            'session_unreadable',
+        );
+
+        expect(refusal.message).toContain('driver error ECONNREFUSED');
+        expect(sessions.endedCount()).toBe(1);
+    });
+
+    it('refuses when the identity read fails, and still hangs up', async () => {
+        const sessions = sessionRecorder({ queryError: errorWithCode('canceling statement', '57014') });
+
+        await expectSessionRefusal(
+            { env: sessionEnv(), openSession: sessions.openSession },
+            'session_unreadable',
+        );
+
+        expect(sessions.endedCount()).toBe(1);
+    });
+
+    it('refuses a server that answers with no identity row at all', async () => {
+        const sessions = sessionRecorder({ noRow: true });
+
+        const refusal = await expectSessionRefusal(
+            { env: sessionEnv(), openSession: sessions.openSession },
+            'session_unreadable',
+        );
+
+        // No SQLSTATE on this one: it is this harness's own verdict, so its
+        // text is the honest detail rather than a code it does not have.
+        expect(refusal.message).toContain('no row for its own identity');
+    });
+
+    it.each([
+        { scenario: 'a development database name', env: { DATABASE_URL: secretUrl(HOST, 'soh_dev_34') }, code: 'database_name_not_test' },
+        {
+            scenario: 'a _test name on a remote host',
+            env: { DATABASE_URL: secretUrl(UNROUTABLE_RFC_5737_DOCUMENTATION_HOST, 'app_test') },
+            code: 'database_host_not_local',
+        },
+        { scenario: 'NODE_ENV that is not test', env: { NODE_ENV: 'development' }, code: 'node_env_not_test' },
+        {
+            scenario: 'a schema-redirecting URL',
+            env: { DATABASE_URL: `${secretUrl(HOST, DATABASE)}?schema=live` },
+            code: 'ambiguous_database_url',
+        },
+    ])('refuses $scenario on the string gate first, opening no session at all', async ({ env, code }) => {
+        const sessions = sessionRecorder();
+        let thrown: unknown;
+
+        try {
+            await assertSessionTarget({ env: sessionEnv(env), openSession: sessions.openSession });
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(TestDatabaseGuardError);
+        expect((thrown as TestDatabaseGuardError).code).toBe(code);
+        // The point of the order: a URL this module refuses is never opened in
+        // order to be measured.
+        expect(sessions.opened).toEqual([]);
+        expect(sessions.queries).toEqual([]);
+    });
+});
+
+describe('deriveDatabaseUrl', () => {
+    it('replaces only the database, keeping the authority the guard judged', () => {
+        expect(
+            deriveDatabaseUrl(`postgresql://${SECRET_USER}:${SECRET_PASSWORD}@127.0.0.1:5433/soh_test_46`, 'postgres'),
+        ).toBe(`postgresql://${SECRET_USER}:${SECRET_PASSWORD}@127.0.0.1:5433/postgres`);
+    });
+
+    it('keeps the query parameters the guard let through, because they decide connectivity', () => {
+        expect(deriveDatabaseUrl('postgresql://soh:soh@localhost:5433/soh_test?sslmode=require', 'soh_test')).toBe(
+            'postgresql://soh:soh@localhost:5433/soh_test?sslmode=require',
+        );
+    });
+});
+
+describe('recreateStatements', () => {
+    it('quotes the name as an identifier and drops only if it exists', () => {
+        expect(recreateStatements('soh_test_46')).toEqual([
+            'DROP DATABASE IF EXISTS "soh_test_46"',
+            'CREATE DATABASE "soh_test_46"',
+        ]);
+    });
+
+    it('creates without dropping when there is nothing to drop', () => {
+        expect(createStatements('soh_test_46')).toEqual(['CREATE DATABASE "soh_test_46"']);
+    });
+
+    it('refuses to build DDL from a name that is not a plain identifier', () => {
+        expect(() => recreateStatements('soh_test"; DROP DATABASE "soh_dev')).toThrow(
+            /not a plain lower-case SQL identifier/,
+        );
+    });
+});
+
+describe('serverFingerprint', () => {
+    const identity = {
+        database: 'soh_test_46',
+        schema: 'public',
+        searchPath: '"$user", public',
+        role: 'soh',
+        serverVersion: 'PostgreSQL 16.15',
+        serverAddress: '172.17.0.2',
+        serverPort: 5432,
+        postmasterStartTime: '2026-09-10 00:44:55.348093+00',
+    };
+
+    it('reads the same for two sessions on one server', () => {
+        expect(serverFingerprint(identity)).toBe(serverFingerprint({ ...identity, database: MAINTENANCE_DATABASE }));
+    });
+
+    it('reads differently when the cluster is a different one', () => {
+        expect(serverFingerprint(identity)).not.toBe(
+            serverFingerprint({ ...identity, postmasterStartTime: '2026-09-11 00:00:00+00' }),
+        );
+    });
+
+    it('spells an address the server did not report, so two sockets still compare equal', () => {
+        const overSocket = { ...identity, serverAddress: null, serverPort: null };
+
+        expect(serverFingerprint(overSocket)).toContain('no-address | no-port');
+        expect(serverFingerprint(overSocket)).not.toBe(serverFingerprint(identity));
+    });
+});
+
+describe('buildMigrateDeployInvocation', () => {
+    const invocation = (env: NodeJS.ProcessEnv): MigrateDeployInvocation =>
+        buildMigrateDeployInvocation({
+            databaseUrl: 'postgresql://soh:soh@127.0.0.1:5433/soh_test_46',
+            env,
+            packageRoot: BACKEND_ROOT,
+            nodeExecutable: '/usr/bin/node',
+            prismaCliPath: '/app/node_modules/prisma/build/index.js',
+        });
+
+    it('runs the Prisma CLI as a module, from the package root that holds prisma/migrations', () => {
+        const built = invocation({});
+
+        expect(built.command).toBe('/usr/bin/node');
+        expect(built.args).toEqual(['/app/node_modules/prisma/build/index.js', 'migrate', 'deploy']);
+        expect(built.cwd).toBe(BACKEND_ROOT);
+    });
+
+    // The point of the whole function: the replay is applied to the target this
+    // command validated, never to whatever the shell happened to export — which
+    // in this environment is a production URL in every new shell.
+    it('assigns DATABASE_URL from the derived target instead of inheriting it', () => {
+        const built = invocation({
+            DATABASE_URL: `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@db.prod.example.com:5432/app`,
+            PATH: '/usr/bin',
+        });
+
+        expect(built.env.DATABASE_URL).toBe('postgresql://soh:soh@127.0.0.1:5433/soh_test_46');
+        expect(built.env.PATH).toBe('/usr/bin');
+    });
+});
+
+describe('recreateTestDatabase', () => {
+    const HOST = '127.0.0.1';
+    const TARGET_DATABASE = 'soh_test_46';
+    const targetUrl = (database = TARGET_DATABASE, query = ''): string =>
+        `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@${HOST}:5433/${database}${query}`;
+
+    const recreateEnv = (databaseUrl = targetUrl()): NodeJS.ProcessEnv => ({ ...SAFE_ENV, DATABASE_URL: databaseUrl });
+
+    const confirmed = (database = TARGET_DATABASE): readonly string[] => [
+        RECREATE_FLAG,
+        CONFIRM_TARGET_FLAG,
+        database,
+    ];
+
+    /** One session's answers, as the fake below is told to behave. */
+    interface SessionPlan {
+        connectError?: Error;
+        identityError?: Error;
+        noIdentityRow?: boolean;
+        identity?: Record<string, unknown>;
+        statementError?: { readonly match: string; readonly error: Error };
+    }
+
+    const identityRow = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+        database: TARGET_DATABASE,
+        schema: 'public',
+        role: 'soh',
+        server_version: 'PostgreSQL 16.15 on x86_64-pc-linux-musl',
+        server_address: '172.17.0.2',
+        server_port: 5432,
+        postmaster_start_time: '2026-09-10 00:44:55.348093+00',
+        search_path: '"$user", public',
+        ...overrides,
+    });
+
+    const errorWithCode = (message: string, code: string): Error => Object.assign(new Error(message), { code });
+
+    /**
+     * Sessions that answer from memory and record everything. The recorder is
+     * the instrument every refusal below is measured with: `issued` holds every
+     * statement that reached a server, so an empty `issued` is the proof that a
+     * refusal dropped nothing.
+     */
+    const sessionRecorder = (plans: { target?: SessionPlan; maintenance?: SessionPlan } = {}) => {
+        const opened: string[] = [];
+        const issued: string[] = [];
+        const ended: string[] = [];
+
+        const openSession: PostgresSessionOpener = (connectionString: string): PostgresSession => {
+            const maintenance = connectionString.endsWith(`/${MAINTENANCE_DATABASE}`);
+            const plan = (maintenance ? plans.maintenance : plans.target) ?? {};
+            const label = maintenance ? MAINTENANCE_DATABASE : 'target';
+
+            opened.push(label);
+
+            return {
+                connect: async () => {
+                    if (plan.connectError !== undefined) {
+                        throw plan.connectError;
+                    }
+                },
+                query: async (sql: string) => {
+                    if (sql.includes('current_database()')) {
+                        if (plan.identityError !== undefined) {
+                            throw plan.identityError;
+                        }
+
+                        // A real maintenance session answers with the
+                        // maintenance database's own name, which is what makes
+                        // `maintenance_is_target` a refusal rather than the
+                        // normal case.
+                        const answered = identityRow({
+                            ...(maintenance ? { database: MAINTENANCE_DATABASE } : {}),
+                            ...plan.identity,
+                        });
+
+                        return { rows: plan.noIdentityRow === true ? [] : [answered] };
+                    }
+
+                    issued.push(sql);
+
+                    if (plan.statementError !== undefined && sql.includes(plan.statementError.match)) {
+                        throw plan.statementError.error;
+                    }
+
+                    return { rows: [] };
+                },
+                end: async () => {
+                    ended.push(label);
+                },
+            };
+        };
+
+        return { openSession, opened, issued, ended };
+    };
+
+    const deployRunner = (result: Partial<MigrateDeployResult> = {}) =>
+        jest
+            .fn<Promise<MigrateDeployResult>, [MigrateDeployInvocation]>()
+            .mockResolvedValue({ exitCode: 0, signal: null, stderr: '', ...result });
+
+    let migrationsDirectory: string;
+
+    beforeAll(() => {
+        migrationsDirectory = mkdtempSync(join(tmpdir(), 'soh-recreate-'));
+
+        for (const migration of ON_DISK) {
+            mkdirSync(join(migrationsDirectory, migration.name));
+            writeFileSync(join(migrationsDirectory, migration.name, 'migration.sql'), migration.sql);
+        }
+    });
+
+    afterAll(() => {
+        rmSync(migrationsDirectory, { recursive: true, force: true });
+    });
+
+    const freshLedgerReader = (): SchemaReader =>
+        jest.fn<Promise<SchemaObservation>, []>().mockResolvedValue({
+            ledger: appliedCleanly,
+            columns: new Map([['meal_plan_preferences', new Set(['id'])]]),
+        });
+
+    const options = (overrides: RecreateOptions = {}): RecreateOptions => ({
+        env: recreateEnv(),
+        argv: confirmed(),
+        migrationsDirectory,
+        readSchema: freshLedgerReader(),
+        nodeExecutable: '/usr/bin/node',
+        prismaCliPath: '/app/node_modules/prisma/build/index.js',
+        ...overrides,
+    });
+
+    const expectRecreateRefusal = async (
+        given: RecreateOptions,
+        code: string,
+    ): Promise<TestDatabaseRecreateError> => {
+        let thrown: unknown;
+
+        try {
+            await recreateTestDatabase(given);
+        } catch (error) {
+            thrown = error;
+        }
+
+        expect(thrown).toBeInstanceOf(TestDatabaseRecreateError);
+
+        const refusal = thrown as TestDatabaseRecreateError;
+        expect(refusal.name).toBe('TestDatabaseRecreateError');
+        expect(refusal.code).toBe(code);
+        expect(refusal.message).not.toContain(SECRET_PASSWORD);
+        expect(refusal.message).not.toContain('postgresql://');
+
+        return refusal;
+    };
+
+    describe('when every check passes', () => {
+        it('drops, creates, deploys against the derived URL and verifies the fresh ledger', async () => {
+            const sessions = sessionRecorder();
+            const runMigrateDeploy = deployRunner();
+
+            const outcome = await recreateTestDatabase(
+                options({ openSession: sessions.openSession, runMigrateDeploy }),
+            );
+
+            expect(outcome).toEqual({
+                target: `database "${TARGET_DATABASE}" on host "${HOST}"`,
+                dropped: true,
+                statements: [`DROP DATABASE IF EXISTS "${TARGET_DATABASE}"`, `CREATE DATABASE "${TARGET_DATABASE}"`],
+                migrations: ON_DISK.length,
+            });
+
+            // The target is read back FIRST and hung up before the maintenance
+            // session issues anything: PostgreSQL cannot drop a database a
+            // session is connected to.
+            expect(sessions.opened).toEqual(['target', MAINTENANCE_DATABASE]);
+            expect(sessions.ended).toEqual(['target', MAINTENANCE_DATABASE]);
+            expect(sessions.issued).toEqual([
+                `DROP DATABASE IF EXISTS "${TARGET_DATABASE}"`,
+                `CREATE DATABASE "${TARGET_DATABASE}"`,
+            ]);
+
+            expect(runMigrateDeploy).toHaveBeenCalledTimes(1);
+            expect(runMigrateDeploy.mock.calls[0][0].env.DATABASE_URL).toBe(targetUrl());
+            expect(runMigrateDeploy.mock.calls[0][0].args).toEqual([
+                '/app/node_modules/prisma/build/index.js',
+                'migrate',
+                'deploy',
+            ]);
+        });
+
+        it('creates without dropping when the database does not exist yet', async () => {
+            const sessions = sessionRecorder({
+                target: { connectError: errorWithCode(`database "${TARGET_DATABASE}" does not exist`, '3D000') },
+            });
+
+            const outcome = await recreateTestDatabase(
+                options({ openSession: sessions.openSession, runMigrateDeploy: deployRunner() }),
+            );
+
+            expect(outcome.dropped).toBe(false);
+            expect(outcome.statements).toEqual([`CREATE DATABASE "${TARGET_DATABASE}"`]);
+            expect(sessions.issued).not.toContain(`DROP DATABASE IF EXISTS "${TARGET_DATABASE}"`);
+        });
+
+        it('resolves the installed Prisma CLI and this running Node when the caller names neither', async () => {
+            const runMigrateDeploy = deployRunner();
+
+            await recreateTestDatabase({
+                env: recreateEnv(),
+                argv: confirmed(),
+                migrationsDirectory,
+                readSchema: freshLedgerReader(),
+                openSession: sessionRecorder().openSession,
+                runMigrateDeploy,
+            });
+
+            const invocation = runMigrateDeploy.mock.calls[0][0];
+
+            expect(invocation.command).toBe(process.execPath);
+            expect(invocation.args[0]).toMatch(/prisma[\\/]build[\\/]index\.js$/);
+            expect(existsSync(invocation.args[0])).toBe(true);
+        });
+    });
+
+    describe('the identity gate runs first, so an unsafe URL never reaches a connection', () => {
+        it.each([
+            {
+                scenario: 'a remote host wearing a _test name',
+                databaseUrl: `postgresql://${SECRET_USER}:${SECRET_PASSWORD}@db.prod.example.com:5432/app_test`,
+                code: 'database_host_not_local',
+                confirm: 'app_test',
+            },
+            {
+                scenario: 'a name that is neither _test nor ci',
+                databaseUrl: targetUrl('soh_dev_46'),
+                code: 'database_name_not_test',
+                confirm: 'soh_dev_46',
+            },
+            {
+                scenario: 'a schema-redirecting options parameter',
+                databaseUrl: targetUrl(TARGET_DATABASE, '?options=-c%20search_path%3Dlive'),
+                code: 'ambiguous_database_url',
+                confirm: TARGET_DATABASE,
+            },
+            {
+                scenario: 'a schema parameter naming another schema',
+                databaseUrl: targetUrl(TARGET_DATABASE, '?schema=live'),
+                code: 'ambiguous_database_url',
+                confirm: TARGET_DATABASE,
+            },
+            {
+                scenario: 'a percent-encoded database name',
+                databaseUrl: targetUrl('soh%5Ftest_46'),
+                code: 'ambiguous_database_url',
+                confirm: 'soh%5Ftest_46',
+            },
+            {
+                scenario: 'a connection-redirecting host parameter',
+                databaseUrl: targetUrl(TARGET_DATABASE, '?host=db.prod.example.com'),
+                code: 'ambiguous_database_url',
+                confirm: TARGET_DATABASE,
+            },
+        ])('refuses $scenario as $code, opening no session and issuing no statement', async ({
+            databaseUrl,
+            code,
+            confirm,
+        }) => {
+            const sessions = sessionRecorder();
+            const runMigrateDeploy = deployRunner();
+            let thrown: unknown;
+
+            try {
+                await recreateTestDatabase(
+                    options({
+                        env: recreateEnv(databaseUrl),
+                        argv: confirmed(confirm),
+                        openSession: sessions.openSession,
+                        runMigrateDeploy,
+                    }),
+                );
+            } catch (error) {
+                thrown = error;
+            }
+
+            expect(thrown).toBeInstanceOf(TestDatabaseGuardError);
+            expect((thrown as TestDatabaseGuardError).code).toBe(code);
+            expect(sessions.opened).toEqual([]);
+            expect(sessions.issued).toEqual([]);
+            expect(runMigrateDeploy).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            { scenario: 'NODE_ENV is not test', env: { NODE_ENV: 'development' }, code: 'node_env_not_test' },
+            {
+                scenario: 'ALLOW_DB_TRUNCATE is not acknowledged',
+                env: { ALLOW_DB_TRUNCATE: undefined },
+                code: 'truncate_not_allowed',
+            },
+        ])('refuses when $scenario, before anything is opened', async ({ env, code }) => {
+            const sessions = sessionRecorder();
+            let thrown: unknown;
+
+            try {
+                await recreateTestDatabase(
+                    options({ env: { ...recreateEnv(), ...env }, openSession: sessions.openSession }),
+                );
+            } catch (error) {
+                thrown = error;
+            }
+
+            expect((thrown as TestDatabaseGuardError).code).toBe(code);
+            expect(sessions.opened).toEqual([]);
+        });
+    });
+
+    describe('the confirmation is required, because an ambient DATABASE_URL is a target nobody read', () => {
+        it('refuses without --confirm-target, and opens no session', async () => {
+            const sessions = sessionRecorder();
+
+            const refusal = await expectRecreateRefusal(
+                options({ argv: [RECREATE_FLAG], openSession: sessions.openSession }),
+                'confirmation_required',
+            );
+
+            expect(refusal.message).toContain(`${CONFIRM_TARGET_FLAG} ${TARGET_DATABASE}`);
+            expect(refusal.message).toContain(`database "${TARGET_DATABASE}" on host "${HOST}"`);
+            expect(sessions.opened).toEqual([]);
+            expect(sessions.issued).toEqual([]);
+        });
+
+        it('refuses when --confirm-target names a different database', async () => {
+            const sessions = sessionRecorder();
+
+            const refusal = await expectRecreateRefusal(
+                options({ argv: confirmed('soh_test_47'), openSession: sessions.openSession }),
+                'confirmation_mismatch',
+            );
+
+            expect(refusal.message).toContain('"soh_test_47"');
+            expect(sessions.issued).toEqual([]);
+        });
+
+        it('refuses a test name that cannot be quoted into DDL, before any connection', async () => {
+            const sessions = sessionRecorder();
+
+            await expectRecreateRefusal(
+                options({
+                    env: recreateEnv(targetUrl('SOH_test')),
+                    argv: confirmed('SOH_test'),
+                    openSession: sessions.openSession,
+                }),
+                'database_name_not_identifier',
+            );
+
+            expect(sessions.opened).toEqual([]);
+        });
+    });
+
+    describe('the read-back is what a string cannot check, and nothing is dropped without it', () => {
+        it('refuses a target it cannot read back, naming the reason the driver gave', async () => {
+            const sessions = sessionRecorder({
+                target: { connectError: errorWithCode('connect ECONNREFUSED 127.0.0.1:5433', 'ECONNREFUSED') },
+            });
+
+            const refusal = await expectRecreateRefusal(
+                options({ openSession: sessions.openSession }),
+                'target_unreadable',
+            );
+
+            expect(refusal.message).toContain('ECONNREFUSED');
+            expect(sessions.issued).toEqual([]);
+        });
+
+        it('refuses a server that answers with no identity row at all', async () => {
+            const sessions = sessionRecorder({ target: { noIdentityRow: true } });
+
+            await expectRecreateRefusal(options({ openSession: sessions.openSession }), 'target_unreadable');
+
+            expect(sessions.issued).toEqual([]);
+        });
+
+        it('refuses when the connection reached a different database than the URL names', async () => {
+            const sessions = sessionRecorder({ target: { identity: { database: 'state_of_health' } } });
+
+            const refusal = await expectRecreateRefusal(
+                options({ openSession: sessions.openSession }),
+                'target_database_mismatch',
+            );
+
+            expect(refusal.message).toContain('"state_of_health"');
+            expect(sessions.issued).toEqual([]);
+        });
+
+        it('refuses a session whose unqualified statements resolve outside public', async () => {
+            const sessions = sessionRecorder({
+                target: { identity: { schema: 'live', search_path: 'live, public' } },
+            });
+
+            const refusal = await expectRecreateRefusal(
+                options({ openSession: sessions.openSession }),
+                'target_schema_redirected',
+            );
+
+            expect(refusal.message).toContain('"live"');
+            expect(refusal.message).toContain('RESET search_path');
+            expect(sessions.issued).toEqual([]);
+        });
+
+        it('refuses when the maintenance database cannot be reached', async () => {
+            const sessions = sessionRecorder({
+                maintenance: { connectError: new Error('password authentication failed for user "soh"') },
+            });
+
+            const refusal = await expectRecreateRefusal(
+                options({ openSession: sessions.openSession }),
+                'maintenance_unreadable',
+            );
+
+            expect(refusal.message).toContain('password authentication failed');
+            expect(sessions.issued).toEqual([]);
+            expect(sessions.ended).toContain(MAINTENANCE_DATABASE);
+        });
+
+        it('refuses when the maintenance session reached a different server than the read-back', async () => {
+            const sessions = sessionRecorder({
+                maintenance: {
+                    identity: {
+                        database: MAINTENANCE_DATABASE,
+                        postmaster_start_time: '2026-09-11 12:00:00+00',
+                    },
+                },
+            });
+
+            const refusal = await expectRecreateRefusal(
+                options({ openSession: sessions.openSession }),
+                'server_identity_mismatch',
+            );
+
+            expect(refusal.message).toContain('different server');
+            expect(sessions.issued).toEqual([]);
+        });
+    });
+
+    describe('when a step fails after the checks pass', () => {
+        it('reports the statement that failed, with the reason the server gave', async () => {
+            const sessions = sessionRecorder({
+                maintenance: {
+                    identity: { database: MAINTENANCE_DATABASE },
+                    statementError: {
+                        match: 'DROP DATABASE',
+                        error: new Error('database "soh_test_46" is being accessed by other users'),
+                    },
+                },
+            });
+            const runMigrateDeploy = deployRunner();
+
+            const refusal = await expectRecreateRefusal(
+                options({ openSession: sessions.openSession, runMigrateDeploy }),
+                'recreate_statement_failed',
+            );
+
+            expect(refusal.message).toContain('being accessed by other users');
+            expect(refusal.message).toContain('DROP DATABASE IF EXISTS');
+            expect(sessions.issued).toEqual([`DROP DATABASE IF EXISTS "${TARGET_DATABASE}"`]);
+            expect(runMigrateDeploy).not.toHaveBeenCalled();
+        });
+
+        it('reports a migrate deploy that exited non-zero, and says the database is empty', async () => {
+            const refusal = await expectRecreateRefusal(
+                options({
+                    openSession: sessionRecorder().openSession,
+                    runMigrateDeploy: deployRunner({ exitCode: 1, stderr: 'P1001: Cannot reach database server' }),
+                }),
+                'migrate_deploy_failed',
+            );
+
+            expect(refusal.message).toContain('exited 1');
+            expect(refusal.message).toContain('P1001');
+            expect(refusal.message).toContain('apply the ledger before running the suite');
+        });
+
+        it('reports a migrate deploy killed by a signal', async () => {
+            const refusal = await expectRecreateRefusal(
+                options({
+                    openSession: sessionRecorder().openSession,
+                    runMigrateDeploy: deployRunner({ exitCode: null, signal: 'SIGKILL' }),
+                }),
+                'migrate_deploy_failed',
+            );
+
+            expect(refusal.message).toContain('SIGKILL');
+        });
+
+        // The proof that the deploy reached THIS database: the verification is
+        // this module's own schema-qualified read of public._prisma_migrations,
+        // so a deploy that succeeded against some other database leaves this one
+        // with no ledger and is reported rather than announced as a success.
+        it('reports a recreated database whose ledger is empty afterwards', async () => {
+            const refusal = await expectRecreateRefusal(
+                options({
+                    openSession: sessionRecorder().openSession,
+                    runMigrateDeploy: deployRunner(),
+                    readSchema: jest
+                        .fn<Promise<SchemaObservation>, []>()
+                        .mockResolvedValue({ ledger: null, columns: new Map() }),
+                }),
+                'ledger_not_verified',
+            );
+
+            expect(refusal.message).toContain('no_ledger');
+        });
+
+        it('lets the schema gate refusal through when the fresh ledger does not match the migrations', async () => {
+            let thrown: unknown;
+
+            try {
+                await recreateTestDatabase(
+                    options({
+                        openSession: sessionRecorder().openSession,
+                        runMigrateDeploy: deployRunner(),
+                        readSchema: jest.fn<Promise<SchemaObservation>, []>().mockResolvedValue({
+                            ledger: [appliedCleanly[0], ledgerRow(FEATURE_MIGRATION, 'a'.repeat(64))],
+                            columns: new Map(),
+                        }),
+                    }),
+                );
+            } catch (error) {
+                thrown = error;
+            }
+
+            expect(thrown).toBeInstanceOf(SchemaFreshnessError);
+            expect((thrown as SchemaFreshnessError).code).toBe('schema_drifted');
+        });
+    });
+});
+
+describe('runRecreateCommand', () => {
+    const recordingOutput = () => {
+        const lines: { log: string[]; warn: string[]; error: string[] } = { log: [], warn: [], error: [] };
+        const output: CommandOutput = {
+            log: (line) => lines.log.push(line),
+            warn: (line) => lines.warn.push(line),
+            error: (line) => lines.error.push(line),
+        };
+
+        return { lines, output };
+    };
+
+    const RECREATE_ENV: NodeJS.ProcessEnv = {
+        ...SAFE_ENV,
+        DATABASE_URL: 'postgresql://soh:soh@127.0.0.1:5433/soh_test_46',
+    };
+
+    const passingSession: PostgresSessionOpener = (connectionString: string): PostgresSession => ({
+        connect: async () => undefined,
+        query: async (sql: string) =>
+            sql.includes('current_database()')
+                ? {
+                      rows: [
+                          {
+                              database: connectionString.endsWith('/postgres') ? 'postgres' : 'soh_test_46',
+                              schema: 'public',
+                              role: 'soh',
+                              server_version: 'PostgreSQL 16.15',
+                              server_address: '172.17.0.2',
+                              server_port: 5432,
+                              postmaster_start_time: '2026-09-10 00:44:55.348093+00',
+                              search_path: '"$user", public',
+                          },
+                      ],
+                  }
+                : { rows: [] },
+        end: async () => undefined,
+    });
+
+    let migrationsDirectory: string;
+
+    beforeAll(() => {
+        migrationsDirectory = mkdtempSync(join(tmpdir(), 'soh-recreate-command-'));
+
+        for (const migration of ON_DISK) {
+            mkdirSync(join(migrationsDirectory, migration.name));
+            writeFileSync(join(migrationsDirectory, migration.name, 'migration.sql'), migration.sql);
+        }
+    });
+
+    afterAll(() => {
+        rmSync(migrationsDirectory, { recursive: true, force: true });
+    });
+
+    const overridesFor = (overrides: RecreateOptions = {}): RecreateOptions => ({
+        env: RECREATE_ENV,
+        migrationsDirectory,
+        openSession: passingSession,
+        runMigrateDeploy: async () => ({ exitCode: 0, signal: null, stderr: '' }),
+        readSchema: jest
+            .fn<Promise<SchemaObservation>, []>()
+            .mockResolvedValue({ ledger: appliedCleanly, columns: new Map() }),
+        nodeExecutable: '/usr/bin/node',
+        prismaCliPath: '/app/node_modules/prisma/build/index.js',
+        ...overrides,
+    });
+
+    it('exits 0 and reports what it dropped, created and verified', async () => {
+        const { lines, output } = recordingOutput();
+
+        const code = await runRecreateCommand(
+            [RECREATE_FLAG, CONFIRM_TARGET_FLAG, 'soh_test_46'],
+            output,
+            overridesFor(),
+        );
+
+        expect(code).toBe(0);
+        expect(lines.error).toEqual([]);
+        expect(lines.log[0]).toBe(
+            'test-database recreate: database "soh_test_46" on host "127.0.0.1" dropped and recreated, ' +
+                '2 migrations applied and verified.',
+        );
+        expect(lines.log).toContain('  DROP DATABASE IF EXISTS "soh_test_46"');
+        expect(lines.log).toContain('  CREATE DATABASE "soh_test_46"');
+    });
+
+    it('exits 1 with exactly one message on a refusal, and nothing on stdout', async () => {
+        const { lines, output } = recordingOutput();
+
+        const code = await runRecreateCommand([RECREATE_FLAG], output, overridesFor());
+
+        expect(code).toBe(1);
+        expect(lines.log).toEqual([]);
+        expect(lines.warn).toEqual([]);
+        expect(lines.error).toHaveLength(1);
+        expect(lines.error[0]).toContain(CONFIRM_TARGET_FLAG);
+    });
+
+    it('reads the confirmation from the argv it is given rather than from the process', async () => {
+        const { lines, output } = recordingOutput();
+
+        const code = await runRecreateCommand(
+            [RECREATE_FLAG, `${CONFIRM_TARGET_FLAG}=soh_test_46`],
+            output,
+            overridesFor(),
+        );
+
+        expect(code).toBe(0);
+        expect(lines.error).toEqual([]);
+    });
+});
+
+describe('runTestDbCommand', () => {
+    const recordingOutput = () => {
+        const lines: { log: string[]; warn: string[]; error: string[] } = { log: [], warn: [], error: [] };
+        const output: CommandOutput = {
+            log: (line) => lines.log.push(line),
+            warn: (line) => lines.warn.push(line),
+            error: (line) => lines.error.push(line),
+        };
+
+        return { lines, output };
+    };
+
+    let migrationsDirectory: string;
+
+    beforeAll(() => {
+        migrationsDirectory = mkdtempSync(join(tmpdir(), 'soh-testdb-command-'));
+
+        for (const migration of ON_DISK) {
+            mkdirSync(join(migrationsDirectory, migration.name));
+            writeFileSync(join(migrationsDirectory, migration.name, 'migration.sql'), migration.sql);
+        }
+    });
+
+    afterAll(() => {
+        rmSync(migrationsDirectory, { recursive: true, force: true });
+    });
+
+    it('runs the diagnosis when the recreate flag is absent, and opens no session for it', async () => {
+        const { lines, output } = recordingOutput();
+        const openSession = jest.fn<PostgresSession, [string]>();
+
+        const code = await runTestDbCommand([], output, {
+            env: SAFE_ENV,
+            readSchema: jest
+                .fn<Promise<SchemaObservation>, []>()
+                .mockResolvedValue({ ledger: appliedCleanly, columns: new Map() }),
+            migrationsDirectory,
+            openSession,
+        });
+
+        expect(code).toBe(0);
+        expect(lines.log[0]).toContain('test-database check:');
+        expect(openSession).not.toHaveBeenCalled();
+    });
+
+    it('runs the recreate when the flag is present, and refuses it on the same identity gate', async () => {
+        const { lines, output } = recordingOutput();
+        const openSession = jest.fn<PostgresSession, [string]>();
+
+        const code = await runTestDbCommand([RECREATE_FLAG, CONFIRM_TARGET_FLAG, 'soh_test'], output, {
+            env: { ...SAFE_ENV, NODE_ENV: 'development' },
+            openSession,
+        });
+
+        expect(code).toBe(1);
+        expect(lines.error).toHaveLength(1);
+        expect(lines.error[0]).toContain('NODE_ENV');
+        expect(openSession).not.toHaveBeenCalled();
+    });
+});
+
 
 // The guard cannot prove itself from inside the process it protects: by the time
 // any test here runs, `jestSetup.ts` has already passed it, so a test asserting
@@ -1127,6 +2398,7 @@ describe('the guard, proven from outside the process it protects', () => {
     let markerPath: string;
     let instrumentControlPath: string;
     let setupShapeProbePath: string;
+    let truncateProbePath: string;
 
     beforeAll(() => {
         probeDirectory = mkdtempSync(join(tmpdir(), 'soh-guard-proof-'));
@@ -1134,6 +2406,7 @@ describe('the guard, proven from outside the process it protects', () => {
         markerPath = join(probeDirectory, 'database-access.log');
         instrumentControlPath = join(probeDirectory, 'instrument-control.js');
         setupShapeProbePath = join(probeDirectory, 'setup-shape-probe.js');
+        truncateProbePath = join(probeDirectory, 'truncate-probe.js');
 
         const packagedClientFixture = join(probeDirectory, 'node_modules', '@prisma', 'client');
         mkdirSync(packagedClientFixture, { recursive: true });
@@ -1200,6 +2473,40 @@ socket.destroy();
 const setup = require(process.env.SOH_SETUP_FILE);
 
 process.stdout.write('typeof=' + typeof setup + '\\n');
+`,
+        );
+
+        // Calls the ONE function every DB-backed suite calls before it touches
+        // data, in a process of our own, and reports on its error descriptor
+        // what stopped it. Nothing reaches stdout unless the truncation
+        // succeeded, so an empty stdout beside a non-zero exit is "no data was
+        // emptied", and the marker file says how far the process got.
+        //
+        // `SOH_TRUNCATE_CALLS` calls it repeatedly, the way a suite's
+        // `beforeEach` does, which is how the memoised gate's "one round trip
+        // per process" is measured from outside: one recorded connect for two
+        // calls.
+        writeFileSync(
+            truncateProbePath,
+            `'use strict';
+const { truncateFeatureTables } = require(process.env.SOH_TEST_DB_MODULE);
+
+const calls = Number(process.env.SOH_TRUNCATE_CALLS || '1');
+
+const run = async () => {
+    for (let index = 0; index < calls; index += 1) {
+        try {
+            await truncateFeatureTables();
+            process.stdout.write('truncated\\n');
+        } catch (error) {
+            process.stderr.write((error && error.name) + ' ' + (error && error.code) + '\\n');
+            process.stderr.write(String(error && error.message) + '\\n');
+            process.exitCode = 1;
+        }
+    }
+};
+
+run();
 `,
         );
     });
@@ -1386,6 +2693,100 @@ process.stdout.write('typeof=' + typeof setup + '\\n');
             CHILD_TIMEOUT_MS,
         );
 
+        // `--recreate` is the one command in this repository that DROPS a
+        // database, so its refusals are proven the same way the identity guard
+        // is: from a child of our own, where "nothing was reached" is
+        // observable. An empty marker file means the child loaded no driver and
+        // opened no socket — which is the only way to be sure no DROP was
+        // issued, because a statement needs a connection to reach a server.
+        //
+        // Every case below carries a correct `--confirm-target`, so what stops
+        // the run is the identity gate and not a missing confirmation. The
+        // command form prints the refusal's MESSAGE (the code is the in-process
+        // assertion surface), so that is what each row names.
+        it.each([
+            {
+                scenario: 'a _test name on a remote host',
+                databaseUrl: secretUrl(UNROUTABLE_RFC_5737_DOCUMENTATION_HOST, 'app_test'),
+                confirm: 'app_test',
+                refusal: 'the host must be one of',
+            },
+            {
+                scenario: 'a name that is neither _test nor ci',
+                databaseUrl: secretUrl('127.0.0.1', 'soh_dev_46'),
+                confirm: 'soh_dev_46',
+                refusal: 'the database name must end in',
+            },
+            {
+                scenario: 'a search_path redirected through options',
+                databaseUrl: `${secretUrl('127.0.0.1', 'soh_test_46')}?options=-c%20search_path%3Dlive`,
+                confirm: 'soh_test_46',
+                refusal: 'redirects the schema',
+            },
+            {
+                scenario: 'a percent-encoded database name',
+                databaseUrl: secretUrl('127.0.0.1', 'soh%5Ftest_46'),
+                confirm: 'soh%5Ftest_46',
+                refusal: 'percent-encoded',
+            },
+        ])(
+            'refuses --recreate for $scenario, reaching no server at all',
+            ({ databaseUrl, confirm, refusal }) => {
+                const child = runChild(
+                    [
+                        '--require',
+                        'ts-node/register',
+                        TEST_DB_MODULE,
+                        RECREATE_FLAG,
+                        CONFIRM_TARGET_FLAG,
+                        confirm,
+                    ],
+                    {
+                        TS_NODE_PROJECT: TEST_TSCONFIG,
+                        TS_NODE_TRANSPILE_ONLY: '1',
+                        NODE_ENV: 'test',
+                        ALLOW_DB_TRUNCATE: 'true',
+                        DATABASE_URL: databaseUrl,
+                    },
+                );
+
+                expect(child.error).toBeUndefined();
+                expect(child.status).toBe(1);
+                expect(child.stdout).toBe('');
+                expect(child.stderr).toContain(refusal);
+                expect(child.stderr).not.toContain('DROP DATABASE');
+                expect(child.stderr).not.toContain(SECRET_PASSWORD);
+                expect(child.stderr).not.toContain(SECRET_USER);
+                expect(readMarker()).toBe('');
+            },
+            CHILD_TIMEOUT_MS,
+        );
+
+        // The confirmation half of the same proof: a URL that passes every
+        // identity rule still reaches nothing until the operator names the
+        // target, which is what an inherited DATABASE_URL cannot do.
+        it(
+            'refuses --recreate with no --confirm-target, and reaches no server',
+            () => {
+                const child = runChild(['--require', 'ts-node/register', TEST_DB_MODULE, RECREATE_FLAG], {
+                    TS_NODE_PROJECT: TEST_TSCONFIG,
+                    TS_NODE_TRANSPILE_ONLY: '1',
+                    NODE_ENV: 'test',
+                    ALLOW_DB_TRUNCATE: 'true',
+                    DATABASE_URL: secretUrl('127.0.0.1', 'soh_test_46'),
+                });
+
+                expect(child.error).toBeUndefined();
+                expect(child.status).toBe(1);
+                expect(child.stdout).toBe('');
+                expect(child.stderr).toContain(CONFIRM_TARGET_FLAG);
+                expect(child.stderr).toContain('soh_test_46');
+                expect(child.stderr).not.toContain(SECRET_PASSWORD);
+                expect(readMarker()).toBe('');
+            },
+            CHILD_TIMEOUT_MS,
+        );
+
         // The fail-open half, end to end: a developer with no database gets a
         // warning and a zero exit, which is what keeps the suites that need no
         // database runnable. A port nothing can listen on stands in for that.
@@ -1409,6 +2810,410 @@ process.stdout.write('typeof=' + typeof setup + '\\n');
                 expect(marker).not.toContain('@prisma/client');
             },
             CHILD_TIMEOUT_MS,
+        );
+    });
+
+    /* ---------------------------------------------------------------------- *
+     * The session gate, against a real server.
+     *
+     * Everything above judges strings. A `search_path` default set on the role
+     * or on the database is not in any string — it is in `pg_db_role_setting` —
+     * so the only way to show that the URL guard cannot see it, and that the
+     * session gate can, is to set one and watch both.
+     *
+     * The measurement runs on a DISPOSABLE database this section creates and
+     * drops on the authority the suite's own `DATABASE_URL` names (through
+     * `deriveDatabaseUrl`, so no host, port or credential is written here), with
+     * a `_test` name so the identity gate accepts it and a `live` schema for the
+     * redirect to land in. Every setting it sets is reset, and the last case
+     * asserts the catalog is left with none.
+     *
+     * It lives inside this describe because the strongest half of the proof is
+     * the child harness above: a suite that refused BEFORE touching data is a
+     * claim about what did NOT happen, and the marker file is how that becomes
+     * observable — the redirected child records the gate's own `pg` connect and
+     * no Prisma module at all, so no `TRUNCATE` could have been issued, while
+     * the same child with the default reset records the Prisma client loading.
+     *
+     * When no server answers, or the role may not create a database, every case
+     * here reports why and passes: this file must stay runnable with no
+     * PostgreSQL, which is the property the 25 pure-logic suites depend on.
+     * ---------------------------------------------------------------------- */
+    describe('the session gate, against a disposable probe database', () => {
+        /** `_test` + a numeric tail, so `isTestDatabaseName` accepts it. */
+        const PROBE_DATABASE = `soh_session_probe_test_${process.pid}`;
+        const REDIRECTED_SCHEMA = 'live';
+        const REDIRECTED_SEARCH_PATH = `${REDIRECTED_SCHEMA}, public`;
+        const PROBE_APPLICATION_NAME = 'soh-test-db-session-probe';
+        const PROBE_TIMEOUT_MS = 30_000;
+
+        interface ProbeEnvironment {
+            readonly host: string;
+            readonly role: string;
+            readonly probeUrl: string;
+            readonly maintenanceUrl: string;
+        }
+
+        let probe: ProbeEnvironment | null = null;
+        let unavailable = '';
+
+        /** Double-quotes one identifier, doubling any quote inside it. */
+        const quoted = (identifier: string): string => `"${identifier.replace(/"/g, '""')}"`;
+
+        /**
+         * `require`, not `import`, for the same reason the module under test
+         * does it: nothing in this file may put a driver in the module graph
+         * until a case that needs a server actually runs.
+         */
+        const openProbeSession = (connectionString: string): PostgresSession => {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires -- a lazy load is the point; see above
+            const postgres = require('pg') as {
+                Client: new (config: {
+                    connectionString: string;
+                    connectionTimeoutMillis?: number;
+                    query_timeout?: number;
+                    application_name?: string;
+                }) => PostgresSession;
+            };
+
+            return new postgres.Client({
+                connectionString,
+                connectionTimeoutMillis: PROBE_TIMEOUT_MS,
+                query_timeout: PROBE_TIMEOUT_MS,
+                application_name: PROBE_APPLICATION_NAME,
+            });
+        };
+
+        /** Runs statements in order on one session, always hanging up. */
+        const runOnProbe = async (
+            connectionString: string,
+            statements: readonly string[],
+        ): Promise<Array<Record<string, unknown>>> => {
+            const session = openProbeSession(connectionString);
+            const rows: Array<Record<string, unknown>> = [];
+
+            await session.connect();
+
+            try {
+                for (const statement of statements) {
+                    rows.push(...(await session.query(statement)).rows);
+                }
+            } finally {
+                await session.end().catch(() => undefined);
+            }
+
+            return rows;
+        };
+
+        const probeEnv = (): NodeJS.ProcessEnv => ({
+            NODE_ENV: 'test',
+            ALLOW_DB_TRUNCATE: 'true',
+            DATABASE_URL: (probe as ProbeEnvironment).probeUrl,
+        });
+
+        const setRoleScopedRedirect = async (): Promise<void> => {
+            const { role, maintenanceUrl } = probe as ProbeEnvironment;
+
+            await runOnProbe(maintenanceUrl, [
+                `ALTER ROLE ${quoted(role)} IN DATABASE ${quoted(PROBE_DATABASE)} ` +
+                    `SET search_path = ${REDIRECTED_SEARCH_PATH}`,
+            ]);
+        };
+
+        const setDatabaseScopedRedirect = async (): Promise<void> => {
+            await runOnProbe((probe as ProbeEnvironment).maintenanceUrl, [
+                `ALTER DATABASE ${quoted(PROBE_DATABASE)} SET search_path = ${REDIRECTED_SEARCH_PATH}`,
+            ]);
+        };
+
+        const resetRedirects = async (): Promise<void> => {
+            const { role, maintenanceUrl } = probe as ProbeEnvironment;
+
+            await runOnProbe(maintenanceUrl, [
+                `ALTER ROLE ${quoted(role)} IN DATABASE ${quoted(PROBE_DATABASE)} RESET search_path`,
+                `ALTER DATABASE ${quoted(PROBE_DATABASE)} RESET search_path`,
+            ]);
+        };
+
+        const remainingDefaults = async (): Promise<number> => {
+            const rows = await runOnProbe((probe as ProbeEnvironment).maintenanceUrl, [
+                'SELECT count(*)::int AS settings FROM pg_db_role_setting s ' +
+                    'JOIN pg_database d ON d.oid = s.setdatabase ' +
+                    `WHERE d.datname = '${PROBE_DATABASE}'`,
+            ]);
+
+            return Number(rows[0]?.settings ?? -1);
+        };
+
+        /** One line per skipped case, so a vacuous pass is never silent. */
+        const reportUnavailable = (): void => {
+            // eslint-disable-next-line no-console -- the skip must be visible; see this section's header
+            console.warn(`session-gate live proof skipped: ${unavailable}`);
+        };
+
+        beforeAll(async () => {
+            const ambient = process.env.DATABASE_URL;
+
+            if (ambient === undefined || ambient.trim().length === 0) {
+                unavailable = 'DATABASE_URL is not set, so there is no authority to create a probe on';
+
+                return;
+            }
+
+            const maintenanceUrl = deriveDatabaseUrl(ambient, MAINTENANCE_DATABASE);
+            const probeUrl = deriveDatabaseUrl(ambient, PROBE_DATABASE);
+
+            try {
+                const rows = await runOnProbe(maintenanceUrl, [
+                    'SELECT current_user AS role',
+                    `DROP DATABASE IF EXISTS ${quoted(PROBE_DATABASE)}`,
+                    `CREATE DATABASE ${quoted(PROBE_DATABASE)}`,
+                ]);
+
+                await runOnProbe(probeUrl, [`CREATE SCHEMA IF NOT EXISTS ${quoted(REDIRECTED_SCHEMA)}`]);
+
+                probe = {
+                    host: new URL(ambient).hostname,
+                    role: String(rows[0]?.role ?? ''),
+                    probeUrl,
+                    maintenanceUrl,
+                };
+            } catch (error) {
+                unavailable = error instanceof Error ? error.message : String(error);
+            }
+        }, PROBE_TIMEOUT_MS);
+
+        afterAll(async () => {
+            if (probe === null) {
+                return;
+            }
+
+            // Reset before the drop as well as after every case: a setting left
+            // on a shared server outlives this suite, and this server is shared.
+            await resetRedirects().catch(() => undefined);
+            await runOnProbe(probe.maintenanceUrl, [`DROP DATABASE IF EXISTS ${quoted(PROBE_DATABASE)}`]).catch(
+                () => undefined,
+            );
+        }, PROBE_TIMEOUT_MS);
+
+        it(
+            'refuses a role-and-database-scoped search_path default that no URL can show',
+            async () => {
+                if (probe === null) {
+                    reportUnavailable();
+
+                    return;
+                }
+
+                // The URL is clean: no query string, a `_test` name, a local
+                // host. The string gate accepts it, and says so here.
+                expect(() => assertTestDatabase(probeEnv())).not.toThrow();
+
+                await setRoleScopedRedirect();
+
+                let thrown: unknown;
+
+                try {
+                    await assertSessionTarget({ env: probeEnv() });
+                } catch (error) {
+                    thrown = error;
+                }
+
+                expect(thrown).toBeInstanceOf(TestDatabaseSessionError);
+
+                const refusal = thrown as TestDatabaseSessionError;
+                expect(refusal.code).toBe('session_schema_redirected');
+                expect(refusal.message).toContain(`"${REDIRECTED_SCHEMA}"`);
+                expect(refusal.message).toContain(PROBE_DATABASE);
+                expect(refusal.message).toContain(probe.host);
+                expect(refusal.message).toContain('RESET search_path');
+                expect(refusal.message).not.toContain('postgresql://');
+
+                await resetRedirects();
+            },
+            PROBE_TIMEOUT_MS,
+        );
+
+        it(
+            'refuses a database-scoped search_path default too, so resetting one default is not enough',
+            async () => {
+                if (probe === null) {
+                    reportUnavailable();
+
+                    return;
+                }
+
+                await setDatabaseScopedRedirect();
+
+                let thrown: unknown;
+
+                try {
+                    await assertSessionTarget({ env: probeEnv() });
+                } catch (error) {
+                    thrown = error;
+                }
+
+                expect(thrown).toBeInstanceOf(TestDatabaseSessionError);
+                expect((thrown as TestDatabaseSessionError).code).toBe('session_schema_redirected');
+                expect((thrown as TestDatabaseSessionError).message).toContain(
+                    `ALTER DATABASE ${PROBE_DATABASE} RESET search_path`,
+                );
+
+                await resetRedirects();
+            },
+            PROBE_TIMEOUT_MS,
+        );
+
+        it(
+            'accepts the same database once both defaults are reset, reporting the public schema it reached',
+            async () => {
+                if (probe === null) {
+                    reportUnavailable();
+
+                    return;
+                }
+
+                await resetRedirects();
+
+                const verification = await assertSessionTarget({ env: probeEnv() });
+
+                expect(verification.database).toBe(PROBE_DATABASE);
+                expect(verification.schema).toBe('public');
+                expect(verification.target).toContain(PROBE_DATABASE);
+                expect(verification.role.length).toBeGreaterThan(0);
+            },
+            PROBE_TIMEOUT_MS,
+        );
+
+        it(
+            'refuses through truncateFeatureTables in a child process, loading no Prisma client at all',
+            async () => {
+                if (probe === null) {
+                    reportUnavailable();
+
+                    return;
+                }
+
+                await setRoleScopedRedirect();
+
+                try {
+                    const child = runChild(['--require', 'ts-node/register', truncateProbePath], {
+                        TS_NODE_PROJECT: TEST_TSCONFIG,
+                        TS_NODE_TRANSPILE_ONLY: '1',
+                        SOH_TEST_DB_MODULE: TEST_DB_MODULE,
+                        NODE_ENV: 'test',
+                        ALLOW_DB_TRUNCATE: 'true',
+                        DATABASE_URL: probe.probeUrl,
+                    });
+                    const marker = readMarker();
+
+                    expect(child.error).toBeUndefined();
+                    expect(child.status).toBe(1);
+                    expect(child.stdout).toBe('');
+                    expect(child.stderr).toContain('TestDatabaseSessionError');
+                    expect(child.stderr).toContain('session_schema_redirected');
+                    expect(child.stderr).toContain('RESET search_path');
+                    expect(child.stderr).not.toContain('postgresql://');
+
+                    // The gate DID reach the server — it has to, to see a
+                    // setting no string carries — and the Prisma client that
+                    // issues the TRUNCATE never loaded, so nothing was emptied.
+                    expect(marker).toContain('module pg');
+                    expect(marker).toContain('connect');
+                    expect(marker).not.toContain('generated/prisma');
+                    expect(marker).not.toContain('@prisma/client');
+                } finally {
+                    await resetRedirects();
+                }
+            },
+            CHILD_TIMEOUT_MS,
+        );
+
+        it(
+            'asks the server once per process however many times a suite truncates',
+            async () => {
+                if (probe === null) {
+                    reportUnavailable();
+
+                    return;
+                }
+
+                await setRoleScopedRedirect();
+
+                try {
+                    const child = runChild(['--require', 'ts-node/register', truncateProbePath], {
+                        TS_NODE_PROJECT: TEST_TSCONFIG,
+                        TS_NODE_TRANSPILE_ONLY: '1',
+                        SOH_TEST_DB_MODULE: TEST_DB_MODULE,
+                        SOH_TRUNCATE_CALLS: '2',
+                        NODE_ENV: 'test',
+                        ALLOW_DB_TRUNCATE: 'true',
+                        DATABASE_URL: probe.probeUrl,
+                    });
+                    const connects = readMarker()
+                        .split('\n')
+                        .filter((entry) => entry === 'connect');
+
+                    expect(child.error).toBeUndefined();
+                    expect(child.status).toBe(1);
+                    // Both calls refused — the memoised verdict is the refusal,
+                    // so a later `beforeEach` cannot slip past it — on the
+                    // strength of ONE connection.
+                    expect(child.stderr.match(/session_schema_redirected/g) ?? []).toHaveLength(2);
+                    expect(connects).toHaveLength(1);
+                } finally {
+                    await resetRedirects();
+                }
+            },
+            CHILD_TIMEOUT_MS,
+        );
+
+        it(
+            'lets the same child through to the data layer once the default is reset, so the refusal above was the gate',
+            async () => {
+                if (probe === null) {
+                    reportUnavailable();
+
+                    return;
+                }
+
+                await resetRedirects();
+
+                const child = runChild(['--require', 'ts-node/register', truncateProbePath], {
+                    TS_NODE_PROJECT: TEST_TSCONFIG,
+                    TS_NODE_TRANSPILE_ONLY: '1',
+                    SOH_TEST_DB_MODULE: TEST_DB_MODULE,
+                    NODE_ENV: 'test',
+                    ALLOW_DB_TRUNCATE: 'true',
+                    DATABASE_URL: probe.probeUrl,
+                });
+                const marker = readMarker();
+
+                expect(child.error).toBeUndefined();
+                expect(child.stderr).not.toContain('TestDatabaseSessionError');
+                // The probe database carries no migration, so the statement
+                // itself fails on a missing table — which is the point: the run
+                // got as far as the Prisma client and the server, which is
+                // exactly what the redirected run above never did.
+                expect(marker).toContain('generated/prisma');
+            },
+            CHILD_TIMEOUT_MS,
+        );
+
+        it(
+            'leaves the shared server with no default of its own behind',
+            async () => {
+                if (probe === null) {
+                    reportUnavailable();
+
+                    return;
+                }
+
+                await resetRedirects();
+
+                expect(await remainingDefaults()).toBe(0);
+            },
+            PROBE_TIMEOUT_MS,
         );
     });
 });

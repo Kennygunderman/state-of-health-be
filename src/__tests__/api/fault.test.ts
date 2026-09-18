@@ -24,6 +24,17 @@
 //   lost", which is what makes the client's unknown-outcome handling honest: the
 //   same-key retry must return the STORED response rather than committing twice.
 //
+//   THE TWO FORMS OF IT DIFFER ON A REPLAY, and the cases below are built around
+//   that difference. `MEAL_PLANNING_FAULT=log` is ONE-SHOT — it withholds a
+//   fresh answer and delivers the stored one, so the device a developer is
+//   holding can reach the unconfirmed-outcome state and then resolve it while
+//   the switch stays armed (§0.9.4's "the same-key retry must return the
+//   committed 201"). The header is a PER-REQUEST instruction: it drops the
+//   response of the request that carried it and no other, which is what lets the
+//   four cases below drop a commit and then read the stored answer back by
+//   sending the retry without it — and it is honoured for a replay too, so a
+//   suite can lose a stored answer on purpose and prove that recoverable.
+//
 // WHICH LAYER EACH CASE DRIVES. The decoded-fault invariants are asserted where
 // they are decided — `commitSwap`, `generatePlan` and `regeneratePlan` called
 // directly against real PostgreSQL — and again at the HTTP boundary for the
@@ -53,11 +64,14 @@
 // ({@link seedRequestFixture}), because a pinned past week would answer
 // `409 plan_not_active` and prove nothing about a fault.
 //
-// TWO THINGS ARE DELIBERATELY NOT ASSERTED, because another work unit is
-// changing them at this checkpoint: the display rounding of planned nutrition in
-// the meal/day DTOs (review finding F04) and the exact `portionText` string
-// (F05). The cases below assert ids, revisions, row counts, ledger state, status
-// codes, machine codes and response bytes, none of which either fix touches.
+// TWO THINGS ARE DELIBERATELY NOT ASSERTED, because they are
+// `mealPlan.mapper.ts`'s DISPLAY contract and neighbours already own them: the
+// display rounding of planned nutrition in the meal/day DTOs
+// (`readPlannedTotals`) and the exact `portionText` string
+// (`formatPortionText`), both pinned where a client reads them by
+// `api/plans.test.ts` and `api/swaps.test.ts`. The cases below assert ids,
+// revisions, row counts, ledger state, status codes, machine codes and response
+// bytes, none of which a display value touches.
 
 import supertest from 'supertest';
 
@@ -89,6 +103,20 @@ import {
 } from '../setup/factories';
 import { asUser, request } from '../setup/testApp';
 import { truncateFeatureTables } from '../setup/testDb';
+
+/**
+ * Jest's default per-case allowance is five seconds, and every case in this file
+ * spends its time on I/O nothing here controls: `beforeEach` truncates the
+ * feature tables and seeds thirteen recipes, two users and a current week, and
+ * each flag case then REBUILDS the module graph and constructs a second
+ * `PrismaClient` and Express app inside `jest.isolateModules`. Idle, the slowest
+ * case runs in under four seconds; against a PostgreSQL instance shared with
+ * other suites it is several times that, and the failure then reported is a
+ * timeout on a seeding hook rather than anything this file asserts. The bound is
+ * raised to a value that keeps a genuine hang loud while leaving contention out
+ * of the result.
+ */
+jest.setTimeout(30_000);
 
 type FeatureFlagsModule = typeof import('../../utils/featureFlags');
 type SwapServiceModule = typeof import('../../services/swap.service');
@@ -1100,7 +1128,10 @@ describe('the injected generation fault', () => {
  * These cases use the HEADER rather than `MEAL_PLANNING_FAULT=log`, and so need
  * no re-imported graph: `postCommitAbort` reads the header whenever `NODE_ENV`
  * is `test`, which Jest has already set. The flag's own path is proven
- * equivalent once, further down, so the two cannot drift.
+ * equivalent for the COMMIT it withholds once, further down, so the two cannot
+ * drift on the half they share; where they deliberately part company — the flag
+ * is one-shot and the header is not — is asserted there and in
+ * `featureFlags.test.ts`.
  * ------------------------------------------------------------------------- */
 
 const HTTP_GENERATION_KEY = '77777777-7777-4777-8777-777777777777';
@@ -1529,10 +1560,18 @@ describe('a planned log whose response is lost after it commits', () => {
  *
  * §0.9.4 arms this switch so a developer driving a real iPhone against a dev
  * backend can reach the unconfirmed-outcome UI, where no test header is
- * available. It must therefore behave EXACTLY as the header does, and it must be
- * scoped to the log: `postCommitAbort` matches on `actionType`, so a mis-scoped
- * predicate would silently break three unrelated flows on any host where a
- * developer left the switch on.
+ * available. Two properties follow, and the cases below are exactly those two.
+ *
+ * It withholds the answer to the COMMIT exactly as the header does — same
+ * durable write, same completed ledger row, same transport error with no
+ * response — and then it STOPS: the same-key retry receives the stored 201 from
+ * the same faulted backend, because §0.9.4 requires the device to resolve the
+ * outcome it could not confirm, and nobody holding a phone can edit the
+ * server's environment between the two taps.
+ *
+ * And it is scoped to the log: `postCommitAbort` matches on `actionType`, so a
+ * mis-scoped predicate would silently break three unrelated flows on any host
+ * where a developer left the switch on.
  * ------------------------------------------------------------------------- */
 
 const FLAGGED_LOG_KEY = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -1547,7 +1586,7 @@ const currentRequestPlanRevision = async (): Promise<number> =>
     ).revision;
 
 describe('the log fault as the device-reachable form of the abort seam', () => {
-    it('drops the response over a durable write, exactly as the header does', async () => {
+    it('drops the first response over a durable write, then replays its stored 201 while still armed', async () => {
         const bucketId = await diaryBucketId(HTTP_PLAN_USER_ID, requestFixture.today, 'Breakfast');
         const body = {
             servings: 1,
@@ -1561,41 +1600,46 @@ describe('the log fault as the device-reachable form of the abort seam', () => {
             // Proven armed before anything is concluded from the outcome.
             expect(resolvedFault).toBe('log');
 
-            // No header at all: the switch alone is what drops this response.
-            await sendAndExpectLostResponse(
+            // One request, sent as many times as the case needs, ALWAYS through
+            // the faulted agent: the whole claim below is about what this
+            // backend does while the switch stays on.
+            const sendLog = () =>
                 agent
                     .post(mealPath(requestFixture.breakfastMealId, '/log'))
                     .set('x-test-user-id', HTTP_PLAN_USER_ID)
-                    .send(body),
+                    .send(body);
+
+            // No header at all: the switch alone is what drops this response.
+            await sendAndExpectLostResponse(sendLog());
+
+            const entries = await prisma.meal_entries.findMany({
+                where: { user_id: HTTP_PLAN_USER_ID },
+            });
+
+            expect(entries).toHaveLength(1);
+            expect(entries[0].meal_plan_meal_id).toBe(requestFixture.breakfastMealId);
+
+            const row = await expectCompletedLedgerRow(HTTP_PLAN_USER_ID, FLAGGED_LOG_KEY, {
+                actionType: 'log',
+                responseStatus: 201,
+            });
+
+            expect(row.meal_entry_id).toBe(entries[0].id);
+
+            // The retry goes through the SAME faulted app, with the switch still
+            // armed, because the ambient switch is ONE-SHOT by design: §0.9.4
+            // arms it so the first tap reaches the unconfirmed-outcome state and
+            // "the same-key retry must return the committed 201", which is the
+            // only way the device that lost the response can resolve without
+            // someone editing the server's environment. `postCommitAbort`
+            // therefore withholds a fresh answer and never a stored one, and
+            // this is where that is observable end to end.
+            await expectVerbatimReplay(sendLog, row);
+
+            expect(await prisma.meal_entries.findMany({ where: { user_id: HTTP_PLAN_USER_ID } })).toEqual(
+                entries,
             );
         });
-
-        const entries = await prisma.meal_entries.findMany({ where: { user_id: HTTP_PLAN_USER_ID } });
-
-        expect(entries).toHaveLength(1);
-        expect(entries[0].meal_plan_meal_id).toBe(requestFixture.breakfastMealId);
-
-        const row = await expectCompletedLedgerRow(HTTP_PLAN_USER_ID, FLAGGED_LOG_KEY, {
-            actionType: 'log',
-            responseStatus: 201,
-        });
-
-        expect(row.meal_entry_id).toBe(entries[0].id);
-
-        // Replayed through the AMBIENT app, whose switch is the `off` that
-        // `jestSetup.ts` sets — the developer turning the fault back off. The
-        // faulted app would drop this response too, which is the point of it.
-        await expectVerbatimReplay(
-            () =>
-                asUser(request.post(mealPath(requestFixture.breakfastMealId, '/log')), {
-                    uid: HTTP_PLAN_USER_ID,
-                }).send(body),
-            row,
-        );
-
-        expect(await prisma.meal_entries.findMany({ where: { user_id: HTTP_PLAN_USER_ID } })).toEqual(
-            entries,
-        );
     });
 
     it('does not abort a generation', async () => {

@@ -281,8 +281,11 @@ export const logCatalogMealEntry = async (
     return mapEntry(entry);
 };
 
-// Everything insertPlannedMealEntry writes. The per-serving macros arrive at
-// full precision and are rounded here, once.
+// Everything insertPlannedMealEntry writes. The four per-serving macros arrive
+// ALREADY ROUNDED, from plannedMealLog.logic.ts's derivePlannedSnapshot — the
+// single rounding owner of the planned-meal contract (§0.7.3) — and are stored
+// verbatim. This writer rounds nothing; a fractional value reaching it is a
+// broken invariant and is refused by requireStoredInteger below.
 export interface PlannedMealEntryInsert {
     userId: string;
     mealId: string;
@@ -294,6 +297,43 @@ export interface PlannedMealEntryInsert {
     servings: number;
     perServing: MacroTotals;
 }
+
+/**
+ * The precondition the planned insert rests on, made loud instead of implicit.
+ *
+ * §0.7.3 gives the planned-meal path exactly ONE rounding step, and it belongs
+ * to `plannedMealLog.logic.ts::derivePlannedSnapshot`: it multiplies the
+ * recipe's per-serving values by the portion multiplier at full precision and
+ * rounds each of the four results once. This writer stores those integers as
+ * they arrive, so a fractional value here means the snapshot step was skipped
+ * or a second scaling crept in between — not a value to quietly repair. Rounding
+ * it would silently restore agreement with the row while leaving the client's
+ * "This adds" card, which only ever sees the stored integers, computing from a
+ * different number.
+ *
+ * A plain `Error` rather than a typed one, following
+ * `mealPlanningAction.service.ts::toActionRecord`: this is a broken internal
+ * invariant with no client-actionable form — the controller maps it to a 500 —
+ * whereas `mealPlanning.errors.ts` exists for states the client must
+ * distinguish. The message names the field, the value and the owner, because
+ * that trio is what makes the fault diagnosable from a log line alone.
+ *
+ * The four `meal_entries` macro columns are Prisma `Int`, so a fractional value
+ * would in any case be refused by the database — after the transaction had done
+ * its work, with a Prisma error naming a column instead of a snapshot.
+ */
+const requireStoredInteger = (value: number, field: string): number => {
+    if (!Number.isInteger(value)) {
+        throw new Error(
+            `insertPlannedMealEntry received a non-integer perServing.${field} (${String(value)}). ` +
+                'Planned per-serving macros are rounded exactly once, by ' +
+                'plannedMealLog.logic.ts::derivePlannedSnapshot, and stored verbatim here; this writer ' +
+                'does not round (AAP §0.7.3).',
+        );
+    }
+
+    return value;
+};
 
 // Takes the transaction client first, breaking this module's userId-first
 // convention (§5): it is a tx-scoped helper with exactly one caller,
@@ -316,15 +356,17 @@ export const insertPlannedMealEntry = async (
             name: params.name,
             serving_text: params.servingText,
             servings: params.servings,
-            // The single rounding in the planned-meal contract: the planned
-            // portion is computed at full precision, rounded once into this
-            // snapshot, and the diary then shows Math.round(snapshot *
-            // servings). Rounding anywhere else makes the app's "This adds"
-            // card and the server's totals disagree.
-            calories: Math.round(params.perServing.calories),
-            protein_g: Math.round(params.perServing.protein),
-            carbs_g: Math.round(params.perServing.carbs),
-            fat_g: Math.round(params.perServing.fat),
+            // Stored VERBATIM, and asserted to be integers rather than made
+            // into them. The planned-meal contract rounds once, in
+            // `derivePlannedSnapshot`, and the diary then shows
+            // Math.round(snapshot * servings); a second Math.round here would
+            // be a no-op on these values today and a second rounding site
+            // forever, which is how the app's "This adds" card and the server's
+            // totals come to disagree once anything upstream changes.
+            calories: requireStoredInteger(params.perServing.calories, 'calories'),
+            protein_g: requireStoredInteger(params.perServing.protein, 'protein'),
+            carbs_g: requireStoredInteger(params.perServing.carbs, 'carbs'),
+            fat_g: requireStoredInteger(params.perServing.fat, 'fat'),
             // The only place this value is written. No request can ask for it:
             // `resolveLegacyInputMethod` keeps it off the legacy path, and the
             // catalog writer stamps 'search'.

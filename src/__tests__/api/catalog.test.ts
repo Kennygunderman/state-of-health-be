@@ -645,6 +645,67 @@ describe('GET /api/catalog/foods', () => {
             expect(namesOf(items)).toEqual(['Zested MURNİX', 'MURNİX bread']);
         });
 
+        it('returns a food a PARTIAL query reaches only through its non-ASCII uppercase name', async () => {
+            // THE SAME PORTABILITY GUARD ONE BRANCH EARLIER, and the sharper
+            // half of it. The head-noun case above is about which TIER a food
+            // scores in; this one is about whether the food is in the result at
+            // all. A partial query — a strict prefix of a word — matches through
+            // NO branch but the two prefix branches, because `plainto_tsquery`
+            // has no prefix semantics, so a fold mismatch on this path does not
+            // mis-rank the food, it removes it.
+            //
+            // Both sides fold through the one ASCII map now: the pattern with
+            // `foldSearchAscii`, the three columns with `translate()` over the
+            // same two exported constants, indexed by
+            // `20260910000000_catalog_prefix_fold_indexes`. Under the pairing
+            // this replaced — `q.toLowerCase()` against `lower(col)` — the
+            // pattern was `murni` + U+0307 while `lower()` answered a plain
+            // `murnix…` on this database and `murnİx…` under C, so the row below
+            // was returned on some servers and not on others. AAP §§0.5.2 and
+            // 0.9.3 require two independently loaded databases to answer the
+            // same way, which a food that is present in one and absent in the
+            // other fails outright.
+            //
+            // `catalogCollation.test.ts` makes the same claim against an ICU
+            // database, which is the other collation this project meets; this
+            // case is the ambient half, driven over HTTP through the shipped
+            // route.
+            const partial = 'MURNİ';
+            const food = await makePrefixOnlyFood(1, 'MURNİXBERRY, raw', {
+                // What `normalizeCanonicalName` produces for this name: NFKD
+                // decomposition drops the combining dot, so the canonical name
+                // is plain ASCII while the display name keeps U+0130. Written
+                // out rather than derived, so the fixture says which column the
+                // capital is in.
+                canonical_name: 'murnixberry raw',
+            });
+
+            const { status, items, pagination } = await searchFoods({ q: partial });
+
+            expect(status).toBe(200);
+            expect(items.map((item) => item.id)).toEqual([food.id]);
+            expect(pagination).toMatchObject({ total: 1 });
+        });
+
+        it('returns a food a PARTIAL query reaches only through its non-ASCII uppercase alias', async () => {
+            // The alias branch of the same guard: this food's own two name
+            // columns carry no word of the term, so the row can only have
+            // arrived through the alias prefix — the branch
+            // `idx_catalog_food_aliases_fold_alias` serves. The alias is stored
+            // in capitals, so the fold is doing work on the column side rather
+            // than on pre-folded fixture text.
+            const food = await makePrefixOnlyFood(1, 'Bottled compote', {
+                canonical_name: 'bottled compote',
+            });
+            await addAlias(food.id, 'MURNİXBERRY PEEL');
+
+            const { status, items, pagination } = await searchFoods({ q: 'MURNİ' });
+
+            expect(status).toBe(200);
+            expect(items.map((item) => item.id)).toEqual([food.id]);
+            expect(pagination).toMatchObject({ total: 1 });
+        });
+
         it('puts a name match above a food matched only by its descriptor words', async () => {
             // The weakest positive band, and the reason it stays positive: the
             // second food is still found and still returned, it simply cannot
@@ -1184,13 +1245,17 @@ describe('the mounting of the catalog router', () => {
 
         const { status, body } = await suggestions();
 
-        // Both paths are literals today, so Express matches them exactly and
-        // the declaration order in `catalog.routes.ts` does not yet decide
-        // anything. The assertion earns its place prospectively: §3.1's rule is
-        // that a literal must mount before a parameterised sibling that would
-        // swallow it, and the day `/catalog/foods/:id` is added above line 11
-        // this answer gains a `pagination` block and loses the three-member
-        // projection — which is the failure this case reports.
+        // `/catalog/foods/suggestions` and `/catalog/foods` are both literals
+        // in `catalog.routes.ts`, so Express matches them exactly, and what is
+        // asserted here is which handler the more specific path reaches. The
+        // body below is the suggestions projection of §0.5.2 — `{id, name,
+        // foodGroup}` per item and NO `pagination` block — and that is the one
+        // answer `searchCatalogFoodsController` cannot give, so it is the
+        // evidence that the path reached
+        // `catalog.controller.ts::getCatalogSuggestionsController`. A path
+        // bound to the wrong handler, or captured by the search read, answers a
+        // page of `CatalogFoodResponse` inside a `pagination` envelope instead
+        // — which is the failure this case reports.
         expect(status).toBe(200);
         expect(body).not.toHaveProperty('pagination');
         expect(body.items).toStrictEqual([

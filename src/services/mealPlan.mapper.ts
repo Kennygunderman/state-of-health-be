@@ -1073,6 +1073,13 @@ export const toMealPlanResponse = (
         id: plan.id,
         revision: plan.revision,
         generationAttempt: plan.generation_attempt,
+        // An additive extra rather than a §0.5.2 member, and therefore optional
+        // on the DTO: it is populated here for every published plan
+        // (`meal_plans.generation_key` is NOT NULL, no fallback) so the screen
+        // that owns a pending generation can recognise its own result (§0.7.4),
+        // while a client is built to tolerate its absence. `ownership.test.ts`
+        // pins that this mapper keeps sending it, which is what the optional
+        // declaration no longer does.
         generationKey: plan.generation_key,
         startDate: toDayKey(plan.start_date, 'meal_plans.start_date', plan.id),
         endDate,
@@ -1133,6 +1140,14 @@ export interface PlanDayEnvelopeRow {
  * `planStatus` stays the stored column, unreinterpreted: §0.5.1 keeps an ended
  * plan `'active'` in storage and §0.5.2 declares the member, so the envelope
  * reports both what is stored and what it MEANS today.
+ *
+ * THE TWO LIFECYCLE MEMBERS ARE ADDITIVE EXTRAS, not §0.5.2 members, so the DTO
+ * declares them optional and a client is built to work without them (it falls
+ * back to `planStatus` and recovers from `409 plan_not_active`). This mapper
+ * nevertheless sends both on every day read, because they are what spare a user
+ * a refusal they could have been told about first;
+ * `src/__tests__/api/planDayWriteability.test.ts` is what pins that, now that
+ * the optional declaration does not.
  */
 export const toMealPlanDayEnvelopeResponse = (
     plan: PlanDayEnvelopeRow,

@@ -2,29 +2,29 @@
   "release_id": "v1",
   "manifest_version": "v1",
   "coverage_plan_version": "v1",
-  "generated_at": "2026-09-17T07:14:19.745Z",
+  "generated_at": "2026-09-18T08:46:23.469Z",
   "produced_by": "pipeline",
   "files": [
     {
       "path": "foods.jsonl",
       "name": "foods.jsonl",
-      "sha256": "bf4d94c8263f59144ffa2df15bd844f590c5f8152820196413d1a6e2af0565b5",
-      "row_count": 11046,
-      "bytes": 13389696
+      "sha256": "9ceef90ab990d5818210c282071bf80061e0ea6bbe9705f873e522818855abab",
+      "row_count": 9422,
+      "bytes": 11395433
     },
     {
       "path": "aliases.jsonl",
       "name": "aliases.jsonl",
-      "sha256": "b14909373894e5066ff6555f3fef5859fb2bb0d0a4293d6f2eafd11528e8fc5e",
-      "row_count": 15939,
-      "bytes": 918946
+      "sha256": "42c45714dec04739eb2d074289f44cc7633a9cf58ae5f9f4c1babee101301389",
+      "row_count": 13088,
+      "bytes": 762032
     },
     {
       "path": "portions.jsonl",
       "name": "portions.jsonl",
-      "sha256": "798b4588e8bfb2dddba8f0663b3cd74785ca02b806699c331d4edb674436de63",
-      "row_count": 31899,
-      "bytes": 4801631
+      "sha256": "cb0c65c365c65b780ad89f27bfd174e7e37d5ee302ec1e9f579dfcd6bfee752c",
+      "row_count": 27289,
+      "bytes": 4100730
     },
     {
       "path": "components.jsonl",
@@ -36,19 +36,19 @@
     {
       "path": "validation-records.jsonl",
       "name": "validation-records.jsonl",
-      "sha256": "35c4e245b5c56d04e5ee50d43d5782962df73bc46a9e0cced2ed662a390ba2d2",
-      "row_count": 11046,
-      "bytes": 56641447
+      "sha256": "b530873af36ae1afc15e497bf4e93c0c3a801be1c23358a51dd6d341c96eb9da",
+      "row_count": 9422,
+      "bytes": 58829717
     }
   ],
   "counts": {
-    "foods": 11046,
-    "published_foods": 11046,
-    "aliases": 15939,
-    "portions": 31899,
+    "foods": 9422,
+    "published_foods": 9422,
+    "aliases": 13088,
+    "portions": 27289,
     "components": 0,
     "published_ingredient_derived": 0,
-    "validation_records": 11046
+    "validation_records": 9422
   },
   "source_datasets": [
     {
@@ -70,7 +70,7 @@
         "Foundation 2025-12",
         "Foundation 2026-04"
       ],
-      "retrieved_at": "2026-09-17T05:10:41.151Z",
+      "retrieved_at": "2026-09-18T03:11:52.117Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     },
@@ -80,7 +80,7 @@
       "versions_present": [
         "SR Legacy 2019-04"
       ],
-      "retrieved_at": "2026-09-17T05:11:35.893Z",
+      "retrieved_at": "2026-09-18T03:28:20.434Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     },
@@ -90,7 +90,7 @@
       "versions_present": [
         "Survey (FNDDS) 2024-10"
       ],
-      "retrieved_at": "2026-09-17T05:12:11.163Z",
+      "retrieved_at": "2026-09-18T03:42:14.865Z",
       "public_domain": true,
       "notes": "USDA FoodData Central. Public domain, which is the basis on which this release redistributes its descriptions, portions and nutrient values."
     }
@@ -111,10 +111,10 @@
   "coverage": {
     "coverage_plan_version": "v1",
     "published_target_total": 11010,
-    "published_actual_total": 11046,
-    "published_total": 11046,
-    "shortfall_total": 2344,
-    "published_gap_to_total": 0,
+    "published_actual_total": 9422,
+    "published_total": 9422,
+    "shortfall_total": 2392,
+    "published_gap_to_total": 1588,
     "categories": [
       {
         "category": "produce_vegetable",
@@ -125,22 +125,22 @@
       },
       {
         "category": "produce_fruit",
-        "published": 730,
-        "published_actual": 730,
+        "published": 728,
+        "published_actual": 728,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_meat",
-        "published": 2218,
-        "published_actual": 2218,
+        "published": 858,
+        "published_actual": 858,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_poultry",
-        "published": 499,
-        "published_actual": 499,
+        "published": 492,
+        "published_actual": 492,
         "published_target": 400,
         "shortfall": 0
       },
@@ -188,15 +188,15 @@
       },
       {
         "category": "bread_bakery",
-        "published": 805,
-        "published_actual": 805,
+        "published": 613,
+        "published_actual": 613,
         "published_target": 500,
         "shortfall": 0
       },
       {
         "category": "legume",
-        "published": 297,
-        "published_actual": 297,
+        "published": 290,
+        "published_actual": 290,
         "published_target": 250,
         "shortfall": 0
       },
@@ -209,17 +209,17 @@
       },
       {
         "category": "oil_fat",
-        "published": 152,
-        "published_actual": 152,
+        "published": 149,
+        "published_actual": 149,
         "published_target": 150,
-        "shortfall": 0
+        "shortfall": 1
       },
       {
         "category": "condiment_sauce",
-        "published": 198,
-        "published_actual": 198,
+        "published": 196,
+        "published_actual": 196,
         "published_target": 700,
-        "shortfall": 502
+        "shortfall": 504
       },
       {
         "category": "spice_herb",
@@ -230,10 +230,10 @@
       },
       {
         "category": "beverage",
-        "published": 432,
-        "published_actual": 432,
+        "published": 420,
+        "published_actual": 420,
         "published_target": 600,
-        "shortfall": 168
+        "shortfall": 180
       },
       {
         "category": "snack",
@@ -244,8 +244,8 @@
       },
       {
         "category": "sweet",
-        "published": 556,
-        "published_actual": 556,
+        "published": 550,
+        "published_actual": 550,
         "published_target": 500,
         "shortfall": 0
       },
@@ -258,10 +258,10 @@
       },
       {
         "category": "other",
-        "published": 47,
-        "published_actual": 47,
+        "published": 14,
+        "published_actual": 14,
         "published_target": 200,
-        "shortfall": 153
+        "shortfall": 186
       }
     ],
     "by_category": [
@@ -274,22 +274,22 @@
       },
       {
         "category": "produce_fruit",
-        "published": 730,
-        "published_actual": 730,
+        "published": 728,
+        "published_actual": 728,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_meat",
-        "published": 2218,
-        "published_actual": 2218,
+        "published": 858,
+        "published_actual": 858,
         "published_target": 700,
         "shortfall": 0
       },
       {
         "category": "protein_poultry",
-        "published": 499,
-        "published_actual": 499,
+        "published": 492,
+        "published_actual": 492,
         "published_target": 400,
         "shortfall": 0
       },
@@ -337,15 +337,15 @@
       },
       {
         "category": "bread_bakery",
-        "published": 805,
-        "published_actual": 805,
+        "published": 613,
+        "published_actual": 613,
         "published_target": 500,
         "shortfall": 0
       },
       {
         "category": "legume",
-        "published": 297,
-        "published_actual": 297,
+        "published": 290,
+        "published_actual": 290,
         "published_target": 250,
         "shortfall": 0
       },
@@ -358,17 +358,17 @@
       },
       {
         "category": "oil_fat",
-        "published": 152,
-        "published_actual": 152,
+        "published": 149,
+        "published_actual": 149,
         "published_target": 150,
-        "shortfall": 0
+        "shortfall": 1
       },
       {
         "category": "condiment_sauce",
-        "published": 198,
-        "published_actual": 198,
+        "published": 196,
+        "published_actual": 196,
         "published_target": 700,
-        "shortfall": 502
+        "shortfall": 504
       },
       {
         "category": "spice_herb",
@@ -379,10 +379,10 @@
       },
       {
         "category": "beverage",
-        "published": 432,
-        "published_actual": 432,
+        "published": 420,
+        "published_actual": 420,
         "published_target": 600,
-        "shortfall": 168
+        "shortfall": 180
       },
       {
         "category": "snack",
@@ -393,8 +393,8 @@
       },
       {
         "category": "sweet",
-        "published": 556,
-        "published_actual": 556,
+        "published": 550,
+        "published_actual": 550,
         "published_target": 500,
         "shortfall": 0
       },
@@ -407,11 +407,42 @@
       },
       {
         "category": "other",
-        "published": 47,
-        "published_actual": 47,
+        "published": 14,
+        "published_actual": 14,
         "published_target": 200,
-        "shortfall": 153
+        "shortfall": 186
       }
     ]
+  },
+  "acceptance": {
+    "requirement_met": false,
+    "required_published_items": 10000,
+    "published_items": 9422,
+    "shortfall_against_requirement": 578,
+    "categories_below_target": 13,
+    "per_category_shortfall_total": 2392,
+    "statement": "THIS RELEASE DOES NOT MEET THE CATALOG REQUIREMENT. It publishes 9422 items against the required 10000 (578 short), and 13 of 21 categories are below their own published target by 2392 items in total; the per-category gaps are in coverage.by_category. It is exported so that it can be reviewed, loaded into a development database and benchmarked, and its evidence floor is enforced either way; it is not evidence that the catalog requirement is met, and the feature flag must not be enabled against it (AAP §0.7.5 verifies the published count before enablement)."
+  },
+  "evidence": {
+    "published_foods": 9422,
+    "assessed_records": 9422,
+    "complete_records": 9422,
+    "observed_status_min": 200,
+    "observed_status_max": 200,
+    "identity_sources": [
+      {
+        "identity_source": "usda",
+        "published_foods": 9422,
+        "assessed_records": 9422,
+        "observed_status_min": 200,
+        "observed_status_max": 200
+      }
+    ],
+    "gap_codes": [],
+    "source_cache_resolution": {
+      "required_records": 9422,
+      "resolved_records": 9422,
+      "cache_rows_read": 501
+    }
   }
 }

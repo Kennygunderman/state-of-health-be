@@ -930,8 +930,13 @@ describe('violatesRepetitionRule', () => {
     });
 
     describe('the optional caller-supplied exclusion set', () => {
-        // `swap.logic.ts` is the one caller that passes it — the alternatives
-        // sheet narrows its own eight-row list by the rest of that day.
+        // A caller-chosen exclusion outside §0.7.3 that NO CURRENT CALLER
+        // PASSES: the generator omits it, and so does `swap.logic.ts`, which
+        // applies the same two clauses to the week with the meal being replaced
+        // removed and narrows nothing further. Both halves of the parameter are
+        // pinned here anyway — the exclusion it applies and the empty default —
+        // so a caller that ever needs one inherits a tested rule instead of
+        // spelling the repetition rule a second time.
         it('excludes a recipe the caller names, inside the rule', () => {
             expect(violatesRepetitionRule('r', 0, none, new Set(['r']))).toBe(true);
         });

@@ -1,38 +1,47 @@
-// Facts about one `catalog_foods` row that both writers of that table have to
-// agree on, as pure functions over their arguments.
+// The payload-digest mechanics both writers of `catalog_foods` share, as pure
+// functions over their arguments: key-sorted JSON, and a SHA-256 of a string.
 //
 // WHY THIS MODULE EXISTS. `catalog-import-usda.ts` and `catalog-generate-ai.ts`
-// write the same table from two different sources — curated USDA records and
-// AI-generated candidates — and they have to derive four things identically or
-// the table stops being one catalog: the `search_text` the STORED
-// `search_vector` is generated from, the alias list that feeds it, the
-// key-sorted JSON a payload digest is taken over, and the two version counters
-// `recipe_ingredients` snapshots are checked for staleness against. The
-// generation stage used to import all four FROM the import stage's CLI entry
-// point, which is a module that starts with `./lib/bootstrap` and `./lib/dbGuard`
-// and declares a `main()`: importing it to borrow a hash helper pulls a second
+// each stamp the row they write with a digest of the payload it was derived
+// from, and the digest has to be taken the same way in both or the same payload
+// would produce two different `source_cache_key` values. The generation stage
+// used to import these helpers FROM the import stage's CLI entry point, which
+// is a module that starts with `./lib/bootstrap` and `./lib/dbGuard` and
+// declares a `main()`: importing it to borrow a hash helper pulls a second
 // command's startup ordering and database-origin policy into your own process,
 // and it reads as though one CLI were a library for the other (Rule
 // backend-architecture §1.1/§7.1 — a script is an I/O recipe, and what both
 // recipes share belongs beside them in `lib/`).
 //
-// So this module is deliberately inert on import: two Node built-ins, one
-// type-only import, and one pure module from `src/services/`. It reads no
-// environment variable, opens no connection, registers no handler and runs no
-// statement at load, which is what makes it safe for any script — or any test —
-// to import for one function.
+// So this module is deliberately inert on import: one Node built-in and nothing
+// else. It reads no environment variable, opens no connection, registers no
+// handler and runs no statement at load, which is what makes it safe for any
+// script — or any test — to import for one function.
 //
-// WHAT DOES NOT LIVE HERE. Anything either stage decides for itself:
-// classification, the brand screen, portion resolution, the validation checks
-// and category bounds (those are `src/services/catalog.logic.ts`, which both
-// stages call), and each stage's own Prisma `select` and persistence. The test
-// is whether the two stages MUST agree on it for the table to be coherent.
+// WHAT DOES NOT LIVE HERE: any catalog DECISION. The three derivations that
+// used to sit beside these two helpers — the stored alias list
+// (`dedupeSortedAliases`), the `search_text` the STORED `search_vector` is
+// generated from (`buildSearchText`), and the two version counters
+// `recipe_ingredients` snapshots are checked for staleness against
+// (`nextCatalogFoodVersions`, with `StoredVersionedFacts` and
+// `CatalogFoodVersions`) — now live in `src/services/catalog.logic.ts`, beside
+// the rest of the catalog's rules and under that module's own unit tests
+// (`src/services/__tests__/catalog.logic.test.ts`). They are decisions about
+// what the catalog
+// IS — which names a food answers to, which words find it, and when a frozen
+// recipe snapshot has gone stale — and the AAP assigns the catalog's pure rules
+// to that module (§0.7.1 Group 3), while Rule backend-architecture §1.1/§7.1
+// keeps a script's shared library to the mechanics the scripts themselves need.
+// Both stages still derive them identically, because both call the one
+// implementation there.
+//
+// A digest is not such a decision: key-sorted JSON and a SHA-256 are facts
+// about bytes, and nothing about the catalog changes if a payload is hashed.
+// Classification, the brand screen, portion resolution, the validation checks
+// and category bounds are likewise `src/services/catalog.logic.ts`, and each
+// stage keeps its own Prisma `select` and persistence.
 
 import crypto from 'crypto';
-
-import { normalizeCanonicalName } from '../../src/services/catalog.logic';
-
-import type { CatalogFoodState } from './manifest';
 
 /**
  * Key-sorted JSON, so a digest of a vendor record does not depend on the order
@@ -53,228 +62,119 @@ export const canonicalJsonString = (value: unknown): string => {
 };
 
 export const sha256Hex = (text: string): string => crypto.createHash('sha256').update(text).digest('hex');
-
-
-/** Lower-case, de-duplicated, sorted, and never the canonical name itself. */
-export const dedupeSortedAliases = (aliases: readonly string[], canonicalName: string): string[] => {
-    const normalizedCanonical = normalizeCanonicalName(canonicalName);
-    const seen = new Set<string>();
-    const kept: string[] = [];
-
-    for (const alias of aliases) {
-        const trimmed = alias.trim().toLowerCase().replace(/\s+/g, ' ');
-        if (trimmed.length === 0 || seen.has(trimmed) || normalizeCanonicalName(trimmed) === normalizedCanonical) {
-            continue;
-        }
-        seen.add(trimmed);
-        kept.push(trimmed);
-    }
-
-    return kept.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
-};
-
-
 /**
- * `search_text` feeds the STORED `search_vector`, so it carries the terms that
- * should match and no punctuation: `to_tsvector` owns stemming and weighting,
- * and this file's job is to hand it plain words (Rule backend-architecture §7).
+ * The characters a model-supplied string may never contain, whatever else it
+ * says, as one pattern both stages test against.
+ *
+ * Membership is chosen by what each class DOES to a sink this pipeline writes,
+ * not by how unusual it looks:
+ *
+ *  * `\u0000` cannot exist in a PostgreSQL `text` or `jsonb` value at all. A
+ *    name carrying one does not arrive truncated, it aborts the statement while
+ *    the parameter is being bound (SQLSTATE 22021, surfacing as an opaque
+ *    Prisma P2010), so a whole batch fails on one candidate — and a value that
+ *    reached an evidence fetch or a digest first spent a network round trip and
+ *    a hash on a string that could never be stored.
+ *  * The remaining C0 controls, DEL and the C1 range are what forge a second
+ *    line in a terminal or a CI log, and what a report reader's pager
+ *    interprets as an escape sequence (CWE-117). The three ORDINARY whitespace
+ *    C0 characters — tab, LF, CR — are excluded from this set and collapsed to
+ *    a single space by {@link boundedModelText} instead, because a trailing
+ *    newline in a proposed name is a formatting artefact rather than a hostile
+ *    payload, and refusing the candidate for it would cost a usable food.
+ *  * The zero-width format controls (U+200B–U+200D, U+FEFF) and the line and
+ *    paragraph separators (U+2028/U+2029) make two different strings render
+ *    identically, or break a line where none was stored.
+ *  * Every bidi control, matched as `\p{Bidi_Control}` rather than as a list of
+ *    ranges. The property is the definition this contract means, and naming it
+ *    is what keeps the two from drifting apart: an enumeration of the U+200x
+ *    and U+202x blocks silently omits U+061C ARABIC LETTER MARK, which carries
+ *    `Bidi_Control=Yes` and sits nowhere near them, and a future Unicode
+ *    version may add another such outlier. The property resolves to twelve code
+ *    points today (U+061C, U+200E/F, U+202A–E, U+2066–9) and is evaluated by
+ *    the engine, so it cannot fall behind a hand-copied range.
+ *
+ * Both classes matter here for the same reason: a food NAME is what a user
+ * reads in search results and in a diary row, and what a curator compares
+ * against retrieved evidence, so a name that renders as something other than
+ * what is stored defeats the review this catalog's publication decision rests
+ * on.
  */
-export const buildSearchText = (
-    canonicalName: string,
-    aliases: readonly string[],
-    foodState: CatalogFoodState,
-    foodGroup: string,
-): string => {
-    const words: string[] = [];
-    const seen = new Set<string>();
-    const push = (value: string): void => {
-        for (const word of normalizeCanonicalName(value).split(' ')) {
-            if (word.length > 0 && !seen.has(word)) {
-                seen.add(word);
-                words.push(word);
-            }
-        }
-    };
+const FORBIDDEN_MODEL_TEXT_PATTERN =
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200d\u2028\u2029\ufeff]|\p{Bidi_Control}/u;
 
-    push(canonicalName);
-    for (const alias of aliases) {
-        push(alias);
-    }
-    push(foodState.replace(/_/g, ' '));
-    push(foodGroup.replace(/_/g, ' '));
-
-    return words.join(' ');
-};
-
+/** Tab, LF and CR: collapsed rather than refused, with every other control refused above. */
+const COLLAPSIBLE_WHITESPACE_PATTERN = /\s+/g;
 
 /**
- * Everything the two version counters on `catalog_foods` answer for, plus the
- * counters themselves.
+ * A surrogate code unit that is not part of a valid pair.
  *
- * Every field is optional and nullable on purpose. The columns Prisma reads
- * back are nullable where prisma/schema.prisma says so — the five nutrients
- * and `density_g_per_ml` are `DOUBLE PRECISION NULL`, where NULL means unknown
- * and never zero — and a field the caller has no value for arrives as
- * `undefined`. {@link nextCatalogFoodVersions} normalises the two into one
- * "no value" so neither reads as a change against the other.
+ * JavaScript strings are UTF-16 and permit a lone surrogate; PostgreSQL's
+ * `text` is UTF-8 and has no encoding for one, so such a value is another
+ * statement-level failure rather than a storage question. It cannot be repaired
+ * — there is no character to keep — so a string carrying one is refused.
  */
-export interface StoredVersionedFacts {
-    /**
-     * The counters as stored. Read from the existing row only — the incoming
-     * facts do not carry a version, because what the next version IS is this
-     * module's decision rather than the vendor payload's.
-     */
-    nutrition_version?: number | null;
-    metadata_version?: number | null;
-
-    // THE NUTRITION SET: the five values `recipe_ingredients.snapshot_per_100g`
-    // freezes, the three that fix what "per 100" means (a per_100ml basis, a
-    // basis amount of 50 or a density each change what the same five numbers
-    // describe), the provenance `snapshot_provenance` freezes, and the vendor
-    // facts the numbers were read from — a different fdc id, data type or
-    // publication month means a different source record produced them, which a
-    // recipe holding the old snapshot has to be told about.
-    calories?: number | null;
-    protein_g?: number | null;
-    carbs_g?: number | null;
-    fat_g?: number | null;
-    fiber_g?: number | null;
-    nutrition_basis?: string | null;
-    basis_amount?: number | null;
-    density_g_per_ml?: number | null;
-    nutrition_provenance?: string | null;
-    usda_fdc_id?: number | null;
-    usda_data_type?: string | null;
-    source_version?: string | null;
-
-    // THE METADATA SET: identity and safety. `snapshot_name` freezes the name a
-    // recipe displays, `snapshot_allergen_tags` and `snapshot_diet_tags` freeze
-    // what it may claim, and `food_group` is what a user's dislike selection
-    // excludes by. `allergen_status` is here because 'known' → 'unknown' is a
-    // change of safety standing even when the tag list is untouched.
-    canonical_name?: string | null;
-    display_name?: string | null;
-    food_group?: string | null;
-    allergen_status?: string | null;
-    allergen_tags?: readonly string[] | null;
-    diet_tags?: readonly string[] | null;
-}
-
-
-/** The two counters to write, and which set moved to get them there. */
-export interface CatalogFoodVersions {
-    readonly nutritionVersion: number;
-    readonly metadataVersion: number;
-    /** False on an insert: a new row's counters start at 1, they do not move. */
-    readonly nutritionChanged: boolean;
-    readonly metadataChanged: boolean;
-}
-
+const UNPAIRED_SURROGATE_PATTERN = /[\ud800-\udbff](?![\udc00-\udfff])|(?:^|[^\ud800-\udbff])[\udc00-\udfff]/;
 
 /**
- * Order-insensitive set comparison for the two tag arrays: a food whose diet
- * tags came back in a different order has not changed, and versioning it would
- * be versioning the vendor's array ordering.
- */
-const sameStringSet = (
-    left: readonly string[] | null | undefined,
-    right: readonly string[] | null | undefined,
-): boolean => {
-    const a = [...(left ?? [])].sort();
-    const b = [...(right ?? [])].sort();
-    return a.length === b.length && a.every((value, index) => value === b[index]);
-};
-
-/**
- * One fact compared, with absent and NULL treated as the same "no value".
+ * One model-supplied string, narrowed to something this pipeline may store,
+ * digest, log and put in front of a curator — or `null`, which means the field
+ * is unusable and the candidate or the field is refused.
  *
- * Strict equality is the right test for the numbers here: they are read per
- * 100 g out of the same vendor payload by the same deterministic code, so a
- * rerun that changes nothing produces bit-identical doubles, and a tolerance
- * would only hide a real vendor revision. What DOES need normalising is
- * `undefined` vs `null` — `fiber_g` is written as `?? null` and a fact the
- * caller omits arrives as `undefined` — which without this would read as a
- * change on every single rerun.
- */
-const sameFact = (
-    left: string | number | null | undefined,
-    right: string | number | null | undefined,
-): boolean => (left ?? null) === (right ?? null);
-
-/**
- * Both version counters for the row about to be written.
+ * `null` is the fail-closed answer and the point of the function: it is
+ * returned for a non-string, for a string that is empty once trimmed, and for a
+ * string carrying any character in {@link FORBIDDEN_MODEL_TEXT_PATTERN} or an
+ * unpaired surrogate. The alternative — stripping the offending characters and
+ * storing what is left — silently changes a name into a DIFFERENT name and then
+ * presents it as the model's proposal, which is exactly the "never present a
+ * generated value as established" rule (AAP §0.1.2) applied to identity rather
+ * than to nutrition. Refusing costs one candidate; rewriting costs the audit
+ * trail.
  *
- * WHY THIS EXISTS AT ALL. `recipe_ingredients` freezes `snapshot_per_100g`,
- * `snapshot_name`, `snapshot_provenance`, `snapshot_allergen_tags` and
- * `snapshot_diet_tags` beside the two counters they were taken at, and
- * `src/services/recipe.logic.ts::isIngredientSnapshotStale` detects a stale
- * snapshot by comparing BOTH counters for INEQUALITY — nothing compares the
- * values themselves. A counter that is reset to 1, or that fails to move when
- * its facts did, therefore means a published recipe goes on claiming nutrition
- * or safety metadata the catalog no longer states: with the allergen set that
- * is a safety bug, not a cosmetic one (AAP §0.5.1, §0.7.3, and the counter
- * contract "nutrition_version bumped on any nutrient change, metadata_version
- * bumped on any allergen/diet/name/food-group change").
+ * What it DOES do to an acceptable string: trims it, collapses every run of
+ * ordinary whitespace to one space, and bounds it at `maxChars`. The bound is
+ * the caller's, because the ceilings differ by field (a canonical name and an
+ * advisory review reason are not the same size of thing) and neither belongs to
+ * this module.
  *
- * Each counter answers for its own set and only its own: a renamed food does
- * not reversion its nutrition, and a changed nutrient does not reversion its
- * safety metadata, because either spurious bump forces a needless new recipe
- * version across every recipe using the food. An unchanged set PRESERVES the
- * stored counter rather than recomputing it, which is what keeps a no-op rerun
- * byte-identical and an exported release stable.
+ * Shared by `catalog-generate-ai.ts` (every string read off a generation
+ * payload) and `catalog-validate.ts` (the advisory review's free-text reason),
+ * for the reason stated at the top of this file: the two stages write and
+ * annotate the same rows, so a character one of them refuses and the other
+ * stores is a difference in what the catalog contains, not a style difference.
  *
- * `next` may carry more than the compared facts — the caller passes the whole
- * scalar set it is about to write — and everything outside the two sets above
- * is ignored.
- *
- * @param existing the stored row, or `null` when this `source_key` is new
- * @param next the facts about to be written
+ * @param value the field as the payload carried it, of unknown type
+ * @param maxChars the ceiling this field is kept to, in UTF-16 code units
  *
  * @example
- * // A rerun that changed nothing keeps both counters where they were.
- * nextCatalogFoodVersions({ nutrition_version: 3, metadata_version: 2, calories: 165 }, { calories: 165 });
- * // → { nutritionVersion: 3, metadataVersion: 2, nutritionChanged: false, metadataChanged: false }
+ * boundedModelText('  chicken   breast\n', 200); // → 'chicken breast'
+ * boundedModelText('chicken\u0000breast', 200);  // → null
  */
-export const nextCatalogFoodVersions = (
-    existing: StoredVersionedFacts | null,
-    next: StoredVersionedFacts,
-): CatalogFoodVersions => {
-    // A new row is at version 1 on both counters. There is no stored snapshot
-    // of it anywhere yet, so nothing has moved and nothing can be stale.
-    if (existing === null) {
-        return { nutritionVersion: 1, metadataVersion: 1, nutritionChanged: false, metadataChanged: false };
+export const boundedModelText = (value: unknown, maxChars: number): string | null => {
+    if (typeof value !== 'string') {
+        return null;
     }
 
-    const nutritionChanged =
-        !sameFact(existing.calories, next.calories) ||
-        !sameFact(existing.protein_g, next.protein_g) ||
-        !sameFact(existing.carbs_g, next.carbs_g) ||
-        !sameFact(existing.fat_g, next.fat_g) ||
-        !sameFact(existing.fiber_g, next.fiber_g) ||
-        !sameFact(existing.nutrition_basis, next.nutrition_basis) ||
-        !sameFact(existing.basis_amount, next.basis_amount) ||
-        !sameFact(existing.density_g_per_ml, next.density_g_per_ml) ||
-        !sameFact(existing.nutrition_provenance, next.nutrition_provenance) ||
-        !sameFact(existing.usda_fdc_id, next.usda_fdc_id) ||
-        !sameFact(existing.usda_data_type, next.usda_data_type) ||
-        !sameFact(existing.source_version, next.source_version);
+    if (FORBIDDEN_MODEL_TEXT_PATTERN.test(value) || UNPAIRED_SURROGATE_PATTERN.test(value)) {
+        return null;
+    }
 
-    const metadataChanged =
-        !sameFact(existing.canonical_name, next.canonical_name) ||
-        !sameFact(existing.display_name, next.display_name) ||
-        !sameFact(existing.food_group, next.food_group) ||
-        !sameFact(existing.allergen_status, next.allergen_status) ||
-        !sameStringSet(existing.allergen_tags, next.allergen_tags) ||
-        !sameStringSet(existing.diet_tags, next.diet_tags);
+    const bound = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 0;
+    if (bound === 0) {
+        return null;
+    }
 
-    // A stored counter this stage never wrote (a hand-loaded row, a release
-    // predating the column) is read as 1 rather than as "no version": the
-    // column is NOT NULL in the schema, and treating a missing counter as 0
-    // would silently renumber a snapshot that already cites 1.
-    return {
-        nutritionVersion: (existing.nutrition_version ?? 1) + (nutritionChanged ? 1 : 0),
-        metadataVersion: (existing.metadata_version ?? 1) + (metadataChanged ? 1 : 0),
-        nutritionChanged,
-        metadataChanged,
-    };
+    // Trimmed after the refusal above, so a control character hiding in
+    // leading or trailing whitespace is refused rather than trimmed away.
+    const collapsed = value.trim().replace(COLLAPSIBLE_WHITESPACE_PATTERN, ' ');
+    const bounded = collapsed.length > bound ? collapsed.slice(0, bound) : collapsed;
+
+    // The cut is in UTF-16 code units, so it can land BETWEEN the two halves of
+    // a surrogate pair and manufacture the lone surrogate the input was checked
+    // for. Dropping the orphaned high half is the only repair that leaves valid
+    // text, and it costs one character of a value already being truncated.
+    const lastUnit = bounded.length > 0 ? bounded.charCodeAt(bounded.length - 1) : 0;
+    const whole = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? bounded.slice(0, -1) : bounded;
+
+    return whole.length > 0 ? whole : null;
 };

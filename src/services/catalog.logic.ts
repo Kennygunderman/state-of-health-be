@@ -878,6 +878,285 @@ export const dedupeIdentity = (candidates: readonly CatalogIdentityCandidate[]):
     };
 };
 
+
+/* ---------------------------------------------------------------------------
+ * The stored-row derivations both writers of `catalog_foods` must agree on
+ * ------------------------------------------------------------------------- */
+
+// WHY THESE THREE RULES ARE HERE. `catalog-import-usda.ts` and
+// `catalog-generate-ai.ts` write the same table from two different sources —
+// curated USDA records and AI-generated candidates — and they have to derive
+// three things identically or the table stops being one catalog: the alias list
+// a food answers to, the `search_text` the STORED `search_vector` is generated
+// from, and the two version counters `recipe_ingredients` snapshots are checked
+// for staleness against. Each is a decision about what the catalog IS rather
+// than a mechanic of either command, so it belongs with the other catalog rules
+// in this module and is unit-tested beside them (AAP §0.7.1 Group 3, Rule
+// backend-architecture §1.1/§7.1 — a script is an I/O recipe, and the domain
+// rules it applies live in the service layer it calls).
+//
+// What stays in `scripts/lib/catalogFoodFacts.ts` is the payload-digest
+// mechanics the two commands also share (`canonicalJsonString`, `sha256Hex`):
+// key-sorted JSON and a SHA-256 are facts about bytes, with no catalog decision
+// in them.
+
+/**
+ * The alias list to store for one food: lower-cased, internally
+ * whitespace-collapsed, de-duplicated, sorted, and never the canonical name
+ * itself.
+ *
+ * Both writers must agree on this because the aliases feed
+ * {@link buildSearchText}, and therefore the stored `search_vector`: a food
+ * whose aliases differ by case or by ordering between two runs produces a
+ * different `search_text`, which is a spurious update on every rerun and a
+ * different search corpus on every release. The canonical name is excluded
+ * because the name is already indexed in its own right — storing it again as an
+ * alias would double its contribution to the score.
+ *
+ * Sorting is by code unit (byte order for the ASCII these names normalise to),
+ * the same comparator the release export and the `COLLATE "C"` tiebreakers use,
+ * so the order is a property of the data rather than of the host's locale.
+ *
+ * @param aliases the candidate's own alias claims, in any order
+ * @param canonicalName the food's canonical name, which is never an alias
+ *
+ * @example
+ * dedupeSortedAliases([' Aubergine ', 'aubergine', 'Egg  plant'], 'eggplant');
+ * // → ['aubergine', 'egg plant']
+ */
+export const dedupeSortedAliases = (aliases: readonly string[], canonicalName: string): string[] => {
+    const normalizedCanonical = normalizeCanonicalName(canonicalName);
+    const seen = new Set<string>();
+    const kept: string[] = [];
+
+    for (const alias of aliases) {
+        const trimmed = alias.trim().toLowerCase().replace(WHITESPACE_RUN_PATTERN, ' ');
+        if (trimmed.length === 0 || seen.has(trimmed) || normalizeCanonicalName(trimmed) === normalizedCanonical) {
+            continue;
+        }
+        seen.add(trimmed);
+        kept.push(trimmed);
+    }
+
+    return kept.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+};
+
+/**
+ * `search_text` feeds the STORED `search_vector`, so it carries the terms that
+ * should match and no punctuation: `to_tsvector` owns stemming and weighting,
+ * and this rule's job is to hand it plain words (Rule backend-architecture §7).
+ *
+ * The words are the canonical name's, then every alias's, then the food state's
+ * and the food group's, first occurrence kept and later repeats dropped — so
+ * the result is stable across two runs over the same facts, which is what makes
+ * a rerun a no-op rather than an update. The state and group are underscored
+ * codes (`as_purchased`, `bell_pepper`), and the underscore is expanded to a
+ * space so each half is its own searchable word instead of one lexeme no user
+ * would type.
+ *
+ * Both writers must agree on this for the same reason they must agree on the
+ * alias list: the column is the search corpus, and two stages deriving it by
+ * two rules would make a food's reachability depend on which stage happened to
+ * write it.
+ */
+export const buildSearchText = (
+    canonicalName: string,
+    aliases: readonly string[],
+    foodState: CatalogFoodState,
+    foodGroup: string,
+): string => {
+    const words: string[] = [];
+    const seen = new Set<string>();
+    const push = (value: string): void => {
+        for (const word of normalizeCanonicalName(value).split(' ')) {
+            if (word.length > 0 && !seen.has(word)) {
+                seen.add(word);
+                words.push(word);
+            }
+        }
+    };
+
+    push(canonicalName);
+    for (const alias of aliases) {
+        push(alias);
+    }
+    push(foodState.replace(/_/g, ' '));
+    push(foodGroup.replace(/_/g, ' '));
+
+    return words.join(' ');
+};
+
+/**
+ * Everything the two version counters on `catalog_foods` answer for, plus the
+ * counters themselves.
+ *
+ * Every field is optional and nullable on purpose. The columns Prisma reads
+ * back are nullable where prisma/schema.prisma says so — the five nutrients
+ * and `density_g_per_ml` are `DOUBLE PRECISION NULL`, where NULL means unknown
+ * and never zero — and a field the caller has no value for arrives as
+ * `undefined`. {@link nextCatalogFoodVersions} normalises the two into one
+ * "no value" so neither reads as a change against the other.
+ */
+export interface StoredVersionedFacts {
+    /**
+     * The counters as stored. Read from the existing row only — the incoming
+     * facts do not carry a version, because what the next version IS is this
+     * module's decision rather than the vendor payload's.
+     */
+    nutrition_version?: number | null;
+    metadata_version?: number | null;
+
+    // THE NUTRITION SET: the five values `recipe_ingredients.snapshot_per_100g`
+    // freezes, the three that fix what "per 100" means (a per_100ml basis, a
+    // basis amount of 50 or a density each change what the same five numbers
+    // describe), the provenance `snapshot_provenance` freezes, and the vendor
+    // facts the numbers were read from — a different fdc id, data type or
+    // publication month means a different source record produced them, which a
+    // recipe holding the old snapshot has to be told about.
+    calories?: number | null;
+    protein_g?: number | null;
+    carbs_g?: number | null;
+    fat_g?: number | null;
+    fiber_g?: number | null;
+    nutrition_basis?: string | null;
+    basis_amount?: number | null;
+    density_g_per_ml?: number | null;
+    nutrition_provenance?: string | null;
+    usda_fdc_id?: number | null;
+    usda_data_type?: string | null;
+    source_version?: string | null;
+
+    // THE METADATA SET: identity and safety. `snapshot_name` freezes the name a
+    // recipe displays, `snapshot_allergen_tags` and `snapshot_diet_tags` freeze
+    // what it may claim, and `food_group` is what a user's dislike selection
+    // excludes by. `allergen_status` is here because 'known' → 'unknown' is a
+    // change of safety standing even when the tag list is untouched.
+    canonical_name?: string | null;
+    display_name?: string | null;
+    food_group?: string | null;
+    allergen_status?: string | null;
+    allergen_tags?: readonly string[] | null;
+    diet_tags?: readonly string[] | null;
+}
+
+/** The two counters to write, and which set moved to get them there. */
+export interface CatalogFoodVersions {
+    readonly nutritionVersion: number;
+    readonly metadataVersion: number;
+    /** False on an insert: a new row's counters start at 1, they do not move. */
+    readonly nutritionChanged: boolean;
+    readonly metadataChanged: boolean;
+}
+
+/**
+ * Order-insensitive set comparison for the two tag arrays: a food whose diet
+ * tags came back in a different order has not changed, and versioning it would
+ * be versioning the vendor's array ordering.
+ */
+const sameStringSet = (
+    left: readonly string[] | null | undefined,
+    right: readonly string[] | null | undefined,
+): boolean => {
+    const a = [...(left ?? [])].sort();
+    const b = [...(right ?? [])].sort();
+    return a.length === b.length && a.every((value, index) => value === b[index]);
+};
+
+/**
+ * One fact compared, with absent and NULL treated as the same "no value".
+ *
+ * Strict equality is the right test for the numbers here: they are read per
+ * 100 g out of the same vendor payload by the same deterministic code, so a
+ * rerun that changes nothing produces bit-identical doubles, and a tolerance
+ * would only hide a real vendor revision. What DOES need normalising is
+ * `undefined` vs `null` — `fiber_g` is written as `?? null` and a fact the
+ * caller omits arrives as `undefined` — which without this would read as a
+ * change on every single rerun.
+ */
+const sameFact = (
+    left: string | number | null | undefined,
+    right: string | number | null | undefined,
+): boolean => (left ?? null) === (right ?? null);
+
+/**
+ * Both version counters for the row about to be written.
+ *
+ * WHY THIS EXISTS AT ALL. `recipe_ingredients` freezes `snapshot_per_100g`,
+ * `snapshot_name`, `snapshot_provenance`, `snapshot_allergen_tags` and
+ * `snapshot_diet_tags` beside the two counters they were taken at, and
+ * `src/services/recipe.logic.ts::isIngredientSnapshotStale` detects a stale
+ * snapshot by comparing BOTH counters for INEQUALITY — nothing compares the
+ * values themselves. A counter that is reset to 1, or that fails to move when
+ * its facts did, therefore means a published recipe goes on claiming nutrition
+ * or safety metadata the catalog no longer states: with the allergen set that
+ * is a safety bug, not a cosmetic one (AAP §0.5.1, §0.7.3, and the counter
+ * contract "nutrition_version bumped on any nutrient change, metadata_version
+ * bumped on any allergen/diet/name/food-group change").
+ *
+ * Each counter answers for its own set and only its own: a renamed food does
+ * not reversion its nutrition, and a changed nutrient does not reversion its
+ * safety metadata, because either spurious bump forces a needless new recipe
+ * version across every recipe using the food. An unchanged set PRESERVES the
+ * stored counter rather than recomputing it, which is what keeps a no-op rerun
+ * byte-identical and an exported release stable.
+ *
+ * `next` may carry more than the compared facts — the caller passes the whole
+ * scalar set it is about to write — and everything outside the two sets above
+ * is ignored.
+ *
+ * @param existing the stored row, or `null` when this `source_key` is new
+ * @param next the facts about to be written
+ *
+ * @example
+ * // A rerun that changed nothing keeps both counters where they were.
+ * nextCatalogFoodVersions({ nutrition_version: 3, metadata_version: 2, calories: 165 }, { calories: 165 });
+ * // → { nutritionVersion: 3, metadataVersion: 2, nutritionChanged: false, metadataChanged: false }
+ */
+export const nextCatalogFoodVersions = (
+    existing: StoredVersionedFacts | null,
+    next: StoredVersionedFacts,
+): CatalogFoodVersions => {
+    // A new row is at version 1 on both counters. There is no stored snapshot
+    // of it anywhere yet, so nothing has moved and nothing can be stale.
+    if (existing === null) {
+        return { nutritionVersion: 1, metadataVersion: 1, nutritionChanged: false, metadataChanged: false };
+    }
+
+    const nutritionChanged =
+        !sameFact(existing.calories, next.calories) ||
+        !sameFact(existing.protein_g, next.protein_g) ||
+        !sameFact(existing.carbs_g, next.carbs_g) ||
+        !sameFact(existing.fat_g, next.fat_g) ||
+        !sameFact(existing.fiber_g, next.fiber_g) ||
+        !sameFact(existing.nutrition_basis, next.nutrition_basis) ||
+        !sameFact(existing.basis_amount, next.basis_amount) ||
+        !sameFact(existing.density_g_per_ml, next.density_g_per_ml) ||
+        !sameFact(existing.nutrition_provenance, next.nutrition_provenance) ||
+        !sameFact(existing.usda_fdc_id, next.usda_fdc_id) ||
+        !sameFact(existing.usda_data_type, next.usda_data_type) ||
+        !sameFact(existing.source_version, next.source_version);
+
+    const metadataChanged =
+        !sameFact(existing.canonical_name, next.canonical_name) ||
+        !sameFact(existing.display_name, next.display_name) ||
+        !sameFact(existing.food_group, next.food_group) ||
+        !sameFact(existing.allergen_status, next.allergen_status) ||
+        !sameStringSet(existing.allergen_tags, next.allergen_tags) ||
+        !sameStringSet(existing.diet_tags, next.diet_tags);
+
+    // A stored counter this rule never wrote (a hand-loaded row, a release
+    // predating the column) is read as 1 rather than as "no version": the
+    // column is NOT NULL in the schema, and treating a missing counter as 0
+    // would silently renumber a snapshot that already cites 1.
+    return {
+        nutritionVersion: (existing.nutrition_version ?? 1) + (nutritionChanged ? 1 : 0),
+        metadataVersion: (existing.metadata_version ?? 1) + (metadataChanged ? 1 : 0),
+        nutritionChanged,
+        metadataChanged,
+    };
+};
+
+
 /* ---------------------------------------------------------------------------
  * Shared request-query readers — used by BOTH request parsers below
  * ------------------------------------------------------------------------- */
@@ -1082,15 +1361,17 @@ export const parseCatalogSearchRequest = (query: unknown): ParsedCatalogSearchRe
  * WHY THIS POLICY EXISTS AT ALL. `ts_rank` alone does not rank this catalog.
  * Its default normalisation scores a document by term frequency and ignores
  * document length, and a catalog food mentions any given word about once — so
- * an entire match set collapses onto ONE rank value. Measured against the v1
- * release: `q = 'salt'` matches 595 published foods and
- * `count(DISTINCT ts_rank(search_vector, plainto_tsquery('english','salt')))`
- * over them is exactly **1**. With every rank equal, the order is decided
- * entirely by the tiebreakers below it — `display_name`, i.e. alphabetical byte
- * order, which is uncorrelated with relevance. That is why "Salt" ranked 463rd
- * of 602 for "salt" and "Chicken breast" 265th of 674 for "chicken", and why
- * the §0.7.3 relevance bar (top-3 ≥ 90 %, top-10 ≥ 97 %) was missed at
- * 62.2 % / 80.3 %.
+ * an entire match set collapses onto ONE rank value. On a bare category word
+ * such as `q = 'salt'`, every published food that mentions it shares a single
+ * value of `ts_rank(search_vector, plainto_tsquery('english','salt'))`. With
+ * every rank equal, the order is decided entirely by the tiebreakers below it —
+ * `display_name`, i.e. alphabetical byte order, which is uncorrelated with
+ * relevance, so the food actually called "Salt" sat pages deep for "salt" and
+ * "Chicken breast" for "chicken", and the §0.7.3 relevance bar (top-3 ≥ 90 %,
+ * top-10 ≥ 97 %) was missed. The rates before and after are a property of a
+ * benchmark run rather than of this file, so they are read from
+ * `data/meal-planning/reports/latest/benchmark-report.json` and not restated
+ * here.
  *
  * WHAT THE POLICY CHANGES, AND WHAT IT DELIBERATELY DOES NOT. It changes only
  * the VALUE of `rank`. `catalog.service.ts` still ranks a food by
@@ -1126,8 +1407,8 @@ export const parseCatalogSearchRequest = (query: unknown): ParsedCatalogSearchRe
  *     each was measured:
  *       * not the alias's own length, because the one-word alias "chickens" on
  *         "Chicken, NS as to part and cooking method, NS as to skin eaten"
- *         then scored 0.06079 and beat "Chicken breast" on its own name at
- *         0.03040 — short aliases hijacked every category query;
+ *         then beat "Chicken breast" on its own name — short aliases hijacked
+ *         every category query;
  *       * not the food's name alone either, because a one-word name with a
  *         longer alias then inherited the short divisor: "Egg", carrying the
  *         alias "chicken egg", took first place for `q = 'chicken'`.
@@ -1155,30 +1436,46 @@ export const parseCatalogSearchRequest = (query: unknown): ParsedCatalogSearchRe
  * search, and adding one would put file I/O on the measured request path.
  *
  * THE VALUES ARE NOT ARBITRARY. Each was adopted from a full measurement of
- * the committed 426-query set against the loaded v1 release, adding one signal
- * at a time: 0.622/0.803 as found → 0.878/0.944 with specificity on the name →
- * 0.913/0.958 adding the prefix band → 0.920/0.962 normalising aliases by the
- * food's name → 0.932/0.977 with the head-segment factor → 0.944/0.991 with
- * the head-noun factor → **0.948/0.991 once the specificity divisor became the
- * name's WORD count** rather than its lexeme count, against bounds of 0.90 and
- * 0.97. That last step is the one worth reading twice, because it was adopted
- * for correctness and not only for the 0.004: a lexeme count drops English
- * stopwords, so "Rice with raisins" counted two against "Brown rice, dry"'s
- * three and the vaguer name won `q = 'rice'`. Counting words treats a
- * postmodified phrase as the longer, less specific name it is — and costs a
- * second `to_tsvector` per alias row less, which is where roughly 25 ms of the
- * widest query's latency went.
+ * the committed query set against the loaded v1 release, adding ONE signal at a
+ * time and keeping the signal only where the measured hit rates improved:
+ * specificity on the name first, then the prefix band, then normalising an
+ * alias by the longer of the alias and the name, then the head-segment factor,
+ * then the head-noun factor, and last the specificity divisor becoming the
+ * name's WORD count rather than its lexeme count. That last step is the one
+ * worth reading twice, because it was adopted for correctness and not for its
+ * margin: a lexeme count drops English stopwords, so "Rice with raisins"
+ * counted two against "Brown rice, dry"'s three and the vaguer name won
+ * `q = 'rice'`. Counting words treats a postmodified phrase as the longer, less
+ * specific name it is — and costs one `to_tsvector` per alias row less, which
+ * also took latency off the widest query.
  *
- * THE DELIVERED FIGURES, for anyone auditing this comment against evidence:
- * top-3 0.948 (404 of 426), top-10 0.991 (422 of 426), zero-result 0, p95
- * 94.666 ms over 1,278 timed samples — the full §0.9.3 protocol against the v1
- * release, reproduced rank-for-rank with zero differences on a second,
- * independently loaded database. Four queries remain outside the top ten
- * ('crackers', 'mushrooms', 'mushroom', 'chicken'): each is a bare category
- * word whose leading results are legitimate members of that category, and
- * moving them would need a signal this policy does not have — which is stated
- * here rather than closed, because the alternative is fitting weights to the
- * benchmark's query list instead of to how names are built.
+ * WHERE THE DELIVERED FIGURES LIVE, rather than a copy of them here. The
+ * acceptance evidence is `data/meal-planning/reports/latest/benchmark-report.json`,
+ * written by `npm run search:benchmark` under the §0.9.3 protocol against a
+ * loaded release: its `thresholds.checks` block carries each bound from
+ * `data/meal-planning/search-benchmark.v1.json` beside the figure measured
+ * against it and its own pass verdict, `rollups` carries the top-3 and top-10
+ * hit rates as counts as well as rates, and `latency` carries the percentiles,
+ * the sample count and the conditions they were taken under. None of its
+ * MEASURED figures is restated here, on purpose: a measurement copied into a
+ * comment is stale the moment the report is regenerated, while a contract bound
+ * like the §0.7.3 relevance bar above is committed and may be named. This
+ * comment's job is the REASONING, which the weights themselves fix, and the
+ * report's job is the evidence. Release determinism is a property of
+ * two runs rather than one, so the report's `crossDatabaseReproduction` block
+ * records it only when the command is given a second, independently loaded
+ * database's report to compare with (`--compare-with`), and states what it has
+ * not yet established otherwise.
+ *
+ * WHAT THE POLICY STILL DOES NOT REACH, stated here rather than closed. A
+ * handful of bare category-word queries ('crackers', 'mushrooms', 'mushroom',
+ * 'chicken' in the committed run — the report's `results` name them, and its
+ * `diagnostics.beyondMeasuredPage` lists any whose expected food fell past the
+ * measured page) rank their expected food outside the top ten: each is a lone
+ * category word whose leading results are legitimate members of that category,
+ * and moving them would need a signal this policy does not have. The
+ * alternative is fitting weights to the benchmark's query list instead of to
+ * how names are built, which would make the next query set the retune.
  */
 export interface SearchRelevanceWeights {
     /**
@@ -1566,6 +1863,349 @@ export const DEFAULT_PRODUCT_FORM_WORDS: readonly string[] = [
     'wrap',
 ];
 
+/**
+ * THE REVIEWED EXCEPTION VOCABULARY: words that legitimately LEAD a
+ * sentence-case generic catalog name, so their capital carries no information.
+ *
+ * WHY IT IS NEEDED. Every sentence-case name capitalises its first word, so
+ * "Acme bar" and "Protein bar" are the same shape; only the word itself
+ * separates a fabricated manufacturer from a food. {@link findBrandPatternMatch}
+ * therefore fires on a leading proper noun with a product form after it UNLESS
+ * the word is in this list, which is what lets the check reject "Acme bar"
+ * without rejecting the generic preparations AI generation exists to propose
+ * (AAP §0.7.3).
+ *
+ * THE ADMISSION CRITERION, so the list can be extended by the same rule it was
+ * built with: a word earns a place here when it names a food, an ingredient, a
+ * preparation or a meal occasion — something any producer's product could be
+ * made of or eaten at. A word that names a MAKER, or that only markets one,
+ * does not: "classic", "original", "premium", "select" and "signature" are
+ * deliberately absent, and so is any cookware or process noun a brand is built
+ * on ("Kettle"), because those are exactly the leading words a fabricated brand
+ * uses.
+ *
+ * Vocabulary rather than a threshold, so it lives in this module beside
+ * {@link DEFAULT_BRAND_WORDS} and {@link DEFAULT_PRODUCT_FORM_WORDS} and can be
+ * replaced through {@link BrandPatternOptions.genericLeadWords} without a code
+ * change. Like those two it is not in `data/meal-planning/coverage-plan.v1.json`
+ * — that document describes the catalog's CONTENT and carries no naming
+ * vocabulary, which is why {@link CatalogValidationPolicy} declares no list for
+ * it either.
+ *
+ * The food and ingredient entries are the words of the coverage plan's own
+ * 123-value `food_group` taxonomy and its 21 category codes (`bell_pepper`,
+ * `dairy_alternative`, `nut_seed` …), extended with the everyday ingredient
+ * nouns that taxonomy groups rather than names. Taking them from the catalog's
+ * own vocabulary is deliberate: a word the catalog files foods under cannot
+ * sensibly be read as a manufacturer.
+ */
+export const DEFAULT_GENERIC_LEAD_WORDS: readonly string[] = [
+    // Food groups, ingredients, and the generic nouns a preparation is named
+    // for ("Trail mix").
+    'almond',
+    'anchovy',
+    'apple',
+    'apricot',
+    'artichoke',
+    'asparagus',
+    'avocado',
+    'bacon',
+    'bakery',
+    'banana',
+    'barley',
+    'basil',
+    'bean',
+    'beef',
+    'beet',
+    'berry',
+    'beverage',
+    'biscuit',
+    'blueberry',
+    'bread',
+    'broccoli',
+    'broth',
+    'butter',
+    'cabbage',
+    'candy',
+    'cantaloupe',
+    'carrot',
+    'cashew',
+    'cauliflower',
+    'celery',
+    'cheese',
+    'cherry',
+    'chicken',
+    'chickpea',
+    'chili',
+    'chive',
+    'chocolate',
+    'cilantro',
+    'citrus',
+    'coconut',
+    'coffee',
+    'condiment',
+    'corn',
+    'couscous',
+    'cracker',
+    'cranberry',
+    'cream',
+    'crustacean',
+    'cucumber',
+    'dairy',
+    'date',
+    'dill',
+    'dressing',
+    'duck',
+    'egg',
+    'eggplant',
+    'farro',
+    'fig',
+    'fish',
+    'flatbread',
+    'flour',
+    'fruit',
+    'garlic',
+    'ginger',
+    'grain',
+    'granola',
+    'grape',
+    'grapefruit',
+    'green',
+    'herb',
+    'honey',
+    'hummus',
+    'juice',
+    'kale',
+    'kefir',
+    'kimchi',
+    'kiwi',
+    'lamb',
+    'leek',
+    'legume',
+    'lemon',
+    'lentil',
+    'lettuce',
+    'lime',
+    'mango',
+    'maple',
+    'mayonnaise',
+    'meal',
+    'meat',
+    'melon',
+    'milk',
+    'millet',
+    'mint',
+    'miso',
+    'mollusk',
+    'mushroom',
+    'mustard',
+    'noodle',
+    'nut',
+    'oat',
+    'oatmeal',
+    'oil',
+    'okra',
+    'olive',
+    'onion',
+    'orange',
+    'oregano',
+    'papaya',
+    'parsley',
+    'parsnip',
+    'pasta',
+    'pastry',
+    'pea',
+    'peach',
+    'peanut',
+    'pear',
+    'pecan',
+    'pepper',
+    'pickle',
+    'pineapple',
+    'pistachio',
+    'pizza',
+    'plantain',
+    'plum',
+    'popcorn',
+    'pork',
+    'potato',
+    'poultry',
+    'protein',
+    'prune',
+    'pumpkin',
+    'quinoa',
+    'radish',
+    'raisin',
+    'raspberry',
+    'rice',
+    'rosemary',
+    'rye',
+    'sage',
+    'salad',
+    'salmon',
+    'salsa',
+    'sandwich',
+    'sauce',
+    'sausage',
+    'seafood',
+    'seed',
+    'seitan',
+    'sesame',
+    'shrimp',
+    'snack',
+    'soup',
+    'soy',
+    'soybean',
+    'spice',
+    'spinach',
+    'sprout',
+    'squash',
+    'strawberry',
+    'sunflower',
+    'sweetener',
+    'syrup',
+    'tahini',
+    'tapioca',
+    'taro',
+    'tea',
+    'tempeh',
+    'thyme',
+    'tofu',
+    'tomato',
+    'tortilla',
+    'trail',
+    'tuna',
+    'turkey',
+    'turnip',
+    'vegetable',
+    'vinegar',
+    'walnut',
+    'watermelon',
+    'wheat',
+    'yam',
+    'yogurt',
+    'zucchini',
+
+    // Preparation, process and cut words — what was DONE to the food, which is
+    // how a generic preparation is distinguished from another ("Roasted carrot
+    // coins", "Smoked paprika blend").
+    'baked',
+    'blanched',
+    'boiled',
+    'braised',
+    'breaded',
+    'brewed',
+    'broiled',
+    'canned',
+    'chilled',
+    'chopped',
+    'cooked',
+    'creamed',
+    'crushed',
+    'cubed',
+    'cured',
+    'diced',
+    'drained',
+    'dried',
+    'fermented',
+    'fresh',
+    'fried',
+    'frozen',
+    'glazed',
+    'grated',
+    'grilled',
+    'ground',
+    'instant',
+    'jarred',
+    'marinated',
+    'mashed',
+    'milled',
+    'minced',
+    'mixed',
+    'packed',
+    'peeled',
+    'pickled',
+    'poached',
+    'powdered',
+    'prepared',
+    'pressed',
+    'puffed',
+    'pureed',
+    'raw',
+    'refried',
+    'rendered',
+    'roasted',
+    'rolled',
+    'salted',
+    'sauteed',
+    'scrambled',
+    'seared',
+    'seasoned',
+    'seeded',
+    'shelled',
+    'shredded',
+    'sliced',
+    'smoked',
+    'soaked',
+    'sprouted',
+    'steamed',
+    'stewed',
+    'stuffed',
+    'sweetened',
+    'toasted',
+    'unsalted',
+    'unsweetened',
+    'whipped',
+
+    // Meal occasions and courses — when it is eaten ("Breakfast cereal").
+    'appetizer',
+    'breakfast',
+    'brunch',
+    'dessert',
+    'dinner',
+    'entree',
+    'lunch',
+    'side',
+    'starter',
+    'supper',
+
+    // Composition, diet and portion qualifiers — a factual claim about the food
+    // rather than a name for it ("Low sodium vegetable blend").
+    'cold',
+    'diet',
+    'energy',
+    'extra',
+    'fortified',
+    'gluten',
+    'high',
+    'hot',
+    'large',
+    'light',
+    'low',
+    'medium',
+    'mild',
+    'mini',
+    'natural',
+    'nonfat',
+    'nutrition',
+    'organic',
+    'plain',
+    'reduced',
+    'regular',
+    'savory',
+    'savoury',
+    'skim',
+    'small',
+    'spicy',
+    'sweet',
+    'vegan',
+    'vegetarian',
+    'warm',
+    'whole',
+    'wholegrain',
+    'wholemeal',
+];
+
 // ® and ™ (and their ASCII spellings) are a trademark claim on their face.
 const TRADEMARK_PATTERN = /[®™]|\((?:r|tm)\)/i;
 // The words of a name, in order, with their original casing kept — the casing
@@ -1589,6 +2229,13 @@ export interface BrandPatternMatch {
 export interface BrandPatternOptions {
     readonly brandWords?: readonly string[];
     readonly productFormWords?: readonly string[];
+    /**
+     * Replaces {@link DEFAULT_GENERIC_LEAD_WORDS}: the words whose leading
+     * capital is English rather than branding. A caller that narrows this list
+     * makes the check STRICTER, because every leading proper noun outside it is
+     * treated as an unknown maker.
+     */
+    readonly genericLeadWords?: readonly string[];
 }
 
 const wordsOf = (value: string): string[] => normalizeCanonicalName(value).split(' ').filter(Boolean);
@@ -1637,31 +2284,40 @@ const nameWordsOf = (value: string): NameWord[] => {
  *
  * THE PROPER-NOUN RULE, because it is the one that has to discriminate rather
  * than merely match. A product name and a generic preparation both pair a
- * capitalised word with a product form; what separates them is which OTHER
- * words the name capitalises:
+ * capitalised word with a product form, so the discriminator is the WORD, and
+ * where in the name it sits:
  *
  *  * a proper noun that is not the first word is a brand wherever a product
- *    form follows it — "granola Kettle crunch" names a product, and no generic
- *    preparation capitalises a word mid-name;
- *  * a proper noun that IS the first word only signals a brand when the product
- *    form that follows is itself capitalised — "Acme Bar" and "Nova Drink" are
- *    written as products, while "Protein bar", "Orange juice" and "Chicken
- *    broth" are ordinary sentence-case food names whose first capital carries no
- *    information at all.
+ *    form follows it, in any casing — "granola Kettle crunch" names a product,
+ *    and no generic preparation capitalises a word mid-name;
+ *  * a proper noun that IS the first word is a brand wherever a product form
+ *    follows it and the word is NOT in the reviewed generic vocabulary
+ *    {@link DEFAULT_GENERIC_LEAD_WORDS} — "Acme bar", "Nova drink" and "Zesta
+ *    crisps" name nothing a food could be made of, while "Protein bar",
+ *    "Orange juice" and "Breakfast cereal" lead with a word the catalog itself
+ *    files foods under, and their first capital carries no information at all;
+ *  * a reviewed generic word leading the name still fires when the product form
+ *    after it is capitalised too ("Rice Cereal"). Title case is not how this
+ *    pipeline writes a generic — the generator states a sentence-case display
+ *    name and a lowercase canonical name — so in this corpus the casing is the
+ *    anomaly worth a human's attention, and the matched token is recorded.
  *
- * So the test is "capitalisation beyond sentence case, plus a product form",
- * which is exactly the casing a manufactured product is written in and exactly
- * the casing this pipeline's generic names are not: the generator states a
- * sentence-case display name and a lowercase canonical name. A title-cased
- * generic ("Rice Cereal") is therefore treated as a product name and rejected —
- * deliberately, with the matched token recorded, because in this corpus the
- * casing is the anomaly worth a human's attention.
+ * The AAP states the rule as "capitalised proper noun followed by a product
+ * form" with no condition on the form's own casing (§0.7.3), and this is that
+ * rule: sentence case is the normal way to write both a food and a fabricated
+ * product, so the form's casing was never able to separate them.
  *
- * What this cannot catch, stated so nobody reads more into it: a fabricated
- * brand written in sentence case ("Acme bar") is indistinguishable from a
- * generic preparation without a food vocabulary this module does not have. The
- * curated brand-word list and the `unsourced` quarantine — no allowlisted
- * evidence names the product — are what stand behind it.
+ * What this cannot catch, stated so nobody reads more into it. Two residuals
+ * remain, and both are narrower than the sentence-case gap that used to sit
+ * here. A fabricated brand that IS a reviewed generic word ("Protein bar", sold
+ * by someone called Protein) is admitted, because the same words name real
+ * foods and refusing them would refuse the generic preparations generation
+ * exists to propose; and a fabricated brand carrying no product form at all
+ * ("Acme tomatoes, raw") is admitted, because a leading capital on its own is
+ * every sentence-case name's first letter and proves nothing. Standing behind
+ * both: the curated brand-word list, which names makers outright, and the
+ * `unsourced` quarantine — a candidate no allowlisted evidence names never
+ * publishes, whoever it claims to be.
  */
 export const findBrandPatternMatch = (
     values: readonly string[],
@@ -1670,6 +2326,9 @@ export const findBrandPatternMatch = (
     const brandWords = new Set((options.brandWords ?? DEFAULT_BRAND_WORDS).map((word) => word.toLowerCase()));
     const productForms = new Set(
         (options.productFormWords ?? DEFAULT_PRODUCT_FORM_WORDS).map((word) => word.toLowerCase()),
+    );
+    const genericLeadWords = new Set(
+        (options.genericLeadWords ?? DEFAULT_GENERIC_LEAD_WORDS).map((word) => word.toLowerCase()),
     );
 
     for (const value of values) {
@@ -1696,15 +2355,23 @@ export const findBrandPatternMatch = (
             }
 
             // The leading word of any sentence-case name is capitalised, so at
-            // position 0 the capital is only evidence when a product form after
-            // it is capitalised too; anywhere else the mid-name capital is the
-            // evidence and the form's own casing is immaterial.
+            // position 0 the capital alone is not evidence — the WORD is: a
+            // leading proper noun outside the reviewed generic vocabulary names
+            // no food, and a product form after it in any casing makes the name
+            // a product ("Acme bar"). A reviewed generic word leading the name
+            // keeps the narrower title-case trigger, which is the casing
+            // anomaly this pipeline's own generic names never carry. Anywhere
+            // else the mid-name capital is itself the evidence and the form's
+            // casing is immaterial.
+            const leadIsReviewedGeneric =
+                properNoun.position === 0 && genericLeadWords.has(properNoun.normalized);
+
             const form = nameWords
                 .slice(properNoun.position + 1)
                 .find(
                     (word) =>
                         productForms.has(word.normalized) &&
-                        (properNoun.position > 0 || CAPITALISED_WORD_PATTERN.test(word.text)),
+                        (!leadIsReviewedGeneric || CAPITALISED_WORD_PATTERN.test(word.text)),
                 );
 
             if (form) {

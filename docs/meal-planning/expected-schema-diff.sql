@@ -18,36 +18,72 @@
 -- markers of any kind: a block comment, or a `--` that starts after a space,
 -- survives the strip and is compared as a statement.
 --
--- REGENERATING, and the comparison itself. From backend/, with
--- SHADOW_DATABASE_URL naming a DISPOSABLE database - the command resets the
--- database it is given, so never the one holding the applied ledger and never
--- anything that matters:
+-- THE COMMAND RESETS THE DATABASE IT IS GIVEN. `migrate diff
+-- --from-migrations` replays the ledger onto the shadow database to build the
+-- side it compares, and replaying starts by emptying it. So SHADOW_DATABASE_URL
+-- must name a DISPOSABLE database - never the one holding the applied ledger,
+-- and nothing of value may live in it. That is not a theoretical caution:
+-- measured against prisma 6.9.0 on PostgreSQL 16.15, a shadow database carrying
+-- an operator's own table came back with that table DROPPED and the command
+-- still exited 2, reporting success.
+--
+-- REGENERATING, and the comparison itself. From backend/, through the guarded
+-- wrapper, which is the only sanctioned caller of that command: it classifies
+-- SHADOW_DATABASE_URL with scripts/lib/dbGuard.ts, reads the target back over a
+-- connection - the database and schema reached must be the ones the URL names,
+-- and no ordinary or partitioned base table in the reached public schema may
+-- hold a row, which is an occupancy statement about the tables of that one
+-- schema rather than a guarantee that the database is empty - and only then
+-- spawns Prisma. That certification runs with row security OFF and refuses a
+-- relation protected by a row-level security policy rather than reading it as
+-- empty: measured on PostgreSQL 16.15, a forced deny-all policy made an
+-- occupied table answer "empty" and the replay dropped the table and the hidden
+-- row with it. The wrapper's own diagnostics go to stderr, so stdout is the SQL
+-- and nothing else:
 --
 --   set +e
---   npx prisma migrate diff \
---     --from-migrations prisma/migrations \
---     --to-schema-datamodel prisma/schema.prisma \
---     --shadow-database-url "$SHADOW_DATABASE_URL" \
---     --exit-code --script > /tmp/schema-diff.sql
+--   SHADOW_DATABASE_URL="postgresql://<user>@127.0.0.1:5432/soh_shadow" \
+--     npx ts-node --project tsconfig.scripts.json scripts/schema-diff.ts diff \
+--     > /tmp/schema-diff.sql
 --   rc=$?
 --   set -e
 --   test "$rc" -eq 2
 --   diff <(sed '/^--/d;/^$/d' /tmp/schema-diff.sql) \
 --        <(sed '/^--/d;/^$/d' docs/meal-planning/expected-schema-diff.sql)
 --
--- --exit-code makes 2 the expected result: it means the datamodel and the
--- ledger differ, which is what this file records. 0 means either that this file
--- is stale - the two now agree - or that the construct its statement stands for
--- is gone from the migration. 1 means the command itself failed, usually an
--- unreachable or non-empty shadow database.
+-- THE EXIT CODES ARE THE WRAPPER'S, and they are not the raw command's. 2 is
+-- the expected result: Prisma ran and found differences between the datamodel
+-- and the ledger, which is what this file records. 0 means Prisma ran and found
+-- none - either this file is stale, the two now agree, or the construct its
+-- statement stands for is gone from the migration. 1 means Prisma itself failed
+-- AFTER the read-back had already succeeded: P3006, a migration that does not
+-- replay cleanly onto the shadow database, or the target changing between the
+-- read-back and the run. A NON-EMPTY shadow database is NOT among them - raw,
+-- that case exits 2 and destroys the content, which is why the wrapper refuses
+-- it before Prisma runs.
+--
+-- 3 is the wrapper's own code and covers EVERY refusal, with no Prisma verdict
+-- produced: a URL the guard refused, a read-back that could not connect,
+-- authenticate or find the database - P1001, P1003 and P1000 are the RAW
+-- command's exit 1 and are this wrapper's 3, because the read-back reaches them
+-- before Prisma is invoked - a database or schema that was not the one the URL
+-- names, the occupancy or row-security refusal, or a Prisma CLI that could not
+-- be started. Only the string-level refusals happen with nothing opened (a
+-- missing, unparsable, target-changing or percent-encoded URL, or one that is
+-- not a shadow origin); the read-back, occupancy and row-security refusals open
+-- a connection first and close it again.
 --
 -- WHAT THE PAYLOAD COVERS, AND WHAT IT CANNOT. AAP 0.5.1 expects this output to
 -- carry the three constructs the Prisma datamodel cannot express: the generated
--- search_vector expression, the lower(alias) expression index on
--- catalog_food_aliases, and the partial indexes' predicates. Measured against
+-- search_vector expression, the alias expression index on
+-- catalog_food_aliases - delivered as the ASCII fold
+-- `translate(alias, 'ABC...', 'abc...')` rather than `lower(alias)`, for the
+-- portability reason
+-- prisma/migrations/20260910000000_catalog_prefix_fold_indexes sets out - and
+-- the partial indexes' predicates. Measured against
 -- prisma 6.9.0 it carries only the first - the statement below. Prisma's schema
 -- describer leaves expression indexes, index predicates and scalar-list NOT
--- NULL out of both sides of its comparison, so deleting the lower(alias) index,
+-- NULL out of both sides of its comparison, so deleting an expression index,
 -- changing a partial index's predicate, or dropping NOT NULL from a required
 -- array column each leave this output and its exit code untouched. That is a
 -- recorded AAP-versus-tool divergence, and what closes the two classes the tool
@@ -64,10 +100,12 @@
 -- below with it verbatim, and review the new content.
 --
 -- THE GATE is the `Schema-drift evidence gate` step of
--- .github/workflows/ci.yml. It runs the command above against a throwaway
--- shadow database of its own, requires exit code 2, and compares this whole
--- file with the output; the same step polices schema-catalog-evidence.sql
--- beside it.
+-- .github/workflows/ci.yml. It runs the wrapper above against a throwaway
+-- shadow database it creates for the run - dropped and recreated first, so its
+-- public schema holds no table at all and the wrapper's disposable check passes
+-- - requires exit code 2,
+-- and compares this whole file with the output; the same step polices
+-- schema-catalog-evidence.sql beside it.
 --
 -- Captured against prisma and @prisma/client 6.9.0 on PostgreSQL 16.15, ledger
 -- prisma/migrations through 20260908000000_meal_planning.

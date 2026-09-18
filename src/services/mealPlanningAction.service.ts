@@ -248,12 +248,17 @@ export type KeyedActionCompletion<TAction extends KeyedActionType = KeyedActionT
  * Exactly what the controller sends, whether this was the first attempt or the
  * hundredth retry of a committed one.
  *
- * There is deliberately no "was this a replay" flag: a client must never be
- * able to tell, and a flag is how a controller starts adding a header or
- * changing a status that lets it. `body` is `unknown` for the same honesty — on
- * a replay it comes back out of a `jsonb` column, so the pure layer types it
- * `unknown` and this module propagates that rather than asserting a shape it
- * did not verify. The controller only forwards it.
+ * NOTHING A CLIENT RECEIVES SAYS WHICH ATTEMPT IT WAS. `replayed` below is
+ * SERVER-INTERNAL: `mealPlanning.controller.ts` reads it for the event it emits
+ * and copies it into no body, no header and no status, because a client able to
+ * tell a replay from the original answer is exactly what §0.5.1 forbids. The
+ * `replayed` paragraph further down states that contract in full, and why the
+ * flag exists at all.
+ *
+ * `body` is `unknown` for a related honesty — on a replay it comes back out of a
+ * `jsonb` column, so the pure layer types it `unknown` and this module
+ * propagates that rather than asserting a shape it did not verify. The
+ * controller only forwards it.
  *
  * **The two attempts agree on the status, on the revision, and on the BYTES the
  * body serialises to.** They reach the body by different routes — a fresh action

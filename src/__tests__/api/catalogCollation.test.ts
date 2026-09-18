@@ -54,7 +54,10 @@
 //
 // SO THIS SUITE CREATES THAT DATABASE AND RUNS THE REAL SERVICE INSIDE IT.
 // `beforeAll` creates a disposable database with an ICU default collation,
-// applies both committed migrations to it with a plain `pg` client — the
+// applies every committed migration to it, in ledger order, with a plain `pg`
+// client — the list is `MIGRATION_SQL` below, and it is the whole ledger rather
+// than a chosen subset precisely so the schema under test is the one every
+// environment runs — the
 // mechanism `src/__tests__/api/compat.test.ts` already uses for its disposable
 // ledgers — and seeds collation-sensitive rows. The Prisma singleton the service
 // imports is redirected at that database through `jest.mock`, so
@@ -76,18 +79,30 @@
 // of the run and not a claim about it.
 //
 // A SECOND PROOF RIDES ON THE SAME DATABASE: that the alias index is usable by
-// the service's own predicate. `idx_catalog_food_aliases_lower_alias` exists for
+// the service's own predicate. `idx_catalog_food_aliases_fold_alias` exists for
 // the prefix fallback in `catalogMatchSet`, and a btree can answer
-// `lower(alias) LIKE 'x%'` with a range scan only when the indexed comparison is
-// byte order — a `*_pattern_ops` operator class, or a column collation of C. The
-// database this suite creates has neither by accident: its default collation is
-// ICU `und`, which is the hostile case, and the index therefore carries
-// `text_pattern_ops` explicitly. The final describe pins that class out of
-// `pg_opclass`, pins the plan (with `enable_seqscan = off`, so cost is not a
-// variable), and confirms equality is still served. The committed
-// schema-evidence gate cannot see an operator class at all —
-// `pg_get_indexdef(oid, k, …)` omits it — so these assertions are where that
-// property is held.
+// `translate(alias, 'ABC…', 'abc…') LIKE 'x%'` with a range scan only when the
+// indexed comparison is byte order — a `*_pattern_ops` operator class, or a
+// column collation of C. The database this suite creates has neither by
+// accident: its default collation is ICU `und`, which is the hostile case, and
+// the index therefore carries `text_pattern_ops` explicitly. The final describe
+// pins that class out of `pg_opclass`, pins the plan (with
+// `enable_seqscan = off`, so cost is not a variable), and confirms equality is
+// still served. The committed schema-evidence gate cannot see an operator class
+// at all — `pg_get_indexdef(oid, k, …)` omits it — so these assertions are
+// where that property is held.
+//
+// THE INDEXED EXPRESSION IS THE ASCII FOLD AND NOT `lower()`, which is the same
+// portability property the head-noun describe at the bottom of this file pins,
+// reaching the prefix branches. `lower()` resolves through the collation while
+// the JavaScript side of the comparison does not, so a partial query over a
+// name carrying a non-ASCII capital matched on one server and not on another —
+// and a prefix branch is the only branch a partial query can match, so the food
+// disappeared rather than being mis-ranked. Both sides now fold through the one
+// ASCII map (`foldSearchAscii` in JavaScript, `translate()` over the same two
+// exported constants in SQL), and `prisma/migrations/
+// 20260910000000_catalog_prefix_fold_indexes/migration.sql` indexes that
+// expression for all three prefix columns.
 //
 // That the REAL CALLER reaches the index is established in the same describe,
 // and deterministically: the mocked Prisma singleton is constructed with query
@@ -316,9 +331,17 @@ import {
 import { getStatus, getSuggestions, searchPublishedFoods } from '../../services/catalog.service';
 
 const BACKEND_ROOT = path.resolve(__dirname, '..', '..', '..');
-const MIGRATION_SQL = ['20260706000000_init', '20260908000000_meal_planning'].map((migration) =>
-    path.join(BACKEND_ROOT, 'prisma', 'migrations', migration, 'migration.sql'),
-);
+// Every entry of the ledger, in order, because this list is what builds the ICU
+// database below: an entry left out is DDL the disposable database does not
+// have, and the index proofs at the bottom of this file would then be asserting
+// about a schema no environment runs. 20260910000000_catalog_prefix_fold_indexes
+// is where the three ASCII-fold indexes the prefix branches read come from.
+const MIGRATION_SQL = [
+    '20260706000000_init',
+    '20260908000000_meal_planning',
+    '20260909000000_usda_cache_http_status',
+    '20260910000000_catalog_prefix_fold_indexes',
+].map((migration) => path.join(BACKEND_ROOT, 'prisma', 'migrations', migration, 'migration.sql'));
 
 /**
  * Five names chosen because `C` and ICU disagree about all of them — and
@@ -625,9 +648,16 @@ describe('catalog read ordering across databases', () => {
  * which this file's disposable database already has, so the handlers are driven
  * with a minimal request/response pair — the instrument
  * `src/__tests__/api/requestParserWiring.test.ts` uses for the same two catalog
- * handlers. A supertest round-trip is not available: `src/routes/catalog.routes.ts`
- * does not exist yet, so no catalog path is mounted on `app`, and asserting
- * through a router that is not there would assert nothing.
+ * handlers. A supertest round-trip cannot make either half of the claim from
+ * this file. The Prisma singleton every service imports is mocked here at the
+ * disposable ICU database, so a request driven through the shipped `app` would
+ * read that database rather than the one the harness truncates, and would fail
+ * on this file's ICU precondition for a reason that has nothing to do with the
+ * route. The zero-I/O half additionally needs the mocked client's `query` event
+ * stream — a refusal is asserted to have produced NO statement — which a wire
+ * response does not expose. The route-level contract of these two reads is
+ * driven over supertest in `src/__tests__/api/catalog.test.ts`, against the
+ * ambient database.
  *
  * "BEFORE ANY PRISMA WORK" IS MEASURED, not assumed. The mocked singleton this
  * file installs emits a `query` event per statement, so a refusal is asserted to
@@ -862,7 +892,20 @@ describe('the catalog request boundary refuses a malformed page block before any
  *     either, so it cannot reach a `beans` result through the name branch.
  * ------------------------------------------------------------------------- */
 describe('the alias-prefix index the search fallback depends on', () => {
-    const INDEX_NAME = 'idx_catalog_food_aliases_lower_alias';
+    const INDEX_NAME = 'idx_catalog_food_aliases_fold_alias';
+
+    /**
+     * The indexed expression, written once and used by every plan assertion
+     * below.
+     *
+     * Built from the two constants `catalog.logic.ts` exports and
+     * `catalog.service.ts::asciiFoldOf` composes, so this file cannot pin a plan
+     * for an expression the service does not issue: an alphabet edited on one
+     * side would stop matching the index and the plan assertions would go red
+     * here rather than silently downgrade a range scan to a sequential read in
+     * production.
+     */
+    const FOLDED_ALIAS = `translate(alias, '${SEARCH_ASCII_UPPERCASE}', '${SEARCH_ASCII_LOWERCASE}')`;
 
     /**
      * The seeded corpus, and why it is this size.
@@ -880,7 +923,8 @@ describe('the alias-prefix index the search fallback depends on', () => {
     const ALIAS_GROUPS = 100;
 
     /**
-     * Alias text that cannot collide with anything above.
+     * Alias text that cannot collide with anything above, carrying capitals so
+     * the fold is doing work on the COLUMN side too.
      *
      * The five foods already seeded are the `beans` family, and the suite's
      * assertions count matches of `beans` exactly. These aliases share no prefix
@@ -888,12 +932,20 @@ describe('the alias-prefix index the search fallback depends on', () => {
      * cannot appear in `getSuggestions`), and its own `display_name` and
      * `canonical_name` do not match the prefix either — so a row reaching the
      * result can only have come through the ALIAS prefix branch.
+     *
+     * The stem is title-cased and the query below is typed in capitals, so
+     * neither side of the comparison is folded already: the stored alias reaches
+     * the index through `translate()` and the typed term reaches the pattern
+     * through `foldSearchAscii`, which is what the branch actually does. The
+     * pattern is therefore derived with the same function the service uses
+     * rather than written out, so a fold that stopped being applied on either
+     * side fails here instead of passing on pre-folded fixture text.
      */
-    const ALIAS_STEM = 'zalix murnen';
+    const ALIAS_STEM = 'Zalix Murnen';
     const MATCHING_GROUP = '007';
     const PREFIX_QUERY = `${ALIAS_STEM} ${MATCHING_GROUP}`;
-    const PREFIX_PATTERN = `${PREFIX_QUERY}%`;
-    const EXACT_ALIAS = `${ALIAS_STEM} ${MATCHING_GROUP} 7`;
+    const PREFIX_PATTERN = `${foldSearchAscii(PREFIX_QUERY)}%`;
+    const EXACT_ALIAS = foldSearchAscii(`${ALIAS_STEM} ${MATCHING_GROUP} 7`);
     const FOOD_SEQUENCE = 901;
 
     let foodId = '';
@@ -1132,7 +1184,10 @@ describe('the alias-prefix index the search fallback depends on', () => {
     it('seeded the corpus the plan assertions are made against', async () => {
         const [counts] = await prisma.$queryRaw<{ total: bigint; matching: bigint }[]>`
             SELECT COUNT(*) AS total,
-                   COUNT(*) FILTER (WHERE lower(alias) LIKE ${PREFIX_PATTERN}) AS matching
+                   COUNT(*) FILTER (
+                       WHERE translate(alias, ${SEARCH_ASCII_UPPERCASE}, ${SEARCH_ASCII_LOWERCASE})
+                           LIKE ${PREFIX_PATTERN}
+                   ) AS matching
             FROM catalog_food_aliases
             WHERE catalog_food_id = ${foodId}::uuid
         `;
@@ -1167,7 +1222,7 @@ describe('the alias-prefix index the search fallback depends on', () => {
     });
 
     it('is the plan for a left-anchored alias prefix even with sequential scans disabled', async () => {
-        const plan = await explain(`lower(alias) LIKE '${PREFIX_PATTERN}'`, true);
+        const plan = await explain(`${FOLDED_ALIAS} LIKE '${PREFIX_PATTERN}'`, true);
 
         // This is the assertion that fails if the operator class is reverted.
         // With the default `text_ops` the planner cannot derive the >=/< bounds a
@@ -1232,8 +1287,8 @@ describe('the alias-prefix index the search fallback depends on', () => {
         expect(indexNode['Actual Loops']).toBeGreaterThanOrEqual(1);
     });
 
-    it('still serves equality on lower(alias), which is why no second index is added', async () => {
-        const plan = await explain(`lower(alias) = '${EXACT_ALIAS}'`, false);
+    it('still serves equality on the folded alias, which is why no second index is added', async () => {
+        const plan = await explain(`${FOLDED_ALIAS} = '${EXACT_ALIAS}'`, false);
 
         // `text_pattern_ops` supports =, < and > as well as the pattern
         // operators, so replacing `text_ops` costs nothing. That is the evidence
@@ -1404,5 +1459,205 @@ describe('the head-noun tier on a name whose case no two collations fold alike',
         // And neither of them is what JavaScript produces, which is the
         // divergence the head-noun comparison used to sit on top of.
         expect(new Set([row.by_default, row.by_c, HEAD_NOUN_NAME.toLowerCase()]).size).toBeGreaterThan(1);
+    });
+});
+
+/* ---------------------------------------------------------------------------
+ * The prefix branches are locale-free
+ *
+ * WHY THIS IS HERE AND NOT IN A UNIT TEST, for the reason the head-noun describe
+ * above gives: the comparison is made in SQL between a pattern folded in
+ * JavaScript and a column folded by the server, so only a database — and only
+ * one whose collation is not C — can show whether the two agree and whether
+ * their agreement is a property of the server.
+ *
+ * THE DEFECT THIS PINS, AND WHY IT WAS WORSE THAN A MIS-RANK. The pattern was
+ * built with `q.toLowerCase()` (Unicode full case folding) while the three
+ * columns were folded with `lower()` (resolved through the collation), and the
+ * two are different functions outside A-Z: `'MURNİ'.toLowerCase()` is `murni` +
+ * U+0307 COMBINING DOT ABOVE, while `lower()` answers `murni` + U+0307 under
+ * ICU, a plain `murni` under `en_US.utf8`, and `murnİ` — unchanged — under C. A
+ * PARTIAL query matches through NO other branch: a stemmed query has no prefix
+ * semantics, so `plainto_tsquery` cannot reach a word the user has only started
+ * typing. So for a name carrying a non-ASCII capital the food did not drop a
+ * tier, it disappeared from the result entirely — on some servers and not on
+ * others. AAP §0.9.3 requires two independently loaded databases to answer with
+ * identical ranks and page sequences, which a food that is present in one and
+ * absent in the other fails outright.
+ *
+ * Both sides now fold through the one ASCII-only map — `foldSearchAscii` in
+ * JavaScript, `translate()` over the same two exported constants in SQL — and
+ * `prisma/migrations/20260910000000_catalog_prefix_fold_indexes/migration.sql`
+ * indexes that expression for all three prefix columns, so the fold costs the
+ * branches nothing.
+ *
+ * THE CORPUS COVERS EACH PREFIX COLUMN ONCE, because the branches read three
+ * and a fix applied to two of them would be invisible to a one-food fixture:
+ * one food carries the capital in its `display_name`, one in its
+ * `canonical_name` alone, and one in an alias. One partial query must return all
+ * three.
+ *
+ * Only `display_name` carries capitals in release v1 — `normalizeCanonicalName`
+ * strips diacritics and case from a canonical name, and the release's aliases
+ * are lower-case ASCII — so the other two rows are text the current loader
+ * would not write. They are seeded anyway, and deliberately: what this describe
+ * pins is the COMPARISON these three branches make, which has to hold for
+ * whatever the columns hold. How a canonical name is normalised on the way in is
+ * a separate invariant, owned by `catalog.logic.ts` and its own unit tests, and
+ * a branch test that leaned on it would silently stop covering two of its three
+ * columns the day the loader changed.
+ *
+ * THE AMBIENT DATABASE IS THE OTHER HALF OF THE SAME CLAIM, and it is asserted
+ * in `src/__tests__/api/catalog.test.ts` ('returns a food a partial query
+ * reaches only through a non-ASCII uppercase name' and its alias sibling), which
+ * drives the same corpus over HTTP against the database the rest of the suite
+ * runs on. Two collations, one answer, which is what portability means here.
+ *
+ * DECLARATION ORDER IS NOT LOAD-BEARING: this describe seeds its three
+ * published foods in its own `beforeAll` and removes them in its own
+ * `afterAll`, as every describe in this file does, and nothing it seeds matches
+ * `beans` on any branch.
+ * ------------------------------------------------------------------------- */
+
+describe('a partial query over text no two collations case-fold alike', () => {
+    /**
+     * The typed term: a strict prefix of a word, in capitals, carrying U+0130
+     * LATIN CAPITAL LETTER I WITH DOT ABOVE.
+     *
+     * A strict prefix is what makes this a PARTIAL query rather than a
+     * full-text one: `plainto_tsquery('english', 'MURNİ')` produces a single
+     * lexeme that equals no lexeme of `murnİxberry`, so contributions 1 and 2
+     * of `catalogMatchSet` cannot reach any of these foods and the row can only
+     * have arrived through a prefix branch. Capitals on this side and capitals
+     * in the stored text mean neither side of the comparison is pre-folded.
+     */
+    const PARTIAL_QUERY = 'MURNİ';
+
+    /** The three foods, one per prefix column the branches read. */
+    const NAME_FOOD = 'MURNİXBERRY, raw';
+    const CANONICAL_FOOD = 'Preserved compote 952';
+    const CANONICAL_TEXT = `${foldSearchAscii(PARTIAL_QUERY)}xberry compote`;
+    const ALIAS_FOOD = 'Bottled compote 953';
+    const ALIAS_TEXT = 'MURNİXBERRY PEEL';
+
+    /**
+     * `search_text` that matches nothing the query stems to, for all three.
+     *
+     * The stored vector is generated from `search_text` alone, so this is what
+     * keeps the full-text branches out of the result and leaves the prefix
+     * branches as the only way in.
+     */
+    const UNREACHED_SEARCH_TEXT = 'fixture prefix corpus';
+
+    const createdIds: string[] = [];
+
+    beforeAll(async () => {
+        const name = await makeCatalogFood({
+            sequence: 960,
+            display_name: NAME_FOOD,
+            canonical_name: foldSearchAscii(NAME_FOOD),
+            food_state: 'raw',
+            search_text: UNREACHED_SEARCH_TEXT,
+        });
+        // The capital lives in `canonical_name` only, which is the half of the
+        // name branch a display-name fixture cannot cover: the branch reads the
+        // two columns with an OR, so each needs its own row to be observable.
+        const canonical = await makeCatalogFood({
+            sequence: 961,
+            display_name: CANONICAL_FOOD,
+            canonical_name: CANONICAL_TEXT,
+            food_state: 'cooked',
+            search_text: UNREACHED_SEARCH_TEXT,
+        });
+        const alias = await makeCatalogFood({
+            sequence: 962,
+            display_name: ALIAS_FOOD,
+            canonical_name: foldSearchAscii(ALIAS_FOOD),
+            food_state: 'prepared',
+            search_text: UNREACHED_SEARCH_TEXT,
+        });
+        await prisma.catalog_food_aliases.create({
+            data: { catalog_food_id: alias.id, alias: ALIAS_TEXT },
+        });
+
+        createdIds.push(name.id, canonical.id, alias.id);
+    });
+
+    afterAll(async () => {
+        if (createdIds.length === 0) return;
+
+        await prisma.catalog_food_aliases.deleteMany({ where: { catalog_food_id: { in: createdIds } } });
+        await prisma.catalog_foods.deleteMany({ where: { id: { in: createdIds } } });
+    });
+
+    it('returns every food the partial query reaches, on each of the three prefix columns', async () => {
+        const { items, total } = await searchPublishedFoods(PARTIAL_QUERY, 1, 50);
+
+        // Asserted as the whole match set rather than as a membership test: a
+        // fold applied to one column and not the others returns a subset, and
+        // the count is what makes that a failure instead of a pass on the one
+        // food that still arrives.
+        expect(total).toBe(createdIds.length);
+        expect(items.map((item) => item.name).slice().sort()).toEqual(
+            [NAME_FOOD, CANONICAL_FOOD, ALIAS_FOOD].slice().sort(),
+        );
+    });
+
+    it('pages that match set without a gap or a repeat', async () => {
+        const single = await searchPublishedFoods(PARTIAL_QUERY, 1, 50);
+        const paged = [
+            ...(await searchPublishedFoods(PARTIAL_QUERY, 1, 2)).items,
+            ...(await searchPublishedFoods(PARTIAL_QUERY, 2, 2)).items,
+        ].map((item) => item.id);
+
+        expect(paged).toEqual(single.items.map((item) => item.id));
+        expect(new Set(paged).size).toBe(paged.length);
+    });
+
+    it('folds each stored text identically under this collation and under C', async () => {
+        // The mechanism behind the case above, stated on its own: `translate()`
+        // takes no locale input, so the indexed expression and the pattern are
+        // the same bytes wherever the release is loaded — and that value is what
+        // `foldSearchAscii` returns in JavaScript, which is the other half of
+        // the comparison.
+        for (const text of [NAME_FOOD, CANONICAL_TEXT, ALIAS_TEXT]) {
+            const [row] = await prisma.$queryRaw<{ by_default: string; by_c: string }[]>`
+                SELECT translate(${text}, ${SEARCH_ASCII_UPPERCASE}, ${SEARCH_ASCII_LOWERCASE}) AS by_default,
+                       translate(${text} COLLATE "C", ${SEARCH_ASCII_UPPERCASE}, ${SEARCH_ASCII_LOWERCASE}) AS by_c
+            `;
+
+            expect(row.by_default).toBe(foldSearchAscii(text));
+            expect(row.by_c).toBe(foldSearchAscii(text));
+        }
+    });
+
+    it('would not have matched through the lower()/toLowerCase() pairing on every server', async () => {
+        // The pairing the branches used to carry, evaluated as the branches
+        // evaluated it: the pattern folded by JavaScript, the column folded by
+        // `lower()`. `toLowerCase()` is called deliberately here — it is the
+        // defect being pinned, not a fold this file endorses.
+        const legacyPattern = `${PARTIAL_QUERY.toLowerCase()}%`;
+        const foldedPattern = `${foldSearchAscii(PARTIAL_QUERY)}%`;
+
+        const [row] = await prisma.$queryRaw<{
+            legacy_by_default: boolean;
+            legacy_by_c: boolean;
+            folded: boolean;
+        }[]>`
+            SELECT lower(${NAME_FOOD}) LIKE ${legacyPattern} AS legacy_by_default,
+                   lower(${NAME_FOOD} COLLATE "C") LIKE ${legacyPattern} AS legacy_by_c,
+                   translate(${NAME_FOOD}, ${SEARCH_ASCII_UPPERCASE}, ${SEARCH_ASCII_LOWERCASE})
+                       LIKE ${foldedPattern} AS folded
+        `;
+
+        // The whole defect in three booleans: the old pairing's answer was a
+        // property of the collation the argument carried — matching under this
+        // database's ICU default and NOT under C, the collation the page order
+        // itself is pinned to — while the fold answers the same thing under
+        // both. A food absent from one server's results and present on
+        // another's is what AAP §0.9.3 forbids.
+        expect(row.legacy_by_default).not.toBe(row.legacy_by_c);
+        expect(row.legacy_by_c).toBe(false);
+        expect(row.folded).toBe(true);
     });
 });

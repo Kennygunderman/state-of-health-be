@@ -410,17 +410,19 @@ describe('gramsToMilliliters', () => {
  * own food.
  *
  * THE SHAPE IT EXISTS FOR is the one the shipped catalog release actually
- * carries: 11,046 published foods, every one `nutrition_basis: per_100g` with
- * `density_g_per_ml` NULL, and 4,622 of them holding a VOLUME-family default
- * portion. Each such portion states `amount` units of volume weighing
- * `gram_weight` grams, which is a density — so the figure the display path needs
- * is already in the data and is read from it here instead of being demanded of a
- * column that is null.
+ * carries, as its own manifest and rows state it: 11,046 published foods, every
+ * one `nutrition_basis: per_100g` with `density_g_per_ml` NULL, and 4,622 of
+ * them holding a VOLUME-family default portion. Each such portion states
+ * `amount` units of volume weighing `gram_weight` grams, which is a density — so
+ * the figure the display path needs is already in the data and is read from it
+ * here instead of being demanded of a column that is null.
  *
  * `amount` IS DIVIDED OUT rather than assumed to be 1, because the release
- * disagrees with that assumption: alongside 4,164 portions at amount 1 it ships
- * 156 at 0.5, 36 at 2, 24 at 0.25, 22 at 8 and more. Assuming 1 would double a
- * half-cup food's density and halve a two-cup food's.
+ * disagrees with that assumption: its volume-family default portions are stated
+ * at amounts other than 1 — halves, doubles, quarters and eighths among them —
+ * and `data/meal-planning/catalog/releases/v1/portions.jsonl` is the authority
+ * on which and how many, not a count transcribed here. Assuming 1 would double
+ * a half-cup food's density and halve a two-cup food's.
  *
  * Every unanswerable input is null rather than a throw, and the last case here
  * pins the counterpart: the two conversion entry points still refuse a missing

@@ -20,16 +20,18 @@
 // test.ts` — where the injected clock's ORDERING is proven — replaces the Prisma
 // singleton module-wide with a recording stub and therefore cannot hold a
 // row-backed case at all, and `api/ownership.test.ts` next door is the
-// cross-user matrix, where a lifecycle case would be a second subject. The AAP
-// names `api/plans.test.ts` for the plan routes' full coverage; it does not
-// exist at this checkpoint, and writing a partial one under that name would
-// collide with the agent that creates it.
+// cross-user matrix, where a lifecycle case would be a second subject.
+// `api/plans.test.ts` owns the plan routes' full HTTP coverage and declares
+// the same split from its own side: it asserts the route-level contract of
+// this envelope, and the lifecycle × zone matrix inside it is this file's.
 //
 // WHICH LAYER IT DRIVES. `mealPlan.service.ts::getMealPlanDay` directly, as the
-// neighbouring suites do: the meal-planning HTTP boundary does not exist yet
-// (no `routes/mealPlanning.routes.ts`, no controller, nothing mounted in
-// `app.ts`), so a supertest call would prove only that the route is absent.
-// When the route lands, its status codes belong beside these cases.
+// neighbouring suites do: the verdict is the service's own, computed from ONE
+// stored week read at three instants in two zones, so driving it here pins the
+// verdict itself rather than the status code that carries it. The route-level
+// contract over the same envelope — its status codes and the `isWritable` a
+// request reports — belongs to `api/plans.test.ts`, and the tenancy matrix
+// over it to `api/ownership.test.ts`.
 //
 // THE CLOCK IS PINNED AND THE STORED WEEK IS NEVER EDITED. Every case reaches a
 // lifecycle by judging the SAME plan at a different instant, which is how a
@@ -116,6 +118,23 @@ afterAll(async () => {
  * ------------------------------------------------------------------------- */
 
 describe('the day envelope reports the plan lifecycle it is read on', () => {
+    // WHAT IS CONTRACT AND WHAT IS EXTRA. §0.5.2 declares this envelope as
+    // exactly `{planId, planRevision, planStatus, day}`. The two lifecycle
+    // members every case below is about are ADDITIVE: the DTO types them
+    // optional and the client requires neither — it falls back to `planStatus`
+    // and recovers from `409 plan_not_active` when they are absent — because a
+    // required non-contract member is a response a conforming server cannot
+    // produce. So the guarantee that this server nevertheless sends them is a
+    // claim about this mapper rather than about the type, and this is where it
+    // is pinned.
+    it('answers the four contract members, and the two lifecycle extras beside them', async () => {
+        const envelope = await readEnvelope(fixture.planId, fixture.dayKey, INSIDE_THE_WEEK);
+
+        expect(Object.keys(envelope).sort()).toEqual(
+            ['day', 'isWritable', 'planId', 'planLifecycle', 'planRevision', 'planStatus'].sort(),
+        );
+    });
+
     it('reports a live week as writable', async () => {
         const envelope = await readEnvelope(fixture.planId, fixture.dayKey, INSIDE_THE_WEEK);
 

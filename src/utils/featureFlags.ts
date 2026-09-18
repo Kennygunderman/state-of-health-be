@@ -96,15 +96,42 @@ export function mealPlanningFault(): MealPlanningFault {
  * Whether a keyed write should drop its response after committing. This
  * answers with a boolean and nothing else — destroying the socket, like every
  * other choice about the response, belongs to the controller.
+ *
+ * THE TWO SWITCHES ARE DELIBERATELY ASYMMETRIC ABOUT A REPLAY, and neither
+ * should be "harmonised" with the other:
+ *
+ *  * The ambient `MEAL_PLANNING_FAULT=log` switch is ONE-SHOT. It withholds the
+ *    answer to a fresh commit and never the stored answer to a same-key retry,
+ *    because AAP §0.9.4 arms it so a developer on a real device reaches the
+ *    unconfirmed-outcome state AND then resolves it: "the same-key retry must
+ *    return the committed 201". A switch that also swallowed the replay would
+ *    leave that device unable to resolve until someone edited the server's
+ *    environment, which is the opposite of what the switch is for.
+ *  * The explicit `POST_COMMIT_ABORT_HEADER` is honoured EXACTLY AS ASKED, per
+ *    request, replay or not. It is a per-request instruction that is only
+ *    readable under `NODE_ENV === 'test'`, so it cannot arrive from a client on
+ *    a deployed host, and keeping it unconditional is what lets a suite prove
+ *    that a LOST REPLAY is still recoverable — a property the one-shot switch
+ *    cannot express.
+ *
+ * @param actionType the keyed write being answered, as stored in
+ *   `meal_plan_actions.action_type`
+ * @param headerValue the raw `POST_COMMIT_ABORT_HEADER` value off the request
+ * @param answer the fact the ambient switch needs about the answer being
+ *   withheld: whether it is a stored replay rather than a fresh commit. Passed
+ *   as data rather than imported (`KeyedActionResult` lives in a service that
+ *   arrives later than this leaf), and required rather than optional so a new
+ *   keyed write cannot reach the seam without stating it.
  */
 export function postCommitAbort(
     actionType: MealPlanningActionType,
     headerValue: unknown,
+    answer: { readonly replayed: boolean },
 ): boolean {
     // Not gated on NODE_ENV by design: this is the path a developer drives from
     // a device against a dev backend, and it is already inert in production
     // because the resolver forces the fault to 'off' there.
-    if (resolvedFault === 'log' && actionType === 'log') {
+    if (resolvedFault === 'log' && actionType === 'log' && !answer.replayed) {
         return true;
     }
 
